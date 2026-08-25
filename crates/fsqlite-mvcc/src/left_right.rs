@@ -659,9 +659,7 @@ mod tests {
 
     #[test]
     fn metrics_increment() {
-        // These counters are process-global, so unrelated tests can increment
-        // them between snapshots when the unit suite runs in parallel. Verify
-        // that our three reads are represented without assuming isolation.
+        // Delta-based: snapshot before, act, snapshot after.
         let before = leftright_metrics();
         let lr = LeftRight::new(1);
         lr.read("m1");
@@ -670,7 +668,7 @@ mod tests {
 
         let after = leftright_metrics();
         let delta = after.fsqlite_leftright_reads_total - before.fsqlite_leftright_reads_total;
-        assert!(delta >= 3, "expected at least 3 reads, got {delta}");
+        assert_eq!(delta, 3);
     }
 
     #[test]
