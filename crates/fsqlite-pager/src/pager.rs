@@ -5203,6 +5203,17 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
     OnceLock::new();
 static GROUP_COMMIT_IDENTITY_QUEUES: OnceLock<Mutex<IdentityWeakRegistry<GroupCommitQueue>>> =
     OnceLock::new();
+/// bd-ioq6x Face-2 (GH#346): process-global holding pen that preserves a
+/// group-commit queue's shared disowned-page ledger across a full teardown of
+/// the queue (the drop-ALL-then-reopen shape). `remove_group_commit_queue`
+/// drains a still-populated ledger here BEFORE dropping the queue at
+/// `strong_count == 1`; the next queue created for the same path re-seeds its
+/// fresh ledger from this pen (`seed_disowned_ledger_from_pending`) so the
+/// on-open sweep reclaims the parked EOF holes. Keyed by the same
+/// `shared_file_state_key` the path-keyed queue registry uses. Without it the
+/// last connection's drop discards the ledger and the parked holes orphan
+/// ("page N is never used") once a later grow brings them in range.
+static PENDING_DISOWNED_BY_PATH: OnceLock<Mutex<HashMap<PathBuf, HashSet<u32>>>> = OnceLock::new();
 static NEXT_GROUP_COMMIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_GROUP_COMMIT_FINALIZATION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -6335,8 +6346,41 @@ fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
             .or_insert_with(|| Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))),
     );
     drop(queues);
+    // bd-ioq6x Face-2: re-seed the shared ledger from any pages a prior full
+    // teardown of this path's queue parked in the pending pen, so the on-open
+    // sweep reclaims them. A no-op when the pen has no entry for this path
+    // (the common case) or when this call returned an already-live queue (a
+    // live queue was never torn down, so nothing was parked for it).
+    seed_disowned_ledger_from_pending(&queue, db_path);
     queue.bind_finalization_path(db_path);
     queue
+}
+
+/// bd-ioq6x Face-2 (GH#346): re-seed a freshly created group-commit queue's
+/// shared disowned-page ledger from [`PENDING_DISOWNED_BY_PATH`], draining that
+/// path's entry. Symmetric to the persist in `remove_group_commit_queue`; keyed
+/// by the same `shared_file_state_key`. The drain is atomic under the pending
+/// pen's mutex, so if two opens race to create the queue only one seeds it.
+fn seed_disowned_ledger_from_pending(queue: &GroupCommitQueueRef, db_path: &Path) {
+    let Some(pending) = PENDING_DISOWNED_BY_PATH.get() else {
+        return;
+    };
+    let key = shared_file_state_key(db_path);
+    let drained = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    let Some(drained) = drained else {
+        return;
+    };
+    if drained.is_empty() {
+        return;
+    }
+    queue
+        .disowned_pages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(drained);
 }
 
 fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommitQueueRef {
@@ -6366,6 +6410,11 @@ fn group_commit_queue_for_identity(
         Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))
     });
     drop(queues);
+    // bd-ioq6x Face-2: re-seed the shared ledger from the pending pen keyed by
+    // this path (see `group_commit_queue_for_path`).
+    if bind_path {
+        seed_disowned_ledger_from_pending(&queue, db_path);
+    }
     queue.bind_finalization_identity(identity);
     if bind_path {
         queue.bind_finalization_path(db_path);
@@ -6660,6 +6709,29 @@ pub fn remove_group_commit_queue(db_path: &Path) {
             .get(&key)
             .is_some_and(|queue| Arc::strong_count(queue) == 1)
         {
+            // bd-ioq6x Face-2 (GH#346): this is the last-drop of the path-keyed
+            // queue (registry is its sole owner). Before dropping it — which
+            // would discard its shared disowned-page ledger — move any still-
+            // parked pages into the pending pen so the next open for this path
+            // re-seeds them and the on-open sweep reclaims them. Drains the
+            // ledger, so a subsequent `impl`-less drop cannot double-persist.
+            if let Some(queue) = queues.get(&key) {
+                let drained: HashSet<u32> = std::mem::take(
+                    &mut *queue
+                        .disowned_pages
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                if !drained.is_empty() {
+                    PENDING_DISOWNED_BY_PATH
+                        .get_or_init(|| Mutex::new(HashMap::new()))
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(key.clone())
+                        .or_default()
+                        .extend(drained);
+                }
+            }
             queues.remove(&key);
         }
     }
@@ -7223,6 +7295,151 @@ impl<F: VfsFile> Drop for PagerInner<F> {
     }
 }
 
+/// Cancellation guard for one disowned-page reconciliation attempt.
+///
+/// Reconciliation has to release `PagerInner` before awaiting the WAL backend:
+/// holding a synchronous mutex guard across those waits blocks unrelated pager
+/// progress and can deadlock with WAL paths that need the pager state. Once the
+/// abandonment pool is moved out of `PagerInner`, however, cancellation must
+/// not drop any unchecked, in-flight, retryable, or verified-frameless page.
+/// This guard synchronously restores all such pages to the pool unless
+/// [`Self::apply`] completes the final state transition. Pages proven to have a
+/// committed frame are deliberately discarded from the attempt and therefore
+/// are not restored.
+struct DisownedPageReclaimAttempt<F: VfsFile> {
+    inner: Arc<Mutex<PagerInner<F>>>,
+    pending: Vec<PageNumber>,
+    in_flight: Option<PageNumber>,
+    retained: Vec<PageNumber>,
+    reconciled: Vec<PageNumber>,
+    applied: bool,
+}
+
+impl<F: VfsFile> DisownedPageReclaimAttempt<F> {
+    fn new(inner: Arc<Mutex<PagerInner<F>>>, pending: Vec<PageNumber>) -> Self {
+        Self {
+            inner,
+            pending,
+            in_flight: None,
+            retained: Vec::new(),
+            reconciled: Vec::new(),
+            applied: false,
+        }
+    }
+
+    fn start_next(&mut self) -> Option<PageNumber> {
+        debug_assert!(self.in_flight.is_none());
+        let page = self.pending.pop()?;
+        self.in_flight = Some(page);
+        Some(page)
+    }
+
+    fn finish_retained(&mut self) {
+        self.retained.push(
+            self.in_flight
+                .take()
+                .expect("a retained reclaim page must be in flight"),
+        );
+    }
+
+    fn finish_reconciled(&mut self) {
+        self.reconciled.push(
+            self.in_flight
+                .take()
+                .expect("a reconciled reclaim page must be in flight"),
+        );
+    }
+
+    fn finish_framed(&mut self) {
+        self.in_flight
+            .take()
+            .expect("a framed reclaim page must be in flight");
+    }
+
+    fn take_restorable_pages(&mut self) -> Vec<PageNumber> {
+        let mut pages = std::mem::take(&mut self.pending);
+        if let Some(page) = self.in_flight.take() {
+            pages.push(page);
+        }
+        pages.append(&mut self.retained);
+        pages.append(&mut self.reconciled);
+        pages
+    }
+
+    fn restore_pages(inner: &mut PagerInner<F>, pages: Vec<PageNumber>) {
+        let mut present: HashSet<u32> = inner
+            .abandoned_eof_reservations
+            .iter()
+            .map(|page| page.get())
+            .collect();
+        inner
+            .abandoned_eof_reservations
+            .extend(pages.into_iter().filter(|page| present.insert(page.get())));
+    }
+
+    fn apply(mut self, promote_to_freelist: bool) -> Result<Vec<PageNumber>> {
+        debug_assert!(self.pending.is_empty());
+        debug_assert!(self.in_flight.is_none());
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+        if inner.journal_mode != JournalMode::Wal || inner.db_size < 2 {
+            let restorable = self.take_restorable_pages();
+            Self::restore_pages(&mut inner, restorable);
+            self.applied = true;
+            return Ok(Vec::new());
+        }
+
+        // Revalidate the extent after releasing the WAL lock. The callers hold
+        // transaction/maintenance fences, so shrinkage is not expected, but a
+        // page above the current local extent is not eligible for freelist
+        // publication even if it was in range when the attempt started.
+        let current_db_size = inner.db_size;
+        let mut promoted = Vec::with_capacity(self.reconciled.len());
+        for page in std::mem::take(&mut self.reconciled) {
+            if page.get() <= current_db_size {
+                promoted.push(page);
+            } else {
+                self.retained.push(page);
+            }
+        }
+        let restorable = self.take_restorable_pages();
+        Self::restore_pages(&mut inner, restorable);
+        if !promoted.is_empty() && promote_to_freelist {
+            if std::env::var_os("IOQ6X_TRACE").is_some() {
+                eprintln!(
+                    "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
+                    promoted.len(),
+                    inner.abandoned_eof_reservations.len(),
+                );
+            }
+            return_pages_to_freelist(&mut inner.freelist, promoted.iter().copied());
+        }
+        self.applied = true;
+        drop(inner);
+        Ok(promoted)
+    }
+}
+
+impl<F: VfsFile> Drop for DisownedPageReclaimAttempt<F> {
+    fn drop(&mut self) {
+        if self.applied {
+            return;
+        }
+        let pages = self.take_restorable_pages();
+        if pages.is_empty() {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::restore_pages(&mut inner, pages);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommittedStateRefresh {
     wal_snapshot_initialized: bool,
@@ -7285,6 +7502,7 @@ impl PendingGroupCommitAllocatorDelta {
         live_committed_allocations: Vec<PageNumber>,
         returned_allocations: &PendingReturnedAllocations,
         pending_freed_pages: &[PageNumber],
+        reclaimed_abandoned_reservations: &[PageNumber],
     ) -> Self {
         let mut delta = Self {
             live_committed_allocations,
@@ -7292,6 +7510,7 @@ impl PendingGroupCommitAllocatorDelta {
                 .all_pages()
                 .into_iter()
                 .chain(pending_freed_pages.iter().copied())
+                .chain(reclaimed_abandoned_reservations.iter().copied())
                 .collect(),
         };
         delta.normalize();
@@ -7376,6 +7595,7 @@ impl PhaseAWriteSetUndo {
 struct PendingGroupCommitNotCommittedState {
     returned_allocations: PendingReturnedAllocations,
     pending_freed_pages: Vec<PageNumber>,
+    reclaimed_abandoned_reservations: Vec<PageNumber>,
 }
 
 struct PendingGroupCommitTxnAttemptState {
@@ -7384,6 +7604,7 @@ struct PendingGroupCommitTxnAttemptState {
     resolution: PendingGroupCommitTxnResolution,
     returned_allocations: Option<PendingReturnedAllocations>,
     pending_freed_pages: Vec<PageNumber>,
+    reclaimed_abandoned_reservations: Vec<PageNumber>,
     publication_intent: Option<ParallelWalPublicationIntent>,
     publication_applied: bool,
     transaction_exit_complete: bool,
@@ -7426,12 +7647,14 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
         staged_page_high_water: u32,
         returned_allocations: PendingReturnedAllocations,
         pending_freed_pages: Vec<PageNumber>,
+        reclaimed_abandoned_reservations: Vec<PageNumber>,
         live_committed_allocations: Vec<PageNumber>,
     ) -> Self {
         let allocator_delta = PendingGroupCommitAllocatorDelta::new(
             live_committed_allocations,
             &returned_allocations,
             &pending_freed_pages,
+            &reclaimed_abandoned_reservations,
         );
         Self {
             queue: Arc::downgrade(queue),
@@ -7453,6 +7676,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
                 resolution: PendingGroupCommitTxnResolution::Pending,
                 returned_allocations: Some(returned_allocations),
                 pending_freed_pages,
+                reclaimed_abandoned_reservations,
                 publication_intent: None,
                 publication_applied: false,
                 transaction_exit_complete: false,
@@ -7605,6 +7829,9 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
                 )
             })?,
             pending_freed_pages: std::mem::take(&mut state.pending_freed_pages),
+            reclaimed_abandoned_reservations: std::mem::take(
+                &mut state.reclaimed_abandoned_reservations,
+            ),
         })
     }
 
@@ -7768,6 +7995,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
             inner.freelist = committed_freelist;
         }
         state.pending_freed_pages.clear();
+        state.reclaimed_abandoned_reservations.clear();
         inner.db_size = publication_intent.db_size;
         let next_unallocated_page = if inner.db_size >= 2 {
             inner.db_size.saturating_add(1)
@@ -7987,6 +8215,10 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                         return_pages_to_freelist(
                             &mut inner.freelist,
                             not_committed.returned_allocations.page_lease,
+                        );
+                        DisownedPageReclaimAttempt::<F>::restore_pages(
+                            &mut inner,
+                            not_committed.reclaimed_abandoned_reservations,
                         );
                         drop(not_committed.pending_freed_pages);
                         self.allocation_cleanup_applied = true;
@@ -8993,10 +9225,7 @@ fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) 
 /// abandonment pool — the parked EOF holes are handed to a surviving connection
 /// instead of being silently discarded. Sync-mutex only, so it is safe to call
 /// from a `Drop` impl.
-fn disown_pages(
-    ledger: &Mutex<HashSet<u32>>,
-    pages: impl IntoIterator<Item = PageNumber>,
-) {
+fn disown_pages(ledger: &Mutex<HashSet<u32>>, pages: impl IntoIterator<Item = PageNumber>) {
     let mut guard = ledger
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9093,6 +9322,40 @@ fn race_amplify_window_us() -> Option<u64> {
     })
 }
 
+/// bd-9inpb allocator-race hunt: env-gated RECLAMATION-COUNT amplifier
+/// (`FSQLITE_IOQ6X_RECLAIM_AMPLIFY`). When set, `adopt_in_range_disowned_pages`
+/// re-shares the in-range pages it just took back onto the shared ledger, so a
+/// concurrent peer's fold re-adopts the SAME pages. This deliberately breaks the
+/// "each disowned page is adopted by exactly one connection" invariant,
+/// recreating the reverted mirror cycle (adopt+re-share ~1000x/run) that cranks
+/// the number of cross-connection reclamation attempts on the same physical
+/// pages — the knob that surfaces the resurrection/double-grant face (one page
+/// granted to two b-trees: "2nd reference to page N" / "cell extends past usable
+/// page size"), as opposed to the window amplifier which surfaces the erasure
+/// face. `false` → inert (default). Diagnostic ONLY — never enable in prod/CI.
+fn reclaim_amplify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_RECLAIM_AMPLIFY").is_some())
+}
+
+/// bd-9inpb allocator-race hunt: env-gated relaxation of the sole-current-snapshot
+/// committed-freelist reuse gate (`FSQLITE_IOQ6X_SNAPSHOT_AMPLIFY`). The gated
+/// reuse arms require BOTH `active_transactions == 1` AND a CURRENT snapshot
+/// (`published_visible_commit_seq == commit_seq`); under high concurrency a peer
+/// commit makes the snapshot stale, closing the gate and structurally starving the
+/// cross-connection double-consumption race (two connections popping the same
+/// durable-free page). When set, this drops ONLY the snapshot-currency half of the
+/// gate (still requires `active_transactions == 1`), so stale-snapshot connections
+/// also reuse committed-free pages — maximal stress on the append-gate
+/// double-consumption guard (`resurrected_or_erased_freelist_pages`) that is meant
+/// to catch exactly this. If the guard is sound the run just churns BusySnapshot
+/// retries; if it has the cur=true window hole, a double-grant results. `false` →
+/// inert (default). Diagnostic ONLY — never enable in prod/CI.
+fn snapshot_gate_amplify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_SNAPSHOT_AMPLIFY").is_some())
+}
+
 fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling: u32) -> usize {
     if ioq6x_ledger_disabled() || inner.journal_mode != JournalMode::Wal {
         return 0;
@@ -9106,6 +9369,42 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
     let adopted = take_in_range_disowned_pages(&ledger, ceiling);
     if adopted.is_empty() {
         return 0;
+    }
+    // bd-9inpb reclamation-count amplifier (diagnostic, env-gated, default OFF).
+    // Re-share the just-taken in-range pages back onto the shared ledger so a
+    // concurrent peer's fold re-adopts the SAME pages: this recreates the
+    // reverted ~1000x mirror cycle and the multi-connection double-adopt that
+    // cranks reclamation attempts and surfaces the cross-connection double-grant.
+    // NEVER enable in prod/CI.
+    if reclaim_amplify_enabled() {
+        // Bounded to at most K re-shares PER PAGE (process-global counter) so the
+        // ledger eventually drains and the run terminates — an unbounded re-share
+        // livelocks (each reclaimed page is re-adopted forever, O(n^2) pool
+        // growth). K extra concurrent reclamations per page is enough to surface
+        // the cross-connection double-grant without the cycle.
+        const RECLAIM_AMPLIFY_K: u8 = 16;
+        static AMPLIFY_COUNT: OnceLock<Mutex<std::collections::HashMap<u32, u8>>> = OnceLock::new();
+        let counts = AMPLIFY_COUNT.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut cguard = counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut re_shared = 0_usize;
+        for page in &adopted {
+            let count = cguard.entry(page.get()).or_insert(0);
+            if *count < RECLAIM_AMPLIFY_K {
+                *count += 1;
+                guard.insert(page.get());
+                re_shared += 1;
+            }
+        }
+        drop(guard);
+        drop(cguard);
+        if re_shared > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+            eprintln!("IOQ6X RECLAIM-AMPLIFY re_shared={re_shared}");
+        }
     }
     // Dedup against the current pool: two connections can disown the same
     // aborted EOF page (both optimistically grew to it, both rolled back), so a
@@ -16901,6 +17200,15 @@ where
         if finish_namespace_bootstrap {
             pager.finish_namespace_bootstrap()?;
         }
+        // bd-ioq6x Face-2 (GH#346): reclaim any in-range EOF holes a prior
+        // drop-all parked in the shared per-file disowned-page ledger before
+        // this connection serves a read. Read-write FILE opens only:
+        // :memory:/private-VFS opens use a fresh, connection-local ledger that
+        // is always empty here. Fully best-effort — it never fails the open and
+        // never drops a ledger entry (see `sweep_disowned_ledger_on_open`).
+        if !pager.vfs.is_memory() {
+            let _ = pager.sweep_disowned_ledger_on_open(cx).await;
+        }
         Ok(pager)
     }
 
@@ -17477,12 +17785,13 @@ where
                 });
             }
 
-            let records_offset = section_header_offset
-                .checked_add(hdr_padded)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "rollback-journal section records offset".to_owned(),
-                    value: section_header_offset.to_string(),
-                })?;
+            let records_offset =
+                section_header_offset
+                    .checked_add(hdr_padded)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback-journal section records offset".to_owned(),
+                        value: section_header_offset.to_string(),
+                    })?;
             if records_offset > jrnl_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -17560,13 +17869,12 @@ where
                 });
             }
 
-            let next_header_offset = records_end
-                .checked_add(hdr_padded - 1)
-                .ok_or_else(|| FrankenError::OutOfRange {
+            let next_header_offset = records_end.checked_add(hdr_padded - 1).ok_or_else(|| {
+                FrankenError::OutOfRange {
                     what: "rollback-journal next section alignment".to_owned(),
                     value: records_end.to_string(),
-                })?
-                / hdr_padded
+                }
+            })? / hdr_padded
                 * hdr_padded;
             if next_header_offset > jrnl_size {
                 tracing::warn!(
@@ -17576,25 +17884,12 @@ where
                 );
                 return Err(FrankenError::Unsupported);
             }
-            if next_header_offset > records_end {
-                let padding_len = usize::try_from(next_header_offset - records_end).map_err(|_| {
-                    FrankenError::OutOfRange {
-                        what: "rollback-journal inter-section padding".to_owned(),
-                        value: (next_header_offset - records_end).to_string(),
-                    }
-                })?;
-                let mut padding = vec![0_u8; padding_len];
-                let padding_read = jrnl_file.read(cx, &mut padding, records_end).await?;
-                if padding_read != padding_len || padding.iter().any(|&byte| byte != 0) {
-                    tracing::warn!(
-                        journal = %journal_path.display(),
-                        "refusing unsupported external rollback journal with nonzero inter-section padding"
-                    );
-                    return Err(FrankenError::Unsupported);
-                }
-                if next_header_offset == jrnl_size {
-                    break;
-                }
+            // Stock playback advances directly to the next sector boundary.
+            // In persistent-journal mode the skipped gap may retain bytes from
+            // an older transaction, so its contents are not part of the hot
+            // journal's authenticated recovery surface.
+            if next_header_offset == jrnl_size {
+                break;
             }
 
             if jrnl_size - next_header_offset < header_size {
@@ -17671,11 +17966,11 @@ where
                         detail: format!("invalid rollback-journal record: {err}"),
                     }
                 })?;
-                record
-                    .verify_checksum(section.nonce)
-                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                record.verify_checksum(section.nonce).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
                         detail: format!("rollback-journal checksum mismatch: {err}"),
-                    })?;
+                    }
+                })?;
                 let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -17706,12 +18001,13 @@ where
                         ),
                     });
                 }
-                validation_offset = validation_offset
-                    .checked_add(record_size_u64)
-                    .ok_or_else(|| FrankenError::OutOfRange {
-                        what: "rollback-journal validation offset".to_owned(),
-                        value: validation_offset.to_string(),
-                    })?;
+                validation_offset =
+                    validation_offset
+                        .checked_add(record_size_u64)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "rollback-journal validation offset".to_owned(),
+                            value: validation_offset.to_string(),
+                        })?;
             }
         }
 
@@ -17736,11 +18032,11 @@ where
                 })?;
 
                 // Verify checksum before applying.
-                record
-                    .verify_checksum(section.nonce)
-                    .map_err(|err| FrankenError::DatabaseCorrupt {
+                record.verify_checksum(section.nonce).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
                         detail: format!("rollback-journal checksum mismatch: {err}"),
-                    })?;
+                    }
+                })?;
 
                 // Write the pre-image back to the database file.
                 let Some(page_no) = PageNumber::new(record.page_number) else {
@@ -18655,6 +18951,7 @@ where
             || !self.allocated_from_freelist.is_empty()
             || !self.allocated_from_eof.is_empty()
             || !self.page_lease.is_empty()
+            || !self.reclaimed_abandoned_reservations.is_empty()
             || !self.retained_memory_overlay_dirty_pages.is_empty()
     }
 
@@ -20999,9 +21296,7 @@ where
                         // is never used", GH#346). Fall back to the current
                         // durable header only when the group carries no
                         // publication of its own (bd-dw8oe cross-group case).
-                        if let Some(header) =
-                            group_publication_page_one_freelist_header(&batches)
-                        {
+                        if let Some(header) = group_publication_page_one_freelist_header(&batches) {
                             let head = u32::from_be_bytes(
                                 header[0..4].try_into().expect("in-group head slice"),
                             );
@@ -22439,6 +22734,8 @@ where
         self.page_lease
             .extend(not_committed.returned_allocations.page_lease);
         self.restore_pending_freed_pages(not_committed.pending_freed_pages);
+        self.reclaimed_abandoned_reservations
+            .extend(not_committed.reclaimed_abandoned_reservations);
         attempt.restore_phase_a_write_set(&mut self.write_set, &mut self.write_pages_sorted);
         attempt.finish_terminal(false)?;
         self.pending_group_commit_attempt.take();
@@ -23142,7 +23439,8 @@ where
                     // commit through WAL first-committer-wins conflict
                     // detection, exactly as for EOF growth.
                     let sole_current_snapshot = inner.active_transactions == 1
-                        && self.published_visible_commit_seq.get() == inner.commit_seq;
+                        && (snapshot_gate_amplify_enabled()
+                            || self.published_visible_commit_seq.get() == inner.commit_seq);
                     if sole_current_snapshot
                         && let Some(idx) = inner
                             .freelist
@@ -23736,6 +24034,7 @@ where
                         staged_page_high_water,
                         std::mem::take(&mut returned_allocations),
                         std::mem::take(&mut pending_freed),
+                        std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
                     ));
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
@@ -24552,6 +24851,7 @@ where
                         staged_page_high_water,
                         std::mem::take(&mut returned_allocations),
                         std::mem::take(&mut pending_freed),
+                        std::mem::take(&mut self.reclaimed_abandoned_reservations),
                         live_committed_allocations,
                     ));
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
@@ -25002,6 +25302,7 @@ where
             || self.owned_rollback_recovery.is_some()
             || self.rollback_commit_finalization_pending
             || !self.write_set.is_empty()
+            || !self.reclaimed_abandoned_reservations.is_empty()
             || self.freelist_metadata_dirty()
     }
 
@@ -25632,6 +25933,14 @@ where
                 error.into_inner()
             }
         };
+        // A dropped commit future may not have reached the point where its
+        // group-commit attempt owns these reconciled holes. Keep them in the
+        // cancellation-safe abandonment pool until a later commit can prove
+        // and publish them again.
+        DisownedPageReclaimAttempt::<V::File>::restore_pages(
+            &mut inner,
+            std::mem::take(&mut self.reclaimed_abandoned_reservations),
+        );
         let recovery_was_pending = self.is_writer
             && self.journal_mode != JournalMode::Wal
             && inner.rollback_journal_recovery_state.is_pending();
@@ -26125,6 +26434,178 @@ where
         }
     }
 
+    /// bd-ioq6x Face-2 (GH#346): reconcile the IN-RANGE disowned/abandoned EOF
+    /// holes into `inner.freelist` through the SAME no-committed-frame guard the
+    /// commit-fold (~L23663) and the checkpoint-fold trust, and return the
+    /// pages it promoted.
+    ///
+    /// Adopts the in-range (`<= db_size`) entries the shared ledger holds into
+    /// this connection's abandonment pool, then — under the WAL backend WRITE
+    /// lock (a stable appended tail) and against the refreshed publication
+    /// horizon — promotes every pool page `<= db_size` that carries NO committed
+    /// WAL frame (a provable hole). Checkpoint callers promote those pages
+    /// directly into `inner.freelist`; the on-open caller transfers them to a
+    /// writer transaction so its normal freelist delta is serialized durably.
+    /// A page WITH a frame is a committed peer's live page (a two-growers
+    /// loser's stale number) and is dropped from the pool permanently; an
+    /// above-extent page is reissuable-from-EOF and stays in the pool.
+    ///
+    /// The pager mutex is held only for the initial pool drain and final state
+    /// application, never across a WAL await. [`DisownedPageReclaimAttempt`]
+    /// restores every page that has not been proven live if the future is
+    /// cancelled or a transient WAL operation fails. In particular, a failed
+    /// publication refresh leaves the whole attempt pending: a stale backend
+    /// view cannot prove that an apparently frameless page is free. Only
+    /// meaningful in WAL mode with `db_size >= 2`. This factors the former
+    /// inline checkpoint-fold so the on-open sweep reuses the identical guard.
+    async fn reclaim_disowned_in_range(
+        &self,
+        wal: &WalBackendHandle,
+        cx: &Cx,
+        promote_to_freelist: bool,
+    ) -> Result<Vec<PageNumber>> {
+        let (db_size, pending) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            // bd-ioq6x Face-2: adopt the in-range pages disowned by dropped
+            // connections into this connection's pool before reconciling.
+            let ceiling = inner.db_size;
+            adopt_in_range_disowned_pages(&mut inner, ceiling);
+            if inner.journal_mode != JournalMode::Wal
+                || inner.db_size < 2
+                || inner.abandoned_eof_reservations.is_empty()
+            {
+                return Ok(Vec::new());
+            }
+            (
+                inner.db_size,
+                std::mem::take(&mut inner.abandoned_eof_reservations),
+            )
+        };
+        // Declare the cancellation restorer before the WAL guard so Rust drops
+        // the WAL lock first and only then re-locks PagerInner during unwind.
+        let mut attempt = DisownedPageReclaimAttempt::new(Arc::clone(&self.inner), pending);
+
+        // Best-effort under whatever fence the caller holds: on a transient
+        // WAL-lock error, `attempt` restores the drained pool.
+        let Ok(mut wal_guard) = async_rwlock_write(wal, cx, "WAL backend").await else {
+            return Ok(Vec::new());
+        };
+        let wal_ref = wal_guard.as_mut();
+        // A connection-local backend view can lag peers' commits; the
+        // no-committed-frame test is only meaningful against the refreshed
+        // publication horizon (bd-vnxjd/bd-dw8oe).
+        if wal_ref.refresh_published_snapshot(cx).await.is_err() {
+            return Ok(Vec::new());
+        }
+        while let Some(page) = attempt.start_next() {
+            if page.get() > db_size {
+                // Above the durable extent: reissuable from EOF.
+                attempt.finish_retained();
+                continue;
+            }
+            match wal_ref.read_page_at_appended_tail(cx, page.get()).await {
+                Ok(None) => attempt.finish_reconciled(),
+                Ok(Some(_)) => attempt.finish_framed(),
+                Err(_) => attempt.finish_retained(),
+            }
+        }
+        drop(wal_guard);
+        attempt.apply(promote_to_freelist)
+    }
+
+    /// bd-ioq6x Face-2 (GH#346): on-open reclamation sweep for the shared
+    /// per-file disowned-page ledger.
+    ///
+    /// When a connection dropped in-range EOF holes into the shared ledger and
+    /// no surviving connection ever folded again, those pages orphaned ("page N
+    /// is never used"). On a read-write open, if the ledger (re-seeded across a
+    /// full drop-all by `PENDING_DISOWNED_BY_PATH`) still holds in-range pages,
+    /// reclaim them BEFORE this connection serves a read: reconcile the provable
+    /// frameless holes through the shared no-committed-frame guard
+    /// ([`Self::reclaim_disowned_in_range`]) and drive a minimal writer commit
+    /// so the freed pages are published durably. Doing the reconcile AFTER
+    /// `begin`'s committed-state refresh keeps the reconciled entries out of the
+    /// refresh's freelist->pool re-park path, and makes the commit observe a
+    /// dirty freelist to serialize.
+    ///
+    /// Entirely best-effort — never fails the open and never drops a ledger
+    /// entry: a `begin` failure never touched the ledger, and a commit failure
+    /// returns the reconciled pages to the cancellation-safe abandonment pool
+    /// so a later fold/open reclaims them (the no-committed-frame guard keeps a
+    /// later re-reclamation safe even if one became live meanwhile). No-op
+    /// under the kill-switch, on read-only opens, in non-WAL mode, or when the
+    /// ledger is empty.
+    async fn sweep_disowned_ledger_on_open(&self, cx: &Cx) -> Result<()> {
+        if ioq6x_ledger_disabled() {
+            return Ok(());
+        }
+        // Fast gate + non-empty peek under the inner lock WITHOUT draining the
+        // ledger. The overwhelming common case (empty ledger) returns here.
+        {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.access_mode.is_readonly()
+                || inner.journal_mode != JournalMode::Wal
+                || inner.db_size < 2
+            {
+                return Ok(());
+            }
+            let Some(ledger) = inner.disowned_page_ledger.as_ref() else {
+                return Ok(());
+            };
+            if ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Ok(());
+            }
+        }
+        // Drive a minimal writer commit through the normal commit path. A
+        // begin() failure never touched the ledger; return Ok and leave it for
+        // a later open.
+        let Ok(mut txn) = self.begin(cx, TransactionMode::Immediate).await else {
+            return Ok(());
+        };
+        let Ok(wal) = wal_backend_handle(&self.wal_backend) else {
+            // begin did not install a WAL backend (e.g. the DB left WAL mode):
+            // nothing to reconcile against the appended tail.
+            let _ = txn.rollback(cx).await;
+            return Ok(());
+        };
+        // Classify the in-range holes AFTER begin's refresh (see the doc
+        // comment), collecting the pages for transaction-owned publication.
+        // Reclaim is best-effort and does not drop entries (adopted pages sit
+        // in the pool for a later fold / drop->ledger).
+        let reconciled = self
+            .reclaim_disowned_in_range(&wal, cx, false)
+            .await
+            .unwrap_or_default();
+        if reconciled.is_empty() {
+            // Nothing reclaimable now (framed peers dropped, above-extent held
+            // in the ledger): do not fabricate a durable write.
+            let _ = txn.rollback(cx).await;
+            return Ok(());
+        }
+        // Transfer the proven holes into the transaction's existing
+        // abandonment-reclaim channel. Its normal WAL Phase A revalidates each
+        // page at the appended tail and stages the actual freelist delta, so
+        // page 1 is serialized instead of the commit becoming a clean no-op.
+        // The transaction carries this ownership through Pending/Authorized/
+        // NotCommitted group-commit states; rollback, cancellation, and
+        // detached cleanup restore only a proven NotCommitted attempt.
+        txn.reclaimed_abandoned_reservations.extend(reconciled);
+        if txn.commit(cx).await.is_err() {
+            let _ = txn.rollback(cx).await;
+        }
+        Ok(())
+    }
+
     /// Run a WAL checkpoint to transfer frames from the WAL to the database.
     ///
     /// This is the main checkpoint entry point for WAL mode. It:
@@ -26352,65 +26833,22 @@ where
         // released before the checkpoint re-acquires it. This never touches the
         // durable page-1 directly (unlike the reverted zeroed-page content-fold
         // fe99bf9b9) — it rides the existing pool + commit-fold machinery only.
-        {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            // bd-ioq6x Face-2: adopt the in-range pages disowned by dropped
-            // connections BEFORE this checkpoint reconciles the pool. Under the
-            // exclusive maintenance fence (active_transactions == 0) they are
-            // reconciled by the same no-committed-frame promotion below; the
-            // guard then preserves any above-extent remainder in the shared
-            // ledger across the WAL-generation boundary (rather than discarding
-            // it, the residual Face-2 leak).
-            let ckpt_ceiling = inner.db_size;
-            adopt_in_range_disowned_pages(&mut inner, ckpt_ceiling);
-            if inner.journal_mode == JournalMode::Wal
-                && inner.db_size >= 2
-                && !inner.abandoned_eof_reservations.is_empty()
-            {
-                let db_size = inner.db_size;
-                // Best-effort under the checkpoint fence: on a transient
-                // WAL-lock or refresh error, leave the pool untouched for the
-                // guard to handle rather than failing the checkpoint or dropping
-                // entries (mirrors the reverted fold's best-effort intent, but
-                // via the pool + commit-fold machinery instead of a direct
-                // page-1 write).
-                if let Ok(mut wal_guard) = async_rwlock_write(&wal, cx, "WAL backend").await {
-                    let wal_ref = wal_guard.as_mut();
-                    // A connection-local backend view can lag peers' commits;
-                    // the no-committed-frame test is only meaningful against the
-                    // refreshed publication horizon (bd-vnxjd/bd-dw8oe).
-                    let _ = wal_ref.refresh_published_snapshot(cx).await;
-                    let pool = std::mem::take(&mut inner.abandoned_eof_reservations);
-                    let mut reconciled: Vec<PageNumber> = Vec::new();
-                    for page in pool {
-                        if page.get() > db_size {
-                            // Above the durable extent: reissuable from EOF.
-                            inner.abandoned_eof_reservations.push(page);
-                            continue;
-                        }
-                        match wal_ref.read_page_at_appended_tail(cx, page.get()).await {
-                            Ok(None) => reconciled.push(page),
-                            Ok(Some(_)) => { /* framed peer page: drop permanently */ }
-                            Err(_) => inner.abandoned_eof_reservations.push(page),
-                        }
-                    }
-                    drop(wal_guard);
-                    if !reconciled.is_empty() {
-                        if std::env::var_os("IOQ6X_TRACE").is_some() {
-                            eprintln!(
-                                "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
-                                reconciled.len(),
-                                inner.abandoned_eof_reservations.len(),
-                            );
-                        }
-                        return_pages_to_freelist(&mut inner.freelist, reconciled);
-                    }
-                }
-            }
-        }
+        // bd-ioq6x Face-2: adopt the in-range pages disowned by dropped
+        // connections and reconcile the provable frameless holes into the
+        // freelist through the shared reclaim path (identical
+        // no-committed-frame guard) BEFORE this checkpoint reconciles the pool.
+        // Under the exclusive maintenance fence (active_transactions == 0) and
+        // the WAL backend WRITE lock, an entry `<= db_size` with NO committed
+        // frame is a provable hole promoted into `inner.freelist`; the next
+        // commit's serialize_freelist_to_write_set publishes it durably. The
+        // CheckpointGuard::drop -> preserve_above_extent_at_generation_boundary
+        // then keeps any above-extent remainder in the shared ledger across the
+        // WAL-generation boundary (rather than discarding it, the residual
+        // Face-2 leak). The helper acquires PagerInner only before and after WAL
+        // I/O, never across an await. This never touches durable page-1 directly
+        // (unlike the reverted zeroed-page content-fold fe99bf9b9) — it rides
+        // the existing pool + commit-fold machinery only.
+        let _ = self.reclaim_disowned_in_range(&wal, cx, true).await?;
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
@@ -26641,6 +27079,7 @@ mod tests {
         let page_four = PageNumber::new(4).unwrap();
         let page_five = PageNumber::new(5).unwrap();
         let page_six = PageNumber::new(6).unwrap();
+        let page_seven = PageNumber::new(7).unwrap();
         let returned = PendingReturnedAllocations {
             from_freelist: vec![page_four, page_five],
             from_eof: vec![page_six],
@@ -26650,12 +27089,13 @@ mod tests {
             vec![page_five, page_five],
             &returned,
             &[page_three, page_five],
+            &[page_seven],
         );
 
         assert_eq!(delta.live_committed_allocations, vec![page_five]);
         assert_eq!(
             delta.returned_or_freed_pages,
-            vec![page_three, page_four, page_six],
+            vec![page_three, page_four, page_six, page_seven],
             "a page committed by any group member must not be returned by another member"
         );
 
@@ -26663,11 +27103,14 @@ mod tests {
         delta.apply_to_freelist(&mut freelist);
         assert_eq!(
             freelist,
-            vec![page_six, page_four, page_three],
+            vec![page_six, page_four, page_three, page_seven],
             "allocator reconciliation must be idempotent and keep committed pages live"
         );
         delta.apply_to_freelist(&mut freelist);
-        assert_eq!(freelist, vec![page_six, page_four, page_three]);
+        assert_eq!(
+            freelist,
+            vec![page_six, page_four, page_three, page_seven]
+        );
     }
 
     #[test]
@@ -26754,6 +27197,7 @@ mod tests {
                 staged_page_high_water,
                 PendingReturnedAllocations::default(),
                 Vec::new(),
+                Vec::new(),
                 vec![owned_page],
             ));
             txn.pending_group_commit_attempt = Some(attempt);
@@ -26826,6 +27270,7 @@ mod tests {
                 PendingReturnedAllocations::default(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ));
             let authorization = publication_authorization_for_test(false);
             let epoch = authorization
@@ -26867,6 +27312,97 @@ mod tests {
     }
 
     #[test]
+    fn not_committed_group_attempt_restores_reclaimed_abandonment_ownership() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
+                &txn.group_commit_queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                txn.snapshot_db_size(),
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                vec![page],
+                Vec::new(),
+            ));
+            txn.pending_group_commit_attempt = Some(attempt);
+
+            txn.restore_not_committed_wal_attempt().unwrap();
+            assert_eq!(txn.reclaimed_abandoned_reservations, vec![page]);
+            txn.rollback(&cx).await.unwrap();
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "a NotCommitted verdict must return reclaimed hole ownership to the abandonment pool"
+            );
+            assert!(
+                !inner.freelist.contains(&page),
+                "a rejected publication cannot expose the reclaimed page as durably free"
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_pending_group_attempt_restores_reclaimed_abandonment_ownership() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+            let queue = Arc::clone(&txn.group_commit_queue);
+            txn.pending_group_commit_attempt = Some(Arc::new(PendingGroupCommitTxnAttempt::new(
+                &queue,
+                Arc::clone(&txn.inner),
+                Arc::clone(&txn.db_file),
+                Arc::clone(&txn.committed_snapshot),
+                Arc::clone(&txn.published),
+                Arc::clone(&txn.writer_idle),
+                txn.cleanup_cx.clone(),
+                txn.original_db_size,
+                txn.mode,
+                txn.is_writer,
+                txn.snapshot_db_size(),
+                PendingReturnedAllocations::default(),
+                Vec::new(),
+                vec![page],
+                Vec::new(),
+            )));
+
+            drop(txn);
+            settle_pending_group_commit_finalization(&queue)
+                .await
+                .unwrap();
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "detached NotCommitted cleanup must preserve reclaimed hole ownership"
+            );
+            assert!(
+                !inner.freelist.contains(&page),
+                "detached cleanup cannot turn a rejected reclaim commit into a volatile free page"
+            );
+        });
+    }
+
+    #[test]
     fn rollback_after_authorized_group_commit_reports_commit_and_keeps_page_live() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = wal_pager().await;
@@ -26896,6 +27432,7 @@ mod tests {
                 txn.is_writer,
                 txn.snapshot_db_size(),
                 PendingReturnedAllocations::default(),
+                Vec::new(),
                 Vec::new(),
                 vec![committed_page],
             ));
@@ -26961,6 +27498,7 @@ mod tests {
                 txn.is_writer,
                 txn.snapshot_db_size(),
                 PendingReturnedAllocations::default(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             ));
@@ -32948,7 +33486,7 @@ mod tests {
             journal
                 .write(
                     &cx,
-                    &vec![0_u8; (second_header_offset - first_section_end) as usize],
+                    &vec![0xA5_u8; (second_header_offset - first_section_end) as usize],
                     first_section_end,
                 )
                 .await
@@ -33080,7 +33618,7 @@ mod tests {
                 .unwrap();
             journal.close(&cx).unwrap();
 
-            let error = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            let Err(error) = SimplePager::open_existing_with_cx_and_page_buffer_max(
                 &cx,
                 vfs.clone(),
                 &path,
@@ -33089,7 +33627,9 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("duplicate record in a later section must fail recovery");
+            else {
+                panic!("duplicate record in a later section must fail recovery");
+            };
             assert!(
                 matches!(
                     error,
@@ -34491,6 +35031,30 @@ mod tests {
 
     struct FailingCheckpointWalBackend;
 
+    #[derive(Clone, Copy)]
+    enum DisownedReclaimProbeMode {
+        FailRefresh,
+        PendPageRead,
+    }
+
+    struct DisownedReclaimProbeWalBackend {
+        mode: DisownedReclaimProbeMode,
+        page_read_entered: Arc<AtomicBool>,
+    }
+
+    impl DisownedReclaimProbeWalBackend {
+        fn new(mode: DisownedReclaimProbeMode) -> (Self, Arc<AtomicBool>) {
+            let page_read_entered = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    mode,
+                    page_read_entered: Arc::clone(&page_read_entered),
+                },
+                page_read_entered,
+            )
+        }
+    }
+
     struct PreparedBatchObservedWalBackend {
         frames: SharedFrames,
         append_frames_calls: SharedCounter,
@@ -35778,6 +36342,77 @@ mod tests {
                     wal_was_reset: false,
                     requested_mode: _mode,
                     effective_mode: _mode,
+                })
+            })
+        }
+    }
+
+    impl crate::traits::WalBackend for DisownedReclaimProbeWalBackend {
+        fn refresh_published_snapshot<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> WalFuture<'a, Option<traits::WalPublicationSnapshot>> {
+            Box::pin(async move {
+                match self.mode {
+                    DisownedReclaimProbeMode::FailRefresh => Err(FrankenError::internal(
+                        "forced disowned-page publication refresh failure",
+                    )),
+                    DisownedReclaimProbeMode::PendPageRead => Ok(None),
+                }
+            })
+        }
+
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+            _page_data: &'a [u8],
+            _db_size_if_commit: u32,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            match self.mode {
+                DisownedReclaimProbeMode::FailRefresh => Box::pin(async { Ok(None) }),
+                DisownedReclaimProbeMode::PendPageRead => {
+                    let page_read_entered = Arc::clone(&self.page_read_entered);
+                    Box::pin(std::future::poll_fn(move |_| {
+                        page_read_entered.store(true, AtomicOrdering::Release);
+                        std::task::Poll::Pending
+                    }))
+                }
+            }
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            0
+        }
+
+        fn checkpoint<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            mode: traits::CheckpointMode,
+            _writer: &'a mut dyn traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> WalFuture<'a, traits::CheckpointResult> {
+            Box::pin(async move {
+                Ok(traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
                 })
             })
         }
@@ -41264,6 +41899,317 @@ mod tests {
                 held,
                 vec![80, 90],
                 "above-extent holes survive the checkpoint boundary in the shared ledger; in-range holes are dropped"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_face2_reopen_after_drop_all_reclaims_disowned_ledger() {
+        // bd-ioq6x Face-2 (GH#346), the residual orphan face: when the LAST
+        // connection drops with in-range EOF holes still parked in the shared
+        // disowned-page ledger, nothing folds again and the pages orphan. The
+        // fix has two halves:
+        //   * Part C: `remove_group_commit_queue` persists a still-populated
+        //     ledger into `PENDING_DISOWNED_BY_PATH` before the queue is torn
+        //     down, and the next queue created for the path re-seeds its fresh
+        //     ledger from that pen — so the pages survive a full drop-all.
+        //   * Part B: the on-open sweep reconciles the re-seeded in-range holes
+        //     into the freelist through the same no-committed-frame guard the
+        //     commit/checkpoint folds use.
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let path = PathBuf::from("/ioq6x_face2_reopen_after_drop_all.db");
+
+            // Part C — drop-all persist + reopen re-seed round-trip. Seed the
+            // ledger through a clone of its inner Arc so the queue Arc itself is
+            // the registry's sole owner (`strong_count == 1`) when the last
+            // connection closes and `remove_group_commit_queue` runs.
+            {
+                let q1 = group_commit_queue_for_path(&path);
+                let ledger1 = q1.disowned_pages.clone();
+                disown_pages(&ledger1, [PageNumber::new(57).unwrap()]);
+                drop(q1);
+                remove_group_commit_queue(&path);
+                assert!(
+                    ledger1
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty(),
+                    "the full drop-all drains the shared ledger into the pending holding pen"
+                );
+            }
+            let q2 = group_commit_queue_for_path(&path);
+            assert!(
+                q2.disowned_pages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&57),
+                "reopening the path re-seeds the fresh ledger from the pending pen"
+            );
+
+            // Part B — the reopened connection's on-open sweep reclaims the
+            // re-seeded in-range hole. Bind the reopened pager to q2's ledger so
+            // the sweep sees exactly the pages Part C preserved.
+            let pager = SimplePager::open(MemoryVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let (backend, frames, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A durable extent that puts page 57 in range. The mock WAL
+                // backend has NO frame for page 57, so the sweep's
+                // no-committed-frame guard treats it as a provable hole.
+                inner.db_size = 64;
+                inner.journal_mode = JournalMode::Wal;
+                inner.disowned_page_ledger = Some(q2.disowned_pages.clone());
+            }
+
+            pager.sweep_disowned_ledger_on_open(&cx).await.unwrap();
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                inner.freelist.contains(&PageNumber::new(57).unwrap()),
+                "the on-open sweep reclaims the re-seeded in-range hole into the freelist"
+            );
+            assert!(
+                !q2.disowned_pages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&57),
+                "the reclaimed in-range hole is drained from the shared ledger"
+            );
+            let frames = frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (_, page_one, _) = frames
+                .iter()
+                .find(|(page_no, _, _)| *page_no == PageNumber::ONE.get())
+                .expect("the on-open sweep must serialize page-1 freelist metadata");
+            assert_eq!(
+                u32::from_be_bytes(page_one[32..36].try_into().unwrap()),
+                57,
+                "the serialized freelist head must name the reclaimed page"
+            );
+            assert_eq!(
+                u32::from_be_bytes(page_one[36..40].try_into().unwrap()),
+                1,
+                "the serialized freelist count must include the reclaimed page"
+            );
+            assert!(
+                frames
+                    .iter()
+                    .any(|(_, _, db_size_if_commit)| *db_size_if_commit > 0),
+                "the page-1 freelist update must belong to a committed WAL batch"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_reclaim_refresh_failure_keeps_page_out_of_freelist() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/ioq6x_reclaim_refresh_failure.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let (backend, _) =
+                DisownedReclaimProbeWalBackend::new(DisownedReclaimProbeMode::FailRefresh);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+            let ledger = {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.db_size = 64;
+                inner
+                    .disowned_page_ledger
+                    .clone()
+                    .expect("an open pager binds the shared disowned-page ledger")
+            };
+            disown_pages(&ledger, [page]);
+
+            pager.sweep_disowned_ledger_on_open(&cx).await.unwrap();
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !inner.freelist.contains(&page),
+                "a failed publication refresh cannot prove that a frameless page is free"
+            );
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "a refresh failure must retain the adopted page for a later reconciliation"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_cancelled_reclaim_page_read_restores_adopted_page() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("cancelled disowned-page reclaim test runtime should build");
+        runtime.block_on(async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/ioq6x_cancelled_reclaim_page_read.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let (backend, page_read_entered) =
+                DisownedReclaimProbeWalBackend::new(DisownedReclaimProbeMode::PendPageRead);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+            let ledger = {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.db_size = 64;
+                inner
+                    .disowned_page_ledger
+                    .clone()
+                    .expect("an open pager binds the shared disowned-page ledger")
+            };
+            disown_pages(&ledger, [page]);
+
+            let mut sweep = Box::pin(pager.sweep_disowned_ledger_on_open(&cx));
+            std::future::poll_fn(|poll_cx| match sweep.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if page_read_entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("disowned-page reclaim unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            drop(sweep);
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !inner.freelist.contains(&page),
+                "cancelling a page lookup cannot publish an unverified page as free"
+            );
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "cancelling after the pool drain must restore the in-flight page"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_failed_reclaim_commit_removes_volatile_freelist_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/ioq6x_failed_reclaim_commit.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let (backend, frames, _, _) = MockWalBackend::new_with_failing_append_before_write();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+            let ledger = {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.db_size = 64;
+                inner
+                    .disowned_page_ledger
+                    .clone()
+                    .expect("an open pager binds the shared disowned-page ledger")
+            };
+            disown_pages(&ledger, [page]);
+
+            pager.sweep_disowned_ledger_on_open(&cx).await.unwrap();
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ledger_contains = ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&page.get());
+            assert!(
+                !inner.freelist.contains(&page),
+                "a failed durable publication cannot leave the same volatile page on the local freelist and shared ledger: ledger_contains={ledger_contains}, frames={:?}, freelist={:?}",
+                *frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                inner.freelist,
+            );
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "a failed durable publication must restore the reclaimed page to the cancellation-safe pool"
+            );
+            assert!(
+                !ledger_contains,
+                "the failed publication must retain exactly one retry authority, not duplicate the page in both pool and ledger"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_dropped_reclaim_transaction_restores_handoff_page() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/ioq6x_dropped_reclaim_transaction.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let (backend, _frames, _, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let page = PageNumber::new(57).unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.reclaimed_abandoned_reservations.push(page);
+            drop(txn);
+
+            let inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                inner.abandoned_eof_reservations.contains(&page),
+                "cancelling after the sweep-to-transaction handoff must restore the page to the abandonment pool"
+            );
+            assert!(
+                !inner.freelist.contains(&page),
+                "a dropped reclaim transaction cannot publish its page as free"
             );
         });
     }
