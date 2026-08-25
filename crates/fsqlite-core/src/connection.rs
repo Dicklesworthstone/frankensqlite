@@ -54496,6 +54496,16 @@ impl Connection {
         self.retained_autocommit_read_count.set(0);
         // Advance commit clock if commit succeeded.
         if commit_result.is_ok() {
+            // bd-zywqc.11.1.3: a retained autocommit batch just flushed durably as
+            // a single `txn.commit()`. Count it once, but only when the parked
+            // batch actually carried writes — parks themselves are never counted,
+            // and an empty flush is a no-op. This is the single instrumentation
+            // point shared by every flush caller (read-after-write realignment,
+            // the explicit-COMMIT drain, connection close, and the error-driven
+            // batch flush), so none of them double-count.
+            if txn_had_pending_writes {
+                fsqlite_observability::metrics::global().commits_total.inc();
+            }
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
                 match self.pager.checkpoint(cx, CheckpointMode::Passive).await {
                     Ok(_) => {}
@@ -56550,6 +56560,13 @@ impl Connection {
                                 "retained commit succeeded but memdb reload from retained txn failed: {error}"
                             );
                         }
+                        // bd-zywqc.11.1.3: the :memory: autocommit write fast path
+                        // committed durably (commit_and_retain returned Ok(true)).
+                        // Count it exactly once. This arm is guarded above by
+                        // `txn_has_pending_writes`, so a read-only autocommit never
+                        // reaches here, and it returns Ok without falling through to
+                        // the normal-commit tail, so there is no double count.
+                        fsqlite_observability::metrics::global().commits_total.inc();
                         drop(displaced_dropped_live_vtabs);
                         return Ok(());
                     }
@@ -56724,6 +56741,17 @@ impl Connection {
         }
 
         txn_result?;
+        // bd-zywqc.11.1.3: count an autocommit write commit exactly once on the
+        // durable-success tail of the normal `txn.commit()` path. `committed_write`
+        // is `txn_has_pending_writes && Ok(())`, so read-only autocommit (including
+        // the file-backed case that reaches `txn.commit()` rather than the :memory:
+        // read-only park) and every Err/rollback path (already returned above via
+        // `txn_result?`) are excluded. The :memory: commit_and_retain fast path and
+        // the retained-batch flush return before this tail and count at their own
+        // durable sites, so there is no double count.
+        if committed_write {
+            fsqlite_observability::metrics::global().commits_total.inc();
+        }
         if committed_write && schema_change_boundary {
             self.publish_committed_schema_cookie(self.schema_cookie());
         }
