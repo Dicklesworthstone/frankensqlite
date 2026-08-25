@@ -68808,10 +68808,10 @@ impl Connection {
             // loops above. Publish (finalize + visibility flip) follows under
             // the same guard until Drop. Guard is Some only on the
             // concurrent-write path that also set `mark_validate_done`.
-            if commit_res.is_ok() {
-                if let Some(g) = commit_registry_guard.as_mut() {
-                    g.mark_io_done();
-                }
+            if commit_res.is_ok()
+                && let Some(g) = commit_registry_guard.as_mut()
+            {
+                g.mark_io_done();
             }
 
             // Feed the conformal calibration ring on the successful-commit

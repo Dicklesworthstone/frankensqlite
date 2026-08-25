@@ -193,9 +193,10 @@ pub fn record_registry_commit_lock_hold(hold_ns: u64) {
     registry_metric_update_max(&REGISTRY_COMMIT_LOCK_HOLD_NS_MAX, hold_ns);
 }
 
-/// bd-i0tn6 GATE: record the validate/io/publish decomposition of ONE commit
-/// hold. Called (in addition to `record_registry_commit_lock_hold`, not instead
-/// of it) only on the concurrent-write path that reached both phase marks, so
+/// bd-i0tn6 GATE: record the validate/io/publish decomposition of one commit hold.
+///
+/// Called (in addition to `record_registry_commit_lock_hold`, not instead of it)
+/// only on the concurrent-write path that reached both phase marks, so
 /// `hold_ns_total` stays the authoritative all-paths hold and these sub-totals
 /// are the steady-state attribution. `io_ns` is the physical WAL/pager write
 /// under the lock — the recoverable portion S3 targets.
