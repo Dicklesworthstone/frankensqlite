@@ -15138,16 +15138,18 @@ where
     /// truncate the WAL so the returned bytes contain the durable main image.
     pub async fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
-        let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
 
         let journal_mode = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            if inner.active_transactions > 0 || inner.checkpoint_active {
+            if inner.active_transactions > 0
+                || inner.writer_active
+                || inner.checkpoint_active
+                || inner.rollback_journal_recovery_state.is_pending()
+            {
                 return Err(FrankenError::Busy);
             }
             inner.journal_mode
@@ -15158,40 +15160,86 @@ where
                 .await?;
         }
 
-        let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
-
-        let export_result = async {
-            let file_size = source_file.file_size(cx)?;
-            let output_len = usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
-                what: "database export size".to_owned(),
-                value: file_size.to_string(),
-            })?;
-            let mut bytes = vec![0_u8; output_len];
-            let mut copied = 0_usize;
-            while copied < output_len {
-                let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
-                let bytes_read = source_file
-                    .read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)
-                    .await?;
-                if bytes_read == 0 {
-                    return Err(FrankenError::internal(
-                        "unexpected EOF while exporting database image",
-                    ));
-                }
-                copied = copied
-                    .checked_add(bytes_read)
-                    .ok_or_else(|| FrankenError::internal("export size overflow"))?;
+        // Checkpointing is deliberately optimistic because it requires an
+        // ordinary transaction lease. Fence the actual image capture only
+        // after it completes, then repeat every quiescence check so a writer
+        // admitted during the checkpoint window either keeps this gate Busy
+        // or leaves WAL frames that the fenced preflight below rejects.
+        settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
+        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        self.validate_namespace_binding()?;
+        let (db_file, wal_handle) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.active_transactions > 0
+                || inner.writer_active
+                || inner.checkpoint_active
+                || inner.rollback_journal_recovery_state.is_pending()
+            {
+                return Err(FrankenError::Busy);
             }
-            Ok(bytes)
-        }
-        .await;
+            let wal_handle = if inner.journal_mode == JournalMode::Wal {
+                Some(wal_backend_handle(&self.wal_backend)?)
+            } else {
+                None
+            };
+            (Arc::clone(&inner.db_file), wal_handle)
+        };
+        let mut export_state = (
+            Arc::clone(&self.vfs),
+            Self::journal_path(&self.db_path),
+            wal_handle,
+        );
 
-        let source_close = source_file.close(cx);
+        with_main_shared_lock(
+            cx,
+            &self.group_commit_queue,
+            &db_file,
+            &mut export_state,
+            |cx, source_file, (vfs, journal_path, wal_handle)| {
+                Box::pin(async move {
+                    if let Some(wal_handle) = wal_handle.as_ref() {
+                        let mut wal = async_rwlock_write(wal_handle, cx, "WAL backend").await?;
+                        // Refresh from durable WAL while main-file SHARED pins
+                        // this exact image. Frames here mean a commit landed
+                        // after the optimistic truncate and before the fence.
+                        wal.begin_transaction(cx).await?;
+                        if wal.frame_count() != 0 {
+                            return Err(FrankenError::Busy);
+                        }
+                    }
 
-        let bytes = export_result?;
-        source_close?;
-        Ok(bytes)
+                    Self::verify_readonly_rollback_journal_state(cx, &**vfs, journal_path).await?;
+
+                    let file_size = source_file.file_size(cx)?;
+                    let output_len =
+                        usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
+                            what: "database export size".to_owned(),
+                            value: file_size.to_string(),
+                        })?;
+                    let mut bytes = vec![0_u8; output_len];
+                    let mut copied = 0_usize;
+                    while copied < output_len {
+                        let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
+                        let bytes_read = source_file
+                            .read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)
+                            .await?;
+                        if bytes_read == 0 {
+                            return Err(FrankenError::internal(
+                                "unexpected EOF while exporting database image",
+                            ));
+                        }
+                        copied = copied
+                            .checked_add(bytes_read)
+                            .ok_or_else(|| FrankenError::internal("export size overflow"))?;
+                    }
+                    Ok(bytes)
+                })
+            },
+        )
+        .await
     }
 
     /// Copy the pager's main database file to `target_path` via the active VFS.
@@ -55058,50 +55106,62 @@ mod tests {
         out
     }
 
-    #[derive(Clone)]
-    struct CopyWriteBlockingVfs {
-        inner: MemoryVfs,
-        target_path: PathBuf,
-        block_target_writes: Arc<AtomicBool>,
-        target_write_entered: Arc<AtomicBool>,
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum WholeImageBlockedIo {
+        SourceRead,
+        TargetWrite,
     }
 
-    impl CopyWriteBlockingVfs {
-        fn new(target_path: PathBuf) -> Self {
+    #[derive(Clone)]
+    struct WholeImageBlockingVfs {
+        inner: MemoryVfs,
+        blocked_path: PathBuf,
+        blocked_io: WholeImageBlockedIo,
+        block_io: Arc<AtomicBool>,
+        io_entered: Arc<AtomicBool>,
+        blocked_path_open_count: Arc<AtomicUsize>,
+    }
+
+    impl WholeImageBlockingVfs {
+        fn new(blocked_path: PathBuf, blocked_io: WholeImageBlockedIo) -> Self {
             Self {
                 inner: MemoryVfs::new(),
-                target_path,
-                block_target_writes: Arc::new(AtomicBool::new(false)),
-                target_write_entered: Arc::new(AtomicBool::new(false)),
+                blocked_path,
+                blocked_io,
+                block_io: Arc::new(AtomicBool::new(false)),
+                io_entered: Arc::new(AtomicBool::new(false)),
+                blocked_path_open_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
-        fn block_target_writes(&self) {
-            self.target_write_entered
-                .store(false, AtomicOrdering::Release);
-            self.block_target_writes
-                .store(true, AtomicOrdering::Release);
+        fn block_io(&self) {
+            self.io_entered.store(false, AtomicOrdering::Release);
+            self.block_io.store(true, AtomicOrdering::Release);
         }
 
-        fn release_target_writes(&self) {
-            self.block_target_writes
-                .store(false, AtomicOrdering::Release);
+        fn release_io(&self) {
+            self.block_io.store(false, AtomicOrdering::Release);
         }
 
-        fn target_write_entered(&self) -> bool {
-            self.target_write_entered.load(AtomicOrdering::Acquire)
+        fn io_entered(&self) -> bool {
+            self.io_entered.load(AtomicOrdering::Acquire)
+        }
+
+        fn blocked_path_open_count(&self) -> usize {
+            self.blocked_path_open_count.load(AtomicOrdering::Acquire)
         }
     }
 
-    struct CopyWriteBlockingFile {
+    struct WholeImageBlockingFile {
         inner: MemoryFile,
-        is_target: bool,
-        block_target_writes: Arc<AtomicBool>,
-        target_write_entered: Arc<AtomicBool>,
+        is_blocked_path: bool,
+        blocked_io: WholeImageBlockedIo,
+        block_io: Arc<AtomicBool>,
+        io_entered: Arc<AtomicBool>,
     }
 
-    impl Vfs for CopyWriteBlockingVfs {
-        type File = CopyWriteBlockingFile;
+    impl Vfs for WholeImageBlockingVfs {
+        type File = WholeImageBlockingFile;
 
         fn name(&self) -> &'static str {
             self.inner.name()
@@ -55113,14 +55173,19 @@ mod tests {
             path: Option<&Path>,
             flags: VfsOpenFlags,
         ) -> Result<(Self::File, VfsOpenFlags)> {
-            let is_target = path.is_some_and(|path| path == self.target_path.as_path());
+            let is_blocked_path = path.is_some_and(|path| path == self.blocked_path.as_path());
+            if is_blocked_path {
+                self.blocked_path_open_count
+                    .fetch_add(1, AtomicOrdering::AcqRel);
+            }
             let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
             Ok((
-                CopyWriteBlockingFile {
+                WholeImageBlockingFile {
                     inner,
-                    is_target,
-                    block_target_writes: Arc::clone(&self.block_target_writes),
-                    target_write_entered: Arc::clone(&self.target_write_entered),
+                    is_blocked_path,
+                    blocked_io: self.blocked_io,
+                    block_io: Arc::clone(&self.block_io),
+                    io_entered: Arc::clone(&self.io_entered),
                 },
                 actual_flags,
             ))
@@ -55143,7 +55208,7 @@ mod tests {
         }
     }
 
-    impl VfsFile for CopyWriteBlockingFile {
+    impl VfsFile for WholeImageBlockingFile {
         fn close(&mut self, cx: &Cx) -> Result<()> {
             self.inner.close(cx)
         }
@@ -55154,7 +55219,24 @@ mod tests {
             buf: &'a mut [u8],
             offset: u64,
         ) -> impl Future<Output = Result<usize>> + Send + 'a {
-            self.inner.read(cx, buf, offset)
+            async move {
+                if self.is_blocked_path
+                    && self.blocked_io == WholeImageBlockedIo::SourceRead
+                    && self.block_io.load(AtomicOrdering::Acquire)
+                {
+                    self.io_entered.store(true, AtomicOrdering::Release);
+                    std::future::poll_fn(|poll_cx| {
+                        if self.block_io.load(AtomicOrdering::Acquire) {
+                            poll_cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(())
+                        }
+                    })
+                    .await;
+                }
+                self.inner.read(cx, buf, offset).await
+            }
         }
 
         fn write<'a>(
@@ -55164,11 +55246,13 @@ mod tests {
             offset: u64,
         ) -> impl Future<Output = Result<()>> + Send + 'a {
             async move {
-                if self.is_target && self.block_target_writes.load(AtomicOrdering::Acquire) {
-                    self.target_write_entered
-                        .store(true, AtomicOrdering::Release);
+                if self.is_blocked_path
+                    && self.blocked_io == WholeImageBlockedIo::TargetWrite
+                    && self.block_io.load(AtomicOrdering::Acquire)
+                {
+                    self.io_entered.store(true, AtomicOrdering::Release);
                     std::future::poll_fn(|poll_cx| {
-                        if self.block_target_writes.load(AtomicOrdering::Acquire) {
+                        if self.block_io.load(AtomicOrdering::Acquire) {
                             poll_cx.waker().wake_by_ref();
                             std::task::Poll::Pending
                         } else {
@@ -55349,7 +55433,8 @@ mod tests {
             let cx = Cx::new();
             let source_path = PathBuf::from("/copy_fenced_source.db");
             let target_path = PathBuf::from("/copy_fenced_target.db");
-            let vfs = CopyWriteBlockingVfs::new(target_path.clone());
+            let vfs =
+                WholeImageBlockingVfs::new(target_path.clone(), WholeImageBlockedIo::TargetWrite);
             let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT)
                 .await
                 .unwrap();
@@ -55361,12 +55446,10 @@ mod tests {
                 .unwrap();
             seed.commit(&cx).await.unwrap();
 
-            vfs.block_target_writes();
+            vfs.block_io();
             let mut copy = Box::pin(pager.copy_database_to(&cx, &target_path));
             std::future::poll_fn(|poll_cx| match copy.as_mut().poll(poll_cx) {
-                std::task::Poll::Pending if vfs.target_write_entered() => {
-                    std::task::Poll::Ready(())
-                }
+                std::task::Poll::Pending if vfs.io_entered() => std::task::Poll::Ready(()),
                 std::task::Poll::Pending => {
                     poll_cx.waker().wake_by_ref();
                     std::task::Poll::Pending
@@ -55383,8 +55466,86 @@ mod tests {
                 "a whole-image copy must exclude a transaction admitted after its quiescence check"
             );
 
-            vfs.release_target_writes();
+            vfs.release_io();
             copy.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_export_database_bytes_fences_new_transactions_during_source_read() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let source_path = PathBuf::from("/export_fenced_source.db");
+            let vfs =
+                WholeImageBlockingVfs::new(source_path.clone(), WholeImageBlockedIo::SourceRead);
+            let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page_no, &vec![0x5A; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            vfs.block_io();
+            let mut export = Box::pin(pager.export_database_bytes(&cx));
+            std::future::poll_fn(|poll_cx| match export.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if vfs.io_entered() => std::task::Poll::Ready(()),
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("export completed before its source read was released: {result:?}")
+                }
+            })
+            .await;
+
+            let begin_result = pager.maintenance_gate.enter_transaction();
+            assert!(
+                matches!(begin_result, Err(FrankenError::Busy)),
+                "a whole-image export must exclude a transaction admitted after its quiescence check"
+            );
+
+            vfs.release_io();
+            let exported = export.await.unwrap();
+            let source = read_all_vfs_bytes(&vfs, &cx, &source_path).await;
+            assert_eq!(exported, source);
+            assert_eq!(
+                vfs.blocked_path_open_count(),
+                2,
+                "export must read the pager's identity-stable source handle; only the pager open and the test's post-export verification may open the source path"
+            );
+        });
+    }
+
+    #[test]
+    fn test_export_database_bytes_supports_readonly_pager() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let source_path = PathBuf::from("/export_readonly_source.db");
+            let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page_no, &vec![0xC3; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+            let expected = read_all_vfs_bytes(&vfs, &cx, &source_path).await;
+            drop(pager);
+
+            let readonly =
+                SimplePager::open_readonly_with_cx(&cx, vfs, &source_path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+            let exported = readonly.export_database_bytes(&cx).await.unwrap();
+            assert_eq!(exported, expected);
         });
     }
 
