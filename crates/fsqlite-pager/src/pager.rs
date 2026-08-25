@@ -55549,6 +55549,40 @@ mod tests {
         });
     }
 
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_export_database_bytes_supports_native_readonly_pager() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("export-native-readonly-source.db");
+            let pager =
+                SimplePager::open_with_cx(&cx, UnixVfs::new(), &source_path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page_no, &vec![0x96; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+            drop(pager);
+            let expected = std::fs::read(&source_path).unwrap();
+
+            let readonly = SimplePager::open_readonly_with_cx(
+                &cx,
+                UnixVfs::new(),
+                &source_path,
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            let exported = readonly.export_database_bytes(&cx).await.unwrap();
+            assert_eq!(exported, expected);
+        });
+    }
+
     #[test]
     fn test_published_snapshot_retries_during_inflight_publication() {
         init_publication_test_tracing();
