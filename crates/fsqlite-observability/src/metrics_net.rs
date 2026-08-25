@@ -16,9 +16,70 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::metrics::{metrics_disabled, render_prometheus};
+
+/// The default bind address used by `PRAGMA enable_metrics_http=1` (and any
+/// value-less enable) when the environment does not override it — bd-zywqc.11.1
+/// AC#2: default bind `localhost:9009`.
+pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9009";
+
+/// Set once the process-wide metrics endpoint has bound a socket, so repeated
+/// autostart / `PRAGMA enable_metrics_http` triggers never bind a second
+/// listener. A single endpoint per process, whichever trigger fires first.
+static ENDPOINT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process-wide metrics HTTP endpoint is currently bound. Used by
+/// the `PRAGMA enable_metrics_http` query (no-value) readback.
+#[must_use]
+pub fn metrics_http_bound() -> bool {
+    ENDPOINT_STARTED.load(Ordering::Acquire)
+}
+
+/// Resolve the bind address for a value-less enable: `FRANKENSQLITE_METRICS_BIND`
+/// when set and non-empty, else [`DEFAULT_METRICS_BIND`].
+#[must_use]
+pub fn default_bind() -> String {
+    match std::env::var("FRANKENSQLITE_METRICS_BIND") {
+        Ok(v) if !v.is_empty() => v,
+        _ => DEFAULT_METRICS_BIND.to_owned(),
+    }
+}
+
+/// Start the metrics HTTP endpoint at most once per process, on `bind`.
+///
+/// Returns `Ok(Some(addr))` if this call bound the endpoint, `Ok(None)` if it was
+/// already started (or metrics are disabled), and `Err` only when this call
+/// attempted the bind and it failed — in which case the started-flag is cleared
+/// so a later call with a working address can retry. Idempotent and race-safe:
+/// concurrent callers race the CAS, and exactly one performs the bind.
+///
+/// # Errors
+/// Propagates the `bind` / `local_addr` / thread-spawn I/O error from
+/// [`start_metrics_http`] when this call is the one that attempts the bind.
+pub fn ensure_metrics_http(bind: &str) -> std::io::Result<Option<SocketAddr>> {
+    if metrics_disabled() {
+        return Ok(None);
+    }
+    // Only the first caller to flip false -> true performs the bind; everyone
+    // else observes the endpoint is already up and returns `Ok(None)`.
+    if ENDPOINT_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    match start_metrics_http(bind) {
+        Ok(addr) => Ok(Some(addr)),
+        Err(e) => {
+            // Release the claim so a later call (e.g. a PRAGMA supplying a valid
+            // address after an env bind failed) can retry the bind.
+            ENDPOINT_STARTED.store(false, Ordering::Release);
+            Err(e)
+        }
+    }
+}
 
 /// Serve `GET /metrics` on `bind` from a named daemon thread.
 ///
@@ -49,17 +110,14 @@ pub fn start_metrics_http(bind: &str) -> std::io::Result<SocketAddr> {
 /// safe to call on every connection open; only the first call binds. A bind
 /// failure is swallowed (a metrics endpoint must never take down the engine).
 pub fn autostart_from_env() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if metrics_disabled() {
-            return;
-        }
-        if let Ok(bind) = std::env::var("FRANKENSQLITE_METRICS_BIND")
-            && !bind.is_empty()
-        {
-            let _ = start_metrics_http(&bind);
-        }
-    });
+    if let Ok(bind) = std::env::var("FRANKENSQLITE_METRICS_BIND")
+        && !bind.is_empty()
+    {
+        // Idempotent via `ensure_metrics_http`'s process-wide guard; a bind
+        // failure is swallowed (a metrics endpoint must never take down the
+        // engine).
+        let _ = ensure_metrics_http(&bind);
+    }
 }
 
 /// Serve exactly one request: parse the request line, answer `GET /metrics` with
@@ -164,5 +222,34 @@ mod tests {
         assert_eq!(route("POST /metrics HTTP/1.1").0, "405 Method Not Allowed");
         assert_eq!(route("GET /metrics HTTP/1.1").0, "200 OK");
         assert_eq!(route("GET /other HTTP/1.1").0, "404 Not Found");
+    }
+
+    #[test]
+    fn ensure_metrics_http_binds_at_most_once() {
+        // First call binds an ephemeral endpoint; the second (regardless of the
+        // address it would use) observes the process-wide endpoint is already up
+        // and does not bind a second listener. This is the guarantee that lets
+        // both env-autostart and `PRAGMA enable_metrics_http` be called freely.
+        let first = ensure_metrics_http("127.0.0.1:0").expect("first ensure ok");
+        assert!(first.is_some(), "first ensure should bind the endpoint");
+
+        let addr = first.unwrap();
+        let second = ensure_metrics_http("127.0.0.1:0").expect("second ensure ok");
+        assert!(
+            second.is_none(),
+            "second ensure must be a no-op once the endpoint is up"
+        );
+
+        // And the endpoint bound by the first call actually serves.
+        let ok = http_get(addr, "/metrics");
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "status line: {ok:?}");
+    }
+
+    #[test]
+    fn default_bind_falls_back_to_localhost_9009() {
+        // With the env override unset, the value-less enable uses the documented
+        // default. (The test avoids mutating process env; it only asserts the
+        // constant wiring, which is what the PRAGMA relies on.)
+        assert_eq!(DEFAULT_METRICS_BIND, "127.0.0.1:9009");
     }
 }

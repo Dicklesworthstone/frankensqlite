@@ -71,6 +71,13 @@ impl WalMetrics {
     pub fn set_wal_frames_current(&self, frame_count: u64) {
         self.wal_frames_current
             .store(frame_count, Ordering::Relaxed);
+        // bd-zywqc.11.1: mirror the WAL-local pending-frame count into the global
+        // SLO registry so `/metrics` exposes `wal_frames_pending_checkpoint`.
+        // Every frame append and the checkpoint reset already funnel through
+        // here, so one mirror keeps the two gauges in lock-step.
+        fsqlite_observability::metrics::global()
+            .wal_frames_pending_checkpoint
+            .set(i64::try_from(frame_count).unwrap_or(i64::MAX));
     }
 
     /// Record a completed checkpoint.
