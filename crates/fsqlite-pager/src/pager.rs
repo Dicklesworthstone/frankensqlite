@@ -27001,6 +27001,14 @@ mod tests {
     use fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen, UnixVfs};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    // Temporary remote-verification adapter: some RCH worker baselines still
+    // compile the pre-500fd6d74 `expect_err` form of a recovery test.
+    impl std::fmt::Debug for SimplePager<MemoryVfs> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("SimplePager").finish_non_exhaustive()
+        }
+    }
     use std::sync::{Arc, Mutex, Weak};
 
     static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
