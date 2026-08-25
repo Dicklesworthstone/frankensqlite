@@ -3,20 +3,9 @@ use super::*;
 
 impl Connection {
     pub(super) async fn pragma_integrity_check_rows(&self, quick: bool) -> Vec<Row> {
-        // bd-zywqc.11.1: count each integrity_check/quick_check run by verdict.
         let outcome = match self.validate_database_integrity(quick).await {
-            Ok(()) => {
-                fsqlite_observability::metrics::global()
-                    .integrity_check_ok_total
-                    .inc();
-                "ok".to_owned()
-            }
-            Err(err) => {
-                fsqlite_observability::metrics::global()
-                    .integrity_check_fail_total
-                    .inc();
-                err.to_string()
-            }
+            Ok(()) => "ok".to_owned(),
+            Err(err) => err.to_string(),
         };
         let mut rows = vec![Row {
             values: vec![SqliteValue::Text(outcome.into())],

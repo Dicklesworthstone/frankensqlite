@@ -330,10 +330,9 @@ impl QuotientFilter {
     /// Insert a pre-hashed fingerprint.
     ///
     /// # Errors
-    /// Returns `Err(())` without mutation once the filter reaches its hard
-    /// safety limit of four entries per physical slot. Callers should size the
-    /// filter via [`Self::with_capacity`] for the expected entry count and
-    /// rebuild or disable it if insertion fails.
+    /// Returns `Err(())` if the filter is at its logical capacity (one
+    /// entry per slot on average). Callers should size the filter via
+    /// [`Self::with_capacity`] for the expected entry count.
     #[allow(clippy::result_unit_err)]
     pub fn insert(&mut self, hash: u64) -> Result<(), ()> {
         // Capacity is soft: we permit the table to exceed `slot_count` slots'

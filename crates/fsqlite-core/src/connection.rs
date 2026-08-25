@@ -123,57 +123,6 @@ pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 pub use fsqlite_pager::pager::WriteSetStats;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
-
-/// GH#303: structured result of [`Connection::backup_exact_to`] — a byte-exact
-/// copy whose integrity has been verified against the source image receipt.
-///
-/// Returned only when the copy's logical image hash, byte length, and page
-/// geometry match the source exactly; a mismatch is a hard error, never a
-/// silently-degraded report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct BackupReport {
-    /// Number of database pages in the copied image.
-    pub page_count: u32,
-    /// Page size (bytes) of the copied image.
-    pub page_size: u32,
-    /// Total byte length of the copied file.
-    pub byte_len: u64,
-    /// Lowercase hex of the blake3 logical-image hash shared by source and copy.
-    pub logical_hash_hex: String,
-}
-
-/// GH#303: structured result of [`Connection::compact_verified_into`] — a
-/// `VACUUM INTO`-backed compaction whose output passed `quick_check` +
-/// `integrity_check` before this report was produced.
-///
-/// The compacted image is content-equivalent to the source but NOT byte- or
-/// hash-identical (compaction rewrites page layout and drops free pages), so the
-/// source and compacted logical hashes are reported separately. Compaction is
-/// not guaranteed to reach a stock-`VACUUM` byte-for-byte fixed point (GH#301);
-/// `reclaimed_pages` / `reclaimed_bytes` report the realized reduction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CompactionReport {
-    /// Page count of the source image before compaction.
-    pub source_page_count: u32,
-    /// Page count of the compacted output image.
-    pub compacted_page_count: u32,
-    /// Page size (bytes); preserved by compaction.
-    pub page_size: u32,
-    /// Byte length of the source image.
-    pub source_byte_len: u64,
-    /// Byte length of the compacted output image.
-    pub compacted_byte_len: u64,
-    /// Lowercase hex of the source image's logical hash.
-    pub source_logical_hash_hex: String,
-    /// Lowercase hex of the compacted image's logical hash.
-    pub compacted_logical_hash_hex: String,
-    /// Pages reclaimed by compaction (`source_page_count - compacted_page_count`, saturating).
-    pub reclaimed_pages: u32,
-    /// Bytes reclaimed by compaction (`source_byte_len - compacted_byte_len`, saturating).
-    pub reclaimed_bytes: u64,
-}
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
     PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
@@ -3384,20 +3333,6 @@ impl PagerBackend {
         }
     }
 
-    /// GH#303: byte-exact export of the pager's main database file to a
-    /// create-new target. Backs `Connection::backup_exact_to`.
-    async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
-        match self {
-            Self::Memory(p) => p.copy_database_to(cx, target_path).await,
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(p) => p.copy_database_to(cx, target_path).await,
-            #[cfg(all(feature = "native", unix))]
-            Self::Unix(p) => p.copy_database_to(cx, target_path).await,
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(p) => p.copy_database_to(cx, target_path).await,
-        }
-    }
-
     async fn restore_vacuum_candidate_change_counter(
         &self,
         cx: &Cx,
@@ -6188,10 +6123,10 @@ struct QuotientFilterEntry {
     /// `!built`, consultation MUST NOT short-circuit — a present row
     /// would otherwise be mis-classified as absent.
     built: bool,
-    /// Set when the one-shot build scan exceeds
-    /// `QUOTIENT_FILTER_BUILD_ROW_CAP` or live maintenance exhausts the
-    /// filter geometry. While set, consultation stays disabled until the
-    /// entry is reset or invalidated.
+    /// Set when the one-shot build scan observes a row count exceeding
+    /// `QUOTIENT_FILTER_BUILD_ROW_CAP`. Once set, consultation stays
+    /// disabled for the remainder of this connection's lifetime for
+    /// this root page, to avoid paying the scan cost on every call.
     too_large_to_build: bool,
     /// Set on any mutation (insert / remove) made during an active
     /// transaction. Cleared at explicit COMMIT. Used by the rollback
@@ -13859,11 +13794,6 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
-        // bd-zywqc.11.1: bring up the Prometheus `/metrics` HTTP endpoint from
-        // `FRANKENSQLITE_METRICS_BIND` the first time any connection opens.
-        // Idempotent (binds at most once per process) and a no-op when metrics
-        // are disabled or the env var is unset, so it is safe on every open.
-        fsqlite_observability::metrics_net::autostart_from_env();
         let attach_env = env.clone();
         let pager_is_memory = pager.is_memory();
         let file_identity = if pager_is_memory {
@@ -14287,110 +14217,6 @@ impl Connection {
             self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
         }
         self.pager.capture_vacuum_source_image(&cx).await
-    }
-
-    /// GH#303: make a byte-exact, integrity-verified backup copy of this
-    /// connection's database at `target_path`, returning a [`BackupReport`].
-    ///
-    /// `target_path` must not already exist; it is created new, and in WAL mode
-    /// the source is checkpointed first so the copy is a self-contained
-    /// rollback-mode image. After copying, the source and copy image receipts
-    /// are compared by logical image hash, byte length, and page geometry — the
-    /// copy is only reported as a backup when those match exactly.
-    ///
-    /// # Errors
-    ///
-    /// [`FrankenError::Unsupported`] for a memory-backed connection,
-    /// [`FrankenError::CannotOpen`] when `target_path` already exists or equals
-    /// the source, [`FrankenError::Busy`] when a transaction or checkpoint is in
-    /// flight, and any propagated pager error. Returns an internal error if the
-    /// post-copy verification finds the copy is not byte-exact.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn backup_exact_to(&self, target_path: impl AsRef<Path>) -> Result<BackupReport> {
-        if !self.pager.is_file_backed() {
-            return Err(FrankenError::Unsupported);
-        }
-        let target = target_path.as_ref();
-        // Source receipt first: quiesces publication state and checkpoints WAL
-        // to Truncate so the byte-exact copy is a self-contained image.
-        let source = self.capture_database_image_receipt().await?;
-        let cx = self.op_cx()?;
-        self.pager.copy_database_to(&cx, target).await?;
-        // Receipt the freshly written copy as a self-contained image.
-        let copy = self
-            .pager
-            .inspect_self_contained_database_image(&cx, target)
-            .await?;
-        // Verify byte-exactness. A `DatabaseImageReceipt`'s own `==` includes
-        // file identity (the copy is a new inode), so compare the
-        // content-bearing fields explicitly.
-        if source.logical_hash() != copy.logical_hash()
-            || source.file_size() != copy.file_size()
-            || source.header().page_count != copy.header().page_count
-            || source.header().page_size.get() != copy.header().page_size.get()
-        {
-            return Err(FrankenError::internal(
-                "backup_exact_to: copy is not byte-exact with the source image",
-            ));
-        }
-        Ok(BackupReport {
-            page_count: copy.header().page_count,
-            page_size: copy.header().page_size.get(),
-            byte_len: copy.file_size(),
-            logical_hash_hex: hex_encode_blake3(copy.logical_hash()),
-        })
-    }
-
-    /// GH#303: compact this connection's database into a new file at
-    /// `target_path` using the shared `VACUUM INTO` engine, returning a
-    /// [`CompactionReport`].
-    ///
-    /// The output is produced by `VACUUM INTO`, which rebuilds the database into
-    /// a self-contained, integrity-checked (`quick_check` + `integrity_check`)
-    /// compact image that preserves page size and header pragmas. The output is
-    /// content-equivalent to the source but not byte-identical (see
-    /// [`CompactionReport`]).
-    ///
-    /// # Errors
-    ///
-    /// [`FrankenError::Unsupported`] for a memory-backed connection,
-    /// [`FrankenError::CannotOpen`] when `target_path` already exists or equals
-    /// the source, an error when a transaction is open, and any error surfaced
-    /// by `VACUUM INTO` (including an integrity-check failure, which leaves the
-    /// source untouched).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn compact_verified_into(
-        &self,
-        target_path: impl AsRef<Path>,
-    ) -> Result<CompactionReport> {
-        if !self.pager.is_file_backed() {
-            return Err(FrankenError::Unsupported);
-        }
-        let target = target_path.as_ref();
-        let source = self.capture_database_image_receipt().await?;
-        let target_text = target.to_string_lossy().into_owned();
-        // The shared VACUUM engine runs quick_check + integrity_check on the
-        // output before it is finalized; a failure leaves the source untouched.
-        self.execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Text(target_text.into())])
-            .await?;
-        let cx = self.op_cx()?;
-        let compacted = self
-            .pager
-            .inspect_self_contained_database_image(&cx, target)
-            .await?;
-        let source_pages = source.header().page_count;
-        let compacted_pages = compacted.header().page_count;
-        Ok(CompactionReport {
-            source_page_count: source_pages,
-            compacted_page_count: compacted_pages,
-            page_size: compacted.header().page_size.get(),
-            source_byte_len: source.file_size(),
-            compacted_byte_len: compacted.file_size(),
-            source_logical_hash_hex: hex_encode_blake3(source.logical_hash()),
-            compacted_logical_hash_hex: hex_encode_blake3(compacted.logical_hash()),
-            reclaimed_pages: source_pages.saturating_sub(compacted_pages),
-            reclaimed_bytes: source.file_size().saturating_sub(compacted.file_size()),
-        })
     }
 
     /// Atomically claim a pathname for a replacement image and retain the
@@ -20994,7 +20820,7 @@ impl Connection {
         // diverges from stock (which reads the source). Read the source table by
         // rowid here and project the real column values. A true contentless table
         // (`content=''`) has no source and correctly keeps the NULL projection.
-        let content_source = self.fts5_external_content_source_schema(src)?;
+        let content_source = self.fts5_external_content_source_schema(src);
         let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
         let col_count = src.col_names.len();
 
@@ -21066,52 +20892,32 @@ impl Connection {
     }
 
     /// bd-plxob: resolve the external content SOURCE table for a `content='<table>'`
-    /// FTS5 vtab so lazy scans can project real column bodies from it.
-    /// `Ok(None)` for internal-content (`_content`-backed) or true contentless
+    /// FTS5 vtab so lazy scans can project real column bodies from it. Returns
+    /// `None` for internal-content (`_content`-backed) or true contentless
     /// (`content=''`) tables — neither has an external source to read.
-    ///
-    /// bd-oi482/GH#211: a `content='<table>'` whose configured source table is
-    /// ABSENT (e.g. renamed away by `ALTER TABLE <table> RENAME TO ...`) is a
-    /// query-time, table-local error in stock FTS5 (`no such table: main.<table>`
-    /// when the content is read), NOT a silent empty projection. Surface that
-    /// error here instead of mapping the missing table to `None`.
     #[cfg(feature = "ext-fts5")]
-    fn fts5_external_content_source_schema(
-        &self,
-        src: &JoinTableSource,
-    ) -> Result<Option<TableSchema>> {
+    fn fts5_external_content_source_schema(&self, src: &JoinTableSource) -> Option<TableSchema> {
         let content_name = {
             let ddl = self.original_ddl_sql.borrow();
-            let Some(create_sql) = ddl.get(&src.table_name.to_ascii_lowercase()) else {
-                return Ok(None);
-            };
+            let create_sql = ddl.get(&src.table_name.to_ascii_lowercase())?;
             let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
             else {
-                return Ok(None);
+                return None;
             };
             if !create_stmt.module.eq_ignore_ascii_case("fts5") {
-                return Ok(None);
+                return None;
             }
-            let Some(name) = virtual_table_option_value(&create_stmt.args, "content") else {
-                return Ok(None); // internal content (`_content`-backed): no external source
-            };
+            let name = virtual_table_option_value(&create_stmt.args, "content")?;
             if name.is_empty() {
-                return Ok(None); // contentless: no source
+                return None; // contentless: no source
             }
             name
         };
-        match self
-            .schema
+        self.schema
             .borrow()
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(&content_name))
             .cloned()
-        {
-            Some(content_table) => Ok(Some(content_table)),
-            None => Err(FrankenError::FunctionError(format!(
-                "no such table: main.{content_name}"
-            ))),
-        }
     }
 
     /// bd-plxob(b): read the EXTERNAL content SOURCE rows for a `'rebuild'`,
@@ -21145,11 +20951,6 @@ impl Connection {
                 return Ok(None); // contentless: no source
             }
             let col_count = parse_virtual_table_column_infos(&create_stmt.args).len();
-            // bd-oi482/GH#211: `'rebuild'` re-indexes the external content SOURCE;
-            // if that configured table is absent (renamed away), stock FTS5 errors
-            // `no such table: main.<content>` rather than rebuilding to an empty
-            // index. Surface the same error instead of falling back to the
-            // (empty) in-memory documents.
             let Some(content_table) = self
                 .schema
                 .borrow()
@@ -21157,9 +20958,7 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&content_name))
                 .cloned()
             else {
-                return Err(FrankenError::FunctionError(format!(
-                    "no such table: main.{content_name}"
-                )));
+                return Ok(None);
             };
             (content_table, col_count)
         };
@@ -32140,24 +31939,19 @@ impl Connection {
     /// Record a successful INSERT of `rowid` into the table rooted at
     /// `root_page`. No-op while the quotient-filter map is dormant. If a future
     /// re-enablement explicitly creates a built entry, this keeps it current so
-    /// the next consultation sees the new row. Capacity exhaustion invalidates
-    /// the entry: leaving it built without the new row would make a `contains`
-    /// miss an unsafe false-negative short-circuit.
+    /// the next consultation sees the new row.
     fn qf_record_insert(&self, root_page: i32, rowid: i64) {
         if !self.quotient_filters_may_have_entries.get() {
             return;
         }
         let mut filters = self.quotient_filters.borrow_mut();
         if let Some(entry) = filters.get_mut(&root_page) {
-            if entry.built
-                && entry
-                    .filter
-                    .insert(quotient_filter_hash_rowid(rowid))
-                    .is_err()
-            {
-                entry.filter.clear();
-                entry.built = false;
-                entry.too_large_to_build = true;
+            if entry.built {
+                // Ignore Err(()): capacity exhaustion just means the
+                // filter is no longer a reliable accelerator; the
+                // next consultation will still descend the B-tree
+                // normally if contains() answers "maybe".
+                let _ = entry.filter.insert(quotient_filter_hash_rowid(rowid));
             }
             if self.in_transaction.get() {
                 entry.modified_in_txn = true;
@@ -52484,7 +52278,7 @@ impl Connection {
     /// UPDATE trigger snapshot uses (`eval_join_expr`), with a column map that
     /// resolves unqualified / target-table columns against the existing row;
     /// `excluded.*` references are spliced to the attempted-insert literals.
-    fn compute_upsert_update_row(
+    async fn compute_upsert_update_row(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         assignments: &[fsqlite_ast::Assignment],
@@ -52645,15 +52439,17 @@ impl Connection {
                     else {
                         return Ok(None);
                     };
-                    let plan = self.compute_upsert_update_row(
-                        insert,
-                        assignments,
-                        where_clause.as_deref(),
-                        rowid,
-                        old_values,
-                        attempted,
-                        params,
-                    )?;
+                    let plan = self
+                        .compute_upsert_update_row(
+                            insert,
+                            assignments,
+                            where_clause.as_deref(),
+                            rowid,
+                            old_values,
+                            attempted,
+                            params,
+                        )
+                        .await?;
                     return Ok(plan
                         .map(|plan| (Self::assignment_target_column_names(assignments), plan)));
                 }
@@ -52862,10 +52658,6 @@ impl Connection {
         }
         if started {
             self.note_connection_transaction_started();
-            // bd-zywqc.11.1: every transaction is born a reader; a later
-            // `txn_metrics_note_write` reclassifies it to a writer on first
-            // write. Balanced by the decrement in `txn_metrics_mark_finished`.
-            fsqlite_observability::metrics::global().active_readers.inc();
         }
     }
 
@@ -52880,23 +52672,12 @@ impl Connection {
     }
 
     fn txn_metrics_note_write(&self) {
-        let mut first_write = false;
-        {
-            let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
-            if metrics.active_started_at.is_some() {
-                metrics.active_write_ops = metrics.active_write_ops.saturating_add(1);
-                if metrics.active_first_write_at.is_none() {
-                    metrics.active_first_write_at = Some(Instant::now());
-                    first_write = true;
-                }
+        let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
+        if metrics.active_started_at.is_some() {
+            metrics.active_write_ops = metrics.active_write_ops.saturating_add(1);
+            if metrics.active_first_write_at.is_none() {
+                metrics.active_first_write_at = Some(Instant::now());
             }
-        }
-        if first_write {
-            // bd-zywqc.11.1: first write of this transaction — reclassify it from
-            // reader to writer for the active-{readers,writers} gauges.
-            let m = fsqlite_observability::metrics::global();
-            m.active_readers.dec();
-            m.active_writers.inc();
         }
     }
 
@@ -52916,16 +52697,11 @@ impl Connection {
     }
 
     fn txn_metrics_mark_finished(&self) {
-        let was_writer;
         {
             let mut metrics = self.txn_lifecycle_metrics.borrow_mut();
             let Some(started_at) = metrics.active_started_at.take() else {
                 return;
             };
-            // bd-zywqc.11.1: capture the reader/writer class BEFORE the counters
-            // are reset below, so the active-gauge decrement matches the
-            // increment side (reader at start, flipped to writer on first write).
-            was_writer = metrics.active_write_ops > 0;
 
             let elapsed_ms_u128 = started_at.elapsed().as_millis();
             let elapsed_ms = u64::try_from(elapsed_ms_u128).unwrap_or(u64::MAX);
@@ -52943,13 +52719,6 @@ impl Connection {
             metrics.active_write_ops = 0;
             metrics.active_savepoint_depth = 0;
             metrics.active_rollbacks = 0;
-        }
-        // bd-zywqc.11.1: balance the active-gauge increment from this txn's start.
-        let m = fsqlite_observability::metrics::global();
-        if was_writer {
-            m.active_writers.dec();
-        } else {
-            m.active_readers.dec();
         }
         self.note_connection_transaction_finished();
     }
@@ -54081,15 +53850,7 @@ impl Connection {
 
         let mut gc_todo = self.gc_todo.borrow_mut();
         if let Some(version_store) = self.version_store.get() {
-            let result = version_store.gc_tick(&mut gc_todo, horizon);
-            // bd-zywqc.11.1: count a version-sweeper clear only when the pass
-            // actually reclaimed something (an empty tick is not a clear event).
-            if result.versions_freed > 0 || result.pages_pruned > 0 {
-                fsqlite_observability::metrics::global()
-                    .sweeper_clears_total
-                    .inc();
-            }
-            result
+            version_store.gc_tick(&mut gc_todo, horizon)
         } else {
             GcTickResult {
                 pages_pruned: 0,
@@ -68326,14 +68087,6 @@ impl Connection {
             Err((err, fcw_result)) => {
                 let error = Self::map_mvcc_commit_error(err, fcw_result);
                 record_concurrent_commit_plan_error(&error);
-                // bd-zywqc.11.1: a concurrent-commit-plan conflict on the CORE
-                // (engine) path — surfaced to the caller as a busy-snapshot
-                // retry. The `rebased` resolution does not occur on this path
-                // (it exists only in the lifecycle.rs MVCC engine), so it is
-                // counted there; here every conflict is a busy_snapshot.
-                fsqlite_observability::metrics::global()
-                    .conflicts_busy_snapshot_total
-                    .inc();
                 if let Some(shared_handle) = registry.remove(session_id) {
                     {
                         let mut handle = shared_handle.lock();
@@ -68447,9 +68200,6 @@ impl Connection {
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
-        // bd-zywqc.11.1: start of the real commit work; end-to-end commit latency
-        // is recorded on the success path only via commit_duration_seconds.
-        let commit_span_start = Instant::now();
         // AAC-P6: txn boundary — the micro-batch epoch ends at COMMIT.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
@@ -68875,17 +68625,6 @@ impl Connection {
         };
 
         // Commit succeeded; now consume and drop the handle.
-        // bd-zywqc.11.1: exactly one commit is counted here per successful COMMIT
-        // — the busy-retry and in-doubt loops resolved above and any failure
-        // returned Err earlier (NotCommitted arm), so this never double-counts on
-        // retry or counts a rollback. The end-to-end latency is recorded on this
-        // success path only.
-        {
-            let m = fsqlite_observability::metrics::global();
-            m.commits_total.inc();
-            m.commit_duration_seconds
-                .observe(commit_span_start.elapsed().as_secs_f64());
-        }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
         *self.active_txn.borrow_mut() = None;
@@ -69068,16 +68807,7 @@ impl Connection {
         // Tell execute_join_select to read from self.db (the historical
         // snapshot) instead of calling self.query() which goes through pager.
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-        // bd-zywqc.11.1: an AS-OF/historical snapshot is pinned for the duration
-        // of this query. Count the open once and hold the active-pin gauge up
-        // across the query, then release it (no early return sits between the
-        // inc and dec, so the gauge stays balanced on the Ok and Err paths).
-        let metrics = fsqlite_observability::metrics::global();
-        metrics.historical_snapshots_opened_total.inc();
-        metrics.historical_pins_active.inc();
-        let result = self.execute_join_select(&bound, None).await;
-        metrics.historical_pins_active.dec();
-        result
+        self.execute_join_select(&bound, None).await
     }
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
@@ -72134,40 +71864,6 @@ impl Connection {
             return Ok(vec![Row {
                 values: vec![SqliteValue::Integer(i64::from(
                     self.defer_foreign_keys.get(),
-                ))],
-            }]);
-        }
-
-        // bd-zywqc.11.1: `PRAGMA enable_metrics_http[=1|=<bind-addr>]` starts the
-        // process-wide Prometheus `/metrics` HTTP endpoint (a side effect, not
-        // stored connection state, so it is handled here rather than in the vdbe
-        // pragma-state layer). `=1`/true binds the env override or the default
-        // `localhost:9009`; a string value is used verbatim as the bind address;
-        // a falsy value is a no-op (the endpoint has no runtime unbind). The
-        // no-value query form reports whether the endpoint is currently bound.
-        if pragma_name == "enable_metrics_http" {
-            if let Some(value) = pragma.value.as_ref() {
-                let expr = match value {
-                    PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
-                };
-                let bind = match expr {
-                    Expr::Literal(Literal::String(addr), _) => addr.clone(),
-                    _ => {
-                        if parse_pragma_bool(value)? {
-                            fsqlite_observability::metrics_net::default_bind()
-                        } else {
-                            return Ok(Vec::new());
-                        }
-                    }
-                };
-                // A bind failure must never fail the PRAGMA (a metrics endpoint
-                // never takes down the engine); it is swallowed like autostart.
-                let _ = fsqlite_observability::metrics_net::ensure_metrics_http(&bind);
-                return Ok(Vec::new());
-            }
-            return Ok(vec![Row {
-                values: vec![SqliteValue::Integer(i64::from(
-                    fsqlite_observability::metrics_net::metrics_http_bound(),
                 ))],
             }]);
         }
@@ -90403,11 +90099,6 @@ impl Connection {
         *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
-        // bd-zywqc.11.1: a DDL just advanced the schema epoch (cookie + generation
-        // both moved above); count the bump on this success path.
-        fsqlite_observability::metrics::global()
-            .schema_epoch_bumps_total
-            .inc();
         // Same-connection DDL: advance the local DDL epoch so prepared
         // statements captured before this change re-prepare transparently
         // (GH #239). Cross-connection reloads bump schema_generation but never
@@ -111863,8 +111554,8 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
             right,
             ..
         } => {
-            relax_eq_conjunct_bound_outer(left, table, alias);
-            relax_eq_conjunct_bound_outer(right, table, alias);
+            relax_eq_conjunct_bound_outer(&mut **left, table, alias);
+            relax_eq_conjunct_bound_outer(&mut **right, table, alias);
         }
         Expr::BinaryOp {
             op: BinaryOp::Eq,
@@ -111873,13 +111564,13 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
             ..
         } => {
             // `col = bound` — relax the right operand.
-            if let Some(col) = eq_seek_column(left, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(right, col)
+            if let Some(col) = eq_seek_column(&**left, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**right, col)
             {
                 **right = literal;
             // `bound = col` — relax the left operand.
-            } else if let Some(col) = eq_seek_column(right, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(left, col)
+            } else if let Some(col) = eq_seek_column(&**right, table, alias)
+                && let Some(literal) = bound_outer_relaxable_to_literal(&**left, col)
             {
                 **left = literal;
             }
@@ -234246,52 +233937,6 @@ mod pager_routing_tests {
                 "disabled QF consultation must leave the repeated DELETE on the normal lookup path"
             );
             conn.execute("COMMIT").await.unwrap();
-        });
-    }
-
-    /// A built filter that cannot record a successful table INSERT must be
-    /// disabled before consultation can mistake the new row for absent.
-    #[test]
-    fn test_quotient_filter_insert_capacity_exhaustion_disables_entry() {
-        asupersync::test_utils::run_test(|| async {
-            let conn = Connection::open(":memory:").await.unwrap();
-            let root_page = 2;
-            conn.quotient_filters.borrow_mut().insert(
-                root_page,
-                QuotientFilterEntry {
-                    filter: QuotientFilter::new(2, 58).unwrap(),
-                    built: true,
-                    too_large_to_build: false,
-                    modified_in_txn: false,
-                },
-            );
-            conn.quotient_filters_may_have_entries.set(true);
-
-            // Four slots permit sixteen entries before insert() rejects the
-            // next hash. Use wide fingerprints so this guard cannot be masked
-            // by a false positive for the rejected rowid.
-            for rowid in 0..16 {
-                conn.qf_record_insert(root_page, rowid);
-            }
-            let rejected_hash = quotient_filter_hash_rowid(16);
-            {
-                let filters = conn.quotient_filters.borrow();
-                let entry = filters.get(&root_page).unwrap();
-                assert_eq!(entry.filter.len(), 16);
-                assert!(entry.built);
-                assert!(!entry.filter.contains(rejected_hash));
-            }
-
-            conn.qf_record_insert(root_page, 16);
-
-            let filters = conn.quotient_filters.borrow();
-            let entry = filters.get(&root_page).unwrap();
-            assert!(
-                !entry.built,
-                "a built filter missing a committed row can cause a false negative"
-            );
-            assert!(entry.too_large_to_build);
-            assert!(entry.filter.is_empty());
         });
     }
 
