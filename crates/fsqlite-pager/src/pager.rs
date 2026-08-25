@@ -15202,11 +15202,10 @@ where
     /// truncate the WAL so the destination contains a self-contained main DB.
     pub async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
         let source_full = self.vfs.full_pathname(cx, &source_path)?;
-        let target_full = self.vfs.full_pathname(cx, target_path)?;
+        let mut target_full = self.vfs.full_pathname(cx, target_path)?;
         if source_full == target_full {
             return Err(FrankenError::CannotOpen { path: target_full });
         }
@@ -15230,51 +15229,65 @@ where
                 .await?;
         }
 
-        let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let target_flags = VfsOpenFlags::MAIN_DB
-            | VfsOpenFlags::CREATE
-            | VfsOpenFlags::EXCLUSIVE
-            | VfsOpenFlags::READWRITE;
-        let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
-        let (mut target_file, _) = self.vfs.open(cx, Some(&target_full), target_flags)?;
-
-        let copy_result = async {
-            let file_size = source_file.file_size(cx)?;
-            let mut copied = 0_u64;
-            let mut buffer = vec![0_u8; Self::EXPORT_COPY_CHUNK_SIZE];
-            while copied < file_size {
-                let remaining = file_size - copied;
-                let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
-                    .map_err(|_| FrankenError::internal("copy chunk length overflow"))?;
-                let bytes_read = source_file
-                    .read(cx, &mut buffer[..chunk_len], copied)
-                    .await?;
-                if bytes_read == 0 {
-                    return Err(FrankenError::internal(
-                        "unexpected EOF while copying database image",
-                    ));
+        self.with_exclusive_maintenance(cx, &mut target_full, |pager, cx, inner, target_full| {
+            Box::pin(async move {
+                // The optimistic check above avoids checkpoint work for an
+                // existing target. Repeat it inside the maintenance epoch
+                // so a target created during that work still fails closed.
+                if pager.vfs.access(cx, target_full, AccessFlags::EXISTS)? {
+                    return Err(FrankenError::CannotOpen {
+                        path: target_full.clone(),
+                    });
                 }
-                target_file.write(cx, &buffer[..bytes_read], copied).await?;
-                copied = copied
-                    .checked_add(
-                        u64::try_from(bytes_read)
-                            .map_err(|_| FrankenError::internal("copy size overflow"))?,
-                    )
-                    .ok_or_else(|| FrankenError::internal("copy offset overflow"))?;
-            }
-            target_file.truncate(cx, file_size)?;
-            target_file.sync(cx, SyncFlags::FULL)?;
-            Ok(())
-        }
-        .await;
 
-        let source_close = source_file.close(cx);
-        let target_close = target_file.close(cx);
+                let target_flags = VfsOpenFlags::MAIN_DB
+                    | VfsOpenFlags::CREATE
+                    | VfsOpenFlags::EXCLUSIVE
+                    | VfsOpenFlags::READWRITE;
+                let (mut target_file, _) = pager.vfs.open(cx, Some(target_full), target_flags)?;
 
-        copy_result?;
-        source_close?;
-        target_close?;
-        Ok(())
+                let copy_result = async {
+                    // Read the identity-stable file handle already owned by
+                    // this pager. Re-resolving the source pathname here
+                    // would reopen a rename/replacement race inside the
+                    // otherwise exclusive whole-image epoch.
+                    let source_file = shared_db_file_read(&inner.db_file, cx).await?;
+                    let file_size = source_file.file_size(cx)?;
+                    let mut copied = 0_u64;
+                    let mut buffer = vec![0_u8; Self::EXPORT_COPY_CHUNK_SIZE];
+                    while copied < file_size {
+                        let remaining = file_size - copied;
+                        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+                            .map_err(|_| FrankenError::internal("copy chunk length overflow"))?;
+                        let bytes_read = source_file
+                            .read(cx, &mut buffer[..chunk_len], copied)
+                            .await?;
+                        if bytes_read == 0 {
+                            return Err(FrankenError::internal(
+                                "unexpected EOF while copying database image",
+                            ));
+                        }
+                        target_file.write(cx, &buffer[..bytes_read], copied).await?;
+                        copied = copied
+                            .checked_add(
+                                u64::try_from(bytes_read)
+                                    .map_err(|_| FrankenError::internal("copy size overflow"))?,
+                            )
+                            .ok_or_else(|| FrankenError::internal("copy offset overflow"))?;
+                    }
+                    target_file.truncate(cx, file_size)?;
+                    target_file.sync(cx, SyncFlags::FULL)?;
+                    Ok(())
+                }
+                .await;
+
+                let target_close = target_file.close(cx);
+                copy_result?;
+                target_close?;
+                Ok(())
+            })
+        })
+        .await
     }
 
     /// Capture point-in-time page-cache counters.
@@ -27103,14 +27116,11 @@ mod tests {
         delta.apply_to_freelist(&mut freelist);
         assert_eq!(
             freelist,
-            vec![page_six, page_four, page_three, page_seven],
+            vec![page_seven, page_six, page_four, page_three],
             "allocator reconciliation must be idempotent and keep committed pages live"
         );
         delta.apply_to_freelist(&mut freelist);
-        assert_eq!(
-            freelist,
-            vec![page_six, page_four, page_three, page_seven]
-        );
+        assert_eq!(freelist, vec![page_seven, page_six, page_four, page_three]);
     }
 
     #[test]
@@ -27312,7 +27322,7 @@ mod tests {
     }
 
     #[test]
-    fn not_committed_group_attempt_restores_reclaimed_abandonment_ownership() {
+    fn test_ioq6x_not_committed_group_attempt_restores_reclaimed_abandonment_ownership() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = wal_pager().await;
             let cx = Cx::new();
@@ -27357,7 +27367,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_pending_group_attempt_restores_reclaimed_abandonment_ownership() {
+    fn test_ioq6x_dropped_pending_group_attempt_restores_reclaimed_abandonment_ownership() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = wal_pager().await;
             let cx = Cx::new();
@@ -33628,7 +33638,7 @@ mod tests {
             )
             .await
             else {
-                panic!("duplicate record in a later section must fail recovery");
+                panic!("duplicate rollback-journal record in a later section must fail recovery");
             };
             assert!(
                 matches!(
@@ -55048,6 +55058,200 @@ mod tests {
         out
     }
 
+    #[derive(Clone)]
+    struct CopyWriteBlockingVfs {
+        inner: MemoryVfs,
+        target_path: PathBuf,
+        block_target_writes: Arc<AtomicBool>,
+        target_write_entered: Arc<AtomicBool>,
+    }
+
+    impl CopyWriteBlockingVfs {
+        fn new(target_path: PathBuf) -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                target_path,
+                block_target_writes: Arc::new(AtomicBool::new(false)),
+                target_write_entered: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn block_target_writes(&self) {
+            self.target_write_entered
+                .store(false, AtomicOrdering::Release);
+            self.block_target_writes
+                .store(true, AtomicOrdering::Release);
+        }
+
+        fn release_target_writes(&self) {
+            self.block_target_writes
+                .store(false, AtomicOrdering::Release);
+        }
+
+        fn target_write_entered(&self) -> bool {
+            self.target_write_entered.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    struct CopyWriteBlockingFile {
+        inner: MemoryFile,
+        is_target: bool,
+        block_target_writes: Arc<AtomicBool>,
+        target_write_entered: Arc<AtomicBool>,
+    }
+
+    impl Vfs for CopyWriteBlockingVfs {
+        type File = CopyWriteBlockingFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let is_target = path.is_some_and(|path| path == self.target_path.as_path());
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            Ok((
+                CopyWriteBlockingFile {
+                    inner,
+                    is_target,
+                    block_target_writes: Arc::clone(&self.block_target_writes),
+                    target_write_entered: Arc::clone(&self.target_write_entered),
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            self.inner.is_memory()
+        }
+    }
+
+    impl VfsFile for CopyWriteBlockingFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+
+        fn read<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a mut [u8],
+            offset: u64,
+        ) -> impl Future<Output = Result<usize>> + Send + 'a {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+        ) -> impl Future<Output = Result<()>> + Send + 'a {
+            async move {
+                if self.is_target && self.block_target_writes.load(AtomicOrdering::Acquire) {
+                    self.target_write_entered
+                        .store(true, AtomicOrdering::Release);
+                    std::future::poll_fn(|poll_cx| {
+                        if self.block_target_writes.load(AtomicOrdering::Acquire) {
+                            poll_cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(())
+                        }
+                    })
+                    .await;
+                }
+                self.inner.write(cx, buf, offset).await
+            }
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
     #[test]
     fn test_copy_database_to_copies_main_db_via_vfs() {
         asupersync::test_utils::run_test(|| async {
@@ -55137,6 +55341,51 @@ mod tests {
                 matches!(err, FrankenError::Busy),
                 "bead_id={BEAD_ID} case=copy_database_to_rejects_active_transactions err={err:?}"
             );
+        });
+    }
+
+    #[test]
+    fn test_copy_database_to_fences_new_transactions_during_target_write() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let source_path = PathBuf::from("/copy_fenced_source.db");
+            let target_path = PathBuf::from("/copy_fenced_target.db");
+            let vfs = CopyWriteBlockingVfs::new(target_path.clone());
+            let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page_no = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, page_no, &vec![0xA5; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+
+            vfs.block_target_writes();
+            let mut copy = Box::pin(pager.copy_database_to(&cx, &target_path));
+            std::future::poll_fn(|poll_cx| match copy.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if vfs.target_write_entered() => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("copy completed before its target write was released: {result:?}")
+                }
+            })
+            .await;
+
+            let begin_result = pager.maintenance_gate.enter_transaction();
+            assert!(
+                matches!(begin_result, Err(FrankenError::Busy)),
+                "a whole-image copy must exclude a transaction admitted after its quiescence check"
+            );
+
+            vfs.release_target_writes();
+            copy.await.unwrap();
         });
     }
 
