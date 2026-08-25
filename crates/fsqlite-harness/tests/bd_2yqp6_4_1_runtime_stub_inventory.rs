@@ -55,14 +55,16 @@ struct InventoryMeta {
     #[serde(default)]
     next_active_id: u32,
     // Files scanned for markers; drives the scanner instead of a hardcoded list.
-    // `#[serde(default)]` for the same bootstrap reason; the gate asserts non-empty.
+    // `#[serde(default)]` for the same bootstrap reason; the gate requires exact
+    // agreement with the independently declared required scan scope below.
     #[serde(default)]
     scanned_files: Vec<String>,
 }
 
-/// Fallback scan list used only when bootstrapping the first fingerprint
-/// regeneration from a pre-migration inventory whose meta lacks `scanned_files`.
-const BOOTSTRAP_SCANNED_FILES: [&str; 4] = [
+/// Required scan list. This is both the bootstrap fallback for a pre-migration
+/// inventory and the independent, fail-closed authority for metadata changes.
+/// Adding or removing a scanned file therefore requires an explicit code review.
+const REQUIRED_SCANNED_FILES: [&str; 4] = [
     "crates/fsqlite-core/src/connection.rs",
     "crates/fsqlite-planner/src/codegen.rs",
     "crates/fsqlite-vdbe/src/codegen.rs",
@@ -272,6 +274,27 @@ fn declared_stub_kinds(source_patterns: &[String]) -> BTreeSet<StubKind> {
         "runtime-stub source-pattern metadata must not be empty"
     );
     kinds
+}
+
+fn validate_scan_scope(meta: &InventoryMeta) {
+    let declared_kinds = declared_stub_kinds(&meta.source_patterns);
+    let required_kinds = StubKind::all().into_iter().collect();
+    assert_eq!(
+        declared_kinds, required_kinds,
+        "runtime-stub source-pattern metadata must declare every supported marker kind"
+    );
+
+    let declared_files: BTreeSet<&str> = meta.scanned_files.iter().map(String::as_str).collect();
+    assert_eq!(
+        declared_files.len(),
+        meta.scanned_files.len(),
+        "runtime-stub scanned-files metadata must not contain duplicates"
+    );
+    let required_files: BTreeSet<&str> = REQUIRED_SCANNED_FILES.into_iter().collect();
+    assert_eq!(
+        declared_files, required_files,
+        "runtime-stub scanned-files metadata must exactly match the independently reviewed scan scope"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -837,10 +860,56 @@ fn inventory_meta_contract_matches_bead() {
     assert!(!doc.meta.contract_owner.trim().is_empty());
     assert_eq!(doc.meta.inventory_scope, "runtime-items-excluding-cfg-test");
     assert_eq!(doc.meta.identity_model, IDENTITY_MODEL);
-    assert!(!doc.meta.source_patterns.is_empty());
     assert!(!doc.meta.parity_critical_severities.is_empty());
-    assert!(!doc.meta.scanned_files.is_empty());
     assert!(doc.meta.next_active_id > 0);
+    validate_scan_scope(&doc.meta);
+}
+
+#[test]
+fn scan_scope_metadata_cannot_self_modify() {
+    for kind in StubKind::all() {
+        let mut missing_kind = load_inventory();
+        missing_kind
+            .meta
+            .source_patterns
+            .retain(|pattern| pattern != kind.marker());
+        assert!(
+            std::panic::catch_unwind(|| validate_scan_scope(&missing_kind.meta)).is_err(),
+            "dropping supported marker kind {kind:?} must fail the inventory contract"
+        );
+    }
+
+    for required_file in REQUIRED_SCANNED_FILES {
+        let mut missing_file = load_inventory();
+        missing_file
+            .meta
+            .scanned_files
+            .retain(|file| file != required_file);
+        assert!(
+            std::panic::catch_unwind(|| validate_scan_scope(&missing_file.meta)).is_err(),
+            "dropping required source file {required_file:?} must fail the inventory contract"
+        );
+    }
+
+    let mut duplicate_file = load_inventory();
+    duplicate_file
+        .meta
+        .scanned_files
+        .push(REQUIRED_SCANNED_FILES[0].to_owned());
+    assert!(
+        std::panic::catch_unwind(|| validate_scan_scope(&duplicate_file.meta)).is_err(),
+        "duplicating a required source file must fail the inventory contract"
+    );
+
+    let mut unreviewed_file = load_inventory();
+    unreviewed_file
+        .meta
+        .scanned_files
+        .push("crates/fsqlite-core/src/lib.rs".to_owned());
+    assert!(
+        std::panic::catch_unwind(|| validate_scan_scope(&unreviewed_file.meta)).is_err(),
+        "adding an unreviewed source file must fail the inventory contract"
+    );
 }
 
 #[test]
@@ -1416,7 +1485,7 @@ fn render_inventory_toml(existing: &InventoryDocument) -> String {
     // Preserve existing metadata, classifications, IDs, and resolved history;
     // refresh source hints and append only genuinely new fingerprints.
     let scan_files: Vec<String> = if existing.meta.scanned_files.is_empty() {
-        BOOTSTRAP_SCANNED_FILES
+        REQUIRED_SCANNED_FILES
             .iter()
             .map(|s| (*s).to_owned())
             .collect()
