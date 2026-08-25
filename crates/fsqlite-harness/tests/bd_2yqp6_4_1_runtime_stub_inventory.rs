@@ -277,23 +277,85 @@ fn declared_stub_kinds(source_patterns: &[String]) -> BTreeSet<StubKind> {
     kinds
 }
 
-fn cfg_expression_requires_test(meta: &Meta) -> bool {
+#[derive(Clone, Copy)]
+struct CfgPossibilities {
+    can_be_false: bool,
+    can_be_true: bool,
+}
+
+/// Conservatively evaluate a cfg expression with `test = false` while treating
+/// every other predicate as unknown. Over-approximating unknown predicates is
+/// intentional: the scanner may include dead code, but it must never hide code
+/// that could be compiled in a production configuration.
+fn cfg_possibilities_without_test(meta: &Meta) -> CfgPossibilities {
     match meta {
-        Meta::Path(path) => path.is_ident("test"),
+        Meta::Path(path) if path.is_ident("test") => CfgPossibilities {
+            can_be_false: true,
+            can_be_true: false,
+        },
         Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
             let terms = list
                 .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
                 .unwrap_or_else(|error| panic!("failed to parse cfg expression: {error}"));
             if list.path.is_ident("all") {
-                terms.iter().any(cfg_expression_requires_test)
+                terms.iter().fold(
+                    CfgPossibilities {
+                        can_be_false: false,
+                        can_be_true: true,
+                    },
+                    |possibilities, term| {
+                        let term = cfg_possibilities_without_test(term);
+                        CfgPossibilities {
+                            can_be_false: possibilities.can_be_false || term.can_be_false,
+                            can_be_true: possibilities.can_be_true && term.can_be_true,
+                        }
+                    },
+                )
             } else {
-                !terms.is_empty() && terms.iter().all(cfg_expression_requires_test)
+                terms.iter().fold(
+                    CfgPossibilities {
+                        can_be_false: true,
+                        can_be_true: false,
+                    },
+                    |possibilities, term| {
+                        let term = cfg_possibilities_without_test(term);
+                        CfgPossibilities {
+                            can_be_false: possibilities.can_be_false && term.can_be_false,
+                            can_be_true: possibilities.can_be_true || term.can_be_true,
+                        }
+                    },
+                )
             }
         }
-        // `not(test)` is specifically enabled outside tests, and an unknown
-        // predicate must remain in scope rather than being hidden by the gate.
-        Meta::List(_) | Meta::NameValue(_) => false,
+        Meta::List(list) if list.path.is_ident("not") => {
+            let terms = list
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .unwrap_or_else(|error| panic!("failed to parse cfg expression: {error}"));
+            assert_eq!(
+                terms.len(),
+                1,
+                "cfg(not(...)) must contain exactly one expression"
+            );
+            let inner = cfg_possibilities_without_test(
+                terms
+                    .first()
+                    .expect("cfg(not(...)) expression count was checked"),
+            );
+            CfgPossibilities {
+                can_be_false: inner.can_be_true,
+                can_be_true: inner.can_be_false,
+            }
+        }
+        // Unknown predicates stay conservatively in scope.
+        Meta::Path(_) | Meta::List(_) | Meta::NameValue(_) => CfgPossibilities {
+            can_be_false: true,
+            can_be_true: true,
+        },
     }
+}
+
+fn cfg_expression_requires_test(meta: &Meta) -> bool {
+    !cfg_possibilities_without_test(meta).can_be_true
 }
 
 fn is_cfg_test(attrs: &[Attribute]) -> bool {
@@ -1174,6 +1236,14 @@ fn test_only() { let _ = CodegenError::Unsupported("test-only".into()); }
 fn test_only_on_unix() { let _ = CodegenError::Unsupported("test-only-unix".into()); }
 #[cfg(any(test, feature = "fixture-live"))]
 fn live_in_a_feature_build() { let _ = CodegenError::Unsupported("feature-or-test".into()); }
+#[cfg(not(test))]
+fn live_outside_tests() { let _ = CodegenError::Unsupported("not-test".into()); }
+#[cfg(not(not(test)))]
+fn nested_test_only() { let _ = CodegenError::Unsupported("nested-test-only".into()); }
+#[cfg(not(any(not(test), feature = "fixture-live")))]
+fn nested_test_only_when_feature_is_off() { let _ = CodegenError::Unsupported("nested-test-only-feature-off".into()); }
+#[cfg(not(all(test, feature = "fixture-live")))]
+fn live_when_test_is_off() { let _ = CodegenError::Unsupported("not-all-test-feature".into()); }
 fn after() { let _ = CodegenError::Unsupported("after".into()); }
 "##;
     let markers = scan_source_markers("fixture.rs", src, &unsupported_only());
@@ -1182,7 +1252,13 @@ fn after() { let _ = CodegenError::Unsupported("after".into()); }
             .iter()
             .map(|marker| marker.payload.as_str())
             .collect::<Vec<_>>(),
-        ["before", "feature-or-test", "after"]
+        [
+            "before",
+            "feature-or-test",
+            "not-test",
+            "not-all-test-feature",
+            "after"
+        ]
     );
 }
 
