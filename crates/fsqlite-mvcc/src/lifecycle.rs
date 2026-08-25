@@ -3408,9 +3408,15 @@ mod tests {
         checksum
     }
 
+    /// Wall-clock microbenchmark for range-read tracking overhead.
+    ///
+    /// Run manually on a quiet host with:
+    /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
+    ///    test_range_scan_tracking_overhead_microbench --ignored --nocapture`
     #[test]
+    #[ignore = "microbench — run manually on a quiet host"]
     #[allow(clippy::cast_precision_loss)]
-    fn test_range_scan_tracking_overhead_under_five_percent() {
+    fn test_range_scan_tracking_overhead_microbench() {
         const START_PAGE: u32 = 100;
         const END_PAGE: u32 = 227;
         const ITERATIONS: u32 = 24;
