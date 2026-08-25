@@ -270,7 +270,8 @@ use fsqlite_mvcc::{
     finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
     morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
     prepare_concurrent_commit_with_ssi, record_registry_commit_lock_hold,
-    record_registry_commit_lock_wait, ssi_metrics_snapshot,
+    record_registry_commit_lock_hold_decomposed, record_registry_commit_lock_wait,
+    ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -56570,7 +56571,13 @@ impl Connection {
                     &pending_conflict_pages,
                     schema_change_boundary,
                 ) {
-                    Ok(plan) => plan,
+                    Ok(plan) => {
+                        // bd-i0tn6 GATE: end of the under-lock validate/reserve
+                        // phase. Physical write (`txn.commit`) is next, still
+                        // under this same guard.
+                        registry.mark_validate_done();
+                        plan
+                    }
                     Err(e) => {
                         drop(commit_registry_guard.take());
                         self.abort_current_concurrent_session();
@@ -56832,6 +56839,14 @@ impl Connection {
             let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
             match txn.commit(cx).await {
                 Ok(()) => {
+                    // bd-i0tn6 GATE: end of the under-lock physical write phase.
+                    // Marked first so the io/publish boundary is the moment the
+                    // pager/WAL write returned, before any publish bookkeeping.
+                    // Guard is Some only on the concurrent-write path (the same
+                    // path that set `mark_validate_done`); None exits skip this.
+                    if let Some(g) = commit_registry_guard.as_mut() {
+                        g.mark_io_done();
+                    }
                     record_hot_path_duration(
                         &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                         commit_txn_roundtrip_start,
@@ -68635,11 +68650,15 @@ impl Connection {
                 None
             };
             let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                self.plan_concurrent_commit_with_registry(
+                let plan = self.plan_concurrent_commit_with_registry(
                     registry,
                     &pending_conflict_pages,
                     schema_cookie_to_publish.is_some(),
-                )?
+                )?;
+                // bd-i0tn6 GATE: end of the under-lock validate/reserve phase.
+                // Physical write (`txn.commit`) is next, still under this guard.
+                registry.mark_validate_done();
+                plan
             } else {
                 None
             };
@@ -68708,6 +68727,10 @@ impl Connection {
                                 &pending_conflict_pages,
                                 schema_cookie_to_publish.is_some(),
                             )?;
+                            // bd-i0tn6 GATE: re-validate under the re-acquired
+                            // guard after the busy back-off; end of P1 for the
+                            // retried attempt.
+                            registry.mark_validate_done();
                             commit_registry_guard = Some(registry);
                         }
                         commit_res = {
@@ -68780,6 +68803,16 @@ impl Connection {
                 &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                 commit_txn_roundtrip_start,
             );
+            // bd-i0tn6 GATE: end of the under-lock physical write phase —
+            // `commit_res` is resolved Ok through the busy-retry + in-doubt
+            // loops above. Publish (finalize + visibility flip) follows under
+            // the same guard until Drop. Guard is Some only on the
+            // concurrent-write path that also set `mark_validate_done`.
+            if commit_res.is_ok() {
+                if let Some(g) = commit_registry_guard.as_mut() {
+                    g.mark_io_done();
+                }
+            }
 
             // Feed the conformal calibration ring on the successful-commit
             // path.  The measured span covers the BUSY retry loop as well
@@ -108454,6 +108487,32 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct TimedRegistryCommitGuard<'a> {
     guard: std::sync::MutexGuard<'a, ConcurrentRegistry>,
     acquired_at: Instant,
+    // bd-i0tn6 GATE decomposition marks. `validate_done_at` is stamped by
+    // `mark_validate_done` after `plan_concurrent_commit_with_registry` returns
+    // Ok (end of the under-lock validate/reserve phase); `io_done_at` by
+    // `mark_io_done` after `txn.commit` returns Ok (end of the under-lock
+    // physical WAL/pager write). When BOTH are set at Drop, the hold splits into
+    // validate = validate_done - acquired, io = io_done - validate_done,
+    // publish = drop - io_done. These marks are pure observation: they do not
+    // change when the guard is released, so the validate → write → publish
+    // TOCTOU window the guard protects is byte-for-byte unchanged.
+    validate_done_at: Option<Instant>,
+    io_done_at: Option<Instant>,
+}
+
+impl TimedRegistryCommitGuard<'_> {
+    /// End of the under-lock validate/reserve phase (P1).
+    #[inline]
+    fn mark_validate_done(&mut self) {
+        self.validate_done_at = Some(Instant::now());
+    }
+
+    /// End of the under-lock physical write phase (P2); publish (P4) follows
+    /// until Drop.
+    #[inline]
+    fn mark_io_done(&mut self) {
+        self.io_done_at = Some(Instant::now());
+    }
 }
 
 impl std::ops::Deref for TimedRegistryCommitGuard<'_> {
@@ -108472,8 +108531,22 @@ impl std::ops::DerefMut for TimedRegistryCommitGuard<'_> {
 
 impl Drop for TimedRegistryCommitGuard<'_> {
     fn drop(&mut self) {
-        let hold_ns = u64::try_from(self.acquired_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let dropped_at = Instant::now();
+        let hold_ns =
+            u64::try_from(dropped_at.duration_since(self.acquired_at).as_nanos()).unwrap_or(u64::MAX);
         record_registry_commit_lock_hold(hold_ns);
+        // Decompose only when the happy concurrent-write path reached both
+        // marks; error/non-concurrent exits leave them None and contribute to
+        // the total hold above only.
+        if let (Some(validate_done), Some(io_done)) = (self.validate_done_at, self.io_done_at) {
+            let validate_ns = u64::try_from(validate_done.duration_since(self.acquired_at).as_nanos())
+                .unwrap_or(u64::MAX);
+            let io_ns =
+                u64::try_from(io_done.duration_since(validate_done).as_nanos()).unwrap_or(u64::MAX);
+            let publish_ns =
+                u64::try_from(dropped_at.duration_since(io_done).as_nanos()).unwrap_or(u64::MAX);
+            record_registry_commit_lock_hold_decomposed(validate_ns, io_ns, publish_ns);
+        }
     }
 }
 
@@ -108487,6 +108560,8 @@ fn lock_registry_for_commit(registry: &Mutex<ConcurrentRegistry>) -> TimedRegist
         // Start the hold clock after publishing the wait sample so the two
         // intervals remain disjoint.
         acquired_at: Instant::now(),
+        validate_done_at: None,
+        io_done_at: None,
     }
 }
 

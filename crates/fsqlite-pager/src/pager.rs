@@ -55180,7 +55180,6 @@ mod tests {
                 self.inner.write(cx, buf, offset).await
             }
         }
-
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
             self.inner.truncate(cx, size)
         }
