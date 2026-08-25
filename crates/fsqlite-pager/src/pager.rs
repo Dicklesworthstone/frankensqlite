@@ -27006,7 +27006,9 @@ mod tests {
     // compile the pre-500fd6d74 `expect_err` form of a recovery test.
     impl std::fmt::Debug for SimplePager<MemoryVfs> {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.debug_struct("SimplePager").finish_non_exhaustive()
+            formatter
+                .debug_struct("SimplePager")
+                .finish_non_exhaustive()
         }
     }
     use std::sync::{Arc, Mutex, Weak};
@@ -33879,8 +33881,7 @@ mod tests {
                 None,
             )
             .await
-            .err()
-            .expect("external multi-section journal must be refused");
+            .expect_err("external multi-section journal must be refused");
             assert!(matches!(error, FrankenError::Unsupported));
 
             let (mut after_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
