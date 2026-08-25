@@ -234244,6 +234244,52 @@ mod pager_routing_tests {
         });
     }
 
+    /// A built filter that cannot record a successful table INSERT must be
+    /// disabled before consultation can mistake the new row for absent.
+    #[test]
+    fn test_quotient_filter_insert_capacity_exhaustion_disables_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let root_page = 2;
+            conn.quotient_filters.borrow_mut().insert(
+                root_page,
+                QuotientFilterEntry {
+                    filter: QuotientFilter::new(2, 58).unwrap(),
+                    built: true,
+                    too_large_to_build: false,
+                    modified_in_txn: false,
+                },
+            );
+            conn.quotient_filters_may_have_entries.set(true);
+
+            // Four slots permit sixteen entries before insert() rejects the
+            // next hash. Use wide fingerprints so this guard cannot be masked
+            // by a false positive for the rejected rowid.
+            for rowid in 0..16 {
+                conn.qf_record_insert(root_page, rowid);
+            }
+            let rejected_hash = quotient_filter_hash_rowid(16);
+            {
+                let filters = conn.quotient_filters.borrow();
+                let entry = filters.get(&root_page).unwrap();
+                assert_eq!(entry.filter.len(), 16);
+                assert!(entry.built);
+                assert!(!entry.filter.contains(rejected_hash));
+            }
+
+            conn.qf_record_insert(root_page, 16);
+
+            let filters = conn.quotient_filters.borrow();
+            let entry = filters.get(&root_page).unwrap();
+            assert!(
+                !entry.built,
+                "a built filter missing a committed row can cause a false negative"
+            );
+            assert!(entry.too_large_to_build);
+            assert!(entry.filter.is_empty());
+        });
+    }
+
     /// IMPL-9a regression guard: INSERT under a transaction, ROLLBACK the
     /// transaction, then DELETE the same rowid. With quotient-filter
     /// consultation disabled, no stale filter state may short-circuit the
