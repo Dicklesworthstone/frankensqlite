@@ -270,7 +270,8 @@ use fsqlite_mvcc::{
     finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
     morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
     prepare_concurrent_commit_with_ssi, record_registry_commit_lock_hold,
-    record_registry_commit_lock_wait, ssi_metrics_snapshot,
+    record_registry_commit_lock_hold_decomposed, record_registry_commit_lock_wait,
+    ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -56490,7 +56491,12 @@ impl Connection {
                     &pending_conflict_pages,
                     schema_change_boundary,
                 ) {
-                    Ok(plan) => plan,
+                    Ok(plan) => {
+                        // End of the under-lock validate/reserve phase. The
+                        // physical write follows while this guard remains held.
+                        registry.mark_validate_done();
+                        plan
+                    }
                     Err(e) => {
                         drop(commit_registry_guard.take());
                         self.abort_current_concurrent_session();
@@ -56745,6 +56751,11 @@ impl Connection {
             let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
             match txn.commit(cx).await {
                 Ok(()) => {
+                    // End of the under-lock physical write phase. Publication
+                    // follows while this same guard remains held.
+                    if let Some(guard) = commit_registry_guard.as_mut() {
+                        guard.mark_io_done();
+                    }
                     record_hot_path_duration(
                         &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                         commit_txn_roundtrip_start,
@@ -68526,11 +68537,15 @@ impl Connection {
                 None
             };
             let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                self.plan_concurrent_commit_with_registry(
+                let plan = self.plan_concurrent_commit_with_registry(
                     registry,
                     &pending_conflict_pages,
                     schema_cookie_to_publish.is_some(),
-                )?
+                )?;
+                // End of the under-lock validate/reserve phase. The physical
+                // write follows while this guard remains held.
+                registry.mark_validate_done();
+                plan
             } else {
                 None
             };
@@ -68599,6 +68614,9 @@ impl Connection {
                                 &pending_conflict_pages,
                                 schema_cookie_to_publish.is_some(),
                             )?;
+                            // This re-acquired guard has its own phase clock, so
+                            // mark validation again after the retry re-plan.
+                            registry.mark_validate_done();
                             commit_registry_guard = Some(registry);
                         }
                         commit_res = {
@@ -68671,6 +68689,13 @@ impl Connection {
                 &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                 commit_txn_roundtrip_start,
             );
+            // A successful result means the physical commit reached a durable
+            // terminal state, including the in-doubt recovery loop above.
+            if commit_res.is_ok() {
+                if let Some(guard) = commit_registry_guard.as_mut() {
+                    guard.mark_io_done();
+                }
+            }
 
             // Feed the conformal calibration ring on the successful-commit
             // path.  The measured span covers the BUSY retry loop as well
@@ -108286,6 +108311,22 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct TimedRegistryCommitGuard<'a> {
     guard: std::sync::MutexGuard<'a, ConcurrentRegistry>,
     acquired_at: Instant,
+    validate_done_at: Option<Instant>,
+    io_done_at: Option<Instant>,
+}
+
+impl TimedRegistryCommitGuard<'_> {
+    /// Mark the end of the under-lock validate/reserve phase.
+    #[inline]
+    fn mark_validate_done(&mut self) {
+        self.validate_done_at = Some(Instant::now());
+    }
+
+    /// Mark the end of the under-lock physical write phase.
+    #[inline]
+    fn mark_io_done(&mut self) {
+        self.io_done_at = Some(Instant::now());
+    }
 }
 
 impl std::ops::Deref for TimedRegistryCommitGuard<'_> {
@@ -108304,8 +108345,21 @@ impl std::ops::DerefMut for TimedRegistryCommitGuard<'_> {
 
 impl Drop for TimedRegistryCommitGuard<'_> {
     fn drop(&mut self) {
-        let hold_ns = u64::try_from(self.acquired_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let dropped_at = Instant::now();
+        let hold_ns =
+            u64::try_from(dropped_at.duration_since(self.acquired_at).as_nanos()).unwrap_or(u64::MAX);
         record_registry_commit_lock_hold(hold_ns);
+        // Error and non-concurrent exits may not reach both marks; they still
+        // contribute to the authoritative total-hold counters above.
+        if let (Some(validate_done), Some(io_done)) = (self.validate_done_at, self.io_done_at) {
+            let validate_ns = u64::try_from(validate_done.duration_since(self.acquired_at).as_nanos())
+                .unwrap_or(u64::MAX);
+            let io_ns =
+                u64::try_from(io_done.duration_since(validate_done).as_nanos()).unwrap_or(u64::MAX);
+            let publish_ns =
+                u64::try_from(dropped_at.duration_since(io_done).as_nanos()).unwrap_or(u64::MAX);
+            record_registry_commit_lock_hold_decomposed(validate_ns, io_ns, publish_ns);
+        }
     }
 }
 
@@ -108319,6 +108373,8 @@ fn lock_registry_for_commit(registry: &Mutex<ConcurrentRegistry>) -> TimedRegist
         // Start the hold clock after publishing the wait sample so the two
         // intervals remain disjoint.
         acquired_at: Instant::now(),
+        validate_done_at: None,
+        io_done_at: None,
     }
 }
 

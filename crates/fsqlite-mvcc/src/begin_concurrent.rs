@@ -80,6 +80,26 @@ static REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL: std::sync::atomic::AtomicU64 =
 static REGISTRY_COMMIT_LOCK_HOLD_NS_MAX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// bd-i0tn6 GATE instrumentation: decompose the single guard HOLD into its three
+// sub-phases so the ledger can attribute the convoy to validate/reserve vs the
+// physical WAL/pager write vs publish. Only the happy concurrent-write commit
+// path (plan present -> txn.commit Ok -> finalize) records a decomposition;
+// error and non-concurrent exits still record the total HOLD above but leave
+// these at zero. The `io` fraction of the hold is the portion S3 (move physical
+// write outside the lock) can recover -- measuring it is the prerequisite for
+// admitting that change. This is telemetry ONLY: the guard still spans
+// validate -> write -> publish exactly as before (TOCTOU coverage unchanged).
+static REGISTRY_COMMIT_LOCK_DECOMPOSED_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_VALIDATE_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_IO_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_IO_NS_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn registry_metric_update_max(metric: &std::sync::atomic::AtomicU64, val: u64) {
     use std::sync::atomic::Ordering;
     let mut prev = metric.load(Ordering::Relaxed);
@@ -104,6 +124,23 @@ pub struct RegistryCommitLockMetrics {
     pub hold_ns_total: u64,
     /// Worst single hold.
     pub hold_ns_max: u64,
+    /// Number of holds that recorded a validate/io/publish decomposition.
+    ///
+    /// Error and non-concurrent exits count toward `holds_total` and
+    /// `hold_ns_total`, but not this subset. Decomposition means must therefore
+    /// use `decomposed_holds` as their denominator.
+    pub decomposed_holds: u64,
+    /// Total time spent in the under-lock validate/reserve phase.
+    pub validate_ns_total: u64,
+    /// Total time spent in the under-lock physical write phase.
+    ///
+    /// This covers `txn.commit` (WAL append plus pager write) and is the portion
+    /// that the bd-i0tn6 S3 candidate would move outside the guard.
+    pub io_ns_total: u64,
+    /// Worst single under-lock physical-write phase.
+    pub io_ns_max: u64,
+    /// Total time spent in the under-lock publish phase.
+    pub publish_ns_total: u64,
 }
 
 /// Read the commit-path registry lock counters.
@@ -116,6 +153,11 @@ pub fn registry_commit_lock_metrics() -> RegistryCommitLockMetrics {
         wait_ns_max: REGISTRY_COMMIT_LOCK_WAIT_NS_MAX.load(Ordering::Relaxed),
         hold_ns_total: REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.load(Ordering::Relaxed),
         hold_ns_max: REGISTRY_COMMIT_LOCK_HOLD_NS_MAX.load(Ordering::Relaxed),
+        decomposed_holds: REGISTRY_COMMIT_LOCK_DECOMPOSED_HOLDS.load(Ordering::Relaxed),
+        validate_ns_total: REGISTRY_COMMIT_LOCK_VALIDATE_NS_TOTAL.load(Ordering::Relaxed),
+        io_ns_total: REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.load(Ordering::Relaxed),
+        io_ns_max: REGISTRY_COMMIT_LOCK_IO_NS_MAX.load(Ordering::Relaxed),
+        publish_ns_total: REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -127,6 +169,11 @@ pub fn reset_registry_commit_lock_metrics() {
     REGISTRY_COMMIT_LOCK_WAIT_NS_MAX.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_HOLD_NS_MAX.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_DECOMPOSED_HOLDS.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_VALIDATE_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_IO_NS_MAX.store(0, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.store(0, Ordering::Relaxed);
 }
 
 /// Record one commit-path registry guard acquisition: how long the committer
@@ -143,6 +190,21 @@ pub fn record_registry_commit_lock_hold(hold_ns: u64) {
     use std::sync::atomic::Ordering;
     REGISTRY_COMMIT_LOCK_HOLD_NS_TOTAL.fetch_add(hold_ns, Ordering::Relaxed);
     registry_metric_update_max(&REGISTRY_COMMIT_LOCK_HOLD_NS_MAX, hold_ns);
+}
+
+/// Record the validate/write/publish decomposition of one commit guard hold.
+///
+/// This is called in addition to [`record_registry_commit_lock_hold`] only for
+/// concurrent-write commits that reach both phase boundaries. The aggregate
+/// hold counters therefore remain authoritative for all paths, while these
+/// sub-totals describe the steady-state successful path.
+pub fn record_registry_commit_lock_hold_decomposed(validate_ns: u64, io_ns: u64, publish_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_COMMIT_LOCK_DECOMPOSED_HOLDS.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_VALIDATE_NS_TOTAL.fetch_add(validate_ns, Ordering::Relaxed);
+    REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.fetch_add(io_ns, Ordering::Relaxed);
+    registry_metric_update_max(&REGISTRY_COMMIT_LOCK_IO_NS_MAX, io_ns);
+    REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.fetch_add(publish_ns, Ordering::Relaxed);
 }
 
 #[inline]
@@ -3937,7 +3999,10 @@ mod tests {
         concurrent_stage_prepared_write_marker, concurrent_track_write_conflict_page,
         concurrent_write_metadata_page, concurrent_write_page,
         finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-        same_txn_identity, summarize_witness_keys, validate_first_committer_wins, witness_is_page,
+        record_registry_commit_lock_hold, record_registry_commit_lock_hold_decomposed,
+        record_registry_commit_lock_wait, registry_commit_lock_metrics,
+        reset_registry_commit_lock_metrics, same_txn_identity, summarize_witness_keys,
+        validate_first_committer_wins, witness_is_page,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -3960,6 +4025,40 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    #[test]
+    fn registry_commit_lock_metrics_include_phase_decomposition() {
+        reset_registry_commit_lock_metrics();
+
+        record_registry_commit_lock_wait(7);
+        record_registry_commit_lock_hold(30);
+        record_registry_commit_lock_hold_decomposed(10, 15, 5);
+
+        let metrics = registry_commit_lock_metrics();
+        assert_eq!(metrics.holds_total, 1);
+        assert_eq!(metrics.wait_ns_total, 7);
+        assert_eq!(metrics.wait_ns_max, 7);
+        assert_eq!(metrics.hold_ns_total, 30);
+        assert_eq!(metrics.hold_ns_max, 30);
+        assert_eq!(metrics.decomposed_holds, 1);
+        assert_eq!(metrics.validate_ns_total, 10);
+        assert_eq!(metrics.io_ns_total, 15);
+        assert_eq!(metrics.io_ns_max, 15);
+        assert_eq!(metrics.publish_ns_total, 5);
+
+        reset_registry_commit_lock_metrics();
+        let reset = registry_commit_lock_metrics();
+        assert_eq!(reset.holds_total, 0);
+        assert_eq!(reset.wait_ns_total, 0);
+        assert_eq!(reset.wait_ns_max, 0);
+        assert_eq!(reset.hold_ns_total, 0);
+        assert_eq!(reset.hold_ns_max, 0);
+        assert_eq!(reset.decomposed_holds, 0);
+        assert_eq!(reset.validate_ns_total, 0);
+        assert_eq!(reset.io_ns_total, 0);
+        assert_eq!(reset.io_ns_max, 0);
+        assert_eq!(reset.publish_ns_total, 0);
     }
 
     const MVCC_METAMORPHIC_PROPTEST_CASES: u32 = 64;
