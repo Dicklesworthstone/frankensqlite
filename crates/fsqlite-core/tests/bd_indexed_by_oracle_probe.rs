@@ -142,5 +142,73 @@ fn indexed_by_matches_rusqlite_oracle() {
             diffs.len(),
             diffs.join("\n")
         );
+        f.close().await.expect("close FrankenSQLite oracle");
+    });
+}
+
+#[test]
+fn gh381_composite_equality_prefix_serves_order_by_without_sorter() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE quotes(quote_id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, observed_at TEXT NOT NULL, payload TEXT)",
+            "CREATE INDEX idx_quotes_symbol ON quotes(symbol ASC, observed_at DESC)",
+            "CREATE INDEX idx_quotes_observed_at ON quotes(observed_at)",
+            "INSERT INTO quotes VALUES (1,'ABC','2026-01-01','a'),(2,'ABC','2026-01-03','b'),(3,'ABC','2026-01-02','c'),(4,'XYZ','2026-01-04','d')",
+        ] {
+            ex(&f, &r, sql).await;
+        }
+
+        for query in [
+            "SELECT quote_id FROM quotes WHERE symbol='ABC' ORDER BY observed_at DESC LIMIT 2",
+            "SELECT quote_id FROM quotes WHERE symbol='ABC' ORDER BY observed_at ASC LIMIT 2",
+            "SELECT quote_id FROM quotes INDEXED BY idx_quotes_symbol WHERE symbol='ABC' ORDER BY observed_at DESC LIMIT 2",
+        ] {
+            assert_eq!(fq(&f, query).await, rq(&r, query), "row divergence for {query}");
+
+            let details = fq(&f, &format!("EXPLAIN QUERY PLAN {query}")).await;
+            let flattened = details
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let has_composite_search = details.iter().flatten().any(|field| {
+                field.contains("SEARCH") && field.contains("idx_quotes_symbol")
+            });
+            assert!(
+                has_composite_search,
+                "the equality prefix must search the composite index for {query}, got {details:?}"
+            );
+            assert!(
+                !flattened.contains("TEMP B-TREE"),
+                "the ordered index must eliminate the sorter for {query}, got {details:?}"
+            );
+        }
+
+        let not_indexed = "SELECT quote_id FROM quotes NOT INDEXED WHERE symbol='ABC' ORDER BY observed_at DESC LIMIT 2";
+        assert_eq!(
+            fq(&f, not_indexed).await,
+            rq(&r, not_indexed),
+            "NOT INDEXED row divergence"
+        );
+        let not_indexed_details = fq(&f, &format!("EXPLAIN QUERY PLAN {not_indexed}")).await;
+        let not_indexed_plan = not_indexed_details
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !not_indexed_plan.contains("idx_quotes_symbol"),
+            "NOT INDEXED must forbid the composite index, got {not_indexed_details:?}"
+        );
+        assert!(
+            not_indexed_plan.contains("TEMP B-TREE"),
+            "NOT INDEXED must retain the ORDER BY sorter, got {not_indexed_details:?}"
+        );
+
+        f.close().await.expect("close FrankenSQLite GH#381 oracle");
     });
 }

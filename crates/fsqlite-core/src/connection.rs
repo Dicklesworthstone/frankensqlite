@@ -89884,14 +89884,25 @@ impl Connection {
 
                 let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
                 if let Ok(program) = self.compile_table_select(select).await {
-                    // bd-2dgf5 / bd-jyyae: the planner produces no directive for an
-                    // aggregate, and the generic bytecode explain below cannot express
-                    // a seek at all — it renders every `OpenRead` as a `SCAN`. So an
-                    // aggregate served by the index seek printed `SCAN t` for a program
-                    // whose first act is `SeekGE`. Read the access path off the program.
-                    if let Some(seek) = crate::explain::aggregate_index_seek_facts(&program)
+                    // bd-2dgf5 / bd-jyyae / GH#381: some safe codegen paths have no
+                    // planner directive, and generic bytecode explain renders every
+                    // `OpenRead` as a `SCAN`. Read SEARCH vs SCAN from the emitted
+                    // program instead: a named index is searched exactly when a Seek*
+                    // opcode positions its cursor.
+                    let simple_top_level_select = select.with.is_none()
+                        && select.body.compounds.is_empty()
+                        && !select_contains_subquery_matching(select, self, |_, _| true);
+                    let index_seek = if select_core_is_aggregate(&select.body.select) {
+                        crate::explain::aggregate_index_seek_facts(&program)
+                    } else if select.order_by.is_empty() {
+                        None
+                    } else {
+                        crate::explain::program_index_seek_facts(&program)
+                    };
+                    if simple_top_level_select
+                        && let Some(seek) = index_seek
                         && let Some(detail) =
-                            aggregate_index_seek_eqp_detail(select, &seek, &self.schema.borrow())
+                            index_seek_eqp_detail(select, &seek, &self.schema.borrow())
                     {
                         return vec![to_row(2, 0, 0, detail)];
                     }
@@ -123919,7 +123930,7 @@ fn first_source_eqp_detail_from_table_or_subquery(source: &TableOrSubquery) -> O
     }
 }
 
-/// `EXPLAIN QUERY PLAN` detail for an aggregate whose emitted program seeks an index.
+/// `EXPLAIN QUERY PLAN` detail for a program that seeks an index.
 ///
 /// bd-2dgf5 / bd-jyyae. The *decision* — SEARCH vs SCAN, COVERING vs not — arrives in
 /// `seek`, having been read off the opcodes the program will actually run. Only the
@@ -123927,20 +123938,30 @@ fn first_source_eqp_detail_from_table_or_subquery(source: &TableOrSubquery) -> O
 /// key column from the schema. Nothing in this function re-decides the access path,
 /// which is the whole point: a second copy of codegen's gates is exactly how EQP text
 /// and the emitted program drift apart.
-fn aggregate_index_seek_eqp_detail(
+fn index_seek_eqp_detail(
     select: &SelectStatement,
-    seek: &crate::explain::AggregateIndexSeek,
+    seek: &crate::explain::IndexSeek,
     schema: &[TableSchema],
 ) -> Option<String> {
     let SelectCore::Select { from, .. } = &select.body.select else {
         return None;
     };
-    let TableOrSubquery::Table { name, alias, .. } = &from.as_ref()?.source else {
+    let from = from.as_ref()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
         return None;
     };
     let table = schema
         .iter()
         .find(|candidate| candidate.name.eq_ignore_ascii_case(&name.name))?;
+    // WITHOUT ROWID secondary-index lookups seek the table by the stored
+    // primary-key suffix rather than `IdxRowid` -> `SeekRowid`. The compact
+    // opcode fact deliberately does not infer covering status for that shape.
+    if table.without_rowid {
+        return None;
+    }
     let index = table
         .indexes
         .iter()

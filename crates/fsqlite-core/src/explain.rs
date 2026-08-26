@@ -229,40 +229,35 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
     rows
 }
 
-/// The index access path an aggregate program actually executes.
+/// An index access path that an emitted program actually executes.
 ///
 /// bd-2dgf5 / bd-jyyae.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AggregateIndexSeek {
+pub struct IndexSeek {
     /// Name of the index the program seeks.
     pub index_name: String,
-    /// True when the seek satisfies every aggregate from the index entry alone,
-    /// i.e. the program never looks the row up in the table.
+    /// True when the result can be satisfied from the index entry alone, i.e.
+    /// the program never looks the row up in the table.
     pub covering: bool,
 }
 
-/// Read an aggregate's index access path off the *emitted program*.
+/// Read an index access path off the *emitted program*.
 ///
-/// bd-2dgf5 / bd-jyyae. `EXPLAIN QUERY PLAN` normally renders from the planner
-/// directive, and `planner_select_directive_with_stats` refuses to produce one for
-/// an aggregate — so an aggregate that seeks used to print `SCAN t`. The obvious
-/// repair, re-checking in the EQP path the same conditions codegen checked, is the
-/// bug bd-jyyae is about: the two copies drift, and then EQP confidently describes
-/// a plan the program never runs (it once reported `SEARCH` for an `IN (...)` whose
-/// program was a bare `Rewind`/`Next` scan).
+/// bd-2dgf5 / bd-jyyae / GH#381. `EXPLAIN QUERY PLAN` normally renders from the
+/// planner directive, but some safe codegen paths have no directive (aggregates
+/// and ORDER BY index bypasses). Re-checking the same source-level gates in the
+/// EQP path is unsafe because those copies drift: EQP once reported `SEARCH` for
+/// an `IN (...)` whose emitted program was a bare `Rewind`/`Next` scan.
 ///
 /// So decide nothing here. An index cursor is SEARCHed exactly when a `Seek*`
 /// positions it, and the index is COVERING exactly when no `IdxRowid` on that cursor
 /// feeds a `SeekRowid` into the table. Both facts are properties of the opcodes.
 ///
-/// Returns `None` unless the program is an aggregate (`AggStep`) driven by exactly
-/// one seeked index cursor; every other shape keeps the existing EQP rendering.
+/// Returns `None` unless exactly one index cursor is positioned by a key seek;
+/// ambiguous multi-index shapes keep the existing conservative EQP rendering.
 #[must_use]
-pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<AggregateIndexSeek> {
+pub fn program_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
     let ops = program.ops();
-    if !ops.iter().any(|op| op.opcode == Opcode::AggStep) {
-        return None;
-    }
 
     let mut index_name_by_cursor: HashMap<i32, &str> = HashMap::new();
     for op in ops {
@@ -303,10 +298,23 @@ pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<AggregateInde
         }
     }
 
-    Some(AggregateIndexSeek {
+    Some(IndexSeek {
         index_name: (*index_name_by_cursor.get(&cursor)?).to_owned(),
         covering: !table_lookup,
     })
+}
+
+/// Aggregate-only compatibility wrapper for callers that require that shape.
+#[must_use]
+pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
+    if !program
+        .ops()
+        .iter()
+        .any(|op| op.opcode == Opcode::AggStep)
+    {
+        return None;
+    }
+    program_index_seek_facts(program)
 }
 
 /// True when the emitted program positions a cursor opened on `index_name`
@@ -666,6 +674,18 @@ mod tests {
     fn test_program_seeks_named_index_true_for_seek_shape() {
         let prog = build_index_seek_program();
         assert!(program_seeks_named_index(&prog, "idx_t_k"));
+        assert_eq!(
+            program_index_seek_facts(&prog),
+            Some(IndexSeek {
+                index_name: "idx_t_k".to_owned(),
+                covering: false,
+            })
+        );
+        assert_eq!(
+            aggregate_index_seek_facts(&prog),
+            None,
+            "a non-aggregate seek must not satisfy the aggregate-only wrapper"
+        );
     }
 
     #[test]
@@ -705,6 +725,11 @@ mod tests {
 
         let prog = b.finish().unwrap();
         assert!(!program_seeks_named_index(&prog, "idx_t_k"));
+        assert_eq!(
+            program_index_seek_facts(&prog),
+            None,
+            "Rewind/Next is an index scan, not a key search"
+        );
     }
 
     #[test]

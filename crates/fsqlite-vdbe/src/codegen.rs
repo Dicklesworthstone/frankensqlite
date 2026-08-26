@@ -4444,6 +4444,7 @@ pub fn codegen_select(
                     where_clause.as_deref(),
                     &stmt.order_by,
                     distinct,
+                    from_index_hint,
                 )
             })
             .flatten()
@@ -8637,8 +8638,7 @@ fn codegen_select_index_ordered_scan(
     } else {
         extract_index_equality_prefix_exprs(&index_plan.index, table, table_alias, where_clause)
     };
-    let use_bounded_prefix_scan = !index_plan.descending
-        && index_plan.equality_prefix_len > 0
+    let use_bounded_prefix_scan = index_plan.equality_prefix_len > 0
         && equality_prefix_exprs.len() >= index_plan.equality_prefix_len;
 
     // Allocate LIMIT/OFFSET counter registers (if present).
@@ -8665,7 +8665,9 @@ fn codegen_select_index_ordered_scan(
     );
 
     let loop_start = if use_bounded_prefix_scan {
-        let probe_key_regs = b.alloc_regs((index_plan.index.key_term_count() + 1) as i32);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let prefix_len = index_plan.equality_prefix_len as i32;
+        let probe_key_regs = b.alloc_regs(prefix_len);
         for (offset, expr) in equality_prefix_exprs
             .iter()
             .take(index_plan.equality_prefix_len)
@@ -8675,35 +8677,21 @@ fn codegen_select_index_ordered_scan(
             emit_expr(b, expr, reg, None);
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         }
-        for offset in index_plan.equality_prefix_len..index_plan.index.key_term_count() {
-            b.emit_op(
-                Opcode::Null,
-                0,
-                probe_key_regs + offset as i32,
-                0,
-                P4::None,
-                0,
-            );
-        }
-        b.emit_op(
-            Opcode::Int64,
-            0,
-            probe_key_regs + index_plan.index.key_term_count() as i32,
-            0,
-            P4::Int64(i64::MIN),
-            0,
-        );
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            (index_plan.index.key_term_count() + 1) as i32,
+            prefix_len,
             probe_record_reg,
             P4::None,
             0,
         );
         b.emit_jump_to_label(
-            Opcode::SeekGE,
+            if index_plan.descending {
+                Opcode::SeekLE
+            } else {
+                Opcode::SeekGE
+            },
             index_cursor,
             probe_record_reg,
             done_label,
@@ -8712,7 +8700,11 @@ fn codegen_select_index_ordered_scan(
         );
         let loop_start = b.current_addr();
         b.emit_jump_to_label(
-            Opcode::IdxGT,
+            if index_plan.descending {
+                Opcode::IdxLT
+            } else {
+                Opcode::IdxGT
+            },
             index_cursor,
             probe_record_reg,
             done_label,
@@ -29500,8 +29492,12 @@ fn resolve_order_by_index_plan(
     where_clause: Option<&Expr>,
     order_by: &[OrderingTerm],
     distinct: Distinctness,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Option<OrderByIndexPlan> {
-    if order_by.is_empty() || distinct == Distinctness::Distinct {
+    if order_by.is_empty()
+        || distinct == Distinctness::Distinct
+        || matches!(index_hint, Some(fsqlite_ast::IndexHint::NotIndexed))
+    {
         return None;
     }
 
@@ -29540,6 +29536,11 @@ fn resolve_order_by_index_plan(
     let mut best_plan: Option<OrderByIndexPlan> = None;
 
     for index in &table.indexes {
+        if let Some(fsqlite_ast::IndexHint::IndexedBy(hinted)) = index_hint
+            && !index.name.eq_ignore_ascii_case(hinted)
+        {
+            continue;
+        }
         if !index.supports_direct_column_lookup() {
             continue;
         }
@@ -29584,38 +29585,39 @@ fn resolve_order_by_index_plan(
             continue;
         }
 
-        let direction = variable_order.first().map(|(_, direction, _)| *direction);
-        if variable_order
-            .iter()
-            .any(|(_, term_direction, _)| Some(*term_direction) != direction)
-        {
-            continue;
-        }
-        let descending = direction == Some(SortDirection::Desc);
+        let mut traversal_descending = None;
+        let matches_order_columns = variable_order.iter().enumerate().all(
+            |(offset, (order_col, term_direction, order_collation))| {
+                let key_pos = equality_prefix_len + offset;
+                if !index.columns[key_pos].eq_ignore_ascii_case(order_col)
+                    || !collation_names_equivalent(
+                        *order_collation,
+                        index.key_term_collation(key_pos),
+                    )
+                {
+                    return false;
+                }
 
-        if equality_prefix_len > 0 && descending {
-            // The generic bounded-prefix emitter currently walks forward.
-            // Composite prefix+range DESC queries use their dedicated reverse
-            // seek path before reaching this resolver.
-            continue;
-        }
-
-        let matches_order_columns =
-            variable_order
-                .iter()
-                .enumerate()
-                .all(|(offset, (order_col, _, order_collation))| {
-                    let key_pos = equality_prefix_len + offset;
-                    !index.key_term_descending(key_pos)
-                        && index.columns[key_pos].eq_ignore_ascii_case(order_col)
-                        && collation_names_equivalent(
-                            *order_collation,
-                            index.key_term_collation(key_pos),
-                        )
-                });
+                // A forward index walk follows each key term's declared
+                // direction; a reverse walk flips every term. All variable
+                // ORDER BY terms must therefore agree on one traversal.
+                let forward_direction = if index.key_term_descending(key_pos) {
+                    SortDirection::Desc
+                } else {
+                    SortDirection::Asc
+                };
+                let reverse = *term_direction != forward_direction;
+                if traversal_descending.is_some_and(|existing| existing != reverse) {
+                    return false;
+                }
+                traversal_descending = Some(reverse);
+                true
+            },
+        );
         if !matches_order_columns {
             continue;
         }
+        let descending = traversal_descending.unwrap_or(false);
 
         let covering_output = if where_clause.is_none() {
             resolve_covering_output_sources(columns, table, table_alias, index)
@@ -46498,6 +46500,52 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_order_by_desc_declared_suffix_bounds_both_traversals() {
+        let mut schema = test_schema_with_composite_prefix_index();
+        schema[0].indexes[0].key_sort_directions =
+            vec![SortDirection::Asc, SortDirection::Desc];
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+
+        for (direction, seek, boundary, step) in [
+            ("DESC", Opcode::SeekGE, Opcode::IdxGT, Opcode::Next),
+            ("ASC", Opcode::SeekLE, Opcode::IdxLT, Opcode::Prev),
+        ] {
+            let stmt = select_sql(&format!(
+                "SELECT m.idx FROM messages AS m \
+                 WHERE m.conversation_id = ?1 \
+                 ORDER BY m.idx {direction} LIMIT ?2"
+            ));
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &ctx).unwrap();
+            let program = builder.finish().unwrap();
+
+            let seek_pos = program
+                .ops()
+                .iter()
+                .position(|op| op.opcode == seek)
+                .expect("equality prefix should anchor inside the composite index");
+            let probe = program.ops()[..seek_pos]
+                .iter()
+                .rev()
+                .find(|op| op.opcode == Opcode::MakeRecord)
+                .expect("bounded scan should build an equality-prefix probe");
+            assert_eq!(probe.p2, 1, "only the fixed prefix belongs in the probe");
+            assert!(program.ops().iter().any(|op| op.opcode == boundary));
+            assert!(program.ops().iter().any(|op| op.opcode == step));
+            assert!(
+                !program
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::SorterOpen),
+                "declared DESC suffix should stream {direction} without a sorter"
+            );
+        }
+    }
+
+    #[test]
     fn test_codegen_order_by_fixed_prefix_direction_does_not_constrain_suffix() {
         let stmt = select_sql(
             "SELECT m.idx FROM messages AS m \
@@ -46649,6 +46697,7 @@ mod tests {
                 where_clause.as_deref(),
                 &stmt.order_by,
                 Distinctness::All,
+                None,
             )
             .is_none(),
             "a qualified equality from another scope must not pin this index prefix"
