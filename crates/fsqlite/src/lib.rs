@@ -15,6 +15,11 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::large_futures)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use fsqlite_core::connection::{
+    BackupReport, BoundedStructuralSnapshot, CompactionReport, DatabaseBuilderReservation,
+    DatabaseImagePublication, PendingDatabaseImagePublication,
+};
 /// Whole-database-image capture, bounded structural proof, and publication.
 ///
 /// These name the guards and proof counters returned by
@@ -23,11 +28,6 @@
 /// call those methods but cannot write down the types they hand back.
 pub use fsqlite_core::connection::{
     BoundedDatabaseStructuralStats, PageCachePeakSnapshot, WriteSetStats,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use fsqlite_core::connection::{
-    BackupReport, BoundedStructuralSnapshot, CompactionReport, DatabaseBuilderReservation,
-    DatabaseImagePublication, PendingDatabaseImagePublication,
 };
 pub use fsqlite_core::connection::{
     Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
