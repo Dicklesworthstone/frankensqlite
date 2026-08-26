@@ -1318,6 +1318,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "parking_lot",
+ "proc-macro2",
  "proptest",
  "rusqlite",
  "serde",
