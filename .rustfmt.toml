@@ -1,0 +1,12 @@
+# Added by campaign orchestrator 2026-08-26 as HOST-PROTECTION.
+# These crates contain multi-MB generated .rs files (fsqlite-core/src/lib.rs,
+# fsqlite-pager/src/pager.rs, fsqlite-vdbe/src/codegen.rs, etc.) that make
+# `rustfmt` balloon to 60-80GB RSS each. Two concurrent runs filled the host's
+# 71G swap and nearly OOM-killed campaign ccs. rustfmt cannot format these files
+# anyway (it explodes), so skipping them is strictly beneficial. Remove this file
+# to restore default fmt behavior for these crates.
+ignore = [
+    "crates/fsqlite-core",
+    "crates/fsqlite-pager",
+    "crates/fsqlite-vdbe",
+]

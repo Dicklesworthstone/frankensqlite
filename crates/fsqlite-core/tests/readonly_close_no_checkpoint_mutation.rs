@@ -15,6 +15,12 @@ fn db_bytes(path: &str) -> Vec<u8> {
     std::fs::read(path).expect("read main db file")
 }
 
+fn wal_len(path: &str) -> u64 {
+    std::fs::metadata(format!("{path}-wal"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
 #[test]
 fn readonly_connection_close_does_not_mutate_main_db_bytes() {
     asupersync::test_utils::run_test(|| async {
@@ -177,5 +183,70 @@ fn stale_connection_truncate_checkpoint_preserves_latest_header_counter() {
             .close()
             .await
             .expect("close checkpointer connection");
+    });
+}
+
+/// GH #385: an open but idle same-process connection does not hold a read
+/// snapshot and must not prevent a reset-mode checkpoint from truncating WAL.
+#[test]
+fn truncate_checkpoint_resets_wal_with_idle_peer_connection() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir
+            .path()
+            .join("idle-peer-checkpoint.db")
+            .to_string_lossy()
+            .into_owned();
+
+        let writer = Connection::open(&db).await.expect("open writer");
+        writer
+            .execute("PRAGMA journal_mode=WAL;")
+            .await
+            .expect("enable WAL");
+        writer
+            .execute("PRAGMA wal_autocheckpoint=0;")
+            .await
+            .expect("disable autocheckpoint");
+        writer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .await
+            .expect("create table");
+
+        let idle_peer = Connection::open(&db).await.expect("open idle peer");
+        for id in 1..=16 {
+            writer
+                .execute(&format!(
+                    "INSERT INTO t VALUES ({id}, '{}');",
+                    "x".repeat(900)
+                ))
+                .await
+                .expect("writer commit");
+        }
+
+        let before = wal_len(&db);
+        assert!(before > 32, "test requires committed WAL frames");
+        let checkpoint = writer
+            .query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("truncate checkpoint");
+        assert_eq!(checkpoint[0].values()[0], SqliteValue::Integer(0));
+        let after = wal_len(&db);
+        assert!(
+            after <= 32,
+            "GH #385: idle peer left WAL at {after} bytes after reset-mode checkpoint (before {before})"
+        );
+
+        let rows = idle_peer
+            .query("SELECT COUNT(*) FROM t;")
+            .await
+            .expect("idle peer reads reset generation");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(16));
+        idle_peer
+            .execute("INSERT INTO t VALUES (17, 'idle-peer');")
+            .await
+            .expect("idle peer writes after reset");
+
+        idle_peer.close().await.expect("close idle peer");
+        writer.close().await.expect("close writer");
     });
 }

@@ -15160,11 +15160,11 @@ where
                 .await?;
         }
 
-        // Checkpointing is deliberately optimistic because it requires an
-        // ordinary transaction lease. Fence the actual image capture only
-        // after it completes, then repeat every quiescence check so a writer
-        // admitted during the checkpoint window either keeps this gate Busy
-        // or leaves WAL frames that the fenced preflight below rejects.
+        // The checkpoint owns an exclusive maintenance lease, but releases it
+        // before returning. Fence the actual image capture separately, then
+        // repeat every quiescence check so a writer admitted between those two
+        // operations either keeps this gate Busy or leaves WAL frames that the
+        // fenced preflight below rejects.
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
         self.validate_namespace_binding()?;
@@ -26711,13 +26711,14 @@ where
     ///
     /// # Notes
     ///
-    /// This implementation refuses to checkpoint while any transaction is active.
-    /// It starts from the beginning (backfilled_frames = 0) and passes
-    /// `oldest_reader_frame = None`. Because pager does not yet track external
-    /// reader end marks, `RESTART` and `TRUNCATE` are conservatively downgraded
-    /// to `FULL` so we never reset or truncate WAL based on incomplete reader
-    /// visibility. For incremental, reader-aware checkpointing, use the
-    /// lower-level WAL backend API.
+    /// This implementation takes the identity-shared exclusive maintenance
+    /// lease, so it refuses to checkpoint while any same-process transaction
+    /// is active and blocks new transaction admission until the checkpoint is
+    /// complete. It starts from the beginning (`backfilled_frames = 0`) and
+    /// passes `oldest_reader_frame = None`; the exclusive in-process lease and
+    /// VFS maintenance fence make reset modes safe even when other idle
+    /// connections remain open. For incremental, reader-aware checkpointing,
+    /// use the lower-level WAL backend API.
     // bd-h9o9r: a sync mutex guard is held across an await in this
     // function's body; reachable-deadlock audit and lock-scope repair
     // belong to the Phase-C pager reconstruction.
@@ -26728,7 +26729,7 @@ where
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
+        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
         self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
         let checkpoint_gate_state;
@@ -26901,28 +26902,13 @@ where
         // Create a checkpoint writer that writes directly to the database file.
         let mut writer = self.checkpoint_writer();
 
-        // Single-connection fast path (issue #66): when this pager is the only
-        // connection to the database (shared_connection_count == 1) and no
-        // transactions are active (already verified above), there are no
-        // readers whose WAL end-marks we need to track. Restart and Truncate
-        // are safe because no other connection can be reading from the WAL.
-        let sole_connection = self
-            .shared_connection_count
-            .get()
-            .is_some_and(|counter| counter.load(std::sync::atomic::Ordering::Acquire) == 1);
-
-        let effective_mode = match mode {
-            traits::CheckpointMode::Restart | traits::CheckpointMode::Truncate
-                if !sole_connection =>
-            {
-                tracing::debug!(
-                    requested_mode = ?mode,
-                    "downgrading checkpoint mode because pager has multiple connections or lacks reader-tracking for safe WAL reset"
-                );
-                traits::CheckpointMode::Full
-            }
-            _ => mode,
-        };
+        // GH #385: the identity-shared exclusive maintenance lease above is
+        // the reader-activity proof. Open-but-idle connections hold no
+        // transaction lease and therefore do not pin this WAL generation;
+        // active readers make admission return Busy before any checkpoint I/O.
+        // Raw connection count is not a reader end-mark and must not silently
+        // downgrade Restart or Truncate to Full.
+        let effective_mode = mode;
 
         // bd-ioq6x / GH#346: reconcile the abandonment pool into the freelist
         // BEFORE the checkpoint truncates/resets the WAL. The CheckpointGuard's
@@ -37759,6 +37745,36 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_busy_with_active_reader_on_peer_pager() {
+        asupersync::test_utils::run_test(|| async {
+            init_publication_test_tracing();
+            let (checkpointer, peer, _frames) = wal_pager_pair_with_shared_backend().await;
+            let cx = Cx::new();
+            assert!(Arc::ptr_eq(
+                &checkpointer.maintenance_gate,
+                &peer.maintenance_gate
+            ));
+
+            let reader = peer.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let err = checkpointer
+                .checkpoint(&cx, crate::traits::CheckpointMode::Truncate)
+                .await
+                .expect_err("peer reader must pin the current WAL generation");
+            assert!(matches!(err, FrankenError::Busy));
+            drop(reader);
+
+            let result = checkpointer
+                .checkpoint(&cx, crate::traits::CheckpointMode::Truncate)
+                .await
+                .expect("idle peer must not block reset-mode checkpoint");
+            assert_eq!(
+                result.effective_mode,
+                crate::traits::CheckpointMode::Truncate
+            );
+        });
+    }
+
+    #[test]
     fn test_checkpoint_busy_with_active_writer() {
         asupersync::test_utils::run_test(|| async {
             init_publication_test_tracing();
@@ -37847,7 +37863,9 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             init_publication_test_tracing();
             let (pager, _frames) = wal_pager().await;
-            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            // An additional open-but-idle connection is not a reader end-mark
+            // and must not change the requested reset mode (GH #385).
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(2)));
             let cx = Cx::new();
 
             for mode in [
