@@ -1890,8 +1890,7 @@ mod tests {
             assert_eq!(rc, SQLITE_OK, "file-backed open failed");
             assert!(!db.is_null());
 
-            let sql =
-                CString::new("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42);").unwrap();
+            let sql = CString::new("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42);").unwrap();
             let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
             assert_eq!(rc, SQLITE_OK, "exec on file-backed database failed");
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -3065,7 +3064,10 @@ mod tests {
             assert_eq!(sqlite3_bind_parameter_count(ins), 3);
             assert_eq!(sqlite3_bind_int(ins, 1, 42), SQLITE_OK);
             let name = CString::new("hello").unwrap();
-            assert_eq!(sqlite3_bind_text(ins, 2, name.as_ptr(), -1, None), SQLITE_OK);
+            assert_eq!(
+                sqlite3_bind_text(ins, 2, name.as_ptr(), -1, None),
+                SQLITE_OK
+            );
             assert_eq!(sqlite3_bind_double(ins, 3, 3.5), SQLITE_OK);
             assert_eq!(sqlite3_step(ins), SQLITE_DONE);
             sqlite3_finalize(ins);

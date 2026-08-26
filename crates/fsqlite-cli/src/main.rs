@@ -2742,7 +2742,10 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             assert!(err.is_empty(), "unexpected stderr: {stderr}");
 
             let stdout = String::from_utf8(out).expect("output should be utf-8");
-            assert!(stdout.contains("42"), "expected query result, got: {stdout}");
+            assert!(
+                stdout.contains("42"),
+                "expected query result, got: {stdout}"
+            );
             assert!(db_path.exists(), "database file was not created on disk");
         });
     }
