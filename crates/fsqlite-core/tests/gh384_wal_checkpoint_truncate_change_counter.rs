@@ -150,3 +150,59 @@ fn gh384_truncate_from_idle_connection_keeps_wal_change_counter() {
         a.close().await.expect("close A");
     });
 }
+
+/// GH#385 companion: reset-mode checkpoints are no longer downgraded to FULL
+/// just because another in-process connection is open. The remaining safety
+/// question is the idle peer itself: `A` runs an autocommit read (pinning a
+/// WAL read snapshot), then goes idle while `B` commits and truncates the WAL.
+/// `A` must then observe every committed row and remain able to write; a
+/// stale pinned snapshot on the reset WAL generation would surface here as a
+/// wrong count, a read error, or a permanent snapshot conflict.
+#[test]
+fn gh385_idle_peer_with_pinned_snapshot_survives_peer_truncate() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("peer.db");
+        let db_str = db.to_string_lossy().into_owned();
+
+        let a = open(&db_str).await;
+        a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, payload BLOB);")
+            .await
+            .expect("create table");
+        insert_txns(&a, "A setup", SETUP_TXNS, SETUP_ROWS).await;
+        // Pin a read snapshot on A, then leave it idle.
+        assert_eq!(count_rows(&a).await, (SETUP_TXNS * SETUP_ROWS) as i64);
+
+        let b = open(&db_str).await;
+        insert_txns(&b, "B bulk", BULK_TXNS, BULK_ROWS).await;
+        let status = b
+            .query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("wal_checkpoint(TRUNCATE) from B with idle peer A");
+        assert_eq!(
+            status[0].values()[0],
+            SqliteValue::Integer(0),
+            "an idle peer must not make the checkpoint busy (GH#385): {status:?}"
+        );
+        let wal_len = std::fs::metadata(dir.path().join("peer.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_len <= 32,
+            "TRUNCATE with an idle peer must reset the WAL (got {wal_len} bytes)"
+        );
+
+        // The idle peer must see B's commits through the reset generation and
+        // must still be able to write.
+        let committed = (SETUP_TXNS * SETUP_ROWS + BULK_TXNS * BULK_ROWS) as i64;
+        assert_eq!(count_rows(&a).await, committed);
+        insert_txns(&a, "A after peer truncate", AFTER_TXNS, AFTER_ROWS).await;
+        insert_txns(&b, "B after truncate", AFTER_TXNS, AFTER_ROWS).await;
+        let expected_total = committed + (2 * AFTER_TXNS * AFTER_ROWS) as i64;
+        assert_eq!(count_rows(&a).await, expected_total);
+        assert_eq!(count_rows(&b).await, expected_total);
+
+        b.close().await.expect("close B");
+        a.close().await.expect("close A");
+    });
+}
