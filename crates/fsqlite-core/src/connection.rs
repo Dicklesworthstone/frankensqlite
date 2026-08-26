@@ -53949,10 +53949,9 @@ impl Connection {
             && snapshot.active_txn_count == 0
         {
             // No active transactions at all -- safe to truncate the WAL file
-            // to zero, reclaiming disk space. The pager's single-connection
-            // fast path (issue #66 fix 2) will allow this through when we are
-            // the sole connection; otherwise the pager conservatively
-            // downgrades to Full.
+            // to zero, reclaiming disk space. The pager's identity-shared
+            // maintenance gate admits this mode while peer connections are
+            // idle and returns Busy if a transaction becomes active.
             CheckpointMode::Truncate
         } else if snapshot.wal_frames_estimate
             >= snapshot.urgent_wal_frames_threshold.saturating_mul(2)
@@ -54135,19 +54134,6 @@ impl Connection {
             .checkpoint_duration_us_total
             .saturating_sub(checkpoint_metrics_before.checkpoint_duration_us_total);
         self.checkpoint_advisor_note_checkpoint(mode, &result, checkpoint_duration_us);
-    }
-
-    #[inline]
-    fn should_defer_autocheckpoint_after_concurrent_commit(
-        &self,
-        was_concurrent_txn: bool,
-    ) -> bool {
-        was_concurrent_txn
-            && self
-                ._shared_mvcc_state
-                .open_connection_count
-                .load(AtomicOrdering::Acquire)
-                > 1
     }
 
     fn checkpoint_advisor_note_checkpoint(
@@ -56956,9 +56942,7 @@ impl Connection {
                     self.capture_time_travel_snapshot(committed_seq.get()).await;
                 }
             }
-            if !self.should_defer_autocheckpoint_after_concurrent_commit(is_concurrent_txn) {
-                self.maybe_run_adaptive_autocheckpoint().await;
-            }
+            self.maybe_run_adaptive_autocheckpoint().await;
             record_hot_path_duration(
                 &FSQLITE_COMMIT_POST_WRITE_MAINTENANCE_TIME_NS,
                 commit_post_write_maintenance_start,
@@ -68919,9 +68903,7 @@ impl Connection {
                 .await?;
             }
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
-            if !self.should_defer_autocheckpoint_after_concurrent_commit(is_concurrent_txn) {
-                self.maybe_run_adaptive_autocheckpoint().await;
-            }
+            self.maybe_run_adaptive_autocheckpoint().await;
 
             // Capture time-travel snapshot AFTER cleanup so the write transaction
             // handle is fully dropped and the pager can serve reads to reload_memdb.

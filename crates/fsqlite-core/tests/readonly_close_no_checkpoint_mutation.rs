@@ -250,3 +250,57 @@ fn truncate_checkpoint_resets_wal_with_idle_peer_connection() {
         writer.close().await.expect("close writer");
     });
 }
+
+/// GH #385: post-commit autocheckpointing must use transaction activity, not
+/// the number of open handles, when deciding whether an idle peer is safe.
+#[test]
+fn autocheckpoint_backfills_with_idle_peer_connection() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir
+            .path()
+            .join("idle-peer-autocheckpoint.db")
+            .to_string_lossy()
+            .into_owned();
+
+        let writer = Connection::open(&db).await.expect("open writer");
+        writer
+            .execute("PRAGMA journal_mode=WAL;")
+            .await
+            .expect("enable WAL");
+        writer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .await
+            .expect("create table");
+        writer
+            .execute("PRAGMA wal_autocheckpoint=1;")
+            .await
+            .expect("enable frequent autocheckpoint");
+        writer
+            .query("PRAGMA checkpoint_write_pressure_fps=1000000000;")
+            .await
+            .expect("disable write-pressure delay");
+
+        let before = std::fs::metadata(&db).expect("main db metadata").len();
+        let idle_peer = Connection::open(&db).await.expect("open idle peer");
+        for id in 1..=16 {
+            writer
+                .execute(&format!(
+                    "INSERT INTO t VALUES ({id}, '{}');",
+                    "y".repeat(900)
+                ))
+                .await
+                .expect("writer commit");
+        }
+
+        let after = std::fs::metadata(&db).expect("main db metadata").len();
+        assert!(
+            after > before,
+            "GH #385: autocheckpoint did not backfill with idle peer (main db stayed {after} bytes)"
+        );
+        assert!(wal_len(&db) > 32, "test requires a live WAL generation");
+
+        idle_peer.close().await.expect("close idle peer");
+        writer.close().await.expect("close writer");
+    });
+}
