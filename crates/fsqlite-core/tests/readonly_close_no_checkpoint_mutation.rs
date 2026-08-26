@@ -78,3 +78,104 @@ fn readonly_connection_close_does_not_mutate_main_db_bytes() {
         writer.close().await.expect("writer close");
     });
 }
+
+/// GH #384: checkpointing from an idle connection must retain the newer
+/// page-1 change counter written to the WAL by a peer connection. Otherwise a
+/// successful TRUNCATE reset leaves both existing and newly opened in-process
+/// connections permanently below the process-shared MVCC commit index.
+#[test]
+fn stale_connection_truncate_checkpoint_preserves_latest_header_counter() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir
+            .path()
+            .join("stale-checkpoint-counter.db")
+            .to_string_lossy()
+            .into_owned();
+
+        let checkpointer = Connection::open(&db).await.expect("open checkpointer");
+        checkpointer
+            .execute("PRAGMA journal_mode=WAL;")
+            .await
+            .expect("enable WAL");
+        checkpointer
+            .execute("PRAGMA wal_autocheckpoint=0;")
+            .await
+            .expect("disable autocheckpoint");
+        checkpointer
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .await
+            .expect("create table");
+        checkpointer
+            .execute("INSERT INTO t VALUES (1, 'checkpointer');")
+            .await
+            .expect("seed table");
+        checkpointer
+            .query("SELECT COUNT(*) FROM t;")
+            .await
+            .expect("pin checkpointer snapshot");
+        let stale_counter = checkpointer.change_counter().await;
+
+        let writer = Connection::open(&db).await.expect("open writer");
+        writer
+            .execute("PRAGMA journal_mode=WAL;")
+            .await
+            .expect("retain WAL mode");
+        writer
+            .execute("PRAGMA wal_autocheckpoint=0;")
+            .await
+            .expect("disable writer autocheckpoint");
+        for id in 2..=9 {
+            writer
+                .execute(&format!(
+                    "INSERT INTO t VALUES ({id}, '{}');",
+                    "x".repeat(900)
+                ))
+                .await
+                .expect("writer commit");
+        }
+        let writer_counter = writer.change_counter().await;
+        assert!(
+            writer_counter > stale_counter,
+            "test requires the writer to advance beyond the checkpointer's pinned clock"
+        );
+        // Match the reported bulk-writer lifetime: an awaited close may run
+        // maintenance work that refreshes or checkpoints the durable horizon.
+        drop(writer);
+
+        let checkpoint_rows = checkpointer
+            .query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("truncate checkpoint");
+        assert_eq!(checkpoint_rows[0].values()[0], SqliteValue::Integer(0));
+
+        let database = db_bytes(&db);
+        let checkpoint_counter = u32::from_be_bytes(database[24..28].try_into().unwrap());
+        let version_valid_for = u32::from_be_bytes(database[92..96].try_into().unwrap());
+        assert!(
+            checkpoint_counter >= writer_counter,
+            "GH #384: checkpoint lowered header counter from {writer_counter} to {checkpoint_counter}"
+        );
+        assert_eq!(version_valid_for, checkpoint_counter);
+
+        checkpointer
+            .execute("INSERT INTO t VALUES (10, 'after-checkpoint');")
+            .await
+            .expect("the stale checkpointer must remain able to write");
+        let fresh = Connection::open(&db).await.expect("open fresh connection");
+        fresh
+            .execute("INSERT INTO t VALUES (11, 'fresh-connection');")
+            .await
+            .expect("a fresh in-process connection must remain able to write");
+        let rows = fresh
+            .query("SELECT COUNT(*) FROM t;")
+            .await
+            .expect("count rows");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(11));
+        fresh.close().await.expect("close fresh connection");
+        checkpointer
+            .close()
+            .await
+            .expect("close checkpointer connection");
+    });
+}

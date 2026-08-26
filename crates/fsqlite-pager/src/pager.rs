@@ -26185,6 +26185,21 @@ where
 // CheckpointPageWriter implementation for WAL checkpointing
 // ---------------------------------------------------------------------------
 
+/// Select the newer of two wrapping 32-bit SQLite change counters.
+///
+/// Serial-number ordering is unambiguous while the counters differ by less
+/// than half their range, which comfortably covers a checkpoint refresh
+/// interval. A plain numeric `max` would incorrectly prefer `u32::MAX` over a
+/// newer post-wrap value of zero.
+fn newer_checkpoint_change_counter(local: u32, on_disk: u32) -> u32 {
+    let on_disk_distance = on_disk.wrapping_sub(local);
+    if on_disk_distance != 0 && on_disk_distance < (1_u32 << 31) {
+        on_disk
+    } else {
+        local
+    }
+}
+
 /// A checkpoint page writer that writes pages directly to the database file.
 ///
 /// This type implements [`crate::CheckpointPageWriter`] and is used during WAL
@@ -26224,7 +26239,7 @@ where
     /// - the true on-disk page count (28..32),
     /// - matching version-valid-for (92..96).
     async fn patch_page1_header(&self, cx: &Cx) -> Result<()> {
-        let (db_file, db_size, page_size, current_change_counter) = {
+        let (db_file, db_size, page_size, local_change_counter) = {
             let inner = self
                 .inner
                 .lock()
@@ -26251,6 +26266,14 @@ where
                 ),
             });
         }
+
+        // GH #384: the page-1 frame just backfilled from the WAL can carry a
+        // newer counter than this checkpointing pager's local commit clock.
+        // Never overwrite that durable horizon with the stale local value.
+        let on_disk_change_counter =
+            u32::from_be_bytes([page1[24], page1[25], page1[26], page1[27]]);
+        let current_change_counter =
+            newer_checkpoint_change_counter(local_change_counter, on_disk_change_counter);
 
         let mut patched_fields = [0_u8; 8];
         patched_fields[..4].copy_from_slice(&current_change_counter.to_be_bytes());
@@ -26772,10 +26795,36 @@ where
             );
             external_lock.acquire_maintenance(cx, true).await?;
 
+            // GH #384: a pager that has been idle while a peer committed can
+            // still carry its old local commit sequence here. Refresh only
+            // after the maintenance fence excludes new publishers, so the
+            // checkpoint writer stamps page 1 with the exact WAL horizon it
+            // is about to backfill and reset. Refreshing before this fence
+            // would leave a commit-sized race window.
+            let commit_seq_before_refresh = inner.commit_seq;
+            let refresh = match inner
+                .refresh_committed_state(cx, &self.cache, &self.wal_backend)
+                .await
+            {
+                Ok(refresh) => refresh,
+                Err(refresh_error) => {
+                    drop(inner);
+                    let restore_result = external_lock.restore().await;
+                    return match restore_result {
+                        Ok(()) => Err(refresh_error),
+                        Err(restore_error) => Err(FrankenError::internal(format!(
+                            "checkpoint committed-state refresh failed and could not release the maintenance fence: refresh={refresh_error}; unlock={restore_error}"
+                        ))),
+                    };
+                }
+            };
+
             inner.checkpoint_active = true;
             checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
-            // D1-CRITICAL Change 3: Use sharded publish_metadata_only.
-            self.published.publish_metadata_only(
+            // A durable-identity change invalidates the page plane just as it
+            // does at transaction begin; publishing metadata alone would
+            // leave pages from the stale pre-checkpoint snapshot reachable.
+            self.published.publish_clear_if(
                 cx,
                 PublishedPagerUpdate {
                     visible_commit_seq: inner.commit_seq,
@@ -26784,6 +26833,7 @@ where
                     freelist_count: inner.freelist.len(),
                     checkpoint_active: inner.checkpoint_active,
                 },
+                refresh.page_cache_invalidated || inner.commit_seq != commit_seq_before_refresh,
             );
             (wal, external_lock)
         };
@@ -37943,6 +37993,79 @@ mod tests {
                 "bead_id={BEAD_ID} case=checkpoint_sync_repairs_version_valid_for"
             );
         });
+    }
+
+    #[test]
+    fn test_checkpoint_writer_sync_preserves_newer_on_disk_change_counter() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page_two = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page_two, &vec![0xCD; ps])
+                    .await
+                    .unwrap();
+                txn.commit(&cx).await.unwrap();
+            }
+
+            let newer_change_counter = {
+                let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                let page_one = txn
+                    .get_page(&cx, PageNumber::ONE)
+                    .await
+                    .unwrap()
+                    .into_vec();
+                let header: [u8; DATABASE_HEADER_SIZE] = page_one[..DATABASE_HEADER_SIZE]
+                    .try_into()
+                    .expect("page 1 header must be present");
+                DatabaseHeader::from_bytes(&header)
+                    .expect("header must parse")
+                    .change_counter
+            };
+            assert!(newer_change_counter > 0, "test requires an advanced counter");
+
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.commit_seq = CommitSeq::new(u64::from(newer_change_counter - 1));
+            }
+
+            let mut writer = pager.checkpoint_writer();
+            let page_three = PageNumber::new(3).unwrap();
+            crate::traits::CheckpointPageWriter::write_page(
+                &mut writer,
+                &cx,
+                page_three,
+                &vec![0xAB; ps],
+            )
+            .await
+            .unwrap();
+            crate::traits::CheckpointPageWriter::sync(&mut writer, &cx)
+                .await
+                .unwrap();
+
+            let txn = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let raw_page1 = txn.get_page(&cx, PageNumber::ONE).await.unwrap().into_vec();
+            let header: [u8; DATABASE_HEADER_SIZE] = raw_page1[..DATABASE_HEADER_SIZE]
+                .try_into()
+                .expect("page 1 header must be present");
+            let parsed = DatabaseHeader::from_bytes(&header).expect("header must parse");
+            assert_eq!(
+                parsed.change_counter, newer_change_counter,
+                "GH #384: checkpoint must not lower the counter carried by page 1"
+            );
+            assert_eq!(parsed.version_valid_for, parsed.change_counter);
+        });
+    }
+
+    #[test]
+    fn checkpoint_change_counter_uses_wrapping_serial_order() {
+        assert_eq!(newer_checkpoint_change_counter(4, 28), 28);
+        assert_eq!(newer_checkpoint_change_counter(28, 4), 28);
+        assert_eq!(newer_checkpoint_change_counter(u32::MAX, 0), 0);
+        assert_eq!(newer_checkpoint_change_counter(0, u32::MAX), 0);
     }
 
     #[test]

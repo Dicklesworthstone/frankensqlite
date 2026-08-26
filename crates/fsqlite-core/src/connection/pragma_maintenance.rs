@@ -107,6 +107,10 @@ impl Connection {
         self.invalidate_cached_read_snapshot(&cx).await;
         let checkpoint_metrics_before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
         let result = self.pager.checkpoint(&cx, mode).await?;
+        // GH #384: the pager refreshed its durable WAL horizon while holding
+        // the checkpoint fence. Carry that horizon into the process-shared
+        // MVCC clock before a later BEGIN is compared with CommitIndex.
+        self.align_commit_clock_floor(self.pager.published_snapshot().visible_commit_seq);
         let checkpoint_metrics_after = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
         let checkpoint_duration_us = checkpoint_metrics_after
             .checkpoint_duration_us_total
