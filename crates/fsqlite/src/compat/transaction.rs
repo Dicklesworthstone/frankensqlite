@@ -10,7 +10,7 @@
 //! the next statement rather than inside `Drop`, because `Drop::drop` cannot
 //! await and this crate never builds its own runtime.
 
-use std::future::Future;
+use std::{cell::Cell, future::Future};
 
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
@@ -34,7 +34,7 @@ use super::params::ParamValue;
 /// ```
 pub struct Transaction<'a> {
     conn: &'a Connection,
-    finalized: bool,
+    finalized: Cell<bool>,
 }
 
 impl<'a> Transaction<'a> {
@@ -42,8 +42,29 @@ impl<'a> Transaction<'a> {
         conn.begin_transaction().await?;
         Ok(Self {
             conn,
-            finalized: false,
+            finalized: Cell::new(false),
         })
+    }
+
+    fn ensure_active(&self) -> Result<(), FrankenError> {
+        if self.finalized.get() {
+            return Err(FrankenError::NoActiveTransaction);
+        }
+        if !self.conn.in_transaction() {
+            self.finalized.set(true);
+            return Err(FrankenError::NoActiveTransaction);
+        }
+        Ok(())
+    }
+
+    fn observe_transaction_state<T>(
+        &self,
+        result: Result<T, FrankenError>,
+    ) -> Result<T, FrankenError> {
+        if !self.conn.in_transaction() {
+            self.finalized.set(true);
+        }
+        result
     }
 
     /// Commit the transaction.
@@ -51,9 +72,9 @@ impl<'a> Transaction<'a> {
     /// If `COMMIT` fails, the transaction remains active so the caller can
     /// inspect the error and choose whether to retry or roll back.
     pub async fn commit(&mut self) -> Result<(), FrankenError> {
-        self.conn.commit_transaction().await?;
-        self.finalized = true;
-        Ok(())
+        self.ensure_active()?;
+        let result = self.conn.commit_transaction().await;
+        self.observe_transaction_state(result)
     }
 
     /// Rollback the transaction explicitly.
@@ -61,14 +82,16 @@ impl<'a> Transaction<'a> {
     /// If `ROLLBACK` fails, the transaction remains active and drop will make a
     /// best-effort rollback later.
     pub async fn rollback(&mut self) -> Result<(), FrankenError> {
-        self.conn.rollback_transaction().await?;
-        self.finalized = true;
-        Ok(())
+        self.ensure_active()?;
+        let result = self.conn.rollback_transaction().await;
+        self.observe_transaction_state(result)
     }
 
     /// Execute a SQL statement within this transaction.
     pub async fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        self.conn.execute(sql).await
+        self.ensure_active()?;
+        let result = self.conn.execute(sql).await;
+        self.observe_transaction_state(result)
     }
 
     /// Execute a SQL statement with parameters within this transaction.
@@ -77,7 +100,9 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        self.conn.execute_with_params(sql, params).await
+        self.ensure_active()?;
+        let result = self.conn.execute_with_params(sql, params).await;
+        self.observe_transaction_state(result)
     }
 
     /// Execute a SQL statement with parameters, skipping the internal
@@ -88,9 +113,12 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        self.conn
+        self.ensure_active()?;
+        let result = self
+            .conn
             .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
-            .await
+            .await;
+        self.observe_transaction_state(result)
     }
 
     /// Execute a SQL statement with `ParamValue` parameters.
@@ -99,13 +127,17 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[ParamValue],
     ) -> Result<usize, FrankenError> {
+        self.ensure_active()?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        self.conn.execute_with_params(sql, &values).await
+        let result = self.conn.execute_with_params(sql, &values).await;
+        self.observe_transaction_state(result)
     }
 
     /// Query within this transaction.
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        self.conn.query(sql).await
+        self.ensure_active()?;
+        let result = self.conn.query(sql).await;
+        self.observe_transaction_state(result)
     }
 
     /// Query with parameters within this transaction.
@@ -114,7 +146,9 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        self.conn.query_with_params(sql, params).await
+        self.ensure_active()?;
+        let result = self.conn.query_with_params(sql, params).await;
+        self.observe_transaction_state(result)
     }
 
     /// Query with `ParamValue` parameters within this transaction.
@@ -123,13 +157,17 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[ParamValue],
     ) -> Result<Vec<Row>, FrankenError> {
+        self.ensure_active()?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        self.conn.query_with_params(sql, &values).await
+        let result = self.conn.query_with_params(sql, &values).await;
+        self.observe_transaction_state(result)
     }
 
     /// Query returning exactly one row within this transaction.
     pub async fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-        self.conn.query_row(sql).await
+        self.ensure_active()?;
+        let result = self.conn.query_row(sql).await;
+        self.observe_transaction_state(result)
     }
 
     /// Query returning exactly one row with parameters within this transaction.
@@ -138,7 +176,9 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
-        self.conn.query_row_with_params(sql, params).await
+        self.ensure_active()?;
+        let result = self.conn.query_row_with_params(sql, params).await;
+        self.observe_transaction_state(result)
     }
 
     /// Execute a query that returns exactly one row, mapping it with `f`.
@@ -153,8 +193,10 @@ impl<'a> Transaction<'a> {
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>,
     {
+        self.ensure_active()?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        let row = self.conn.query_row_with_params(sql, &values).await?;
+        let result = self.conn.query_row_with_params(sql, &values).await;
+        let row = self.observe_transaction_state(result)?;
         f(&row)
     }
 
@@ -170,14 +212,17 @@ impl<'a> Transaction<'a> {
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
+        self.ensure_active()?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let mut mapped = Vec::new();
-        self.conn
+        let result = self
+            .conn
             .query_with_params_for_each(sql, &values, |row| {
                 mapped.push(f(row)?);
                 Ok(())
             })
-            .await?;
+            .await;
+        self.observe_transaction_state(result)?;
         Ok(mapped)
     }
 
@@ -186,11 +231,14 @@ impl<'a> Transaction<'a> {
     ///
     /// Analogous to `BatchExt::execute_batch` but within a transaction.
     pub async fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        Connection::execute_batch(self.conn, sql).await
+        self.ensure_active()?;
+        let result = Connection::execute_batch(self.conn, sql).await;
+        self.observe_transaction_state(result)
     }
 
     /// Get `last_insert_rowid()` within this transaction.
     pub fn last_insert_rowid(&self) -> Result<i64, FrankenError> {
+        self.ensure_active()?;
         Ok(self.conn.last_insert_rowid())
     }
 }
@@ -207,7 +255,7 @@ impl Drop for Transaction<'_> {
         // rusqlite contract -- an abandoned transaction's writes are never
         // visible to a later statement -- without blocking in `Drop` and
         // without owning a runtime.
-        if !self.finalized {
+        if !self.finalized.get() {
             self.conn.mark_transaction_cleanup_required();
             tracing::debug!(
                 target: "fsqlite::compat",
@@ -258,6 +306,66 @@ mod tests {
             let rows = conn.query("SELECT val FROM t").await.unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "committed");
+        });
+    }
+
+    #[test]
+    fn finalized_transaction_rejects_later_operations() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+
+            let mut tx = conn.transaction().await.unwrap();
+            tx.execute("INSERT INTO t (val) VALUES ('committed')")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+
+            let error = tx
+                .execute("INSERT INTO t (val) VALUES ('must_not_autocommit')")
+                .await
+                .expect_err("a finalized transaction wrapper must reject later statements");
+            assert!(matches!(error, FrankenError::NoActiveTransaction));
+
+            let rows = conn.query("SELECT val FROM t ORDER BY id").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_typed::<String>(0).unwrap(), "committed");
+        });
+    }
+
+    #[test]
+    fn transaction_rejects_operations_after_sql_ends_underlying_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+                .await
+                .unwrap();
+
+            let tx = conn.transaction().await.unwrap();
+            tx.execute("COMMIT").await.unwrap();
+
+            let mut replacement = conn.transaction().await.unwrap();
+
+            let error = tx
+                .execute("INSERT INTO t (val) VALUES ('must_not_autocommit')")
+                .await
+                .expect_err("a wrapper must reject statements after SQL ends its transaction");
+            assert!(matches!(error, FrankenError::NoActiveTransaction));
+            drop(tx);
+
+            replacement
+                .execute("INSERT INTO t (val) VALUES ('replacement_transaction')")
+                .await
+                .unwrap();
+            replacement.commit().await.unwrap();
+            let rows = conn.query("SELECT val FROM t ORDER BY id").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].get_typed::<String>(0).unwrap(),
+                "replacement_transaction"
+            );
         });
     }
 
