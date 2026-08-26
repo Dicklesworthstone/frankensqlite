@@ -6061,11 +6061,13 @@ mod tests {
                     Ok(())
                 },
             ));
-            std::future::poll_fn(|task_cx| match operation.as_mut().poll(task_cx) {
-                Poll::Pending => Poll::Ready(()),
-                Poll::Ready(result) => {
-                    panic!("durability callback unexpectedly completed: {result:?}")
-                }
+            std::future::poll_fn(|task_cx| {
+                let poll = operation.as_mut().poll(task_cx);
+                assert!(
+                    matches!(poll, Poll::Pending),
+                    "durability callback unexpectedly completed: {poll:?}"
+                );
+                Poll::Ready(())
             })
             .await;
             drop(operation);

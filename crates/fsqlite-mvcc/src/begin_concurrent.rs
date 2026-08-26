@@ -197,7 +197,8 @@ pub fn record_registry_commit_lock_hold(hold_ns: u64) {
 /// This is called in addition to [`record_registry_commit_lock_hold`] only for
 /// concurrent-write commits that reach both phase boundaries. The aggregate
 /// hold counters therefore remain authoritative for all paths, while these
-/// sub-totals describe the steady-state successful path.
+/// sub-totals describe the steady-state successful physical-commit path. A
+/// later publication failure remains part of the measured publish phase.
 pub fn record_registry_commit_lock_hold_decomposed(validate_ns: u64, io_ns: u64, publish_ns: u64) {
     use std::sync::atomic::Ordering;
     REGISTRY_COMMIT_LOCK_DECOMPOSED_HOLDS.fetch_add(1, Ordering::Relaxed);

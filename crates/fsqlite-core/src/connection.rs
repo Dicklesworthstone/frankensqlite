@@ -68536,7 +68536,8 @@ impl Connection {
             } else {
                 None
             };
-            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
+            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut()
+            {
                 let plan = self.plan_concurrent_commit_with_registry(
                     registry,
                     &pending_conflict_pages,
@@ -108346,14 +108347,15 @@ impl std::ops::DerefMut for TimedRegistryCommitGuard<'_> {
 impl Drop for TimedRegistryCommitGuard<'_> {
     fn drop(&mut self) {
         let dropped_at = Instant::now();
-        let hold_ns =
-            u64::try_from(dropped_at.duration_since(self.acquired_at).as_nanos()).unwrap_or(u64::MAX);
+        let hold_ns = u64::try_from(dropped_at.duration_since(self.acquired_at).as_nanos())
+            .unwrap_or(u64::MAX);
         record_registry_commit_lock_hold(hold_ns);
         // Error and non-concurrent exits may not reach both marks; they still
         // contribute to the authoritative total-hold counters above.
         if let (Some(validate_done), Some(io_done)) = (self.validate_done_at, self.io_done_at) {
-            let validate_ns = u64::try_from(validate_done.duration_since(self.acquired_at).as_nanos())
-                .unwrap_or(u64::MAX);
+            let validate_ns =
+                u64::try_from(validate_done.duration_since(self.acquired_at).as_nanos())
+                    .unwrap_or(u64::MAX);
             let io_ns =
                 u64::try_from(io_done.duration_since(validate_done).as_nanos()).unwrap_or(u64::MAX);
             let publish_ns =
