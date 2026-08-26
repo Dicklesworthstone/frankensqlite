@@ -99,40 +99,57 @@ fn gh211_external_content_rename_rebuild_and_lifecycle_match_stock() {
             stock_exec_err(&sqlite, REBUILD).is_none(),
             "sanity: stock rebuild succeeds while the content table exists"
         );
-        sqlite.execute_batch("ALTER TABLE c RENAME TO c2;").expect("stock rename");
+        sqlite
+            .execute_batch("ALTER TABLE c RENAME TO c2;")
+            .expect("stock rename");
         let stock_rebuild_err = stock_exec_err(&sqlite, REBUILD);
         let stock_unrelated_ok = stock_exec_err(&sqlite, UNRELATED).is_none();
         let stock_match_rowid = stock_rowids(&sqlite, MATCH_ROWID);
-        sqlite.execute_batch("ALTER TABLE c2 RENAME TO c;").expect("stock rename-back");
+        sqlite
+            .execute_batch("ALTER TABLE c2 RENAME TO c;")
+            .expect("stock rename-back");
         let stock_rebuild_recovered = stock_exec_err(&sqlite, REBUILD);
         drop(sqlite);
 
         // ---- FRANK under test -----------------------------------------
-        let conn = Connection::open(frank_str.clone()).await.expect("open frank");
+        let conn = Connection::open(frank_str.clone())
+            .await
+            .expect("open frank");
         conn.execute(SETUP).await.expect("frank setup");
         assert!(
             frank_exec_err(&conn, REBUILD).await.is_none(),
             "frank rebuild succeeds while the content table exists"
         );
-        conn.execute("ALTER TABLE c RENAME TO c2;").await.expect("frank rename");
+        conn.execute("ALTER TABLE c RENAME TO c2;")
+            .await
+            .expect("frank rename");
         let frank_rebuild_err = frank_exec_err(&conn, REBUILD).await;
         let frank_unrelated_ok = frank_exec_err(&conn, UNRELATED).await.is_none();
         let frank_match_rowid = frank_rowids(&conn, MATCH_ROWID).await;
-        conn.execute("ALTER TABLE c2 RENAME TO c;").await.expect("frank rename-back");
+        conn.execute("ALTER TABLE c2 RENAME TO c;")
+            .await
+            .expect("frank rename-back");
         let frank_rebuild_recovered = frank_exec_err(&conn, REBUILD).await;
 
         // ---- Differential assertions ----------------------------------
         // 1. Post-rename `'rebuild'` errors `no such table: main.c` on both.
         assert!(
-            stock_rebuild_err.as_deref().is_some_and(is_no_such_content_table),
+            stock_rebuild_err
+                .as_deref()
+                .is_some_and(is_no_such_content_table),
             "sanity: stock `'rebuild'` errors `no such table: main.c` after the rename, got {stock_rebuild_err:?}"
         );
         assert!(
-            frank_rebuild_err.as_deref().is_some_and(is_no_such_content_table),
+            frank_rebuild_err
+                .as_deref()
+                .is_some_and(is_no_such_content_table),
             "post-rename `'rebuild'` must error `no such table: main.c` like stock, got {frank_rebuild_err:?}"
         );
         // 2. The connection stays usable (reload-poisoning face).
-        assert!(stock_unrelated_ok, "sanity: stock unrelated statement succeeds after rename");
+        assert!(
+            stock_unrelated_ok,
+            "sanity: stock unrelated statement succeeds after rename"
+        );
         assert!(
             frank_unrelated_ok,
             "an unrelated statement must still succeed after the rename (no connection poisoning)"
@@ -148,7 +165,10 @@ fn gh211_external_content_rename_rebuild_and_lifecycle_match_stock() {
             "rowid-only MATCH must match stock after the rename"
         );
         // 4. Rename-back recovers `'rebuild'` on both.
-        assert!(stock_rebuild_recovered.is_none(), "sanity: stock rebuild recovers after rename-back");
+        assert!(
+            stock_rebuild_recovered.is_none(),
+            "sanity: stock rebuild recovers after rename-back"
+        );
         assert!(
             frank_rebuild_recovered.is_none(),
             "rename-back must let `'rebuild'` succeed again, got {frank_rebuild_recovered:?}"

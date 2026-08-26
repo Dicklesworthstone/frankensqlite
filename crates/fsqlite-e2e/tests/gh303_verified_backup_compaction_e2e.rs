@@ -28,8 +28,10 @@ fn oracle_integrity(path: &str) -> String {
 
 fn oracle_count(path: &str, table: &str) -> i64 {
     let c = rusqlite::Connection::open(path).expect("oracle open");
-    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))
-        .expect("oracle count")
+    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .expect("oracle count")
 }
 
 fn oracle_freelist_count(path: &str) -> i64 {
@@ -74,7 +76,10 @@ fn backup_exact_to_produces_byte_identical_verified_copy() {
     // Report sanity.
     assert!(report.page_count >= 1, "page_count {}", report.page_count);
     assert!(report.page_size >= 512 && report.page_size.is_power_of_two());
-    assert_eq!(report.byte_len, u64::from(report.page_count) * u64::from(report.page_size));
+    assert_eq!(
+        report.byte_len,
+        u64::from(report.page_count) * u64::from(report.page_size)
+    );
     assert_eq!(report.logical_hash_hex.len(), 64, "blake3 hex is 64 chars");
 
     // Byte-exactness: the copy equals the source main file byte-for-byte
@@ -82,7 +87,10 @@ fn backup_exact_to_produces_byte_identical_verified_copy() {
     // authoritative image).
     let src_bytes = std::fs::read(&src).expect("read source main file");
     let copy_bytes = std::fs::read(&copy).expect("read copy");
-    assert_eq!(src_bytes, copy_bytes, "backup must be byte-identical to source");
+    assert_eq!(
+        src_bytes, copy_bytes,
+        "backup must be byte-identical to source"
+    );
 
     // C-oracle: the copy is a valid, integrity-clean database with all rows.
     assert_eq!(oracle_integrity(&copy_s), "ok");
@@ -113,7 +121,9 @@ fn compact_verified_into_reclaims_free_pages_and_preserves_content() {
             .unwrap();
         }
         // Delete ~3/4 of the rows to create a substantial freelist.
-        conn.execute("DELETE FROM t WHERE id % 4 <> 0;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE id % 4 <> 0;")
+            .await
+            .unwrap();
         let surviving = 100_i64; // ids 0,4,8,... < 400 => 100 rows
         let report = conn.compact_verified_into(&out).await.unwrap();
         conn.close().await.unwrap();
@@ -143,7 +153,11 @@ fn compact_verified_into_reclaims_free_pages_and_preserves_content() {
     // C-oracle: compacted image is integrity-clean, fully compact (no free
     // pages), and content-equivalent (surviving rows preserved).
     assert_eq!(oracle_integrity(&out_s), "ok");
-    assert_eq!(oracle_freelist_count(&out_s), 0, "compacted image must have no free pages");
+    assert_eq!(
+        oracle_freelist_count(&out_s),
+        0,
+        "compacted image must have no free pages"
+    );
     assert_eq!(oracle_count(&out_s, "t"), surviving);
 
     // The source is left untouched and readable with the same surviving rows.
@@ -177,8 +191,13 @@ fn backup_exact_to_rejects_existing_target_and_memory() {
             .unwrap();
         let mem_backup = mem.backup_exact_to(dir.path().join("mem_copy.db")).await;
         assert!(mem_backup.is_err(), "memory backup must be unsupported");
-        let mem_compact = mem.compact_verified_into(dir.path().join("mem_compact.db")).await;
-        assert!(mem_compact.is_err(), "memory compaction must be unsupported");
+        let mem_compact = mem
+            .compact_verified_into(dir.path().join("mem_compact.db"))
+            .await;
+        assert!(
+            mem_compact.is_err(),
+            "memory compaction must be unsupported"
+        );
         mem.close().await.unwrap();
     });
 }

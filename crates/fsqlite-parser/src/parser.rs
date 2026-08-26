@@ -117,7 +117,9 @@ pub enum ParseErrorKind {
     /// boundary surfaces `message` VERBATIM, with NO `SQL error at offset N:`
     /// prefix. bd-parser-syntax-error-format-6w6kp (Part C).
     Semantic,
-    ExpressionTooDeep { max: u32 },
+    ExpressionTooDeep {
+        max: u32,
+    },
     RecursionLimit,
 }
 
@@ -1028,7 +1030,7 @@ impl Parser {
             && matches!(self.peek(), TokenKind::KwOrder | TokenKind::KwLimit)
         {
             return Err(
-                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"),
+                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term")
             );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
@@ -1053,7 +1055,7 @@ impl Parser {
             && (!order_by.is_empty() || limit.value.is_some())
         {
             return Err(
-                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term"),
+                self.err_unexpected("ORDER BY / LIMIT clause is not allowed after a VALUES term")
             );
         }
         Ok(HeightTracked {
@@ -1549,7 +1551,7 @@ impl Parser {
             && context == DmlParseContext::TriggerBody
         {
             return Err(
-                self.err_unexpected("DEFAULT VALUES is not allowed in trigger body statements"),
+                self.err_unexpected("DEFAULT VALUES is not allowed in trigger body statements")
             );
         } else if self.eat_kw(&TokenKind::KwDefault) {
             self.expect_kw(&TokenKind::KwValues)?;
@@ -1681,7 +1683,7 @@ impl Parser {
         let returning = self.parse_returning(context, false)?;
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
             return Err(
-                self.err_unexpected("ORDER BY is not allowed in trigger body UPDATE statements"),
+                self.err_unexpected("ORDER BY is not allowed in trigger body UPDATE statements")
             );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
@@ -1692,7 +1694,7 @@ impl Parser {
         };
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
             return Err(
-                self.err_unexpected("LIMIT is not allowed in trigger body UPDATE statements"),
+                self.err_unexpected("LIMIT is not allowed in trigger body UPDATE statements")
             );
         }
         let limit = self.parse_limit()?;
@@ -1743,7 +1745,7 @@ impl Parser {
         let returning = self.parse_returning(context, false)?;
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwOrder) {
             return Err(
-                self.err_unexpected("ORDER BY is not allowed in trigger body DELETE statements"),
+                self.err_unexpected("ORDER BY is not allowed in trigger body DELETE statements")
             );
         }
         let order_by = if self.eat_kw(&TokenKind::KwOrder) {
@@ -1754,7 +1756,7 @@ impl Parser {
         };
         if context == DmlParseContext::TriggerBody && self.check_kw(&TokenKind::KwLimit) {
             return Err(
-                self.err_unexpected("LIMIT is not allowed in trigger body DELETE statements"),
+                self.err_unexpected("LIMIT is not allowed in trigger body DELETE statements")
             );
         }
         let limit = self.parse_limit()?;
@@ -2313,10 +2315,9 @@ impl Parser {
             }
             TokenKind::KwUpdate => self.parse_update_stmt(None, DmlParseContext::TriggerBody),
             TokenKind::KwDelete => self.parse_delete_stmt(None, DmlParseContext::TriggerBody),
-            _ => {
-                Err(self
-                    .err_unexpected("trigger body statement must be SELECT, INSERT, UPDATE, or DELETE"))
-            }
+            _ => Err(self.err_unexpected(
+                "trigger body statement must be SELECT, INSERT, UPDATE, or DELETE",
+            )),
         }
     }
 
@@ -2878,9 +2879,8 @@ pub fn parse_first_statement_with_tail(
     } else if parser.at_eof() {
         sql.len()
     } else {
-        return Err(
-            parser.err_unexpected("unexpected token after end of statement; expected ';' separator")
-        );
+        return Err(parser
+            .err_unexpected("unexpected token after end of statement; expected ';' separator"));
     };
 
     Ok(Some((statement, tail_offset)))

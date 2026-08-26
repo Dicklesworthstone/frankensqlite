@@ -418,8 +418,7 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
             break;
         }
     }
-    let (fs_statements_executed, fs_rows_returned) =
-        work_meter_snapshot().delta_since(work_before);
+    let (fs_statements_executed, fs_rows_returned) = work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", ""); // Clear progress line.
 
     Measurement {
@@ -528,8 +527,7 @@ where
             break;
         }
     }
-    let (fs_statements_executed, fs_rows_returned) =
-        work_meter_snapshot().delta_since(work_before);
+    let (fs_statements_executed, fs_rows_returned) = work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -674,8 +672,7 @@ where
             break;
         }
     }
-    let (fs_statements_executed, fs_rows_returned) =
-        work_meter_snapshot().delta_since(work_before);
+    let (fs_statements_executed, fs_rows_returned) = work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -826,8 +823,7 @@ where
             break;
         }
     }
-    let (fs_statements_executed, fs_rows_returned) =
-        work_meter_snapshot().delta_since(work_before);
+    let (fs_statements_executed, fs_rows_returned) = work_meter_snapshot().delta_since(work_before);
     eprint!("\r{:80}\r", "");
 
     (
@@ -1029,8 +1025,8 @@ async fn fs_stmt_execute_with_params_async(
 
 /// `block_on(stmt.query())`, metered. Returns the materialised rows.
 fn fs_stmt_query(stmt: &fsqlite::PreparedStatement<'_>) -> Vec<fsqlite::Row> {
-    let rows = fsqlite_e2e::block_on(stmt.query())
-        .unwrap_or_else(|e| panic!("fsqlite query failed: {e}"));
+    let rows =
+        fsqlite_e2e::block_on(stmt.query()).unwrap_or_else(|e| panic!("fsqlite query failed: {e}"));
     record_fsqlite_statement();
     record_fsqlite_rows(rows.len() as u64);
     rows
@@ -9402,11 +9398,13 @@ mod tests {
     fn fsqlite_executed_work_gate_refuses_zero_work_arm() {
         // A well-formed arm (nonzero executed work) passes the gate.
         let mut healthy = BenchReport::new();
-        healthy.add_section("Read-after-write", "full scan").add_row(
-            "100 rows / full table scan",
-            Some(sample_measurement("cs_scan", 100, &[5, 6])),
-            Some(sample_measurement("fs_scan", 100, &[7, 8])),
-        );
+        healthy
+            .add_section("Read-after-write", "full scan")
+            .add_row(
+                "100 rows / full table scan",
+                Some(sample_measurement("cs_scan", 100, &[5, 6])),
+                Some(sample_measurement("fs_scan", 100, &[7, 8])),
+            );
         assert!(
             fsqlite_executed_work_errors(&healthy).is_empty(),
             "an arm with a nonzero executed-work receipt must be citable"
@@ -9415,11 +9413,13 @@ mod tests {
         // A FrankenSQLite arm that produced timing samples yet executed zero
         // statements must be refused, and the error must name the arm.
         let mut zero_work = BenchReport::new();
-        zero_work.add_section("Read-after-write", "full scan").add_row(
-            "100 rows / full table scan",
-            Some(sample_measurement("cs_scan", 100, &[5, 6])),
-            Some(zero_work_fsqlite_measurement("fs_scan", &[7, 8])),
-        );
+        zero_work
+            .add_section("Read-after-write", "full scan")
+            .add_row(
+                "100 rows / full table scan",
+                Some(sample_measurement("cs_scan", 100, &[5, 6])),
+                Some(zero_work_fsqlite_measurement("fs_scan", &[7, 8])),
+            );
         let errors = fsqlite_executed_work_errors(&zero_work);
         assert_eq!(
             errors.len(),
@@ -17527,9 +17527,7 @@ fn main() {
         if options.allow_unverified_provenance {
             provenance.mark_explicit_override();
         } else {
-            eprintln!(
-                "ERROR: benchmark provenance is not citable; no artifact emitted:"
-            );
+            eprintln!("ERROR: benchmark provenance is not citable; no artifact emitted:");
             for error in &provenance.validation_errors {
                 eprintln!("  - {error}");
             }

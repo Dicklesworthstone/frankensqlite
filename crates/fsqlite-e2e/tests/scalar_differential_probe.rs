@@ -151,11 +151,17 @@ fn scalar_differential_probe_vs_c_oracle() {
     });
 
     if !mismatches.is_empty() {
-        eprintln!("=== SCALAR DIFFERENTIAL DIVERGENCES ({}) ===", mismatches.len());
+        eprintln!(
+            "=== SCALAR DIFFERENTIAL DIVERGENCES ({}) ===",
+            mismatches.len()
+        );
         for m in &mismatches {
             eprintln!("{m}");
         }
-        panic!("{} scalar divergences vs C oracle (see stderr)", mismatches.len());
+        panic!(
+            "{} scalar divergences vs C oracle (see stderr)",
+            mismatches.len()
+        );
     }
 }
 

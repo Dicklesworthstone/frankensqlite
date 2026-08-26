@@ -4423,9 +4423,9 @@ fn run_rusqlite_one_row_transactions(
                     // to have physically executed rather than a future being
                     // constructed and dropped unpolled (bd-h9pzn/bd-i8pt6).
                     let _affected = affected;
-                    statements_executed = statements_executed
-                        .checked_add(1)
-                        .ok_or_else(|| format!("[sqlite t{tid}] executed-statement counter overflow"))?;
+                    statements_executed = statements_executed.checked_add(1).ok_or_else(|| {
+                        format!("[sqlite t{tid}] executed-statement counter overflow")
+                    })?;
                 }
                 Err(error) => {
                     conn.execute_batch("ROLLBACK").map_err(|rollback_error| {

@@ -2268,10 +2268,7 @@ impl<'a> ParseMachine<'a> {
             } else {
                 self.parser.pos = self.parser.pos.saturating_add(2);
                 self.parser.finish_expr(
-                    Expr::Column(
-                        ColumnRef::qualified(name, mid),
-                        start.merge(mid_token.span),
-                    ),
+                    Expr::Column(ColumnRef::qualified(name, mid), start.merge(mid_token.span)),
                     2,
                     false,
                     false,
@@ -4194,7 +4191,10 @@ impl Parser {
                 }
             };
             // Three-part reference `schema.table.column` (e.g. `main.t.id`).
-            if matches!(self.peek_nth_token(2).map(|t| &t.kind), Some(TokenKind::Dot)) {
+            if matches!(
+                self.peek_nth_token(2).map(|t| &t.kind),
+                Some(TokenKind::Dot)
+            ) {
                 let Some(col_tok) = self.peek_nth_token(3).cloned() else {
                     return Err(self.err_here("expected column name after '.'"));
                 };
@@ -5062,7 +5062,10 @@ impl Parser {
             }
             TokenKind::OversizedInt(s) => Ok(s.clone()),
             TokenKind::Id(s) | TokenKind::QuotedId(s, _) => Ok(s.to_string()),
-            _ => Err(ParseError::unexpected_at("expected type argument", Some(&tok))),
+            _ => Err(ParseError::unexpected_at(
+                "expected type argument",
+                Some(&tok),
+            )),
         }
     }
 
