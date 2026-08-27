@@ -62939,13 +62939,10 @@ impl Connection {
         };
 
         if let Err(error) = persistence_result {
-            if let Some(target) = target_reservation.as_ref().or(rebuild_target.as_ref())
-                && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
-            {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    path = %target.path().display(),
-                    "VACUUM persistence failed and exact-reservation cleanup also failed"
+            if let Some(target) = target_reservation.as_ref().or(rebuild_target.as_ref()) {
+                target.cleanup_after_failure(
+                    &cx,
+                    "VACUUM persistence failed and exact-reservation cleanup was incomplete",
                 );
             }
             return Err(error);
@@ -63005,23 +63002,31 @@ impl Connection {
                     let candidate_receipt = match finalization_result {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                                tracing::warn!(
-                                    error = %cleanup_error,
-                                    path = %target.path().display(),
-                                    "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
-                                );
-                            }
+                            target.cleanup_after_failure(
+                                &cx,
+                                "VACUUM INTO finalization failed and exact-reservation cleanup was incomplete",
+                            );
                             return Err(error);
                         }
                     };
                     finalized_output_receipt = Some(candidate_receipt);
                 }
                 crate::vacuum::VacuumTargetKind::Discard => {
-                    if !target.cleanup_if_owned(&cx)? {
-                        return Err(FrankenError::CannotOpen {
-                            path: target.path().to_owned(),
-                        });
+                    let cleanup = target.cleanup_if_owned(&cx)?;
+                    match cleanup {
+                        fsqlite_vfs::PrivateDatabaseCleanupOutcome::Complete { .. } => {}
+                        fsqlite_vfs::PrivateDatabaseCleanupOutcome::NotOwned => {
+                            return Err(FrankenError::CannotOpen {
+                                path: target.path().to_owned(),
+                            });
+                        }
+                        partial @ fsqlite_vfs::PrivateDatabaseCleanupOutcome::Partial {
+                            ..
+                        } => {
+                            return Err(FrankenError::FunctionError(format!(
+                                "VACUUM discard cleanup was partial: {partial:?}"
+                            )));
+                        }
                     }
                 }
                 crate::vacuum::VacuumTargetKind::InternalRebuild => {
@@ -63097,18 +63102,10 @@ impl Connection {
 
             let cleanup_cx = cx.create_child();
             let _cleanup_mask = cleanup_cx.masked();
-            match rebuild_target.cleanup_if_owned(&cleanup_cx) {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
-                    path = %rebuild_target.path().display(),
-                    "VACUUM committed but the rebuild pathname no longer names its reserved identity; preserving the replacement"
-                ),
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    path = %rebuild_target.path().display(),
-                    "VACUUM committed but could not remove its identity-bound rebuild image"
-                ),
-            }
+            rebuild_target.cleanup_after_failure(
+                &cleanup_cx,
+                "VACUUM committed but rebuild-image cleanup was incomplete",
+            );
             drop(_cleanup_mask);
             self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)
                 .await?;
@@ -63121,13 +63118,10 @@ impl Connection {
             .reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows)
             .await
         {
-            if let Some(target) = target_reservation.as_ref()
-                && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
-            {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    path = %target.path().display(),
-                    "VACUUM INTO source-state restoration failed and exact-reservation cleanup also failed"
+            if let Some(target) = target_reservation.as_ref() {
+                target.cleanup_after_failure(
+                    &cx,
+                    "VACUUM INTO source-state restoration failed and exact-reservation cleanup was incomplete",
                 );
             }
             return Err(error);
@@ -63144,26 +63138,20 @@ impl Connection {
             match final_receipt {
                 Ok(receipt) if receipt == *expected_receipt => {}
                 Ok(_) => {
-                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                        tracing::warn!(
-                            error = %cleanup_error,
-                            path = %target.path().display(),
-                            "VACUUM INTO final receipt changed and exact-reservation cleanup also failed"
-                        );
-                    }
+                    target.cleanup_after_failure(
+                        &cx,
+                        "VACUUM INTO final receipt changed and exact-reservation cleanup was incomplete",
+                    );
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "VACUUM INTO candidate identity or content changed before success"
                             .to_owned(),
                     });
                 }
                 Err(error) => {
-                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                        tracing::warn!(
-                            error = %cleanup_error,
-                            path = %target.path().display(),
-                            "VACUUM INTO final receipt failed and exact-reservation cleanup also failed"
-                        );
-                    }
+                    target.cleanup_after_failure(
+                        &cx,
+                        "VACUUM INTO final receipt failed and exact-reservation cleanup was incomplete",
+                    );
                     return Err(error);
                 }
             }

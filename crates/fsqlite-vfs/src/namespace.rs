@@ -1480,7 +1480,7 @@ fn preflight_cleanup_entry(database_path: &Path, path: PathBuf) -> Result<Planne
 }
 
 fn cleanup_companion_paths(database_path: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![
+    let paths = vec![
         sidecar_path(database_path, "-journal"),
         sidecar_path(database_path, "-wal"),
         sidecar_path(database_path, "-wal-fec"),
@@ -1492,11 +1492,15 @@ fn cleanup_companion_paths(database_path: &Path) -> Vec<PathBuf> {
         sidecar_path(database_path, ".fsqlite-migration-state"),
     ];
     #[cfg(windows)]
-    paths.extend([
-        sidecar_path(database_path, "-wal-lock-shared"),
-        sidecar_path(database_path, "-wal-lock-reserved"),
-        sidecar_path(database_path, "-wal-lock-pending"),
-    ]);
+    let paths = {
+        let mut paths = paths;
+        paths.extend([
+            sidecar_path(database_path, "-wal-lock-shared"),
+            sidecar_path(database_path, "-wal-lock-reserved"),
+            sidecar_path(database_path, "-wal-lock-pending"),
+        ]);
+        paths
+    };
     paths
 }
 
@@ -1512,28 +1516,45 @@ fn cleanup_entry_receipts(
         .collect()
 }
 
-fn refresh_unremoved_cleanup_states(entries: &mut [PlannedCleanupEntry]) {
+fn refresh_cleanup_states(entries: &mut [PlannedCleanupEntry]) {
     for entry in entries {
-        if entry.state == PrivateDatabaseCleanupEntryState::RemovedOwned {
-            continue;
-        }
-        entry.state = match (entry.preflight_identity, observe_cleanup_entry(&entry.path)) {
-            (None, CleanupEntryObservation::Absent) => {
+        let observed = observe_cleanup_entry(&entry.path);
+        entry.state = match (entry.state, entry.preflight_identity, observed) {
+            (
+                PrivateDatabaseCleanupEntryState::RemovedOwned,
+                _,
+                CleanupEntryObservation::Absent,
+            ) => PrivateDatabaseCleanupEntryState::RemovedOwned,
+            (
+                PrivateDatabaseCleanupEntryState::RemovedOwned,
+                _,
+                CleanupEntryObservation::Present { .. } | CleanupEntryObservation::Unsafe,
+            ) => PrivateDatabaseCleanupEntryState::ReplacementDetected,
+            (
+                PrivateDatabaseCleanupEntryState::RemovedOwned,
+                _,
+                CleanupEntryObservation::Unknown,
+            ) => PrivateDatabaseCleanupEntryState::OperationUnknown,
+            (_, None, CleanupEntryObservation::Absent) => {
                 PrivateDatabaseCleanupEntryState::AbsentAtPreflight
             }
-            (None, CleanupEntryObservation::Present { .. } | CleanupEntryObservation::Unsafe) => {
-                PrivateDatabaseCleanupEntryState::NewlyPresentUnowned
-            }
-            (Some(expected), CleanupEntryObservation::Present { identity, .. })
+            (
+                _,
+                None,
+                CleanupEntryObservation::Present { .. } | CleanupEntryObservation::Unsafe,
+            ) => PrivateDatabaseCleanupEntryState::NewlyPresentUnowned,
+            (_, Some(expected), CleanupEntryObservation::Present { identity, .. })
                 if identity == expected =>
             {
                 PrivateDatabaseCleanupEntryState::RetainedOwned
             }
             (
+                _,
                 Some(_),
                 CleanupEntryObservation::Present { .. } | CleanupEntryObservation::Unsafe,
             ) => PrivateDatabaseCleanupEntryState::ReplacementDetected,
-            (Some(_), CleanupEntryObservation::Absent) | (_, CleanupEntryObservation::Unknown) => {
+            (_, Some(_), CleanupEntryObservation::Absent)
+            | (_, _, CleanupEntryObservation::Unknown) => {
                 PrivateDatabaseCleanupEntryState::OperationUnknown
             }
         };
@@ -1544,7 +1565,7 @@ fn partial_cleanup_outcome(
     entries: &mut [PlannedCleanupEntry],
     cause: PrivateDatabaseCleanupFailure,
 ) -> PrivateDatabaseCleanupOutcome {
-    refresh_unremoved_cleanup_states(entries);
+    refresh_cleanup_states(entries);
     PrivateDatabaseCleanupOutcome::Partial {
         cause,
         entries: cleanup_entry_receipts(entries),
@@ -1791,6 +1812,24 @@ fn cleanup_abandoned_private_database_with_hooks(
         }
     }
 
+    #[cfg(unix)]
+    let parent = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    if let Err(error) = hooks.before_directory_sync(parent) {
+        let cause = cleanup_io_failure(
+            PrivateDatabaseCleanupFailureStage::DirectorySync,
+            Some(parent),
+            error,
+        );
+        return Ok(partial_cleanup_outcome(&mut entries, cause));
+    }
+
+    // This is the final complete-set observation. On Unix it deliberately
+    // follows the last pre-sync hook so a pathname repopulated after its own
+    // removal ordinal cannot be hidden behind a successful durability claim.
     if let Some((path, state)) = verify_cleanup_completion_entries(&mut entries) {
         let cause = cleanup_ownership_failure(&path, state);
         return Ok(partial_cleanup_outcome(&mut entries, cause));
@@ -1798,18 +1837,6 @@ fn cleanup_abandoned_private_database_with_hooks(
 
     #[cfg(unix)]
     {
-        let parent = database_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if let Err(error) = hooks.before_directory_sync(parent) {
-            let cause = cleanup_io_failure(
-                PrivateDatabaseCleanupFailureStage::DirectorySync,
-                Some(parent),
-                error,
-            );
-            return Ok(partial_cleanup_outcome(&mut entries, cause));
-        }
         if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
             let cause = cleanup_io_failure(
                 PrivateDatabaseCleanupFailureStage::DirectorySync,
@@ -4601,6 +4628,95 @@ mod tests {
                 "all remaining owned entries must already be removed"
             );
         }
+    }
+
+    struct ReplaceRemovedEntryAndInterrupt {
+        ordinal: usize,
+    }
+
+    impl PrivateDatabaseCleanupHooks for ReplaceRemovedEntryAndInterrupt {
+        fn after_remove(&mut self, ordinal: usize, path: &Path) -> io::Result<()> {
+            if ordinal == self.ordinal {
+                fs::write(path, b"replacement after successful removal")?;
+                return Err(io::Error::other("interrupt after replacement"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cleanup_partial_receipt_refreshes_post_removal_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("post-removal-replacement.db");
+        let ordinal = 0;
+        let (identity, paths) = seed_cleanup_fixture(&database, None);
+        let outcome = cleanup_abandoned_private_database_with_hooks(
+            &database,
+            identity,
+            &mut ReplaceRemovedEntryAndInterrupt { ordinal },
+        )
+        .expect("post-removal replacement must return a typed receipt");
+        let (cause, entries, durability) = unwrap_partial_cleanup(outcome);
+
+        assert_eq!(
+            cause.stage,
+            PrivateDatabaseCleanupFailureStage::AfterRemoval
+        );
+        assert_eq!(cause.path.as_deref(), Some(paths[ordinal].as_path()));
+        assert_eq!(durability, PrivateDatabaseCleanupDurability::Unknown);
+        assert_eq!(
+            entries[ordinal].state,
+            PrivateDatabaseCleanupEntryState::ReplacementDetected
+        );
+        assert_eq!(
+            fs::read(&paths[ordinal]).expect("read post-removal replacement"),
+            b"replacement after successful removal"
+        );
+    }
+
+    #[cfg(unix)]
+    struct RepopulateBeforeDirectorySync {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl PrivateDatabaseCleanupHooks for RepopulateBeforeDirectorySync {
+        fn before_directory_sync(&mut self, _parent: &Path) -> io::Result<()> {
+            fs::write(&self.path, b"late entry before directory sync")
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_final_sweep_follows_the_last_pre_sync_hook() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("pre-sync-repopulation.db");
+        let ordinal = 0;
+        let (identity, paths) = seed_cleanup_fixture(&database, Some(ordinal));
+        let outcome = cleanup_abandoned_private_database_with_hooks(
+            &database,
+            identity,
+            &mut RepopulateBeforeDirectorySync {
+                path: paths[ordinal].clone(),
+            },
+        )
+        .expect("pre-sync repopulation must return a typed receipt");
+        let (cause, entries, durability) = unwrap_partial_cleanup(outcome);
+
+        assert_eq!(
+            cause.stage,
+            PrivateDatabaseCleanupFailureStage::OwnershipRecheck
+        );
+        assert_eq!(cause.path.as_deref(), Some(paths[ordinal].as_path()));
+        assert_eq!(durability, PrivateDatabaseCleanupDurability::Unknown);
+        assert_eq!(
+            entries[ordinal].state,
+            PrivateDatabaseCleanupEntryState::NewlyPresentUnowned
+        );
+        assert_eq!(
+            fs::read(&paths[ordinal]).expect("read pre-sync repopulation"),
+            b"late entry before directory sync"
+        );
     }
 
     struct RemoveCleanupEntryBeforeRecheck {
