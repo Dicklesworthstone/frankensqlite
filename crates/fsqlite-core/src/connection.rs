@@ -24358,6 +24358,15 @@ impl Connection {
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
+    /// Consume the raw CREATE source after expression-span users have finished
+    /// with it, then normalize only the copy persisted in `sqlite_master`.
+    fn take_pending_ddl_source_for_storage(&self) -> Option<String> {
+        self.pending_ddl_source.borrow_mut().take().map(|source| {
+            strip_trailing_sql_comments_and_terminator(strip_leading_sql_comments(&source))
+                .to_owned()
+        })
+    }
+
     /// Prepare SQL into a statement.
     pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
@@ -25266,13 +25275,12 @@ impl Connection {
         // render_create_* and write sqlite_master directly, without going through
         // execute()); multi-statement batches fall back to AST serialization.
         //
-        // bd-lgolw / bd-xfmv9: the captured text must begin at the statement's
-        // first token. Stock sqlite3 stores the CREATE from its first keyword; a
-        // leading `-- comment` (which parses as part of a one-statement
-        // script) persisted into sqlite_master makes canonical SQLite fail
-        // the whole schema load with "malformed database schema (<table>)". For
-        // CREATE TRIGGER the AST re-render also collapsed redundant `WHEN`
-        // parentheses (GH#350), so triggers likewise need the verbatim capture.
+        // Keep the raw source here because expression spans are offsets into
+        // this exact input. Stripping a leading comment before CHECK/default
+        // extraction rebases the text without rebasing the AST spans and can
+        // silently attach unrelated source bytes to a constraint. The CREATE
+        // handlers normalize the consumed copy immediately before persisting it
+        // to sqlite_master, which still must begin at the first CREATE token.
         *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
             && matches!(
                 statements[0].as_ref(),
@@ -25281,12 +25289,7 @@ impl Connection {
                     | Statement::CreateView(_)
                     | Statement::CreateTrigger(_)
             ))
-        .then(|| {
-            // Both boundaries mirror stock sqlite3's stored text: begin at the
-            // statement's first token, end at its last (no terminator, no
-            // trailing comment) — bd-lgolw.
-            strip_trailing_sql_comments_and_terminator(strip_leading_sql_comments(sql)).to_owned()
-        });
+        .then(|| sql.to_owned());
         let mut last_count = 0;
         for statement in statements {
             let is_dml = matches!(
@@ -59659,11 +59662,17 @@ impl Connection {
                 // serialization for multi-statement batches and internal rewrite
                 // paths. This keeps sqlite_master.sql byte-faithful to the original
                 // statement, matching stock SQLite's .schema output.
-                let create_sql = self
-                    .pending_ddl_source
-                    .borrow_mut()
-                    .take()
-                    .unwrap_or_else(|| create.to_string());
+                let pending_create_sql = self.take_pending_ddl_source_for_storage();
+                let create_sql = if create.name.schema.is_some() {
+                    // sqlite_master stores persistent object names without a
+                    // database qualifier. Keeping `main.` here makes canonical
+                    // SQLite reject the entire schema as malformed on reopen.
+                    let mut stored_create = create.clone();
+                    stored_create.name.schema = None;
+                    stored_create.to_string()
+                } else {
+                    pending_create_sql.unwrap_or_else(|| create.to_string())
+                };
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 if target_is_temp {
@@ -60416,10 +60425,6 @@ impl Connection {
 
     /// Execute an ALTER TABLE statement.
     async fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
-        if !matches!(alter.action, AlterTableAction::DropColumn(_)) {
-            return self.execute_alter_table_impl(alter).await;
-        }
-
         let table_name_lc = alter.table.name.to_ascii_lowercase();
         let targets_main_explicit = alter
             .table
@@ -60432,7 +60437,11 @@ impl Connection {
                 .borrow()
                 .contains_key(&table_name_lc)
         {
-            return self.execute_alter_drop_on_shadowed_main(alter).await;
+            return self.execute_alter_on_shadowed_main(alter).await;
+        }
+
+        if !matches!(alter.action, AlterTableAction::DropColumn(_)) {
+            return self.execute_alter_table_impl(alter).await;
         }
 
         self.execute_visible_alter_drop_column(alter).await
@@ -60488,7 +60497,7 @@ impl Connection {
     /// the ordinary ALTER machinery can rewrite its pager root and catalog
     /// row. The connection-local TEMP table is restored as the unqualified
     /// binding before this function returns, on both success and failure.
-    async fn execute_alter_drop_on_shadowed_main(
+    async fn execute_alter_on_shadowed_main(
         &self,
         alter: &fsqlite_ast::AlterTableStatement,
     ) -> Result<()> {
@@ -60509,10 +60518,21 @@ impl Connection {
                     let mut schema = self.connection.schema.borrow_mut();
                     std::mem::replace(&mut schema[self.visible_slot], temp_table)
                 };
-                self.connection
-                    .shadowed_main_tables
-                    .borrow_mut()
-                    .insert(self.table_name_lc.clone(), updated_main);
+                if updated_main
+                    .name
+                    .eq_ignore_ascii_case(&self.table_name_lc)
+                {
+                    self.connection
+                        .shadowed_main_tables
+                        .borrow_mut()
+                        .insert(self.table_name_lc.clone(), updated_main);
+                } else {
+                    // RENAME TO moved the main table out from behind the TEMP
+                    // table's name. Both are now ordinary visible entries: the
+                    // TEMP table keeps the old name and the renamed main table
+                    // occupies its new, non-conflicting name.
+                    self.connection.schema.borrow_mut().push(updated_main);
+                }
                 self.connection
                     .rowid_alias_columns
                     .borrow_mut()
@@ -63504,11 +63524,14 @@ impl Connection {
         // text captured in execute() (byte-faithful to what the user issued,
         // e.g. redundant parens in a partial-index WHERE) when present; fall back
         // to AST re-render for multi-statement batches / internal rewrites.
-        let create_sql = self
-            .pending_ddl_source
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| stmt.to_string());
+        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let create_sql = if stmt.name.schema.is_some() {
+            let mut stored_stmt = stmt.clone();
+            stored_stmt.name.schema = None;
+            stored_stmt.to_string()
+        } else {
+            pending_create_sql.unwrap_or_else(|| stmt.to_string())
+        };
         if !target_is_temp {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
@@ -63739,11 +63762,14 @@ impl Connection {
         // bd-xfmv9: prefer the verbatim CREATE VIEW text captured in execute()
         // (byte-faithful to the issued statement, incl. redundant parens in the
         // view's SELECT) over an AST re-render; fall back for batches / rewrites.
-        let create_sql = self
-            .pending_ddl_source
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| stmt.to_string());
+        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let create_sql = if stmt.name.schema.is_some() {
+            let mut stored_stmt = stmt.clone();
+            stored_stmt.name.schema = None;
+            stored_stmt.to_string()
+        } else {
+            pending_create_sql.unwrap_or_else(|| stmt.to_string())
+        };
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
             columns: stmt.columns.clone(),
@@ -63839,11 +63865,14 @@ impl Connection {
         // `WHEN (((a) AND (b)))` parentheses, so a trigger could not round-trip
         // through sqlite_master byte-for-byte (breaking schema-digest consumers
         // and stock sqlite3 tooling). Fall back for batches / internal rewrites.
-        let create_sql = self
-            .pending_ddl_source
-            .borrow_mut()
-            .take()
-            .unwrap_or_else(|| stmt.to_string());
+        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let create_sql = if stmt.name.schema.is_some() {
+            let mut stored_stmt = stmt.clone();
+            stored_stmt.name.schema = None;
+            stored_stmt.to_string()
+        } else {
+            pending_create_sql.unwrap_or_else(|| stmt.to_string())
+        };
         self.triggers
             .borrow_mut()
             .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
@@ -101687,6 +101716,7 @@ fn rewrite_create_table_sql_for_alter(
 ) -> Result<String> {
     let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
     let self_table_name = create.name.name.clone();
+    let had_schema_qualifier = create.name.schema.take().is_some();
 
     match action {
         AlterTableAction::RenameTo(new_name) => {
@@ -101757,7 +101787,8 @@ fn rewrite_create_table_sql_for_alter(
             // so a verbatim-stored CREATE stays byte-faithful to `.schema` across
             // ADD COLUMN. Fall back to AST re-serialization when the column-list
             // structure cannot be located.
-            if let Some(spliced) =
+            if !had_schema_qualifier
+                && let Some(spliced) =
                 splice_added_column_into_create_sql(original_sql, &column.to_string())
             {
                 return Ok(spliced);
@@ -167024,6 +167055,100 @@ mod tests {
                     })
                     .unwrap(),
                 (1, 10)
+            );
+        });
+    }
+
+    #[test]
+    fn test_alter_rename_qualified_main_preserves_temp_shadow() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("alter-main-rename-behind-temp.db");
+            let conn = Connection::open(db_path.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            for setup in [
+                "CREATE TABLE current (key TEXT NOT NULL, value TEXT NOT NULL);",
+                "INSERT INTO main.current VALUES ('owned', 'original');",
+                "CREATE TEMP TABLE staged (sentinel TEXT NOT NULL);",
+                "INSERT INTO temp.staged VALUES ('preserve-temp');",
+                "CREATE TABLE main.staged (key TEXT NOT NULL, value TEXT NOT NULL);",
+                "INSERT INTO main.staged (key, value) SELECT key, value FROM main.current;",
+                "DROP TABLE main.current;",
+            ] {
+                conn.execute(setup).await.unwrap();
+                oracle.execute_batch(setup).unwrap();
+            }
+
+            conn.execute("ALTER TABLE main.staged RENAME TO current;")
+                .await
+                .unwrap();
+            oracle
+                .execute_batch("ALTER TABLE main.staged RENAME TO current;")
+                .unwrap();
+
+            let temp = conn
+                .query_row("SELECT sentinel FROM temp.staged;")
+                .await
+                .unwrap();
+            assert_eq!(
+                temp.values(),
+                &[SqliteValue::Text("preserve-temp".into())]
+            );
+            let main = conn
+                .query_row("SELECT key, value FROM main.current;")
+                .await
+                .unwrap();
+            assert_eq!(
+                main.values(),
+                &[
+                    SqliteValue::Text("owned".into()),
+                    SqliteValue::Text("original".into()),
+                ]
+            );
+            assert_eq!(
+                oracle
+                    .query_row("SELECT sentinel FROM temp.staged", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap(),
+                "preserve-temp"
+            );
+            assert_eq!(
+                oracle
+                    .query_row("SELECT key, value FROM main.current", [], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap(),
+                ("owned".to_owned(), "original".to_owned())
+            );
+
+            conn.close().await.unwrap();
+            let reopened = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(
+                reopened
+                    .query_row("SELECT key, value FROM main.current", [], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap(),
+                ("owned".to_owned(), "original".to_owned())
+            );
+            assert!(
+                reopened
+                    .query_row(
+                        "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'staged'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .is_err(),
+                "the renamed main staging table must not survive under its old name"
+            );
+            assert_eq!(
+                reopened
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
             );
         });
     }
@@ -268051,6 +268176,8 @@ mod pager_routing_tests {
                 "INSERT INTO bounded VALUES (3, 100);",
                 "CREATE TABLE multi_check (a INTEGER CHECK(a > 0), b TEXT CHECK(length(b) <= 5));",
                 "INSERT INTO multi_check VALUES (1, 'hi');",
+                "-- schema provenance retained ahead of CREATE\nCREATE TABLE repeated_check (title TEXT NOT NULL CHECK(length(title) <= 5) CHECK(length(title) >= 1));",
+                "INSERT INTO repeated_check VALUES ('ok');",
             ];
             for s in &setup {
                 fconn.execute(s).await.unwrap();
@@ -268060,6 +268187,7 @@ mod pager_routing_tests {
             let queries = [
                 "SELECT * FROM bounded ORDER BY id",
                 "SELECT * FROM multi_check ORDER BY a",
+                "SELECT * FROM repeated_check ORDER BY title",
             ];
             let mismatches = oracle_compare(&fconn, &rconn, &queries).await;
             assert!(mismatches.is_empty(), "Setup mismatch: {mismatches:?}");
@@ -268134,6 +268262,19 @@ mod pager_routing_tests {
                 bad_multi_r.is_err(),
                 "C SQLite should reject multi-column CHECK violation"
             );
+
+            for invalid in ["", "toolong"] {
+                let sql = format!("INSERT INTO repeated_check VALUES ('{invalid}')");
+                assert!(
+                    fconn.execute(&sql).await.is_err(),
+                    "FrankenSQLite should enforce every repeated column CHECK for {invalid:?}"
+                );
+                assert!(
+                    rconn.execute_batch(&sql).is_err(),
+                    "C SQLite should enforce every repeated column CHECK for {invalid:?}"
+                );
+            }
+            fconn.close().await.unwrap();
         });
     }
 
