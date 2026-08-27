@@ -17,13 +17,14 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) (2026-08-23). v0.3.2–v0.3.4 and v0.3.6–v0.3.9 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.10) (2026-08-26). v0.3.2–v0.3.4 and v0.3.6–v0.3.10 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...main) | HEAD | 2026-08-23 | (no post-0.3.9 changes yet) |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.10...main) | HEAD | 2026-08-26 | Development after v0.3.10 |
+| [v0.3.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.10) | Release | 2026-08-26 | DDL source-span and shadowed-main ALTER correctness; checkpoint, recovery, planner, backup, compaction, and observability hardening |
 | [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | **Expedited**: v0.3.8 prebuilt CLI could not open file databases (bd-slgya feature-pin regression) + Windows read-only open regression fix (GH#438) + async-api implies native (GH#379) + C API `sqlite3_bind_*` + UPSERT/trigger/parity continuation |
 | [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) | Release | 2026-08-22 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
 | [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) | Release | 2026-08-20 | GH#345/#366/#368/#369/#370/#371/#244 + bd-xv5cm 7-facet concurrency hardening + REVIEW3 |
@@ -35,11 +36,47 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.9
+## [Unreleased] -- development on `main` since v0.3.10
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.10...main>
 
-Post-v0.3.9 development continues on `main` (see the compare link).
+Post-v0.3.10 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.10] -- 2026-08-26 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.9...v0.3.10>
+
+This patch release is headed by two downstream-blocking schema fixes. CREATE
+statements with leading comments now retain the original source coordinate
+system while CHECK/default expressions are extracted, so every constraint is
+enforced instead of silently slicing unrelated SQL. Explicit
+`ALTER TABLE main.<name> RENAME TO ...` also works when a same-named TEMP table
+shadows the persistent table, while preserving the TEMP binding and storing
+canonical, unqualified DDL that stock SQLite accepts on reopen.
+
+Other changes since v0.3.9 include:
+
+- checkpoint and recovery hardening, including exclusive maintenance leases,
+  commit-horizon preservation, multi-section journal recovery, and per-record
+  parallel-WAL CRC32C validation;
+- pager and B-tree safety work for reclamation, abandoned-page ledgers,
+  allocator exhaustion, export/copy fencing, and quotient-filter fail-safe
+  behavior;
+- concurrent transaction lifecycle enforcement, commit-phase liveness fixes,
+  and decomposed validation/I/O/publication observability;
+- typed verified-backup and compaction APIs, plus process-wide metrics
+  autostart and expanded transaction, conflict, lock, and WAL telemetry;
+- planner and VDBE correctness for WITHOUT ROWID lookups, correlated EXISTS,
+  composite ordering, triggers, and multi-clause UPSERT routing.
+
+Release evidence for the schema fixes includes stock-SQLite differential
+checks, canonical reopen plus `PRAGMA integrity_check`, the exact downstream
+`beads_rust` reproducers, the full downstream library suite, and clean
+workspace check/clippy gates. Two exhaustive workspace-test attempts were
+terminated by remote infrastructure during test-binary linking (one full
+volume and one external SIGTERM); neither emitted a source or test failure.
 
 ---
 
