@@ -67,12 +67,14 @@ still becoming permanent registry metadata after publication.
 
 ### Publish DAG
 
-The disabled release workflow lists 25 publishable crates in an order that an
+The disabled release workflow lists the original 25 publishable crates in an order that an
 independent manifest review found consistent with normal-dependency topology.
-Two of the 27 workspace members are intentionally non-publishable. That list
-survives as the reference sequence for DSR; because the workflow no longer
-runs, the crate-set and version checks it used to perform are now DSR's
-responsibility, not automation's.
+The current workspace has 28 members: two are intentionally non-publishable,
+and `beads-doctor` brings the live publishable set to 26. The workflow list
+survives only as a reference sequence for DSR; because the workflow no longer
+runs, the current Cargo metadata is authoritative and the crate-set and
+version checks it used to perform are now DSR's responsibility, not
+automation's.
 
 DSR must therefore itself confirm, at cut time, that the crate set matches
 Cargo metadata and that every package version equals the release tag. Neither

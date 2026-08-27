@@ -7,7 +7,7 @@ page-level MVCC concurrent writers and Serializable Snapshot Isolation (SSI).
 RaptorQ erasure coding is durability research: the codecs and WAL repair
 routines exist in the workspace, but the compatibility runtime's WAL commit and
 recovery paths do not write or consult repair symbols. The project is organized
-as a 27-member Cargo workspace under `crates/`.
+as a 28-member Cargo workspace under `crates/`.
 
 > The project is pre-release. Crates are published to crates.io as `fsqlite`
 > and the `fsqlite-*` workspace members. The historical entries below
@@ -17,13 +17,14 @@ as a 27-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.10) (2026-08-26). v0.3.2–v0.3.4 and v0.3.6–v0.3.10 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.11](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.11) (2026-08-27). v0.3.2–v0.3.4 and v0.3.6–v0.3.11 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.10...main) | HEAD | 2026-08-26 | Development after v0.3.10 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.11...main) | HEAD | 2026-08-27 | Development after v0.3.11 |
+| [v0.3.11](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.11) | Release | 2026-08-27 | Preserve and enforce compound CHECK constraints with nested grouping parentheses |
 | [v0.3.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.10) | Release | 2026-08-26 | DDL source-span and shadowed-main ALTER correctness; checkpoint, recovery, planner, backup, compaction, and observability hardening |
 | [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | **Expedited**: v0.3.8 prebuilt CLI could not open file databases (bd-slgya feature-pin regression) + Windows read-only open regression fix (GH#438) + async-api implies native (GH#379) + C API `sqlite3_bind_*` + UPSERT/trigger/parity continuation |
 | [v0.3.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.8) | Release | 2026-08-22 | UPSERT clobber P1 fix + INSERT-ABORT atomicity + stock-error-message parity campaign + JSON5 + differential oracle keeper suite |
@@ -36,11 +37,32 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.10
+## [Unreleased] -- development on `main` since v0.3.11
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.10...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.11...main>
 
-Post-v0.3.10 development continues on `main` (see the compare link).
+Post-v0.3.11 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.11] -- 2026-08-27 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.10...v0.3.11>
+
+This patch release fixes a CHECK-constraint enforcement hole in freshly
+created schemas. Parser expression spans intentionally omit grouping
+parentheses, but the direct CREATE and ALTER paths previously reused those
+spans as verbatim SQL. For a compound expression such as
+`CHECK((a) AND (b))`, that produced the malformed fragment `a) AND (b`; VDBE
+code generation then skipped the unparsable constraint, so it was not enforced
+until the database was reopened and the schema was canonicalized.
+
+CHECK source now keeps its verbatim spelling only when it reparses to the same
+AST, otherwise it uses the AST's canonical rendering. VDBE code generation
+also fails closed if an invalid stored CHECK ever reaches it. Regression tests
+cover the exact downstream `beads_rust` status/closure invariant on a live and
+reopened file database, compound CHECKs introduced by `ALTER TABLE ADD
+COLUMN`, and malformed internal CHECK metadata.
 
 ---
 
