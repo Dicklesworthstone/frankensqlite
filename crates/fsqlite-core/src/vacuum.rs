@@ -6,6 +6,12 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::DatabaseHeader;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::SqliteValue;
+use fsqlite_vfs::PrivateDatabaseCleanupOutcome;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+use fsqlite_vfs::{
+    PrivateDatabaseCleanupDurability, PrivateDatabaseCleanupFailure,
+    PrivateDatabaseCleanupFailureStage,
+};
 use fsqlite_vdbe::codegen::TableSchema;
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -173,17 +179,64 @@ impl VacuumTargetReservation {
 
     /// Remove an internal or failed output only while its pathname still maps
     /// to the exact object reserved by this value.
-    pub(crate) fn cleanup_if_owned(&self, cx: &Cx) -> Result<bool> {
+    pub(crate) fn cleanup_if_owned(&self, cx: &Cx) -> Result<PrivateDatabaseCleanupOutcome> {
+        self.cleanup_if_owned_with_parent_sync(|| {
+            PlatformVfs::new().sync_parent_directory(cx, &self.path)
+        })
+    }
+
+    fn cleanup_if_owned_with_parent_sync(
+        &self,
+        sync_parent: impl FnOnce() -> Result<()>,
+    ) -> Result<PrivateDatabaseCleanupOutcome> {
         if FileIdentity::from_file(&self.reservation)? != Some(self.identity) {
             return Err(FrankenError::internal(
                 "VACUUM reservation descriptor changed identity",
             ));
         }
-        if !fsqlite_vfs::cleanup_abandoned_private_database(&self.path, self.identity)? {
-            return Ok(false);
+        let outcome = fsqlite_vfs::cleanup_abandoned_private_database(&self.path, self.identity)?;
+        let PrivateDatabaseCleanupOutcome::Complete {
+            entries,
+            durability,
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        match sync_parent() {
+            Ok(()) => Ok(PrivateDatabaseCleanupOutcome::Complete {
+                entries,
+                durability,
+            }),
+            Err(error) => Ok(PrivateDatabaseCleanupOutcome::Partial {
+                cause: PrivateDatabaseCleanupFailure {
+                    stage: PrivateDatabaseCleanupFailureStage::CallerDirectorySync,
+                    path: Some(self.path.clone()),
+                    error_kind: match &error {
+                        FrankenError::Io(error) => Some(error.kind()),
+                        _ => None,
+                    },
+                    detail: error.to_string(),
+                },
+                entries,
+                durability: PrivateDatabaseCleanupDurability::Unknown,
+            }),
         }
-        PlatformVfs::new().sync_parent_directory(cx, &self.path)?;
-        Ok(true)
+    }
+
+    pub(crate) fn cleanup_after_failure(&self, cx: &Cx, context: &'static str) {
+        match self.cleanup_if_owned(cx) {
+            Ok(PrivateDatabaseCleanupOutcome::Complete { .. }) => {}
+            Ok(outcome) => tracing::warn!(
+                outcome = ?outcome,
+                path = %self.path.display(),
+                "{context}"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                path = %self.path.display(),
+                "{context}"
+            ),
+        }
     }
 }
 
@@ -205,10 +258,16 @@ impl VacuumTargetReservation {
         ))
     }
 
-    pub(crate) fn cleanup_if_owned(&self, _cx: &Cx) -> Result<bool> {
+    pub(crate) fn cleanup_if_owned(&self, _cx: &Cx) -> Result<PrivateDatabaseCleanupOutcome> {
         Err(FrankenError::not_implemented(
             "VACUUM requires native file support",
         ))
+    }
+
+    pub(crate) fn cleanup_after_failure(&self, cx: &Cx, context: &'static str) {
+        if let Err(error) = self.cleanup_if_owned(cx) {
+            tracing::warn!(error = %error, path = %self.path.display(), "{context}");
+        }
     }
 }
 
@@ -886,6 +945,60 @@ mod tests {
         assert!(second.path().exists());
     }
 
+    #[test]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn test_cleanup_reports_partial_when_outer_parent_sync_fails_after_unlinks() {
+        let cx = Cx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = reserve_temp_rebuild_target(&cx, &source).unwrap();
+        let target_path = target.path().to_owned();
+        let binding = fsqlite_vfs::PendingNamespaceOpen::begin(
+            &target_path,
+            fsqlite_vfs::NamespaceOpenIntent::ReservedExclusive,
+        )
+        .unwrap()
+        .bind(target.identity())
+        .unwrap();
+        binding.finish_bootstrap().unwrap();
+        drop(binding);
+
+        let outcome = target
+            .cleanup_if_owned_with_parent_sync(|| {
+                Err(fsqlite_error::FrankenError::Io(std::io::Error::other(
+                    "injected outer parent-sync failure",
+                )))
+            })
+            .unwrap();
+        let fsqlite_vfs::PrivateDatabaseCleanupOutcome::Partial {
+            cause,
+            entries,
+            durability,
+        } = outcome
+        else {
+            panic!("expected partial cleanup receipt, got {outcome:?}");
+        };
+
+        assert_eq!(
+            cause.stage,
+            fsqlite_vfs::PrivateDatabaseCleanupFailureStage::CallerDirectorySync
+        );
+        assert_eq!(cause.path.as_deref(), Some(target_path.as_path()));
+        assert_eq!(cause.error_kind, Some(std::io::ErrorKind::Other));
+        assert_eq!(
+            durability,
+            fsqlite_vfs::PrivateDatabaseCleanupDurability::Unknown
+        );
+        assert!(
+            entries.iter().all(|entry| matches!(
+                entry.state,
+                fsqlite_vfs::PrivateDatabaseCleanupEntryState::AbsentAtPreflight
+                    | fsqlite_vfs::PrivateDatabaseCleanupEntryState::RemovedOwned
+            ))
+        );
+        assert!(!target_path.exists());
+    }
+
     /// GH #304 (cleanup arm): when the rebuild refuses an index whose declared
     /// collation the builder cannot resolve, the partially written candidate
     /// must actually be removed, and an unrelated caller-owned file in the same
@@ -1010,7 +1123,7 @@ mod tests {
                 "the failed rebuild must leave its candidate for the reservation"
             );
             assert!(
-                target.cleanup_if_owned(&cx).unwrap(),
+                target.cleanup_if_owned(&cx).unwrap().is_complete(),
                 "the reservation still owns the candidate and must reclaim it"
             );
             assert!(
@@ -1051,7 +1164,7 @@ mod tests {
         host_fs::rename(&original_path, &moved_path).unwrap();
         host_fs::write(&original_path, b"replacement-sentinel").unwrap();
 
-        assert!(!target.cleanup_if_owned(&cx).unwrap());
+        assert!(target.cleanup_if_owned(&cx).unwrap().is_not_owned());
         assert_eq!(
             host_fs::read(&original_path).unwrap(),
             b"replacement-sentinel"

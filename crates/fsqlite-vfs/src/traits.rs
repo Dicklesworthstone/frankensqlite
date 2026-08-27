@@ -10,6 +10,119 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 use crate::shm::ShmRegion;
 
+/// Durability boundary reached by abandoned private-database cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateDatabaseCleanupDurability {
+    /// The parent directory was synchronized after all removals.
+    DirectorySynced,
+    /// The platform has no portable parent-directory synchronization primitive.
+    PlatformNoDirectorySync,
+    /// The cleanup did not prove its required durability boundary.
+    Unknown,
+}
+
+/// Observed final state of one fixed abandoned-database cleanup entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateDatabaseCleanupEntryState {
+    /// The entry did not exist during preflight and still does not exist.
+    AbsentAtPreflight,
+    /// The preflight identity was revalidated and pathname removal succeeded.
+    ///
+    /// This is evidence within the cooperative namespace contract; it does not
+    /// claim an identity-bound unlink primitive on platforms that lack one. On
+    /// a partial receipt it also does not claim the pathname remained absent
+    /// after that successful removal.
+    RemovedOwned,
+    /// The preflight identity remains installed and was not removed.
+    RetainedOwned,
+    /// A preflight-present entry now names a different or unsafe object.
+    ReplacementDetected,
+    /// A path that was absent during preflight became present before completion.
+    NewlyPresentUnowned,
+    /// The operation or a later observation could not determine the final state.
+    OperationUnknown,
+}
+
+/// Per-entry receipt for the fixed abandoned-database cleanup allowlist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateDatabaseCleanupEntryReceipt {
+    /// Exact path for this fixed cleanup ordinal.
+    pub path: PathBuf,
+    /// Best final state the cleanup could establish for this path.
+    pub state: PrivateDatabaseCleanupEntryState,
+}
+
+/// Stage at which an abandoned-database cleanup stopped making progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateDatabaseCleanupFailureStage {
+    /// A pathname no longer carried the ownership evidence captured at preflight.
+    OwnershipRecheck,
+    /// Testable interruption immediately before a removal ordinal.
+    BeforeRemoval,
+    /// The pathname-removal operation returned an error.
+    Remove,
+    /// Testable interruption immediately after a successful removal ordinal.
+    AfterRemoval,
+    /// The VFS helper could not establish its parent-directory durability boundary.
+    DirectorySync,
+    /// The owning caller's additional parent-directory sync failed after cleanup.
+    CallerDirectorySync,
+}
+
+/// Typed cause attached to a partial abandoned-database cleanup receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateDatabaseCleanupFailure {
+    /// Cleanup stage that failed or detected changed ownership.
+    pub stage: PrivateDatabaseCleanupFailureStage,
+    /// Exact path involved, when the failure is path-specific.
+    pub path: Option<PathBuf>,
+    /// Portable I/O category when an I/O operation returned the failure.
+    pub error_kind: Option<std::io::ErrorKind>,
+    /// Human-readable diagnostic detail; callers should branch on typed fields.
+    pub detail: String,
+}
+
+/// Truthful outcome of cleaning an exact caller-owned private database namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrivateDatabaseCleanupOutcome {
+    /// Ownership could not be proven before destructive entry; this call
+    /// preserved every planned entry.
+    NotOwned,
+    /// Every preflight-owned entry was removed, no unowned entry appeared, and
+    /// the reported durability boundary completed.
+    Complete {
+        /// Final full-set receipt in destructive-ordinal order.
+        entries: Vec<PrivateDatabaseCleanupEntryReceipt>,
+        /// Durability boundary reached after the final full-set observation.
+        durability: PrivateDatabaseCleanupDurability,
+    },
+    /// Cleanup crossed the destructive boundary but did not complete. The
+    /// receipt classifies every fixed ordinal; callers must not interpret this
+    /// as "no mutation" and must not retry by pathname without a fresh proof.
+    Partial {
+        /// Typed reason cleanup stopped or refused to claim completion.
+        cause: PrivateDatabaseCleanupFailure,
+        /// Best final observation for every fixed destructive ordinal.
+        entries: Vec<PrivateDatabaseCleanupEntryReceipt>,
+        /// Durability reached by the incomplete operation.
+        durability: PrivateDatabaseCleanupDurability,
+    },
+}
+
+impl PrivateDatabaseCleanupOutcome {
+    /// Whether every owned entry was removed and the durability boundary completed.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    /// Whether cleanup preserved the namespace because ownership was unproven.
+    #[must_use]
+    pub const fn is_not_owned(&self) -> bool {
+        matches!(self, Self::NotOwned)
+    }
+}
+
 /// Opaque identity of an already-open filesystem object.
 ///
 /// Identities are intended only as opaque comparison keys while the relevant
