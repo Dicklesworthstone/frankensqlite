@@ -24358,6 +24358,22 @@ impl Connection {
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
+    /// Return CHECK SQL that is guaranteed to round-trip to the parsed AST.
+    ///
+    /// Grouping parentheses are intentionally omitted from expression spans,
+    /// because DEFAULT reporting strips its outer grouping. A compound CHECK
+    /// such as `CHECK((a) AND (b))` can therefore have a span whose verbatim
+    /// slice is the invalid fragment `a) AND (b`. Preserve verbatim spelling
+    /// only when it reparses to the same expression; otherwise use the AST's
+    /// canonical rendering so CHECK bytecode cannot silently disappear.
+    fn format_check_expr_source(&self, expr: &Expr) -> String {
+        self.expr_verbatim_source(expr)
+            .filter(|source| {
+                fsqlite_parser::expr::parse_expr(source).is_ok_and(|parsed| parsed.eq(expr))
+            })
+            .unwrap_or_else(|| expr.to_string())
+    }
+
     /// Consume the raw CREATE source after expression-span users have finished
     /// with it, then normalize only the copy persisted in `sqlite_master`.
     fn take_pending_ddl_source_for_storage(&self) -> Option<String> {
@@ -59624,9 +59640,7 @@ impl Connection {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
                             check_defs.push(CheckConstraint {
-                                expr: self
-                                    .expr_verbatim_source(expr)
-                                    .unwrap_or_else(|| expr.to_string()),
+                                expr: self.format_check_expr_source(expr),
                                 owner_column: Some(col.name.clone()),
                                 name: c.name.clone(),
                             });
@@ -59636,9 +59650,7 @@ impl Connection {
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
                         check_defs.push(CheckConstraint {
-                            expr: self
-                                .expr_verbatim_source(expr)
-                                .unwrap_or_else(|| expr.to_string()),
+                            expr: self.format_check_expr_source(expr),
                             owner_column: None,
                             name: tc.name.clone(),
                         });
@@ -61149,9 +61161,7 @@ impl Connection {
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
-                            expr: self
-                                .expr_verbatim_source(expr)
-                                .unwrap_or_else(|| expr.to_string()),
+                            expr: self.format_check_expr_source(expr),
                             owner_column: Some(col_def.name.clone()),
                             name: constraint.name.clone(),
                         }),
@@ -166486,20 +166496,42 @@ mod tests {
                 .await
                 .unwrap();
 
-            conn.execute("ALTER TABLE t ADD COLUMN score INTEGER CHECK(score > 0);")
-                .await
-                .unwrap();
+            conn.execute(
+                "ALTER TABLE t ADD COLUMN score INTEGER CHECK((score > 0) AND (score < 10));",
+            )
+            .await
+            .unwrap();
 
-            let err = conn
-                .execute("INSERT INTO t (id, score) VALUES (1, -1);")
-                .await;
-            assert!(err.is_err(), "CHECK on added column should be enforced");
+            let checks = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name == "t")
+                .expect("altered table is live")
+                .check_constraints
+                .clone();
+            assert_eq!(checks.len(), 1, "added-column CHECK must be retained");
+            assert!(
+                fsqlite_parser::expr::parse_expr(&checks[0].expr).is_ok(),
+                "stored added-column CHECK must remain parseable: {:?}",
+                checks[0].expr
+            );
 
-            conn.execute("INSERT INTO t (id, score) VALUES (2, 7);")
+            for invalid in [
+                "INSERT INTO t (id, score) VALUES (1, -1);",
+                "INSERT INTO t (id, score) VALUES (2, 10);",
+            ] {
+                assert!(
+                    conn.execute(invalid).await.is_err(),
+                    "compound CHECK on added column should reject: {invalid}"
+                );
+            }
+
+            conn.execute("INSERT INTO t (id, score) VALUES (3, 7);")
                 .await
                 .unwrap();
             let rows = conn
-                .query("SELECT score FROM t WHERE id = 2;")
+                .query("SELECT score FROM t WHERE id = 3;")
                 .await
                 .unwrap();
             assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
@@ -268275,6 +268307,83 @@ mod pager_routing_tests {
                 );
             }
             fconn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_table_check_closed_state_invariant_enforcement() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir
+                .path()
+                .join("grouped-table-check.db")
+                .to_string_lossy()
+                .into_owned();
+            let fconn = Connection::open(db_path.clone()).await.unwrap();
+            let rconn = rusqlite::Connection::open_in_memory().unwrap();
+            let create = "CREATE TABLE issues (
+                id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                closed_at TEXT,
+                CHECK (
+                    (status = 'closed' AND closed_at IS NOT NULL) OR
+                    (status = 'tombstone') OR
+                    (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL)
+                )
+            )";
+            fconn.execute(create).await.unwrap();
+            rconn.execute_batch(create).unwrap();
+
+            let checks = fconn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name == "issues")
+                .expect("issues table is live")
+                .check_constraints
+                .clone();
+            assert_eq!(checks.len(), 1, "table-level CHECK must be retained");
+            assert!(
+                fsqlite_parser::expr::parse_expr(&checks[0].expr).is_ok(),
+                "stored table-level CHECK must remain parseable: {:?}",
+                checks[0].expr
+            );
+
+            for valid in [
+                "INSERT INTO issues VALUES ('open', 'open', NULL)",
+                "INSERT INTO issues VALUES ('closed', 'closed', '2026-08-26T00:00:00Z')",
+                "INSERT INTO issues VALUES ('tombstone', 'tombstone', NULL)",
+            ] {
+                fconn.execute(valid).await.unwrap();
+                rconn.execute_batch(valid).unwrap();
+            }
+
+            for invalid in [
+                "INSERT INTO issues VALUES ('closed-null', 'closed', NULL)",
+                "INSERT INTO issues VALUES ('open-time', 'open', '2026-08-26T00:00:00Z')",
+            ] {
+                assert!(
+                    fconn.execute(invalid).await.is_err(),
+                    "FrankenSQLite must reject table-level CHECK violation: {invalid}"
+                );
+                assert!(
+                    rconn.execute_batch(invalid).is_err(),
+                    "C SQLite must reject table-level CHECK violation: {invalid}"
+                );
+            }
+            fconn.close().await.unwrap();
+
+            let reopened = Connection::open(db_path).await.unwrap();
+            for invalid in [
+                "INSERT INTO issues VALUES ('reopen-closed-null', 'closed', NULL)",
+                "INSERT INTO issues VALUES ('reopen-open-time', 'open', '2026-08-26T00:00:00Z')",
+            ] {
+                assert!(
+                    reopened.execute(invalid).await.is_err(),
+                    "reopened FrankenSQLite must reject table-level CHECK violation: {invalid}"
+                );
+            }
+            reopened.close().await.unwrap();
         });
     }
 

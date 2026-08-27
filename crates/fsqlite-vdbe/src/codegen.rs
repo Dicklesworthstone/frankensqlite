@@ -27132,7 +27132,18 @@ fn emit_check_constraints(
 
     for check in &table.check_constraints {
         let Some(expr) = parse_default_expr(&check.expr) else {
-            continue;
+            b.emit_op(
+                Opcode::Halt,
+                ErrorCode::Internal as i32,
+                0,
+                0,
+                P4::Str(format!(
+                    "CHECK constraint codegen invariant failed: malformed expression `{}`",
+                    check.expr
+                )),
+                0,
+            );
+            return;
         };
 
         let result_reg = b.alloc_reg();
@@ -55811,6 +55822,31 @@ mod tests {
             emitted_function_contexts(check_builder),
             [SchemaEvaluationContext::CheckConstraint]
         );
+    }
+
+    #[test]
+    fn test_malformed_check_constraint_codegen_fails_closed() {
+        let mut table = test_schema().remove(0);
+        table.check_constraints = vec![CheckConstraint {
+            expr: "a) AND (b".to_owned(),
+            owner_column: None,
+            name: None,
+        }];
+        let mut builder = ProgramBuilder::new();
+        let row = builder.alloc_regs(
+            i32::try_from(table.columns.len()).expect("test column count fits i32"),
+        );
+        emit_check_constraints(&mut builder, &table, row, None);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("malformed CHECK program builds");
+        assert!(program.ops().iter().any(|op| {
+            op.opcode == Opcode::Halt
+                && op.p1 == ErrorCode::Internal as i32
+                && matches!(
+                    &op.p4,
+                    P4::Str(message) if message.contains("malformed expression")
+                )
+        }));
     }
 
     #[test]
