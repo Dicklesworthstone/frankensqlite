@@ -32,6 +32,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{LockLevel, PageSize};
+use nix::unistd::{AccessFlags as UnixAccessFlags, access as unix_access};
 #[cfg(test)]
 use tracing::debug;
 use tracing::{error, warn};
@@ -1140,6 +1141,29 @@ impl Default for UnixVfs {
     }
 }
 
+fn unix_access_mode(flags: AccessFlags) -> UnixAccessFlags {
+    if flags == AccessFlags::EXISTS {
+        UnixAccessFlags::F_OK
+    } else if flags == AccessFlags::READ {
+        UnixAccessFlags::R_OK
+    } else {
+        UnixAccessFlags::R_OK | UnixAccessFlags::W_OK
+    }
+}
+
+fn open_with_optional_readonly_fallback<T>(
+    requested_readwrite: bool,
+    promote_readonly_to_readwrite: bool,
+    mut open: impl FnMut(bool) -> io::Result<T>,
+) -> io::Result<T> {
+    let write = requested_readwrite || promote_readonly_to_readwrite;
+    match open(write) {
+        Ok(file) => Ok(file),
+        Err(_) if promote_readonly_to_readwrite => open(false),
+        Err(error) => Err(error),
+    }
+}
+
 impl Vfs for UnixVfs {
     type File = UnixFile;
 
@@ -1180,17 +1204,21 @@ impl Vfs for UnixVfs {
                 .access(cx, &resolved, AccessFlags::READWRITE)
                 .unwrap_or(false);
 
-        let file = OpenOptions::new()
-            .read(true)
-            // Prefer a canonical read-write fd whenever the underlying file is
-            // writable, even for read-only callers. Otherwise a later writable
-            // open in the same process would clone a read-only canonical fd and
-            // fail on writes or lock-related syscalls.
-            .write(requested_rw || promote_readonly_to_rw)
-            .create(is_create)
-            .create_new(create_new)
-            .open(&resolved)
-            .map_err(|e| {
+        let open_file = |write| {
+            OpenOptions::new()
+                .read(true)
+                // Prefer a canonical read-write fd whenever the underlying file is
+                // writable, even for read-only callers. Otherwise a later writable
+                // open in the same process would clone a read-only canonical fd and
+                // fail on writes or lock-related syscalls.
+                .write(write)
+                .create(is_create)
+                .create_new(create_new)
+                .open(&resolved)
+        };
+        let file =
+            open_with_optional_readonly_fallback(requested_rw, promote_readonly_to_rw, open_file)
+                .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     FrankenError::CannotOpen {
                         path: resolved.clone(),
@@ -1276,18 +1304,9 @@ impl Vfs for UnixVfs {
     }
 
     fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
-        match flags {
-            AccessFlags::READWRITE => {
-                // Avoid opening the file (opening/closing extra fds can interact
-                // poorly with fcntl locks). Use metadata-based heuristics.
-                match fs::metadata(path) {
-                    Ok(meta) => Ok(!meta.permissions().readonly()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(e) => Err(FrankenError::Io(e)),
-                }
-            }
-            _ => Ok(path.exists()),
-        }
+        // Match SQLite's Unix VFS without opening an extra descriptor: closing
+        // any descriptor for an inode can release this process's fcntl locks.
+        Ok(unix_access(path, unix_access_mode(flags)).is_ok())
     }
 
     fn path_entry_exists(&self, _cx: &Cx, path: &Path) -> Result<bool> {
@@ -4985,6 +5004,73 @@ mod tests {
         file.close(&cx).unwrap();
 
         assert!(vfs.access(&cx, &path, AccessFlags::READWRITE).unwrap());
+    }
+
+    #[test]
+    fn test_unix_vfs_access_modes_match_posix_contract() {
+        assert_eq!(unix_access_mode(AccessFlags::EXISTS), UnixAccessFlags::F_OK);
+        assert_eq!(unix_access_mode(AccessFlags::READ), UnixAccessFlags::R_OK);
+        assert_eq!(
+            unix_access_mode(AccessFlags::READWRITE),
+            UnixAccessFlags::R_OK | UnixAccessFlags::W_OK
+        );
+    }
+
+    #[test]
+    fn test_unix_vfs_readonly_open_of_readable_nonwritable_file() {
+        let path = Path::new("/etc/passwd");
+        if unix_access(path, UnixAccessFlags::R_OK).is_err()
+            || unix_access(path, UnixAccessFlags::W_OK).is_ok()
+        {
+            // Privileged test runners may legitimately have write access.
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        assert!(!vfs.access(&cx, path, AccessFlags::READWRITE).unwrap());
+
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY;
+        let (mut file, out_flags) = vfs.open(&cx, Some(path), flags).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(file.read(&cx, &mut byte, 0).unwrap(), 1);
+        assert!(out_flags.contains(VfsOpenFlags::READONLY));
+        assert!(!out_flags.contains(VfsOpenFlags::READWRITE));
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_promoted_readonly_open_retries_without_write_access() {
+        let mut attempts = Vec::new();
+        let opened = open_with_optional_readonly_fallback(false, true, |write| {
+            attempts.push(write);
+            if write {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "fixture rejects read-write open",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(opened.is_ok());
+        assert_eq!(attempts, [true, false]);
+    }
+
+    #[test]
+    fn test_requested_readwrite_open_does_not_fallback_to_readonly() {
+        let mut attempts = Vec::new();
+        let opened: io::Result<()> = open_with_optional_readonly_fallback(true, false, |write| {
+            attempts.push(write);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture rejects read-write open",
+            ))
+        });
+
+        assert_eq!(opened.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, [true]);
     }
 
     #[test]
