@@ -4804,6 +4804,8 @@ const PRAGMA_COLLATION_LIST_COLUMNS: [&str; 2] = ["seq", "name"];
 const PRAGMA_KEY_VALUE_COLUMNS: [&str; 2] = ["key", "value"];
 #[cfg(any(feature = "diagnostic-pragmas", not(target_arch = "wasm32")))]
 const PRAGMA_NAME_VALUE_COLUMNS: [&str; 2] = ["name", "value"];
+#[cfg(feature = "diagnostic-pragmas")]
+const PRAGMA_SCHEMA_ADVISOR_COLUMNS: [&str; 4] = ["code", "severity", "subject", "message"];
 #[cfg(any(feature = "diagnostic-pragmas", not(target_arch = "wasm32")))]
 const PRAGMA_STATUS_COLUMNS: [&str; 1] = ["status"];
 #[cfg(feature = "diagnostic-pragmas")]
@@ -5204,6 +5206,12 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
         {
             return &["jit_cache_capacity"];
         }
+        if full_name_is("fsqlite.schema_advisor")
+            || full_name_is("schema_advisor")
+            || full_name_is("fsqlite_schema_advisor")
+        {
+            return &PRAGMA_SCHEMA_ADVISOR_COLUMNS;
+        }
         if full_name_is("fsqlite.jit_stats")
             || full_name_is("jit_stats")
             || full_name_is("fsqlite_jit_stats")
@@ -5232,9 +5240,6 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
             || full_name_is("fsqlite.gc_stats")
             || full_name_is("gc_stats")
             || full_name_is("fsqlite_gc_stats")
-            || full_name_is("fsqlite.schema_advisor")
-            || full_name_is("schema_advisor")
-            || full_name_is("fsqlite_schema_advisor")
             || full_name_is("fsqlite.txn_stats")
             || full_name_is("txn_stats")
             || full_name_is("fsqlite_txn_stats")
@@ -214420,7 +214425,40 @@ fts5(title, body, content=docs, content_rowid=id)'
             conn.execute("CREATE INDEX i_ab ON t(a, b);").await.unwrap();
             conn.execute("CREATE INDEX i_a ON t(a);").await.unwrap();
 
-            let rows = conn.query("PRAGMA schema_advisor;").await.unwrap();
+            let mut rows = Vec::new();
+            for sql in [
+                "PRAGMA schema_advisor;",
+                "PRAGMA fsqlite.schema_advisor;",
+                "PRAGMA fsqlite_schema_advisor;",
+            ] {
+                let stmt = conn.prepare(sql).await.unwrap();
+                assert_eq!(stmt.column_count(), 4, "prepared metadata width for {sql}");
+                assert_eq!(
+                    stmt.column_names(),
+                    &[
+                        "code".to_owned(),
+                        "severity".to_owned(),
+                        "subject".to_owned(),
+                        "message".to_owned(),
+                    ],
+                    "prepared metadata names for {sql}"
+                );
+                let prepared_rows = stmt.query().await.unwrap();
+                assert!(!prepared_rows.is_empty(), "advisor rows for {sql}");
+                for row in &prepared_rows {
+                    assert_eq!(row.values().len(), 4, "runtime row width for {sql}");
+                    assert!(
+                        row.values()
+                            .iter()
+                            .all(|value| matches!(value, SqliteValue::Text(_))),
+                        "runtime row types for {sql}: {:?}",
+                        row.values()
+                    );
+                }
+                if sql == "PRAGMA schema_advisor;" {
+                    rows = prepared_rows;
+                }
+            }
             let text = |v: &SqliteValue| match v {
                 SqliteValue::Text(s) => s.to_string(),
                 _ => String::new(),
