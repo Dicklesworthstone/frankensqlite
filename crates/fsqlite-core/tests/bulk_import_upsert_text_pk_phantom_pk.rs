@@ -743,8 +743,8 @@ struct BeadsIssue {
     comments: Vec<BeadsComment>,
 }
 
-fn opt_text(value: &Option<String>) -> SqliteValue {
-    value.as_deref().map_or(SqliteValue::Null, text)
+fn opt_text(value: Option<&String>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, |value| text(value.clone()))
 }
 
 impl BeadsIssue {
@@ -760,19 +760,19 @@ impl BeadsIssue {
             text(self.status.clone()),
             SqliteValue::Integer(self.priority),
             text(self.issue_type.clone()),
-            opt_text(&self.assignee),
+            opt_text(self.assignee.as_ref()),
             text(self.owner.clone()),
             self.estimated_minutes
                 .map_or(SqliteValue::Null, SqliteValue::Integer),
             text(self.created_at.clone()),
             text(self.created_by.clone()),
             text(self.updated_at.clone()),
-            opt_text(&self.closed_at),
+            opt_text(self.closed_at.as_ref()),
             text(self.close_reason.clone()),
             text(self.closed_by_session.clone()),
-            opt_text(&self.due_at),
+            opt_text(self.due_at.as_ref()),
             SqliteValue::Null,
-            opt_text(&self.external_ref),
+            opt_text(self.external_ref.as_ref()),
             text(""),
             text("."),
             SqliteValue::Null,
@@ -1218,7 +1218,7 @@ async fn beads_import_transaction(
 
         hash_batch.push((issue.id.clone(), issue.content_hash.clone()));
         if hash_batch.len() >= BEADS_EXPORT_HASH_BATCH {
-            for (issue_id, content_hash) in hash_batch.drain(..) {
+            for (issue_id, content_hash) in std::mem::take(&mut hash_batch) {
                 conn.execute_with_params(
                     "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) \
                      VALUES (?, ?, ?)",
@@ -1229,7 +1229,7 @@ async fn beads_import_transaction(
             }
         }
     }
-    for (issue_id, content_hash) in hash_batch.drain(..) {
+    for (issue_id, content_hash) in std::mem::take(&mut hash_batch) {
         conn.execute_with_params(
             "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
             &[text(issue_id), text(content_hash), text(exported_at.clone())],
@@ -1289,7 +1289,11 @@ async fn beads_import_transaction(
     }
     conn.execute("DELETE FROM child_counters").await.expect("child counters clear");
     let ids = conn.query("SELECT id FROM issues").await.expect("child counter scan");
-    assert_eq!(ids.len(), issues.len(), "child counter scan must see every issue");
+    assert_eq!(
+        ids.len(),
+        effective.len(),
+        "child counter scan must see every distinct issue id"
+    );
 
     for (key, value) in [
         ("last_import_time", exported_at.clone()),
@@ -1614,5 +1618,558 @@ fn beads_rust_import_with_key_collisions_round_trips_and_keeps_unique_page_owner
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.expect("final checkpoint");
         drop(conn);
         beads_verify_with_stock_sqlite(&db_path, &landed_v1, "collisions-re-import");
+    });
+}
+
+/// Stock SQLite is the independent oracle for physical page ownership. It
+/// walks the freelist first, so "2nd reference to page" reports a page that
+/// is simultaneously on the freelist and inside a tree.
+fn stock_integrity_report(db_path: &std::path::Path) -> Vec<String> {
+    let sqlite = rusqlite::Connection::open(db_path).expect("stock SQLite open");
+    let mut stmt = sqlite
+        .prepare("PRAGMA integrity_check")
+        .expect("prepare integrity_check");
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .expect("run integrity_check")
+        .map(|row| row.expect("integrity row"))
+        .collect()
+}
+
+/// One `br` command as a separate process: open, beads runtime PRAGMAs,
+/// the command's write transaction, PASSIVE checkpoint, TRUNCATE checkpoint
+/// at close.
+async fn beads_command_connection(db: &str) -> Connection {
+    let conn = Connection::open(db).await.expect("open for command");
+    conn.execute("PRAGMA busy_timeout=5000").await.expect("busy_timeout");
+    // `apply_schema` on a non-fresh database re-executes the whole
+    // SCHEMA_SQL (`CREATE ... IF NOT EXISTS` for every table and index) as
+    // autocommit statements before stamping user_version.
+    for ddl in BEADS_SCHEMA {
+        conn.execute(ddl)
+            .await
+            .unwrap_or_else(|error| panic!("schema re-apply failed: {error:?}\n{ddl}"));
+    }
+    conn.execute("PRAGMA user_version = 17").await.expect("user_version");
+    conn.execute("PRAGMA journal_mode = WAL").await.expect("journal_mode");
+    conn.execute("PRAGMA foreign_keys = ON").await.expect("foreign_keys");
+    conn.execute("PRAGMA synchronous = NORMAL").await.expect("synchronous");
+    conn.execute("PRAGMA cache_size = -8000").await.expect("cache_size");
+    conn.execute("PRAGMA wal_autocheckpoint = 0").await.expect("wal_autocheckpoint");
+    conn
+}
+
+async fn beads_command_close(conn: Connection) {
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").await.expect("passive checkpoint");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.expect("truncate checkpoint");
+    drop(conn);
+}
+
+/// Rebuild the blocked-issues cache the way every `br` write command does:
+/// DELETE every row, then reinsert the whole set inside the same transaction.
+async fn beads_rebuild_blocked_cache(conn: &Connection, issues: &[BeadsIssue], stamp: &str) {
+    conn.execute("DELETE FROM blocked_issues_cache").await.expect("blocked cache clear");
+    for issue in issues {
+        if let Some((target, _)) = issue
+            .dependencies
+            .iter()
+            .find(|(_, dep_type)| dep_type == "blocks")
+        {
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, ?)",
+                &[
+                    text(issue.id.clone()),
+                    text(format!("[\"{target}\"]")),
+                    text(stamp),
+                ],
+            )
+            .await
+            .expect("blocked cache insert");
+        }
+    }
+}
+
+/// bd-5wrwi / GH #399: after a clean rebuild, `br create` (INSERT) keeps the
+/// file stock-valid, then a single `br update <id> --status=in_progress` —
+/// an UPDATE of an `issues` row whose description lives in overflow pages —
+/// leaves a page both on the freelist and referenced by a cell. Each command
+/// runs on its own connection with PASSIVE + TRUNCATE checkpoints at close,
+/// exactly like separate `br` processes, and stock SQLite checks the image
+/// after every command so the first corrupting command is named.
+#[test]
+fn beads_update_of_overflow_row_after_rebuild_keeps_unique_page_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("beads-update.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        // `br doctor --repair`: fresh rebuild from JSONL.
+        let corpus = build_beads_corpus(0x2545_F491_4F6C_DD1D, 0);
+        let conn = Connection::open(&db).await.expect("open fresh");
+        beads_apply_schema_and_pragmas(&conn).await;
+        let landed = beads_import_transaction(&conn, &corpus, true).await;
+        beads_command_close(conn).await;
+        assert_eq!(stock_integrity_report(&db_path), vec!["ok".to_owned()], "after rebuild");
+
+        // `br create`: one small INSERT plus the per-command bookkeeping.
+        let conn = beads_command_connection(&db).await;
+        conn.execute("BEGIN IMMEDIATE").await.expect("begin create");
+        let mut created = landed[0].clone();
+        created.id = "zz-cre8d".to_owned();
+        created.title = "created after rebuild".to_owned();
+        created.description = deterministic_payload("created", 1, 640);
+        created.status = "open".to_owned();
+        created.closed_at = None;
+        created.close_reason = String::new();
+        created.labels.clear();
+        created.dependencies.clear();
+        created.comments.clear();
+        conn.execute_with_params(BEADS_ISSUE_INSERT, &created.insert_params())
+            .await
+            .expect("br create insert");
+        conn.execute_with_params(
+            "INSERT INTO events (issue_id, event_type, actor, created_at) VALUES (?, 'created', 'ubuntu', ?)",
+            &[text(created.id.clone()), text(created.created_at.clone())],
+        )
+        .await
+        .expect("create event");
+        conn.execute_with_params(
+            "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+            &[text(created.id.clone()), text(created.created_at.clone())],
+        )
+        .await
+        .expect("dirty mark");
+        beads_rebuild_blocked_cache(&conn, &landed, "2026-08-27T18:30:00+00:00").await;
+        conn.execute("COMMIT").await.expect("commit create");
+        beads_command_close(conn).await;
+        assert_eq!(stock_integrity_report(&db_path), vec!["ok".to_owned()], "after br create");
+
+        // `br update <id> --status=in_progress` on rows whose description
+        // overflows: the reported corrupting command. Repeat across several
+        // overflow rows, each as its own command, checking after every one.
+        let overflow_rows: Vec<&BeadsIssue> = landed
+            .iter()
+            .filter(|issue| issue.description.len() > 8_000)
+            .take(12)
+            .collect();
+        assert!(overflow_rows.len() >= 8, "fixture must carry overflow rows");
+        for (step, issue) in overflow_rows.iter().enumerate() {
+            let conn = beads_command_connection(&db).await;
+            conn.execute("BEGIN IMMEDIATE").await.expect("begin update");
+            let updated_at = beads_timestamp(20_000 + step);
+            let changed = conn
+                .execute_with_params(
+                    // `br update --status=in_progress` reopens a closed issue:
+                    // the CHECK constraint requires closed_at to be cleared.
+                    "UPDATE issues SET status = ?, updated_at = ?, closed_at = NULL WHERE id = ?",
+                    &[text("in_progress"), text(updated_at.clone()), text(issue.id.clone())],
+                )
+                .await
+                .expect("status update");
+            assert_eq!(changed, 1);
+            conn.execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, created_at) \
+                 VALUES (?, 'status_changed', 'ubuntu', ?, 'in_progress', ?)",
+                &[text(issue.id.clone()), text(issue.status.clone()), text(updated_at.clone())],
+            )
+            .await
+            .expect("status event");
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                &[text(issue.id.clone()), text(updated_at.clone())],
+            )
+            .await
+            .expect("dirty mark");
+            beads_rebuild_blocked_cache(&conn, &landed, &updated_at).await;
+            conn.execute("COMMIT").await.expect("commit update");
+            beads_command_close(conn).await;
+            let report = stock_integrity_report(&db_path);
+            assert_eq!(
+                report,
+                vec!["ok".to_owned()],
+                "stock SQLite integrity after `br update` #{step} of overflow row {}",
+                issue.id
+            );
+        }
+
+        // Every updated row must still read back exactly (payload intact).
+        let conn = Connection::open(&db).await.expect("verify open");
+        for issue in &overflow_rows {
+            let rows = conn
+                .query_with_params(
+                    "SELECT status, description, close_reason FROM issues WHERE id = ?",
+                    &[text(issue.id.clone())],
+                )
+                .await
+                .expect("verify read");
+            assert_eq!(rows.len(), 1, "{} must be addressable", issue.id);
+            assert_eq!(rows[0].values()[0], text("in_progress"));
+            assert_eq!(rows[0].values()[1], text(issue.description.clone()));
+            assert_eq!(rows[0].values()[2], text(issue.close_reason.clone()));
+        }
+        let integrity = conn.query("PRAGMA integrity_check").await.expect("fsqlite integrity");
+        assert_eq!(integrity[0].values()[0], text("ok"));
+    });
+}
+
+/// GH #399 (local specimen on this host): a FrankenSQLite-written beads.db
+/// whose `blocked_issues_cache` leaves and index leaves were simultaneously
+/// on the durable freelist. That table is rebuilt (DELETE all + reinsert) by
+/// every `br` write command, each command a separate process with a
+/// TRUNCATE checkpoint at close. Drive that churn for many commands on a file
+/// with large overflow rows and check the physical image after every one.
+#[test]
+fn beads_cache_rebuild_churn_across_reopens_keeps_freelist_disjoint_from_trees() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("beads-churn.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let corpus = build_beads_corpus(0x9E37_79B9_7F4A_7C15, 0);
+        let conn = Connection::open(&db).await.expect("open fresh");
+        beads_apply_schema_and_pragmas(&conn).await;
+        let landed = beads_import_transaction(&conn, &corpus, true).await;
+        beads_command_close(conn).await;
+        assert_eq!(stock_integrity_report(&db_path), vec!["ok".to_owned()], "after rebuild");
+
+        for command in 0..40usize {
+            let conn = beads_command_connection(&db).await;
+            conn.execute("BEGIN IMMEDIATE").await.expect("begin command");
+            let stamp = beads_timestamp(30_000 + command);
+            // A `br close`/`br update`-style row change on an overflow row.
+            let issue = &landed[(command * 97) % landed.len()];
+            let new_status = if command % 2 == 0 { "closed" } else { "open" };
+            let closed_at = if new_status == "closed" {
+                text(stamp.clone())
+            } else {
+                SqliteValue::Null
+            };
+            conn.execute_with_params(
+                "UPDATE issues SET status = ?, updated_at = ?, closed_at = ?, close_reason = ? \
+                 WHERE id = ?",
+                &[
+                    text(new_status),
+                    text(stamp.clone()),
+                    closed_at,
+                    text(deterministic_payload("churnclose", command, 3_000 + (command % 4) * 2_500)),
+                    text(issue.id.clone()),
+                ],
+            )
+            .await
+            .expect("row update");
+            conn.execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, new_value, created_at) \
+                 VALUES (?, 'status_changed', 'ubuntu', ?, ?)",
+                &[text(issue.id.clone()), text(new_status), text(stamp.clone())],
+            )
+            .await
+            .expect("event");
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+                &[text(issue.id.clone()), text(stamp.clone())],
+            )
+            .await
+            .expect("dirty mark");
+            beads_rebuild_blocked_cache(&conn, &landed, &stamp).await;
+            conn.execute("DELETE FROM child_counters").await.expect("child counters clear");
+            for key in ["needs_flush", "last_write_time"] {
+                conn.execute_with_params("DELETE FROM metadata WHERE key = ?", &[text(key)])
+                    .await
+                    .expect("metadata delete");
+                conn.execute_with_params(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    &[text(key), text(stamp.clone())],
+                )
+                .await
+                .expect("metadata insert");
+            }
+            conn.execute("COMMIT").await.expect("commit command");
+            beads_command_close(conn).await;
+            let report = stock_integrity_report(&db_path);
+            assert_eq!(
+                report,
+                vec!["ok".to_owned()],
+                "stock SQLite integrity after churn command #{command}"
+            );
+        }
+
+        let conn = Connection::open(&db).await.expect("verify open");
+        let integrity = conn.query("PRAGMA integrity_check").await.expect("fsqlite integrity");
+        assert_eq!(integrity[0].values()[0], text("ok"));
+        let count = conn.query("SELECT COUNT(*) FROM issues").await.expect("count");
+        assert_eq!(count[0].values()[0], SqliteValue::Integer(landed.len() as i64));
+    });
+}
+
+// ── Multi-process shape: one OS process per `br` command ──────────────────
+//
+// The pager keeps process-global, path-keyed state (group-commit queues,
+// pending disowned pages, recovery fences, maintenance gates). Reopening a
+// `Connection` inside one process therefore shares bookkeeping that a fresh
+// `br` process never inherits. The helper test below performs exactly one
+// beads command and exits; the driver spawns it once per command, checking
+// the physical image with stock SQLite between processes.
+
+const BEADS_CHURN_HELPER_TEST: &str = "beads_churn_command_helper";
+const BEADS_CHURN_DB_ENV: &str = "FSQLITE_BEADS_CHURN_DB";
+const BEADS_CHURN_STEP_ENV: &str = "FSQLITE_BEADS_CHURN_STEP";
+const BEADS_CHURN_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Fallible blocked-cache rebuild used under concurrent writers, where a
+/// peer's page lock can surface as a transient error mid-transaction.
+async fn beads_rebuild_blocked_cache_attempt(
+    conn: &Connection,
+    issues: &[BeadsIssue],
+    stamp: &str,
+) -> Result<(), fsqlite_error::FrankenError> {
+    conn.execute("DELETE FROM blocked_issues_cache").await?;
+    for issue in issues {
+        if let Some((target, _)) = issue
+            .dependencies
+            .iter()
+            .find(|(_, dep_type)| dep_type == "blocks")
+        {
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, ?)",
+                &[
+                    text(issue.id.clone()),
+                    text(format!("[\"{target}\"]")),
+                    text(stamp),
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// One attempt at a `br` write command's transaction body: status flip of
+/// an overflow row, event, dirty mark, blocked-cache rebuild, child-counter
+/// reset, metadata rewrite, COMMIT.
+async fn beads_churn_command_attempt(
+    conn: &Connection,
+    landed: &[BeadsIssue],
+    command: usize,
+) -> Result<(), fsqlite_error::FrankenError> {
+    conn.execute("BEGIN IMMEDIATE").await?;
+    let stamp = beads_timestamp(30_000 + command);
+    let issue = &landed[(command * 97) % landed.len()];
+    let new_status = if command.is_multiple_of(2) {
+        "closed"
+    } else {
+        "open"
+    };
+    let closed_at = if new_status == "closed" {
+        text(stamp.clone())
+    } else {
+        SqliteValue::Null
+    };
+    conn.execute_with_params(
+        "UPDATE issues SET status = ?, updated_at = ?, closed_at = ?, close_reason = ? \
+         WHERE id = ?",
+        &[
+            text(new_status),
+            text(stamp.clone()),
+            closed_at,
+            text(deterministic_payload(
+                "churnclose",
+                command,
+                3_000 + (command % 4) * 2_500,
+            )),
+            text(issue.id.clone()),
+        ],
+    )
+    .await?;
+    conn.execute_with_params(
+        "INSERT INTO events (issue_id, event_type, actor, new_value, created_at) \
+         VALUES (?, 'status_changed', 'ubuntu', ?, ?)",
+        &[text(issue.id.clone()), text(new_status), text(stamp.clone())],
+    )
+    .await?;
+    conn.execute_with_params(
+        "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+        &[text(issue.id.clone()), text(stamp.clone())],
+    )
+    .await?;
+    beads_rebuild_blocked_cache_attempt(conn, landed, &stamp).await?;
+    conn.execute("DELETE FROM child_counters").await?;
+    for key in ["needs_flush", "last_write_time"] {
+        conn.execute_with_params("DELETE FROM metadata WHERE key = ?", &[text(key)])
+            .await?;
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            &[text(key), text(stamp.clone())],
+        )
+        .await?;
+    }
+    conn.execute("COMMIT").await?;
+    Ok(())
+}
+
+/// One `br` write command against `db` with `with_write_transaction`'s
+/// retry discipline: a transient error anywhere in the attempt rolls the
+/// transaction back and retries after a jittered backoff. Ends with the
+/// PASSIVE + TRUNCATE checkpoints and close of a `br` process exit.
+async fn beads_churn_command(db: &str, landed: &[BeadsIssue], command: usize) {
+    const MAX_ATTEMPTS: usize = 24;
+    let conn = beads_command_connection(db).await;
+    for attempt in 0..MAX_ATTEMPTS {
+        match beads_churn_command_attempt(&conn, landed, command).await {
+            Ok(()) => {
+                beads_command_close(conn).await;
+                return;
+            }
+            Err(error) if error.is_transient() && attempt + 1 < MAX_ATTEMPTS => {
+                let _ = conn.execute("ROLLBACK").await;
+                let backoff = 5 + ((command * 31 + attempt * 17) % 60) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(backoff));
+            }
+            Err(error) => panic!("churn command #{command} failed after {attempt} retries: {error:?}"),
+        }
+    }
+}
+
+/// Child-process body: performs a single command and exits. Driven only by
+/// `beads_cache_rebuild_churn_across_processes_keeps_freelist_disjoint_from_trees`.
+#[test]
+#[ignore = "multi-process helper; spawned by the churn-across-processes driver"]
+fn beads_churn_command_helper() {
+    let db = std::env::var(BEADS_CHURN_DB_ENV).expect("helper needs the database path");
+    let command: usize = std::env::var(BEADS_CHURN_STEP_ENV)
+        .expect("helper needs the command index")
+        .parse()
+        .expect("command index parses");
+    asupersync::test_utils::run_test(|| async move {
+        let landed = build_beads_corpus(BEADS_CHURN_SEED, 0);
+        beads_churn_command(&db, &landed, command).await;
+    });
+}
+
+/// GH #399: the same churn as the in-process test, but every command runs
+/// in its own OS process like a real `br` invocation, so nothing survives
+/// between commands except the files on disk.
+#[test]
+fn beads_cache_rebuild_churn_across_processes_keeps_freelist_disjoint_from_trees() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("beads-churn-procs.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let corpus = build_beads_corpus(BEADS_CHURN_SEED, 0);
+        let conn = Connection::open(&db).await.expect("open fresh");
+        beads_apply_schema_and_pragmas(&conn).await;
+        let landed = beads_import_transaction(&conn, &corpus, true).await;
+        assert_eq!(landed.len(), corpus.len());
+        beads_command_close(conn).await;
+        assert_eq!(
+            stock_integrity_report(&db_path),
+            vec!["ok".to_owned()],
+            "after rebuild"
+        );
+
+        for command in 0..40usize {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("current_exe"),
+            )
+            .arg("--exact")
+            .arg(BEADS_CHURN_HELPER_TEST)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(BEADS_CHURN_DB_ENV, &db)
+            .env(BEADS_CHURN_STEP_ENV, command.to_string())
+            .status()
+            .expect("spawn churn helper process");
+            assert!(
+                status.success(),
+                "churn command #{command} process failed: {status:?}"
+            );
+            let report = stock_integrity_report(&db_path);
+            assert_eq!(
+                report,
+                vec!["ok".to_owned()],
+                "stock SQLite integrity after churn process #{command}"
+            );
+        }
+
+        let conn = Connection::open(&db).await.expect("verify open");
+        let integrity = conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("fsqlite integrity");
+        assert_eq!(integrity[0].values()[0], text("ok"));
+        let count = conn.query("SELECT COUNT(*) FROM issues").await.expect("count");
+        assert_eq!(
+            count[0].values()[0],
+            SqliteValue::Integer(landed.len() as i64)
+        );
+    });
+}
+
+/// GH #399 (agent-swarm shape): several `br` processes writing the same
+/// database at once. Each round spawns four helper processes concurrently;
+/// each retries its whole transaction on transient conflicts exactly like
+/// `with_write_transaction`. Stock SQLite checks the physical image after
+/// every round so the first corrupting round is named.
+#[test]
+fn beads_concurrent_processes_churn_keeps_freelist_disjoint_from_trees() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("beads-churn-concurrent.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let corpus = build_beads_corpus(BEADS_CHURN_SEED, 0);
+        let conn = Connection::open(&db).await.expect("open fresh");
+        beads_apply_schema_and_pragmas(&conn).await;
+        let landed = beads_import_transaction(&conn, &corpus, true).await;
+        beads_command_close(conn).await;
+        assert_eq!(
+            stock_integrity_report(&db_path),
+            vec!["ok".to_owned()],
+            "after rebuild"
+        );
+
+        const PROCESSES_PER_ROUND: usize = 4;
+        for round in 0..10usize {
+            let mut children = Vec::with_capacity(PROCESSES_PER_ROUND);
+            for lane in 0..PROCESSES_PER_ROUND {
+                let command = 100 + round * PROCESSES_PER_ROUND + lane;
+                let child = std::process::Command::new(
+                    std::env::current_exe().expect("current_exe"),
+                )
+                .arg("--exact")
+                .arg(BEADS_CHURN_HELPER_TEST)
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env(BEADS_CHURN_DB_ENV, &db)
+                .env(BEADS_CHURN_STEP_ENV, command.to_string())
+                .spawn()
+                .expect("spawn concurrent churn helper");
+                children.push((command, child));
+            }
+            for (command, mut child) in children {
+                let status = child.wait().expect("wait for churn helper");
+                assert!(
+                    status.success(),
+                    "concurrent churn command #{command} (round {round}) failed: {status:?}"
+                );
+            }
+            let report = stock_integrity_report(&db_path);
+            assert_eq!(
+                report,
+                vec!["ok".to_owned()],
+                "stock SQLite integrity after concurrent round #{round}"
+            );
+        }
+
+        let conn = Connection::open(&db).await.expect("verify open");
+        let integrity = conn
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("fsqlite integrity");
+        assert_eq!(integrity[0].values()[0], text("ok"));
+        let count = conn.query("SELECT COUNT(*) FROM issues").await.expect("count");
+        assert_eq!(
+            count[0].values()[0],
+            SqliteValue::Integer(landed.len() as i64)
+        );
     });
 }
