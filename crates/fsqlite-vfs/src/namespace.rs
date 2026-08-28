@@ -1441,20 +1441,17 @@ fn observe_cleanup_entry(path: &Path) -> CleanupEntryObservation {
         return CleanupEntryObservation::Unsafe;
     }
 
-    let guard = match open_cleanup_identity_probe(path) {
-        Ok(guard) => guard,
-        Err(_) => return CleanupEntryObservation::Unknown,
+    let Ok(guard) = open_cleanup_identity_probe(path) else {
+        return CleanupEntryObservation::Unknown;
     };
-    let guard_metadata = match guard.metadata() {
-        Ok(metadata) => metadata,
-        Err(_) => return CleanupEntryObservation::Unknown,
+    let Ok(guard_metadata) = guard.metadata() else {
+        return CleanupEntryObservation::Unknown;
     };
     if !cleanup_metadata_is_safe(&guard_metadata) {
         return CleanupEntryObservation::Unsafe;
     }
-    let identity = match FileIdentity::from_file(&guard) {
-        Ok(Some(identity)) => identity,
-        Ok(None) | Err(_) => return CleanupEntryObservation::Unknown,
+    let Ok(Some(identity)) = FileIdentity::from_file(&guard) else {
+        return CleanupEntryObservation::Unknown;
     };
     CleanupEntryObservation::Present { identity, guard }
 }
@@ -1615,7 +1612,7 @@ fn verify_cleanup_completion_entries(
 fn cleanup_io_failure(
     stage: PrivateDatabaseCleanupFailureStage,
     path: Option<&Path>,
-    error: io::Error,
+    error: &io::Error,
 ) -> PrivateDatabaseCleanupFailure {
     PrivateDatabaseCleanupFailure {
         stage,
@@ -1740,8 +1737,8 @@ fn cleanup_abandoned_private_database_with_hooks(
         database_path,
         database_path.to_path_buf(),
     )?);
-    entries.push(preflight_cleanup_entry(database_path, use_path.clone())?);
-    entries.push(preflight_cleanup_entry(database_path, gate_path.clone())?);
+    entries.push(preflight_cleanup_entry(database_path, use_path)?);
+    entries.push(preflight_cleanup_entry(database_path, gate_path)?);
 
     // Revalidate immediately before the first removal while both namespace
     // locks and the expected main descriptor are still live.
@@ -1763,7 +1760,7 @@ fn cleanup_abandoned_private_database_with_hooks(
             let cause = cleanup_io_failure(
                 PrivateDatabaseCleanupFailureStage::BeforeRemoval,
                 Some(&path),
-                error,
+                &error,
             );
             return Ok(partial_cleanup_outcome(&mut entries, cause));
         }
@@ -1797,7 +1794,7 @@ fn cleanup_abandoned_private_database_with_hooks(
             let cause = cleanup_io_failure(
                 PrivateDatabaseCleanupFailureStage::Remove,
                 Some(&path),
-                error,
+                &error,
             );
             return Ok(partial_cleanup_outcome(&mut entries, cause));
         }
@@ -1806,7 +1803,7 @@ fn cleanup_abandoned_private_database_with_hooks(
             let cause = cleanup_io_failure(
                 PrivateDatabaseCleanupFailureStage::AfterRemoval,
                 Some(&path),
-                error,
+                &error,
             );
             return Ok(partial_cleanup_outcome(&mut entries, cause));
         }
@@ -1822,7 +1819,7 @@ fn cleanup_abandoned_private_database_with_hooks(
         let cause = cleanup_io_failure(
             PrivateDatabaseCleanupFailureStage::DirectorySync,
             Some(parent),
-            error,
+            &error,
         );
         return Ok(partial_cleanup_outcome(&mut entries, cause));
     }
@@ -1841,7 +1838,7 @@ fn cleanup_abandoned_private_database_with_hooks(
             let cause = cleanup_io_failure(
                 PrivateDatabaseCleanupFailureStage::DirectorySync,
                 Some(parent),
-                error,
+                &error,
             );
             return Ok(partial_cleanup_outcome(&mut entries, cause));
         }
