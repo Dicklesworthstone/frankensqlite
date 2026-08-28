@@ -54485,8 +54485,12 @@ impl Connection {
             return Err(error);
         }
         let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
-            let begin_result =
-                lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
+            // GH#390: snap the connection's isolation policy at BEGIN so a
+            // later `PRAGMA fsqlite.serializable` cannot retroactively change
+            // how this transaction validates at commit.
+            let serializable = self.pragma_state.borrow().serializable;
+            let begin_result = lock_unpoisoned(&self.concurrent_registry)
+                .begin_concurrent_with_isolation(snapshot, serializable);
             match begin_result {
                 Ok(session_id) => Some(session_id),
                 Err(error) => {
@@ -67653,8 +67657,10 @@ impl Connection {
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
         let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
+            // GH#390: BEGIN-time snapshot of `PRAGMA fsqlite.serializable`.
+            let serializable = self.pragma_state.borrow().serializable;
             let session_id = lock_unpoisoned(&self.concurrent_registry)
-                .begin_concurrent(snapshot)
+                .begin_concurrent_with_isolation(snapshot, serializable)
                 .map_err(|e| match e {
                     MvccError::Busy => FrankenError::Busy,
                     _ => FrankenError::Internal(format!("MVCC begin failed: {e}")),
@@ -68092,8 +68098,16 @@ impl Connection {
         // uniformly across the audit stride.
         let audit_hash = session_id ^ planned_commit_seq.get();
         let gate_skipped_ssi = self.should_skip_ssi_validation(audit_hash);
+        // GH#390: the connection's `PRAGMA fsqlite.serializable` policy was
+        // snapped onto the registry handle at BEGIN. OFF selects the FCW-only
+        // preparer directly — it still rejects base drift as `BusySnapshot`
+        // and keeps the schema-staleness and conservative-surface checks
+        // above — without routing through the LAB_UNSAFE audit gate.
+        let begin_time_serializable = registry
+            .get(session_id)
+            .is_none_or(|handle| handle.serializable());
 
-        let prepare_outcome = if gate_skipped_ssi {
+        let prepare_outcome = if gate_skipped_ssi || !begin_time_serializable {
             prepare_concurrent_commit_fcw_only(
                 registry,
                 &self.concurrent_commit_index,
@@ -69437,8 +69451,10 @@ impl Connection {
                 return Err(error);
             }
             let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
+                // GH#390: BEGIN-time snapshot of `PRAGMA fsqlite.serializable`.
+                let serializable = self.pragma_state.borrow().serializable;
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
-                    .begin_concurrent(snapshot)
+                    .begin_concurrent_with_isolation(snapshot, serializable)
                     .map_err(|error| match error {
                         MvccError::Busy => FrankenError::Busy,
                         _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),

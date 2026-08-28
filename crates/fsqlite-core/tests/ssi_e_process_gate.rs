@@ -288,3 +288,278 @@ fn reset_gate_via_api_clears_state() {
         assert!((post.e_value - 1.0).abs() < 1e-12);
     });
 }
+
+// ---------------------------------------------------------------------------
+// GH#390: `PRAGMA fsqlite.serializable = OFF` must select first-committer-wins
+// only, snapped at BEGIN, on the public `Connection` pipeline.
+//
+// Every round starts from a fresh file-backed fixture with two tables whose
+// single rows live on physically distinct root pages. Each session reads both
+// tables and writes one of them, forming the classic rw-antidependency cycle
+// (write skew) while keeping the FCW write sets page-disjoint. Under ON the
+// Page-SSI pivot rule must reject the cycle; under OFF the same schedule must
+// commit on both sides, which is what proves the ON rejection came from SSI
+// and not from a shared page.
+// ---------------------------------------------------------------------------
+
+async fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
+    let stmt = conn.prepare(sql).await.unwrap();
+    let row = stmt.query_row().await.unwrap();
+    match &row.values()[0] {
+        fsqlite_types::SqliteValue::Integer(n) => *n,
+        other => panic!("expected integer from `{sql}`, got {other:?}"),
+    }
+}
+
+/// Fresh file-backed database with two one-row tables on distinct roots.
+async fn write_skew_fixture() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skew.db").to_string_lossy().into_owned();
+    let conn = Connection::open(&path).await.unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE left_slot (id INTEGER PRIMARY KEY, on_duty INTEGER NOT NULL);
+         CREATE TABLE right_slot (id INTEGER PRIMARY KEY, on_duty INTEGER NOT NULL);
+         INSERT INTO left_slot VALUES (1, 1);
+         INSERT INTO right_slot VALUES (1, 1);",
+    )
+    .await
+    .unwrap();
+    let left_root = scalar_i64(
+        &conn,
+        "SELECT rootpage FROM sqlite_master WHERE name = 'left_slot'",
+    )
+    .await;
+    let right_root = scalar_i64(
+        &conn,
+        "SELECT rootpage FROM sqlite_master WHERE name = 'right_slot'",
+    )
+    .await;
+    assert!(left_root > 1 && right_root > 1, "fixture tables must own their own roots");
+    assert_ne!(left_root, right_root, "fixture roots must be physically distinct");
+    drop(conn);
+    (dir, path)
+}
+
+async fn open_skew_session(path: &str, pragma_before_begin: Option<&str>) -> Connection {
+    let conn = Connection::open(path).await.unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL;").await.unwrap();
+    if let Some(pragma) = pragma_before_begin {
+        conn.execute_batch(pragma).await.unwrap();
+    }
+    conn
+}
+
+/// Outcome of one two-session schedule.
+#[derive(Debug)]
+struct SkewRound {
+    first_commit: Result<(), fsqlite_error::FrankenError>,
+    second_commit: Result<(), fsqlite_error::FrankenError>,
+    /// `SUM(on_duty)` over both tables after both sessions settled.
+    on_duty_total: i64,
+}
+
+impl SkewRound {
+    fn both_committed(&self) -> bool {
+        self.first_commit.is_ok() && self.second_commit.is_ok()
+    }
+}
+
+/// Run the disjoint-page write-skew schedule. `pragma_before_begin` is
+/// applied to both sessions before `BEGIN CONCURRENT`; `pragma_after_begin`
+/// is applied inside the open transactions and must have no effect on how
+/// they validate.
+async fn run_disjoint_write_skew(
+    path: &str,
+    pragma_before_begin: Option<&str>,
+    pragma_after_begin: Option<&str>,
+) -> SkewRound {
+    let c1 = open_skew_session(path, pragma_before_begin).await;
+    let c2 = open_skew_session(path, pragma_before_begin).await;
+    c1.execute_batch("BEGIN CONCURRENT;").await.unwrap();
+    c2.execute_batch("BEGIN CONCURRENT;").await.unwrap();
+    if let Some(pragma) = pragma_after_begin {
+        c1.execute_batch(pragma).await.unwrap();
+        c2.execute_batch(pragma).await.unwrap();
+    }
+
+    // Both sessions read BOTH roots, then each writes the root the other read.
+    const READ_BOTH: &str = "SELECT (SELECT SUM(on_duty) FROM left_slot) \
+                             + (SELECT SUM(on_duty) FROM right_slot)";
+    assert_eq!(scalar_i64(&c1, READ_BOTH).await, 2);
+    assert_eq!(scalar_i64(&c2, READ_BOTH).await, 2);
+    c1.execute_batch("UPDATE left_slot SET on_duty = 0 WHERE id = 1;")
+        .await
+        .expect("left root is not locked by the peer");
+    c2.execute_batch("UPDATE right_slot SET on_duty = 0 WHERE id = 1;")
+        .await
+        .expect("right root is not locked by the peer");
+
+    let first_commit = c1.execute_batch("COMMIT;").await.map(|_| ());
+    if first_commit.is_err() {
+        let _ = c1.execute_batch("ROLLBACK;").await;
+    }
+    let second_commit = c2.execute_batch("COMMIT;").await.map(|_| ());
+    if second_commit.is_err() {
+        let _ = c2.execute_batch("ROLLBACK;").await;
+    }
+    drop(c1);
+    drop(c2);
+
+    let verify = Connection::open(path).await.unwrap();
+    let on_duty_total = scalar_i64(&verify, READ_BOTH).await;
+    SkewRound {
+        first_commit,
+        second_commit,
+        on_duty_total,
+    }
+}
+
+fn assert_ssi_rejected(round: &SkewRound, label: &str) {
+    assert!(
+        !round.both_committed(),
+        "[{label}] both sessions committed a write skew under SSI: {round:?}"
+    );
+    let rejected = match (&round.first_commit, &round.second_commit) {
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => error,
+        other => panic!("[{label}] exactly one commit must be rejected, got {other:?}"),
+    };
+    assert!(
+        rejected.is_transient(),
+        "[{label}] the SSI rejection must be a retryable busy-class error, got {rejected:?}"
+    );
+    assert_eq!(
+        round.on_duty_total, 1,
+        "[{label}] exactly one side's write may land under SSI"
+    );
+}
+
+#[test]
+fn serializable_on_rejects_disjoint_page_write_skew() {
+    asupersync::test_utils::run_test(|| async {
+        // Default policy: a fresh connection reads back ON and behaves as ON.
+        let (_dir, path) = write_skew_fixture().await;
+        let probe = Connection::open(&path).await.unwrap();
+        assert_eq!(
+            scalar_i64(&probe, "PRAGMA fsqlite.serializable").await,
+            1,
+            "new connections must default to serializable = ON"
+        );
+        drop(probe);
+        let round = run_disjoint_write_skew(&path, None, None).await;
+        assert_ssi_rejected(&round, "default");
+
+        // Explicit ON on both sessions.
+        let (_dir, path) = write_skew_fixture().await;
+        let round = run_disjoint_write_skew(
+            &path,
+            Some("PRAGMA fsqlite.serializable = ON;"),
+            None,
+        )
+        .await;
+        assert_ssi_rejected(&round, "explicit-on");
+    });
+}
+
+#[test]
+fn serializable_off_permits_only_fcw_disjoint_write_skew() {
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = write_skew_fixture().await;
+        let round = run_disjoint_write_skew(
+            &path,
+            Some("PRAGMA fsqlite.serializable = OFF;"),
+            None,
+        )
+        .await;
+        assert!(
+            round.both_committed(),
+            "OFF must downgrade to snapshot isolation and admit the FCW-disjoint write skew: {round:?}"
+        );
+        assert_eq!(
+            round.on_duty_total, 0,
+            "write skew must be observable once SSI is off"
+        );
+    });
+}
+
+#[test]
+fn serializable_policy_is_snapped_at_begin() {
+    asupersync::test_utils::run_test(|| async {
+        // ON at BEGIN, OFF issued inside the transactions: still SSI.
+        let (_dir, path) = write_skew_fixture().await;
+        let round = run_disjoint_write_skew(
+            &path,
+            Some("PRAGMA fsqlite.serializable = ON;"),
+            Some("PRAGMA fsqlite.serializable = OFF;"),
+        )
+        .await;
+        assert_ssi_rejected(&round, "on-at-begin-off-mid-txn");
+
+        // OFF at BEGIN, ON issued inside the transactions: still FCW-only.
+        let (_dir, path) = write_skew_fixture().await;
+        let round = run_disjoint_write_skew(
+            &path,
+            Some("PRAGMA fsqlite.serializable = OFF;"),
+            Some("PRAGMA fsqlite.serializable = ON;"),
+        )
+        .await;
+        assert!(
+            round.both_committed(),
+            "a mid-transaction PRAGMA must not retroactively re-enable SSI: {round:?}"
+        );
+        assert_eq!(round.on_duty_total, 0);
+    });
+}
+
+#[test]
+fn serializable_off_keeps_first_committer_wins_live() {
+    asupersync::test_utils::run_test(|| async {
+        let (_dir, path) = write_skew_fixture().await;
+        let c1 = open_skew_session(&path, Some("PRAGMA fsqlite.serializable = OFF;")).await;
+        let c2 = open_skew_session(&path, Some("PRAGMA fsqlite.serializable = OFF;")).await;
+        c1.execute_batch("BEGIN CONCURRENT;").await.unwrap();
+        c2.execute_batch("BEGIN CONCURRENT;").await.unwrap();
+
+        // Same row, same page: at most one side may win regardless of SSI.
+        c1.execute_batch("UPDATE left_slot SET on_duty = 5 WHERE id = 1;")
+            .await
+            .unwrap();
+        let c2_update = c2
+            .execute_batch("UPDATE left_slot SET on_duty = 7 WHERE id = 1;")
+            .await;
+        let c1_commit = c1.execute_batch("COMMIT;").await;
+        assert!(c1_commit.is_ok(), "first writer must commit: {c1_commit:?}");
+        let c2_committed = match c2_update {
+            Ok(_) => {
+                let commit = c2.execute_batch("COMMIT;").await;
+                if let Err(error) = &commit {
+                    assert!(
+                        error.is_transient(),
+                        "same-page loser must see a retryable FCW rejection, got {error:?}"
+                    );
+                    let _ = c2.execute_batch("ROLLBACK;").await;
+                }
+                commit.is_ok()
+            }
+            Err(error) => {
+                assert!(
+                    error.is_transient(),
+                    "same-page write must be refused with a retryable error, got {error:?}"
+                );
+                let _ = c2.execute_batch("ROLLBACK;").await;
+                false
+            }
+        };
+        assert!(
+            !c2_committed,
+            "serializable = OFF must never bypass first-committer-wins"
+        );
+        drop(c1);
+        drop(c2);
+        let verify = Connection::open(&path).await.unwrap();
+        assert_eq!(
+            scalar_i64(&verify, "SELECT on_duty FROM left_slot WHERE id = 1").await,
+            5
+        );
+    });
+}

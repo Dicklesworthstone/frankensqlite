@@ -255,6 +255,14 @@ pub enum FcwResult {
 pub struct ConcurrentHandle {
     /// Read snapshot established at `BEGIN CONCURRENT` time.
     snapshot: Snapshot,
+    /// Isolation policy snapped at `BEGIN CONCURRENT` time (GH#390).
+    ///
+    /// `true` selects full Page-SSI validation at commit; `false`
+    /// (`PRAGMA fsqlite.serializable = OFF` on the owning connection when
+    /// the transaction began) selects first-committer-wins only. The value
+    /// is fixed for the life of the transaction so a mid-transaction PRAGMA
+    /// change cannot retroactively alter validation.
+    serializable: bool,
     /// Per-page transactional state for staged writes, frees, synthetic
     /// conflict tracking, and held page locks.
     page_states: PageMap<PageTxnState>,
@@ -412,11 +420,21 @@ struct SavepointPageState {
 }
 
 impl ConcurrentHandle {
-    /// Create a new concurrent handle with the given snapshot and token.
+    /// Create a new concurrent handle with the given snapshot and token,
+    /// validating under full SSI at commit.
     #[must_use]
     pub fn new(snapshot: Snapshot, txn_token: TxnToken) -> Self {
+        Self::new_with_isolation(snapshot, txn_token, true)
+    }
+
+    /// Create a new concurrent handle carrying an explicit BEGIN-time
+    /// isolation policy: `serializable = true` keeps Page-SSI validation,
+    /// `false` commits under first-committer-wins only (GH#390).
+    #[must_use]
+    pub fn new_with_isolation(snapshot: Snapshot, txn_token: TxnToken, serializable: bool) -> Self {
         Self {
             snapshot,
+            serializable,
             page_states: PageMap::default(),
             state: TransactionState::Active,
             read_set: PageSet::default(),
@@ -434,9 +452,23 @@ impl ConcurrentHandle {
     }
 
     /// Reset this handle for a new concurrent transaction while preserving
-    /// allocation capacity across hot autocommit begin/commit cycles.
+    /// allocation capacity across hot autocommit begin/commit cycles. The
+    /// recycled session validates under full SSI.
     pub fn reset_for_new_transaction(&mut self, snapshot: Snapshot, txn_token: TxnToken) {
+        self.reset_for_new_transaction_with_isolation(snapshot, txn_token, true);
+    }
+
+    /// Reset this handle for a new concurrent transaction with an explicit
+    /// BEGIN-time isolation policy. Recycled handles must never inherit the
+    /// previous session's policy, so the flag is rewritten unconditionally.
+    pub fn reset_for_new_transaction_with_isolation(
+        &mut self,
+        snapshot: Snapshot,
+        txn_token: TxnToken,
+        serializable: bool,
+    ) {
         self.snapshot = snapshot;
+        self.serializable = serializable;
         self.page_states.clear();
         self.savepoint_snapshot_cache = None;
         self.savepoint_snapshot_dirty.clear();
@@ -456,6 +488,13 @@ impl ConcurrentHandle {
     #[must_use]
     pub const fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// BEGIN-time isolation policy: `true` for full Page-SSI validation,
+    /// `false` for first-committer-wins only (GH#390).
+    #[must_use]
+    pub const fn serializable(&self) -> bool {
+        self.serializable
     }
 
     /// Returns the current transaction state.
@@ -985,12 +1024,27 @@ impl ConcurrentRegistry {
         self.active.len()
     }
 
-    /// Begin a new concurrent transaction.
+    /// Begin a new concurrent transaction under full SSI validation.
     ///
     /// Establishes a read snapshot and registers a new concurrent handle.
     /// Returns the session id and handle, or an error if the soft limit
-    /// is reached.
+    /// is reached. Lower-level callers that never consult a connection's
+    /// `PRAGMA fsqlite.serializable` keep this ON/SSI entry point; the
+    /// connection pipeline snaps its policy through
+    /// [`Self::begin_concurrent_with_isolation`].
     pub fn begin_concurrent(&mut self, snapshot: Snapshot) -> Result<u64, MvccError> {
+        self.begin_concurrent_with_isolation(snapshot, true)
+    }
+
+    /// Begin a new concurrent transaction carrying the BEGIN-time isolation
+    /// policy: `serializable = true` validates with Page-SSI at commit,
+    /// `false` with first-committer-wins only (GH#390). Recycled handles are
+    /// reset with the new policy every session.
+    pub fn begin_concurrent_with_isolation(
+        &mut self,
+        snapshot: Snapshot,
+        serializable: bool,
+    ) -> Result<u64, MvccError> {
         if self.active.len() >= MAX_CONCURRENT_WRITERS {
             return Err(MvccError::Busy);
         }
@@ -1003,10 +1057,18 @@ impl ConcurrentRegistry {
         let txn_token = TxnToken::new(txn_id, TxnEpoch::new(self.epoch_counter));
 
         let handle = if let Some(handle) = self.recycled_handles.pop() {
-            handle.lock().reset_for_new_transaction(snapshot, txn_token);
+            handle.lock().reset_for_new_transaction_with_isolation(
+                snapshot,
+                txn_token,
+                serializable,
+            );
             handle
         } else {
-            Arc::new(Mutex::new(ConcurrentHandle::new(snapshot, txn_token)))
+            Arc::new(Mutex::new(ConcurrentHandle::new_with_isolation(
+                snapshot,
+                txn_token,
+                serializable,
+            )))
         };
         self.active.insert(session_id, handle);
         self.active_snapshot_highs.insert(session_id, snapshot.high);
