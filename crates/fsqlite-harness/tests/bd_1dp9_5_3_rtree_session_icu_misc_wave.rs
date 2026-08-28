@@ -293,7 +293,7 @@ fn test_unit_session_changeset_apply_invariants() -> Result<(), String> {
     let changeset = session.changeset();
     let encoded = changeset.encode();
     let decoded = Changeset::decode(&encoded)
-        .ok_or_else(|| format!("bead_id={BEAD_ID} case=changeset_decode_failed"))?;
+        .map_err(|error| format!("bead_id={BEAD_ID} case=changeset_decode_failed error={error}"))?;
     assert_eq!(decoded.tables.len(), 1);
     assert_eq!(decoded.tables[0].rows.len(), 2);
     assert_eq!(decoded.tables[0].rows[0].op, ChangeOp::Insert);
@@ -307,7 +307,9 @@ fn test_unit_session_changeset_apply_invariants() -> Result<(), String> {
     );
     assert_eq!(decoded.tables[0].rows[1].op, ChangeOp::Delete);
 
-    let inverted = decoded.invert();
+    let inverted = decoded
+        .invert()
+        .map_err(|error| format!("bead_id={BEAD_ID} case=changeset_invert_failed error={error}"))?;
     assert_eq!(inverted.tables[0].rows[0].op, ChangeOp::Delete);
     assert_eq!(inverted.tables[0].rows[1].op, ChangeOp::Insert);
 
@@ -507,7 +509,7 @@ fn test_session_changeset_differential_wave_with_artifact() -> Result<(), String
     }
 
     let decoded = Changeset::decode(&blob)
-        .ok_or_else(|| format!("bead_id={BEAD_ID} case=decoded_changeset_none"))?;
+        .map_err(|error| format!("bead_id={BEAD_ID} case=decoded_changeset_error error={error}"))?;
     assert_eq!(decoded.tables.len(), 1);
     assert_eq!(decoded.tables[0].rows.len(), 2);
 

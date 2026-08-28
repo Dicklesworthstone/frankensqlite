@@ -393,6 +393,7 @@ fn session_changeset_encode_store_decode() {
             rows: vec![
                 session_ext::ChangesetRow {
                     op: session_ext::ChangeOp::Insert,
+                    indirect: false,
                     old_values: vec![],
                     new_values: vec![
                         session_ext::ChangesetValue::Integer(1),
@@ -402,6 +403,7 @@ fn session_changeset_encode_store_decode() {
                 },
                 session_ext::ChangesetRow {
                     op: session_ext::ChangeOp::Insert,
+                    indirect: false,
                     old_values: vec![],
                     new_values: vec![
                         session_ext::ChangesetValue::Integer(2),
@@ -456,6 +458,7 @@ fn session_changeset_invert_round_trip() {
             },
             rows: vec![session_ext::ChangesetRow {
                 op: session_ext::ChangeOp::Insert,
+                indirect: false,
                 old_values: vec![],
                 new_values: vec![
                     session_ext::ChangesetValue::Integer(42),
@@ -464,7 +467,7 @@ fn session_changeset_invert_round_trip() {
             }],
         });
 
-        let inverted = changeset.invert();
+        let inverted = changeset.invert().expect("changeset inversion");
         let inv_encoded = inverted.encode();
 
         {
@@ -506,6 +509,7 @@ fn session_patchset_round_trip() {
             },
             rows: vec![session_ext::ChangesetRow {
                 op: session_ext::ChangeOp::Insert,
+                indirect: false,
                 old_values: vec![],
                 new_values: vec![
                     session_ext::ChangesetValue::Integer(1),
@@ -881,6 +885,7 @@ fn multi_extension_data_on_single_db() {
                 },
                 rows: vec![session_ext::ChangesetRow {
                     op: session_ext::ChangeOp::Insert,
+                    indirect: false,
                     old_values: vec![],
                     new_values: vec![
                         session_ext::ChangesetValue::Integer(1),
@@ -1120,6 +1125,7 @@ fn session_concat_multi_table_round_trip() {
             },
             rows: vec![session_ext::ChangesetRow {
                 op: session_ext::ChangeOp::Insert,
+                indirect: false,
                 old_values: vec![],
                 new_values: vec![
                     session_ext::ChangesetValue::Integer(1),
@@ -1137,6 +1143,7 @@ fn session_concat_multi_table_round_trip() {
             },
             rows: vec![session_ext::ChangesetRow {
                 op: session_ext::ChangeOp::Insert,
+                indirect: false,
                 old_values: vec![],
                 new_values: vec![
                     session_ext::ChangesetValue::Integer(10),
@@ -1145,7 +1152,7 @@ fn session_concat_multi_table_round_trip() {
             }],
         });
 
-        cs1.concat(&cs2);
+        cs1.concat(&cs2).expect("concat same-kind changesets");
         let encoded = cs1.encode();
 
         {
