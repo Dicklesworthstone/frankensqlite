@@ -175,9 +175,14 @@ fn bd_fts5_integrity_check_is_the_only_maintenance_insert_allowed_read_only() {
         }
 
         let conn = Connection::open_schema_only(&db_str).await.unwrap();
+        conn.execute("PRAGMA query_only = 1;")
+            .await
+            .expect("enable the application-level read-only guard");
         conn.execute("INSERT INTO t(t) VALUES('integrity-check');")
             .await
-            .expect("the FTS5 integrity decoder must run through a read-only pager");
+            .expect(
+                "the FTS5 integrity decoder must run through a read-only pager with query_only enabled",
+            );
 
         for command in ["flush", "optimize", "rebuild", "delete-all"] {
             let err = conn

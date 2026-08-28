@@ -35450,6 +35450,7 @@ impl Connection {
         let schema_change_boundary =
             statement_starts_fresh_schema_change_boundary(statement) || writable_schema_dml;
         if self.pragma_state.borrow().query_only
+            && !self.statement_is_read_only_fts5_integrity_check(statement)
             && (statement_writes_under_query_only(statement) || writable_schema_dml)
         {
             return Err(FrankenError::ReadOnly);
