@@ -147,6 +147,13 @@ pub const SHM_SEGMENT_SIZE: u32 = 32 * 1024;
 /// - `[132..136)`: reserved
 pub const SHM_READ_MARK_OFFSET: usize = 100;
 
+/// `aReadMark[i]` value marking an unused reader slot.
+///
+/// C SQLite's `READMARK_NOT_USED`: a checkpointer parks every reader slot it
+/// can lock exclusively at this value so a later reader never mistakes a
+/// stale mark for a shareable snapshot horizon (GH#399).
+pub const WAL_READ_MARK_NOT_USED: u32 = 0xFFFF_FFFF;
+
 /// Legacy SQLite POSIX SHM lock-byte base offset in the `*-shm` file.
 const SQLITE_SHM_LOCK_BASE: u64 = 120;
 

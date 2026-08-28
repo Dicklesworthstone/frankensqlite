@@ -7151,6 +7151,14 @@ pub(crate) struct PagerInner<F: VfsFile> {
     active_transactions: u32,
     /// Whether a checkpoint is currently running.
     checkpoint_active: bool,
+    /// GH#399: the cross-process WAL reader slot (`WAL_READ_LOCK(i)`) this
+    /// pager holds SHARED for its current active-transaction window. The
+    /// WAL read snapshot is pinned once when `active_transactions` goes
+    /// 0 -> 1 and stays fixed until it returns to 0, so one registration per
+    /// window publishes the exact `aReadMark` horizon a peer checkpointer
+    /// must respect. `None` outside a window or on backends without a
+    /// shared reader table (memory VFS).
+    wal_reader_slot: Option<u32>,
     /// Whether this pager was opened read-only (skip freelist
     /// scans during refresh since we never allocate pages).
     access_mode: PagerAccessMode,
@@ -13571,6 +13579,17 @@ where
                 None
             };
 
+            // GH#399: publish the pinned WAL horizon to the cross-process
+            // reader table before any page is served from it. A peer
+            // process's checkpoint must neither backfill frames beyond this
+            // snapshot into the database file (the pages this transaction
+            // still reads from there) nor reset the WAL generation the
+            // snapshot's frames live in. The slot is held until the last
+            // transaction of this window exits (`coordinated_transaction_exit`).
+            if inner.journal_mode == JournalMode::Wal && active_transactions_before_begin == 0 {
+                register_wal_reader_slot(&mut inner, cx, wal_conflict_snapshot.as_ref()).await?;
+            }
+
             inner.active_transactions =
                 inner.active_transactions.checked_add(1).ok_or_else(|| {
                     FrankenError::internal("active transaction count overflow during begin")
@@ -17216,6 +17235,7 @@ where
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                wal_reader_slot: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
@@ -17635,6 +17655,7 @@ where
                     .collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                wal_reader_slot: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
@@ -22908,6 +22929,91 @@ where
     }
 }
 
+/// GH#399: SQLite `mxFrame` for a pinned WAL publication — the number of WAL
+/// frames (through the last visible commit) the snapshot depends on. An
+/// unpinned or empty snapshot reads only the database file (`0`).
+fn wal_reader_mark_for_snapshot(snapshot: Option<&traits::WalPublicationSnapshot>) -> u32 {
+    snapshot
+        .and_then(|snapshot| snapshot.last_commit_frame)
+        .map_or(0, |last_commit_frame| {
+            u32::try_from(last_commit_frame.saturating_add(1)).unwrap_or(u32::MAX)
+        })
+}
+
+/// GH#399: register the pager's pinned WAL read snapshot with the
+/// cross-process reader table (`aReadMark` / `WAL_READ_LOCK(i)`) for the
+/// active-transaction window that is about to open.
+///
+/// Runs under the main-file SHARED fence and after the WAL backend pinned the
+/// snapshot, so the published mark is exactly the horizon this window reads
+/// through. A read-only pager that cannot open a writable `*-shm` (the table
+/// lives there) proceeds unregistered with a warning rather than failing the
+/// read; a read-write pager propagates the error so the caller retries.
+async fn register_wal_reader_slot<F: VfsFile>(
+    inner: &mut PagerInner<F>,
+    cx: &Cx,
+    snapshot: Option<&traits::WalPublicationSnapshot>,
+) -> Result<()> {
+    let mx_frame = wal_reader_mark_for_snapshot(snapshot);
+    let acquired = {
+        let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+        // A begin that failed after registering leaves its slot behind;
+        // retire it before publishing the new horizon.
+        if let Some(stale) = inner.wal_reader_slot.take() {
+            db_file.wal_reader_slot_release(cx, stale)?;
+        }
+        db_file.wal_reader_slot_acquire(cx, mx_frame)
+    };
+    match acquired {
+        Ok(slot) => {
+            inner.wal_reader_slot = slot;
+            tracing::debug!(
+                target: "fsqlite::wal::checkpoint_coordination",
+                trace_id = cx.trace_id(),
+                mx_frame,
+                reader_slot = ?slot,
+                "registered WAL read snapshot with the cross-process reader table"
+            );
+            Ok(())
+        }
+        Err(error) if inner.access_mode.is_readonly() && !matches!(error, FrankenError::Busy) => {
+            tracing::warn!(
+                target: "fsqlite::wal::checkpoint_coordination",
+                trace_id = cx.trace_id(),
+                mx_frame,
+                %error,
+                "read-only pager could not register its WAL read snapshot; peers cannot see this reader"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// GH#399: release the reader slot held for the active-transaction window
+/// that just closed. Idempotent: a pager without a slot is a no-op.
+async fn release_wal_reader_slot<F: VfsFile>(inner: &mut PagerInner<F>, cx: &Cx) -> Result<()> {
+    let Some(slot) = inner.wal_reader_slot.take() else {
+        return Ok(());
+    };
+    let release = shared_db_file_write(&inner.db_file, cx)
+        .await?
+        .wal_reader_slot_release(cx, slot);
+    if let Err(error) = &release {
+        // Keep the claim visible so the next window's registration retires
+        // it before publishing a new mark.
+        inner.wal_reader_slot = Some(slot);
+        tracing::warn!(
+            target: "fsqlite::wal::checkpoint_coordination",
+            trace_id = cx.trace_id(),
+            reader_slot = slot,
+            %error,
+            "failed to release the cross-process WAL reader slot"
+        );
+    }
+    release
+}
+
 const fn retained_lock_level_after_txn_exit(
     remaining_active_transactions: u32,
     writer_active: bool,
@@ -22972,7 +23078,13 @@ async fn coordinated_transaction_exit<F: VfsFile>(
     };
     let _cleanup_mask = cleanup_cx.masked();
     if remaining_active_transactions == 0 {
+        // GH#399: the reader slot is released before the main-file SHARED
+        // fence (reverse acquisition order). A slot-release failure must not
+        // strand the fence restore, which every later begin depends on; it is
+        // surfaced after the fence is back at its baseline.
+        let slot_release = release_wal_reader_slot(inner, &cleanup_cx).await;
         shared_db_restore_external_snapshot_attempt(&inner.db_file, &cleanup_cx).await?;
+        slot_release?;
     } else {
         let preserve_level = retained_lock_level_after_txn_exit(
             remaining_active_transactions,
@@ -26437,6 +26549,32 @@ where
         })
     }
 
+    fn acquire_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, bool> {
+        Box::pin(async move {
+            let db_file = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                Arc::clone(&inner.db_file)
+            };
+            let mut db_file = shared_db_file_write(&db_file, cx).await?;
+            db_file.wal_checkpoint_reset_gate_acquire(cx)
+        })
+    }
+
+    fn release_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let db_file = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                Arc::clone(&inner.db_file)
+            };
+            let mut db_file = shared_db_file_write(&db_file, cx).await?;
+            db_file.wal_checkpoint_reset_gate_release(cx)
+        })
+    }
+
     fn sync<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
             // Ensure header page_count reflects the final db_size after all
@@ -26736,7 +26874,7 @@ where
         // Reserve exclusive checkpoint ownership while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
-        let (wal, external_lock) = {
+        let (wal, external_lock, db_file) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -26836,7 +26974,7 @@ where
                 },
                 refresh.page_cache_invalidated || inner.commit_seq != commit_seq_before_refresh,
             );
-            (wal, external_lock)
+            (wal, external_lock, Arc::clone(&inner.db_file))
         };
         // Lock is released here.
         log_checkpoint_coordination(
@@ -26947,13 +27085,52 @@ where
         // the existing pool + commit-fold machinery only.
         let _ = self.reclaim_disowned_in_range(&wal, cx, true).await?;
 
-        // Run the checkpoint from the beginning. Reader-aware incremental
-        // checkpointing requires exposing oldest-reader tracking from pager.
+        // GH#399: the in-process maintenance lease proves no transaction of
+        // THIS process pins the WAL, but readers in other processes publish
+        // their pinned horizon through the shared `aReadMark` table. Take the
+        // backfill gate (`WAL_READ_LOCK(0)`, excluding peers that read the
+        // database file directly) and clamp the plan to the oldest peer
+        // horizon so no frame a peer still serves from the database file is
+        // overwritten underneath it. The RESTART/TRUNCATE reset itself is
+        // gated again inside the executor, under the exclusive reader-slot
+        // fence, because a peer may register after this sample.
         let mut wal = async_rwlock_write(&wal, cx, "WAL backend").await?;
+        let total_frames = u32::try_from(wal.frame_count()).unwrap_or(u32::MAX);
+        let (oldest_reader_frame, backfill_gate_held) = {
+            let mut db_file = shared_db_file_write(&db_file, cx).await?;
+            let backfill_gate_held = db_file.wal_checkpoint_backfill_gate_acquire(cx)?;
+            let horizon = if backfill_gate_held {
+                db_file.wal_checkpoint_reader_horizon(cx, total_frames)?
+            } else {
+                0
+            };
+            ((horizon < total_frames).then_some(horizon), backfill_gate_held)
+        };
+        tracing::debug!(
+            target: "fsqlite::wal::checkpoint_coordination",
+            trace_id = cx.trace_id(),
+            run_id = PHYSICAL_WRITER_CHECKPOINT_RUN_ID,
+            scenario_id = PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID,
+            checkpoint_phase = "reader_horizon",
+            total_frames,
+            oldest_reader_frame = ?oldest_reader_frame,
+            backfill_gate_held,
+            requested_mode = ?mode,
+            "sampled the cross-process WAL reader horizon"
+        );
+        // Run the checkpoint from the beginning, clamped to the peer reader
+        // horizon.
         let checkpoint_result = wal
-            .checkpoint(cx, effective_mode, &mut writer, 0, None)
+            .checkpoint(cx, effective_mode, &mut writer, 0, oldest_reader_frame)
             .await;
         drop(wal);
+        if backfill_gate_held {
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            shared_db_file_write(&db_file, &cleanup_cx)
+                .await?
+                .wal_checkpoint_backfill_gate_release(&cleanup_cx)?;
+        }
         if let Err(error) = &checkpoint_result {
             let queue_snapshot =
                 checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(self));
@@ -26982,8 +27159,12 @@ where
 
         // Surface any pager-level downgrade in the result so callers can
         // detect that their requested mode was not honored (issue #66 fix 4).
+        // GH#399: a backend-level downgrade (the reset was deferred for a
+        // peer reader) is preserved rather than overwritten.
         result.requested_mode = mode;
-        result.effective_mode = effective_mode;
+        if effective_mode != mode {
+            result.effective_mode = effective_mode;
+        }
         let queue_snapshot =
             checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(self));
         tracing::debug!(

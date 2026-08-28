@@ -117,8 +117,17 @@ impl Connection {
             .saturating_sub(checkpoint_metrics_before.checkpoint_duration_us_total);
         self.checkpoint_advisor_note_checkpoint(mode, &result, checkpoint_duration_us);
 
+        // GH#399: SQLite reports `busy = 1` when readers kept the checkpoint
+        // from finishing — frames beyond the oldest reader horizon stayed in
+        // the WAL, or a RESTART/TRUNCATE could not replace the generation
+        // because a peer process still pins it. Mirror that so callers can
+        // retry instead of assuming the WAL was truncated.
+        let reset_requested = matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate);
+        let blocked_by_readers = !result.completed
+            || (reset_requested && result.total_frames > 0 && !result.wal_was_reset);
+
         Ok([
-            0,
+            i64::from(blocked_by_readers),
             i64::from(result.total_frames),
             i64::from(result.frames_backfilled),
         ])

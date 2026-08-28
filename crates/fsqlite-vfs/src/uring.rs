@@ -1077,6 +1077,34 @@ impl VfsFile for IoUringFile {
         self.inner.shm_unmap(cx, delete)
     }
 
+    fn wal_reader_slot_acquire(&mut self, cx: &Cx, mx_frame: u32) -> Result<Option<u32>> {
+        self.inner.wal_reader_slot_acquire(cx, mx_frame)
+    }
+
+    fn wal_reader_slot_release(&mut self, cx: &Cx, slot: u32) -> Result<()> {
+        self.inner.wal_reader_slot_release(cx, slot)
+    }
+
+    fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
+        self.inner.wal_checkpoint_backfill_gate_acquire(cx)
+    }
+
+    fn wal_checkpoint_backfill_gate_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_checkpoint_backfill_gate_release(cx)
+    }
+
+    fn wal_checkpoint_reader_horizon(&mut self, cx: &Cx, mx_frame: u32) -> Result<u32> {
+        self.inner.wal_checkpoint_reader_horizon(cx, mx_frame)
+    }
+
+    fn wal_checkpoint_reset_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
+        self.inner.wal_checkpoint_reset_gate_acquire(cx)
+    }
+
+    fn wal_checkpoint_reset_gate_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_checkpoint_reset_gate_release(cx)
+    }
+
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
     }

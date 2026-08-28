@@ -75,6 +75,22 @@ pub trait CheckpointTarget: Send {
     ) -> CheckpointTargetFuture<'a, Option<usize>> {
         Box::pin(async { Ok(None) })
     }
+
+    /// GH#399: take the cross-process gate that excludes every WAL reader
+    /// pinned to the current generation while a RESTART/TRUNCATE replaces it
+    /// (C SQLite holds `WAL_READ_LOCK(1..WAL_NREADER)` exclusively across
+    /// `walRestartHdr`). `Ok(false)` means a peer reader still pins the
+    /// generation: the post-action is skipped and the WAL is left intact.
+    ///
+    /// The default is the single-process behaviour (never blocked).
+    fn acquire_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Release the gate taken by a successful [`Self::acquire_wal_reset_gate`].
+    fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +108,16 @@ pub struct CheckpointExecutionResult {
     pub db_size_pages: Option<u32>,
     /// Whether the WAL was reset after backfill.
     pub wal_was_reset: bool,
+}
+
+impl CheckpointExecutionResult {
+    /// GH#399: the plan asked for a RESTART/TRUNCATE reset but a peer reader
+    /// pinned the current generation, so the executor kept the WAL intact
+    /// (the checkpoint effectively ran as FULL).
+    #[must_use]
+    pub const fn reset_deferred_by_readers(&self) -> bool {
+        (self.plan.should_reset_wal() || self.plan.should_truncate_wal()) && !self.wal_was_reset
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +312,44 @@ async fn apply_checkpoint_post_action<F: VfsFile>(
 ) -> Result<bool> {
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
+            // GH#399: the planner only knows the reader horizon sampled
+            // before backfill. A reader in another process may hold a slot at
+            // exactly the current frame count (so it never limited backfill)
+            // or have registered since; either still depends on this WAL
+            // generation. Hold the reader slots exclusively across the reset,
+            // exactly like C SQLite's `WAL_READ_LOCK(1..)` fence, and defer
+            // the reset when they cannot be taken.
+            if !target.acquire_wal_reset_gate(cx).await? {
+                info!(
+                    action = ?post_action,
+                    "WAL reset deferred: a peer reader still pins the current WAL generation"
+                );
+                return Ok(false);
+            }
+            let reset =
+                replace_wal_generation(cx, wal, post_action, target, expected_checksums).await;
+            let release = target.release_wal_reset_gate(cx).await;
+            match (reset, release) {
+                (Ok(()), Ok(())) => Ok(true),
+                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            }
+        }
+        CheckpointPostAction::None => Ok(false),
+    }
+}
+
+/// Rewrite the WAL header for a fresh generation (and truncate the file for
+/// TRUNCATE) once the database file is durably up to date. Callers must hold
+/// the reader reset gate.
+async fn replace_wal_generation<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut WalFile<F>,
+    post_action: CheckpointPostAction,
+    target: &mut impl CheckpointTarget,
+    expected_checksums: &[ExpectedPageChecksum],
+) -> Result<()> {
+    match post_action {
+        CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
             let new_seq = wal.header().checkpoint_seq.wrapping_add(1);
             // Salt-1 increments, salt-2 randomizes (C SQLite `walRestartHdr`
             // semantics): stale frames from the pre-reset generation must
@@ -346,9 +410,9 @@ async fn apply_checkpoint_post_action<F: VfsFile>(
                 truncate,
                 "WAL reset after checkpoint"
             );
-            Ok(true)
+            Ok(())
         }
-        CheckpointPostAction::None => Ok(false),
+        CheckpointPostAction::None => Ok(()),
     }
 }
 
@@ -776,6 +840,128 @@ mod tests {
 
         assert_eq!(result.frames_backfilled, 6);
         assert!(!result.wal_was_reset);
+    }
+
+    /// GH#399: a target whose cross-process reader gate refuses (a peer
+    /// process still pins the current WAL generation) keeps the WAL intact
+    /// even though the plan asked for a reset, and reports the deferral.
+    struct GatedTarget {
+        inner: RecordingTarget,
+        allow_reset: bool,
+        gate_acquired: u32,
+        gate_released: u32,
+    }
+
+    impl CheckpointTarget for GatedTarget {
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn truncate_db<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            self.inner.truncate_db(cx, n_pages)
+        }
+
+        fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            self.inner.sync_db(cx)
+        }
+
+        fn acquire_wal_reset_gate<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> CheckpointTargetFuture<'a, bool> {
+            Box::pin(async move {
+                if self.allow_reset {
+                    self.gate_acquired += 1;
+                }
+                Ok(self.allow_reset)
+            })
+        }
+
+        fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.gate_released += 1;
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn test_truncate_defers_reset_when_peer_reader_gate_refuses_gh399() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 6);
+
+        // No reader was visible when the plan was sampled, so the plan asks
+        // for a truncating reset ...
+        let state = CheckpointState {
+            total_frames: 6,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = GatedTarget {
+            inner: RecordingTarget::new(),
+            allow_reset: false,
+            gate_acquired: 0,
+            gate_released: 0,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("checkpoint");
+
+        // ... every frame is still backfilled ...
+        assert_eq!(result.frames_backfilled, 6);
+        assert!(result.plan.should_truncate_wal());
+        assert!(result.plan.completes_checkpoint());
+        // ... but the generation a peer reader pins survives untouched.
+        assert!(!result.wal_was_reset);
+        assert!(result.reset_deferred_by_readers());
+        assert_eq!(wal.frame_count(), 6);
+        assert_eq!(wal.header().checkpoint_seq, 0);
+        assert_eq!(wal.header().salts, test_salts());
+        assert_eq!(target.gate_acquired, 0);
+        assert_eq!(target.gate_released, 0, "a refused gate is never released");
+    }
+
+    #[test]
+    fn test_truncate_holds_reader_gate_across_reset_gh399() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 6);
+
+        let state = CheckpointState {
+            total_frames: 6,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = GatedTarget {
+            inner: RecordingTarget::new(),
+            allow_reset: true,
+            gate_acquired: 0,
+            gate_released: 0,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("checkpoint");
+
+        assert!(result.wal_was_reset);
+        assert!(!result.reset_deferred_by_readers());
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.header().checkpoint_seq, 1);
+        assert_eq!(target.gate_acquired, 1);
+        assert_eq!(target.gate_released, 1, "the gate is released exactly once");
     }
 
     #[test]

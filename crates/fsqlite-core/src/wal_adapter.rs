@@ -2065,13 +2065,25 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             self.publish_latest_committed_snapshot(cx, "checkpoint")
                 .await?;
 
+            // GH#399: a RESTART/TRUNCATE whose reset was refused by the
+            // cross-process reader gate ran as a FULL checkpoint — every safe
+            // frame was backfilled but the generation survives for the peer
+            // reader that still pins it. Report that downgrade so callers
+            // (PRAGMA wal_checkpoint's `busy` column) can see the request was
+            // not honoured yet.
+            let effective_mode = if result.reset_deferred_by_readers() {
+                CheckpointMode::Full
+            } else {
+                mode
+            };
+
             Ok(CheckpointResult {
                 total_frames,
                 frames_backfilled: result.frames_backfilled,
                 completed: result.plan.completes_checkpoint(),
                 wal_was_reset: result.wal_was_reset,
                 requested_mode: mode,
-                effective_mode: mode,
+                effective_mode,
             })
         })
     }
@@ -4396,6 +4408,14 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 
     fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
         Box::pin(async move { self.writer.sync(cx).await })
+    }
+
+    fn acquire_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, bool> {
+        Box::pin(async move { self.writer.acquire_wal_reset_gate(cx).await })
+    }
+
+    fn release_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move { self.writer.release_wal_reset_gate(cx).await })
     }
 }
 

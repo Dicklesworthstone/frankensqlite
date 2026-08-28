@@ -39,8 +39,8 @@ use tracing::{error, warn};
 
 use crate::shm::{
     SHM_READ_MARK_OFFSET, SHM_SEGMENT_SIZE, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK,
-    SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK, WAL_NREADER_USIZE,
-    WAL_TOTAL_LOCKS, WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
+    SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK, WAL_NREADER, WAL_NREADER_USIZE,
+    WAL_READ_MARK_NOT_USED, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
 use crate::traits::{
     FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
@@ -3334,8 +3334,208 @@ impl VfsFile for UnixFile {
         self.release_shm_owner_state(delete)
     }
 
+    // --- GH#399: cross-process WAL reader registration (C SQLite `aReadMark`) ---
+
+    fn wal_reader_slot_acquire(&mut self, cx: &Cx, mx_frame: u32) -> Result<Option<u32>> {
+        checkpoint_or_abort(cx)?;
+        let region_0 = self.shm_map(cx, 0, SHM_SEGMENT_SIZE, true)?;
+        // Mirror `walTryBeginRead`'s WAL_RETRY loop: a reader table that is
+        // momentarily fully contended (every slot pinned at another mark, or
+        // a slot mutated between publish and share) is retried with backoff
+        // inside the handle's busy budget instead of failing the transaction.
+        let budget = Duration::from_millis(self.busy_timeout_ms.max(WAL_READER_SLOT_MIN_BUDGET_MS));
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            if let Some(slot) = self.try_acquire_wal_reader_slot(cx, &region_0, mx_frame)? {
+                return Ok(Some(slot));
+            }
+            let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+                warn!(
+                    mx_frame,
+                    read_marks = ?self.compat_read_marks(),
+                    "no WAL reader slot could be acquired within the busy budget"
+                );
+                return Err(FrankenError::Busy);
+            };
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(WAL_READER_SLOT_MAX_BACKOFF);
+        }
+    }
+
+    fn wal_reader_slot_release(&mut self, cx: &Cx, slot: u32) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let lock_slot = wal_reader_lock_slot(slot)?;
+        self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+    }
+
+    fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        let lock_slot = wal_reader_lock_slot(0)?;
+        match self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE) {
+            Ok(()) => Ok(true),
+            Err(FrankenError::Busy) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wal_checkpoint_backfill_gate_release(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let lock_slot = wal_reader_lock_slot(0)?;
+        self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+    }
+
+    fn wal_checkpoint_reader_horizon(&mut self, cx: &Cx, mx_frame: u32) -> Result<u32> {
+        checkpoint_or_abort(cx)?;
+        let region_0 = self.shm_map(cx, 0, SHM_SEGMENT_SIZE, true)?;
+        // C SQLite `walCheckpoint`: every reader slot whose mark is below the
+        // WAL end is either free (lock it exclusively, park it, move on) or
+        // pinned by a live reader (its mark becomes the new safe horizon).
+        let mut mx_safe_frame = mx_frame;
+        for index in 1..WAL_NREADER {
+            let mark = read_wal_read_mark(&region_0, index)?;
+            if mx_safe_frame <= mark {
+                continue;
+            }
+            let lock_slot = wal_reader_lock_slot(index)?;
+            match self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE) {
+                Ok(()) => {
+                    // Slot 1 is re-armed at the current tip so the next reader
+                    // can share it without an exclusive publish; the rest are
+                    // parked as unused so a stale mark never looks shareable.
+                    let replacement = if index == 1 {
+                        mx_safe_frame
+                    } else {
+                        WAL_READ_MARK_NOT_USED
+                    };
+                    let publish = write_wal_read_mark(&region_0, index, replacement);
+                    self.shm_barrier();
+                    self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
+                    publish?;
+                }
+                Err(FrankenError::Busy) => {
+                    mx_safe_frame = mark;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(mx_safe_frame)
+    }
+
+    fn wal_checkpoint_reset_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        let first = wal_reader_lock_slot(1)?;
+        match self.shm_lock(
+            cx,
+            first,
+            WAL_NREADER - 1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        ) {
+            Ok(()) => Ok(true),
+            Err(FrankenError::Busy) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn wal_checkpoint_reset_gate_release(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let first = wal_reader_lock_slot(1)?;
+        self.shm_lock(
+            cx,
+            first,
+            WAL_NREADER - 1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+    }
+
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.busy_timeout_ms = ms;
+    }
+}
+
+/// Smallest busy budget for reader-slot acquisition, even when the handle has
+/// no busy timeout: the table is only ever contended for the microseconds a
+/// peer needs between publishing a mark and sharing it.
+const WAL_READER_SLOT_MIN_BUDGET_MS: u64 = 100;
+const WAL_READER_SLOT_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
+fn wal_reader_lock_slot(index: u32) -> Result<u32> {
+    wal_read_lock_slot(index).ok_or_else(|| FrankenError::LockFailed {
+        detail: format!("invalid WAL reader slot {index}"),
+    })
+}
+
+fn wal_read_mark_offset(index: u32) -> usize {
+    SHM_READ_MARK_OFFSET + usize::try_from(index).expect("reader index fits usize") * 4
+}
+
+fn read_wal_read_mark(region_0: &ShmRegion, index: u32) -> Result<u32> {
+    region_0.read_u32_ne(wal_read_mark_offset(index))
+}
+
+fn write_wal_read_mark(region_0: &ShmRegion, index: u32, mark: u32) -> Result<()> {
+    region_0.write_u32_ne(wal_read_mark_offset(index), mark)
+}
+
+impl UnixFile {
+    /// One `walTryBeginRead` attempt: share the slot already published at the
+    /// best mark `<= mx_frame`, publishing `mx_frame` into a free slot first
+    /// when no slot carries it. `Ok(None)` asks the caller to retry after a
+    /// transient conflict (every slot pinned, or the shared slot's mark moved
+    /// between publish and share).
+    fn try_acquire_wal_reader_slot(
+        &mut self,
+        cx: &Cx,
+        region_0: &ShmRegion,
+        mx_frame: u32,
+    ) -> Result<Option<u32>> {
+        let mut mx_read_mark = 0_u32;
+        let mut mx_index = 0_u32;
+        for index in 1..WAL_NREADER {
+            let mark = read_wal_read_mark(region_0, index)?;
+            if mx_read_mark <= mark && mark <= mx_frame {
+                mx_read_mark = mark;
+                mx_index = index;
+            }
+        }
+
+        if mx_read_mark < mx_frame || mx_index == 0 {
+            for index in 1..WAL_NREADER {
+                let lock_slot = wal_reader_lock_slot(index)?;
+                match self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE) {
+                    Ok(()) => {
+                        let publish = write_wal_read_mark(region_0, index, mx_frame);
+                        self.shm_barrier();
+                        self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
+                        publish?;
+                        mx_read_mark = mx_frame;
+                        mx_index = index;
+                        break;
+                    }
+                    Err(FrankenError::Busy) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if mx_index == 0 {
+            return Ok(None);
+        }
+
+        let lock_slot = wal_reader_lock_slot(mx_index)?;
+        match self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED) {
+            Ok(()) => {}
+            Err(FrankenError::Busy) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        self.shm_barrier();
+        // A checkpointer may have re-armed the slot between the scan and the
+        // SHARED acquisition; a mark that moved no longer describes this
+        // reader, so give the slot back and rescan.
+        if read_wal_read_mark(region_0, mx_index)? != mx_read_mark {
+            self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)?;
+            return Ok(None);
+        }
+        Ok(Some(mx_index))
     }
 }
 
@@ -4577,6 +4777,192 @@ mod tests {
             .unwrap();
         reader1
             .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+    }
+
+    /// GH#399: a registered reader clamps a peer checkpointer's safe horizon
+    /// to its published mark and holds the reset gate closed until it ends.
+    #[test]
+    fn test_wal_reader_slot_publishes_horizon_and_gates_reset() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("gh399_reader_horizon.db");
+        let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut checkpointer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let slot = reader
+            .wal_reader_slot_acquire(&cx, 41)
+            .unwrap()
+            .expect("unix backend registers readers");
+        assert!(
+            (1..WAL_NREADER).contains(&slot),
+            "reader slot {slot} out of range"
+        );
+        let slot_idx = usize::try_from(slot).unwrap();
+        assert_eq!(
+            reader.compat_read_marks().expect("shm mapped")[slot_idx],
+            41
+        );
+
+        assert!(
+            checkpointer
+                .wal_checkpoint_backfill_gate_acquire(&cx)
+                .unwrap(),
+            "no reader serves pages straight from the database file"
+        );
+        assert_eq!(
+            checkpointer
+                .wal_checkpoint_reader_horizon(&cx, 100)
+                .unwrap(),
+            41,
+            "the live reader's mark bounds the safe backfill horizon"
+        );
+        let marks = checkpointer.compat_read_marks().expect("shm mapped");
+        assert_eq!(marks[slot_idx], 41, "a held slot keeps its mark");
+        for (index, mark) in marks.iter().enumerate().skip(1) {
+            if index == slot_idx {
+                continue;
+            }
+            let expected = if index == 1 {
+                100
+            } else {
+                WAL_READ_MARK_NOT_USED
+            };
+            assert_eq!(*mark, expected, "free slot {index} is re-armed or parked");
+        }
+        assert!(
+            !checkpointer.wal_checkpoint_reset_gate_acquire(&cx).unwrap(),
+            "the reset gate must stay closed while a reader pins the generation"
+        );
+        checkpointer
+            .wal_checkpoint_backfill_gate_release(&cx)
+            .unwrap();
+
+        reader.wal_reader_slot_release(&cx, slot).unwrap();
+
+        assert_eq!(
+            checkpointer
+                .wal_checkpoint_reader_horizon(&cx, 100)
+                .unwrap(),
+            100,
+            "with no live reader the whole WAL is safe to backfill"
+        );
+        assert!(
+            checkpointer.wal_checkpoint_reset_gate_acquire(&cx).unwrap(),
+            "the reset gate opens once the last reader is gone"
+        );
+        checkpointer.wal_checkpoint_reset_gate_release(&cx).unwrap();
+
+        // A reader arriving after the checkpointer's pass shares the re-armed
+        // tip slot without publishing a new mark.
+        let tip_slot = reader
+            .wal_reader_slot_acquire(&cx, 100)
+            .unwrap()
+            .expect("registered");
+        assert_eq!(tip_slot, 1, "slot 1 was re-armed at the WAL tip");
+        reader.wal_reader_slot_release(&cx, tip_slot).unwrap();
+    }
+
+    /// GH#399: readers at one mark share a slot; a reader whose mark has no
+    /// free slot falls back to the largest published mark below it (which is
+    /// conservative for the checkpointer); a reader below every held mark
+    /// cannot register and reports Busy instead of pinning a wrong horizon.
+    #[test]
+    fn test_wal_reader_slots_share_marks_and_fall_back_conservatively() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("gh399_reader_slots.db");
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let (handle, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            handles.push(handle);
+        }
+
+        let first = handles[0]
+            .wal_reader_slot_acquire(&cx, 10)
+            .unwrap()
+            .unwrap();
+        let shared = handles[1]
+            .wal_reader_slot_acquire(&cx, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, shared, "equal marks share one slot");
+
+        let mut held = vec![(0_usize, first), (1_usize, shared)];
+        for (owner, mark) in [(2_usize, 20_u32), (3, 30), (4, 40)] {
+            let slot = handles[owner]
+                .wal_reader_slot_acquire(&cx, mark)
+                .unwrap()
+                .unwrap();
+            assert!(
+                held.iter().all(|(_, other)| *other != slot),
+                "distinct marks need distinct slots"
+            );
+            held.push((owner, slot));
+        }
+
+        // Every slot is pinned: 35 has no exact slot and cannot claim one, so
+        // it shares the 30 slot (the largest published mark below it).
+        let fallback = handles[5]
+            .wal_reader_slot_acquire(&cx, 35)
+            .unwrap()
+            .unwrap();
+        let slot_of_30 = held[3].1;
+        assert_eq!(
+            fallback, slot_of_30,
+            "falls back to the largest mark <= mx_frame"
+        );
+        handles[5].wal_reader_slot_release(&cx, fallback).unwrap();
+
+        // Below every held mark there is nothing safe to share.
+        let (mut latecomer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        latecomer.set_busy_timeout_ms(1);
+        assert!(matches!(
+            latecomer.wal_reader_slot_acquire(&cx, 5),
+            Err(FrankenError::Busy)
+        ));
+
+        for (owner, slot) in held {
+            handles[owner].wal_reader_slot_release(&cx, slot).unwrap();
+        }
+    }
+
+    /// GH#399: a legacy reader that pinned `WAL_READ_LOCK(0)` (serving pages
+    /// straight from the database file) blocks the backfill gate.
+    #[test]
+    fn test_wal_checkpoint_backfill_gate_blocked_by_slot0_reader() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("gh399_backfill_gate.db");
+        let (mut legacy_reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut checkpointer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        legacy_reader
+            .compat_reader_acquire_wal_read_lock(&cx, 0, 0)
+            .unwrap();
+        assert!(
+            !checkpointer
+                .wal_checkpoint_backfill_gate_acquire(&cx)
+                .unwrap(),
+            "a slot-0 reader forbids any backfill"
+        );
+        assert!(
+            checkpointer.wal_checkpoint_reset_gate_acquire(&cx).unwrap(),
+            "slot 0 does not pin the WAL generation itself"
+        );
+        checkpointer.wal_checkpoint_reset_gate_release(&cx).unwrap();
+
+        let slot = wal_read_lock_slot(0).expect("reader slot 0 should exist");
+        legacy_reader
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        assert!(
+            checkpointer
+                .wal_checkpoint_backfill_gate_acquire(&cx)
+                .unwrap()
+        );
+        checkpointer
+            .wal_checkpoint_backfill_gate_release(&cx)
             .unwrap();
     }
 

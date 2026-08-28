@@ -1263,6 +1263,20 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
 
     /// Sync the database file to stable storage.
     fn sync<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()>;
+
+    /// GH#399: take the cross-process gate that excludes every WAL reader
+    /// pinned to the current generation while it is replaced by a
+    /// RESTART/TRUNCATE reset. `Ok(false)` means a peer reader still pins the
+    /// generation; the backend then keeps the WAL intact instead of resetting
+    /// it. The default is the single-process behaviour (never blocked).
+    fn acquire_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Release the gate taken by a successful [`Self::acquire_wal_reset_gate`].
+    fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 // ---------------------------------------------------------------------------

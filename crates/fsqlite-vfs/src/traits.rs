@@ -1276,6 +1276,69 @@ pub trait VfsFile: Send + Sync {
     /// (Equivalent to sqlite3_io_methods.xShmUnmap)
     fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()>;
 
+    // --- Cross-process WAL reader registration (GH#399) ---
+    //
+    // These mirror C SQLite's `aReadMark` / `WAL_READ_LOCK(i)` protocol so a
+    // checkpointer in another process can see which WAL frames a live read
+    // snapshot still depends on. The defaults are the single-process
+    // behaviour: no registration, every frame is safe to backfill, and a
+    // reset is never blocked. Only backends with a real shared `*-shm`
+    // table (Unix) override them; the memory VFS has no peer processes and
+    // the Windows `-shm` protocol is tracked separately (#395).
+
+    /// Register this handle as a WAL reader whose pinned snapshot ends at
+    /// `mx_frame` (the number of WAL frames visible to it — SQLite
+    /// `mxFrame`), holding the chosen `WAL_READ_LOCK(i)` slot SHARED until
+    /// [`Self::wal_reader_slot_release`].
+    ///
+    /// Returns the held reader slot index (`1..WAL_NREADER`) or `None` when
+    /// the backend has no cross-process reader table. Returns `Busy` when
+    /// every slot is pinned by other readers at incompatible marks for the
+    /// whole busy budget.
+    fn wal_reader_slot_acquire(&mut self, _cx: &Cx, _mx_frame: u32) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
+    /// Release a reader slot returned by [`Self::wal_reader_slot_acquire`].
+    fn wal_reader_slot_release(&mut self, _cx: &Cx, _slot: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// Checkpointer: take the exclusive `WAL_READ_LOCK(0)` that excludes
+    /// readers serving pages straight from the database file while frames are
+    /// copied into it. `Ok(false)` means such a reader is active and nothing
+    /// may be backfilled right now.
+    fn wal_checkpoint_backfill_gate_acquire(&mut self, _cx: &Cx) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Release the gate taken by [`Self::wal_checkpoint_backfill_gate_acquire`].
+    fn wal_checkpoint_backfill_gate_release(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
+    /// Checkpointer: compute the highest WAL frame count that can be copied
+    /// into the database without overtaking a live reader (SQLite
+    /// `walCheckpoint`'s `mxSafeFrame`). `mx_frame` is the current WAL frame
+    /// count; the result is `<= mx_frame`, and equals it when no reader pins
+    /// an older horizon. Slots that are not held are parked at
+    /// `READMARK_NOT_USED` as a side effect.
+    fn wal_checkpoint_reader_horizon(&mut self, _cx: &Cx, mx_frame: u32) -> Result<u32> {
+        Ok(mx_frame)
+    }
+
+    /// Checkpointer: take every reader slot exclusively so the WAL generation
+    /// can be replaced (RESTART/TRUNCATE). `Ok(false)` means a reader still
+    /// pins the current generation and the reset must be deferred.
+    fn wal_checkpoint_reset_gate_acquire(&mut self, _cx: &Cx) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Release the gate taken by [`Self::wal_checkpoint_reset_gate_acquire`].
+    fn wal_checkpoint_reset_gate_release(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
     /// Set the busy-timeout for cross-process file-lock contention.
     ///
     /// When `ms > 0`, the VFS should retry `F_SETLK` with exponential
