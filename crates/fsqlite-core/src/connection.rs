@@ -35888,10 +35888,33 @@ impl Connection {
     fn guard_mutation_encoding_supported(&self, statement: &Statement) -> Result<()> {
         if self.db_text_encoding.get().is_write_supported()
             || !statement_may_mutate_database(statement)
+            || self.statement_is_read_only_fts5_integrity_check(statement)
         {
             return Ok(());
         }
         Err(FrankenError::Unsupported)
+    }
+
+    /// Whether `statement` uses FTS5's syntactically-INSERT, semantically
+    /// read-only integrity command against a live FTS5 table.
+    ///
+    /// Keep this test exact: every other FTS5 maintenance command can mutate
+    /// persisted or in-memory index state and therefore still requires a
+    /// writable pager.
+    #[cfg(feature = "ext-fts5")]
+    fn statement_is_read_only_fts5_integrity_check(&self, statement: &Statement) -> bool {
+        matches!(
+            statement,
+            Statement::Insert(insert)
+                if fts5_maintenance_insert_command(insert)
+                    == Some(Fts5MaintenanceCommand::IntegrityCheck)
+                    && self.insert_targets_live_fts5_command_column(insert)
+        )
+    }
+
+    #[cfg(not(feature = "ext-fts5"))]
+    fn statement_is_read_only_fts5_integrity_check(&self, _statement: &Statement) -> bool {
+        false
     }
 
     /// Test-only convenience dispatcher: run a statement with a fresh op-Cx and
@@ -35999,6 +36022,7 @@ impl Connection {
         // (Writability of the attached schema is governed by how the attached
         // connection itself is opened, handled in the ATTACH branch below.)
         if self.pager.is_readonly()
+            && !self.statement_is_read_only_fts5_integrity_check(statement)
             && (matches!(
                 statement,
                 Statement::Insert(_)

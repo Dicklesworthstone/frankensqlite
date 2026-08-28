@@ -8,6 +8,7 @@
 //! whose doclist spills across leaf pages, exercising the GH#360 stitcher.
 
 use fsqlite_core::connection::Connection;
+use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 fn rowids(rows: &[fsqlite_core::connection::Row]) -> Vec<i64> {
@@ -114,6 +115,92 @@ fn bd_fts5_integrity_check_passes_on_stock_spilled_index() {
             .await
             .unwrap();
         assert_eq!(rowids(&matched), (1..=40).collect::<Vec<i64>>());
+        conn.close().await.unwrap();
+
+        // Keep the structure record valid so a schema-only open succeeds, but
+        // corrupt one persisted leaf. The read-only maintenance command must
+        // scan far enough to discover that planted negative itself.
+        {
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let leaf_id: i64 = stock
+                .query_row("SELECT min(id) FROM t_data WHERE id > 100", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            stock
+                .execute(
+                    "UPDATE t_data SET block = X'FFFFFFFFFFFFFFFFFFFFFFFF' WHERE id = ?1",
+                    [leaf_id],
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open_schema_only(db_path.to_str().unwrap())
+            .await
+            .expect("leaf corruption must not prevent the read-only schema open");
+        let err = conn
+            .execute("INSERT INTO t(t) VALUES('integrity-check');")
+            .await
+            .expect_err("the read-only integrity command must reject a corrupt leaf");
+        assert!(
+            !matches!(err, FrankenError::ReadOnly),
+            "the semantic integrity result must not be hidden by the SQL write guard"
+        );
+        assert!(
+            err.to_string().contains("malformed") || err.to_string().contains("corrupt"),
+            "expected a corruption diagnostic, got {err:?}"
+        );
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
+fn bd_fts5_integrity_check_is_the_only_maintenance_insert_allowed_read_only() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_read_only_integrity.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE t USING fts5(body, content='', contentless_delete=1);",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO t(rowid, body) VALUES (1, 'read only sentinel');")
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        }
+
+        let conn = Connection::open_schema_only(&db_str).await.unwrap();
+        conn.execute("INSERT INTO t(t) VALUES('integrity-check');")
+            .await
+            .expect("the FTS5 integrity decoder must run through a read-only pager");
+
+        for command in ["flush", "optimize", "rebuild", "delete-all"] {
+            let err = conn
+                .execute(&format!("INSERT INTO t(t) VALUES('{command}');"))
+                .await
+                .expect_err("mutating FTS5 maintenance must stay read-only rejected");
+            assert!(
+                matches!(err, FrankenError::ReadOnly),
+                "{command} must require a writable pager, got {err:?}"
+            );
+        }
+
+        let err = conn
+            .execute("INSERT INTO t(rowid, body) VALUES (2, 'forbidden write');")
+            .await
+            .expect_err("ordinary inserts must stay read-only rejected");
+        assert!(matches!(err, FrankenError::ReadOnly));
+
+        let matched = conn
+            .query("SELECT rowid FROM t WHERE t MATCH 'sentinel';")
+            .await
+            .unwrap();
+        assert_eq!(rowids(&matched), vec![1]);
         conn.close().await.unwrap();
     });
 }
