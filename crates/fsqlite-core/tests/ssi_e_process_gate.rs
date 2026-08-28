@@ -395,11 +395,11 @@ async fn run_disjoint_write_skew(
         .await
         .expect("right root is not locked by the peer");
 
-    let first_commit = c1.execute_batch("COMMIT;").await.map(|_| ());
+    let first_commit = c1.execute_batch("COMMIT;").await;
     if first_commit.is_err() {
         let _ = c1.execute_batch("ROLLBACK;").await;
     }
-    let second_commit = c2.execute_batch("COMMIT;").await.map(|_| ());
+    let second_commit = c2.execute_batch("COMMIT;").await;
     if second_commit.is_err() {
         let _ = c2.execute_batch("ROLLBACK;").await;
     }
@@ -530,7 +530,7 @@ fn serializable_off_keeps_first_committer_wins_live() {
         let c1_commit = c1.execute_batch("COMMIT;").await;
         assert!(c1_commit.is_ok(), "first writer must commit: {c1_commit:?}");
         let c2_committed = match c2_update {
-            Ok(_) => {
+            Ok(()) => {
                 let commit = c2.execute_batch("COMMIT;").await;
                 if let Err(error) = &commit {
                     assert!(
