@@ -12062,6 +12062,14 @@ pub struct Connection {
     /// fallback and require all cursor operations to route through the real
     /// Pager+BtreeCursor stack. Used for parity-certification testing.
     reject_mem_fallback: RefCell<bool>,
+    /// Keep file-backed row data pager-resident even when a prepared-query
+    /// shape has an optional MemDatabase fast path.
+    ///
+    /// The schema-only open family promises bounded-memory, pager-backed
+    /// reads. Without this mode bit, its first parameterized indexed lookup
+    /// can opportunistically hydrate every table merely to enter a MemDB fast
+    /// path, defeating that contract on large databases.
+    defer_memdb_row_hydration: bool,
     /// Whether schema reload may keep a contentless FTS5 table in the
     /// bounded, on-disk lazy representation.
     ///
@@ -13129,6 +13137,27 @@ impl Connection {
         Self::open_existing_schema_only_with_env(path, ConnectionEnv::default()).await
     }
 
+    /// Open an existing database through a read-only schema connection while
+    /// deferring FTS5 shadow validation and hydration.
+    ///
+    /// This is for canonical-data consumers that do not query FTS5 tables.
+    /// Ordinary tables remain available through pager-backed cursors, while
+    /// FTS5 virtual tables stay as empty connected instances for the lifetime
+    /// of the connection. Writes are refused by the read-only pager.
+    pub async fn open_schema_only_deferred_fts5(path: impl Into<String>) -> Result<Self> {
+        Self::open_schema_only_deferred_fts5_with_env(path, ConnectionEnv::default()).await
+    }
+
+    /// [`open_schema_only_deferred_fts5`](Self::open_schema_only_deferred_fts5)
+    /// with an explicit runtime environment.
+    pub async fn open_schema_only_deferred_fts5_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false, true)
+            .await
+    }
+
     /// #368 defect 3: like [`open_existing_schema_only`](Self::open_existing_schema_only)
     /// but DEFERS FTS5 shadow validation/hydration at open. The schema reload
     /// keeps bare, empty FTS5 vtab instances and never reads/validates `%_data`,
@@ -13561,6 +13590,7 @@ impl Connection {
             // Schema-only connections always use parity-cert mode (pager-backed
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
+            defer_memdb_row_hydration: true,
             allow_lazy_contentless_fts5: true,
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
@@ -14094,6 +14124,7 @@ impl Connection {
             // via `set_reject_mem_fallback(false)` or
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
+            defer_memdb_row_hydration: false,
             allow_lazy_contentless_fts5: false,
             defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
@@ -26878,6 +26909,14 @@ impl Connection {
             && self.retained_autocommit_txn.borrow().is_none()
             && self.pending_memdb_direct_upserts.borrow().is_empty()
             && !self.memdb_requires_active_txn_reload.get()
+            && self.prepared_file_backed_memdb_hydration_allowed(stmt)
+    }
+
+    fn prepared_file_backed_memdb_hydration_allowed(
+        &self,
+        stmt: &PreparedStatement<'_>,
+    ) -> bool {
+        !self.defer_memdb_row_hydration
             && stmt
                 .prepared_query_fast_path
                 .as_ref()
@@ -54811,10 +54850,8 @@ impl Connection {
         }
 
         if self.committed_pager_refresh_allowed() {
-            let hydrate_file_backed_fast_path = stmt
-                .prepared_query_fast_path
-                .as_ref()
-                .is_some_and(PreparedQueryFastPath::can_use_clean_file_backed_memdb);
+            let hydrate_file_backed_fast_path =
+                self.prepared_file_backed_memdb_hydration_allowed(stmt);
             if hydrate_file_backed_fast_path {
                 let _ = self
                     .refresh_memdb_if_stale_with_publication_and_mode(

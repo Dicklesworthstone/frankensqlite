@@ -1710,6 +1710,9 @@ enum WorkerOpenRequest {
     SchemaOnly {
         path: String,
     },
+    SchemaOnlyDeferredFts5 {
+        path: String,
+    },
     WithFlags {
         path: String,
         flags: OpenFlags,
@@ -1736,6 +1739,9 @@ impl WorkerOpenRequest {
             } => Connection::open_with_page_size(path, page_size_bytes).await,
             Self::Existing { path } => Connection::open_existing(path).await,
             Self::SchemaOnly { path } => Connection::open_schema_only(path).await,
+            Self::SchemaOnlyDeferredFts5 { path } => {
+                Connection::open_schema_only_deferred_fts5(path).await
+            }
             Self::WithFlags { path, flags } => open_with_flags(&path, flags).await,
             Self::ReservedWithExpectedIdentityAndEnv {
                 path,
@@ -2024,6 +2030,18 @@ impl AsyncConnection {
     /// avoid introducing writer semantics such as close-time checkpoints.
     pub fn open_schema_only_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
         Self::open_sync_with_request(WorkerOpenRequest::SchemaOnly { path: path.into() })
+    }
+
+    /// Open an existing database on a dedicated worker through the read-only,
+    /// schema-only connection that deliberately leaves FTS5 unhydrated.
+    ///
+    /// Canonical non-FTS tables remain queryable and every write is refused.
+    pub fn open_schema_only_deferred_fts5_sync(
+        path: impl Into<String>,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::SchemaOnlyDeferredFts5 {
+            path: path.into(),
+        })
     }
 
     /// Open a database with explicit SQLite-compatible [`OpenFlags`].
@@ -6561,6 +6579,25 @@ mod tests {
             Some(&SqliteValue::Text("t".into())),
             "schema-only mode must expose the persisted table definition"
         );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_schema_only_deferred_fts5_sync_reads_canonical_data_and_refuses_writes() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = seeded_database(&dir, "schema-only-deferred-fts5.db");
+        let mut conn = AsyncConnection::open_schema_only_deferred_fts5_sync(&path)
+            .expect("deferred-fts5 schema-only open should succeed");
+        let rows = conn
+            .query_sync("SELECT name FROM t WHERE id = 1")
+            .expect("canonical row should remain readable");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Text("seeded".into()))
+        );
+        conn.execute_sync("INSERT INTO t VALUES (2, 'refused')")
+            .expect_err("deferred-fts5 schema-only open must refuse writes");
         conn.close_sync().expect("close should succeed");
     }
 

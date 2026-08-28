@@ -25,6 +25,12 @@ fn deferred_fts5_open_survives_corrupt_shadow_structure() {
         {
             let conn = Connection::open(&path).await.unwrap();
             conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("CREATE TABLE canonical_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .await
+                .expect("create canonical table");
+            conn.execute("INSERT INTO canonical_meta VALUES ('semantic_state', 'kept')")
+                .await
+                .expect("seed canonical row");
             conn.execute("CREATE VIRTUAL TABLE idx USING fts5(body, content='')")
                 .await
                 .expect("create contentless fts5");
@@ -65,6 +71,42 @@ fn deferred_fts5_open_survives_corrupt_shadow_structure() {
                 || message.contains("segment"),
             "expected an FTS5 %_data corruption error, got: {message}"
         );
+
+        // Canonical-data consumers need the same deferred hydration without a
+        // writable handle. Ordinary tables remain readable, while the pager
+        // refuses mutations for the full lifetime of the connection.
+        let readonly = Connection::open_schema_only_deferred_fts5(&path)
+            .await
+            .expect("read-only deferred-fts5 open must ignore the corrupt shadow");
+        assert_eq!(
+            readonly.memdb_row_hydration_count(),
+            0,
+            "schema-only open must not hydrate canonical rows into MemDatabase"
+        );
+        let canonical = readonly
+            .query_row_with_params(
+                "SELECT value FROM canonical_meta WHERE key = ?1",
+                &[SqliteValue::Text("semantic_state".into())],
+            )
+            .await
+            .expect("canonical table remains readable");
+        assert_eq!(
+            canonical.values().first(),
+            Some(&SqliteValue::Text("kept".into()))
+        );
+        assert_eq!(
+            readonly.memdb_row_hydration_count(),
+            0,
+            "prepared canonical lookup must remain pager-backed"
+        );
+        readonly
+            .execute("INSERT INTO canonical_meta VALUES ('refused', 'refused')")
+            .await
+            .expect_err("read-only deferred-fts5 open must refuse writes");
+        readonly
+            .close_without_checkpoint()
+            .await
+            .expect("close read-only deferred-fts5 connection");
 
         // The deferred-hydration repair open must SUCCEED: it keeps the bare FTS5
         // vtab and never reads %_data (#368 defect 3), so a repair path can now
