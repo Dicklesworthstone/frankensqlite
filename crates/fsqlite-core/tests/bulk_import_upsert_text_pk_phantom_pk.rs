@@ -1658,9 +1658,20 @@ async fn beads_command_connection(db: &str) -> Connection {
     conn
 }
 
+/// Close-time checkpoint policy for a simulated `br` process. `br` runs a
+/// PASSIVE checkpoint and then `wal_checkpoint(TRUNCATE)` at close; the
+/// concurrent-process discriminator overrides this per child through
+/// `FSQLITE_BEADS_CHURN_CLOSE_MODE` (`truncate` | `passive` | `none`).
+const BEADS_CHURN_CLOSE_MODE_ENV: &str = "FSQLITE_BEADS_CHURN_CLOSE_MODE";
+
 async fn beads_command_close(conn: Connection) {
-    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").await.expect("passive checkpoint");
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.expect("truncate checkpoint");
+    let mode = std::env::var(BEADS_CHURN_CLOSE_MODE_ENV).unwrap_or_else(|_| "truncate".to_owned());
+    if mode != "none" {
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").await.expect("passive checkpoint");
+    }
+    if mode == "truncate" {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await.expect("truncate checkpoint");
+    }
     drop(conn);
 }
 
@@ -2108,12 +2119,14 @@ fn beads_cache_rebuild_churn_across_processes_keeps_freelist_disjoint_from_trees
 /// database at once. Each round spawns four helper processes concurrently;
 /// each retries its whole transaction on transient conflicts exactly like
 /// `with_write_transaction`. Stock SQLite checks the physical image after
-/// every round so the first corrupting round is named.
-#[test]
-fn beads_concurrent_processes_churn_keeps_freelist_disjoint_from_trees() {
-    asupersync::test_utils::run_test(|| async {
+/// every round so the first corrupting round is named. `close_mode` selects
+/// what every child does at process exit (see `BEADS_CHURN_CLOSE_MODE_ENV`).
+async fn beads_concurrent_processes_churn(close_mode: &str) {
+    {
         let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("beads-churn-concurrent.db");
+        let db_path = dir
+            .path()
+            .join(format!("beads-churn-concurrent-{close_mode}.db"));
         let db = db_path.to_string_lossy().into_owned();
 
         let corpus = build_beads_corpus(BEADS_CHURN_SEED, 0);
@@ -2141,6 +2154,7 @@ fn beads_concurrent_processes_churn_keeps_freelist_disjoint_from_trees() {
                 .arg("--nocapture")
                 .env(BEADS_CHURN_DB_ENV, &db)
                 .env(BEADS_CHURN_STEP_ENV, command.to_string())
+                .env(BEADS_CHURN_CLOSE_MODE_ENV, close_mode)
                 .spawn()
                 .expect("spawn concurrent churn helper");
                 children.push((command, child));
@@ -2149,14 +2163,14 @@ fn beads_concurrent_processes_churn_keeps_freelist_disjoint_from_trees() {
                 let status = child.wait().expect("wait for churn helper");
                 assert!(
                     status.success(),
-                    "concurrent churn command #{command} (round {round}) failed: {status:?}"
+                    "[close={close_mode}] concurrent churn command #{command} (round {round}) failed: {status:?}"
                 );
             }
             let report = stock_integrity_report(&db_path);
             assert_eq!(
                 report,
                 vec!["ok".to_owned()],
-                "stock SQLite integrity after concurrent round #{round}"
+                "[close={close_mode}] stock SQLite integrity after concurrent round #{round}"
             );
         }
 
@@ -2171,5 +2185,40 @@ fn beads_concurrent_processes_churn_keeps_freelist_disjoint_from_trees() {
             count[0].values()[0],
             SqliteValue::Integer(landed.len() as i64)
         );
+    }
+}
+
+/// Peers never checkpoint: pure concurrent WAL writers across processes.
+#[test]
+fn beads_concurrent_processes_churn_without_checkpoints_keeps_unique_page_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        beads_concurrent_processes_churn("none").await;
+    });
+}
+
+/// Peers run only PASSIVE checkpoints at close (no WAL reset under readers).
+#[test]
+fn beads_concurrent_processes_churn_with_passive_checkpoints_keeps_unique_page_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        beads_concurrent_processes_churn("passive").await;
+    });
+}
+
+/// Peers run `wal_checkpoint(TRUNCATE)` at close exactly like `br`.
+///
+/// KNOWN RED (GH#399 / GH#385): with four concurrent `br`-shaped processes,
+/// a TRUNCATE reset by the process that commits first is not gated on the
+/// peer processes' live read snapshots (cross-process reader registration
+/// is the #385 residual). The peers then read the winner's freshly
+/// allocated EOF page as zeros — `failed to parse B-tree page N ...
+/// invalid B-tree page type flag: 0x00` — in the first round, and a writer
+/// continuing from that view is what later produces the freelist/overflow
+/// aliases stock SQLite reports as "2nd reference to page". Run with
+/// `--ignored` to observe; flip to a green keeper with the #385 fix.
+#[test]
+#[ignore = "GH#399/GH#385 known-red: TRUNCATE checkpoint under concurrent peer processes zero-reads fresh EOF pages; run with --ignored"]
+fn beads_concurrent_processes_churn_with_truncate_checkpoints_keeps_unique_page_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        beads_concurrent_processes_churn("truncate").await;
     });
 }
