@@ -29,6 +29,101 @@ const VAL_BLOB: u8 = 0x04;
 const VAL_NULL: u8 = 0x05;
 
 // ---------------------------------------------------------------------------
+// Wire kind and typed format errors
+// ---------------------------------------------------------------------------
+
+/// Which SQLite session wire format a decoded [`Changeset`] carries.
+///
+/// SQLite keeps the two formats distinct at the API level:
+/// `sqlite3changeset_invert()` rejects patchsets and
+/// `sqlite3changeset_concat()` refuses to mix kinds. The tag lets the Rust
+/// API enforce the same boundaries with typed errors instead of silently
+/// producing malformed output (GH#394).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangesetKind {
+    /// Full changeset: UPDATE rows carry complete old and new records.
+    Changeset,
+    /// Compact patchset: UPDATE rows carry only primary-key old values.
+    Patchset,
+}
+
+impl ChangesetKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Changeset => "changeset",
+            Self::Patchset => "patchset",
+        }
+    }
+}
+
+/// Typed decode/format failure for changeset and patchset blobs.
+///
+/// Decoding never silently normalizes foreign bytes: an operation byte or
+/// indirect byte outside SQLite's canonical encoding is reported with its
+/// offset so callers can distinguish corruption from truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangesetFormatError {
+    /// The blob ended before the record that starts at `offset` was complete.
+    Truncated { offset: usize },
+    /// The table header at `offset` is not a valid header for the requested
+    /// wire kind, or its column/primary-key metadata is malformed.
+    MalformedTableHeader { offset: usize },
+    /// The operation byte at `offset` is not INSERT, DELETE, or UPDATE.
+    InvalidOperation { offset: usize, byte: u8 },
+    /// The indirect byte at `offset` is neither `0x00` nor `0x01`.
+    InvalidIndirectFlag { offset: usize, byte: u8 },
+    /// A column value at `offset` has an unknown type tag or is truncated.
+    MalformedValue { offset: usize },
+    /// A patchset record references a primary-key layout that does not match
+    /// its table header (for example a DELETE on a table without key columns).
+    MalformedPatchsetRecord { offset: usize },
+    /// The operation is defined only for one wire kind (`invert` on a
+    /// patchset) or the operands disagree (`concat` across kinds).
+    KindMismatch {
+        expected: ChangesetKind,
+        found: ChangesetKind,
+    },
+}
+
+impl std::fmt::Display for ChangesetFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated { offset } => {
+                write!(f, "changeset truncated at byte offset {offset}")
+            }
+            Self::MalformedTableHeader { offset } => {
+                write!(
+                    f,
+                    "malformed changeset table header at byte offset {offset}"
+                )
+            }
+            Self::InvalidOperation { offset, byte } => write!(
+                f,
+                "invalid changeset operation byte {byte:#04x} at byte offset {offset}"
+            ),
+            Self::InvalidIndirectFlag { offset, byte } => write!(
+                f,
+                "invalid changeset indirect byte {byte:#04x} at byte offset {offset} (expected 0x00 or 0x01)"
+            ),
+            Self::MalformedValue { offset } => {
+                write!(f, "malformed changeset value at byte offset {offset}")
+            }
+            Self::MalformedPatchsetRecord { offset } => {
+                write!(f, "malformed patchset record at byte offset {offset}")
+            }
+            Self::KindMismatch { expected, found } => write!(
+                f,
+                "expected a {} but found a {}",
+                expected.as_str(),
+                found.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChangesetFormatError {}
+
+// ---------------------------------------------------------------------------
 // Public API — extension name
 // ---------------------------------------------------------------------------
 
@@ -323,17 +418,39 @@ impl TableInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangesetRow {
     pub op: ChangeOp,
+    /// SQLite's per-change indirect flag (`sqlite3changeset_op()` `pbIndirect`).
+    ///
+    /// `true` marks a change that every contributing operation recorded while
+    /// the session was in indirect mode (trigger/foreign-key side effects in
+    /// SQLite). The flag travels byte-for-byte through both wire formats and
+    /// through changeset inversion; only the canonical bytes `0x00`/`0x01` are
+    /// accepted on decode (GH#394).
+    pub indirect: bool,
     /// For DELETE and UPDATE: the old column values. Empty for INSERT.
     pub old_values: Vec<ChangesetValue>,
     /// For INSERT and UPDATE: the new column values. Empty for DELETE.
     pub new_values: Vec<ChangesetValue>,
 }
 
+/// Decode the indirect byte that follows every operation byte.
+///
+/// SQLite writes exactly `0x00` (direct) or `0x01` (indirect). Any other value
+/// is rejected as a format error rather than silently normalized, so a
+/// decode→encode round trip can never rewrite a foreign byte.
+fn decode_indirect_flag(data: &[u8], offset: usize) -> Result<bool, ChangesetFormatError> {
+    match data.get(offset) {
+        Some(0x00) => Ok(false),
+        Some(0x01) => Ok(true),
+        Some(&byte) => Err(ChangesetFormatError::InvalidIndirectFlag { offset, byte }),
+        None => Err(ChangesetFormatError::Truncated { offset }),
+    }
+}
+
 impl ChangesetRow {
     /// Encode this row change into changeset binary format.
     pub fn encode_changeset(&self, out: &mut Vec<u8>) {
         out.push(self.op.as_byte());
-        out.push(0x00);
+        out.push(u8::from(self.indirect));
         match self.op {
             ChangeOp::Insert => {
                 for v in &self.new_values {
@@ -364,7 +481,7 @@ impl ChangesetRow {
     /// values or [`ChangesetValue::Undefined`] for unchanged columns.
     pub fn encode_patchset(&self, out: &mut Vec<u8>, pk_flags: &[bool]) {
         out.push(self.op.as_byte());
-        out.push(0x00);
+        out.push(u8::from(self.indirect));
         match self.op {
             ChangeOp::Insert => {
                 for v in &self.new_values {
@@ -393,41 +510,71 @@ impl ChangesetRow {
         }
     }
 
-    /// Decode one changeset row starting at `pos`, given the column count.
-    pub fn decode_changeset(data: &[u8], pos: usize, col_count: usize) -> Option<(Self, usize)> {
-        let op = ChangeOp::from_byte(*data.get(pos)?)?;
-        let mut offset = pos + 2;
-        let _indirect = *data.get(pos + 1)?;
+    /// Decode the operation and indirect bytes that open every row record.
+    fn decode_row_prefix(
+        data: &[u8],
+        pos: usize,
+    ) -> Result<(ChangeOp, bool), ChangesetFormatError> {
+        let op_byte = *data
+            .get(pos)
+            .ok_or(ChangesetFormatError::Truncated { offset: pos })?;
+        let op = ChangeOp::from_byte(op_byte).ok_or(ChangesetFormatError::InvalidOperation {
+            offset: pos,
+            byte: op_byte,
+        })?;
+        let indirect = decode_indirect_flag(data, pos + 1)?;
+        Ok((op, indirect))
+    }
 
-        let decode_n = |data: &[u8], offset: &mut usize, n: usize| -> Option<Vec<ChangesetValue>> {
-            let mut vals = Vec::with_capacity(n);
-            for _ in 0..n {
-                let (v, consumed) = ChangesetValue::decode(data, *offset)?;
-                *offset += consumed;
-                vals.push(v);
-            }
-            Some(vals)
-        };
+    /// Decode `n` consecutive column values starting at `*offset`.
+    fn decode_values(
+        data: &[u8],
+        offset: &mut usize,
+        n: usize,
+    ) -> Result<Vec<ChangesetValue>, ChangesetFormatError> {
+        let mut vals = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (v, consumed) = ChangesetValue::decode(data, *offset)
+                .ok_or(ChangesetFormatError::MalformedValue { offset: *offset })?;
+            *offset += consumed;
+            vals.push(v);
+        }
+        Ok(vals)
+    }
+
+    /// Decode one changeset row starting at `pos`, given the column count.
+    ///
+    /// Returns the row and the number of bytes consumed. Non-canonical
+    /// operation or indirect bytes are rejected with a typed
+    /// [`ChangesetFormatError`] rather than being normalized.
+    pub fn decode_changeset(
+        data: &[u8],
+        pos: usize,
+        col_count: usize,
+    ) -> Result<(Self, usize), ChangesetFormatError> {
+        let (op, indirect) = Self::decode_row_prefix(data, pos)?;
+        let mut offset = pos + 2;
 
         let (old_values, new_values) = match op {
             ChangeOp::Insert => {
-                let new_values = decode_n(data, &mut offset, col_count)?;
+                let new_values = Self::decode_values(data, &mut offset, col_count)?;
                 (Vec::new(), new_values)
             }
             ChangeOp::Delete => {
-                let old_values = decode_n(data, &mut offset, col_count)?;
+                let old_values = Self::decode_values(data, &mut offset, col_count)?;
                 (old_values, Vec::new())
             }
             ChangeOp::Update => {
-                let old_values = decode_n(data, &mut offset, col_count)?;
-                let new_values = decode_n(data, &mut offset, col_count)?;
+                let old_values = Self::decode_values(data, &mut offset, col_count)?;
+                let new_values = Self::decode_values(data, &mut offset, col_count)?;
                 (old_values, new_values)
             }
         };
 
-        Some((
+        Ok((
             Self {
                 op,
+                indirect,
                 old_values,
                 new_values,
             },
@@ -445,41 +592,32 @@ impl ChangesetRow {
         pos: usize,
         col_count: usize,
         pk_flags: &[bool],
-    ) -> Option<(Self, usize)> {
+    ) -> Result<(Self, usize), ChangesetFormatError> {
         if pk_flags.len() != col_count {
-            return None;
+            return Err(ChangesetFormatError::MalformedPatchsetRecord { offset: pos });
         }
 
-        let op = ChangeOp::from_byte(*data.get(pos)?)?;
+        let (op, indirect) = Self::decode_row_prefix(data, pos)?;
         let mut offset = pos + 2;
-        let _indirect = *data.get(pos + 1)?;
-
-        let decode_n = |data: &[u8], offset: &mut usize, n: usize| -> Option<Vec<ChangesetValue>> {
-            let mut vals = Vec::with_capacity(n);
-            for _ in 0..n {
-                let (v, consumed) = ChangesetValue::decode(data, *offset)?;
-                *offset += consumed;
-                vals.push(v);
-            }
-            Some(vals)
-        };
 
         let (old_values, new_values) = match op {
             ChangeOp::Insert => {
-                let new_values = decode_n(data, &mut offset, col_count)?;
+                let new_values = Self::decode_values(data, &mut offset, col_count)?;
                 (Vec::new(), new_values)
             }
             ChangeOp::Delete => {
                 let pk_count = pk_flags.iter().filter(|&&is_pk| is_pk).count();
                 if pk_count == 0 {
-                    return None;
+                    return Err(ChangesetFormatError::MalformedPatchsetRecord { offset: pos });
                 }
-                let pk_old_values = decode_n(data, &mut offset, pk_count)?;
+                let pk_old_values = Self::decode_values(data, &mut offset, pk_count)?;
                 let mut old_values = Vec::with_capacity(col_count);
                 let mut pk_iter = pk_old_values.into_iter();
                 for is_pk in pk_flags {
                     if *is_pk {
-                        old_values.push(pk_iter.next()?);
+                        old_values.push(pk_iter.next().ok_or(
+                            ChangesetFormatError::MalformedPatchsetRecord { offset: pos },
+                        )?);
                     } else {
                         old_values.push(ChangesetValue::Undefined);
                     }
@@ -487,7 +625,7 @@ impl ChangesetRow {
                 (old_values, Vec::new())
             }
             ChangeOp::Update => {
-                let record = decode_n(data, &mut offset, col_count)?;
+                let record = Self::decode_values(data, &mut offset, col_count)?;
                 let mut old_values = Vec::with_capacity(col_count);
                 let mut new_values = Vec::with_capacity(col_count);
                 for (index, value) in record.into_iter().enumerate() {
@@ -503,9 +641,10 @@ impl ChangesetRow {
             }
         };
 
-        Some((
+        Ok((
             Self {
                 op,
+                indirect,
                 old_values,
                 new_values,
             },
@@ -514,22 +653,26 @@ impl ChangesetRow {
     }
 
     /// Invert this change: INSERT becomes DELETE, DELETE becomes INSERT,
-    /// UPDATE swaps old and new values.
+    /// UPDATE swaps old and new values. The indirect flag is preserved, as
+    /// `sqlite3changeset_invert()` copies it unchanged.
     #[must_use]
     pub fn invert(&self) -> Self {
         match self.op {
             ChangeOp::Insert => Self {
                 op: ChangeOp::Delete,
+                indirect: self.indirect,
                 old_values: self.new_values.clone(),
                 new_values: Vec::new(),
             },
             ChangeOp::Delete => Self {
                 op: ChangeOp::Insert,
+                indirect: self.indirect,
                 old_values: Vec::new(),
                 new_values: self.old_values.clone(),
             },
             ChangeOp::Update => Self {
                 op: ChangeOp::Update,
+                indirect: self.indirect,
                 old_values: self.new_values.clone(),
                 new_values: self.old_values.clone(),
             },
@@ -573,14 +716,21 @@ impl TableChangeset {
 /// A complete changeset covering one or more tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Changeset {
+    /// Which wire format this container was decoded from or is meant to
+    /// encode as. Session output and [`Changeset::new`] are full changesets;
+    /// [`Changeset::decode_patchset`] yields [`ChangesetKind::Patchset`].
+    pub kind: ChangesetKind,
     pub tables: Vec<TableChangeset>,
 }
 
 impl Changeset {
-    /// Create an empty changeset.
+    /// Create an empty full changeset.
     #[must_use]
     pub fn new() -> Self {
-        Self { tables: Vec::new() }
+        Self {
+            kind: ChangesetKind::Changeset,
+            tables: Vec::new(),
+        }
     }
 
     /// Encode the entire changeset in binary format.
@@ -604,11 +754,16 @@ impl Changeset {
     }
 
     /// Decode a changeset from its binary representation.
-    pub fn decode(data: &[u8]) -> Option<Self> {
+    ///
+    /// Every row's indirect byte is preserved; non-canonical bytes and any
+    /// other structural damage are reported as a typed
+    /// [`ChangesetFormatError`].
+    pub fn decode(data: &[u8]) -> Result<Self, ChangesetFormatError> {
         let mut tables = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
-            let (info, consumed) = TableInfo::decode(data, pos)?;
+            let (info, consumed) = TableInfo::decode(data, pos)
+                .ok_or(ChangesetFormatError::MalformedTableHeader { offset: pos })?;
             pos += consumed;
             let mut rows = Vec::new();
             // Read rows until we hit another table header or end of data.
@@ -619,15 +774,23 @@ impl Changeset {
             }
             tables.push(TableChangeset { info, rows });
         }
-        Some(Self { tables })
+        Ok(Self {
+            kind: ChangesetKind::Changeset,
+            tables,
+        })
     }
 
     /// Decode a patchset from its binary representation.
-    pub fn decode_patchset(data: &[u8]) -> Option<Self> {
+    ///
+    /// The result is tagged [`ChangesetKind::Patchset`]; it can be encoded
+    /// back with [`Changeset::encode_patchset`] and applied, but cannot be
+    /// inverted or concatenated with a full changeset.
+    pub fn decode_patchset(data: &[u8]) -> Result<Self, ChangesetFormatError> {
         let mut tables = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
-            let (info, consumed) = TableInfo::decode_patchset(data, pos)?;
+            let (info, consumed) = TableInfo::decode_patchset(data, pos)
+                .ok_or(ChangesetFormatError::MalformedTableHeader { offset: pos })?;
             pos += consumed;
             let mut rows = Vec::new();
             while pos < data.len() && data[pos] != PATCHSET_TABLE_HEADER_BYTE {
@@ -638,14 +801,29 @@ impl Changeset {
             }
             tables.push(TableChangeset { info, rows });
         }
-        Some(Self { tables })
+        Ok(Self {
+            kind: ChangesetKind::Patchset,
+            tables,
+        })
     }
 
     /// Invert the changeset: every INSERT becomes DELETE, every DELETE
-    /// becomes INSERT, every UPDATE swaps old and new values.
-    #[must_use]
-    pub fn invert(&self) -> Self {
-        Self {
+    /// becomes INSERT, every UPDATE swaps old and new values. Each row keeps
+    /// its indirect flag.
+    ///
+    /// Like `sqlite3changeset_invert()`, inversion is defined only for full
+    /// changesets: a patchset lacks the non-key old values an inverted UPDATE
+    /// or DELETE needs, so it is rejected with
+    /// [`ChangesetFormatError::KindMismatch`].
+    pub fn invert(&self) -> Result<Self, ChangesetFormatError> {
+        if self.kind != ChangesetKind::Changeset {
+            return Err(ChangesetFormatError::KindMismatch {
+                expected: ChangesetKind::Changeset,
+                found: self.kind,
+            });
+        }
+        Ok(Self {
+            kind: self.kind,
             tables: self
                 .tables
                 .iter()
@@ -654,14 +832,27 @@ impl Changeset {
                     rows: tc.rows.iter().map(ChangesetRow::invert).collect(),
                 })
                 .collect(),
-        }
+        })
     }
 
-    /// Concatenate another changeset onto this one.
-    pub fn concat(&mut self, other: &Self) {
+    /// Append every table section of `other` onto this container, keeping
+    /// each appended row's indirect flag.
+    ///
+    /// Both operands must share a wire kind; mixing a changeset with a
+    /// patchset is rejected with [`ChangesetFormatError::KindMismatch`]. This
+    /// does not merge same-key operations the way
+    /// `sqlite3changeset_concat()` does; it is a section-level append.
+    pub fn concat(&mut self, other: &Self) -> Result<(), ChangesetFormatError> {
+        if self.kind != other.kind {
+            return Err(ChangesetFormatError::KindMismatch {
+                expected: self.kind,
+                found: other.kind,
+            });
+        }
         for tc in &other.tables {
             self.tables.push(tc.clone());
         }
+        Ok(())
     }
 }
 
@@ -680,6 +871,8 @@ impl Default for Changeset {
 struct TrackedChange {
     table_name: String,
     op: ChangeOp,
+    /// Snapshot of [`Session::indirect`] at record time.
+    indirect: bool,
     old_values: Vec<ChangesetValue>,
     new_values: Vec<ChangesetValue>,
 }
@@ -812,32 +1005,48 @@ fn primary_key_changed(
     !primary_key_matches(old_row, new_row, pk_flags)
 }
 
+/// The accumulated state of one primary key inside a [`Session`].
+///
+/// Mirrors SQLite's per-key `SessionChange`: `before` is the row as it stood
+/// when the session first touched the key, `after` is its current image, and
+/// `indirect` is the logical AND of every contributing operation's indirect
+/// flag. An entry whose images cancel out (a net no-op) is retained rather
+/// than discarded so later operations on the same key keep the earlier direct
+/// provenance (GH#394).
 #[derive(Debug, Clone)]
 struct PendingRowChange {
+    /// Primary-key values that identify this entry. Taken from the first
+    /// contributing operation and refreshed whenever the key moves.
+    key: Vec<ChangesetValue>,
     before: Option<Vec<ChangesetValue>>,
     after: Option<Vec<ChangesetValue>>,
+    indirect: bool,
 }
 
 impl PendingRowChange {
     fn from_tracked(change: &TrackedChange, column_count: usize) -> Self {
         match change.op {
             ChangeOp::Insert => Self {
+                key: change.new_values.clone(),
                 before: None,
                 after: Some(change.new_values.clone()),
+                indirect: change.indirect,
             },
             ChangeOp::Delete => Self {
+                key: change.old_values.clone(),
                 before: Some(change.old_values.clone()),
                 after: None,
+                indirect: change.indirect,
             },
             ChangeOp::Update => {
                 debug_assert_eq!(change.old_values.len(), column_count);
                 debug_assert_eq!(change.new_values.len(), column_count);
+                let after = materialize_sparse_update(&change.old_values, &change.new_values);
                 Self {
+                    key: after.clone(),
                     before: Some(change.old_values.clone()),
-                    after: Some(materialize_sparse_update(
-                        &change.old_values,
-                        &change.new_values,
-                    )),
+                    after: Some(after),
+                    indirect: change.indirect,
                 }
             }
         }
@@ -845,11 +1054,10 @@ impl PendingRowChange {
 
     fn matches_change(&self, change: &TrackedChange, pk_flags: &[bool]) -> bool {
         match change.op {
+            // An INSERT can only follow a key that is currently absent: one
+            // that was deleted, or one that was inserted and deleted again.
             ChangeOp::Insert => {
-                self.before.as_ref().zip(self.after.as_ref()).is_none()
-                    && self.before.as_ref().is_some_and(|before| {
-                        primary_key_matches(before, &change.new_values, pk_flags)
-                    })
+                self.after.is_none() && primary_key_matches(&self.key, &change.new_values, pk_flags)
             }
             ChangeOp::Delete | ChangeOp::Update => self
                 .after
@@ -859,6 +1067,9 @@ impl PendingRowChange {
     }
 
     fn merge(&mut self, change: &TrackedChange, column_count: usize) {
+        // SQLite: a change is indirect only if every contributing operation
+        // was recorded in indirect mode.
+        self.indirect &= change.indirect;
         match change.op {
             ChangeOp::Insert => {
                 self.after = Some(change.new_values.clone());
@@ -870,31 +1081,27 @@ impl PendingRowChange {
                 debug_assert_eq!(change.old_values.len(), column_count);
                 debug_assert_eq!(change.new_values.len(), column_count);
                 if let Some(current_row) = self.after.as_ref() {
-                    self.after = Some(materialize_sparse_update(current_row, &change.new_values));
+                    let after = materialize_sparse_update(current_row, &change.new_values);
+                    self.key.clone_from(&after);
+                    self.after = Some(after);
                 }
             }
         }
     }
 
-    fn is_no_op(&self) -> bool {
-        matches!((&self.before, &self.after), (None, None))
-            || self
-                .before
-                .as_ref()
-                .zip(self.after.as_ref())
-                .is_some_and(|(before, after)| before == after)
-    }
-
     fn into_changeset_rows(self, pk_flags: &[bool]) -> Vec<ChangesetRow> {
+        let indirect = self.indirect;
         match (self.before, self.after) {
             (None, None) => Vec::new(),
             (None, Some(new_row)) => vec![ChangesetRow {
                 op: ChangeOp::Insert,
+                indirect,
                 old_values: Vec::new(),
                 new_values: new_row,
             }],
             (Some(old_row), None) => vec![ChangesetRow {
                 op: ChangeOp::Delete,
+                indirect,
                 old_values: old_row,
                 new_values: Vec::new(),
             }],
@@ -902,14 +1109,17 @@ impl PendingRowChange {
                 if old_row == new_row {
                     Vec::new()
                 } else if primary_key_changed(&old_row, &new_row, pk_flags) {
+                    // Both derived rows inherit the accumulated provenance.
                     vec![
                         ChangesetRow {
                             op: ChangeOp::Delete,
+                            indirect,
                             old_values: old_row,
                             new_values: Vec::new(),
                         },
                         ChangesetRow {
                             op: ChangeOp::Insert,
+                            indirect,
                             old_values: Vec::new(),
                             new_values: new_row,
                         },
@@ -917,6 +1127,7 @@ impl PendingRowChange {
                 } else {
                     vec![ChangesetRow {
                         op: ChangeOp::Update,
+                        indirect,
                         old_values: canonical_old_values(&old_row, &new_row, pk_flags),
                         new_values: canonical_new_values(&old_row, &new_row),
                     }]
@@ -936,6 +1147,9 @@ impl PendingRowChange {
 pub struct Session {
     tables: Vec<TrackedTable>,
     changes: Vec<TrackedChange>,
+    /// Current `sqlite3session_indirect()` mode; snapshotted by every
+    /// `record_*` call. Defaults to direct.
+    indirect: bool,
 }
 
 impl Session {
@@ -985,7 +1199,24 @@ impl Session {
         Self {
             tables: Vec::new(),
             changes: Vec::new(),
+            indirect: false,
         }
+    }
+
+    /// Set the session's indirect mode (`sqlite3session_indirect()`).
+    ///
+    /// While `true`, every subsequently recorded change is marked indirect.
+    /// A key touched by both direct and indirect operations is emitted as
+    /// direct, matching SQLite's "indirect only if every contributing change
+    /// was indirect" rule.
+    pub fn set_indirect(&mut self, indirect: bool) {
+        self.indirect = indirect;
+    }
+
+    /// Current indirect mode. New sessions start direct.
+    #[must_use]
+    pub const fn indirect(&self) -> bool {
+        self.indirect
     }
 
     /// Attach a table for change tracking.
@@ -1014,6 +1245,7 @@ impl Session {
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Insert,
+            indirect: self.indirect,
             old_values: Vec::new(),
             new_values,
         });
@@ -1025,6 +1257,7 @@ impl Session {
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Delete,
+            indirect: self.indirect,
             old_values,
             new_values: Vec::new(),
         });
@@ -1044,6 +1277,7 @@ impl Session {
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Update,
+            indirect: self.indirect,
             old_values,
             new_values,
         });
@@ -1089,10 +1323,10 @@ impl Session {
                     .iter()
                     .position(|existing| existing.matches_change(change, &tracked.pk_flags))
                 {
+                    // Net no-op entries stay in `pending`: their images emit
+                    // nothing, but their indirect provenance must survive for
+                    // any later operation on the same key.
                     pending[index].merge(change, tracked.column_count);
-                    if pending[index].is_no_op() {
-                        pending.remove(index);
-                    }
                 } else {
                     pending.push(PendingRowChange::from_tracked(change, tracked.column_count));
                 }
@@ -1116,7 +1350,10 @@ impl Session {
         // Changes for unattached tables, or attached tables without an
         // explicit primary key, are intentionally dropped to match SQLite
         // session semantics.
-        Changeset { tables }
+        Changeset {
+            kind: ChangesetKind::Changeset,
+            tables,
+        }
     }
 }
 
@@ -2049,6 +2286,7 @@ mod tests {
     fn test_changeset_invert_insert() {
         let row = ChangesetRow {
             op: ChangeOp::Insert,
+            indirect: false,
             old_values: Vec::new(),
             new_values: vec![ChangesetValue::Integer(1)],
         };
@@ -2062,6 +2300,7 @@ mod tests {
     fn test_changeset_invert_delete() {
         let row = ChangesetRow {
             op: ChangeOp::Delete,
+            indirect: false,
             old_values: vec![ChangesetValue::Integer(1)],
             new_values: Vec::new(),
         };
@@ -2075,6 +2314,7 @@ mod tests {
     fn test_changeset_invert_update() {
         let row = ChangesetRow {
             op: ChangeOp::Update,
+            indirect: false,
             old_values: vec![
                 ChangesetValue::Integer(1),
                 ChangesetValue::Text("old".into()),
@@ -2107,11 +2347,13 @@ mod tests {
             },
             rows: vec![ChangesetRow {
                 op: ChangeOp::Insert,
+                indirect: false,
                 old_values: Vec::new(),
                 new_values: vec![ChangesetValue::Integer(1)],
             }],
         });
         let cs2 = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "b".to_owned(),
@@ -2120,12 +2362,13 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Insert,
+                    indirect: false,
                     old_values: Vec::new(),
                     new_values: vec![ChangesetValue::Integer(2)],
                 }],
             }],
         };
-        cs1.concat(&cs2);
+        cs1.concat(&cs2).expect("same-kind concat");
         assert_eq!(cs1.tables.len(), 2);
     }
 
@@ -2166,6 +2409,7 @@ mod tests {
         let pk_flags = vec![true, false, false];
         let row = ChangesetRow {
             op: ChangeOp::Update,
+            indirect: false,
             old_values: vec![
                 ChangesetValue::Integer(1),
                 ChangesetValue::Text("old_name".into()),
@@ -2264,7 +2508,7 @@ mod tests {
 
         let mut patchset_bytes = session.patchset();
         patchset_bytes.pop();
-        assert!(Changeset::decode_patchset(&patchset_bytes).is_none());
+        assert!(Changeset::decode_patchset(&patchset_bytes).is_err());
     }
 
     #[test]
@@ -2344,6 +2588,7 @@ mod tests {
     #[test]
     fn test_apply_insert() {
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2352,6 +2597,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Insert,
+                    indirect: false,
                     old_values: Vec::new(),
                     new_values: vec![
                         ChangesetValue::Integer(1),
@@ -2391,6 +2637,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2399,6 +2646,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("hello".into()),
@@ -2431,6 +2679,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2439,6 +2688,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("old".into()),
@@ -2472,6 +2722,7 @@ mod tests {
     #[test]
     fn test_conflict_not_found() {
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2480,6 +2731,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(999)],
                     new_values: Vec::new(),
                 }],
@@ -2513,6 +2765,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2521,6 +2774,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("expected".into()),
@@ -2553,6 +2807,7 @@ mod tests {
             .insert("t".to_owned(), vec![vec![SqliteValue::Integer(1)]]);
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2561,6 +2816,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Insert,
+                    indirect: false,
                     old_values: Vec::new(),
                     new_values: vec![ChangesetValue::Integer(1)], // Duplicate PK
                 }],
@@ -2586,6 +2842,7 @@ mod tests {
     fn test_conflict_omit_skips() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2594,6 +2851,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1)],
                     new_values: Vec::new(),
                 }],
@@ -2621,6 +2879,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2629,6 +2888,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Insert,
+                    indirect: false,
                     old_values: Vec::new(),
                     new_values: vec![
                         ChangesetValue::Integer(1),
@@ -2659,6 +2919,7 @@ mod tests {
     fn test_conflict_abort_stops_apply() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -2668,11 +2929,13 @@ mod tests {
                 rows: vec![
                     ChangesetRow {
                         op: ChangeOp::Delete,
+                        indirect: false,
                         old_values: vec![ChangesetValue::Integer(1)],
                         new_values: Vec::new(),
                     },
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![ChangesetValue::Integer(2)],
                     },
@@ -2744,7 +3007,7 @@ mod tests {
         );
 
         let cs = session.changeset();
-        let inv = cs.invert();
+        let inv = cs.invert().expect("changeset inversion");
 
         // Apply original changeset.
         let mut target = SimpleTarget::default();
@@ -3043,6 +3306,7 @@ mod tests {
     fn test_changeset_row_invert_double_is_identity() {
         let row = ChangesetRow {
             op: ChangeOp::Update,
+            indirect: false,
             old_values: vec![
                 ChangesetValue::Integer(1),
                 ChangesetValue::Text("old".into()),
@@ -3063,16 +3327,19 @@ mod tests {
             let row = match op {
                 ChangeOp::Insert => ChangesetRow {
                     op,
+                    indirect: false,
                     old_values: Vec::new(),
                     new_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
                 },
                 ChangeOp::Delete => ChangesetRow {
                     op,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
                     new_values: Vec::new(),
                 },
                 ChangeOp::Update => ChangesetRow {
                     op,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
                     new_values: vec![ChangesetValue::Undefined, ChangesetValue::Text("b".into())],
                 },
@@ -3087,7 +3354,13 @@ mod tests {
 
     #[test]
     fn test_changeset_row_decode_bad_op() {
-        assert!(ChangesetRow::decode_changeset(&[0xFF, VAL_NULL], 0, 1).is_none());
+        assert_eq!(
+            ChangesetRow::decode_changeset(&[0xFF, VAL_NULL], 0, 1),
+            Err(ChangesetFormatError::InvalidOperation {
+                offset: 0,
+                byte: 0xFF
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3099,6 +3372,7 @@ mod tests {
         let pk_flags = vec![true, false, false];
         let row = ChangesetRow {
             op: ChangeOp::Update,
+            indirect: false,
             old_values: vec![
                 ChangesetValue::Integer(1),
                 ChangesetValue::Text("old_name".into()),
@@ -3122,6 +3396,7 @@ mod tests {
         let pk_flags = vec![true, false];
         let row = ChangesetRow {
             op: ChangeOp::Delete,
+            indirect: false,
             old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
             new_values: Vec::new(),
         };
@@ -3239,7 +3514,11 @@ mod tests {
         );
 
         let cs = session.changeset();
-        let double_inv = cs.invert().invert();
+        let double_inv = cs
+            .invert()
+            .expect("first inversion")
+            .invert()
+            .expect("second inversion");
         assert_eq!(double_inv, cs);
     }
 
@@ -3277,6 +3556,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3285,6 +3565,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("expected".into()),
@@ -3320,6 +3601,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3328,6 +3610,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("alice".into()),
@@ -3374,6 +3657,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3382,6 +3666,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("alice".into()),
@@ -3423,6 +3708,7 @@ mod tests {
         );
 
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3431,6 +3717,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![
                         ChangesetValue::Integer(1),
                         ChangesetValue::Text("expected".into()),
@@ -3455,6 +3742,7 @@ mod tests {
     fn test_apply_update_not_found_abort() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3463,6 +3751,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1)],
                     new_values: vec![ChangesetValue::Integer(2)],
                 }],
@@ -3476,6 +3765,7 @@ mod tests {
     fn test_apply_delete_not_found_replace_aborts() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3484,6 +3774,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Delete,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1)],
                     new_values: Vec::new(),
                 }],
@@ -3498,6 +3789,7 @@ mod tests {
     fn test_apply_update_not_found_replace_aborts() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3506,6 +3798,7 @@ mod tests {
                 },
                 rows: vec![ChangesetRow {
                     op: ChangeOp::Update,
+                    indirect: false,
                     old_values: vec![ChangesetValue::Integer(1)],
                     new_values: vec![ChangesetValue::Integer(2)],
                 }],
@@ -3520,6 +3813,7 @@ mod tests {
     fn test_apply_abort_rolls_back_prior_successes() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3529,11 +3823,13 @@ mod tests {
                 rows: vec![
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![ChangesetValue::Integer(1)],
                     },
                     ChangesetRow {
                         op: ChangeOp::Delete,
+                        indirect: false,
                         old_values: vec![ChangesetValue::Integer(2)],
                         new_values: Vec::new(),
                     },
@@ -3549,6 +3845,7 @@ mod tests {
     fn test_apply_multiple_rows_mixed() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3558,6 +3855,7 @@ mod tests {
                 rows: vec![
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
@@ -3566,6 +3864,7 @@ mod tests {
                     },
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(2),
@@ -3590,6 +3889,7 @@ mod tests {
     fn test_apply_insert_without_pk_uses_full_row_identity() {
         let mut target = SimpleTarget::default();
         let cs = Changeset {
+            kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
                 info: TableInfo {
                     name: "t".to_owned(),
@@ -3599,6 +3899,7 @@ mod tests {
                 rows: vec![
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
@@ -3607,6 +3908,7 @@ mod tests {
                     },
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(2),
@@ -3615,6 +3917,7 @@ mod tests {
                     },
                     ChangesetRow {
                         op: ChangeOp::Insert,
+                        indirect: false,
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
@@ -3671,6 +3974,7 @@ mod tests {
             },
             rows: vec![ChangesetRow {
                 op: ChangeOp::Insert,
+                indirect: false,
                 old_values: Vec::new(),
                 new_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
             }],
@@ -3753,6 +4057,628 @@ mod tests {
         assert_ne!(
             ApplyOutcome::Aborted { applied: 3 },
             ApplyOutcome::Aborted { applied: 4 }
+        );
+    }
+}
+
+/// GH#394: per-change indirect flag preservation, typed rejection of
+/// non-canonical bytes, wire-kind enforcement, and SQLite-parity provenance
+/// merging.
+///
+/// Stock SQLite is the oracle for every wire-level claim. The byte fixtures
+/// below were captured from the `sqlite3` 3.46.1 shell with this script
+/// (`.session indirect` toggles `sqlite3session_indirect()`):
+///
+/// ```text
+/// CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+/// INSERT INTO t VALUES(1,'a',10);
+/// INSERT INTO t VALUES(2,'b',20);
+/// .session open main s
+/// .session attach t
+/// .session indirect 1
+/// INSERT INTO t VALUES(3,'c',30);
+/// .session indirect 0
+/// UPDATE t SET score=11 WHERE id=1;
+/// .session indirect 1
+/// DELETE FROM t WHERE id=2;
+/// .session changeset mixed.changeset
+/// .session patchset mixed.patchset
+/// .session close
+/// .session open main s2
+/// .session attach t
+/// .session indirect 1
+/// INSERT INTO t VALUES(9,'z',90);
+/// .session changeset single.changeset
+/// ```
+///
+/// `stock_cli_regenerates_identical_fixtures` re-runs that script against
+/// the installed shell when one with session support is available, and the
+/// `libsqlite3` session C API (through `python3` + `ctypes`) reads
+/// `sqlite3changeset_op()`'s `pbIndirect` back out of bytes this crate
+/// wrote. Both oracles skip loudly when the host lacks them; every other
+/// assertion runs unconditionally against the captured bytes.
+#[cfg(test)]
+mod indirect_flag_tests {
+    use super::*;
+    use std::process::Command;
+
+    const STOCK_SCHEMA_SQL: &str = "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);\n\
+         INSERT INTO t VALUES(1,'a',10);\n\
+         INSERT INTO t VALUES(2,'b',20);\n";
+
+    const STOCK_MIXED_SESSION_SCRIPT: &str = ".session open main s\n\
+         .session attach t\n\
+         .session indirect 1\n\
+         INSERT INTO t VALUES(3,'c',30);\n\
+         .session indirect 0\n\
+         UPDATE t SET score=11 WHERE id=1;\n\
+         .session indirect 1\n\
+         DELETE FROM t WHERE id=2;\n";
+
+    const STOCK_SINGLE_SESSION_SCRIPT: &str = ".session open main s2\n\
+         .session attach t\n\
+         .session indirect 1\n\
+         INSERT INTO t VALUES(9,'z',90);\n";
+
+    /// `mixed.changeset`: direct UPDATE(id=1), indirect DELETE(id=2),
+    /// indirect INSERT(id=3), in the order SQLite emitted them.
+    const STOCK_MIXED_CHANGESET: &[u8] = &[
+        0x54, 0x03, 0x01, 0x00, 0x00, 0x74, 0x00, 0x17, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x09, 0x01, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x01, 0x62, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x14, 0x12, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x01,
+        0x63, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e,
+    ];
+
+    /// `mixed.patchset`: the same three changes in patchset form.
+    const STOCK_MIXED_PATCHSET: &[u8] = &[
+        0x50, 0x03, 0x01, 0x00, 0x00, 0x74, 0x00, 0x17, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x09, 0x01,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x12, 0x01, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x01, 0x63, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x1e,
+    ];
+
+    /// `single.changeset`: one indirect INSERT(id=9).
+    const STOCK_SINGLE_INDIRECT_CHANGESET: &[u8] = &[
+        0x54, 0x03, 0x01, 0x00, 0x00, 0x74, 0x00, 0x12, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x09, 0x03, 0x01, 0x7a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a,
+    ];
+
+    /// `(op, pbIndirect)` per row of the mixed fixtures, derived from the
+    /// `.session indirect` toggles in the capture script.
+    const STOCK_MIXED_OPS: &[(ChangeOp, bool)] = &[
+        (ChangeOp::Update, false),
+        (ChangeOp::Delete, true),
+        (ChangeOp::Insert, true),
+    ];
+
+    /// Python `ctypes` shim over the host `libsqlite3` session API: prints
+    /// one `<op> <indirect>` line per change of the blob at `argv[1]`.
+    const CTYPES_ITERATOR_SCRIPT: &str = r#"
+import ctypes, ctypes.util, sys
+lib_name = ctypes.util.find_library("sqlite3")
+if not lib_name:
+    sys.exit(3)
+lib = ctypes.CDLL(lib_name)
+for symbol in ("sqlite3changeset_start", "sqlite3changeset_next",
+               "sqlite3changeset_op", "sqlite3changeset_finalize"):
+    if not hasattr(lib, symbol):
+        sys.exit(3)
+blob = open(sys.argv[1], "rb").read()
+buf = ctypes.create_string_buffer(blob, len(blob))
+it = ctypes.c_void_p()
+lib.sqlite3changeset_start.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
+lib.sqlite3changeset_next.argtypes = [ctypes.c_void_p]
+lib.sqlite3changeset_op.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+                                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                    ctypes.POINTER(ctypes.c_int)]
+lib.sqlite3changeset_finalize.argtypes = [ctypes.c_void_p]
+rc = lib.sqlite3changeset_start(ctypes.byref(it), len(blob), buf)
+if rc != 0:
+    sys.exit(4)
+ops = {18: "insert", 9: "delete", 23: "update"}
+while lib.sqlite3changeset_next(it) == 100:
+    table = ctypes.c_char_p()
+    ncol = ctypes.c_int()
+    op = ctypes.c_int()
+    indirect = ctypes.c_int()
+    if lib.sqlite3changeset_op(it, ctypes.byref(table), ctypes.byref(ncol),
+                               ctypes.byref(op), ctypes.byref(indirect)) != 0:
+        sys.exit(4)
+    print(ops.get(op.value, "unknown"), "1" if indirect.value else "0")
+if lib.sqlite3changeset_finalize(it) != 0:
+    sys.exit(4)
+"#;
+
+    /// Read `(op, pbIndirect)` per change through the host SQLite session
+    /// C API. `None` when the host offers no usable oracle (no `python3`, no
+    /// `libsqlite3`, or one built without `SQLITE_ENABLE_SESSION`).
+    /// Unique scratch directory per oracle invocation. Tests run in
+    /// parallel inside one process, so the process id alone is not enough
+    /// to keep two oracle inputs apart.
+    fn unique_scratch_dir(prefix: &str) -> Option<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    fn stock_ops(blob: &[u8]) -> Option<Vec<(ChangeOp, bool)>> {
+        let dir = unique_scratch_dir("fsqlite-session-oracle")?;
+        let script = dir.join("iterate.py");
+        let input = dir.join("input.bin");
+        std::fs::write(&script, CTYPES_ITERATOR_SCRIPT).ok()?;
+        std::fs::write(&input, blob).ok()?;
+        let output = Command::new("python3")
+            .arg(&script)
+            .arg(&input)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_dir(&dir);
+        match output.status.code() {
+            Some(0) => {}
+            Some(3) => return None,
+            other => panic!(
+                "libsqlite3 session oracle failed (exit {other:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+        let stdout = String::from_utf8(output.stdout).expect("oracle output is utf-8");
+        Some(
+            stdout
+                .lines()
+                .map(|line| {
+                    let (op, indirect) = line.split_once(' ').expect("oracle line shape");
+                    let op = match op {
+                        "insert" => ChangeOp::Insert,
+                        "delete" => ChangeOp::Delete,
+                        "update" => ChangeOp::Update,
+                        other => panic!("oracle reported unknown op {other}"),
+                    };
+                    (op, indirect == "1")
+                })
+                .collect(),
+        )
+    }
+
+    /// Assert that stock SQLite reads exactly `expected` flags from `blob`,
+    /// or report a loud skip when the host has no session-capable SQLite.
+    fn assert_stock_reads(blob: &[u8], expected: &[(ChangeOp, bool)]) {
+        match stock_ops(blob) {
+            Some(ops) => assert_eq!(ops, expected, "stock SQLite pbIndirect view"),
+            None => eprintln!(
+                "SKIP libsqlite3 session oracle unavailable on this host; \
+                 embedded-fixture assertions still ran"
+            ),
+        }
+    }
+
+    fn our_ops(changeset: &Changeset) -> Vec<(ChangeOp, bool)> {
+        changeset
+            .tables
+            .iter()
+            .flat_map(|table| table.rows.iter().map(|row| (row.op, row.indirect)))
+            .collect()
+    }
+
+    /// Encode every row of `tables` (changeset or patchset form) and sort
+    /// the encodings so two containers can be compared independent of row
+    /// order.
+    fn sorted_rows(tables: &[TableChangeset], patchset: bool) -> Vec<Vec<u8>> {
+        let mut rows: Vec<Vec<u8>> = tables
+            .iter()
+            .flat_map(|table| {
+                table.rows.iter().map(move |row| {
+                    let mut bytes = Vec::new();
+                    if patchset {
+                        row.encode_patchset(&mut bytes, &table.info.pk_flags);
+                    } else {
+                        row.encode_changeset(&mut bytes);
+                    }
+                    bytes
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Run the capture script against the installed `sqlite3` shell and
+    /// return `(changeset, patchset)` bytes, or `None` when the shell is
+    /// missing or lacks session support.
+    fn regenerate_with_cli(session_script: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let dir = unique_scratch_dir("fsqlite-session-cli")?;
+        let db = dir.join("fixture.db");
+        let changeset = dir.join("out.changeset");
+        let patchset = dir.join("out.patchset");
+        let script = format!(
+            "{STOCK_SCHEMA_SQL}{session_script}.session changeset {}\n.session patchset {}\n",
+            changeset.display(),
+            patchset.display()
+        );
+        let mut child = Command::new("sqlite3")
+            .arg(&db)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take()?;
+            stdin.write_all(script.as_bytes()).ok()?;
+        }
+        let output = child.wait_with_output().ok()?;
+        let result = if output.status.success() {
+            std::fs::read(&changeset)
+                .ok()
+                .zip(std::fs::read(&patchset).ok())
+        } else {
+            None
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn stock_cli_regenerates_identical_fixtures() {
+        let Some((mixed_changeset, mixed_patchset)) =
+            regenerate_with_cli(STOCK_MIXED_SESSION_SCRIPT)
+        else {
+            eprintln!("SKIP sqlite3 shell with session support unavailable on this host");
+            return;
+        };
+        assert_eq!(mixed_changeset, STOCK_MIXED_CHANGESET);
+        assert_eq!(mixed_patchset, STOCK_MIXED_PATCHSET);
+        let (single_changeset, _) = regenerate_with_cli(STOCK_SINGLE_SESSION_SCRIPT)
+            .expect("shell already proved session support");
+        assert_eq!(single_changeset, STOCK_SINGLE_INDIRECT_CHANGESET);
+    }
+
+    #[test]
+    fn stock_changeset_indirect_flags_decode_and_re_encode_byte_identical() {
+        let decoded = Changeset::decode(STOCK_MIXED_CHANGESET).expect("decode stock changeset");
+        assert_eq!(decoded.kind, ChangesetKind::Changeset);
+        let ours = our_ops(&decoded);
+        assert_eq!(ours, STOCK_MIXED_OPS);
+        assert_stock_reads(STOCK_MIXED_CHANGESET, &ours);
+        assert_eq!(
+            decoded.encode(),
+            STOCK_MIXED_CHANGESET,
+            "decode→encode must preserve every indirect byte"
+        );
+    }
+
+    #[test]
+    fn stock_patchset_indirect_flags_decode_and_re_encode_byte_identical() {
+        let decoded =
+            Changeset::decode_patchset(STOCK_MIXED_PATCHSET).expect("decode stock patchset");
+        assert_eq!(decoded.kind, ChangesetKind::Patchset);
+        let ours = our_ops(&decoded);
+        assert_eq!(ours, STOCK_MIXED_OPS);
+        assert_stock_reads(STOCK_MIXED_PATCHSET, &ours);
+        assert_eq!(
+            decoded.encode_patchset(),
+            STOCK_MIXED_PATCHSET,
+            "patchset decode→encode must preserve every indirect byte"
+        );
+    }
+
+    #[test]
+    fn stock_sqlite_reads_indirect_flags_written_by_our_session() {
+        let mut session = Session::new();
+        session.attach_table("t", 3, vec![true, false, false]);
+        session.set_indirect(true);
+        session.record_insert(
+            "t",
+            vec![
+                ChangesetValue::Integer(3),
+                ChangesetValue::Text("c".to_owned()),
+                ChangesetValue::Integer(30),
+            ],
+        );
+        session.set_indirect(false);
+        session.record_update(
+            "t",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Integer(10),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+                ChangesetValue::Integer(11),
+            ],
+        );
+        session.set_indirect(true);
+        session.record_delete(
+            "t",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("b".to_owned()),
+                ChangesetValue::Integer(20),
+            ],
+        );
+        let changeset = session.changeset();
+        let expected = vec![
+            (ChangeOp::Insert, true),
+            (ChangeOp::Update, false),
+            (ChangeOp::Delete, true),
+        ];
+        assert_eq!(our_ops(&changeset), expected);
+
+        // The same logical operations recorded with the same indirect
+        // toggles must produce exactly the rows stock SQLite produced (row
+        // order differs: SQLite emits its hash-table order), in both formats.
+        let stock_changeset = Changeset::decode(STOCK_MIXED_CHANGESET).expect("stock decode");
+        assert_eq!(
+            sorted_rows(&changeset.tables, false),
+            sorted_rows(&stock_changeset.tables, false)
+        );
+        let stock_patchset =
+            Changeset::decode_patchset(STOCK_MIXED_PATCHSET).expect("stock patchset decode");
+        assert_eq!(
+            sorted_rows(&changeset.tables, true),
+            sorted_rows(&stock_patchset.tables, true)
+        );
+
+        assert_stock_reads(&changeset.encode(), &expected);
+        assert_stock_reads(&changeset.encode_patchset(), &expected);
+    }
+
+    /// Offset of the first row's indirect byte in a single-table blob for
+    /// table `t` with three columns: header byte, column-count varint, three
+    /// pk flags, "t\0", then the op byte.
+    const FIRST_ROW_INDIRECT_OFFSET: usize = 1 + 1 + 3 + 2 + 1;
+
+    #[test]
+    fn noncanonical_indirect_byte_is_rejected_not_normalized() {
+        let mut changeset_blob = STOCK_MIXED_CHANGESET.to_vec();
+        let mut patchset_blob = STOCK_MIXED_PATCHSET.to_vec();
+        assert!(matches!(
+            changeset_blob[FIRST_ROW_INDIRECT_OFFSET],
+            0x00 | 0x01
+        ));
+        changeset_blob[FIRST_ROW_INDIRECT_OFFSET] = 0x02;
+        assert_eq!(
+            Changeset::decode(&changeset_blob),
+            Err(ChangesetFormatError::InvalidIndirectFlag {
+                offset: FIRST_ROW_INDIRECT_OFFSET,
+                byte: 0x02,
+            })
+        );
+
+        patchset_blob[FIRST_ROW_INDIRECT_OFFSET] = 0xFF;
+        assert_eq!(
+            Changeset::decode_patchset(&patchset_blob),
+            Err(ChangesetFormatError::InvalidIndirectFlag {
+                offset: FIRST_ROW_INDIRECT_OFFSET,
+                byte: 0xFF,
+            })
+        );
+
+        // Truncation right before the indirect byte is a distinct typed error.
+        let truncated = &changeset_blob[..FIRST_ROW_INDIRECT_OFFSET];
+        assert_eq!(
+            Changeset::decode(truncated),
+            Err(ChangesetFormatError::Truncated {
+                offset: FIRST_ROW_INDIRECT_OFFSET,
+            })
+        );
+    }
+
+    #[test]
+    fn inversion_preserves_indirect_flags_and_rejects_patchsets() {
+        let decoded = Changeset::decode(STOCK_MIXED_CHANGESET).expect("decode");
+        let inverted = decoded.invert().expect("changeset inversion");
+        let expected: Vec<(ChangeOp, bool)> = our_ops(&decoded)
+            .into_iter()
+            .map(|(op, indirect)| {
+                let op = match op {
+                    ChangeOp::Insert => ChangeOp::Delete,
+                    ChangeOp::Delete => ChangeOp::Insert,
+                    ChangeOp::Update => ChangeOp::Update,
+                };
+                (op, indirect)
+            })
+            .collect();
+        assert_eq!(our_ops(&inverted), expected);
+        assert_stock_reads(&inverted.encode(), &expected);
+
+        let patchset = Changeset::decode_patchset(STOCK_MIXED_PATCHSET).expect("decode patchset");
+        assert_eq!(
+            patchset.invert(),
+            Err(ChangesetFormatError::KindMismatch {
+                expected: ChangesetKind::Changeset,
+                found: ChangesetKind::Patchset,
+            })
+        );
+    }
+
+    #[test]
+    fn concat_rejects_mixed_kinds_and_keeps_appended_flags() {
+        let mut changeset = Changeset::decode(STOCK_MIXED_CHANGESET).expect("decode");
+        let patchset = Changeset::decode_patchset(STOCK_MIXED_PATCHSET).expect("decode patchset");
+        assert_eq!(
+            changeset.concat(&patchset),
+            Err(ChangesetFormatError::KindMismatch {
+                expected: ChangesetKind::Changeset,
+                found: ChangesetKind::Patchset,
+            })
+        );
+        let other = Changeset::decode(STOCK_SINGLE_INDIRECT_CHANGESET).expect("decode other");
+        changeset.concat(&other).expect("same-kind concat");
+        let ops = our_ops(&changeset);
+        assert_eq!(ops.last(), Some(&(ChangeOp::Insert, true)));
+        assert_stock_reads(&changeset.encode(), &ops);
+    }
+
+    fn row(id: i64, name: &str, score: i64) -> Vec<ChangesetValue> {
+        vec![
+            ChangesetValue::Integer(id),
+            ChangesetValue::Text(name.to_owned()),
+            ChangesetValue::Integer(score),
+        ]
+    }
+
+    fn sparse_score(score: i64) -> Vec<ChangesetValue> {
+        vec![
+            ChangesetValue::Undefined,
+            ChangesetValue::Undefined,
+            ChangesetValue::Integer(score),
+        ]
+    }
+
+    fn attached_session() -> Session {
+        let mut session = Session::new();
+        session.attach_table("t", 3, vec![true, false, false]);
+        session
+    }
+
+    #[test]
+    fn session_is_direct_by_default_and_snapshots_the_mode_per_record() {
+        let mut session = attached_session();
+        assert!(!session.indirect());
+        session.record_insert("t", row(1, "a", 1));
+        session.set_indirect(true);
+        assert!(session.indirect());
+        session.record_insert("t", row(2, "b", 2));
+        // Flipping the mode afterwards must not rewrite earlier records.
+        session.set_indirect(false);
+        assert_eq!(
+            our_ops(&session.changeset()),
+            vec![(ChangeOp::Insert, false), (ChangeOp::Insert, true)]
+        );
+    }
+
+    #[test]
+    fn indirect_provenance_is_the_logical_and_of_every_contributor() {
+        // I(indirect) + U(indirect) stays indirect.
+        let mut session = attached_session();
+        session.set_indirect(true);
+        session.record_insert("t", row(1, "a", 1));
+        session.record_update("t", row(1, "a", 1), sparse_score(2));
+        assert_eq!(
+            our_ops(&session.changeset()),
+            vec![(ChangeOp::Insert, true)]
+        );
+
+        // I(direct) + U(indirect) becomes direct.
+        let mut session = attached_session();
+        session.record_insert("t", row(1, "a", 1));
+        session.set_indirect(true);
+        session.record_update("t", row(1, "a", 1), sparse_score(2));
+        assert_eq!(
+            our_ops(&session.changeset()),
+            vec![(ChangeOp::Insert, false)]
+        );
+
+        // D(indirect) + I(direct) on a pre-existing key becomes a direct UPDATE.
+        let mut session = attached_session();
+        session.set_indirect(true);
+        session.record_delete("t", row(1, "a", 1));
+        session.set_indirect(false);
+        session.record_insert("t", row(1, "a", 5));
+        assert_eq!(
+            our_ops(&session.changeset()),
+            vec![(ChangeOp::Update, false)]
+        );
+
+        // Unrelated keys keep independent provenance.
+        let mut session = attached_session();
+        session.set_indirect(true);
+        session.record_insert("t", row(1, "a", 1));
+        session.set_indirect(false);
+        session.record_insert("t", row(2, "b", 2));
+        assert_eq!(
+            our_ops(&session.changeset()),
+            vec![(ChangeOp::Insert, true), (ChangeOp::Insert, false)]
+        );
+    }
+
+    #[test]
+    fn primary_key_change_marks_both_derived_rows() {
+        let mut session = attached_session();
+        session.set_indirect(true);
+        session.record_update(
+            "t",
+            row(1, "a", 1),
+            vec![
+                ChangesetValue::Integer(7),
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+            ],
+        );
+        let changeset = session.changeset();
+        assert_eq!(
+            our_ops(&changeset),
+            vec![(ChangeOp::Delete, true), (ChangeOp::Insert, true)]
+        );
+        assert_stock_reads(&changeset.encode(), &our_ops(&changeset));
+    }
+
+    #[test]
+    fn net_no_op_retains_direct_provenance_for_later_indirect_changes() {
+        let mut session = attached_session();
+        session.record_update("t", row(1, "a", 0), sparse_score(1));
+        session.record_update("t", row(1, "a", 1), sparse_score(0));
+        // The key is back to its original image: nothing to emit yet.
+        assert!(session.changeset().tables.is_empty());
+        session.set_indirect(true);
+        session.record_update("t", row(1, "a", 0), sparse_score(2));
+        let changeset = session.changeset();
+        assert_eq!(our_ops(&changeset), vec![(ChangeOp::Update, false)]);
+        assert_eq!(
+            changeset.tables[0].rows[0].new_values,
+            sparse_score(2),
+            "the accumulated image must be the final value, not a replay"
+        );
+        assert_stock_reads(&changeset.encode(), &[(ChangeOp::Update, false)]);
+    }
+
+    #[test]
+    fn apply_conflict_handler_observes_the_indirect_flag() {
+        let mut target = SimpleTarget::default();
+        target.tables.insert(
+            "t".to_owned(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::from("a"),
+                SqliteValue::Integer(1),
+            ]],
+        );
+        let mut session = attached_session();
+        session.set_indirect(true);
+        session.record_insert("t", row(1, "a", 1));
+        let changeset = session.changeset();
+
+        let mut observed = Vec::new();
+        let outcome = target.apply(&changeset, |conflict, change| {
+            observed.push((conflict, change.op, change.indirect));
+            ConflictAction::OmitChange
+        });
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 0,
+                skipped: 1
+            }
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].1, ChangeOp::Insert);
+        assert!(
+            observed[0].2,
+            "the conflict handler must see the indirect flag"
         );
     }
 }

@@ -879,8 +879,10 @@ fn session_changeset_blob_roundtrip_rows_match_csqlite() -> Result<(), String> {
     let manual_changeset = manual_session.changeset();
     let manual_changeset_blob = manual_changeset.encode();
     let manual_patchset_blob = manual_session.patchset();
-    let manual_patchset = Changeset::decode_patchset(&manual_patchset_blob).ok_or_else(|| {
-        format!("bead_id={SESSION_EXTENSION_BEAD_ID} case=manual_patchset_decode_failed")
+    let manual_patchset = Changeset::decode_patchset(&manual_patchset_blob).map_err(|error| {
+        format!(
+            "bead_id={SESSION_EXTENSION_BEAD_ID} case=manual_patchset_decode_failed error={error}"
+        )
     })?;
 
     let mut changeset_target = SimpleTarget::default();
@@ -1013,8 +1015,10 @@ fn session_conflict_apply_semantics_match_sqlite_session_extension() -> Result<(
     }
 
     let (sqlite_changeset_blob, _) = build_sqlite_session_bytes()?;
-    let decoded_sqlite_changeset = Changeset::decode(&sqlite_changeset_blob).ok_or_else(|| {
-        format!("bead_id={SESSION_EXTENSION_BEAD_ID} case=sqlite_conflict_changeset_decode_failed")
+    let decoded_sqlite_changeset = Changeset::decode(&sqlite_changeset_blob).map_err(|error| {
+        format!(
+            "bead_id={SESSION_EXTENSION_BEAD_ID} case=sqlite_conflict_changeset_decode_failed error={error}"
+        )
     })?;
     let run_id =
         format!("{SESSION_EXTENSION_BEAD_ID}-session-conflict-seed-{SESSION_CONFLICT_SEED}");
