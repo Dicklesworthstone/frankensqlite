@@ -16166,31 +16166,64 @@ impl VdbeEngine {
                 detail: format!("malformed column {payload_idx} payload length"),
             });
         };
-        ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics).await?;
         let start =
             usize::try_from(col.body_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                 detail: format!("malformed column {payload_idx} payload offset"),
             })?;
-        let bytes = cursor.payload_buf.get(start..col_end).ok_or_else(|| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!("column {payload_idx} payload exceeds row image"),
-            }
-        })?;
+        // GH#400: the column's full byte length is known from the record
+        // header before any overflow bytes are read. Bound the payload read
+        // (and every allocation below) to just the prefix so a large
+        // overflow-backed value is never fully hydrated to answer
+        // `substr(col, 1, N)` / a byte-prefix projection.
+        let col_len = col_end.saturating_sub(start);
 
         let value = match classify_serial_type(col.serial_type) {
             SerialTypeClass::Null => Some(SqliteValue::Null),
             SerialTypeClass::Text => {
-                if !bytes.is_ascii() {
+                // A char prefix of `prefix_len` code points needs at most
+                // `4 * prefix_len` UTF-8 bytes; read a few more so the window
+                // is guaranteed to contain strictly more than `prefix_len`
+                // whole characters even in the all-4-byte-char worst case,
+                // and after trimming an incomplete trailing character. When
+                // the window is a strict prefix of the value, the first
+                // `prefix_len` characters (and any earlier embedded NUL) are
+                // fully present, so the shared prefix logic yields exactly the
+                // whole-value result.
+                let budget = prefix_len.saturating_mul(4).saturating_add(8);
+                if col_len <= budget {
+                    // Small value: no memory concern. Defer to the generic
+                    // scalar path, which preserves every embedded-NUL and
+                    // invalid-UTF-8 edge exactly.
                     return Ok(None);
                 }
-                let end = prefix_len.min(bytes.len());
-                let text = std::str::from_utf8(&bytes[..end])
-                    .expect("ASCII storage text prefix must be valid UTF-8");
-                Some(SqliteValue::Text(SmallText::new(text)))
+                let window_end = start.saturating_add(budget);
+                ensure_storage_cursor_row_layout(cursor, window_end, collect_vdbe_metrics).await?;
+                let window = cursor.payload_buf.get(start..window_end).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!("column {payload_idx} prefix window exceeds row image"),
+                    }
+                })?;
+                // Storage TEXT is UTF-8; a bounded window can only cut an
+                // incomplete final character, which `valid_up_to` trims.
+                let valid = match std::str::from_utf8(window) {
+                    Ok(text) => text,
+                    Err(error) => std::str::from_utf8(&window[..error.valid_up_to()])
+                        .expect("valid_up_to prefix of UTF-8 storage bytes is valid UTF-8"),
+                };
+                Some(sqlite_substr_prefix_text(Cow::Borrowed(valid), prefix_len))
             }
             SerialTypeClass::Blob => {
-                let end = prefix_len.min(bytes.len());
-                Some(SqliteValue::Blob(Arc::from(&bytes[..end])))
+                // `substr` on a blob is byte-oriented, so only the first
+                // `prefix_len` bytes are needed.
+                let end = prefix_len.min(col_len);
+                let window_end = start.saturating_add(end);
+                ensure_storage_cursor_row_layout(cursor, window_end, collect_vdbe_metrics).await?;
+                let bytes = cursor.payload_buf.get(start..window_end).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!("column {payload_idx} blob prefix exceeds row image"),
+                    }
+                })?;
+                Some(SqliteValue::Blob(Arc::from(bytes)))
             }
             SerialTypeClass::Integer
             | SerialTypeClass::Float
