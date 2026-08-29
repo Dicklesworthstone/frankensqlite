@@ -22984,9 +22984,16 @@ async fn register_wal_reader_slot<F: VfsFile>(
     let acquired = {
         let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
         // A begin that failed after registering leaves its slot behind;
-        // retire it before publishing the new horizon.
-        if let Some(stale) = inner.wal_reader_slot.take() {
-            db_file.wal_reader_slot_release(cx, stale)?;
+        // retire it before publishing the new horizon. Mirror
+        // `release_wal_reader_slot`: on a failed unlock, keep the claim
+        // recorded (do not lose the slot id after `take()`) so the next
+        // window's registration retires it instead of leaking the shm SHARED
+        // claim and its fcntl byte.
+        if let Some(stale) = inner.wal_reader_slot.take()
+            && let Err(error) = db_file.wal_reader_slot_release(cx, stale)
+        {
+            inner.wal_reader_slot = Some(stale);
+            return Err(error);
         }
         db_file.wal_reader_slot_acquire(cx, mx_frame)
     };
