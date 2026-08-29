@@ -2688,3 +2688,134 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
         assert_eq!(stale, 0, "the backfilled image is the v3 generation");
     });
 }
+
+/// GH#399 reset-gate keeper (verifier): a slot-only reader pinned at the WAL
+/// TIP must still block a RESTART/TRUNCATE generation reset.
+///
+/// A reader whose `aReadMark` equals the current frame count never limits
+/// backfill: the horizon walk skips marks `>= mx_frame`, the pager passes
+/// `oldest_reader_frame = None`, and the plan is `Complete` + reset. The only
+/// thing between that reader and a reset underneath it is the exclusive
+/// `WAL_READ_LOCK(1..)` gate in `checkpoint_executor::apply_checkpoint_post_action`.
+/// The keeper above pins BELOW the tip, so the horizon clamp alone already
+/// prevents its reset and it stays green with the gate removed; this test
+/// goes red with the gate removed (verified by planting `if false` around the
+/// gate at 5946b3b7c: `[0, tip, tip]` and a new generation while the slot was
+/// held).
+#[cfg(unix)]
+#[test]
+fn gh399_tip_reader_slot_blocks_wal_reset_until_released() {
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::shm::{SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, wal_read_lock_slot};
+    use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("gh399-tip-reader.db");
+        let wal_path = dir.path().join("gh399-tip-reader.db-wal");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db).await.expect("driver open");
+        conn.execute("PRAGMA busy_timeout=5000").await.expect("busy_timeout");
+        conn.execute("PRAGMA journal_mode = WAL").await.expect("journal_mode");
+        conn.execute("PRAGMA wal_autocheckpoint = 0").await.expect("wal_autocheckpoint");
+        conn.execute("CREATE TABLE gh399_tip (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            .await
+            .expect("create table");
+        conn.execute("BEGIN").await.expect("seed begin");
+        for id in 0..GH399_ROWS {
+            conn.execute_with_params(
+                "INSERT INTO gh399_tip (id, payload) VALUES (?, ?)",
+                &[
+                    SqliteValue::Integer(id as i64),
+                    text(deterministic_payload("gh399tip", id, 160)),
+                ],
+            )
+            .await
+            .expect("seed row");
+        }
+        conn.execute("COMMIT").await.expect("seed commit");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
+            .expect("seed checkpoint");
+
+        // v1 rewrites every leaf page into the WAL. A no-reader PASSIVE
+        // backfills everything and its `log` column is the frame count at the
+        // tip, which is exactly the mark the tip reader pins.
+        conn.execute("UPDATE gh399_tip SET payload = payload || '-v1'")
+            .await
+            .expect("v1 update");
+        let [busy, tip, backfilled] = gh399_checkpoint(&conn, "PASSIVE").await;
+        assert_eq!(busy, 0, "no reader: PASSIVE must not be busy");
+        assert!(tip > 0, "v1 must leave frames in the WAL");
+        assert_eq!(backfilled, tip, "no reader: PASSIVE backfills everything");
+        let generation_v1 = gh399_wal_generation(&wal_path);
+        let wal_len_v1 = gh399_wal_len(&wal_path);
+
+        // A stock-SQLite-shaped reader pins WAL_READ_LOCK(1) at the tip.
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (mut tip_reader, _) = vfs
+            .open(
+                &cx,
+                Some(&db_path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .expect("open a second handle for the tip reader");
+        let tip_mark = u32::try_from(tip).expect("tip fits u32");
+        tip_reader
+            .compat_reader_acquire_wal_read_lock(&cx, 1, tip_mark)
+            .expect("pin WAL_READ_LOCK(1) at the tip");
+
+        // TRUNCATE / RESTART while pinned: the whole WAL is (re)backfilled —
+        // the reader clamps nothing — but the generation MUST survive and the
+        // pragma must report busy.
+        for mode in ["TRUNCATE", "RESTART"] {
+            let row = gh399_checkpoint(&conn, mode).await;
+            assert_eq!(
+                row,
+                [1, tip, tip],
+                "{mode} with a tip reader pinned: expected busy=1 and a full backfill, got {row:?}"
+            );
+            assert_eq!(
+                gh399_wal_generation(&wal_path),
+                generation_v1,
+                "{mode} reset the WAL generation underneath a pinned tip reader"
+            );
+            assert_eq!(
+                gh399_wal_len(&wal_path),
+                wal_len_v1,
+                "{mode} truncated the WAL underneath a pinned tip reader"
+            );
+        }
+
+        // Release the slot: the same request now completes and resets.
+        let slot = wal_read_lock_slot(1).expect("reader slot 1 exists");
+        tip_reader
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("release WAL_READ_LOCK(1)");
+        let row = gh399_checkpoint(&conn, "TRUNCATE").await;
+        assert_eq!(row, [0, tip, tip], "with the tip reader gone TRUNCATE completes");
+        assert_ne!(
+            gh399_wal_generation(&wal_path),
+            generation_v1,
+            "TRUNCATE must start a new WAL generation once the reader is gone"
+        );
+        assert_eq!(gh399_wal_len(&wal_path), 32, "TRUNCATE leaves only the WAL header");
+        tip_reader.close(&cx).expect("close the tip reader handle");
+
+        drop(conn);
+        assert_eq!(stock_integrity_report(&db_path), vec!["ok".to_owned()]);
+        let sqlite = rusqlite::Connection::open(&db_path).expect("stock open");
+        let (count, stale): (i64, i64) = sqlite
+            .query_row(
+                "SELECT COUNT(*), SUM(payload NOT LIKE '%-v1') FROM gh399_tip",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stock count");
+        assert_eq!(count, GH399_ROWS as i64);
+        assert_eq!(stale, 0, "the backfilled image is the v1 generation");
+    });
+}
