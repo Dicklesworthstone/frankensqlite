@@ -8999,6 +8999,25 @@ impl<F: VfsFile> PagerInner<F> {
         mode: CommittedStateRefreshMode,
     ) -> Result<CommittedStateRefresh> {
         let probe = self.probe_visible_commit_seq(cx, wal_backend).await?;
+        // GH#399: a WAL generation change — a peer process's RESTART/TRUNCATE
+        // checkpoint, or a stock SQLite close that deleted the WAL — invalidates
+        // every "no committed frame => provable hole" judgement this pager could
+        // still make from its private abandonment pool, the shared disowned
+        // ledger, or its volatile-only freelist entries. The frames that proved
+        // such a page live were backfilled into the database file and discarded
+        // with the old generation, so an in-range page with no frame in the new
+        // generation is exactly as likely a live tree page as a hole; folding
+        // it into the durable freelist would hand a live page to a second tree
+        // (the beads churn's "2nd reference to page" / zeroed-leaf aliases).
+        // Cross the boundary the way the checkpointing pager itself does:
+        // above-extent entries stay in the shared ledger, in-range ones are
+        // dropped, and this refresh must not re-park anything.
+        let wal_generation_changed = self.journal_mode == JournalMode::Wal
+            && self.committed_wal_generation.is_some()
+            && self.committed_wal_generation != probe.wal_generation;
+        if wal_generation_changed {
+            preserve_above_extent_at_generation_boundary(self);
+        }
         if mode == CommittedStateRefreshMode::Normal
             && probe.visible_commit_seq == self.commit_seq
             && probe.file_size == self.committed_db_file_size_bytes
@@ -9121,7 +9140,14 @@ impl<F: VfsFile> PagerInner<F> {
         // WAL mode: rollback-journal mode has no commit-fold to drain the pool
         // (see restore_uncommitted_allocations_for_clean_commit), and its
         // single-connection shapes do not hit this wholesale-replace path.
-        if self.journal_mode == JournalMode::Wal && effective_db_size >= 2 {
+        // GH#399: never re-park across a WAL generation boundary — a
+        // volatile-only entry may have been consumed and committed by a peer
+        // in the generation that was just discarded, and nothing in the new
+        // generation can prove otherwise (see `wal_generation_changed`).
+        if self.journal_mode == JournalMode::Wal
+            && effective_db_size >= 2
+            && !wal_generation_changed
+        {
             let mut reparked = 0_usize;
             for page in std::mem::take(&mut self.freelist) {
                 let raw = page.get();
@@ -26180,6 +26206,22 @@ where
             let db_file = Arc::clone(&inner.db_file);
             match db_file.try_write() {
                 Ok(mut db_file) => {
+                    // GH#399: the last transaction of the window gives its
+                    // cross-process reader slot back before the main-file
+                    // fence, mirroring `coordinated_transaction_exit`. A
+                    // failed release keeps the claim recorded so the next
+                    // window's registration retires it.
+                    if remaining_active_transactions == 0
+                        && let Some(slot) = inner.wal_reader_slot.take()
+                        && let Err(error) = db_file.wal_reader_slot_release(&cleanup_cx, slot)
+                    {
+                        inner.wal_reader_slot = Some(slot);
+                        tracing::warn!(
+                            %error,
+                            reader_slot = slot,
+                            "drop-time transaction exit could not release the WAL reader slot"
+                        );
+                    }
                     if let Err(error) = restore_target.restore(&mut *db_file, &cleanup_cx) {
                         tracing::warn!(
                             %error,

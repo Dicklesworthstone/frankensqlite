@@ -2294,14 +2294,14 @@ fn beads_concurrent_processes_churn_with_passive_checkpoints_keeps_unique_page_o
 /// behind the exclusive `WAL_READ_LOCK(1..)` fence and deferred while any
 /// peer reader pins the generation.
 ///
-/// STILL RED after the reader-slot registration + reset gate: with the
-/// mid-transaction race closed (no child reads a zeroed page any more), a
-/// round still leaves an image stock SQLite reports as malformed once a
-/// legitimately ungated reset (no peer reader held a slot) has happened.
-/// The residual is the peers' handling of the WAL generation boundary
-/// between their transactions; tracked under GH#399. Run with `--ignored`.
+/// The second half of the fix is on the peers' side of the generation
+/// boundary: after a peer's legitimately ungated reset (no reader held a
+/// slot), a pager's "no committed WAL frame => provable hole" fold of its
+/// abandoned-page pool was evaluated against the fresh, empty generation and
+/// reclaimed live tree pages into the durable freelist (the "2nd reference
+/// to page" / zeroed-leaf aliases). A refresh that observes a WAL generation
+/// change now drops its in-range pool exactly as the checkpointing pager does.
 #[test]
-#[ignore = "GH#399 residual: stock integrity_check reports the image malformed after an ungated TRUNCATE reset between peer transactions; run with --ignored"]
 fn beads_concurrent_processes_churn_with_truncate_checkpoints_keeps_unique_page_ownership() {
     asupersync::test_utils::run_test(|| async {
         beads_concurrent_processes_churn("truncate").await;
@@ -2313,14 +2313,19 @@ fn beads_concurrent_processes_churn_with_truncate_checkpoints_keeps_unique_page_
 // horizon and the WAL reset until it ends.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 const GH399_READER_HELPER_TEST: &str = "gh399_reset_gate_reader_helper";
+#[cfg(unix)]
 const GH399_READER_DB_ENV: &str = "FSQLITE_GH399_READER_DB";
+#[cfg(unix)]
 const GH399_READER_SIGNAL_DIR_ENV: &str = "FSQLITE_GH399_READER_SIGNAL_DIR";
+#[cfg(unix)]
 const GH399_ROWS: usize = 400;
 
 /// Everything a reader can observe about `gh399_rows` in one snapshot: the
 /// row count plus a full ordered scan of every payload (so every leaf page is
 /// actually read, not just the header).
+#[cfg(unix)]
 async fn gh399_snapshot_fingerprint(conn: &Connection) -> (i64, Vec<(i64, String)>) {
     let count = conn
         .query("SELECT COUNT(*) FROM gh399_rows")
@@ -2349,6 +2354,7 @@ async fn gh399_snapshot_fingerprint(conn: &Connection) -> (i64, Vec<(i64, String
     (count, scan)
 }
 
+#[cfg(unix)]
 fn gh399_wait_for_signal(path: &std::path::Path, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !path.exists() {
@@ -2363,6 +2369,7 @@ fn gh399_wait_for_signal(path: &std::path::Path, what: &str) {
 
 /// WAL header generation identity: checkpoint sequence + salt-1 + salt-2
 /// (bytes 12..24). A RESTART/TRUNCATE rewrites all three.
+#[cfg(unix)]
 fn gh399_wal_generation(wal_path: &std::path::Path) -> Vec<u8> {
     let bytes = std::fs::read(wal_path).expect("read WAL header");
     assert!(bytes.len() >= 32, "WAL file shorter than its header");
@@ -2372,6 +2379,7 @@ fn gh399_wal_generation(wal_path: &std::path::Path) -> Vec<u8> {
 /// Child-process body for the reset-gate keeper: pin a read snapshot, tell
 /// the driver, hold it while the driver appends and checkpoints, then prove
 /// the snapshot is still exactly what was pinned.
+#[cfg(unix)]
 #[test]
 #[ignore = "multi-process helper; spawned by the GH#399 reset-gate keeper"]
 fn gh399_reset_gate_reader_helper() {
@@ -2383,10 +2391,11 @@ fn gh399_reset_gate_reader_helper() {
         execute_with_transient_retry(&conn, "PRAGMA busy_timeout=5000").await;
         execute_with_transient_retry(&conn, "BEGIN").await;
         let pinned = gh399_snapshot_fingerprint(&conn).await;
-        assert_eq!(pinned.0, GH399_ROWS as i64, "reader pins the v1 image");
-        assert!(
-            pinned.1.iter().all(|(_, payload)| payload.ends_with("-v1")),
-            "reader pins the v1 image"
+        assert!(pinned.0 > 0, "reader pins a populated image");
+        assert_eq!(
+            usize::try_from(pinned.0).expect("count fits usize"),
+            pinned.1.len(),
+            "the full scan covers every row of the pinned image"
         );
         std::fs::write(signals.join("pinned"), b"pinned").expect("signal pinned");
 
@@ -2405,13 +2414,56 @@ fn gh399_reset_gate_reader_helper() {
     });
 }
 
-/// GH#399 acceptance (d): a peer process's TRUNCATE checkpoint must neither
-/// backfill past a pinned reader's WAL horizon nor reset the WAL generation
-/// until that reader ends; the reader keeps reading its original snapshot;
-/// once it ends a later TRUNCATE completes and resets.
+/// `PRAGMA wal_checkpoint(mode)` as its `[busy, log, checkpointed]` row.
+#[cfg(unix)]
+async fn gh399_checkpoint(conn: &Connection, mode: &str) -> [i64; 3] {
+    let rows = conn
+        .query(&format!("PRAGMA wal_checkpoint({mode})"))
+        .await
+        .unwrap_or_else(|error| panic!("wal_checkpoint({mode}) must not fail: {error:?}"));
+    let values = rows[0].values();
+    let mut row = [0_i64; 3];
+    for (out, value) in row.iter_mut().zip(values) {
+        let SqliteValue::Integer(value) = value else {
+            panic!("wal_checkpoint({mode}) columns must be integers, got {values:?}");
+        };
+        *out = *value;
+    }
+    row
+}
+
+#[cfg(unix)]
+fn gh399_wal_len(wal_path: &std::path::Path) -> u64 {
+    std::fs::metadata(wal_path).expect("wal metadata").len()
+}
+
+/// GH#399 acceptance (d): while a peer reader pins a WAL snapshot at horizon
+/// R, a checkpoint must neither backfill past R into the database file nor
+/// replace the WAL generation; the reader keeps reading exactly its snapshot;
+/// once the reader ends, TRUNCATE completes and resets.
+///
+/// Phase 1 pins the horizon the way a stock SQLite reader does — a SHARED
+/// `WAL_READ_LOCK(1)` with `aReadMark[1] = R` and no main-file lock — so the
+/// engine-level horizon clamp and reset gate are exercised end to end:
+/// PASSIVE and TRUNCATE backfill exactly R frames, report `busy = 1`, and
+/// leave the generation and file length untouched; after the slot is
+/// released the same TRUNCATE completes and resets.
+///
+/// Phase 2 pins the horizon from another fsqlite process. Such a reader also
+/// holds the main-file SHARED fence, so the checkpoint cannot even take its
+/// maintenance fence: both pragmas report `busy = 1` with nothing
+/// checkpointed, the generation is untouched, the peer re-verifies its
+/// snapshot before exiting, and TRUNCATE completes once it is gone.
+#[cfg(unix)]
 #[test]
-#[ignore = "GH#399: reset-gate keeper not yet verified green on a clean worker; run with --ignored"]
 fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::shm::{SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, wal_read_lock_slot};
+    use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+
+    const WAL_FRAME_BYTES: u64 = 24 + 4096;
+
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("gh399-reset-gate.db");
@@ -2446,41 +2498,31 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
             .await
             .expect("seed checkpoint");
 
-        // v1: the reader's snapshot will live partly in the WAL (every leaf
-        // page rewritten) so the checkpointer has frames it may backfill
-        // (<= the reader's horizon) and frames it must not (beyond it).
+        // ── Phase 1: a stock-SQLite-shaped reader pins WAL_READ_LOCK(1) ──
+        // v1 rewrites every leaf page into the WAL so the checkpointer has
+        // frames it may backfill (<= R) and, after v2, frames it must not.
         conn.execute("UPDATE gh399_rows SET payload = payload || '-v1'")
             .await
             .expect("v1 update");
-        let reader_horizon_frames = {
-            let rows = conn
-                .query("PRAGMA wal_checkpoint(PASSIVE)")
-                .await
-                .expect("horizon probe");
-            // A no-reader PASSIVE backfills everything; its `log` column is
-            // the frame count the reader is about to pin.
-            let SqliteValue::Integer(log) = rows[0].values()[1] else {
-                panic!("wal_checkpoint log column must be an integer");
-            };
-            log
-        };
-        assert!(reader_horizon_frames > 0, "v1 must leave frames in the WAL");
-        let generation_before = gh399_wal_generation(&wal_path);
+        // A no-reader PASSIVE backfills everything; its `log` column is the
+        // frame count R the reader pins.
+        let [_, reader_horizon, _] = gh399_checkpoint(&conn, "PASSIVE").await;
+        assert!(reader_horizon > 0, "v1 must leave frames in the WAL");
+        let generation_v1 = gh399_wal_generation(&wal_path);
 
-        let mut reader = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .arg("--exact")
-            .arg(GH399_READER_HELPER_TEST)
-            .arg("--ignored")
-            .arg("--nocapture")
-            .env(GH399_READER_DB_ENV, &db)
-            .env(GH399_READER_SIGNAL_DIR_ENV, &signals)
-            .spawn()
-            .expect("spawn reader helper");
-        gh399_wait_for_signal(&signals.join("pinned"), "pinned");
-        assert!(
-            reader.try_wait().expect("poll reader").is_none(),
-            "reader helper exited before the driver appended"
-        );
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (mut legacy_reader, _) = vfs
+            .open(
+                &cx,
+                Some(&db_path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .expect("open a second handle for the legacy reader");
+        let reader_mark = u32::try_from(reader_horizon).expect("horizon fits u32");
+        legacy_reader
+            .compat_reader_acquire_wal_read_lock(&cx, 1, reader_mark)
+            .expect("pin WAL_READ_LOCK(1) at the v1 horizon");
 
         // A peer appends beyond the reader's horizon: every leaf page again,
         // plus new EOF pages.
@@ -2500,59 +2542,114 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
             .expect("v2 insert");
         }
         conn.execute("COMMIT").await.expect("v2 commit");
-        let wal_len_before = std::fs::metadata(&wal_path).expect("wal metadata").len();
+        let wal_len_v2 = gh399_wal_len(&wal_path);
 
-        // PASSIVE while the reader is pinned: backfill stops at the reader's
-        // horizon and the pragma reports busy.
-        let passive = conn
-            .query("PRAGMA wal_checkpoint(PASSIVE)")
-            .await
-            .expect("passive checkpoint with a pinned peer reader must not fail");
-        let passive = passive[0].values();
-        let SqliteValue::Integer(total_frames) = passive[1] else {
-            panic!("wal_checkpoint log column must be an integer");
-        };
+        // PASSIVE stops exactly at the reader's mark and reports busy.
+        let passive = gh399_checkpoint(&conn, "PASSIVE").await;
+        let total_frames = passive[1];
         assert!(
-            total_frames > reader_horizon_frames,
-            "v2 must append beyond the reader horizon ({total_frames} <= {reader_horizon_frames})"
+            total_frames > reader_horizon,
+            "v2 must append beyond the reader horizon ({total_frames} <= {reader_horizon})"
         );
         assert_eq!(
-            passive[0],
-            SqliteValue::Integer(1),
-            "PASSIVE is reported busy while a peer reader pins frames beyond its horizon"
-        );
-        assert_eq!(
-            passive[2],
-            SqliteValue::Integer(reader_horizon_frames),
-            "PASSIVE backfills exactly up to the pinned reader horizon"
+            passive,
+            [1, total_frames, reader_horizon],
+            "PASSIVE backfills exactly up to the pinned legacy reader horizon and is busy"
         );
 
-        // TRUNCATE while the reader is pinned: same clamp, and no reset.
-        let truncate = conn
-            .query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .await
-            .expect("truncate checkpoint with a pinned peer reader must not fail");
-        let truncate = truncate[0].values();
+        // TRUNCATE: same clamp, and the generation must survive.
+        let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
         assert_eq!(
-            truncate[0],
-            SqliteValue::Integer(1),
-            "TRUNCATE is reported busy while a peer reader pins the generation"
-        );
-        assert_eq!(truncate[1], SqliteValue::Integer(total_frames));
-        assert_eq!(
-            truncate[2],
-            SqliteValue::Integer(reader_horizon_frames),
-            "TRUNCATE backfills exactly up to the pinned reader horizon"
+            truncate,
+            [1, total_frames, reader_horizon],
+            "TRUNCATE backfills exactly up to the pinned legacy reader horizon and is busy"
         );
         assert_eq!(
             gh399_wal_generation(&wal_path),
-            generation_before,
-            "the WAL generation was reset while a peer reader pinned it"
+            generation_v1,
+            "the WAL generation was reset while a legacy reader pinned it"
         );
         assert_eq!(
-            std::fs::metadata(&wal_path).expect("wal metadata").len(),
-            wal_len_before,
-            "the WAL was truncated while a peer reader pinned it"
+            gh399_wal_len(&wal_path),
+            wal_len_v2,
+            "the WAL was truncated while a legacy reader pinned it"
+        );
+
+        // Release the slot: the same request now completes and resets.
+        let slot = wal_read_lock_slot(1).expect("reader slot 1 exists");
+        legacy_reader
+            .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("release WAL_READ_LOCK(1)");
+        let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
+        assert_eq!(
+            truncate,
+            [0, total_frames, total_frames],
+            "with the legacy reader gone TRUNCATE completes"
+        );
+        assert_ne!(
+            gh399_wal_generation(&wal_path),
+            generation_v1,
+            "TRUNCATE must start a new WAL generation once the reader is gone"
+        );
+        assert_eq!(
+            gh399_wal_len(&wal_path),
+            32,
+            "TRUNCATE leaves only the WAL header"
+        );
+        legacy_reader
+            .close(&cx)
+            .expect("close the legacy reader handle");
+
+        // ── Phase 2: an fsqlite peer process pins a snapshot ──
+        let generation_v2 = gh399_wal_generation(&wal_path);
+        let mut reader = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--exact")
+            .arg(GH399_READER_HELPER_TEST)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(GH399_READER_DB_ENV, &db)
+            .env(GH399_READER_SIGNAL_DIR_ENV, &signals)
+            .spawn()
+            .expect("spawn reader helper");
+        gh399_wait_for_signal(&signals.join("pinned"), "pinned");
+        assert!(
+            reader.try_wait().expect("poll reader").is_none(),
+            "reader helper exited before the driver appended"
+        );
+
+        conn.execute("UPDATE gh399_rows SET payload = replace(payload, '-v2', '-v3')")
+            .await
+            .expect("v3 update");
+        let wal_len_v3 = gh399_wal_len(&wal_path);
+        let total_v3 = i64::try_from((wal_len_v3 - 32) / WAL_FRAME_BYTES).expect("frame count");
+        assert!(total_v3 > 0, "v3 must leave frames in the WAL");
+
+        // The peer's read transaction holds the main-file SHARED fence, so the
+        // checkpoint cannot take its maintenance fence at all: busy, nothing
+        // checkpointed, generation untouched. A short busy budget keeps the
+        // excluded attempts prompt.
+        conn.execute("PRAGMA busy_timeout=250").await.expect("busy_timeout");
+        let passive = gh399_checkpoint(&conn, "PASSIVE").await;
+        assert_eq!(
+            (passive[0], passive[2]),
+            (1, 0),
+            "PASSIVE is busy with nothing checkpointed while an fsqlite peer pins a snapshot: {passive:?}"
+        );
+        let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
+        assert_eq!(
+            (truncate[0], truncate[2]),
+            (1, 0),
+            "TRUNCATE is busy with nothing checkpointed while an fsqlite peer pins a snapshot: {truncate:?}"
+        );
+        assert_eq!(
+            gh399_wal_generation(&wal_path),
+            generation_v2,
+            "the WAL generation was reset while an fsqlite peer pinned it"
+        );
+        assert_eq!(
+            gh399_wal_len(&wal_path),
+            wal_len_v3,
+            "the WAL was truncated while an fsqlite peer pinned it"
         );
 
         // Release the reader; it re-verifies its snapshot before exiting.
@@ -2563,37 +2660,31 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
             "reader helper failed (its pinned snapshot was disturbed): {status:?}"
         );
 
-        // With the last reader gone the same request completes and resets.
-        let truncate = conn
-            .query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .await
-            .expect("truncate checkpoint after the reader ended");
-        let truncate = truncate[0].values();
-        assert_eq!(truncate[0], SqliteValue::Integer(0), "no reader blocks the reset");
-        assert_eq!(truncate[1], SqliteValue::Integer(total_frames));
-        assert_eq!(truncate[2], SqliteValue::Integer(total_frames));
+        conn.execute("PRAGMA busy_timeout=5000").await.expect("busy_timeout");
+        let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
+        assert_eq!(
+            truncate,
+            [0, total_v3, total_v3],
+            "with the peer gone TRUNCATE completes"
+        );
         assert_ne!(
             gh399_wal_generation(&wal_path),
-            generation_before,
-            "TRUNCATE must start a new WAL generation once the reader is gone"
+            generation_v2,
+            "TRUNCATE must start a new WAL generation once the peer is gone"
         );
-        assert_eq!(
-            std::fs::metadata(&wal_path).expect("wal metadata").len(),
-            32,
-            "TRUNCATE leaves only the WAL header"
-        );
+        assert_eq!(gh399_wal_len(&wal_path), 32);
 
         drop(conn);
         assert_eq!(stock_integrity_report(&db_path), vec!["ok".to_owned()]);
         let sqlite = rusqlite::Connection::open(&db_path).expect("stock open");
         let (count, stale): (i64, i64) = sqlite
             .query_row(
-                "SELECT COUNT(*), SUM(payload NOT LIKE '%-v2') FROM gh399_rows",
+                "SELECT COUNT(*), SUM(payload NOT LIKE '%-v3') FROM gh399_rows",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("stock count");
         assert_eq!(count, (GH399_ROWS + 100) as i64);
-        assert_eq!(stale, 0, "the backfilled image is the v2 generation");
+        assert_eq!(stale, 0, "the backfilled image is the v3 generation");
     });
 }

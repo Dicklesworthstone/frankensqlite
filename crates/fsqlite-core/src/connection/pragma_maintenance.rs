@@ -106,7 +106,21 @@ impl Connection {
         self.invalidate_cached_write_txn(&cx).await;
         self.invalidate_cached_read_snapshot(&cx).await;
         let checkpoint_metrics_before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
-        let result = self.pager.checkpoint(&cx, mode).await?;
+        let result = match self.pager.checkpoint(&cx, mode).await {
+            Ok(result) => result,
+            // GH#399: another process owns the checkpoint fence right now.
+            // `sqlite3_wal_checkpoint_v2` reports that as SQLITE_BUSY without
+            // consulting the busy handler, and the PRAGMA surfaces it as
+            // `busy = 1` with nothing checkpointed rather than as an error, so
+            // peers closing at the same moment do not fail each other's
+            // close-time checkpoints.
+            Err(FrankenError::Busy) => {
+                let log_frames =
+                    i64::try_from(self.pager.wal_frame_count(&cx).await).unwrap_or(i64::MAX);
+                return Ok([1, log_frames, 0]);
+            }
+            Err(error) => return Err(error),
+        };
         // GH #384: the pager refreshed its durable WAL horizon while holding
         // the checkpoint fence. Carry that horizon into the process-shared
         // MVCC clock before a later BEGIN is compared with CommitIndex.
