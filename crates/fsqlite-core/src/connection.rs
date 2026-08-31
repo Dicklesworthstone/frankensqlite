@@ -991,6 +991,74 @@ fn fire_pending_conflict_lock_window_hook() {
     }
 }
 
+/// Test-only hook fired inside `BoundedStructuralSnapshot::finish` immediately
+/// before the closing whole-image receipt is captured — i.e. while the pinned
+/// validation transaction still owns its stock-visible external
+/// shared-snapshot fence (GH#307). The image path is passed so a deterministic
+/// regression can act only on its own snapshot even though the hook is
+/// process-global.
+#[cfg(test)]
+static FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK: Mutex<
+    Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_bounded_snapshot_pre_final_receipt_hook(
+    hook: Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
+) {
+    *FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK
+        .lock()
+        .expect("bounded-snapshot pre-final-receipt hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+#[inline]
+fn fire_bounded_snapshot_pre_final_receipt_hook(image_path: &Path) {
+    let hook = {
+        FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK
+            .lock()
+            .expect("bounded-snapshot pre-final-receipt hook mutex poisoned")
+            .clone()
+    };
+    if let Some(hook) = hook {
+        hook(image_path);
+    }
+}
+
+/// Test-only hook fired inside `BoundedStructuralSnapshot::finish` immediately
+/// before teardown (rollback, then close) begins — i.e. after the closing
+/// receipt has been captured under the fence. Paired with the
+/// pre-final-receipt hook it pins the GH#307 ordering
+/// `capture/compare -> rollback -> close`, and its firing after an injected
+/// receipt failure pins that teardown is attempted unconditionally.
+#[cfg(test)]
+static FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK: Mutex<
+    Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_bounded_snapshot_pre_teardown_hook(
+    hook: Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
+) {
+    *FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK
+        .lock()
+        .expect("bounded-snapshot pre-teardown hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+#[inline]
+fn fire_bounded_snapshot_pre_teardown_hook(image_path: &Path) {
+    let hook = {
+        FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK
+            .lock()
+            .expect("bounded-snapshot pre-teardown hook mutex poisoned")
+            .clone()
+    };
+    if let Some(hook) = hook {
+        hook(image_path);
+    }
+}
+
 /// Test-only post-durable failure injection at the connection boundary.
 ///
 /// The pager has already returned its durable completion before this hook
@@ -16925,8 +16993,9 @@ impl Connection {
     /// separately would leave the snapshot.
     ///
     /// The caller **must** end the snapshot with
-    /// [`BoundedStructuralSnapshot::finish`], which releases the transaction and
-    /// then proves the image is still byte-for-byte equal to `expected`. That
+    /// [`BoundedStructuralSnapshot::finish`], which proves the image is still
+    /// byte-for-byte equal to `expected` while the pinned transaction still
+    /// owns its fence, and then releases the transaction. That
     /// final compare-and-swap is what makes a candidate built from this snapshot
     /// safe to publish; dropping the guard instead skips it and the result must
     /// not be trusted.
@@ -39301,9 +39370,10 @@ pub struct BoundedDatabaseStructuralStats {
 /// guard is alive, one deferred transaction holds the proven snapshot open;
 /// read it through [`Self::connection`].
 ///
-/// Finish with [`Self::finish`]. It releases the transaction and then proves
-/// the image never changed during the window — the second half of the
-/// compare-and-swap that makes work derived from this snapshot publishable.
+/// Finish with [`Self::finish`]. It proves the image never changed during the
+/// window — the second half of the compare-and-swap that makes work derived
+/// from this snapshot publishable — while the pinned transaction still owns
+/// its external fence, and only then releases the transaction.
 /// Dropping the guard without calling `finish` releases the reader but performs
 /// no such proof, so anything derived from the snapshot is unverified; the drop
 /// path logs an error rather than failing silently.
@@ -39348,49 +39418,89 @@ impl BoundedStructuralSnapshot<'_> {
         &self.stats
     }
 
-    /// Release the snapshot and prove the image never changed during it.
+    /// Prove the image never changed during the snapshot, then release it.
     ///
-    /// Rolls back the pinned transaction, closes the identity-bound handle, and
-    /// re-reads the whole-image receipt. Errors are reported in that order, so a
-    /// validation-window failure is never masked by a teardown failure.
+    /// GH#307: the closing whole-image receipt is captured and compared while
+    /// the pinned validation transaction still owns its stock-visible external
+    /// shared-snapshot fence. Capturing after rollback would open an ABA
+    /// window in which a compliant writer could change and exactly restore
+    /// the image between fence release and the proof point. Receipt-context
+    /// and capture failures are recorded rather than returned early, so
+    /// rollback and close are attempted unconditionally on every completed
+    /// path.
     ///
     /// # Errors
     ///
-    /// Returns [`FrankenError::BusySnapshot`] if the image changed while the
-    /// snapshot was open, plus any rollback or close error.
+    /// Errors are returned in this precedence: rollback error, then close
+    /// error, then the fenced receipt outcome — [`FrankenError::BusySnapshot`]
+    /// if the image changed while the snapshot was open, or the
+    /// receipt-capture failure itself. Errors suppressed by a
+    /// higher-precedence one are logged, not lost.
     pub async fn finish(mut self) -> Result<()> {
+        // Capture and compare the closing receipt while `validation` — still
+        // inside the guard, so cancellation here keeps drop-time visibility —
+        // owns the transaction and with it the external fence.
+        #[cfg(test)]
+        fire_bounded_snapshot_pre_final_receipt_hook(&self.image_path);
+        let receipt_result = match self.source.op_cx() {
+            Ok(cx) => match self
+                .source
+                .pager
+                .inspect_self_contained_database_image(&cx, &self.image_path)
+                .await
+            {
+                Ok(after) if after == self.expected => Ok(()),
+                Ok(_) => Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "bounded structural source receipt changed during validation".to_owned(),
+                }),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+
+        // Only now leave the fenced window: unconditionally attempt rollback
+        // and close, whatever the receipt outcome was.
         let validation = self
             .validation
             .take()
             .expect("finish() consumes self, so the connection is still present");
+        #[cfg(test)]
+        fire_bounded_snapshot_pre_teardown_hook(&self.image_path);
         let rollback_result = validation.rollback_transaction().await;
         let close_result = validation.close().await;
+
+        // Error precedence: rollback, then close, then receipt/BusySnapshot.
         match (rollback_result, close_result) {
-            (Ok(()), Ok(())) => {}
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-            (Err(rollback_error), Err(close_error)) => {
-                tracing::warn!(
-                    error = %close_error,
-                    image = %self.image_path.display(),
-                    "bounded snapshot rollback failed and close also failed"
-                );
-                return Err(rollback_error);
+            (Ok(()), Ok(())) => receipt_result,
+            (Ok(()), Err(close_error)) => {
+                if let Err(receipt_error) = receipt_result {
+                    tracing::warn!(
+                        error = %receipt_error,
+                        image = %self.image_path.display(),
+                        "bounded snapshot close failed; fenced closing receipt error suppressed"
+                    );
+                }
+                Err(close_error)
+            }
+            (Err(rollback_error), close_result) => {
+                if let Err(close_error) = close_result {
+                    tracing::warn!(
+                        error = %close_error,
+                        image = %self.image_path.display(),
+                        "bounded snapshot rollback failed and close also failed"
+                    );
+                }
+                if let Err(receipt_error) = receipt_result {
+                    tracing::warn!(
+                        error = %receipt_error,
+                        image = %self.image_path.display(),
+                        "bounded snapshot rollback failed; fenced closing receipt error suppressed"
+                    );
+                }
+                Err(rollback_error)
             }
         }
-
-        let cx = self.source.op_cx()?;
-        let after = self
-            .source
-            .pager
-            .inspect_self_contained_database_image(&cx, &self.image_path)
-            .await?;
-        if after != self.expected {
-            return Err(FrankenError::BusySnapshot {
-                conflicting_pages: "bounded structural source receipt changed during validation"
-                    .to_owned(),
-            });
-        }
-        Ok(())
     }
 }
 
@@ -247803,6 +247913,145 @@ mod pager_routing_tests {
             assert!(
                 matches!(error, FrankenError::BusySnapshot { .. }),
                 "expected a typed BusySnapshot refusal, got {error:?}"
+            );
+        });
+    }
+
+    /// GH#307: `finish()` must capture and compare the closing whole-image
+    /// receipt while the validation transaction still owns its external
+    /// shared-snapshot fence, and only then tear down. The two path-keyed test
+    /// hooks record the observed order for this image; a regression that moves
+    /// receipt capture back after rollback flips the recorded sequence.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_finish_captures_the_closing_receipt_before_fence_release() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot-order").await;
+            let snapshot = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect("snapshot opens against a matching receipt");
+
+            let events: Arc<std::sync::Mutex<Vec<&'static str>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let image_for_receipt = db_path.clone();
+            let events_for_receipt = Arc::clone(&events);
+            super::set_bounded_snapshot_pre_final_receipt_hook(Some(Arc::new(
+                move |path: &Path| {
+                    if path == image_for_receipt {
+                        events_for_receipt
+                            .lock()
+                            .unwrap()
+                            .push("fenced-receipt-capture");
+                    }
+                },
+            )));
+            let image_for_teardown = db_path.clone();
+            let events_for_teardown = Arc::clone(&events);
+            super::set_bounded_snapshot_pre_teardown_hook(Some(Arc::new(move |path: &Path| {
+                if path == image_for_teardown {
+                    events_for_teardown.lock().unwrap().push("teardown");
+                }
+            })));
+            struct BoundedSnapshotHookGuard;
+            impl Drop for BoundedSnapshotHookGuard {
+                fn drop(&mut self) {
+                    super::set_bounded_snapshot_pre_final_receipt_hook(None);
+                    super::set_bounded_snapshot_pre_teardown_hook(None);
+                }
+            }
+            let hook_guard = BoundedSnapshotHookGuard;
+
+            snapshot.finish().await.expect(
+                "an unchanged image must recertify with the receipt captured under the fence",
+            );
+            drop(hook_guard);
+
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["fenced-receipt-capture", "teardown"],
+                "the closing receipt must be captured before the validation transaction \
+                 (and with it the external shared-snapshot fence) is released"
+            );
+        });
+    }
+
+    /// GH#307: a mutation landing at the fenced proof point — after the read
+    /// window, immediately before receipt capture — must be caught, and a
+    /// receipt failure must not short-circuit teardown. Both hooks firing
+    /// proves rollback/close were still attempted after the receipt failed;
+    /// the surfaced error being the receipt's `BusySnapshot` (which rollback
+    /// and close errors outrank) proves both teardown steps ran and succeeded.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bounded_snapshot_finish_records_receipt_failure_and_still_tears_down() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let (conn, receipt, db_path) =
+                seed_bounded_snapshot_db(dir.path(), "bounded-snapshot-fenced-drift").await;
+            let page_size = usize::try_from(receipt.header().page_size.get()).unwrap();
+            let snapshot = conn
+                .begin_bounded_structural_snapshot(&receipt, &db_path, 64)
+                .await
+                .expect("snapshot opens against a matching receipt");
+
+            let events: Arc<std::sync::Mutex<Vec<&'static str>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mutated = Arc::new(AtomicBool::new(false));
+            let image_for_receipt = db_path.clone();
+            let events_for_receipt = Arc::clone(&events);
+            let mutated_for_receipt = Arc::clone(&mutated);
+            super::set_bounded_snapshot_pre_final_receipt_hook(Some(Arc::new(
+                move |path: &Path| {
+                    if path == image_for_receipt
+                        && !mutated_for_receipt.swap(true, AtomicOrdering::SeqCst)
+                    {
+                        // The fence is advisory to compliant writers; this
+                        // out-of-band mutation lands at the exact proof point
+                        // the fenced capture must still catch.
+                        corrupt_one_content_byte(&image_for_receipt, page_size);
+                        events_for_receipt
+                            .lock()
+                            .unwrap()
+                            .push("fenced-receipt-capture");
+                    }
+                },
+            )));
+            let image_for_teardown = db_path.clone();
+            let events_for_teardown = Arc::clone(&events);
+            super::set_bounded_snapshot_pre_teardown_hook(Some(Arc::new(move |path: &Path| {
+                if path == image_for_teardown {
+                    events_for_teardown.lock().unwrap().push("teardown");
+                }
+            })));
+            struct BoundedSnapshotDriftHookGuard;
+            impl Drop for BoundedSnapshotDriftHookGuard {
+                fn drop(&mut self) {
+                    super::set_bounded_snapshot_pre_final_receipt_hook(None);
+                    super::set_bounded_snapshot_pre_teardown_hook(None);
+                }
+            }
+            let hook_guard = BoundedSnapshotDriftHookGuard;
+
+            let error = snapshot
+                .finish()
+                .await
+                .expect_err("drift injected at the fenced proof point must not recertify");
+            drop(hook_guard);
+
+            assert!(
+                matches!(error, FrankenError::BusySnapshot { .. }),
+                "expected the recorded receipt BusySnapshot to surface after teardown, got {error:?}"
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec!["fenced-receipt-capture", "teardown"],
+                "a receipt failure must be recorded, not returned early: teardown must \
+                 still be attempted after the fenced receipt comparison fails"
             );
         });
     }
