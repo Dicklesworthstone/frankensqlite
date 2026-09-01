@@ -286344,3 +286344,484 @@ mod pager_routing_tests {
         });
     }
 }
+
+/// GH#386 keepers: two-table INNER JOIN outer-IPK keyset LIMIT-pushdown
+/// streaming lane. See `try_stream_keyset_limited_join_combined`.
+#[cfg(test)]
+mod join_keyset_stream_tests {
+    use super::{
+        Connection, FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS,
+        FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS, FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS,
+        Row, fsqlite_core_test_serializer,
+    };
+    use fsqlite_types::value::SqliteValue;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    fn lane_hits() -> u64 {
+        FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS.load(AtomicOrdering::Relaxed)
+    }
+    fn visited_outer() -> u64 {
+        FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS.load(AtomicOrdering::Relaxed)
+    }
+    fn runtime_refusals() -> u64 {
+        FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.load(AtomicOrdering::Relaxed)
+    }
+    fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
+        rows.iter().map(|row| row.values().to_vec()).collect()
+    }
+
+    /// Build the standard messages/conversations fixture: `outer_rows`
+    /// messages spread across `conversations` conversations, every message
+    /// with a matching parent.
+    async fn populate_fixture(conn: &Connection, outer_rows: i64, conversations: i64) {
+        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT);")
+            .await
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, \
+             content TEXT);",
+        )
+        .await
+        .unwrap();
+        let mut stmt = String::from("INSERT INTO conversations (id, title) VALUES ");
+        for cid in 1..=conversations {
+            if cid > 1 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!("({cid}, 'conversation {cid}')"));
+        }
+        stmt.push(';');
+        conn.execute(&stmt).await.unwrap();
+        let batch = 500;
+        let mut next = 1i64;
+        while next <= outer_rows {
+            let mut stmt =
+                String::from("INSERT INTO messages (id, conversation_id, content) VALUES ");
+            let end = (next + batch - 1).min(outer_rows);
+            for mid in next..=end {
+                if mid > next {
+                    stmt.push(',');
+                }
+                let cid = (mid % conversations) + 1;
+                stmt.push_str(&format!("({mid}, {cid}, 'message body {mid}')"));
+            }
+            stmt.push(';');
+            conn.execute(&stmt).await.unwrap();
+            next = end + 1;
+        }
+    }
+
+    /// The exact GH#386 Q2 keyset shape (all literals; the placeholder-bound
+    /// form reaches the same dispatch after binding).
+    fn q2(cursor: i64, limit: i64) -> String {
+        format!(
+            "SELECT m.id, m.conversation_id, c.title FROM messages m \
+             JOIN conversations c ON m.conversation_id = c.id \
+             WHERE m.id > {cursor} ORDER BY m.id ASC LIMIT {limit};"
+        )
+    }
+
+    /// Same semantics as [`q2`] but with the bound term duplicated, which the
+    /// static shape gate refuses (WHERE is not a single comparison), forcing
+    /// the generic materialize-then-limit route. Used as the byte-parity
+    /// oracle: identical rows in identical order are required.
+    fn q2_generic(cursor: i64, limit: i64) -> String {
+        format!(
+            "SELECT m.id, m.conversation_id, c.title FROM messages m \
+             JOIN conversations c ON m.conversation_id = c.id \
+             WHERE m.id > {cursor} AND m.id > {cursor} ORDER BY m.id ASC LIMIT {limit};"
+        )
+    }
+
+    /// Q2 through the lane at start/middle/end cursors on a file-backed
+    /// database: lane engages, visits only the outer rows needed for LIMIT,
+    /// and the rows are byte-identical to the generic materializing path.
+    #[test]
+    fn test_keyset_stream_lane_file_backed_parity_and_bounded_visits() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh386_keyset.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            populate_fixture(&conn, 4000, 40).await;
+
+            for (cursor, limit, expected_len) in [
+                (0i64, 7i64, 7usize),
+                (2000, 7, 7),
+                (3990, 7, 7),
+                (3995, 100, 5),
+                (4000, 7, 0),
+            ] {
+                let hits_before = lane_hits();
+                let visited_before = visited_outer();
+                let fast = conn.query(&q2(cursor, limit)).await.unwrap();
+                let hits_after = lane_hits();
+                let visited_after = visited_outer();
+                let generic = conn.query(&q2_generic(cursor, limit)).await.unwrap();
+                assert_eq!(
+                    values_of(&fast),
+                    values_of(&generic),
+                    "keyset lane must be byte-identical to the generic path \
+                     (cursor={cursor} limit={limit})"
+                );
+                assert_eq!(fast.len(), expected_len, "cursor={cursor} limit={limit}");
+                assert_eq!(
+                    hits_after - hits_before,
+                    1,
+                    "keyset lane must engage for the exact Q2 shape (cursor={cursor})"
+                );
+                // Every outer row has a matching parent, so the scan must
+                // stop after exactly the emitted row count (or the rows that
+                // remain past the cursor when fewer exist).
+                let expected_visits = u64::try_from(expected_len).unwrap();
+                assert_eq!(
+                    visited_after - visited_before,
+                    expected_visits,
+                    "outer scan must start at the bound and stop at LIMIT \
+                     (cursor={cursor} limit={limit})"
+                );
+            }
+        });
+    }
+
+    /// The GH#386 planted fixture: NULL FK, non-numeric FK, and missing
+    /// parent must not consume LIMIT, and the ON predicate keeps its
+    /// affinity/collation semantics (no raw integer-coerced rowid probe).
+    /// Runs on both the memdb (`:memory:`) and pager (file) backends.
+    #[test]
+    fn test_keyset_stream_lane_null_junk_missing_parent_fixture() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            for file_backed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let target = if file_backed {
+                    dir.path()
+                        .join("gh386_fixture.db")
+                        .to_str()
+                        .unwrap()
+                        .to_owned()
+                } else {
+                    ":memory:".to_owned()
+                };
+                let conn = Connection::open(&target).await.unwrap();
+                conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT);")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO c (id, v) VALUES (0, 'zero'), (1, 'one'), (2, 'two');")
+                    .await
+                    .unwrap();
+                conn.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, fk);")
+                    .await
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO m (id, fk) VALUES (1, NULL), (2, 'junk'), (3, 999), \
+                     (4, 1), (5, 1), (6, 2);",
+                )
+                .await
+                .unwrap();
+                let hits_before = lane_hits();
+                let rows = conn
+                    .query(
+                        "SELECT m.id, m.fk FROM m JOIN c ON m.fk = c.id \
+                         WHERE m.id > 0 ORDER BY m.id ASC LIMIT 2;",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    values_of(&rows),
+                    vec![
+                        vec![SqliteValue::Integer(4), SqliteValue::Integer(1)],
+                        vec![SqliteValue::Integer(5), SqliteValue::Integer(1)],
+                    ],
+                    "NULL/'junk'/missing-parent outers must not consume LIMIT \
+                     (file_backed={file_backed})"
+                );
+                assert_eq!(
+                    lane_hits() - hits_before,
+                    1,
+                    "lane must engage on the {} backend",
+                    if file_backed { "pager" } else { "memdb" }
+                );
+            }
+        });
+    }
+
+    /// An inner-side join key with duplicates: multiple joined rows per outer
+    /// row must keep the generic path's (outer scan, inner scan) tie order
+    /// and LIMIT must count joined output rows, not outer rows.
+    #[test]
+    fn test_keyset_stream_lane_duplicate_inner_matches_tie_order() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh386_dup.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER, tag TEXT);")
+                .await
+                .unwrap();
+            conn.execute(
+                "INSERT INTO c (id, k, tag) VALUES (1, 10, 'a'), (2, 20, 'b'), \
+                 (3, 10, 'c'), (4, 20, 'd');",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, fk INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO m (id, fk) VALUES (1, 10), (2, 20), (3, 10), (4, 30);")
+                .await
+                .unwrap();
+            let hits_before = lane_hits();
+            let fast = conn
+                .query(
+                    "SELECT m.id, c.id, c.tag FROM m JOIN c ON m.fk = c.k \
+                     WHERE m.id > 0 ORDER BY m.id ASC LIMIT 3;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(lane_hits() - hits_before, 1, "lane must engage");
+            let generic = conn
+                .query(
+                    "SELECT m.id, c.id, c.tag FROM m JOIN c ON m.fk = c.k \
+                     WHERE m.id > 0 AND m.id > 0 ORDER BY m.id ASC LIMIT 3;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                values_of(&fast),
+                values_of(&generic),
+                "duplicate inner matches must keep the generic tie order"
+            );
+            // Outer row 1 matches parents 1 and 3 (in inner scan order),
+            // outer row 2 matches parent 2 first; LIMIT 3 cuts there.
+            assert_eq!(
+                values_of(&fast),
+                vec![
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("a".into())
+                    ],
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Integer(3),
+                        SqliteValue::Text("c".into())
+                    ],
+                    vec![
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("b".into())
+                    ],
+                ],
+            );
+        });
+    }
+
+    /// Near-miss shapes must refuse the lane (hits unchanged) and keep
+    /// generic-path results. DESC, non-outer ORDER BY, LEFT JOIN, OFFSET,
+    /// residual WHERE, text bound, and `>=`-vs-`>` boundary checks.
+    #[test]
+    fn test_keyset_stream_lane_near_misses_refuse() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh386_nearmiss.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            populate_fixture(&conn, 200, 8).await;
+
+            // `>=` IS eligible: boundary parity against `>` on the
+            // predecessor cursor.
+            let hits_before = lane_hits();
+            let ge_rows = conn
+                .query(
+                    "SELECT m.id FROM messages m JOIN conversations c \
+                     ON m.conversation_id = c.id WHERE m.id >= 51 \
+                     ORDER BY m.id ASC LIMIT 5;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(lane_hits() - hits_before, 1, ">= bound must stream");
+            let gt_rows = conn.query(&q2(50, 5)).await.unwrap();
+            assert_eq!(
+                values_of(&ge_rows)
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                values_of(&gt_rows)
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                "id >= 51 must equal id > 50"
+            );
+
+            let refusing_queries = [
+                // DESC: no reverse-stream lane; must fall back.
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.id > 50 ORDER BY m.id DESC LIMIT 5;",
+                // ORDER BY a non-outer-IPK column.
+                "SELECT m.id, c.id FROM messages m JOIN conversations c \
+                 ON m.conversation_id = c.id WHERE m.id > 50 ORDER BY c.id ASC LIMIT 5;",
+                // ORDER BY a non-IPK outer column.
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.id > 50 ORDER BY m.content ASC LIMIT 5;",
+                // LEFT JOIN.
+                "SELECT m.id FROM messages m LEFT JOIN conversations c \
+                 ON m.conversation_id = c.id WHERE m.id > 50 ORDER BY m.id ASC LIMIT 5;",
+                // OFFSET.
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.id > 50 ORDER BY m.id ASC LIMIT 5 OFFSET 3;",
+                // Residual WHERE term.
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.id > 50 AND m.conversation_id = 3 ORDER BY m.id ASC LIMIT 5;",
+                // Non-integer bound literal (text keeps affinity semantics).
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.id > '50' ORDER BY m.id ASC LIMIT 5;",
+                // DISTINCT.
+                "SELECT DISTINCT m.conversation_id FROM messages m JOIN conversations c \
+                 ON m.conversation_id = c.id WHERE m.id > 50 ORDER BY m.conversation_id ASC \
+                 LIMIT 5;",
+            ];
+            for sql in refusing_queries {
+                let hits_before = lane_hits();
+                let rows = conn.query(sql).await.unwrap();
+                assert_eq!(
+                    lane_hits() - hits_before,
+                    0,
+                    "near-miss shape must refuse the keyset lane: {sql}"
+                );
+                assert!(rows.len() <= 5, "near-miss still limited: {sql}");
+            }
+
+            // OFFSET parity: rows [3..8) of the no-offset ordering.
+            let with_offset = conn
+                .query(
+                    "SELECT m.id FROM messages m JOIN conversations c \
+                     ON m.conversation_id = c.id WHERE m.id > 50 \
+                     ORDER BY m.id ASC LIMIT 5 OFFSET 3;",
+                )
+                .await
+                .unwrap();
+            let base = conn.query(&q2(50, 8)).await.unwrap();
+            assert_eq!(
+                values_of(&with_offset)
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                values_of(&base)[3..]
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                "OFFSET must keep generic semantics"
+            );
+
+            // Text bound parity: stock affinity makes `> '50'` equal `> 50`.
+            let text_bound = conn
+                .query(
+                    "SELECT m.id FROM messages m JOIN conversations c \
+                     ON m.conversation_id = c.id WHERE m.id > '50' \
+                     ORDER BY m.id ASC LIMIT 5;",
+                )
+                .await
+                .unwrap();
+            let int_bound = conn.query(&q2(50, 5)).await.unwrap();
+            assert_eq!(
+                values_of(&text_bound)
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                values_of(&int_bound)
+                    .iter()
+                    .map(|row| row[0].clone())
+                    .collect::<Vec<_>>(),
+                "text bound refusal must not change semantics"
+            );
+        });
+    }
+
+    /// A WITHOUT ROWID outer table passes the static AST gate but must be
+    /// refused by the runtime gate (its IPK is not a rowid alias).
+    #[test]
+    fn test_keyset_stream_lane_without_rowid_runtime_refusal() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh386_worowid.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, tag TEXT);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO parent (id, tag) VALUES (1, 'a'), (2, 'b');")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, fk INTEGER) WITHOUT ROWID;",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO w (id, fk) VALUES (1, 1), (2, 2), (3, 1);")
+                .await
+                .unwrap();
+            let hits_before = lane_hits();
+            let refusals_before = runtime_refusals();
+            let rows = conn
+                .query(
+                    "SELECT w.id, p.tag FROM w JOIN parent p ON w.fk = p.id \
+                     WHERE w.id > 0 ORDER BY w.id ASC LIMIT 2;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(lane_hits() - hits_before, 0, "WITHOUT ROWID must refuse");
+            assert!(
+                runtime_refusals() > refusals_before,
+                "WITHOUT ROWID refusal must be a counted runtime refusal"
+            );
+            assert_eq!(
+                values_of(&rows),
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())],
+                    vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())],
+                ],
+            );
+        });
+    }
+
+    /// Structural scaling keeper: at a fixed cursor distance and LIMIT, the
+    /// outer rows visited must be identical for N and 2N tables — bounded by
+    /// need, not by table size — while the generic route on the same data
+    /// scans the whole table.
+    #[test]
+    fn test_keyset_stream_lane_scaling_n_vs_2n_bounded_work() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let mut visits = Vec::new();
+            for outer_rows in [3000i64, 6000i64] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(format!("gh386_scale_{outer_rows}.db"));
+                let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+                populate_fixture(&conn, outer_rows, 30).await;
+                let hits_before = lane_hits();
+                let visited_before = visited_outer();
+                let started = std::time::Instant::now();
+                let fast = conn.query(&q2(500, 20)).await.unwrap();
+                let fast_elapsed = started.elapsed();
+                assert_eq!(lane_hits() - hits_before, 1);
+                assert_eq!(fast.len(), 20);
+                let visited = visited_outer() - visited_before;
+                let started = std::time::Instant::now();
+                let generic = conn.query(&q2_generic(500, 20)).await.unwrap();
+                let generic_elapsed = started.elapsed();
+                assert_eq!(values_of(&fast), values_of(&generic));
+                println!(
+                    "GH#386 scaling: N={outer_rows} visited_outer={visited} \
+                     lane={fast_elapsed:?} generic_materialize={generic_elapsed:?}"
+                );
+                visits.push(visited);
+            }
+            assert_eq!(
+                visits[0], visits[1],
+                "visited outer rows must not scale with table size"
+            );
+            assert_eq!(visits[0], 20, "all-matching join visits exactly LIMIT rows");
+        });
+    }
+}
