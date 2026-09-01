@@ -2129,9 +2129,21 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 mode
             };
 
+            // Stock parity (wal.c `sqlite3WalCheckpoint`: `*pnCkpt =
+            // nBackfill`): the reported backfill count is CUMULATIVE for the
+            // current WAL generation, not this call's new frames. With the
+            // GH#402 resume watermark, a checkpoint whose frames were already
+            // durably backfilled by an earlier pass copies nothing new — but
+            // `PRAGMA wal_checkpoint`'s third column must still report how far
+            // the database file has caught up, or every post-watermark
+            // checkpoint looks like it checkpointed nothing (the GH#399
+            // keepers caught exactly that). The watermark math above keeps
+            // using the planner's raw per-call count.
             Ok(CheckpointResult {
                 total_frames,
-                frames_backfilled: result.frames_backfilled,
+                frames_backfilled: effective_backfilled
+                    .saturating_add(result.frames_backfilled)
+                    .min(total_frames),
                 completed: result.plan.completes_checkpoint(),
                 wal_was_reset: result.wal_was_reset,
                 requested_mode: mode,
