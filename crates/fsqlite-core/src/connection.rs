@@ -51988,7 +51988,7 @@ impl Connection {
                     if let Some(values) = parse_record(&payload) {
                         let segid = values.first().map_or(0, SqliteValue::to_integer);
                         if doomed_segids.contains(&segid) {
-                            doomed_records.push(payload.to_vec());
+                            doomed_records.push(payload.clone());
                         }
                     }
                     if !cursor.next(cx).await? {
@@ -88446,33 +88446,35 @@ impl Connection {
 
         // ── 4. Perform joins ──
         // Start with primary table rows as "left" side.
-        let mut combined: Vec<Vec<SqliteValue>> = table_rows[0]
-            .iter()
-            .map(|row| {
-                // Invariant: a materialized primary-table row is at least as wide
-                // as scan_width(). A violation means scan_width() over-counted —
-                // historically a virtual/FTS5 table that reported a hidden-rowid or
-                // special column the scan never materialized (see
-                // join_table_supports_hidden_rowid). Surface the offending widths
-                // so the over-count is self-diagnosing instead of a bare slice OOB.
-                debug_assert!(
-                    row.len() >= primary_width,
-                    "join primary row width {} < scan_width {}: primary table scan_width over-counted columns the scan did not materialize",
-                    row.len(),
-                    primary_width,
-                );
-                row[..primary_width].to_vec()
-            })
-            .collect();
-        if let Some(rows) = keyset_streamed {
+        let mut combined: Vec<Vec<SqliteValue>> = if let Some(rows) = keyset_streamed {
             // GH#386: the streaming lane emitted the joined rows directly
             // (outer seek + per-row inner probe + early LIMIT stop) in the
             // exact (outer scan order, inner scan order) sequence the join
             // loop below would produce. The join loop is skipped; the WHERE
             // filter below is a no-op re-check (the whole WHERE is the seek
             // bound) and the stable ORDER BY sort is a no-op reorder.
-            combined = rows;
-        }
+            rows
+        } else {
+            table_rows[0]
+                .iter()
+                .map(|row| {
+                    // Invariant: a materialized primary-table row is at least as
+                    // wide as scan_width(). A violation means scan_width()
+                    // over-counted — historically a virtual/FTS5 table that
+                    // reported a hidden-rowid or special column the scan never
+                    // materialized (see join_table_supports_hidden_rowid).
+                    // Surface the offending widths so the over-count is
+                    // self-diagnosing instead of a bare slice OOB.
+                    debug_assert!(
+                        row.len() >= primary_width,
+                        "join primary row width {} < scan_width {}: primary table scan_width over-counted columns the scan did not materialize",
+                        row.len(),
+                        primary_width,
+                    );
+                    row[..primary_width].to_vec()
+                })
+                .collect()
+        };
 
         for (join_idx, join) in from.joins.iter().enumerate() {
             if keyset_stream_active {
