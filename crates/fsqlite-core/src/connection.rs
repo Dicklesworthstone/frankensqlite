@@ -1221,6 +1221,19 @@ static FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+/// GH#386: times the two-table INNER JOIN outer-IPK keyset LIMIT-pushdown
+/// streaming lane produced the joined rows (outer seek + early LIMIT stop)
+/// instead of the generic materialize-then-limit join fallback.
+static FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+/// GH#386: outer-table rows actually visited by the keyset streaming lane
+/// (rows at or after the seek bound that were inflated and probed). Bounded
+/// by the rows needed to emit LIMIT joined rows, not by the table size.
+static FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS: AtomicU64 = AtomicU64::new(0);
+/// GH#386: times a query matched the static keyset-pushdown shape but the
+/// runtime gate refused the lane (non-IPK order column, WITHOUT ROWID or
+/// vtab/FTS5 source, unstreamable backend, ...), falling back to the generic
+/// materialize path.
+static FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static FSQLITE_JOIN_HASH_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
@@ -36720,7 +36733,17 @@ impl Connection {
                     }
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
+                    // GH#386: for the two-table INNER JOIN outer-IPK keyset
+                    // shape, leave the LIMIT on the statement so the
+                    // streaming pushdown lane inside `execute_join_select`
+                    // can stop the outer scan early. If the lane refuses at
+                    // runtime, `execute_join_select`'s own tail applies the
+                    // same LIMIT clause, so semantics are unchanged.
+                    let limit_clause = if join_keyset_limit_pushdown_shape(&bound).is_some() {
+                        None
+                    } else {
+                        bound.limit.take()
+                    };
                     if limit_clause
                         .as_ref()
                         .is_some_and(bound_limit_clause_is_constant_zero)
@@ -50881,20 +50904,34 @@ impl Connection {
         )
         .await?;
 
-        self.replace_storage_table_rows(
-            &format!("{table_name}_idx"),
-            shadow_rows.idx.into_iter().enumerate().map(|(index, row)| {
-                (
-                    i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
-                    vec![
-                        SqliteValue::Integer(i64::from(row.segid)),
-                        SqliteValue::Blob(Arc::from(row.term.into_boxed_slice())),
-                        SqliteValue::Integer(i64::from(row.btree_page)),
-                    ],
-                )
-            }),
-        )
-        .await?;
+        // GH#404: `%_idx.pgno` uses stock's encoding `(btree_page << 1) | dlidx`
+        // — the same value fsqlite's own lazy reader decodes. Rows are written
+        // only into a stock-shaped WITHOUT ROWID `%_idx`; a legacy rowid-shaped
+        // shadow keeps its (empty) status quo, because the index-cursor reader
+        // must never meet rows on a table-structured root (frankensqlite#121).
+        let idx_name = format!("{table_name}_idx");
+        let idx_values = if self.fts5_idx_shadow_is_without_rowid(&idx_name) {
+            shadow_rows
+                .idx
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let encoded_pgno = row.encoded_pgno()?;
+                    Ok((
+                        i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
+                        vec![
+                            SqliteValue::Integer(i64::from(row.segid)),
+                            SqliteValue::Blob(Arc::from(row.term.into_boxed_slice())),
+                            SqliteValue::Integer(encoded_pgno),
+                        ],
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        self.replace_storage_table_rows(&idx_name, idx_values)
+            .await?;
 
         self.replace_storage_table_rows(
             &format!("{table_name}_config"),
@@ -51126,6 +51163,11 @@ impl Connection {
         self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)
             .await?;
 
+        // Append the new segment's `%_idx` seek rows (GH#404): without them
+        // stock SQLite's term seek never leaves page 1 of a multi-leaf segment.
+        self.append_fts5_idx_rows(&format!("{table_name}_idx"), &flush.idx_rows)
+            .await?;
+
         // Append the new documents' docsize rows (read back on reopen for BM25).
         let docsize_name = format!("{table_name}_docsize");
         if self.schema_table_exists(&docsize_name) {
@@ -51284,6 +51326,14 @@ impl Connection {
         // dlidx orphans and the next promote's integrity_report rejects the
         // shadow (bd-x9ber).
         self.delete_fts5_data_rows_for_segids(table_name, &merged_segids.iter().copied().collect())
+            .await?;
+        // GH#404: swap the `%_idx` seek rows the same way — the merged
+        // segment's rows in, the dropped inputs' rows out (a surviving row for
+        // a dropped segid would alias the seek space when that segid is
+        // reallocated).
+        let idx_name = format!("{table_name}_idx");
+        self.append_fts5_idx_rows(&idx_name, &flush.idx_rows).await?;
+        self.delete_fts5_idx_rows_for_segids(&idx_name, &merged_segids.iter().copied().collect())
             .await?;
 
         tracing::debug!(
@@ -51549,6 +51599,16 @@ impl Connection {
             .collect();
         self.delete_fts5_data_rows_for_segids(table_name, &dropped_segids)
             .await?;
+
+        // GH#404: every segment is gone, so clear the `%_idx` seek shadow too.
+        // The next insert generation restarts segids at 1; a stale row from a
+        // dropped segid would alias the restarted seek space for both stock
+        // SQLite and fsqlite's own lazy reader.
+        let idx_name = format!("{table_name}_idx");
+        if self.schema_table_exists(&idx_name) {
+            self.replace_storage_table_rows(&idx_name, std::iter::empty::<(i64, Vec<SqliteValue>)>())
+                .await?;
+        }
 
         // Contentless: every document is gone, so clear the whole `_docsize`
         // shadow. External-content: the documents still live in the content
@@ -51828,6 +51888,117 @@ impl Connection {
             }
             for id in to_delete {
                 if cursor.table_move_to(cx, id).await?.is_found() {
+                    cursor.delete(cx).await?;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// True when the `%_idx` shadow is the stock-shaped WITHOUT ROWID table.
+    /// The GH#404 seek-row writers only touch that shape: a legacy rowid-shaped
+    /// `%_idx` stays empty (status quo), because the lazy reader probes the
+    /// root with an index cursor and rows on a table-structured root would trip
+    /// the frankensqlite#121 cursor-shape guard.
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_idx_shadow_is_without_rowid(&self, idx_name: &str) -> bool {
+        let schema = self.schema.borrow();
+        schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(idx_name))
+            .is_some_and(|table| table.without_rowid && table.root_page > 0)
+    }
+
+    /// Append `rows` to the stock-shaped `%_idx` shadow (GH#404): full-record
+    /// index-key inserts of `(segid, term, encoded_pgno)`. Callers pass rows
+    /// for freshly allocated segids only, so the keys never collide with
+    /// existing entries. No-op when `%_idx` is absent or legacy rowid-shaped.
+    #[cfg(feature = "ext-fts5")]
+    async fn append_fts5_idx_rows(
+        &self,
+        idx_name: &str,
+        rows: &[fsqlite_ext_fts5::Fts5IdxRow],
+    ) -> Result<()> {
+        if rows.is_empty() || !self.fts5_idx_shadow_is_without_rowid(idx_name) {
+            return Ok(());
+        }
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(idx_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {idx_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, idx_name, "fts5 %_idx shadow")?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let encoded_pgno = row.encoded_pgno()?;
+            records.push(serialize_record_with_encoding(
+                &[
+                    SqliteValue::Integer(i64::from(row.segid)),
+                    SqliteValue::Blob(Arc::from(row.term.clone().into_boxed_slice())),
+                    SqliteValue::Integer(encoded_pgno),
+                ],
+                self.db_text_encoding.get(),
+            ));
+        }
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, false).await?;
+            for record in records {
+                cursor.index_insert(cx, &record).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete every `%_idx` seek row whose segid is in `segids` (GH#404): the
+    /// merge and delete paths drop segments, and a surviving row for a dropped
+    /// segid would alias the seek space when its segid is later reallocated.
+    /// No-op when `%_idx` is absent or legacy rowid-shaped.
+    #[cfg(feature = "ext-fts5")]
+    async fn delete_fts5_idx_rows_for_segids(
+        &self,
+        idx_name: &str,
+        segids: &std::collections::BTreeSet<u32>,
+    ) -> Result<()> {
+        if segids.is_empty() || !self.fts5_idx_shadow_is_without_rowid(idx_name) {
+            return Ok(());
+        }
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(idx_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {idx_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, idx_name, "fts5 %_idx shadow")?;
+        let doomed_segids: Vec<i64> = segids.iter().map(|segid| i64::from(*segid)).collect();
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, false).await?;
+            // Collect the doomed full-record keys first, then delete (never
+            // mutate the tree while iterating it).
+            let mut doomed_records: Vec<Vec<u8>> = Vec::new();
+            if cursor.first(cx).await? {
+                loop {
+                    let payload = cursor.payload(cx).await?;
+                    if let Some(values) = parse_record(&payload) {
+                        let segid = values.first().map_or(0, SqliteValue::to_integer);
+                        if doomed_segids.contains(&segid) {
+                            doomed_records.push(payload.to_vec());
+                        }
+                    }
+                    if !cursor.next(cx).await? {
+                        break;
+                    }
+                }
+            }
+            for record in doomed_records {
+                let _ = cursor.index_move_to(cx, &record).await?;
+                if !cursor.eof() && cursor.payload(cx).await?.as_slice() == record.as_slice() {
                     cursor.delete(cx).await?;
                 }
             }
@@ -82736,6 +82907,292 @@ impl Connection {
         Some(result)
     }
 
+    /// GH#386: streaming keyset LIMIT-pushdown lane for the two-table INNER
+    /// JOIN outer-IPK keyset form
+    /// (`... JOIN ... WHERE o.ipk > ? ORDER BY o.ipk ASC LIMIT ?`).
+    ///
+    /// The generic join fallback materializes EVERY outer row before the
+    /// post-sort LIMIT truncation, making keyset pagination O(table) per page
+    /// regardless of LIMIT or cursor position. When the single ORDER BY term
+    /// is exactly the outer table's rowid-alias IPK ascending — the outer
+    /// B-tree's scan order — the nested-loop join emits rows in ORDER BY
+    /// order already, so the outer scan can seek to the WHERE bound and stop
+    /// as soon as LIMIT joined rows exist.
+    ///
+    /// Semantics preservation relative to the generic path:
+    /// - Row set: the WHERE clause is exactly the seek bound (the static
+    ///   shape refuses residual terms), so every row at/after the seek
+    ///   passes WHERE; the ON predicate is evaluated per pair with the same
+    ///   `eval_join_predicate` the generic nested-loop join uses, under the
+    ///   same `JoinExprBindings` and fallback function registry.
+    /// - Order: outer rows arrive in ascending rowid order and each outer
+    ///   row's inner matches are emitted in inner scan order — the same
+    ///   (outer scan order, inner scan order) sequence the generic
+    ///   nested-loop/hash join produces; the downstream stable
+    ///   `sort_rows_by_order_terms` is then a no-op reorder, so the emitted
+    ///   prefix is byte-identical to the generic path's post-sort prefix.
+    /// - LIMIT boundary: the lane emits AT MOST the literal LIMIT rows and
+    ///   `select.limit` still reaches the shared tail LIMIT application, so
+    ///   truncation runs through the same code either way.
+    ///
+    /// Returns `Ok(None)` when the lane refuses (shape mismatch or runtime
+    /// gate); the caller then runs the generic scan+join unchanged.
+    #[allow(clippy::too_many_lines)]
+    async fn try_stream_keyset_limited_join_combined(
+        &self,
+        select: &SelectStatement,
+        from: &FromClause,
+        table_sources: &[JoinTableSource],
+        col_map: &[(String, String, bool)],
+    ) -> Result<Option<Vec<Vec<SqliteValue>>>> {
+        let Some(shape) = join_keyset_limit_pushdown_shape(select) else {
+            return Ok(None);
+        };
+        let refuse = || {
+            FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.fetch_add(1, AtomicOrdering::Relaxed);
+        };
+        let [outer_src, inner_src] = table_sources else {
+            refuse();
+            return Ok(None);
+        };
+        let Some(outer_binding) = outer_src.local_table_binding().cloned() else {
+            refuse();
+            return Ok(None);
+        };
+        if inner_src.local_table_binding().is_none() {
+            refuse();
+            return Ok(None);
+        }
+        for src in [outer_src, inner_src] {
+            if self.has_live_vtab_instance(&src.table_name)
+                || self.has_live_fts5_instance(&src.table_name)
+            {
+                refuse();
+                return Ok(None);
+            }
+        }
+        // Resolve the outer table's rowid-alias (INTEGER PRIMARY KEY) column.
+        // `rowid_alias_columns` only holds ordinary rowid tables, so WITHOUT
+        // ROWID outers (and bare-`rowid` ordering on alias-less tables) refuse
+        // here. Both the ORDER BY column and the WHERE bound column must name
+        // exactly that column.
+        let ipk_idx = {
+            let alias_columns = self.rowid_alias_columns.borrow();
+            alias_columns
+                .get(&outer_binding.name.to_ascii_lowercase())
+                .copied()
+        };
+        let Some(ipk_idx) = ipk_idx else {
+            refuse();
+            return Ok(None);
+        };
+        let Some(ipk_name) = outer_src.col_names.get(ipk_idx) else {
+            refuse();
+            return Ok(None);
+        };
+        let outer_label = outer_src.alias.as_deref().unwrap_or(&outer_src.table_name);
+        let names_outer_ipk = |col_ref: &ColumnRef| -> bool {
+            col_ref.column.as_ref().eq_ignore_ascii_case(ipk_name)
+                && match col_ref.table.as_deref() {
+                    Some(qualifier) => qualifier.eq_ignore_ascii_case(outer_label),
+                    // A bare name is only provably the outer IPK when the
+                    // inner table exposes no column of the same name.
+                    None => !inner_src
+                        .col_names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(ipk_name)),
+                }
+        };
+        if !names_outer_ipk(shape.order_col) || !names_outer_ipk(shape.bound_col) {
+            refuse();
+            return Ok(None);
+        }
+        let Some(JoinConstraint::On(on_expr)) = &from.joins[0].constraint else {
+            // Guaranteed by the static shape gate.
+            refuse();
+            return Ok(None);
+        };
+
+        // Materialize the inner (probe) table exactly like the generic scan
+        // does. The plain-named-table SQL fallback scan is not mirrored here:
+        // if neither the memdb nor the pager scan can serve the inner table,
+        // refuse the lane rather than recursing through `self.query`.
+        let right_width = inner_src.scan_width();
+        let mut inner_rows: Vec<Vec<SqliteValue>> =
+            if let Some(rows) = self.try_scan_join_source_from_memdb(inner_src) {
+                rows
+            } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src).await {
+                result?
+            } else {
+                refuse();
+                return Ok(None);
+            };
+        for row in &mut inner_rows {
+            if row.len() != right_width {
+                row.resize(right_width, SqliteValue::Null);
+            }
+        }
+
+        let limit_rows = shape.limit_rows;
+        let primary_width = outer_src.scan_width();
+        let mut combined: Vec<Vec<SqliteValue>> = Vec::new();
+        let mut visited_outer: u64 = 0;
+        let lower_bound = if shape.lower_inclusive {
+            Some(shape.lower_bound)
+        } else {
+            // `ipk > i64::MAX` matches nothing.
+            shape.lower_bound.checked_add(1)
+        };
+        let (Some(lower_bound), false) = (lower_bound, inner_rows.is_empty()) else {
+            // Empty result without touching the outer table: either the bound
+            // excludes every rowid, or the INNER join's probe side is empty.
+            FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(Some(combined));
+        };
+
+        // Same ON-predicate binding scope the generic `execute_single_join`
+        // establishes for its hash/nested paths.
+        let _on_bindings_guard = {
+            let mut bindings = JoinExprBindings::default();
+            bindings.bind_expr(on_expr, col_map, None);
+            JoinExprBindingsGuard::push(bindings)
+        };
+        let mut scratch: Vec<SqliteValue> = Vec::with_capacity(primary_width + right_width);
+        // Probe one outer row against the inner rows in scan order; returns
+        // `true` once LIMIT joined rows exist.
+        let mut join_outer_row = |outer_row: &[SqliteValue]| -> Result<bool> {
+            for right_row in &inner_rows {
+                scratch.clear();
+                scratch.extend_from_slice(&outer_row[..primary_width]);
+                scratch.extend_from_slice(&right_row[..right_width]);
+                if eval_join_predicate(on_expr, &scratch, col_map)? {
+                    combined.push(scratch.clone());
+                    if combined.len() >= limit_rows {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        };
+
+        // Outer scan, mirroring the generic scan's backend order
+        // (memdb, then pager) and per-row materialization exactly.
+        let mut memdb_handled = false;
+        if self.join_mem_scan_safe() {
+            let table_schema = {
+                let schema = self.schema.borrow();
+                schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&outer_binding.name))
+                    .cloned()
+            };
+            if let Some(table_schema) = table_schema {
+                let has_virtual_generated = table_schema.columns.iter().any(|column| {
+                    column.generated_expr.is_some() && column.generated_stored != Some(true)
+                });
+                let db = self.db.borrow();
+                if let Some(table) = db.get_table(table_schema.root_page) {
+                    memdb_handled = true;
+                    for (rowid, values) in table.iter_rows_from(lower_bound) {
+                        visited_outer += 1;
+                        let mut row = values.to_vec();
+                        if let Some(alias_value) = row.get_mut(ipk_idx) {
+                            *alias_value = SqliteValue::Integer(rowid);
+                        }
+                        if has_virtual_generated
+                            && Self::fill_virtual_generated_columns(
+                                &table_schema,
+                                rowid,
+                                Some(ipk_idx),
+                                &mut row,
+                            )
+                            .is_err()
+                        {
+                            // The generic memdb scan declines wholesale on a
+                            // generated-column evaluation error so the pager
+                            // path can surface it; mirror by refusing the
+                            // lane and discarding the partial stream.
+                            refuse();
+                            return Ok(None);
+                        }
+                        if outer_src.hidden_rowid_projection.is_some() {
+                            row.push(SqliteValue::Integer(rowid));
+                        }
+                        if row.len() != primary_width {
+                            row.resize(primary_width, SqliteValue::Null);
+                        }
+                        if self.with_fallback_function_registry(|| join_outer_row(&row))? {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !memdb_handled {
+            if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
+                refuse();
+                return Ok(None);
+            }
+            let outer_table = {
+                let schema = self.schema.borrow();
+                schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&outer_binding.name))
+                    .map(|table| (table.root_page, table.clone()))
+            };
+            let Some((root_page_num, table_schema)) = outer_table else {
+                refuse();
+                return Ok(None);
+            };
+            let cx = &self.root_cx;
+            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+            let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
+                .unwrap_or(PageNumber::ONE);
+            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true).await?;
+            // SeekGE: `Found` lands on `lower_bound` itself, `NotFound` lands
+            // on its successor (or EOF), so the cursor starts at the first
+            // rowid `>= lower_bound` either way.
+            cursor.table_move_to(cx, lower_bound).await?;
+            let mut valid = !cursor.eof();
+            while valid {
+                let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
+                let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "keyset join stream scan: table `{}` rowid {rowid} has invalid record",
+                            outer_binding.name
+                        ),
+                    }
+                })?;
+                let mut row = self
+                    .inflate_table_row_values_for_storage_reload(
+                        &table_schema,
+                        rowid,
+                        &payload_values,
+                        Some(ipk_idx),
+                    )
+                    .await?;
+                visited_outer += 1;
+                if outer_src.hidden_rowid_projection.is_some() {
+                    row.push(SqliteValue::Integer(rowid));
+                }
+                if row.len() != primary_width {
+                    row.resize(primary_width, SqliteValue::Null);
+                }
+                if self.with_fallback_function_registry(|| join_outer_row(&row))? {
+                    break;
+                }
+                valid = cursor.next(cx).await?;
+            }
+            drop(cursor);
+            txn.commit(cx).await?;
+        }
+        FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS
+            .fetch_add(visited_outer, AtomicOrdering::Relaxed);
+        Ok(Some(combined))
+    }
+
     /// Execute a SELECT containing window functions at the connection level.
     ///
     /// Execute a SELECT with both GROUP BY and window functions.
@@ -87793,6 +88250,21 @@ impl Connection {
                 })
             };
 
+        // GH#386: two-table INNER JOIN outer-IPK keyset LIMIT pushdown. When
+        // the ORDER BY is exactly the outer scan key, stream the outer scan
+        // from the WHERE bound and stop once LIMIT joined rows exist instead
+        // of materializing the entire outer table below. Callers that
+        // pre-check `join_keyset_limit_pushdown_shape` leave `select.limit`
+        // in place so the lane (and, on refusal, the shared tail LIMIT
+        // application) can see it.
+        let keyset_streamed = if select.limit.is_some() && preloaded.iter().all(Option::is_none) {
+            self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
+                .await?
+        } else {
+            None
+        };
+        let keyset_stream_active = keyset_streamed.is_some();
+
         // ── 3. Load each table's raw rows ──
         // Cache scanned rows by resolved scan identity so that repeated
         // references to the same source reuse the same rows without letting
@@ -87800,6 +88272,12 @@ impl Connection {
         let mut scanned_cache: HashMap<String, Vec<Vec<SqliteValue>>> = HashMap::new();
         let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
         for (i, src) in table_sources.iter().enumerate() {
+            if keyset_stream_active {
+                // GH#386: the streaming keyset lane already produced the
+                // joined rows with a bounded outer scan; skip the full scans.
+                table_rows.push(Vec::new());
+                continue;
+            }
             if let Some(rows) = preloaded[i].take() {
                 // Subquery: use preloaded rows.
                 table_rows.push(maybe_filter_primary_join_rows(
@@ -87901,8 +88379,21 @@ impl Connection {
                 row[..primary_width].to_vec()
             })
             .collect();
+        if let Some(rows) = keyset_streamed {
+            // GH#386: the streaming lane emitted the joined rows directly
+            // (outer seek + per-row inner probe + early LIMIT stop) in the
+            // exact (outer scan order, inner scan order) sequence the join
+            // loop below would produce. The join loop is skipped; the WHERE
+            // filter below is a no-op re-check (the whole WHERE is the seek
+            // bound) and the stable ORDER BY sort is a no-op reorder.
+            combined = rows;
+        }
 
         for (join_idx, join) in from.joins.iter().enumerate() {
+            if keyset_stream_active {
+                // GH#386: join already applied by the streaming keyset lane.
+                break;
+            }
             let right_rows = &table_rows[join_idx + 1];
             let right_width = table_sources[join_idx + 1].scan_width();
             let current_width: usize = table_sources[..=join_idx]
@@ -141160,6 +141651,183 @@ fn plan_hash_join_predicate(
 /// Perform a single join step: combine left-side rows with right-side rows.
 /// Uses hash-join O(n+m) for equi-joins, falls back to nested-loop O(n*m).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// GH#386: statically parsed shape of a two-table INNER JOIN outer-IPK keyset
+/// query eligible for the streaming LIMIT-pushdown lane:
+///
+/// ```sql
+/// SELECT ... FROM outer o JOIN inner i ON <expr>
+/// WHERE o.ipk > <int> ORDER BY o.ipk ASC LIMIT <int>
+/// ```
+///
+/// Whether `order_col` / `bound_col` actually name the outer table's rowid
+/// alias (INTEGER PRIMARY KEY) column is resolved at runtime against the
+/// live schema; this struct only carries the syntactic pieces.
+struct JoinKeysetLimitPushdownShape<'a> {
+    /// The single ORDER BY column reference (must be ASC with no NULLS term).
+    order_col: &'a ColumnRef,
+    /// The column side of the WHERE lower-bound comparison.
+    bound_col: &'a ColumnRef,
+    /// The literal integer side of the WHERE lower-bound comparison.
+    lower_bound: i64,
+    /// `true` for `>=`, `false` for `>`.
+    lower_inclusive: bool,
+    /// The literal LIMIT row count (>= 1; constant-zero limits keep the
+    /// existing early-return path and negatives mean "no limit").
+    limit_rows: usize,
+}
+
+/// GH#386 helper: `(column, integer literal)` when `col` is a bare/qualified
+/// column reference and `lit` is exactly an integer literal. Any other
+/// literal type (NULL, text, real, blob, TRUE/FALSE) refuses the lane so the
+/// generic path keeps its comparison-affinity semantics; a raw B-tree seek
+/// would integer-coerce them.
+fn join_keyset_bound_column_literal<'a>(col: &'a Expr, lit: &Expr) -> Option<(&'a ColumnRef, i64)> {
+    let Expr::Column(col_ref, _) = col else {
+        return None;
+    };
+    if col_ref.schema.is_some() {
+        return None;
+    }
+    let Expr::Literal(Literal::Integer(value), _) = lit else {
+        return None;
+    };
+    Some((col_ref, *value))
+}
+
+/// GH#386 helper: recognize `col > lit`, `col >= lit`, `lit < col`, and
+/// `lit <= col` as an outer-scan lower bound. Returns
+/// `(column, bound, inclusive)`.
+fn join_keyset_lower_bound_term(expr: &Expr) -> Option<(&ColumnRef, i64, bool)> {
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    match op {
+        BinaryOp::Gt => {
+            join_keyset_bound_column_literal(left, right).map(|(col, v)| (col, v, false))
+        }
+        BinaryOp::Ge => join_keyset_bound_column_literal(left, right).map(|(col, v)| (col, v, true)),
+        BinaryOp::Lt => {
+            join_keyset_bound_column_literal(right, left).map(|(col, v)| (col, v, false))
+        }
+        BinaryOp::Le => join_keyset_bound_column_literal(right, left).map(|(col, v)| (col, v, true)),
+        _ => None,
+    }
+}
+
+/// GH#386: static (AST-only) gate for the keyset LIMIT-pushdown join lane.
+///
+/// Runs on a placeholder-bound statement, so parameters have already been
+/// substituted as literals. Deliberately narrow — every refused shape falls
+/// through to the generic materialize-then-limit path unchanged:
+/// - exactly two named table sources joined by one non-NATURAL INNER JOIN
+///   with an `ON` constraint free of subqueries/aggregates;
+/// - WHERE is exactly one `col > / >= <integer literal>` lower bound
+///   (residual terms would make "rows visited" unbounded-by-LIMIT and are
+///   left to the generic path);
+/// - ORDER BY is exactly one bare/qualified column, ascending, with no
+///   COLLATE wrapper and no NULLS FIRST/LAST (DESC would need a reverse
+///   scan lane; refused for now);
+/// - LIMIT is a positive integer literal with no OFFSET (OFFSET is refused
+///   rather than emulated so the boundary semantics stay on one code path);
+/// - no DISTINCT / GROUP BY / HAVING / windows / CTEs / compound operators,
+///   no per-table AS OF time travel, and no subqueries or aggregates in the
+///   projection.
+fn join_keyset_limit_pushdown_shape(
+    select: &SelectStatement,
+) -> Option<JoinKeysetLimitPushdownShape<'_>> {
+    if select.with.is_some() || !select.body.compounds.is_empty() {
+        return None;
+    }
+    let limit_clause = select.limit.as_ref()?;
+    if limit_clause.offset.is_some() {
+        return None;
+    }
+    let Expr::Literal(Literal::Integer(limit_rows), _) = &limit_clause.limit else {
+        return None;
+    };
+    if *limit_rows < 1 {
+        return None;
+    }
+    let limit_rows = usize::try_from(*limit_rows).ok()?;
+    let [order_term] = select.order_by.as_slice() else {
+        return None;
+    };
+    if order_term.direction == Some(SortDirection::Desc) || order_term.nulls.is_some() {
+        return None;
+    }
+    let Expr::Column(order_col, _) = &order_term.expr else {
+        return None;
+    };
+    if order_col.schema.is_some() {
+        return None;
+    }
+    let SelectCore::Select {
+        distinct: Distinctness::All,
+        columns,
+        from: Some(from),
+        where_clause: Some(where_clause),
+        group_by,
+        having: None,
+        windows,
+    } = &select.body.select
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || !windows.is_empty() {
+        return None;
+    }
+    let (bound_col, lower_bound, lower_inclusive) = join_keyset_lower_bound_term(where_clause)?;
+    if !matches!(
+        &from.source,
+        TableOrSubquery::Table {
+            time_travel: None,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let [join] = from.joins.as_slice() else {
+        return None;
+    };
+    if join.join_type.natural || join.join_type.kind != JoinKind::Inner {
+        return None;
+    }
+    if !matches!(
+        &join.table,
+        TableOrSubquery::Table {
+            time_travel: None,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let Some(JoinConstraint::On(on_expr)) = &join.constraint else {
+        return None;
+    };
+    if expr_has_any_subquery(on_expr) || expr_has_aggregate(on_expr) {
+        return None;
+    }
+    for column in columns {
+        if let ResultColumn::Expr { expr, .. } = column
+            && (expr_has_any_subquery(expr)
+                || expr_has_aggregate(expr)
+                || expr_has_window_function(expr))
+        {
+            return None;
+        }
+    }
+    Some(JoinKeysetLimitPushdownShape {
+        order_col,
+        bound_col,
+        lower_bound,
+        lower_inclusive,
+        limit_rows,
+    })
+}
+
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],

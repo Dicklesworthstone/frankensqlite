@@ -938,10 +938,17 @@ impl Fts5SegmentLeaf {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // Header bytes [0..2] (the "first rowid" offset) stay 0: stock FTS5
+        // sets them only when a rowid lands on the page BEFORE any term — a
+        // doclist-continuation page — and fsqlite never splits a doclist
+        // across leaves, so every written leaf begins with a term. A nonzero
+        // value here makes stock's segment iterator misparse every page >= 2
+        // as a doclist continuation ("malformed inverted index", GH#404).
+        // Stock-written continuation pages are still READ correctly: `decode`
+        // preserves the header field and the stitcher consumes it.
         let mut page = vec![0, 0, 0, 0];
         let mut term_offsets = Vec::with_capacity(self.terms.len());
         let mut previous_term: &[u8] = &[];
-        let mut first_rowid_offset = 0;
 
         for (index, entry) in self.terms.iter().enumerate() {
             if index > 0 && entry.term.as_slice() <= previous_term {
@@ -967,10 +974,6 @@ impl Fts5SegmentLeaf {
                 page.extend_from_slice(&entry.term[prefix_len..]);
             }
 
-            if index == 0 {
-                first_rowid_offset = u16::try_from(page.len())
-                    .map_err(|_| fts5_data_error("segment leaf rowid offset exceeds u16"))?;
-            }
             page.extend_from_slice(&entry.doclist.encode()?);
             previous_term = &entry.term;
         }
@@ -986,7 +989,6 @@ impl Fts5SegmentLeaf {
             previous_offset = offset;
         }
 
-        write_be_u16(&mut page[0..2], first_rowid_offset);
         write_be_u16(&mut page[2..4], footer_offset);
         Ok(page)
     }
@@ -1845,6 +1847,10 @@ pub struct Fts5MergeFlush {
     /// The merged inputs' `_data` rows (segment leaves + tombstone pages) to
     /// physically delete, reclaiming their space.
     pub deleted_data_rowids: Vec<i64>,
+    /// The merged segment's `%_idx` seek rows ([`segment_idx_rows`], GH#404).
+    /// The caller appends these and deletes the merged inputs' `%_idx` rows.
+    /// Empty when the merge dropped every row.
+    pub idx_rows: Vec<Fts5IdxRow>,
 }
 
 /// Encode the merge of `merged_segids` (all at `source_level`) into one new
@@ -1955,6 +1961,7 @@ pub fn encode_merged_segment(
     // Encode the merged leaves (normalized via encode/decode) and append the new
     // segment at the target level — unless the merge dropped every row.
     let mut leaf_data_rows = Vec::with_capacity(leaves.len());
+    let mut decoded_leaves = Vec::with_capacity(leaves.len());
     if !leaves.is_empty() {
         let pgno_last = u32::try_from(leaves.len())
             .map_err(|_| fts5_data_error("merged segment leaf count exceeds u32"))?;
@@ -1963,6 +1970,7 @@ pub fn encode_merged_segment(
                 .map_err(|_| fts5_data_error("merged leaf pgno exceeds u32"))?;
             let decoded = Fts5SegmentLeaf::decode(&leaf.encode()?)?;
             leaf_data_rows.push(decoded.to_data_row(new_segid, pgno)?);
+            decoded_leaves.push(decoded);
         }
         let entry_count = u64::try_from(live_rowids.len()).unwrap_or(u64::MAX);
         let merged_segment = Fts5StructureSegment::new(new_segid, 1, pgno_last)
@@ -1977,10 +1985,12 @@ pub fn encode_merged_segment(
     }
     structure.write_counter = structure.write_counter.saturating_add(1);
 
+    let idx_rows = segment_idx_rows(new_segid, &decoded_leaves);
     Ok(Fts5MergeFlush {
         leaf_data_rows,
         structure_data_row: Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
         deleted_data_rowids,
+        idx_rows,
     })
 }
 
@@ -2250,9 +2260,10 @@ impl Fts5PendingHash {
 
         let structure_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode());
         data_rows.push(structure_row);
+        let idx_rows = segment_idx_rows(segid, &decoded_leaves);
         Ok(Fts5PendingFlush {
             data_rows,
-            idx_rows: Vec::new(),
+            idx_rows,
             leaves: decoded_leaves,
             structure,
             pending_bytes: self.pending_bytes,
@@ -2332,6 +2343,35 @@ fn estimate_leaf_term_bytes(term: &Fts5SegmentTerm) -> usize {
         .saturating_add(3)
 }
 
+/// The stock-shaped `%_idx` seek rows for one segment's leaves (GH#404).
+///
+/// Stock FTS5 requires at least one `%_idx` row per segment or its term seek
+/// (`SELECT pgno FROM %_idx WHERE segid=? AND term<=? ORDER BY term DESC
+/// LIMIT 1`, fts5_index.c `fts5SegIterSeekInit`) never leaves page 1 and
+/// every term on a later leaf silently matches nothing. The rows mirror
+/// stock's writer (`fts5WriteFlushBtree`): page 1 is keyed by the empty term,
+/// and every later leaf by its first term (stock explicitly blesses the full
+/// first term over a minimal split key). fsqlite never splits a doclist
+/// across leaves, so no row ever carries the doclist-index flag.
+#[must_use]
+pub fn segment_idx_rows(segid: u32, leaves: &[Fts5SegmentLeaf]) -> Vec<Fts5IdxRow> {
+    let mut rows = Vec::with_capacity(leaves.len());
+    for (index, leaf) in leaves.iter().enumerate() {
+        let pgno = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        if index == 0 {
+            rows.push(Fts5IdxRow::new(segid, Vec::new(), pgno, false));
+        } else if let Some(first_term) = leaf.terms.first() {
+            rows.push(Fts5IdxRow::new(
+                segid,
+                first_term.term.clone(),
+                pgno,
+                false,
+            ));
+        }
+    }
+    rows
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fts5PendingFlush {
     pub data_rows: Vec<Fts5DataRow>,
@@ -2371,6 +2411,9 @@ pub struct Fts5IncrementalInsertFlush {
     /// Per-column docsize rows for the newly inserted documents, to append to
     /// the `_docsize` shadow table.
     pub docsize_rows: Vec<Fts5DocsizeRow>,
+    /// The new segment's `%_idx` seek rows ([`segment_idx_rows`], GH#404), to
+    /// append alongside its leaves. Empty when no segment was created.
+    pub idx_rows: Vec<Fts5IdxRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9431,7 +9474,7 @@ impl Fts5Table {
     /// instead APPENDS a new segment via [`Self::encode_incremental_insert_flush`]
     /// (`next_segid = max + 1`, existing leaves untouched) and never lands here.
     /// The debug assert pins that contract (bd-fts5-lazy-shadow-reads-itcc4.3).
-    pub fn encode_data_rows(&self) -> Result<Vec<Fts5DataRow>> {
+    pub fn encode_data_rows(&self) -> Result<(Vec<Fts5DataRow>, Vec<Fts5IdxRow>)> {
         debug_assert!(
             !self.is_lazy_on_disk(),
             "encode_data_rows (full index rewrite) must not run on a lazy-on-disk \
@@ -9464,11 +9507,11 @@ impl Fts5Table {
                 effective_leaf_budget(self.config.page_size),
             )?;
             rows.extend(flush.data_rows);
-            return Ok(rows);
+            return Ok((rows, flush.idx_rows));
         }
 
         rows.push(Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()));
-        Ok(rows)
+        Ok((rows, Vec::new()))
     }
 
     pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
@@ -9595,6 +9638,7 @@ impl Fts5Table {
                 ),
                 averages_data_row,
                 docsize_rows,
+                idx_rows: Vec::new(),
             }));
         }
         let flush = pending.flush_to_segment(
@@ -9615,13 +9659,15 @@ impl Fts5Table {
             structure_data_row,
             averages_data_row,
             docsize_rows,
+            idx_rows: flush.idx_rows,
         }))
     }
 
     pub fn encode_shadow_rows(&self) -> Result<Fts5ShadowRows> {
+        let (data, idx) = self.encode_data_rows()?;
         Ok(Fts5ShadowRows {
-            data: self.encode_data_rows()?,
-            idx: Vec::new(),
+            data,
+            idx,
             config: self.encode_config_rows(),
             content: self.encode_content_rows(),
             docsize: self.encode_docsize_rows(),
@@ -12256,7 +12302,7 @@ mod tests {
             &["rust index".to_owned(), "shadow table rows".to_owned()],
         );
 
-        let data = table.encode_data_rows().unwrap();
+        let (data, _idx) = table.encode_data_rows().unwrap();
         let metadata = table.decode_data_rows(&data).unwrap();
         let snapshot = Fts5DataRowsStructure {
             data_blocks: data.iter().map(|row| (row.id, row.block.clone())).collect(),
@@ -12506,7 +12552,7 @@ mod tests {
     }
 
     fn sample_segment_leaf() -> Fts5SegmentLeaf {
-        let mut leaf = Fts5SegmentLeaf::new(vec![
+        let leaf = Fts5SegmentLeaf::new(vec![
             Fts5SegmentTerm::new(
                 b"rust".to_vec(),
                 Fts5Doclist::new(vec![
@@ -12534,7 +12580,6 @@ mod tests {
                 )]),
             ),
         ]);
-        leaf.first_rowid_offset = 9;
         leaf
     }
 
@@ -12870,14 +12915,27 @@ mod tests {
     fn test_fts5_segment_leaf_dlidx_and_tombstone_round_trip() {
         let leaf = sample_segment_leaf();
         let encoded_leaf = leaf.encode().unwrap();
+        // GH#404: the leaf header's first-rowid offset is always 0 for
+        // fsqlite-written pages (every leaf begins with a term).
         assert_eq!(
             encoded_leaf,
             vec![
-                0, 9, 0, 27, 4, 114, 117, 115, 116, 7, 10, 3, 5, 1, 2, 11, 5, 3, 4, 4, 1, 121, 20,
+                0, 0, 0, 27, 4, 114, 117, 115, 116, 7, 10, 3, 5, 1, 2, 11, 5, 3, 4, 4, 1, 121, 20,
                 6, 1, 1, 2, 4, 15,
             ]
         );
         assert_eq!(Fts5SegmentLeaf::decode(&encoded_leaf).unwrap(), leaf);
+        // Stock-written continuation pages carry a nonzero header offset;
+        // decode must preserve it (the GH#360 stitcher consumes it).
+        let mut stock_shaped = encoded_leaf.clone();
+        stock_shaped[1] = 9;
+        assert_eq!(
+            Fts5SegmentLeaf::decode(&stock_shaped)
+                .unwrap()
+                .first_rowid_offset,
+            9,
+            "decode preserves a stock continuation-page header offset"
+        );
 
         let dlidx = Fts5DlidxPage::new(0, 3, 7, vec![Some(5), None, Some(9)]);
         assert!(dlidx.is_root());
@@ -13483,7 +13541,7 @@ mod tests {
         ),
     ],
     leaf: Fts5SegmentLeaf {
-        first_rowid_offset: 9,
+        first_rowid_offset: 0,
         terms: [
             Fts5SegmentTerm {
                 term: [
@@ -13563,7 +13621,7 @@ mod tests {
     },
     leaf_bytes: [
         0,
-        9,
+        0,
         0,
         27,
         4,
@@ -14963,7 +15021,7 @@ mod tests {
         let cx = Cx::new();
         let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
         let rows = Fts5ShadowRows {
-            data: base.encode_data_rows().unwrap(),
+            data: base.encode_data_rows().unwrap().0,
             idx: Vec::new(),
             config: base.encode_config_rows(),
             content: vec![Fts5ContentRow::new(1, vec!["only one column".to_owned()])],

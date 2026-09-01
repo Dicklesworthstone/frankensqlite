@@ -1064,6 +1064,7 @@ dependencies = [
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
+ "fsqlite-wal",
  "futures-lite",
  "rand 0.10.2",
  "rusqlite",

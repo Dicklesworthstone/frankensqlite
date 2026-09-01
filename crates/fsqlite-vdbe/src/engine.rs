@@ -1022,6 +1022,23 @@ impl MemTable {
             .map(|row| (row.rowid, row.values.as_slice()))
     }
 
+    /// Iterate rows whose rowid is `>= lower_inclusive`, in ascending rowid
+    /// order, through the end of the table.
+    ///
+    /// Unlike [`Self::iter_rows_in_rowid_range`] there is no exclusive upper
+    /// bound, so a row with rowid `i64::MAX` is reachable. Used by the keyset
+    /// LIMIT-pushdown join lane (GH#386) to seek to a cursor bound without
+    /// materializing the rows before it.
+    pub fn iter_rows_from(
+        &self,
+        lower_inclusive: i64,
+    ) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
+        let start = self.rowid_lower_bound(lower_inclusive);
+        self.rows[start..]
+            .iter()
+            .map(|row| (row.rowid, row.values.as_slice()))
+    }
+
     /// Iterate all rows as `(rowid, values)` pairs.
     ///
     /// Used by the compat persistence layer to dump table contents to
