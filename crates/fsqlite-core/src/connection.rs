@@ -36744,12 +36744,6 @@ impl Connection {
                     } else {
                         bound.limit.take()
                     };
-                    if true {
-                        eprintln!(
-                            "GH386DBG join_or_subquery callsite: limit_kept={}",
-                            limit_clause.is_none()
-                        );
-                    }
                     if limit_clause
                         .as_ref()
                         .is_some_and(bound_limit_clause_is_constant_zero)
@@ -82954,14 +82948,13 @@ impl Connection {
         let Some(shape) = join_keyset_limit_pushdown_shape(select) else {
             return Ok(None);
         };
-        if true {
-            eprintln!("GH386DBG lane: shape matched, entering runtime gate");
-        }
         let refuse = |reason: &str| {
-            if true {
-                eprintln!("GH386DBG lane: runtime refusal: {reason}");
-            }
-            let _ = reason;
+            tracing::debug!(
+                target: "fsqlite.query",
+                reason,
+                "keyset LIMIT-pushdown join lane refused at runtime; using the generic \
+                 materialize path"
+            );
             FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.fetch_add(1, AtomicOrdering::Relaxed);
         };
         let [outer_src, inner_src] = table_sources else {
@@ -83027,9 +83020,8 @@ impl Connection {
         };
 
         // Materialize the inner (probe) table exactly like the generic scan
-        // does. The plain-named-table SQL fallback scan is not mirrored here:
-        // if neither the memdb nor the pager scan can serve the inner table,
-        // refuse the lane rather than recursing through `self.query`.
+        // does: memdb fast path, then pager fast path, then the same
+        // single-table SELECT fallback the generic step-3 loop issues.
         let right_width = inner_src.scan_width();
         let mut inner_rows: Vec<Vec<SqliteValue>> =
             if let Some(rows) = self.try_scan_join_source_from_memdb(inner_src) {
@@ -83037,8 +83029,12 @@ impl Connection {
             } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src).await {
                 result?
             } else {
-                refuse("inner table not scannable via memdb/pager");
-                return Ok(None);
+                // Same last-resort scan the generic step-3 loop uses for a
+                // plain named table (e.g. while a transaction scope is
+                // active): a single-table SELECT through the normal dispatch.
+                let scan_sql = build_join_scan_sql(inner_src);
+                let rows = self.query(&scan_sql).await?;
+                rows.iter().map(|row| row.values().to_vec()).collect()
             };
         for row in &mut inner_rows {
             if row.len() != right_width {
@@ -83142,8 +83138,8 @@ impl Connection {
             }
         }
         if !memdb_handled {
-            if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
-                refuse("outer table not streamable (no memdb table, pager unavailable)");
+            if !self.pager.is_file_backed() {
+                refuse("outer table not streamable (no memdb table, pager not file-backed)");
                 return Ok(None);
             }
             let outer_table = {
@@ -83158,52 +83154,128 @@ impl Connection {
                 return Ok(None);
             };
             let cx = &self.root_cx;
-            let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
             let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                 .unwrap_or(PageNumber::ONE);
-            let mut cursor = Self::new_pager_btree_cursor(cx, &mut txn, page_no, true).await?;
-            // SeekGE: `Found` lands on `lower_bound` itself, `NotFound` lands
-            // on its successor (or EOF), so the cursor starts at the first
-            // rowid `>= lower_bound` either way.
-            cursor.table_move_to(cx, lower_bound).await?;
-            let mut valid = !cursor.eof();
-            while valid {
-                let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "keyset join stream scan: table `{}` rowid {rowid} has invalid record",
-                            outer_binding.name
-                        ),
-                    }
-                })?;
-                let mut row = self
-                    .inflate_table_row_values_for_storage_reload(
+            // File-backed statements normally run with the dispatch-opened
+            // pager transaction parked in `active_txn`; a fresh ReadOnly
+            // transaction would read a different snapshot (and miss local
+            // uncommitted writes), so borrow the active transaction for the
+            // scan exactly like VDBE table programs do, restoring it on every
+            // path. Only when no transaction scope is active at all is a
+            // fresh ReadOnly transaction equivalent to what the generic scan
+            // helpers would open.
+            let parked_txn = self.active_txn.borrow_mut().take();
+            if let Some(mut txn_kind) = parked_txn {
+                if matches!(txn_kind, TransactionKind::Drained) {
+                    *self.active_txn.borrow_mut() = Some(txn_kind);
+                    refuse("active transaction is drained");
+                    return Ok(None);
+                }
+                let stream_result = self
+                    .stream_keyset_outer_pager_rows(
+                        cx,
+                        &mut txn_kind,
+                        page_no,
                         &table_schema,
-                        rowid,
-                        &payload_values,
-                        Some(ipk_idx),
+                        ipk_idx,
+                        outer_src.hidden_rowid_projection.is_some(),
+                        primary_width,
+                        lower_bound,
+                        &outer_binding.name,
+                        &mut visited_outer,
+                        &mut join_outer_row,
                     )
-                    .await?;
-                visited_outer += 1;
-                if outer_src.hidden_rowid_projection.is_some() {
-                    row.push(SqliteValue::Integer(rowid));
-                }
-                if row.len() != primary_width {
-                    row.resize(primary_width, SqliteValue::Null);
-                }
-                if self.with_fallback_function_registry(|| join_outer_row(&row))? {
-                    break;
-                }
-                valid = cursor.next(cx).await?;
+                    .await;
+                *self.active_txn.borrow_mut() = Some(txn_kind);
+                stream_result?;
+            } else if !self.local_transaction_scope_is_active() {
+                let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
+                self.stream_keyset_outer_pager_rows(
+                    cx,
+                    &mut txn,
+                    page_no,
+                    &table_schema,
+                    ipk_idx,
+                    outer_src.hidden_rowid_projection.is_some(),
+                    primary_width,
+                    lower_bound,
+                    &outer_binding.name,
+                    &mut visited_outer,
+                    &mut join_outer_row,
+                )
+                .await?;
+                txn.commit(cx).await?;
+            } else {
+                refuse("outer table not streamable (transaction scope active, no parked txn)");
+                return Ok(None);
             }
-            drop(cursor);
-            txn.commit(cx).await?;
         }
         FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS
             .fetch_add(visited_outer, AtomicOrdering::Relaxed);
         Ok(Some(combined))
+    }
+
+    /// GH#386 helper: stream the outer table's rows starting at `lower_bound`
+    /// (SeekGE) through a table B-tree cursor over `txn`, inflating each
+    /// record exactly like the generic pager scan and feeding it to
+    /// `join_outer_row` until that reports the LIMIT is satisfied.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_keyset_outer_pager_rows<T, F>(
+        &self,
+        cx: &Cx,
+        txn: &mut T,
+        page_no: PageNumber,
+        table_schema: &TableSchema,
+        ipk_idx: usize,
+        push_hidden_rowid: bool,
+        primary_width: usize,
+        lower_bound: i64,
+        outer_name: &str,
+        visited_outer: &mut u64,
+        mut join_outer_row: F,
+    ) -> Result<()>
+    where
+        T: TransactionHandle + ?Sized,
+        F: FnMut(&[SqliteValue]) -> Result<bool>,
+    {
+        let mut cursor = Self::new_pager_btree_cursor(cx, txn, page_no, true).await?;
+        // SeekGE semantics: `Found` lands on `lower_bound` itself, `NotFound`
+        // lands on its successor (or at EOF), so the cursor starts at the
+        // first rowid `>= lower_bound` either way.
+        cursor.table_move_to(cx, lower_bound).await?;
+        let mut valid = !cursor.eof();
+        while valid {
+            let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
+            let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "keyset join stream scan: table `{outer_name}` rowid {rowid} has an \
+                         invalid record"
+                    ),
+                }
+            })?;
+            let mut row = self
+                .inflate_table_row_values_for_storage_reload(
+                    table_schema,
+                    rowid,
+                    &payload_values,
+                    Some(ipk_idx),
+                )
+                .await?;
+            *visited_outer += 1;
+            if push_hidden_rowid {
+                row.push(SqliteValue::Integer(rowid));
+            }
+            if row.len() != primary_width {
+                row.resize(primary_width, SqliteValue::Null);
+            }
+            if self.with_fallback_function_registry(|| join_outer_row(&row))? {
+                break;
+            }
+            valid = cursor.next(cx).await?;
+        }
+        Ok(())
     }
 
     /// Execute a SELECT containing window functions at the connection level.
@@ -88270,14 +88342,6 @@ impl Connection {
         // pre-check `join_keyset_limit_pushdown_shape` leave `select.limit`
         // in place so the lane (and, on refusal, the shared tail LIMIT
         // application) can see it.
-        if true {
-            eprintln!(
-                "GH386DBG execute_join_select: limit_present={} preloaded_none={} shape={}",
-                select.limit.is_some(),
-                preloaded.iter().all(Option::is_none),
-                join_keyset_limit_pushdown_shape(select).is_some()
-            );
-        }
         let keyset_streamed = if select.limit.is_some() && preloaded.iter().all(Option::is_none) {
             self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
                 .await?
@@ -286843,6 +286907,50 @@ mod join_keyset_stream_tests {
                 "visited outer rows must not scale with table size"
             );
             assert_eq!(visits[0], 20, "all-matching join visits exactly LIMIT rows");
+        });
+    }
+
+    /// The reporter's exact parameterized Q2 (`?1` cursor, `?2` limit) must
+    /// engage the lane after placeholder binding, and a NULL cursor parameter
+    /// must refuse the lane while keeping the stock-correct empty result.
+    #[test]
+    fn test_keyset_stream_lane_parameterized_q2_engages() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh386_params.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            populate_fixture(&conn, 300, 10).await;
+            let hits_before = lane_hits();
+            let rows = conn
+                .query_with_params(
+                    "SELECT m.id, m.conversation_id, c.title FROM messages m \
+                     JOIN conversations c ON m.conversation_id = c.id \
+                     WHERE m.id > ?1 ORDER BY m.id LIMIT ?2;",
+                    &[SqliteValue::Integer(120), SqliteValue::Integer(9)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(lane_hits() - hits_before, 1, "parameterized Q2 must stream");
+            let generic = conn.query(&q2_generic(120, 9)).await.unwrap();
+            assert_eq!(values_of(&rows), values_of(&generic));
+
+            let hits_before = lane_hits();
+            let rows = conn
+                .query_with_params(
+                    "SELECT m.id FROM messages m \
+                     JOIN conversations c ON m.conversation_id = c.id \
+                     WHERE m.id > ?1 ORDER BY m.id LIMIT ?2;",
+                    &[SqliteValue::Null, SqliteValue::Integer(9)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                lane_hits() - hits_before,
+                0,
+                "a NULL cursor bound must refuse the lane"
+            );
+            assert!(rows.is_empty(), "a NULL comparison matches nothing");
         });
     }
 }
