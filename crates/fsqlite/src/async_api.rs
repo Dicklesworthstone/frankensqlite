@@ -1710,6 +1710,10 @@ enum WorkerOpenRequest {
     SchemaOnly {
         path: String,
     },
+    ExistingSchemaOnlyWithEnv {
+        path: String,
+        env: ConnectionEnv,
+    },
     WithFlags {
         path: String,
         flags: OpenFlags,
@@ -1736,6 +1740,9 @@ impl WorkerOpenRequest {
             } => Connection::open_with_page_size(path, page_size_bytes).await,
             Self::Existing { path } => Connection::open_existing(path).await,
             Self::SchemaOnly { path } => Connection::open_schema_only(path).await,
+            Self::ExistingSchemaOnlyWithEnv { path, env } => {
+                Connection::open_existing_schema_only_with_env(path, env).await
+            }
             Self::WithFlags { path, flags } => open_with_flags(&path, flags).await,
             Self::ReservedWithExpectedIdentityAndEnv {
                 path,
@@ -2024,6 +2031,24 @@ impl AsyncConnection {
     /// avoid introducing writer semantics such as close-time checkpoints.
     pub fn open_schema_only_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
         Self::open_sync_with_request(WorkerOpenRequest::SchemaOnly { path: path.into() })
+    }
+
+    /// Open an existing writable database in schema-only mode with a custom
+    /// [`ConnectionEnv`].
+    ///
+    /// Routes to [`Connection::open_existing_schema_only_with_env`] on the
+    /// dedicated large-stack worker thread. User rows remain pager-backed
+    /// instead of being copied into the compatibility `MemDatabase`, while
+    /// the connection retains existing-only writable semantics and the
+    /// caller's explicit resource limits.
+    pub fn open_existing_schema_only_with_env_sync(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::ExistingSchemaOnlyWithEnv {
+            path: path.into(),
+            env,
+        })
     }
 
     /// Open a database with explicit SQLite-compatible [`OpenFlags`].
@@ -6560,6 +6585,40 @@ mod tests {
             rows.first().and_then(|row| row.get(0)),
             Some(&SqliteValue::Text("t".into())),
             "schema-only mode must expose the persisted table definition"
+        );
+        conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn open_existing_schema_only_with_env_sync_is_existing_only_and_writable() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("missing-schema-only-writer.db");
+        let error = AsyncConnection::open_existing_schema_only_with_env_sync(
+            missing.to_string_lossy().into_owned(),
+            ConnectionEnv::default(),
+        )
+        .expect_err("writable schema-only open must refuse a missing database");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert!(
+            !missing.exists(),
+            "a refused existing-only open must not create the missing path"
+        );
+
+        let path = seeded_database(&dir, "schema-only-writer.db");
+        let mut env = ConnectionEnv::default();
+        env.set_page_buffer_max(16_384);
+        assert_eq!(env.page_buffer_max(), Some(16_384));
+        let mut conn = AsyncConnection::open_existing_schema_only_with_env_sync(&path, env)
+            .expect("writable schema-only open should succeed");
+        conn.execute_sync("INSERT INTO t VALUES (2, 'pager-backed')")
+            .expect("schema-only writer should persist a row");
+        let rows = conn
+            .query_sync("SELECT name FROM t WHERE id = 2")
+            .expect("schema-only writer should read the persisted row");
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Text("pager-backed".into()))
         );
         conn.close_sync().expect("close should succeed");
     }
