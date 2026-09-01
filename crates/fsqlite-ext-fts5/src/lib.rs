@@ -974,13 +974,6 @@ impl Fts5SegmentLeaf {
                 page.extend_from_slice(&entry.term[prefix_len..]);
             }
 
-            // GH404_RED_PROOF: temporary planted negative — restore the
-            // pre-fix buggy header write to prove the keeper detects it.
-            if index == 0 {
-                let bad = u16::try_from(page.len())
-                    .map_err(|_| fts5_data_error("segment leaf rowid offset exceeds u16"))?;
-                write_be_u16(&mut page[0..2], bad);
-            }
             page.extend_from_slice(&entry.doclist.encode()?);
             previous_term = &entry.term;
         }
