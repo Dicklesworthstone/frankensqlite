@@ -245,18 +245,33 @@ directory — primarily `crates/fsqlite-e2e/tests/` and
 `[package]`), so files there are never compiled or run by
 `cargo test --workspace`.
 
-### CI Coverage Warning: fsqlite-e2e Integration Tests Are Allowlisted (bd-ohk1x)
+### CI Coverage Warning: GitHub Actions Is Off; Workflow Allowlists Are Inert (bd-ohk1x)
 
-`crates/fsqlite-e2e/tests/` contains ~270 integration test files, but CI
-executes only the explicitly named `--test` targets in
-`.github/workflows/*.yml` (currently on the order of a dozen across all
-workflows). `concurrent-platform-matrix.yml` builds the crate with
-`cargo test -p fsqlite-e2e --no-run` (build only) plus a hand-maintained
-allowlist, and `unit-test-shard-matrix.yml` runs `--lib` only, which never
-touches `tests/`. **A new integration test in fsqlite-e2e is silently inert
-in CI unless you also add it to a workflow.** When you land a regression
-guard there, either wire it into a workflow or state explicitly in the
-bead/commit that it is local-only. Tracked by bd-ohk1x.
+**As of 2026-09-01 GitHub Actions is disabled for this repository**
+(`gh api repos/Dicklesworthstone/frankensqlite/actions/permissions` reports
+`enabled: false`, and `verification-gates.yml`, `unit-test-shard-matrix.yml`,
+`release.yml`, `fsqlite-wasm-ci.yml` are additionally `disabled_manually`).
+No workflow has executed since 2026-07-16; the manual dispatches of
+2026-08-07 and 2026-08-17 are still `queued`. Nothing under
+`.github/workflows/` gates anything today. The effective gates are the local
+/ rch keeper runs recorded on beads, commits, and release notes: when you
+land a regression guard, RUN it and cite the run (revision, platform, result)
+in the bead/commit. A test named in a workflow file is not evidence.
+
+The allowlist structure still matters for the day Actions is re-enabled.
+`concurrent-platform-matrix.yml` executes an explicit `--test` allowlist
+(fsqlite-e2e targets plus, since 2026-09-01, the fsqlite-core cross-process
+checkpoint battery `bulk_import_upsert_text_pk_phantom_pk`);
+`verification-gates.yml` runs the named stock-oracle keepers (including the
+GH#404 / bd-kon3m FTS5 keepers and the GH#402 scaling keepers since
+2026-09-01); `unit-test-shard-matrix.yml` runs `--lib` per crate plus every
+fsqlite-e2e integration target by directory discovery, and never touches
+`crates/fsqlite-core/tests/` or `crates/fsqlite/tests/`. **An integration
+test outside those lists stays inert even once CI returns** — wire it in or
+state in the bead/commit that it is local-only. History: bd-ohk1x
+(fsqlite-e2e allowlist drift, fixed by discovery in 2026-07); bd-kon3m sat in
+a file no workflow named while Actions was off and surfaced only through a
+local run two weeks later (2026-08-18 to 2026-09-01).
 
 ### Unit Tests
 

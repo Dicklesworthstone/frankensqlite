@@ -74,7 +74,10 @@ jobs:
             dep_root: D:\dp
 
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # 45 covered the original allowlist plus the 265 s replay smoke; the
+    # cross-process checkpoint battery adds a fsqlite-core test-binary build
+    # and ~6+ min of multi-process churn per Unix platform.
+    timeout-minutes: 75
     name: "${{ matrix.platform_tag }} (${{ matrix.fs_note }})"
 
     env:
@@ -275,6 +278,27 @@ jobs:
           test_status=${PIPESTATUS[0]}
           echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/replay_smoke.exit
 
+      # GH#399 / bd-5wrwi / GH#397 field-corruption class: the beads-shaped
+      # cross-process churn discriminators (peers closing without / with PASSIVE
+      # / with TRUNCATE checkpoints), the cross-process cache-rebuild churn, the
+      # single-process overflow-UPDATE repro, and the two WAL reader-horizon
+      # keepers (resume-from-watermark + clamp-at-reader, and the tip-reader
+      # reset gate) — with stock SQLite `PRAGMA integrity_check` as the oracle
+      # after every command. Unix only: the reader-slot protocol lives in the
+      # `-shm` read marks, which Windows does not yet share across processes
+      # (#395). The multi-process phase alone is ~6 min on Apple Silicon.
+      - name: Cross-process checkpoint corruption battery (GH#399, bd-5wrwi)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --locked -p fsqlite-core \
+            --test bulk_import_upsert_text_pk_phantom_pk \
+            -- --nocapture 2>&1 | tee artifacts/concurrent-${{ matrix.platform_tag }}/checkpoint_battery.log
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=${test_status}" >> artifacts/concurrent-${{ matrix.platform_tag }}/checkpoint_battery.exit
+
       - name: Cross-engine integrity check on artifacts (Linux only)
         if: runner.os == 'Linux'
         shell: bash
@@ -359,6 +383,11 @@ jobs:
             replace_conflict_guard
             replay_smoke
           )
+          # The checkpoint battery step is Unix-only (see its `if:`), so
+          # Windows legitimately has no receipt for it.
+          if [ "${RUNNER_OS}" != "Windows" ]; then
+            expected_suites+=(checkpoint_battery)
+          fi
           shopt -s nullglob
           actual_receipts=(artifacts/concurrent-${{ matrix.platform_tag }}/*.exit)
           if [ "${#actual_receipts[@]}" -ne "${#expected_suites[@]}" ]; then

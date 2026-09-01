@@ -520,10 +520,12 @@ jobs:
           path: artifacts/bd-2yqp6.3.3/
           retention-days: 21
 
+  # This workflow has no `push` trigger and the repo takes no PRs, so `schedule`
+  # is the only trigger that ever fires. Skipping this job on `schedule` (as it
+  # did until 2026-09-01) meant every oracle keeper below was dead code in CI.
   param-binding-regression-guard:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
@@ -577,6 +579,23 @@ jobs:
           cargo test -p fsqlite-core --test alter_table_oracle -- --nocapture
           cargo test -p fsqlite-core --test error_message_oracle -- --nocapture
           cargo test -p fsqlite-e2e --test pragma_introspection_oracle_e2e -- --nocapture
+
+      # GH#404: fsqlite-written FTS5 %_data must be stock-verifiable (stock
+      # `PRAGMA integrity_check` + stock MATCH parity on a multi-leaf corpus).
+      # bd-kon3m: the legacy-contentless automerge keeper that sat outside every
+      # workflow from 2026-08-18 until 2026-09-01 and therefore hid a
+      # corrupt-on-reopen `_docsize` bug for two weeks.
+      - name: FTS5 stock-compat and legacy-contentless keepers (GH#404, bd-kon3m)
+        run: |
+          cargo test --locked -p fsqlite-core --test gh404_fts5_stock_compat -- --nocapture
+          cargo test --locked -p fsqlite --test fts5_contentless_incremental_persist -- --nocapture
+
+      # GH#402: checkpoint backfill work stays linear across an autocommit DDL
+      # loop (generation-tagged resume watermark), cross-connection schema
+      # visibility, and schema-only opens staying pager-backed.
+      - name: Autocommit checkpoint-backfill scaling keepers (GH#402)
+        run: |
+          cargo test --locked -p fsqlite --test gh402_autocommit_schema_scaling -- --nocapture
 
   e2e-scenario-matrix:
     if: github.event_name == 'workflow_dispatch'

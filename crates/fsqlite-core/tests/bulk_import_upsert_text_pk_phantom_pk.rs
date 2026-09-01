@@ -2443,11 +2443,16 @@ fn gh399_wal_len(wal_path: &std::path::Path) -> u64 {
 /// once the reader ends, TRUNCATE completes and resets.
 ///
 /// Phase 1 pins the horizon the way a stock SQLite reader does — a SHARED
-/// `WAL_READ_LOCK(1)` with `aReadMark[1] = R` and no main-file lock — so the
-/// engine-level horizon clamp and reset gate are exercised end to end:
-/// PASSIVE and TRUNCATE backfill exactly R frames, report `busy = 1`, and
-/// leave the generation and file length untouched; after the slot is
-/// released the same TRUNCATE completes and resets.
+/// `WAL_READ_LOCK(1)` with `aReadMark[1] = M` and no main-file lock — so the
+/// engine-level horizon clamp and reset gate are exercised end to end. M is
+/// a commit boundary strictly between the checkpointer's resume watermark W
+/// (its GH#402 `nBackfill`) and the WAL tip T, so the cumulative count that
+/// PASSIVE and TRUNCATE report (`M`) proves in one triple that the checkpoint
+/// both resumed from W (it did real work: W < M) and stopped at the reader's
+/// mark (M < T). A reader pinned at W itself would accept `W` for "clamped"
+/// and "never started" alike. Both pragmas report `busy = 1` and leave the
+/// generation and file length untouched; after the slot is released the same
+/// TRUNCATE completes and resets.
 ///
 /// Phase 2 pins the horizon from another fsqlite process. Such a reader also
 /// holds the main-file SHARED fence, so the checkpoint cannot even take its
@@ -2499,16 +2504,58 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
             .expect("seed checkpoint");
 
         // ── Phase 1: a stock-SQLite-shaped reader pins WAL_READ_LOCK(1) ──
-        // v1 rewrites every leaf page into the WAL so the checkpointer has
-        // frames it may backfill (<= R) and, after v2, frames it must not.
+        // v1 rewrites every leaf page into the WAL. A no-reader PASSIVE
+        // backfills all of it, so the checkpointer's resume watermark (its
+        // GH#402 `nBackfill`) sits at W = the v1 frame count.
         conn.execute("UPDATE gh399_rows SET payload = payload || '-v1'")
             .await
             .expect("v1 update");
-        // A no-reader PASSIVE backfills everything; its `log` column is the
-        // frame count R the reader pins.
-        let [_, reader_horizon, _] = gh399_checkpoint(&conn, "PASSIVE").await;
-        assert!(reader_horizon > 0, "v1 must leave frames in the WAL");
+        let v1 = gh399_checkpoint(&conn, "PASSIVE").await;
+        let watermark = v1[1];
+        assert!(watermark > 0, "v1 must leave frames in the WAL");
+        assert_eq!(
+            v1,
+            [0, watermark, watermark],
+            "a no-reader PASSIVE backfills every v1 frame, so the resume watermark is W"
+        );
         let generation_v1 = gh399_wal_generation(&wal_path);
+
+        // A peer appends beyond the watermark in two commits: v2a rewrites
+        // every leaf page again (frames W+1..=M) and v2b adds new EOF pages
+        // (frames M+1..=T). The reader pins the v2a commit boundary M, which
+        // sits strictly between the watermark and the tip, so the only
+        // cumulative count a checkpoint can report is one that both RESUMED
+        // from W (it backfilled frames W+1..=M) and STOPPED at M (the clamp):
+        // a checkpoint that never started reports W, one that ignores the
+        // reader reports T.
+        conn.execute("BEGIN").await.expect("v2a begin");
+        conn.execute("UPDATE gh399_rows SET payload = replace(payload, '-v1', '-v2')")
+            .await
+            .expect("v2a update");
+        conn.execute("COMMIT").await.expect("v2a commit");
+        let reader_horizon = i64::try_from((gh399_wal_len(&wal_path) - 32) / WAL_FRAME_BYTES)
+            .expect("frame count");
+        conn.execute("BEGIN").await.expect("v2b begin");
+        for id in GH399_ROWS..GH399_ROWS + 100 {
+            conn.execute_with_params(
+                "INSERT INTO gh399_rows (id, payload) VALUES (?, ?)",
+                &[
+                    SqliteValue::Integer(id as i64),
+                    text(format!("{}-v2", deterministic_payload("gh399", id, 160))),
+                ],
+            )
+            .await
+            .expect("v2b insert");
+        }
+        conn.execute("COMMIT").await.expect("v2b commit");
+        let wal_len_v2 = gh399_wal_len(&wal_path);
+        let total_frames =
+            i64::try_from((wal_len_v2 - 32) / WAL_FRAME_BYTES).expect("frame count");
+        assert!(
+            watermark < reader_horizon && reader_horizon < total_frames,
+            "the reader mark must sit strictly between the resume watermark and the WAL tip \
+             (W={watermark}, M={reader_horizon}, T={total_frames})"
+        );
 
         let cx = Cx::new();
         let vfs = UnixVfs::new();
@@ -2522,47 +2569,24 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
         let reader_mark = u32::try_from(reader_horizon).expect("horizon fits u32");
         legacy_reader
             .compat_reader_acquire_wal_read_lock(&cx, 1, reader_mark)
-            .expect("pin WAL_READ_LOCK(1) at the v1 horizon");
+            .expect("pin WAL_READ_LOCK(1) at the v2a commit boundary");
 
-        // A peer appends beyond the reader's horizon: every leaf page again,
-        // plus new EOF pages.
-        conn.execute("BEGIN").await.expect("v2 begin");
-        conn.execute("UPDATE gh399_rows SET payload = replace(payload, '-v1', '-v2')")
-            .await
-            .expect("v2 update");
-        for id in GH399_ROWS..GH399_ROWS + 100 {
-            conn.execute_with_params(
-                "INSERT INTO gh399_rows (id, payload) VALUES (?, ?)",
-                &[
-                    SqliteValue::Integer(id as i64),
-                    text(format!("{}-v2", deterministic_payload("gh399", id, 160))),
-                ],
-            )
-            .await
-            .expect("v2 insert");
-        }
-        conn.execute("COMMIT").await.expect("v2 commit");
-        let wal_len_v2 = gh399_wal_len(&wal_path);
-
-        // PASSIVE stops exactly at the reader's mark and reports busy.
+        // PASSIVE resumes at W, backfills through M, stops there, and is busy.
         let passive = gh399_checkpoint(&conn, "PASSIVE").await;
-        let total_frames = passive[1];
-        assert!(
-            total_frames > reader_horizon,
-            "v2 must append beyond the reader horizon ({total_frames} <= {reader_horizon})"
-        );
         assert_eq!(
             passive,
             [1, total_frames, reader_horizon],
-            "PASSIVE backfills exactly up to the pinned legacy reader horizon and is busy"
+            "PASSIVE must resume from the watermark and backfill exactly up to the pinned \
+             legacy reader horizon (busy)"
         );
 
-        // TRUNCATE: same clamp, and the generation must survive.
+        // TRUNCATE: same clamp (nothing new below M), and the generation must
+        // survive.
         let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
         assert_eq!(
             truncate,
             [1, total_frames, reader_horizon],
-            "TRUNCATE backfills exactly up to the pinned legacy reader horizon and is busy"
+            "TRUNCATE must stay clamped at the pinned legacy reader horizon (busy)"
         );
         assert_eq!(
             gh399_wal_generation(&wal_path),
