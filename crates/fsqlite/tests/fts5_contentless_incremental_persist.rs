@@ -16,11 +16,16 @@
 //! insert is O(new rows), not O(table). Live MATCH still reads the in-memory
 //! index; reopen hydrates from the multi-segment structure.
 //!
-//! "Fails on old / passes on new" gate: the `_data` shadow row count. The old
-//! full-re-encode path replaced `_data` wholesale, so it held a constant ~3
-//! rows (averages + structure + one merged leaf) regardless of how many INSERT
-//! statements ran. The incremental path appends one leaf per statement, so
-//! `_data` grows with the number of inserts.
+//! "Fails on old / passes on new" gate: the maximum allocated segid in the
+//! `_data` shadow. The old full-re-encode path replaced `_data` wholesale and
+//! always rebuilt a single segment with segid 1, regardless of how many
+//! INSERT statements ran. The incremental path allocates `next_segid = max +
+//! 1` per appending statement (and merges allocate still-higher segids for
+//! their outputs), so the maximum segid grows with the number of inserts.
+//! The raw `_data` ROW count is deliberately not the gate any more: the lazy
+//! automerge (bd-fts5-lazy-shadow-reads-itcc4.3, 654621ac5) exists precisely
+//! to keep that count bounded, which had left the original >= N row gate
+//! stale-red while every correctness assertion still passed.
 //!
 //! Run: `cargo test -p fsqlite --features fts5 --test fts5_contentless_incremental_persist -- --nocapture`
 
@@ -53,17 +58,20 @@ async fn insert_doc(conn: &Connection, rowid: i64, body: &str) {
     .expect("insert contentless fts row");
 }
 
-async fn data_row_count(conn: &Connection) -> i64 {
+/// Maximum segid allocated in the `_data` shadow: segment-leaf rowids encode
+/// `(segid << 37) | pgno`, and ids 1 (averages) / 10 (structure) sit below
+/// the shift, so filtering to `id > 10` leaves only segment-owned rows.
+async fn max_data_segid(conn: &Connection) -> i64 {
     match &conn
-        .query("SELECT count(*) FROM idx_data")
+        .query("SELECT max(id >> 37) FROM idx_data WHERE id > 10")
         .await
-        .expect("count _data rows")
+        .expect("max _data segid")
         .first()
-        .expect("one count row")
+        .expect("one max row")
         .values()[0]
     {
         SqliteValue::Integer(i) => *i,
-        other => panic!("unexpected count value: {other:?}"),
+        other => panic!("unexpected max segid value: {other:?}"),
     }
 }
 
@@ -103,14 +111,18 @@ fn contentless_fts_inserts_append_incremental_segments() {
                 "shared token did not return every inserted row"
             );
 
-            // Incremental gate: `_data` must have grown well past the constant ~3
-            // rows the old full-re-encode path produced. One leaf per insert means
-            // at least N leaves plus averages + structure.
-            let data_rows = data_row_count(&conn).await;
+            // Incremental gate: each appending statement allocates
+            // `next_segid = max + 1`, and automerge outputs allocate
+            // still-higher segids, so after N single-statement inserts the
+            // maximum segid is >= N. The old full-re-encode path rebuilt one
+            // segment with segid 1 no matter how many statements ran. (The
+            // `_data` ROW count is automerge-bounded by design and is no
+            // longer a valid incremental observable.)
+            let max_segid = max_data_segid(&conn).await;
             assert!(
-                data_rows >= N,
-                "expected incremental segment growth (>= {N} _data rows), got {data_rows}; \
-             the old full-re-encode path holds a constant ~3 rows"
+                max_segid >= N,
+                "expected incremental segid growth (max segid >= {N}), got {max_segid}; \
+             the old full-re-encode path pins the single rebuilt segment at segid 1"
             );
         }
 

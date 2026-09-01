@@ -1972,9 +1972,26 @@ pub fn encode_merged_segment(
             leaf_data_rows.push(decoded.to_data_row(new_segid, pgno)?);
             decoded_leaves.push(decoded);
         }
+        // Preserve the structure's tracking mode: only an origin-tracked
+        // (contentless_delete) structure gets an origin-stamped merged
+        // segment. Stamping a merged segment with a nonzero entry_count into a
+        // LEGACY structure flips `uses_origin_tracking()` true for the whole
+        // structure, after which incremental inserts append 3-column
+        // `_docsize` rows into the legacy 2-column shadow and the table
+        // refuses to reopen ("stores 3 payload columns but schema allows at
+        // most 2").
         let entry_count = u64::try_from(live_rowids.len()).unwrap_or(u64::MAX);
-        let merged_segment = Fts5StructureSegment::new(new_segid, 1, pgno_last)
-            .with_origin_tracking(origin_lower, origin_upper, 0, 0, entry_count);
+        let merged_segment = if existing_structure.uses_origin_tracking() {
+            Fts5StructureSegment::new(new_segid, 1, pgno_last).with_origin_tracking(
+                origin_lower,
+                origin_upper,
+                0,
+                0,
+                entry_count,
+            )
+        } else {
+            Fts5StructureSegment::new(new_segid, 1, pgno_last)
+        };
         let target_level = source_level + 1;
         while structure.levels.len() <= target_level {
             structure
@@ -2361,12 +2378,7 @@ pub fn segment_idx_rows(segid: u32, leaves: &[Fts5SegmentLeaf]) -> Vec<Fts5IdxRo
         if index == 0 {
             rows.push(Fts5IdxRow::new(segid, Vec::new(), pgno, false));
         } else if let Some(first_term) = leaf.terms.first() {
-            rows.push(Fts5IdxRow::new(
-                segid,
-                first_term.term.clone(),
-                pgno,
-                false,
-            ));
+            rows.push(Fts5IdxRow::new(segid, first_term.term.clone(), pgno, false));
         }
     }
     rows
