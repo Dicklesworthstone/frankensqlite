@@ -12328,7 +12328,7 @@ mod tests {
             137438953473,
             [
                 0,
-                11,
+                0,
                 0,
                 145,
                 6,
@@ -13958,20 +13958,27 @@ mod tests {
         assert_eq!(profile.data_row_writes, 2);
         assert_eq!(profile.segment_leaf_writes, 1);
         assert_eq!(profile.structure_record_writes, 1);
-        assert_eq!(profile.idx_row_writes, 0);
-        assert_eq!(profile.hot_write_count, 1);
+        // GH#404: every segment flush now also publishes its page-1 `%_idx`
+        // seek row. The structure commit itself stays single.
+        assert_eq!(profile.idx_row_writes, 1);
+        assert_eq!(profile.hot_write_count, 2);
         assert_eq!(profile.unique_segment_pages, vec![(4, 1)]);
+        assert_eq!(profile.unique_idx_pages, vec![(4, 1)]);
         assert!(profile.append_only_rows_precede_hot_rows);
         assert_eq!(
             profile.publication_order,
             vec![
                 Fts5ShadowWriteClass::SegmentLeaf { segid: 4, pgno: 1 },
-                Fts5ShadowWriteClass::StructureRecord
+                Fts5ShadowWriteClass::StructureRecord,
+                Fts5ShadowWriteClass::IdxPage {
+                    segid: 4,
+                    btree_page: 1
+                },
             ]
         );
         assert_eq!(
             profile.mitigation,
-            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeSingleMetadataCommit
+            Fts5ShadowWriteMitigation::AppendOnlyRowsBeforeBatchedHotWrites
         );
     }
 
@@ -14272,14 +14279,14 @@ mod tests {
             r"Fts5ShadowWriteHotspotProfileStructure {
     flush_profile: Fts5ShadowWriteHotspotProfile {
         data_row_writes: 2,
-        idx_row_writes: 0,
+        idx_row_writes: 1,
         append_only_data_writes: 1,
         segment_leaf_writes: 1,
         doclist_index_writes: 0,
         tombstone_writes: 0,
         averages_record_writes: 0,
         structure_record_writes: 1,
-        hot_write_count: 1,
+        hot_write_count: 2,
         append_only_rows_precede_hot_rows: true,
         unique_segment_pages: [
             (
@@ -14289,15 +14296,24 @@ mod tests {
         ],
         unique_doclist_index_pages: [],
         unique_tombstone_pages: [],
-        unique_idx_pages: [],
+        unique_idx_pages: [
+            (
+                4,
+                1,
+            ),
+        ],
         publication_order: [
             SegmentLeaf {
                 segid: 4,
                 pgno: 1,
             },
             StructureRecord,
+            IdxPage {
+                segid: 4,
+                btree_page: 1,
+            },
         ],
-        mitigation: AppendOnlyRowsBeforeSingleMetadataCommit,
+        mitigation: AppendOnlyRowsBeforeBatchedHotWrites,
     },
     idx_profile: Fts5ShadowWriteHotspotProfile {
         data_row_writes: 3,
@@ -14610,7 +14626,7 @@ mod tests {
         leaf_page_count: 2,
         idx_row_count: 1,
         term_count: 4,
-        checksum: 3861481483356166922,
+        checksum: 14675037215621412687,
     },
 }"
         );
@@ -15090,7 +15106,7 @@ mod tests {
             137438953473,
             [
                 0,
-                11,
+                0,
                 0,
                 58,
                 6,
@@ -15172,7 +15188,14 @@ mod tests {
             ],
         ),
     ],
-    idx: [],
+    idx: [
+        Fts5IdxRow {
+            segid: 1,
+            term: [],
+            btree_page: 1,
+            has_doclist_index: false,
+        },
+    ],
     config: [
         (
             "insttoken",
@@ -15352,7 +15375,7 @@ mod tests {
                 leaf_page_count: 2,
                 idx_row_count: 1,
                 term_count: 4,
-                checksum: 3861481483356166922,
+                checksum: 14675037215621412687,
             },
         ),
         content_row_count: 2,
