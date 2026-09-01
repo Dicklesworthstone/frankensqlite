@@ -10,7 +10,7 @@
 //!   * keeper tests — bounded-work assertions that fail if the per-autocommit
 //!     cost regresses back to O(schema) re-materialization.
 
-use fsqlite::Connection;
+use fsqlite::{Connection, SqliteValue};
 use fsqlite_core::connection::{
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
@@ -101,9 +101,15 @@ fn window_report(
         ms(after.commit_pre_txn_ns, before.commit_pre_txn_ns),
         ms(after.commit_roundtrip_ns, before.commit_roundtrip_ns),
         ms(after.commit_finalize_seq_ns, before.commit_finalize_seq_ns),
-        ms(after.commit_handle_finalize_ns, before.commit_handle_finalize_ns),
+        ms(
+            after.commit_handle_finalize_ns,
+            before.commit_handle_finalize_ns
+        ),
         ms(after.commit_post_maint_ns, before.commit_post_maint_ns),
-        ms(after.finalize_post_publish_ns, before.finalize_post_publish_ns),
+        ms(
+            after.finalize_post_publish_ns,
+            before.finalize_post_publish_ns
+        ),
         file_kb(db_path),
         file_kb(&wal),
     );
@@ -150,7 +156,9 @@ fn gh402_measure_autocommit_schema_scaling() {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("gh402_seq.db");
-        let conn = Connection::open(path.to_str().unwrap()).await.expect("open");
+        let conn = Connection::open(path.to_str().unwrap())
+            .await
+            .expect("open");
         let windows = create_schema_autocommit(&conn, table_count(), "seq", &path).await;
         println!("[gh402] seq window_ms trace: {windows:?}");
         println!(
@@ -198,10 +206,187 @@ fn gh402_measure_autocommit_schema_scaling() {
 
         // Reopen + first statement.
         let t = Instant::now();
-        let c2 = Connection::open(path.to_str().unwrap()).await.expect("reopen");
+        let c2 = Connection::open(path.to_str().unwrap())
+            .await
+            .expect("reopen");
         let _ = c2.execute("SELECT 1;").await;
-        println!("[gh402] reopen+first statement: {} ms", t.elapsed().as_millis());
+        println!(
+            "[gh402] reopen+first statement: {} ms",
+            t.elapsed().as_millis()
+        );
 
         set_hot_path_profile_enabled(false);
+    });
+}
+
+/// GH#402 keeper: total checkpoint backfill work across a file-backed
+/// autocommit DDL loop must stay linear in the frames actually written.
+///
+/// Pre-fix, every post-commit autocheckpoint restarted from WAL frame 0
+/// (`SimplePager::checkpoint` passed `backfilled_frames = 0`) and the trigger
+/// keyed on raw WAL length, so once the WAL crossed the adaptive target every
+/// autocommit statement re-walked the whole WAL: backfilled-frames grew
+/// quadratically (observed ratio >40x at this scale). Post-fix the adapter's
+/// generation-tagged watermark resumes where the last checkpoint stopped, so
+/// cumulative backfill stays within a small multiple of frames written.
+///
+/// The counters are process-global, so concurrent tests can only ADD linear
+/// noise to both sides of the inequality; the quadratic signature this guards
+/// against exceeds the bound by more than an order of magnitude.
+#[test]
+fn gh402_autocommit_checkpoint_backfill_work_is_linear() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gh402_keeper.db");
+        let conn = Connection::open(path.to_str().unwrap())
+            .await
+            .expect("open");
+
+        let before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
+        const KEEPER_TABLES: usize = 250; // 500 objects: safely past the cliff.
+        for i in 0..KEEPER_TABLES {
+            conn.execute(&format!(
+                "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b REAL, c BLOB);"
+            ))
+            .await
+            .expect("create table");
+            conn.execute(&format!("CREATE INDEX idx_t{i}_a ON t{i}(a);"))
+                .await
+                .expect("create index");
+        }
+        let after = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
+
+        let written = after
+            .frames_written_total
+            .saturating_sub(before.frames_written_total);
+        let backfilled = after
+            .checkpoint_frames_backfilled_total
+            .saturating_sub(before.checkpoint_frames_backfilled_total);
+        println!(
+            "[gh402-keeper] frames_written_delta={written} checkpoint_backfilled_delta={backfilled}"
+        );
+        assert!(
+            backfilled <= written.saturating_mul(3).saturating_add(4_000),
+            "checkpoint backfill work is super-linear again (GH#402): \
+             {backfilled} frames backfilled for {written} frames written — \
+             autocheckpoints are re-walking the whole WAL per autocommit statement"
+        );
+        conn.close().await.expect("close");
+    });
+}
+
+/// GH#402 keeper: the checkpoint-scheduling change must not weaken
+/// cross-connection schema visibility. Connection A holds warm caches; B (a
+/// separate connection on the same file) commits DDL + a row; A must observe
+/// both without any manual refresh — the schema-cookie / visible-commit-seq
+/// staleness check is the guard that any skip-refresh fast path has to pass.
+#[test]
+fn gh402_cross_connection_schema_change_remains_visible() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gh402_visibility.db");
+        let path = path.to_str().unwrap();
+
+        let conn_a = Connection::open(path).await.expect("open A");
+        conn_a
+            .execute("CREATE TABLE seed (id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .expect("seed table");
+        conn_a
+            .execute("INSERT INTO seed (v) VALUES ('warm');")
+            .await
+            .expect("seed row");
+        // Warm A's prepared/schema caches.
+        let rows = conn_a
+            .query("SELECT v FROM seed;")
+            .await
+            .expect("warm read");
+        assert_eq!(rows.len(), 1);
+
+        let conn_b = Connection::open(path).await.expect("open B");
+        conn_b
+            .execute("CREATE TABLE from_b (id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .expect("B ddl");
+        conn_b
+            .execute("INSERT INTO from_b (v) VALUES ('peer');")
+            .await
+            .expect("B row");
+
+        // A must see B's committed schema object and its row.
+        let rows = conn_a
+            .query("SELECT v FROM from_b;")
+            .await
+            .expect("A must see B's new table");
+        assert_eq!(rows.len(), 1, "A must see B's committed row");
+        conn_b.close().await.expect("close B");
+        conn_a.close().await.expect("close A");
+    });
+}
+
+/// PR#401 invariant keeper (reimplemented in-house, GH#402 companion): a
+/// schema-only open never bulk-hydrates file rows into `MemDatabase` through
+/// the prepared-query MemDB fast path, and the read-only variant still
+/// refuses writes. The gate derives from the open mode (the schema-only
+/// family), not a caller-set flag.
+#[test]
+fn gh402_schema_only_prepared_reads_stay_pager_backed() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gh402_schema_only.db");
+        let path = path.to_str().unwrap();
+
+        // Build a small canonical table with an index through a normal open.
+        let writer = Connection::open(path).await.expect("open writer");
+        writer
+            .execute("CREATE TABLE canon (id INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT);")
+            .await
+            .expect("ddl");
+        writer
+            .execute("CREATE INDEX idx_canon_k ON canon(k);")
+            .await
+            .expect("index");
+        writer.execute("BEGIN;").await.expect("begin");
+        for i in 0..64 {
+            writer
+                .execute(&format!(
+                    "INSERT INTO canon (k, v) VALUES ('k{i}', 'v{i}');"
+                ))
+                .await
+                .expect("insert");
+        }
+        writer.execute("COMMIT;").await.expect("commit");
+        writer.close().await.expect("close writer");
+
+        // Read-only schema-only open: parameterized prepared lookup must
+        // answer from the pager without hydrating MemDatabase rows.
+        let reader = Connection::open_schema_only(path)
+            .await
+            .expect("schema-only open");
+        let stmt = reader
+            .prepare("SELECT v FROM canon WHERE k = ?1;")
+            .await
+            .expect("prepare");
+        for i in [3_usize, 41, 3] {
+            let rows = stmt
+                .query_with_params(&[SqliteValue::from(format!("k{i}"))])
+                .await
+                .expect("prepared lookup");
+            assert_eq!(rows.len(), 1, "lookup k{i} must find its row");
+        }
+        assert_eq!(
+            reader.memdb_row_hydration_count(),
+            0,
+            "schema-only prepared reads must stay pager-backed \
+             (PR#401 invariant): the MemDB fast path bulk-hydrated the file"
+        );
+        assert!(
+            reader
+                .execute("INSERT INTO canon (k, v) VALUES ('nope', 'nope');")
+                .await
+                .is_err(),
+            "read-only schema-only open must refuse writes"
+        );
+        reader.close().await.expect("close reader");
     });
 }

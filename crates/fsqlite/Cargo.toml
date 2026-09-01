@@ -60,6 +60,7 @@ asupersync = { workspace = true, features = ["test-internals"] }
 fsqlite-ast = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
+fsqlite-wal = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
 sha2 = { workspace = true }
