@@ -53,7 +53,7 @@
 //! }
 //! ```
 
-use crate::compat::{OpenFlags, open_with_flags};
+use crate::compat::{OpenFlags, open_with_flags_with_env};
 use crate::{Connection, ConnectionEnv, FileIdentity, FrankenError, Row, SqliteValue};
 use asupersync::channel::{mpsc as async_mpsc, oneshot};
 use asupersync::cx::{Cx as NativeCx, cap as native_cap};
@@ -1737,20 +1737,49 @@ enum WorkerOpenRequest {
 impl WorkerOpenRequest {
     async fn open(self) -> Result<Connection, FrankenError> {
         match self {
-            Self::WithEnv { path, env } => Connection::open_with_env(path, env).await,
+            Self::WithEnv { path, env } => {
+                Connection::open_with_env(path, dedicated_worker_env(env)).await
+            }
             Self::WithPageSize {
                 path,
                 page_size_bytes,
-            } => Connection::open_with_page_size(path, page_size_bytes).await,
-            Self::Existing { path } => Connection::open_existing(path).await,
-            Self::SchemaOnly { path } => Connection::open_schema_only(path).await,
+            } => {
+                Connection::open_with_page_size_and_env(
+                    path,
+                    page_size_bytes,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
+            }
+            Self::Existing { path } => {
+                Connection::open_existing_with_env(
+                    path,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
+            }
+            Self::SchemaOnly { path } => {
+                Connection::open_schema_only_with_env(
+                    path,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
+            }
             Self::SchemaOnlyWithEnv { path, env } => {
-                Connection::open_schema_only_with_env(path, env).await
+                Connection::open_schema_only_with_env(path, dedicated_worker_env(env)).await
             }
             Self::ExistingSchemaOnlyWithEnv { path, env } => {
-                Connection::open_existing_schema_only_with_env(path, env).await
+                Connection::open_existing_schema_only_with_env(path, dedicated_worker_env(env))
+                    .await
             }
-            Self::WithFlags { path, flags } => open_with_flags(&path, flags).await,
+            Self::WithFlags { path, flags } => {
+                open_with_flags_with_env(
+                    &path,
+                    flags,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
+            }
             Self::ReservedWithExpectedIdentityAndEnv {
                 path,
                 expected_identity,
@@ -1759,7 +1788,7 @@ impl WorkerOpenRequest {
                 Connection::open_reserved_with_expected_identity_and_env(
                     path,
                     expected_identity,
-                    env,
+                    dedicated_worker_env(env),
                 )
                 .await
             }
@@ -1771,12 +1800,17 @@ impl WorkerOpenRequest {
                 Connection::open_existing_with_expected_identity_and_env(
                     path,
                     expected_identity,
-                    env,
+                    dedicated_worker_env(env),
                 )
                 .await
             }
         }
     }
+}
+
+fn dedicated_worker_env(mut env: ConnectionEnv) -> ConnectionEnv {
+    env.mark_blocking_io_inline_safe();
+    env
 }
 
 fn spawn_worker_thread(
@@ -1802,15 +1836,10 @@ fn spawn_worker_thread(
 
                 match open_result {
                     Ok(conn) => {
-                        // bd-bjm5d: this thread is a dedicated engine OS thread —
-                        // it runs a bare single-future executor
-                        // (futures_lite::block_on) that owns exactly one
-                        // Connection and serializes its command stream, so a
-                        // bounded inline pread/pwrite can stall nothing but this
-                        // connection's own next command. This is the ONLY
-                        // permitted set site (enforced by
-                        // blocking_io_inline_marker_has_exactly_one_set_site).
-                        conn.root_cx().mark_blocking_io_inline_safe();
+                        // The worker request marked its ConnectionEnv before
+                        // bootstrap, so both open-time pager/WAL I/O and this
+                        // connection's command stream carry the same dedicated
+                        // OS-thread inline-I/O authority.
                         #[cfg(test)]
                         state.pause_before_open_response();
                         open_tx.respond(Ok(OpenHandshake::Opened));
@@ -2077,7 +2106,7 @@ impl AsyncConnection {
 
     /// Open a database with explicit SQLite-compatible [`OpenFlags`].
     ///
-    /// Routes to [`open_with_flags`] on the dedicated large-stack worker
+    /// Routes to [`crate::compat::open_with_flags`] on the dedicated large-stack worker
     /// thread. The primary consumer contract is
     /// [`OpenFlags::SQLITE_OPEN_READ_ONLY`], which refuses writes for the
     /// lifetime of the connection.
@@ -6645,6 +6674,15 @@ mod tests {
         conn.execute_sync("INSERT INTO t VALUES (2, 'refused')")
             .expect_err("read-only schema-only mode must refuse writes");
         conn.close_sync().expect("close should succeed");
+    }
+
+    #[test]
+    fn dedicated_worker_env_enables_inline_io_explicitly() {
+        let env = ConnectionEnv::default();
+        assert!(!env.blocking_io_inline_safe());
+
+        let env = dedicated_worker_env(env);
+        assert!(env.blocking_io_inline_safe());
     }
 
     #[cfg(all(feature = "native", any(unix, windows)))]

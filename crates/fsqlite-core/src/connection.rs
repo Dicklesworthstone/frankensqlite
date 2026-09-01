@@ -3088,6 +3088,11 @@ async fn capture_ambient_io_native_cx(root_cx: &Cx) -> Option<asupersync::runtim
 #[derive(Debug, Clone)]
 pub struct ConnectionEnv {
     runtime: Arc<RuntimeContext>,
+    /// Whether contexts derived while opening this connection are running on
+    /// a dedicated engine OS thread where bounded positional I/O may safely
+    /// execute inline. Raw connection opens leave this disabled; the
+    /// `AsyncConnection` worker enables it before bootstrap.
+    blocking_io_inline_safe: bool,
     /// Explicit page-buffer-pool ceiling override. `None` defers to the
     /// `FSQLITE_PAGE_BUFFER_MAX` env var / [`DEFAULT_PAGE_BUFFER_MAX`].
     page_buffer_max: Option<usize>,
@@ -3116,6 +3121,7 @@ impl ConnectionEnv {
     pub fn new(runtime: Arc<RuntimeContext>) -> Self {
         Self {
             runtime,
+            blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
@@ -3197,6 +3203,39 @@ impl ConnectionEnv {
         &self.runtime
     }
 
+    /// Mark this environment as owned by a dedicated engine OS thread.
+    ///
+    /// Contexts derived during connection bootstrap and for the resulting
+    /// connection will permit bounded positional I/O inline. Callers must set
+    /// this only when the complete open and operation lifecycle is serialized
+    /// on one dedicated thread; ordinary raw opens deliberately remain false.
+    pub fn mark_blocking_io_inline_safe(&mut self) {
+        self.blocking_io_inline_safe = true;
+    }
+
+    /// Whether this connection environment carries dedicated-thread inline
+    /// I/O authority.
+    #[must_use]
+    pub const fn blocking_io_inline_safe(&self) -> bool {
+        self.blocking_io_inline_safe
+    }
+
+    fn apply_blocking_io_inline_safety(&self, cx: &Cx) {
+        if self.blocking_io_inline_safe {
+            cx.mark_blocking_io_inline_safe();
+        }
+    }
+
+    fn bootstrap_cx(&self) -> Cx {
+        let cx = self
+            .runtime
+            .root_cx
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        self.apply_blocking_io_inline_safety(&cx);
+        cx
+    }
+
     /// Override the maximum number of page buffers the pager's buffer pool
     /// will allocate.
     ///
@@ -3234,6 +3273,7 @@ impl Default for ConnectionEnv {
     fn default() -> Self {
         Self {
             runtime: RuntimeContext::global(),
+            blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
             strict_multi_process: false,
@@ -13373,11 +13413,7 @@ impl Connection {
         }
         let attach_env = env.clone();
 
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = match disposition {
             SchemaOnlyPagerDisposition::Ordinary if writable => {
@@ -13423,6 +13459,7 @@ impl Connection {
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
+        env.apply_blocking_io_inline_safety(&root_cx);
         pager.bind_shared_connection_count(shared_mvcc_state.shared_open_connection_count());
         if let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started() {
             let _ = shared_mvcc_state.release_connection(runtime_region, true);
@@ -13773,11 +13810,7 @@ impl Connection {
             });
         }
 
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_reserved_with_page_buffer_max(
@@ -13804,11 +13837,7 @@ impl Connection {
             });
         }
 
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_existing_with_page_buffer_max(
@@ -13845,11 +13874,7 @@ impl Connection {
             })?;
         // Phase 5 (bd-3iw8): initialize the pager backend as the primary
         // storage layer. The pager handles all persistence via WAL.
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let storage_was_empty = if path == ":memory:" {
             true
@@ -13897,11 +13922,7 @@ impl Connection {
             bytes.len() >= DATABASE_HEADER_SIZE && bytes[18] == 2 && bytes[19] == 2;
 
         let path = ":memory:".to_owned();
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+        let bootstrap_cx = env.bootstrap_cx();
         let vfs = env
             .memory_vfs_config()
             .map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
@@ -13939,6 +13960,7 @@ impl Connection {
             None
         } else {
             let identity_cx = env.runtime().root_cx.create_child();
+            env.apply_blocking_io_inline_safety(&identity_cx);
             pager.file_identity(&identity_cx).await?
         };
         let shared_mvcc_state =
@@ -13946,6 +13968,7 @@ impl Connection {
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         shared_mvcc_state.align_commit_clock_floor(initial_visible_commit_seq);
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
+        env.apply_blocking_io_inline_safety(&root_cx);
         pager.bind_shared_connection_count(shared_mvcc_state.shared_open_connection_count());
         if !pager_is_memory
             && let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started()
@@ -147510,6 +147533,27 @@ mod tests {
             env.runtime().config().io_poll_strategy,
             IoPollStrategy::Blocking
         );
+    }
+
+    #[test]
+    fn test_connection_env_inline_io_authority_is_explicit_and_bootstrap_scoped() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let mut env = ConnectionEnv::new(runtime);
+
+        assert!(!env.blocking_io_inline_safe());
+        assert!(!env.bootstrap_cx().blocking_io_inline_safe());
+
+        env.mark_blocking_io_inline_safe();
+        assert!(env.blocking_io_inline_safe());
+        assert!(env.bootstrap_cx().blocking_io_inline_safe());
+
+        let connection_root = env.runtime().root_cx.create_child();
+        assert!(!connection_root.blocking_io_inline_safe());
+        env.apply_blocking_io_inline_safety(&connection_root);
+        assert!(connection_root.blocking_io_inline_safe());
     }
 
     #[test]

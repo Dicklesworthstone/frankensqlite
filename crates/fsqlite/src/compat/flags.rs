@@ -3,7 +3,7 @@
 use fsqlite_error::FrankenError;
 use fsqlite_types::flags::VfsOpenFlags;
 
-use crate::Connection;
+use crate::{Connection, ConnectionEnv};
 
 /// Subset of SQLite open flags that cass uses, mirroring `rusqlite::OpenFlags`.
 ///
@@ -163,13 +163,16 @@ fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
     Ok(())
 }
 
-async fn open_read_only_connection(path: &str) -> Result<Connection, FrankenError> {
+async fn open_read_only_connection_with_env(
+    path: &str,
+    env: ConnectionEnv,
+) -> Result<Connection, FrankenError> {
     if path == ":memory:" {
         return Err(FrankenError::NotImplemented(
             "read-only :memory: connections are not supported".to_owned(),
         ));
     }
-    Connection::open_schema_only(path).await
+    Connection::open_schema_only_with_env(path, env).await
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -197,16 +200,24 @@ impl std::ops::BitOr for OpenFlags {
 /// let conn = open_with_flags("my.db", OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 /// ```
 pub async fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
+    open_with_flags_with_env(path, flags, ConnectionEnv::default()).await
+}
+
+pub(crate) async fn open_with_flags_with_env(
+    path: &str,
+    flags: OpenFlags,
+    env: ConnectionEnv,
+) -> Result<Connection, FrankenError> {
     match classify_access_mode(flags)? {
-        OpenDisposition::ReadOnly => open_read_only_connection(path).await,
+        OpenDisposition::ReadOnly => open_read_only_connection_with_env(path, env).await,
         OpenDisposition::WriteExisting => {
             if path == ":memory:" {
-                Connection::open(path).await
+                Connection::open_with_env(path, env).await
             } else {
-                Connection::open_existing(path).await
+                Connection::open_existing_with_env(path, env).await
             }
         }
-        OpenDisposition::WriteCreate => Connection::open(path).await,
+        OpenDisposition::WriteCreate => Connection::open_with_env(path, env).await,
     }
 }
 
