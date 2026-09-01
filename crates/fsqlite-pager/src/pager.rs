@@ -15696,6 +15696,24 @@ where
         .unwrap_or(0)
     }
 
+    /// Number of current-generation WAL frames already backfilled into the
+    /// database file by this pager's WAL backend (GH#402; `nBackfill`
+    /// equivalent). Same read-lock discipline as [`Self::wal_frame_count`]:
+    /// this is a plain advisory probe for autocheckpoint scheduling.
+    pub async fn wal_backfilled_frame_count(&self, cx: &Cx) -> usize {
+        if self
+            .group_commit_queue
+            .has_process_root_finalization_attempt()
+        {
+            return 0;
+        }
+        with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
+            Box::pin(async move { Ok(wal.backfilled_frame_count()) })
+        })
+        .await
+        .unwrap_or(0)
+    }
+
     /// Compute the journal path from the database path.
     fn journal_path(db_path: &Path) -> PathBuf {
         let mut jp = db_path.as_os_str().to_owned();

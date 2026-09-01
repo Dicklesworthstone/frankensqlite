@@ -998,14 +998,14 @@ fn fire_pending_conflict_lock_window_hook() {
 /// regression can act only on its own snapshot even though the hook is
 /// process-global.
 #[cfg(test)]
-static FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK: Mutex<
-    Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
-> = Mutex::new(None);
+type BoundedSnapshotTestHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
 
 #[cfg(test)]
-fn set_bounded_snapshot_pre_final_receipt_hook(
-    hook: Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
-) {
+static FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK: Mutex<Option<BoundedSnapshotTestHook>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn set_bounded_snapshot_pre_final_receipt_hook(hook: Option<BoundedSnapshotTestHook>) {
     *FSQLITE_BOUNDED_SNAPSHOT_PRE_FINAL_RECEIPT_HOOK
         .lock()
         .expect("bounded-snapshot pre-final-receipt hook mutex poisoned") = hook;
@@ -1032,14 +1032,11 @@ fn fire_bounded_snapshot_pre_final_receipt_hook(image_path: &Path) {
 /// `capture/compare -> rollback -> close`, and its firing after an injected
 /// receipt failure pins that teardown is attempted unconditionally.
 #[cfg(test)]
-static FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK: Mutex<
-    Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
-> = Mutex::new(None);
+static FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK: Mutex<Option<BoundedSnapshotTestHook>> =
+    Mutex::new(None);
 
 #[cfg(test)]
-fn set_bounded_snapshot_pre_teardown_hook(
-    hook: Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>,
-) {
+fn set_bounded_snapshot_pre_teardown_hook(hook: Option<BoundedSnapshotTestHook>) {
     *FSQLITE_BOUNDED_SNAPSHOT_PRE_TEARDOWN_HOOK
         .lock()
         .expect("bounded-snapshot pre-teardown hook mutex poisoned") = hook;
@@ -3639,6 +3636,21 @@ impl PagerBackend {
             Self::Unix(p) => p.wal_frame_count(cx).await,
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.wal_frame_count(cx).await,
+        }
+    }
+
+    /// Number of current-generation WAL frames already backfilled into the
+    /// database file (GH#402 autocheckpoint scheduling probe).
+    #[must_use]
+    pub async fn wal_backfilled_frame_count(&self, cx: &Cx) -> usize {
+        match self {
+            Self::Memory(p) => p.wal_backfilled_frame_count(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.wal_backfilled_frame_count(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.wal_backfilled_frame_count(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.wal_backfilled_frame_count(cx).await,
         }
     }
 
@@ -10887,6 +10899,11 @@ struct CheckpointRuntimeSnapshot {
     wal_autocheckpoint_pages: u64,
     adaptive_autocheckpoint_target_pages: u64,
     wal_frames_estimate: u64,
+    /// GH#402: WAL frames NOT yet backfilled into the database file
+    /// (`wal_frames_estimate` minus the backend's current-generation
+    /// backfill watermark). The autocheckpoint trigger keys on this so an
+    /// already-backfilled WAL does not re-checkpoint on every commit.
+    wal_unbackfilled_frames_estimate: u64,
     frames_written_total: u64,
     bytes_written_total: u64,
     write_rate_frames_per_sec: u64,
@@ -22806,6 +22823,18 @@ impl Connection {
         self.path == ":memory:" || !*self.reject_mem_fallback.borrow()
     }
 
+    /// PR#401 invariant (GH#402 companion): connections opened through the
+    /// schema-only family promise bounded-memory, pager-backed row reads, so
+    /// the opportunistic prepared-query MemDB fast path must never bulk-
+    /// hydrate the whole file into `MemDatabase` on their behalf. Derived
+    /// from the open mode: `allow_lazy_contentless_fts5` is set exclusively
+    /// by the schema-only open family (every variant — read-only, writable
+    /// existing-only, and deferred-FTS5), never by ordinary opens.
+    #[inline]
+    fn defer_memdb_row_hydration(&self) -> bool {
+        self.allow_lazy_contentless_fts5
+    }
+
     #[inline]
     fn version_store(&self) -> Arc<VersionStore> {
         Arc::clone(
@@ -26965,6 +26994,7 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
     ) -> bool {
         !self.pager.is_memory()
+            && !self.defer_memdb_row_hydration()
             && !self.in_transaction.get()
             && !self.active_txn_is_open_or_borrowed()
             && self.retained_autocommit_txn.borrow().is_none()
@@ -53791,9 +53821,11 @@ impl Connection {
         // on paths that already passed the background-status gate (commit,
         // checkpoint scheduling); minting a fresh gated op_cx here charged an
         // extra op_cx_background_gates entry to the direct commit API.
-        let wal_frames_estimate = {
+        let (wal_frames_estimate, wal_unbackfilled_frames_estimate) = {
             let cx = self.op_cx_after_background_status();
-            self.pager.wal_frame_count(&cx).await as u64
+            let frames = self.pager.wal_frame_count(&cx).await as u64;
+            let backfilled = self.pager.wal_backfilled_frame_count(&cx).await as u64;
+            (frames, frames.saturating_sub(backfilled))
         };
 
         let now = Instant::now();
@@ -53854,6 +53886,7 @@ impl Connection {
             wal_autocheckpoint_pages,
             adaptive_autocheckpoint_target_pages,
             wal_frames_estimate,
+            wal_unbackfilled_frames_estimate,
             frames_written_total: wal_metrics.frames_written_total,
             bytes_written_total: wal_metrics.bytes_written_total,
             write_rate_frames_per_sec,
@@ -54121,7 +54154,8 @@ impl Connection {
 
     fn checkpoint_should_delay_for_write_pressure(snapshot: &CheckpointRuntimeSnapshot) -> bool {
         snapshot.wal_autocheckpoint_pages > 0
-            && snapshot.wal_frames_estimate >= snapshot.adaptive_autocheckpoint_target_pages.max(1)
+            && snapshot.wal_unbackfilled_frames_estimate
+                >= snapshot.adaptive_autocheckpoint_target_pages.max(1)
             && snapshot.write_rate_frames_per_sec >= snapshot.write_pressure_frames_per_sec
             && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold
     }
@@ -54240,7 +54274,15 @@ impl Connection {
         }
 
         let adaptive_target = snapshot.adaptive_autocheckpoint_target_pages.max(1);
-        if snapshot.wal_frames_estimate < adaptive_target {
+        // GH#402: key the trigger on the frames NOT yet backfilled, not on raw
+        // WAL length. A fully backfilled WAL that merely has not been reset
+        // yet must not re-run a checkpoint on every autocommit commit — that
+        // was the super-linear per-statement cost cliff (each pass re-walked
+        // the whole WAL). Raw WAL length still escalates past the urgent
+        // threshold so Full/Restart/Truncate can bound the file itself.
+        if snapshot.wal_unbackfilled_frames_estimate < adaptive_target
+            && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold.max(1)
+        {
             return;
         }
 
@@ -54945,10 +54987,14 @@ impl Connection {
         }
 
         if self.committed_pager_refresh_allowed() {
-            let hydrate_file_backed_fast_path = stmt
-                .prepared_query_fast_path
-                .as_ref()
-                .is_some_and(PreparedQueryFastPath::can_use_clean_file_backed_memdb);
+            // PR#401 invariant: schema-only opens never bulk-hydrate file rows
+            // into MemDatabase through the prepared fast path; their reads stay
+            // pager-backed (see `defer_memdb_row_hydration`).
+            let hydrate_file_backed_fast_path = !self.defer_memdb_row_hydration()
+                && stmt
+                    .prepared_query_fast_path
+                    .as_ref()
+                    .is_some_and(PreparedQueryFastPath::can_use_clean_file_backed_memdb);
             if hydrate_file_backed_fast_path {
                 let _ = self
                     .refresh_memdb_if_stale_with_publication_and_mode(

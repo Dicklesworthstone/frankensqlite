@@ -621,6 +621,16 @@ pub trait WalBackend: Send + Sync {
     /// Number of valid frames currently in the WAL.
     fn frame_count(&self) -> usize;
 
+    /// Number of frames of the CURRENT WAL generation this backend has
+    /// already backfilled into the database file (`nBackfill` equivalent,
+    /// GH#402). Used by autocheckpoint scheduling so an already-backfilled
+    /// WAL does not re-trigger a checkpoint on every commit. Backends that
+    /// do not track backfill return 0, which keeps the conservative
+    /// re-backfill-from-zero behavior.
+    fn backfilled_frame_count(&self) -> usize {
+        0
+    }
+
     /// Run a checkpoint to transfer frames from the WAL to the database.
     ///
     /// Takes a `CheckpointPageWriter` that handles the actual page writes

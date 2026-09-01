@@ -275,6 +275,16 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// full authoritative index in steady state. Tests can lower the cap to
     /// exercise the partial-index fallback path explicitly.
     page_index_cap: usize,
+    /// GH#402: frames this adapter has already backfilled into the database
+    /// file for the tagged WAL generation (`nBackfill` equivalent). A
+    /// checkpoint resumes from here instead of re-reading and re-writing the
+    /// whole WAL from frame 0 on every pass — the source of the super-linear
+    /// per-autocommit cost once the WAL crosses the autocheckpoint target.
+    /// The tag is the generation identity (`checkpoint_seq` + salts): any
+    /// reset — ours or a peer's — changes it and invalidates the watermark,
+    /// so a stale watermark can only ever cause extra re-backfilling of
+    /// identical bytes, never a skipped frame.
+    checkpoint_backfill_watermark: Option<(WalGenerationIdentity, u32)>,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
@@ -296,6 +306,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
+            checkpoint_backfill_watermark: None,
         }
     }
 
@@ -316,6 +327,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
+            checkpoint_backfill_watermark: None,
         }
     }
 
@@ -1994,6 +2006,19 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         self.wal.frame_count()
     }
 
+    fn backfilled_frame_count(&self) -> usize {
+        // Valid only for the current WAL generation; a reset (ours or a
+        // peer's) invalidates the watermark to 0 (GH#402).
+        match self.checkpoint_backfill_watermark {
+            Some((tagged_generation, frames))
+                if tagged_generation == self.wal.generation_identity() =>
+            {
+                frames as usize
+            }
+            _ => 0,
+        }
+    }
+
     fn checkpoint<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -2021,10 +2046,23 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             self.refresh_before_append = true;
             let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
 
+            // GH#402: resume from this adapter's durable backfill watermark
+            // when it belongs to the CURRENT WAL generation (a reset — ours or
+            // a peer's — changes the generation identity and invalidates it).
+            // Without this, every autocheckpoint restarted at frame 0 and
+            // re-read/re-compared the whole WAL, making each post-commit
+            // checkpoint O(total WAL frames) instead of O(new frames).
+            let generation = self.wal.generation_identity();
+            let tracked_backfilled = match self.checkpoint_backfill_watermark {
+                Some((tagged_generation, frames)) if tagged_generation == generation => frames,
+                _ => 0,
+            };
+            let effective_backfilled = backfilled_frames.max(tracked_backfilled).min(total_frames);
+
             // Build checkpoint state for the planner.
             let state = CheckpointState {
                 total_frames,
-                backfilled_frames,
+                backfilled_frames: effective_backfilled,
                 oldest_reader_frame,
             };
 
@@ -2061,6 +2099,20 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             if result.wal_was_reset {
                 self.invalidate_publication();
             }
+
+            // GH#402: advance (or reset) the backfill watermark. Frames
+            // [effective_backfilled .. effective_backfilled + frames_backfilled)
+            // are now durably represented in the database file for this
+            // generation; a reset starts a fresh generation with nothing
+            // backfilled.
+            self.checkpoint_backfill_watermark = if result.wal_was_reset {
+                None
+            } else {
+                Some((
+                    generation,
+                    effective_backfilled.saturating_add(result.frames_backfilled),
+                ))
+            };
 
             self.publish_latest_committed_snapshot(cx, "checkpoint")
                 .await?;
@@ -4337,6 +4389,10 @@ where
 
     fn frame_count(&self) -> usize {
         self.inner.frame_count()
+    }
+
+    fn backfilled_frame_count(&self) -> usize {
+        self.inner.backfilled_frame_count()
     }
 
     fn checkpoint<'a>(
