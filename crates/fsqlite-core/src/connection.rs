@@ -36744,7 +36744,7 @@ impl Connection {
                     } else {
                         bound.limit.take()
                     };
-                    if std::env::var_os("GH386_DBG").is_some() {
+                    if true {
                         eprintln!(
                             "GH386DBG join_or_subquery callsite: limit_kept={}",
                             limit_clause.is_none()
@@ -82954,11 +82954,11 @@ impl Connection {
         let Some(shape) = join_keyset_limit_pushdown_shape(select) else {
             return Ok(None);
         };
-        if std::env::var_os("GH386_DBG").is_some() {
+        if true {
             eprintln!("GH386DBG lane: shape matched, entering runtime gate");
         }
         let refuse = |reason: &str| {
-            if std::env::var_os("GH386_DBG").is_some() {
+            if true {
                 eprintln!("GH386DBG lane: runtime refusal: {reason}");
             }
             let _ = reason;
@@ -88270,7 +88270,7 @@ impl Connection {
         // pre-check `join_keyset_limit_pushdown_shape` leave `select.limit`
         // in place so the lane (and, on refusal, the shared tail LIMIT
         // application) can see it.
-        if std::env::var_os("GH386_DBG").is_some() {
+        if true {
             eprintln!(
                 "GH386DBG execute_join_select: limit_present={} preloaded_none={} shape={}",
                 select.limit.is_some(),
