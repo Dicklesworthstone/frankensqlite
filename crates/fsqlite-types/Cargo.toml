@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-types"
-version = "0.3.13"
+version = "0.3.14"
 description = "Core type definitions for FrankenSQLite"
 edition.workspace = true
 license-file.workspace = true

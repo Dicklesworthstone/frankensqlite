@@ -17,13 +17,16 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.11](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.11) (2026-08-27). v0.3.2–v0.3.4 and v0.3.6–v0.3.11 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) (2026-09-01). v0.3.2–v0.3.4 and v0.3.6–v0.3.14 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. The v0.3.12/v0.3.13 rows below are timeline summaries from their release tags; full per-change sections for that pair were not reconstructed.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.11...main) | HEAD | 2026-08-27 | Development after v0.3.11 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...main) | HEAD | 2026-09-01 | Development after v0.3.14 |
+| [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) | Release | 2026-09-01 | FTS5 stock-compat writer fix (GH#404) + GH#402 checkpoint watermark (super-linear autocommit fix) + `PRAGMA wal_checkpoint` cumulative-nBackfill parity + legacy-automerge origin-poisoning fix |
+| [v0.3.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.13) | Release | 2026-08-29 | GH#399 reader-slot release-failure follow-up (b1c4609d9) |
+| [v0.3.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.12) | Release | 2026-08-29 | GH#399 cross-process WAL wave: reader-slot registration + checkpoint horizon gating (55c186682), abandoned-page pool drop at a peer WAL generation reset (5946b3b7c) |
 | [v0.3.11](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.11) | Release | 2026-08-27 | Preserve and enforce compound CHECK constraints with nested grouping parentheses |
 | [v0.3.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.10) | Release | 2026-08-26 | DDL source-span and shadowed-main ALTER correctness; checkpoint, recovery, planner, backup, compaction, and observability hardening |
 | [v0.3.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.9) | Release | 2026-08-23 | **Expedited**: v0.3.8 prebuilt CLI could not open file databases (bd-slgya feature-pin regression) + Windows read-only open regression fix (GH#438) + async-api implies native (GH#379) + C API `sqlite3_bind_*` + UPSERT/trigger/parity continuation |
@@ -37,11 +40,89 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.11
+## [Unreleased] -- development on `main` since v0.3.14
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.11...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...main>
 
-Post-v0.3.11 development continues on `main` (see the compare link).
+Post-v0.3.14 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.14] -- 2026-09-01 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.13...v0.3.14>
+
+### FTS5 stock-compatibility: fsqlite-written indexes verify and search under stock SQLite (GH#404)
+
+Two writer divergences made every multi-leaf-page FTS5 index written by
+fsqlite fail stock SQLite's `PRAGMA integrity_check` ("malformed inverted
+index") while stock `MATCH` silently returned 0 rows for any term beyond leaf
+page 1 (`6fd828248`, `c6e5528f5`, `04655d158`):
+
+- The segment-leaf header's first-rowid offset was set on every page (stock
+  sets it only on doclist-continuation pages, which fsqlite never writes), so
+  stock's segment iterator misparsed every page ≥ 2 as a doclist continuation.
+  Written leaves now carry 0; stock-written continuation pages still decode.
+- The `%_idx` seek shadow was never populated, so stock's term seek never left
+  page 1. All four segment producers (initial flush, incremental contentless
+  append, automerge output, full re-encode) now emit stock-shaped rows —
+  page 1 keyed by the empty term, later leaves by their first term, `pgno`
+  stored encoded `(page << 1) | dlidx_flag` — and the merge / `delete-all`
+  paths swap or clear them with the segments they drop.
+
+Keeper: `crates/fsqlite-core/tests/gh404_fts5_stock_compat.rs` (multi-page
+corpus in the GH#404 shape; stock `integrity_check`, stock MATCH parity on
+page>1 terms, `fts5vocab` enumeration, `%_idx` shape, `delete-all` clearing,
+fsqlite reopen parity; demonstrated red against the pre-fix writer).
+
+**Migration:** existing fsqlite-written FTS5 indexes stay fsqlite-readable but
+need `INSERT INTO t(t) VALUES('rebuild')` (or `'optimize'`) after upgrading to
+become stock-verifiable/searchable.
+
+### FTS5: legacy contentless automerge no longer poisons the structure into origin tracking (bd-kon3m)
+
+The automerge stamped origin tracking onto its merged segment even for a
+legacy structure (`content=''` without `contentless_delete=1`); after the
+first merge, incremental inserts appended 3-column `_docsize` rows into the
+legacy 2-column shadow and the table refused to reopen. The merged segment now
+inherits the structure's tracking mode (`6dad0e026`). A legacy table already
+poisoned on disk by an earlier build keeps the condition (bd-kon3m tracks the
+sanitizer decision); the resurrected
+`fts5_contentless_incremental_persist` test is the keeper.
+
+### WAL checkpoints resume from a generation-tagged backfill watermark (GH#402)
+
+File-backed autocommit cost grew super-linearly with schema size because every
+post-commit checkpoint re-read the whole WAL from frame 0 and the
+autocheckpoint trigger keyed on raw WAL length. Checkpoints now resume from an
+`nBackfill`-style watermark tagged with the WAL generation identity (any
+reset — ours or a peer's — invalidates it), and the trigger keys on the
+unbackfilled estimate (`714dd288d`, keepers in `82bdbecca`).
+
+### `PRAGMA wal_checkpoint` reports cumulative nBackfill (bd-i5j5b)
+
+The watermark change had regressed the pragma's third column to this-call
+frames (0 after a resumed no-op pass); stock reports the cumulative
+`nBackfill` for the current WAL (`wal.c:4378`), which is what the GH#399
+keepers encode — they caught it. Restored in `5fb4e6d62`; durability was
+never affected.
+
+### Keyset stream lane hardening (GH#386)
+
+Granular refusal reasons for the keyset stream lane, WITHOUT ROWID and N-vs-2N
+scaling tests, and a scan-SQL fallback so a plain named inner table that is
+neither memdb- nor pager-scannable during an active transaction scope is
+served through normal dispatch instead of refusing the lane (`043fc79c7`,
+`f4b819e4e`, `65bf55ef4`).
+
+### Verification note
+
+The full GH#399 corruption battery — the three beads-shaped concurrent-process
+churn discriminators (no / PASSIVE / TRUNCATE close checkpoints), cross-process
+cache-rebuild churn, the single-process overflow-UPDATE repro, and both
+reader-horizon keepers — passed on macOS (Apple Silicon) at this release's
+tree state, with stock SQLite `integrity_check` as the oracle after every
+command. Previous keeper verification was Linux-only.
 
 ---
 
