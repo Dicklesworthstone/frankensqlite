@@ -36744,6 +36744,12 @@ impl Connection {
                     } else {
                         bound.limit.take()
                     };
+                    if std::env::var_os("GH386_DBG").is_some() {
+                        eprintln!(
+                            "GH386DBG join_or_subquery callsite: limit_kept={}",
+                            limit_clause.is_none()
+                        );
+                    }
                     if limit_clause
                         .as_ref()
                         .is_some_and(bound_limit_clause_is_constant_zero)
@@ -82948,26 +82954,33 @@ impl Connection {
         let Some(shape) = join_keyset_limit_pushdown_shape(select) else {
             return Ok(None);
         };
-        let refuse = || {
+        if std::env::var_os("GH386_DBG").is_some() {
+            eprintln!("GH386DBG lane: shape matched, entering runtime gate");
+        }
+        let refuse = |reason: &str| {
+            if std::env::var_os("GH386_DBG").is_some() {
+                eprintln!("GH386DBG lane: runtime refusal: {reason}");
+            }
+            let _ = reason;
             FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.fetch_add(1, AtomicOrdering::Relaxed);
         };
         let [outer_src, inner_src] = table_sources else {
-            refuse();
+            refuse("not exactly two table sources");
             return Ok(None);
         };
         let Some(outer_binding) = outer_src.local_table_binding().cloned() else {
-            refuse();
+            refuse("outer table not a local binding");
             return Ok(None);
         };
         if inner_src.local_table_binding().is_none() {
-            refuse();
+            refuse("inner table not a local binding");
             return Ok(None);
         }
         for src in [outer_src, inner_src] {
             if self.has_live_vtab_instance(&src.table_name)
                 || self.has_live_fts5_instance(&src.table_name)
             {
-                refuse();
+                refuse("live vtab/fts5 source");
                 return Ok(None);
             }
         }
@@ -82983,11 +82996,11 @@ impl Connection {
                 .copied()
         };
         let Some(ipk_idx) = ipk_idx else {
-            refuse();
+            refuse("outer table has no rowid-alias IPK");
             return Ok(None);
         };
         let Some(ipk_name) = outer_src.col_names.get(ipk_idx) else {
-            refuse();
+            refuse("rowid-alias index out of range");
             return Ok(None);
         };
         let outer_label = outer_src.alias.as_deref().unwrap_or(&outer_src.table_name);
@@ -83004,12 +83017,12 @@ impl Connection {
                 }
         };
         if !names_outer_ipk(shape.order_col) || !names_outer_ipk(shape.bound_col) {
-            refuse();
+            refuse("ORDER BY / bound column is not the outer IPK");
             return Ok(None);
         }
         let Some(JoinConstraint::On(on_expr)) = &from.joins[0].constraint else {
             // Guaranteed by the static shape gate.
-            refuse();
+            refuse("join constraint is not ON");
             return Ok(None);
         };
 
@@ -83024,7 +83037,7 @@ impl Connection {
             } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src).await {
                 result?
             } else {
-                refuse();
+                refuse("inner table not scannable via memdb/pager");
                 return Ok(None);
             };
         for row in &mut inner_rows {
@@ -83112,7 +83125,7 @@ impl Connection {
                             // generated-column evaluation error so the pager
                             // path can surface it; mirror by refusing the
                             // lane and discarding the partial stream.
-                            refuse();
+                            refuse("virtual generated column evaluation failed");
                             return Ok(None);
                         }
                         if outer_src.hidden_rowid_projection.is_some() {
@@ -83130,7 +83143,7 @@ impl Connection {
         }
         if !memdb_handled {
             if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
-                refuse();
+                refuse("outer table not streamable (no memdb table, pager unavailable)");
                 return Ok(None);
             }
             let outer_table = {
@@ -83141,7 +83154,7 @@ impl Connection {
                     .map(|table| (table.root_page, table.clone()))
             };
             let Some((root_page_num, table_schema)) = outer_table else {
-                refuse();
+                refuse("outer table missing from schema");
                 return Ok(None);
             };
             let cx = &self.root_cx;
@@ -88257,6 +88270,14 @@ impl Connection {
         // pre-check `join_keyset_limit_pushdown_shape` leave `select.limit`
         // in place so the lane (and, on refusal, the shared tail LIMIT
         // application) can see it.
+        if std::env::var_os("GH386_DBG").is_some() {
+            eprintln!(
+                "GH386DBG execute_join_select: limit_present={} preloaded_none={} shape={}",
+                select.limit.is_some(),
+                preloaded.iter().all(Option::is_none),
+                join_keyset_limit_pushdown_shape(select).is_some()
+            );
+        }
         let keyset_streamed = if select.limit.is_some() && preloaded.iter().all(Option::is_none) {
             self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
                 .await?
