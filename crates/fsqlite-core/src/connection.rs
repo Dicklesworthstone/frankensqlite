@@ -50932,7 +50932,7 @@ impl Connection {
             return Ok(false);
         }
 
-        let shadow_rows = {
+        let (shadow_rows, live_row_count, is_contentless) = {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
             let instance = instances.get(&key).ok_or_else(|| {
@@ -50946,8 +50946,36 @@ impl Connection {
                         "rootpage=0 virtual table {table_name} is not an FTS5 instance"
                     ))
                 })?;
-            fts5.encode_shadow_rows()?
+            (
+                fts5.encode_shadow_rows()?,
+                fts5.row_count(),
+                fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless,
+            )
         };
+
+        // bd-dqcf5 fail-closed guard: a CONTENTLESS table keeps no `_content`,
+        // so its `_data` segments are the only copy of the corpus. A full
+        // re-encode that carries live rows in memory but produces zero segment
+        // leaves would silently overwrite that corpus with an empty index. Refuse
+        // the write and abort the statement rather than lose data — this path is
+        // the fallback for a contentless DELETE whose row predates origin
+        // tracking, so a latent hydration/encode defect here must fail loudly,
+        // never blank the index. (A genuine empty index, e.g. after delete-all,
+        // has `live_row_count == 0` and is unaffected.)
+        if is_contentless && live_row_count > 0 {
+            let encoded_segment_leaves = shadow_rows
+                .data
+                .iter()
+                .filter(|row| row.id != FTS5_AVERAGES_ROWID && row.id != FTS5_STRUCTURE_ROWID)
+                .count();
+            if encoded_segment_leaves == 0 {
+                return Err(FrankenError::Internal(format!(
+                    "refusing to persist an empty FTS5 index for contentless table `{table_name}` \
+                     with {live_row_count} live rows (bd-dqcf5): the full re-encode dropped every \
+                     segment leaf, which would erase the on-disk corpus"
+                )));
+            }
+        }
 
         // Contentless-delete tables carry a per-row `_docsize.origin` so a later
         // lazy DELETE can tombstone the owning segment without hydrating the

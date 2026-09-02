@@ -14928,6 +14928,149 @@ mod tests {
         assert_eq!(search_rowids(&reopened, "fresh").unwrap(), vec![99]);
     }
 
+    /// bd-dqcf5: a lazily bound CONTENTLESS table that has been hydrated from
+    /// its persisted segments must re-encode to a NON-empty index — the
+    /// hydrate + full-re-encode sequence is the connection's fallback for a
+    /// contentless DELETE whose row predates origin tracking, and an empty
+    /// re-encode there erases the corpus.
+    #[test]
+    fn test_fts5_contentless_hydrated_table_reencodes_nonempty_index() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        let mut rows = sample_shadow_query_rows(&base);
+        rows.content.clear();
+        let persisted_leaves = rows.data.iter().filter(|row| row.id > 10).count();
+        assert!(persisted_leaves >= 1, "fixture persists segment leaves");
+
+        let mut reopened = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        reopened.apply_shadow_rows(&rows).unwrap();
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+
+        // The promote path: hydrate the in-memory index from the segments.
+        reopened
+            .ensure_shadow_rows_materializable_for_mutation()
+            .expect("hydrate contentless index from segments");
+        assert!(
+            reopened.shadow_rows.is_none(),
+            "hydration consumes the binding"
+        );
+        assert_eq!(
+            search_rowids(&reopened, "brown").unwrap(),
+            vec![1, 4],
+            "hydrated in-memory index answers"
+        );
+
+        // The full re-encode must carry the whole corpus.
+        let reencoded = reopened
+            .encode_shadow_rows()
+            .expect("re-encode the hydrated table");
+        let leaves = reencoded.data.iter().filter(|row| row.id > 10).count();
+        assert!(
+            leaves >= 1,
+            "re-encode of a hydrated contentless table wrote no segment leaves \
+             (bd-dqcf5: this is the empty-index data loss)"
+        );
+        assert!(
+            !reencoded.idx.is_empty(),
+            "re-encode of a hydrated contentless table wrote no %_idx seek rows"
+        );
+        assert_eq!(
+            reencoded.docsize.len(),
+            rows.docsize.len(),
+            "docsize rows survive the re-encode"
+        );
+
+        // A third table bound to the re-encoded rows still answers.
+        let mut rebound = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        rebound.apply_shadow_rows(&reencoded).unwrap();
+        let mut rebound_hits = search_rowids(&rebound, "brown").unwrap();
+        rebound_hits.sort_unstable();
+        assert_eq!(
+            rebound_hits,
+            vec![1, 4],
+            "the re-encoded image answers the same query"
+        );
+
+        // Same round trip on a SEEK-LESS image (every `%_idx` row missing — the
+        // pre-GH#404 on-disk shape): `%_idx` is only an accelerator, so
+        // hydration must still find every leaf and the re-encode must still
+        // carry the corpus.
+        let mut seekless = rows.clone();
+        seekless.idx.clear();
+        let mut reopened_seekless = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        reopened_seekless.apply_shadow_rows(&seekless).unwrap();
+        reopened_seekless
+            .ensure_shadow_rows_materializable_for_mutation()
+            .expect("hydrate a seek-less contentless index");
+        let mut hydrated_hits = search_rowids(&reopened_seekless, "brown").unwrap();
+        hydrated_hits.sort_unstable();
+        assert_eq!(
+            hydrated_hits,
+            vec![1, 4],
+            "hydration of a seek-less image must not depend on %_idx"
+        );
+        let reencoded_seekless = reopened_seekless
+            .encode_shadow_rows()
+            .expect("re-encode the seek-less hydrated table");
+        assert!(
+            reencoded_seekless
+                .data
+                .iter()
+                .filter(|row| row.id > 10)
+                .count()
+                >= 1,
+            "re-encode after seek-less hydration wrote no segment leaves (bd-dqcf5)"
+        );
+    }
+
     #[test]
     fn test_contentless_lazy_append_discards_each_batch_resident_state() {
         const HISTORICAL_ROWS: usize = 1_000_000;

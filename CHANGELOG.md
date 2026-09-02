@@ -46,6 +46,17 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...m
 
 Post-v0.3.14 development continues on `main` (see the compare link).
 
+### FTS5 contentless index: fail closed instead of blanking on an empty re-encode (bd-dqcf5)
+
+A contentless FTS5 table keeps no `_content`, so its `_data` segments are the
+only copy of the corpus. `persist_rootpage_zero_fts5_shadow_rows` (the fallback
+for a contentless DELETE whose row predates origin tracking) now refuses to
+write an empty index over a table that still holds live rows, aborting the
+statement with a typed error rather than silently losing the corpus. Guarded
+at the ext-fts5 layer by `test_fts5_contentless_hydrated_table_reencodes_nonempty_index`,
+which proves hydrate → re-encode carries the whole corpus even for a seek-less
+(pre-GH#404) on-disk image.
+
 ### FTS5 `'optimize'` now rewrites the index (bd-aks56)
 
 `INSERT INTO t(t) VALUES('optimize')` used to promote the table and write
