@@ -47,6 +47,22 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...m
 
 Post-v0.3.15 development continues on `main` (see the compare link).
 
+### WAL: appended-tail reads no longer rescan the whole WAL per page (cass GH #382)
+
+`reclaim_disowned_in_range` (run by `checkpoint` and by the on-open reclamation
+sweep) resolved every disowned-ledger page through
+`WalBackend::read_page_at_appended_tail`, which walked every WAL frame header
+backwards per page. On a 10 GB WAL-mode database with a 1,576,443-entry ledger
+and a 48,607-frame (200 MB) WAL that is ~7.7e10 header reads: every writable
+open and every checkpoint ran at 100 % of one core and never returned (strace +
+gdb on the symbolized `fsqlite` CLI, 0.3.14 and 0.3.15). `WalBackendAdapter`
+now keeps an `AppendedTailIndex` — one header pass over the tail, keyed on the
+generation identity, the frame count and the last frame's checksum — so a
+stable tail is indexed once and a changed tail costs one fresh pass; the answer
+is unchanged (newest frame wins). Receipt on that archive's copy: `PRAGMA
+wal_checkpoint(PASSIVE)` returned `0 | 48607 | 48607` in 53 s (commit
+`8d012706a`; downstream bead `coding_agent_session_search-g3zyo`).
+
 ---
 
 ## [0.3.15] -- 2026-09-02 (GitHub Release)
