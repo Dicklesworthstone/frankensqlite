@@ -46,6 +46,19 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...m
 
 Post-v0.3.14 development continues on `main` (see the compare link).
 
+### FTS5 legacy contentless: self-heal a structure poisoned into origin tracking (bd-kon3m residual)
+
+A legacy contentless table (`content=''` without `contentless_delete=1`) whose
+structure record was stamped into origin tracking by a pre-fix automerge kept
+writing 3-column origin `_docsize` rows into its 2-column shadow and refused to
+reopen. Origin tracking is now decided by the declared config, not the
+structure byte: on a legacy table the incremental-insert path strips the
+spurious origin fields (`Fts5StructureRecord::strip_origin_tracking`) before
+appending, so the append writes legacy rows and rewrites a clean structure
+record, self-healing the poison. Keeper: `bd_kon3m_legacy_origin_poison.rs`
+(plants the poison with stock SQLite, then proves an fsqlite append + reopen
+recovers with `_docsize` still 2-column and stock `integrity_check` ok).
+
 ### FTS5 contentless index: fail closed instead of blanking on an empty re-encode (bd-dqcf5)
 
 A contentless FTS5 table keeps no `_content`, so its `_data` segments are the

@@ -431,6 +431,33 @@ impl Fts5StructureRecord {
             })
     }
 
+    /// Coerce this structure back to legacy (non-origin-tracking) shape, so a
+    /// later [`Self::uses_origin_tracking`] returns false and encoders/appends
+    /// keyed off it write the 2-column `_docsize` legacy layout.
+    ///
+    /// bd-kon3m: a legacy contentless table (`content=''` WITHOUT
+    /// `contentless_delete=1`) keeps a 2-column `_docsize` shadow, but a
+    /// pre-fix automerge could stamp origin tracking onto its structure record
+    /// (`entry_count > 0`). Once poisoned, `uses_origin_tracking()` stays true,
+    /// so every later append wrote a 3-column origin `_docsize` row into the
+    /// 2-column shadow and the table refused to reopen. The DECLARED config,
+    /// not a poisoned structure byte, decides origin tracking; the connection
+    /// calls this on a legacy table before appending so the append writes
+    /// legacy rows and rewrites a clean (legacy) structure record — self-healing
+    /// the poison on the next write.
+    pub fn strip_origin_tracking(&mut self) {
+        self.origin_counter = 0;
+        for level in &mut self.levels {
+            for segment in &mut level.segments {
+                segment.origin_lower = 0;
+                segment.origin_upper = 0;
+                segment.tombstone_page_count = 0;
+                segment.tombstone_entry_count = 0;
+                segment.entry_count = 0;
+            }
+        }
+    }
+
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let use_origin_tracking = self.uses_origin_tracking();

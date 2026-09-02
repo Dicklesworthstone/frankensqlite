@@ -51191,7 +51191,7 @@ impl Connection {
         // just reset by 'delete-all'): the full encode lays down the first
         // segment plus the config/idx/docsize shadows. Once a segment exists,
         // every later INSERT appends incrementally.
-        let Some(structure) = structure.filter(|s| s.segment_count() > 0) else {
+        let Some(mut structure) = structure.filter(|s| s.segment_count() > 0) else {
             // A lazy table with zero live segments has an EMPTY on-disk corpus
             // (e.g. after 'delete-all' marks it lazy with doc_count 0), so the
             // in-memory index holds the entire corpus — the full re-encode is
@@ -51222,6 +51222,26 @@ impl Connection {
                 .persist_rootpage_zero_fts5_shadow_rows(table_name)
                 .await;
         };
+        // bd-kon3m: origin tracking is decided by the DECLARED config, not by a
+        // (possibly poisoned) structure byte. A legacy contentless table
+        // (`content=''` WITHOUT `contentless_delete=1`) keeps a 2-column
+        // `_docsize` shadow; if a pre-fix automerge stamped origin tracking onto
+        // its structure record, appending against that record would write a
+        // 3-column origin `_docsize` row into the 2-column shadow and the table
+        // would refuse to reopen. Strip the spurious origin fields for a legacy
+        // table so this append writes legacy rows and rewrites a clean structure
+        // record, self-healing the poison. A genuine `contentless_delete=1`
+        // table is left untouched.
+        let contentless_delete = {
+            let instances = self.vtab_instances.borrow();
+            instances
+                .get(&table_name.to_ascii_uppercase())
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .is_some_and(|fts5| fts5.config().contentless_delete_enabled())
+        };
+        if !contentless_delete && structure.uses_origin_tracking() {
+            structure.strip_origin_tracking();
+        }
         let next_segid = structure
             .levels
             .iter()
