@@ -20939,6 +20939,47 @@ impl Connection {
         Ok(Fts5StructureRecord::decode(&block)?.segment_count() > 0)
     }
 
+    /// Stock parity for the `'optimize'` control command (fts5_index.c
+    /// `fts5IndexOptimizeStruct`): a persisted index that already holds
+    /// exactly one segment with no tombstone pages needs no rewrite. fsqlite
+    /// additionally requires that segment to carry `%_idx` seek rows — every
+    /// segment written since GH#404 keys its first page by the empty term,
+    /// and no pre-GH#404 segment has any — so `'optimize'` rewrites a legacy
+    /// index into stock-verifiable shape instead of leaving it as is
+    /// (bd-aks56). Decided BEFORE the promote-on-lazy fallback so a routine
+    /// `'optimize'` on a healthy index never hydrates the corpus.
+    #[cfg(feature = "ext-fts5")]
+    async fn fts5_persisted_index_is_optimized(&self, table_name: &str) -> Result<bool> {
+        if !self.schema_table_exists(&format!("{table_name}_data")) {
+            return Ok(false);
+        }
+        self.with_lazy_fts5_reader(table_name, async |reader| {
+            let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else {
+                return Ok(false);
+            };
+            let structure = Fts5StructureRecord::decode(&block)?;
+            if structure.segment_count() != 1 {
+                return Ok(false);
+            }
+            let Some(segment) = structure
+                .levels
+                .iter()
+                .flat_map(|level| level.segments.iter())
+                .next()
+            else {
+                return Ok(false);
+            };
+            if segment.tombstone_page_count != 0 {
+                return Ok(false);
+            }
+            Ok(reader
+                .idx_candidate_page(segment.segid, &[])
+                .await?
+                .is_some())
+        })
+        .await
+    }
+
     /// Build a transaction-backed [`Fts5LiveShadowReader`] and run `f` on it.
     ///
     /// The reader reuses the query's read snapshot, so segment, idx, docsize,
@@ -50678,6 +50719,39 @@ impl Connection {
             return Ok(true);
         }
 
+        // `'optimize'` (bd-aks56), decided before the promote-on-lazy fallback:
+        // an index that is already one tombstone-free, seekable segment is a
+        // no-op, exactly as in stock; a contentless table is merged from its
+        // persisted segments without ever hydrating the corpus (it has no
+        // `_content` to re-index, so the full re-encode below would write an
+        // EMPTY index). Only a content-backed table falls through to promote +
+        // full re-encode.
+        if command == Fts5MaintenanceCommand::Optimize {
+            if self
+                .fts5_persisted_index_is_optimized(insert.table.name.as_str())
+                .await?
+            {
+                self.reset_statement_change_count();
+                return Ok(true);
+            }
+            let is_lazy_contentless = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&insert.table.name.to_ascii_uppercase())
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(|fts5| {
+                        fts5.config().content_mode() == fsqlite_ext_fts5::ContentMode::Contentless
+                    })
+                    && self.schema_table_exists(&format!("{}_data", insert.table.name))
+            };
+            if is_lazy_contentless {
+                self.optimize_rootpage_zero_fts5_segments(insert.table.name.as_str())
+                    .await?;
+                self.reset_statement_change_count();
+                return Ok(true);
+            }
+        }
+
         {
             let key = insert.table.name.to_ascii_uppercase();
             let is_lazy = {
@@ -50694,7 +50768,15 @@ impl Connection {
         }
 
         match command {
-            Fts5MaintenanceCommand::Optimize => {}
+            Fts5MaintenanceCommand::Optimize => {
+                // Content-backed only (contentless returned above): the
+                // promotion re-indexed `_content` into memory, and the full
+                // re-encode writes it back as one stock-shaped segment with
+                // fresh `%_idx` seek rows — stock's post-optimize shape
+                // (bd-aks56).
+                self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)
+                    .await?;
+            }
             Fts5MaintenanceCommand::Rebuild => {
                 // bd-plxob(b): for EXTERNAL content, `'rebuild'` re-indexes the
                 // content SOURCE (stock behavior), not the in-memory documents,
@@ -51267,6 +51349,107 @@ impl Connection {
             return Ok(());
         }
         let merged: Vec<Fts5StructureSegment> = level.segments[..merge_inputs].to_vec();
+        self.merge_rootpage_zero_fts5_segments(
+            table_name,
+            &structure,
+            plan.level,
+            merged,
+            leaf_budget,
+            "automerge",
+        )
+        .await
+    }
+
+    /// `'optimize'` for a lazy contentless table (bd-aks56): stock parity with
+    /// fts5_index.c `sqlite3Fts5IndexOptimize`, which merges every segment into
+    /// one freshly written segment. Runs level by level — the shallowest
+    /// non-empty level is merged whole into the next one — until a single
+    /// segment remains, reading only the segments each pass merges (never
+    /// hydrating the corpus). A lone segment is still rewritten once, which is
+    /// how a pre-GH#404 index becomes stock-seekable; the caller's
+    /// [`Self::fts5_persisted_index_is_optimized`] check keeps a healthy
+    /// single-segment index untouched, exactly as stock does.
+    #[cfg(feature = "ext-fts5")]
+    async fn optimize_rootpage_zero_fts5_segments(&self, table_name: &str) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        let leaf_budget = {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(());
+            };
+            fts5.segment_leaf_budget()
+        };
+        let mut passes = 0_usize;
+        let mut max_passes = 0_usize;
+        loop {
+            let structure = self
+                .with_lazy_fts5_reader(table_name, async |reader| {
+                    match reader.read_data_block(FTS5_STRUCTURE_ROWID).await? {
+                        Some(block) => Ok(Some(Fts5StructureRecord::decode(&block)?)),
+                        None => Ok(None),
+                    }
+                })
+                .await?;
+            let Some(structure) = structure else {
+                return Ok(());
+            };
+            let total = structure.segment_count();
+            if total == 0 || (total == 1 && passes > 0) {
+                return Ok(());
+            }
+            if passes == 0 {
+                // Each pass moves the shallowest populated level one level
+                // deeper, so everything meets at (deepest + 1) within
+                // `levels + 1` passes; the extra slack covers the lone-segment
+                // rewrite.
+                max_passes = structure.levels.len().saturating_add(3);
+            }
+            if passes >= max_passes {
+                return Err(FrankenError::Internal(format!(
+                    "fts5 optimize did not converge for `{table_name}` after {passes} merge passes"
+                )));
+            }
+            let Some((level_index, level)) = structure
+                .levels
+                .iter()
+                .enumerate()
+                .find(|(_, level)| !level.segments.is_empty())
+            else {
+                return Ok(());
+            };
+            let merged = level.segments.clone();
+            self.merge_rootpage_zero_fts5_segments(
+                table_name,
+                &structure,
+                level_index,
+                merged,
+                leaf_budget,
+                "optimize",
+            )
+            .await?;
+            passes += 1;
+        }
+    }
+
+    /// Merge `merged` — every one of them at `level_index` of `structure` —
+    /// into one new segment at `level_index + 1`, reading only their leaves
+    /// and tombstone pages: collect the merged term-groups lazily, encode the
+    /// merged segment, upsert it plus the updated structure, delete the inputs'
+    /// `_data` rows, and swap their `%_idx` seek rows for the merged segment's.
+    /// Rides the caller's write txn. (bd-fts5-lazy-shadow-reads-itcc4.3)
+    #[cfg(feature = "ext-fts5")]
+    async fn merge_rootpage_zero_fts5_segments(
+        &self,
+        table_name: &str,
+        structure: &Fts5StructureRecord,
+        level_index: usize,
+        merged: Vec<Fts5StructureSegment>,
+        leaf_budget: usize,
+        reason: &'static str,
+    ) -> Result<()> {
         let merged_segids: Vec<u32> = merged.iter().map(|segment| segment.segid).collect();
         let new_segid = structure
             .levels
@@ -51293,8 +51476,8 @@ impl Connection {
         let flush = encode_merged_segment(
             term_doclists,
             &merged_segids,
-            &structure,
-            plan.level,
+            structure,
+            level_index,
             new_segid,
             leaf_budget,
         )?;
@@ -51338,9 +51521,10 @@ impl Connection {
 
         tracing::debug!(
             table = table_name,
-            level = plan.level,
+            level = level_index,
             merged = merged_segids.len(),
             new_segid,
+            reason,
             "fts5: merged lazy contentless segments (bd-fts5-lazy-shadow-reads-itcc4.3)"
         );
         Ok(())

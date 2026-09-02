@@ -46,6 +46,23 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...m
 
 Post-v0.3.14 development continues on `main` (see the compare link).
 
+### FTS5 `'optimize'` now rewrites the index (bd-aks56)
+
+`INSERT INTO t(t) VALUES('optimize')` used to promote the table and write
+nothing back. It now does what stock's does (fts5_index.c
+`sqlite3Fts5IndexOptimize`): every segment is merged into one freshly written
+segment with `%_idx` seek rows, and an index that is already a single
+tombstone-free, seekable segment is left untouched. A contentless table is
+merged level by level from its persisted segments through the same lazy
+merge path the automerge uses, so the corpus is never hydrated; a
+content-backed table is re-indexed from `_content` and written back as one
+segment. Because the rewrite uses the current writer, this is also the
+in-place migration for FTS5 indexes written before v0.3.14 (GH#404): for
+contentless tables, where `'rebuild'` is refused by fsqlite and stock alike,
+it is the only in-engine one. Keepers:
+`bd_aks56_optimize_merges_every_segment_into_one_stock_shaped_segment` and
+`gh404_optimize_rewrites_a_seekless_legacy_index_into_stock_shape`.
+
 ---
 
 ## [0.3.14] -- 2026-09-01 (GitHub Release)

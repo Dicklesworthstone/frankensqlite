@@ -258,6 +258,15 @@ No workflow has executed since 2026-07-16; the manual dispatches of
 land a regression guard, RUN it and cite the run (revision, platform, result)
 in the bead/commit. A test named in a workflow file is not evidence.
 
+**Owner decision (2026-09-01, bd-0p0sp): Actions stays off. Releases and
+release artifacts go through dsr (the Doodlestein Self-Releaser), not
+`release.yml`.** The v0.3.14 procedure: on trj, move the exact-tag release
+clone to the tag, `dsr build frankensqlite --version X` (dry-run first),
+`dsr release frankensqlite X --verify-tag`; then sign the uploaded
+`SHA256SUMS` on css (the epoch-2 key host) with
+`dsr signing sign SHA256SUMS -t "FrankenSQLite vX SHA256SUMS"` and upload the
+`.minisig`. install.sh fails closed without that signature.
+
 The allowlist structure still matters for the day Actions is re-enabled.
 `concurrent-platform-matrix.yml` executes an explicit `--test` allowlist
 (fsqlite-e2e targets plus, since 2026-09-01, the fsqlite-core cross-process

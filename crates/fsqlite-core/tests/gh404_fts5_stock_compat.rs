@@ -414,6 +414,108 @@ fn gh404_reporter_repro_corpus_is_stock_verifiable_with_exact_match_parity() {
     });
 }
 
+/// bd-aks56: `'optimize'` is the in-place migration for a pre-GH#404
+/// fsqlite-written index. The seek-less half of that shape is reproduced
+/// exactly — a multi-leaf segment with every `%_idx` row removed — and stock
+/// must show the GH#404 symptom on it (silent 0 for a term past page 1) while
+/// fsqlite, whose reader never consults `%_idx`, still answers. After
+/// `'optimize'` the index is one freshly written, seekable segment that stock
+/// verifies and searches with full parity.
+#[test]
+fn gh404_optimize_rewrites_a_seekless_legacy_index_into_stock_shape() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("gh404_optimize_legacy.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).await.expect("open franken");
+        let probes = build_corpus(&conn, 1_200, 50).await;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("truncate checkpoint");
+        conn.close().await.expect("close franken");
+
+        // Reproduce the legacy shape: strip every seek row.
+        {
+            let stock = rusqlite::Connection::open(&db_path).expect("stock open");
+            let max_leaf_pgno = stock_count(
+                &stock,
+                &format!("SELECT max(id & {FTS5_DATA_PGNO_MASK}) FROM t_data WHERE id > 10"),
+            );
+            assert!(
+                max_leaf_pgno >= 2,
+                "corpus precondition: segment leaves must span multiple pages, got {max_leaf_pgno}"
+            );
+            stock
+                .execute_batch("DELETE FROM t_idx;")
+                .expect("strip %_idx rows");
+            assert_eq!(stock_count(&stock, "SELECT count(*) FROM t_idx"), 0);
+            // The GH#404 symptom: without seek rows stock never leaves page 1,
+            // so the last unique token (on the last leaf page) is invisible.
+            let (last_term, last_count) = &probes[2];
+            assert_eq!(*last_count, 1, "probe precondition: the last token is live");
+            assert_eq!(
+                stock_count(
+                    &stock,
+                    &format!("SELECT count(*) FROM t WHERE t MATCH '{last_term}'")
+                ),
+                0,
+                "legacy precondition: stock silently misses a term past page 1 without %_idx"
+            );
+        }
+
+        // fsqlite still answers the legacy shape, then rewrites it in place.
+        let conn = Connection::open(&db_str).await.expect("reopen franken");
+        for (term, franken_matches) in &probes {
+            let count = franken_count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE t MATCH '{term}';"),
+            )
+            .await;
+            assert_eq!(count, *franken_matches, "fsqlite reads the seek-less index: {term:?}");
+        }
+        conn.execute("INSERT INTO t(t) VALUES('optimize');")
+            .await
+            .expect("optimize");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("truncate checkpoint after optimize");
+        conn.close().await.expect("close franken after optimize");
+
+        let stock = rusqlite::Connection::open(&db_path).expect("stock open post-optimize");
+        assert!(
+            stock_count(&stock, "SELECT count(*) FROM t_idx") >= 1,
+            "optimize wrote %_idx seek rows"
+        );
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .expect("stock integrity_check");
+        assert_eq!(integrity, "ok", "stock verifies the optimized image");
+        for (term, franken_matches) in &probes {
+            assert_eq!(
+                stock_count(
+                    &stock,
+                    &format!("SELECT count(*) FROM t WHERE t MATCH '{term}'")
+                ),
+                *franken_matches,
+                "stock/franken MATCH parity after optimize: {term:?}"
+            );
+        }
+        drop(stock);
+
+        let reopened = Connection::open(&db_str).await.expect("reopen franken");
+        for (term, franken_matches) in &probes {
+            let count = franken_count(
+                &reopened,
+                &format!("SELECT count(*) FROM t WHERE t MATCH '{term}';"),
+            )
+            .await;
+            assert_eq!(count, *franken_matches, "fsqlite reopen parity after optimize: {term:?}");
+        }
+        reopened.close().await.expect("close reopened");
+    });
+}
+
 /// 'delete-all' must clear `%_idx` along with the segments: the next insert
 /// restarts segids at 1, so a stale pre-delete-all `%_idx` row for segid 1
 /// would alias the new segment's seek space (wrong pages for both engines).
