@@ -33,7 +33,10 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 
 /// Default rebuild lease duration in seconds.
 const DEFAULT_LEASE_SECS: u64 = 5;
-#[cfg(unix)]
+// The `/proc`-backed birth marker is Linux-only; the tests also reference this
+// tag. A bare `#[cfg(unix)]` left it dead in the macOS lib build, breaking the
+// workspace-wide `clippy -D warnings` gate there.
+#[cfg(any(target_os = "linux", test))]
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 const OCCUPANCY_STRIPE_COUNT: usize = 16;
 const REBUILD_DRAIN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(100);

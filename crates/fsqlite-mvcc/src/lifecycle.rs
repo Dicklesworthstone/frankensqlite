@@ -64,7 +64,10 @@ const PROACTIVE_COMPACT_THRESHOLD: usize = 8;
 /// if chain exceeds SOFT_BOUND_MULTIPLIER × max_chain_length.
 const SOFT_BOUND_MULTIPLIER: usize = 4;
 const NO_GC_HORIZON: u64 = u64::MAX;
-#[cfg(unix)]
+// The `/proc`-backed birth marker is Linux-only; the tests also reference this
+// tag. A bare `#[cfg(unix)]` left it dead in the macOS lib build, breaking the
+// workspace-wide `clippy -D warnings` gate there.
+#[cfg(any(target_os = "linux", test))]
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
