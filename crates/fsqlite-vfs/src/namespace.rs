@@ -2937,6 +2937,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let database = dir.path().join("pool-teardown.db");
         let identity = create_database(&database, b"pooled generation");
+        // Only the Linux `fd_open_to` asserts inspect the sidecar path.
+        #[cfg(target_os = "linux")]
         let use_path = sidecar_path(&database, USE_SUFFIX);
 
         let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
@@ -3009,6 +3011,8 @@ mod tests {
         let database = dir.path().join("quarantine-guard.db");
         let quarantined = dir.path().join("quarantine-guard.quarantined.db");
         let identity = create_database(&database, b"live generation");
+        // Only the Linux `fd_open_to` asserts inspect the sidecar path.
+        #[cfg(target_os = "linux")]
         let use_path = sidecar_path(&database, USE_SUFFIX);
 
         let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)

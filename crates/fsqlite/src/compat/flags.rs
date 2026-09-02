@@ -203,7 +203,10 @@ pub async fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection,
     open_with_flags_with_env(path, flags, ConnectionEnv::default()).await
 }
 
-pub(crate) async fn open_with_flags_with_env(
+// `pub`, not `pub(crate)`: the enclosing `flags` module is private, so `pub`
+// already limits this to the crate; `pub(crate)` here trips
+// `clippy::redundant_pub_crate` and breaks the workspace `-D warnings` gate.
+pub async fn open_with_flags_with_env(
     path: &str,
     flags: OpenFlags,
     env: ConnectionEnv,
