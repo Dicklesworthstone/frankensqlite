@@ -23,7 +23,8 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...main) | HEAD | 2026-09-01 | Development after v0.3.14 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...main) | HEAD | 2026-09-02 | Development after v0.3.15 |
+| [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
 | [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) | Release | 2026-09-01 | FTS5 stock-compat writer fix (GH#404) + GH#402 checkpoint watermark (super-linear autocommit fix) + `PRAGMA wal_checkpoint` cumulative-nBackfill parity + legacy-automerge origin-poisoning fix |
 | [v0.3.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.13) | Release | 2026-08-29 | GH#399 reader-slot release-failure follow-up (b1c4609d9) |
 | [v0.3.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.12) | Release | 2026-08-29 | GH#399 cross-process WAL wave: reader-slot registration + checkpoint horizon gating (55c186682), abandoned-page pool drop at a peer WAL generation reset (5946b3b7c) |
@@ -40,11 +41,41 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.14
+## [Unreleased] -- development on `main` since v0.3.15
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...main>
 
-Post-v0.3.14 development continues on `main` (see the compare link).
+Post-v0.3.15 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.15] -- 2026-09-02 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.14...v0.3.15>
+
+A patch release completing the FTS5 contentless migration story from v0.3.14
+(GH#404), plus two data-safety hardening fixes and the restoration of the
+macOS `clippy -D warnings` gate.
+
+### FTS5 `'optimize'` now rewrites the index (bd-aks56)
+
+`INSERT INTO t(t) VALUES('optimize')` used to promote the table and write
+nothing back. It now does what stock's does (fts5_index.c
+`sqlite3Fts5IndexOptimize`): every segment is merged into one freshly written
+segment with `%_idx` seek rows, and an index that is already a single
+tombstone-free, seekable segment is left untouched. A contentless table is
+merged level by level from its persisted segments through the same lazy merge
+path the automerge uses, so the corpus is never hydrated; a content-backed
+table is re-indexed from `_content`. Because the rewrite uses the current
+writer, **this is the in-place migration for FTS5 indexes written before
+v0.3.14 (GH#404): for contentless tables, where `'rebuild'` is refused by
+fsqlite and stock alike, it is the only in-engine one.** Verified on the GH#404
+reporter's own corpus written by the crates.io 0.3.13 engine: before, stock
+reported `fts5: corruption on page 47, segment 1` and `MATCH 'segment'` = 0;
+after one `optimize`, stock `integrity_check` = ok and `MATCH 'segment'` = 2759
+on both engines. Keepers:
+`bd_aks56_optimize_merges_every_segment_into_one_stock_shaped_segment`,
+`gh404_optimize_rewrites_a_seekless_legacy_index_into_stock_shape`.
 
 ### FTS5 legacy contentless: self-heal a structure poisoned into origin tracking (bd-kon3m residual)
 
@@ -55,37 +86,30 @@ reopen. Origin tracking is now decided by the declared config, not the
 structure byte: on a legacy table the incremental-insert path strips the
 spurious origin fields (`Fts5StructureRecord::strip_origin_tracking`) before
 appending, so the append writes legacy rows and rewrites a clean structure
-record, self-healing the poison. Keeper: `bd_kon3m_legacy_origin_poison.rs`
-(plants the poison with stock SQLite, then proves an fsqlite append + reopen
-recovers with `_docsize` still 2-column and stock `integrity_check` ok).
+record, self-healing the poison. Keeper: `bd_kon3m_legacy_origin_poison.rs`.
 
 ### FTS5 contentless index: fail closed instead of blanking on an empty re-encode (bd-dqcf5)
 
-A contentless FTS5 table keeps no `_content`, so its `_data` segments are the
-only copy of the corpus. `persist_rootpage_zero_fts5_shadow_rows` (the fallback
-for a contentless DELETE whose row predates origin tracking) now refuses to
-write an empty index over a table that still holds live rows, aborting the
-statement with a typed error rather than silently losing the corpus. Guarded
-at the ext-fts5 layer by `test_fts5_contentless_hydrated_table_reencodes_nonempty_index`,
-which proves hydrate → re-encode carries the whole corpus even for a seek-less
-(pre-GH#404) on-disk image.
+`persist_rootpage_zero_fts5_shadow_rows` (the fallback for a contentless DELETE
+whose row predates origin tracking) now refuses to write an empty index over a
+contentless table that still holds live rows, aborting the statement with a
+typed error rather than silently losing the corpus. Guarded at the ext-fts5
+layer by `test_fts5_contentless_hydrated_table_reencodes_nonempty_index`.
 
-### FTS5 `'optimize'` now rewrites the index (bd-aks56)
+### macOS `clippy -D warnings` gate restored (bd-0v03x)
 
-`INSERT INTO t(t) VALUES('optimize')` used to promote the table and write
-nothing back. It now does what stock's does (fts5_index.c
-`sqlite3Fts5IndexOptimize`): every segment is merged into one freshly written
-segment with `%_idx` seek rows, and an index that is already a single
-tombstone-free, seekable segment is left untouched. A contentless table is
-merged level by level from its persisted segments through the same lazy
-merge path the automerge uses, so the corpus is never hydrated; a
-content-backed table is re-indexed from `_content` and written back as one
-segment. Because the rewrite uses the current writer, this is also the
-in-place migration for FTS5 indexes written before v0.3.14 (GH#404): for
-contentless tables, where `'rebuild'` is refused by fsqlite and stock alike,
-it is the only in-engine one. Keepers:
-`bd_aks56_optimize_merges_every_segment_into_one_stock_shaped_segment` and
-`gh404_optimize_rewrites_a_seekless_legacy_index_into_stock_shape`.
+A batch of Linux-only process-liveness code left several items dead on macOS
+(`PID_BIRTH_PROCFS_TAG` in fsqlite-mvcc, `use_path` and
+`MAX_RESIDENT_GROWTH_BYTES` in fsqlite-vfs / fsqlite-e2e), and a `pub(crate)`
+function in a private module tripped `redundant_pub_crate` on every platform,
+so `cargo clippy --workspace --all-targets -- -D warnings` (the AGENTS.md
+canonical gate) failed. Each item is now `#[cfg]`-gated to its actual use or
+made `pub`; zero behavior change on any platform.
+
+### Note
+
+`Cargo.lock` was regenerated for the 0.3.15 workspace (a mid-flight bump had
+left it pinned to 0.3.14, which would have failed `--locked`).
 
 ---
 
