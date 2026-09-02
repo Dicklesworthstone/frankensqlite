@@ -43,6 +43,10 @@ const SEED_ROWS: i64 = 40_000;
 /// plus all incremental append batches. Eager hydration of the seeded corpus
 /// would add at least the corpus size (> 40 MiB); the bound sits at half that
 /// to keep clear air between legitimate bounded allocation and regression.
+///
+/// Only the Linux RSS assertion (via `/proc`) consumes this bound; a bare
+/// definition was dead on macOS and broke the workspace `-D warnings` gate.
+#[cfg(target_os = "linux")]
 const MAX_RESIDENT_GROWTH_BYTES: u64 = 24 * 1024 * 1024;
 
 /// Rows appended per incremental batch, mirroring the bounded CASS repair
