@@ -128,7 +128,10 @@ const LAYOUT_VERSION: u32 = 1;
 const DEFAULT_MAX_TXN_SLOTS: u32 = 128;
 
 /// High bit identifying a `/proc/<pid>/stat` start-time birth marker.
-#[cfg(unix)]
+// Only the `/proc`-backed birth marker (Linux) uses this tag; a bare
+// `#[cfg(unix)]` left it dead on other unixes (macOS), breaking the
+// workspace-wide `clippy -D warnings` gate there.
+#[cfg(target_os = "linux")]
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
 /// High bit identifying an owner token whose birth marker is not published yet.
