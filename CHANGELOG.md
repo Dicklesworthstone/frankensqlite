@@ -17,7 +17,7 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) (2026-09-01). v0.3.2–v0.3.4 and v0.3.6–v0.3.14 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. The v0.3.12/v0.3.13 rows below are timeline summaries from their release tags; full per-change sections for that pair were not reconstructed.
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) (2026-09-01). v0.3.2–v0.3.4 and v0.3.6–v0.3.14 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
@@ -123,6 +123,107 @@ cache-rebuild churn, the single-process overflow-UPDATE repro, and both
 reader-horizon keepers — passed on macOS (Apple Silicon) at this release's
 tree state, with stock SQLite `integrity_check` as the oracle after every
 command. Previous keeper verification was Linux-only.
+
+---
+
+## [0.3.13] -- 2026-08-29 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.12...v0.3.13>
+
+Single-fix follow-up to the v0.3.12 cross-process WAL wave (GH#399).
+`register_wal_reader_slot` took the previous window's reader slot out of the
+pager state and released it with `?`, so a failed `-shm` UNLOCK lost the slot
+id while the SHARED claim (and its fcntl byte) persisted, leaking one of the
+process's few reader slots. The slot id is now restored on a failed release so
+the next window's registration retires it (b1c4609d9).
+
+---
+
+## [0.3.12] -- 2026-08-29 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.11...v0.3.12>
+
+### Cross-process WAL reader registration and checkpoint horizon gating (GH#399)
+
+The beads-shaped multi-process churn (short-lived single-connection
+processes, one closing with `PRAGMA wal_checkpoint(TRUNCATE)`) corrupted a
+shared database in its first round: the on-disk pager never published its
+pinned WAL read snapshot to the shared `aReadMark` / `WAL_READ_LOCK(i)`
+table, so a peer's checkpoint ran with no reader horizon, backfilled frames a
+peer still served, and reset the WAL generation underneath a pinned snapshot
+(zero-page reads, page aliases, stock "2nd reference to page N").
+
+- C SQLite's reader protocol is now implemented on the Unix path
+  (55c186682): `VfsFile` gains reader-slot acquire/release, the backfill gate
+  (`WAL_READ_LOCK(0)`), the `mxSafeFrame` horizon walk and the exclusive
+  reset gate (`WAL_READ_LOCK(1..)`), implemented by `UnixFile` on the mmap'd
+  `-shm`; the pager registers one slot per active-transaction window and
+  releases it at the last exit; `SimplePager::checkpoint` passes the sampled
+  peer horizon as `oldest_reader_frame`; RESTART/TRUNCATE hold the reset
+  gate and defer the reset while a peer pins the generation, which `PRAGMA
+  wal_checkpoint` reports as `busy = 1`.
+- The residual corruption was a generation-boundary fold, not the reset race
+  (5946b3b7c): after a peer's legitimately ungated reset, a pager's "no
+  committed WAL frame => provable hole" test for its abandoned-page pool ran
+  against the fresh, empty generation and reclaimed live tree pages into the
+  durable freelist. A refresh that observes a WAL generation change now drops
+  its in-range pool the way the checkpointing pager already did, drop-time
+  transaction exit releases the window's reader slot, and a peer-held
+  checkpoint reports busy instead of failing.
+- Keepers in `crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs`
+  (00b270651, 013b3b52d, b670a5570, 9b573e2f6): the three concurrent-process
+  churn discriminators (peers closing without / with PASSIVE / with TRUNCATE
+  checkpoints), cross-process cache-rebuild churn, the single-process
+  overflow-UPDATE repro from bd-5wrwi, and two reader-horizon keepers (a
+  stock-shaped slot reader clamps PASSIVE/TRUNCATE and blocks the reset until
+  released; a tip-pinned slot exercises the reset gate alone), with stock
+  `PRAGMA integrity_check` as the oracle after every command.
+
+### Isolation policy is snapped at BEGIN CONCURRENT (GH#390)
+
+`PRAGMA fsqlite.serializable` no longer retroactively changes how an
+already-open concurrent transaction validates at commit: the policy is copied
+onto the registry handle at BEGIN and fixed for that session. ON (default)
+keeps full Page-SSI validation; OFF routes commit through first-committer-wins
+only (base drift still aborts as `BusySnapshot`; the schema-staleness checks
+stay). Recycled handles rewrite the flag so a pooled session cannot inherit a
+previous transaction's policy (195f4b3d5, 8709600bc).
+
+### Bounded prefix projection of overflow TEXT/BLOB (GH#400)
+
+`substr(col, 1, N)` and byte-prefix projections hydrated the column's full
+payload, including every overflow page, before slicing, and fell back to the
+unbounded path for any non-ASCII TEXT. The record header already names the
+byte length, so TEXT now reads at most `4*N + 8` bytes (whole UTF-8 code
+points plus a trimmed partial trailing char) and BLOB only the first `N`
+bytes, with results byte-identical to the generic path and to stock SQLite
+(33b5035b4, d54b4f6b8; keeper `column_substr_prefix_bound.rs`).
+
+### Session extension: indirect flags and typed format errors (GH#394)
+
+`fsqlite-ext-session` discarded SQLite Session's per-change indirect byte on
+decode -> encode. `ChangesetRow.indirect` is now decoded, written back
+byte-for-byte and preserved through `invert()`; malformed bytes fail with a
+typed `ChangesetFormatError`; `Changeset.kind` tags changeset vs patchset so
+`invert()` rejects patchsets and `concat()` rejects mixed kinds, matching
+`sqlite3changeset_invert()` / `sqlite3changeset_concat()`;
+`Session::set_indirect()` mirrors `sqlite3session_indirect()` (86225c360;
+byte fixtures captured from the sqlite3 3.46.1 shell).
+
+### Other fixes
+
+- FTS5 `INSERT INTO t(t) VALUES('integrity-check')` is admitted through
+  read-only pagers and under `PRAGMA query_only`; every other FTS5
+  maintenance command and ordinary write still fails `ReadOnly` (22af07533,
+  027f62f22).
+- Private-database cleanup (GH#388 / GH#393) emits structured
+  `PrivateDatabaseCleanupOutcome` receipts with preflight verification, and
+  VACUUM preserves them (d46336552, 591441915, d1991ca83).
+- `PRAGMA schema_advisor` declares its exact 4-column metadata in
+  `pragma_result_columns` (01a8526ad); the Unix VFS uses `access(2)` for the
+  POSIX mode check and falls back on a promoted read-only open (b79628cb0).
+- Beads-shaped bulk-import parity tests cover overflow and relation pages
+  (7d85e59bd, 9fa068c79).
 
 ---
 
