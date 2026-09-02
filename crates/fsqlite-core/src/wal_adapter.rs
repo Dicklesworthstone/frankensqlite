@@ -242,6 +242,22 @@ struct PendingPublicationFrame {
     is_commit: bool,
 }
 
+/// One-pass index of the PHYSICAL appended tail (`0..frame_count`), built on
+/// demand by [`WalBackend::read_page_at_appended_tail`] and reused while the
+/// tail is provably unchanged: same generation identity, same frame count and
+/// the same checksum on the last frame. Before this index every gate-held
+/// tail read walked the whole WAL backwards one 24-byte header at a time, so
+/// the disowned-page reclaim sweep cost O(ledger × frames): a 1.58M-entry
+/// ledger against a 48,607-frame WAL never finished a writable open or a
+/// checkpoint (cass GH #382).
+struct AppendedTailIndex {
+    generation: WalGenerationIdentity,
+    frame_count: usize,
+    tail_checksum: SqliteWalChecksum,
+    /// Newest frame index per page within the appended tail.
+    latest_frame_by_page: HashMap<u32, usize>,
+}
+
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
     /// Guard so commit-time append refresh runs only once per commit batch.
@@ -285,6 +301,11 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// so a stale watermark can only ever cause extra re-backfilling of
     /// identical bytes, never a skipped frame.
     checkpoint_backfill_watermark: Option<(WalGenerationIdentity, u32)>,
+    /// Lazily built index of the appended tail; see [`AppendedTailIndex`].
+    appended_tail_index: Option<AppendedTailIndex>,
+    /// How many times the appended-tail index was (re)built — the observable
+    /// that pins "one scan per stable tail" in tests.
+    appended_tail_index_builds: u64,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
@@ -307,6 +328,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
             checkpoint_backfill_watermark: None,
+            appended_tail_index: None,
+            appended_tail_index_builds: 0,
         }
     }
 
@@ -328,6 +351,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
             checkpoint_backfill_watermark: None,
+            appended_tail_index: None,
+            appended_tail_index_builds: 0,
         }
     }
 
@@ -645,6 +670,48 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
         }
         Ok(None)
+    }
+
+    /// Newest frame for `page_number` within the appended tail `0..=tail_frame`.
+    ///
+    /// Same answer as [`Self::scan_backwards_for_page`] over that range (the
+    /// newest frame wins), but the tail is indexed once and the index is
+    /// reused while the tail is provably unchanged — same generation
+    /// identity, same frame count, same checksum on the last frame. A
+    /// changed tail costs one fresh pass; a stable tail costs one header
+    /// read (the checksum probe) per lookup.
+    async fn appended_tail_frame_for_page(
+        &mut self,
+        cx: &Cx,
+        page_number: u32,
+        tail_frame: usize,
+    ) -> Result<Option<usize>> {
+        let frame_count = tail_frame.saturating_add(1);
+        let generation = self.wal.generation_identity();
+        let tail_checksum = self.wal.read_frame_header(cx, tail_frame).await?.checksum;
+        let current = self.appended_tail_index.as_ref().is_some_and(|index| {
+            index.generation == generation
+                && index.frame_count == frame_count
+                && index.tail_checksum == tail_checksum
+        });
+        if !current {
+            let mut latest_frame_by_page = HashMap::new();
+            for frame_index in 0..frame_count {
+                let header = self.wal.read_frame_header(cx, frame_index).await?;
+                latest_frame_by_page.insert(header.page_number, frame_index);
+            }
+            self.appended_tail_index = Some(AppendedTailIndex {
+                generation,
+                frame_count,
+                tail_checksum,
+                latest_frame_by_page,
+            });
+            self.appended_tail_index_builds = self.appended_tail_index_builds.saturating_add(1);
+        }
+        Ok(self
+            .appended_tail_index
+            .as_ref()
+            .and_then(|index| index.latest_frame_by_page.get(&page_number).copied()))
     }
 
     /// Take any pending FEC commit results for sidecar persistence.
@@ -1670,8 +1737,11 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     // deferred sync, so it can lag peers' appended-but-unfsynced commits; the
     // append-gate guards (synthetic page-1 promotion, stale-header byte check,
     // freelist resurrection/erasure walk) need the newest appended frame, not
-    // the newest published one. Under the gate the tail is stable, so a
-    // backwards header scan from `frame_count() - 1` is exact.
+    // the newest published one. Under the gate the tail is stable, so one
+    // header pass over `0..frame_count()` is exact — and it is done once per
+    // stable tail (`AppendedTailIndex`), not once per page: the reclaim sweep
+    // asks for every ledger page in turn, and a per-page backwards scan made
+    // that O(ledger × frames) (cass GH #382).
     fn read_page_at_appended_tail<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -1683,7 +1753,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 return Ok(None);
             };
             let Some(frame_index) = self
-                .scan_backwards_for_page(cx, page_number, tail_frame)
+                .appended_tail_frame_for_page(cx, page_number, tail_frame)
                 .await?
             else {
                 return Ok(None);
@@ -8583,6 +8653,88 @@ mod tests {
         assert_eq!(after.commit_count, 0);
         assert_eq!(after.latest_frame_entries, 0);
         assert!(after.lookup_contract_is_authoritative());
+    }
+
+    // -- Appended-tail index (cass GH #382) --
+
+    /// The reclaim sweep asks `read_page_at_appended_tail` for every ledger
+    /// page in turn. It must answer exactly like the backwards scan it
+    /// replaced (newest frame wins, absent pages are `None`) while scanning
+    /// the tail once per stable tail, rebuilding only when the tail changes.
+    #[test]
+    fn appended_tail_reads_index_the_tail_once_per_stable_tail() {
+        init_wal_publication_test_tracing();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1_old = sample_page(0x11);
+        let p2 = sample_page(0x22);
+        let p1_new = sample_page(0x33);
+        adapter.append_frame(&cx, 1, &p1_old, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 0).expect("append p2");
+        adapter
+            .append_frame(&cx, 1, &p1_new, 2)
+            .expect("append newer p1 (commit)");
+        adapter.sync(&cx).expect("publish staged frames");
+        assert_eq!(adapter.appended_tail_index_builds, 0);
+
+        // Newest frame wins, exactly like the backwards scan.
+        assert_eq!(
+            adapter
+                .read_page_at_appended_tail(&cx, 1)
+                .expect("tail read p1"),
+            Some(p1_new.clone())
+        );
+        assert_eq!(
+            adapter
+                .read_page_at_appended_tail(&cx, 2)
+                .expect("tail read p2"),
+            Some(p2.clone())
+        );
+        assert_eq!(
+            adapter
+                .read_page_at_appended_tail(&cx, 3)
+                .expect("tail read p3"),
+            None
+        );
+        // Many lookups against an unchanged tail: one scan, not one per page.
+        for page in 1..=64_u32 {
+            let expected = adapter
+                .scan_backwards_for_page(&cx, page, adapter.wal.frame_count() - 1)
+                .expect("backwards scan");
+            let via_index = adapter
+                .appended_tail_frame_for_page(&cx, page, adapter.wal.frame_count() - 1)
+                .expect("indexed lookup");
+            assert_eq!(via_index, expected, "page {page}: index must equal the scan");
+        }
+        assert_eq!(
+            adapter.appended_tail_index_builds, 1,
+            "a stable tail is indexed exactly once"
+        );
+
+        // Appending changes the tail: the next lookup rebuilds, and sees it.
+        let p3 = sample_page(0x44);
+        adapter
+            .append_frame(&cx, 3, &p3, 3)
+            .expect("append p3 (commit)");
+        adapter.sync(&cx).expect("publish p3");
+        assert_eq!(
+            adapter
+                .read_page_at_appended_tail(&cx, 3)
+                .expect("tail read p3 after append"),
+            Some(p3)
+        );
+        assert_eq!(
+            adapter
+                .read_page_at_appended_tail(&cx, 1)
+                .expect("tail read p1 after append"),
+            Some(p1_new)
+        );
+        assert_eq!(
+            adapter.appended_tail_index_builds, 2,
+            "a changed tail costs exactly one fresh pass"
+        );
     }
 
     // -- Partial index fallback tests --
