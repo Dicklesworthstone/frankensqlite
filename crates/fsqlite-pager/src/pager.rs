@@ -21393,6 +21393,14 @@ where
                         Err(_) => 0,
                     }
                 };
+                // bd-9inpb: preserve the PRE-floor snapshot base. Our newly
+                // allocated EOF pages start at flush_snapshot_db_size + 1;
+                // flooring flush_base up to the durable certificate fixes the
+                // CERTIFIED size but NOT the physical page numbers already baked
+                // into our frames, so a peer that grew into that range since our
+                // snapshot leaves us aliasing its pages. The append-gate check
+                // below catches that and fails closed.
+                let flush_snapshot_db_size = flush_base_db_size;
                 let flush_base_db_size = flush_base_db_size.max(durable_certified_db_size);
                 let consolidated_db_size = group_commit_final_db_size(flush_base_db_size, &batches);
                 let promoted_page_one_headers =
@@ -21883,6 +21891,51 @@ where
                                 let authorized_seed = wal
                                     .latest_authorized_parallel_wal_commit_certificate(cx)
                                     .await?;
+                                // bd-9inpb: EOF-growth anti-alias gate. This runs
+                                // under the RESERVED append lock, so the floor
+                                // read above already reflects every peer commit
+                                // published before us. Our frames carry physical
+                                // page numbers allocated against
+                                // flush_snapshot_db_size; if any of them falls in
+                                // (flush_snapshot_db_size, durable_floor] it aliases
+                                // a page a peer now owns — one physical page handed
+                                // to two b-trees ("2nd reference to page N", lost
+                                // rows). Fail closed so the statement retry re-preps
+                                // against the fresh durable size and re-allocates a
+                                // non-conflicting EOF range. Disjoint-page and
+                                // non-growing commits never trip this: their pages
+                                // are all <= flush_snapshot_db_size.
+                                if let Some(durable_db_size_floor) = durable_db_size_floor
+                                    && durable_db_size_floor > flush_snapshot_db_size
+                                {
+                                    let mut aliased: Vec<u32> = batches
+                                        .iter()
+                                        .flat_map(|batch| batch.frames.iter())
+                                        .map(|frame| frame.page_number)
+                                        .filter(|&page| {
+                                            page > flush_snapshot_db_size
+                                                && page <= durable_db_size_floor
+                                        })
+                                        .collect();
+                                    if !aliased.is_empty() {
+                                        aliased.sort_unstable();
+                                        aliased.dedup();
+                                        tracing::warn!(
+                                            target: "fsqlite.pager.commit",
+                                            snapshot_db_size = flush_snapshot_db_size,
+                                            durable_db_size = durable_db_size_floor,
+                                            pages = ?aliased,
+                                            "commit refused: EOF-growth pages alias a peer-committed range (bd-9inpb)"
+                                        );
+                                        return Err(FrankenError::BusySnapshot {
+                                            conflicting_pages: aliased
+                                                .iter()
+                                                .map(u32::to_string)
+                                                .collect::<Vec<_>>()
+                                                .join(","),
+                                        });
+                                    }
+                                }
                                 // bd-vnxjd: db_size monotonicity gate. A peer
                                 // may have committed growth between this
                                 // flush's prep-time floor read and this append
