@@ -225,6 +225,15 @@ fn gh406_content_backed_bulk_load_is_subquadratic() {
         let first = quarter_times[0].as_secs_f64().max(1e-6);
         let last = quarter_times[QUARTERS - 1].as_secs_f64();
         let ratio = last / first;
+        eprintln!(
+            "GH#406 bulk load: {total_rows} rows in {} statements of {ROWS_PER_STATEMENT}; \
+             quarters (s) = {:?}; last/first = {ratio:.2}",
+            QUARTERS * STATEMENTS_PER_QUARTER,
+            quarter_times
+                .iter()
+                .map(|d| format!("{:.3}", d.as_secs_f64()))
+                .collect::<Vec<_>>()
+        );
         assert!(
             ratio < 3.0,
             "GH#406: bulk INSERT cost is growing with table size — quarter timings {quarter_times:?}, \
