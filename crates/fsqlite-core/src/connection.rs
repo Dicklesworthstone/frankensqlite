@@ -88,7 +88,8 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
     Fts5DocsizeRow, Fts5Expr, Fts5HighlightFunc, Fts5IdxRow, Fts5MergeScheduler, Fts5OnDiskReader,
-    Fts5ScoreSnapshot, Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureLevel, Fts5StructureRecord,
+    Fts5ScoreSnapshot, Fts5ScoreTerm, Fts5ShadowRows, Fts5SnippetFunc, Fts5StructureLevel,
+    Fts5StructureRecord,
     Fts5StructureSegment, Fts5Table, Fts5TombstonePage, Fts5VocabTable, Fts5VocabType, build_expr,
     build_fts5vocab_rows, collect_merged_term_groups, decode_docsize_blob,
     encode_contentless_delete_all_flush, encode_incremental_delete_flush, encode_merged_segment,
@@ -21529,9 +21530,13 @@ impl Connection {
         let query_terms = score_snapshot
             .query_terms_for_queries(&query_refs)
             .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?;
+        let score_terms = score_snapshot
+            .score_terms_for_queries(&query_refs)
+            .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?;
         Ok(Some(Fts5AuxTableContext {
             score_snapshot,
             query_terms,
+            score_terms,
             column_count,
             row_table_label: src.alias.clone().unwrap_or_else(|| src.table_name.clone()),
             rank_weights,
@@ -140947,7 +140952,12 @@ fn is_rtree_instance(_instance: &dyn ErasedVtabInstance) -> bool {
 #[derive(Debug, Clone)]
 struct Fts5AuxTableContext {
     score_snapshot: Fts5ScoreSnapshot,
+    /// The MATCH query's terms as plain strings, for snippet()/highlight()/auto-
+    /// column resolution (which match against the projected row text).
     query_terms: Vec<String>,
+    /// The MATCH query's scoring units, preserving exact-vs-prefix kind, for
+    /// bm25/rank so a prefix operand scores from its aggregated prefix doclist.
+    score_terms: Vec<Fts5ScoreTerm>,
     column_count: usize,
     row_table_label: String,
     /// Per-column bm25 weights from a `rank MATCH '<bm25(...)>'` directive, if
@@ -142952,7 +142962,7 @@ fn fts5_aux_bm25_score(
 ) -> Result<f64> {
     table_ctx
         .score_snapshot
-        .bm25_score_for_terms_with_weights(rowid, &table_ctx.query_terms, weights)
+        .bm25_score_for_terms_with_weights(rowid, &table_ctx.score_terms, weights)
         .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))
 }
 

@@ -8815,12 +8815,15 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
             };
             let df = match term {
                 Fts5ScoreTerm::Exact(text) => self.doc_frequency(text)?,
-                Fts5ScoreTerm::Prefix(_) => entries
-                    .iter()
-                    .filter(|entry| {
-                        !entry.poslist.delete && rowid_u64_to_i64(entry.rowid).is_some()
-                    })
-                    .count() as u64,
+                Fts5ScoreTerm::Prefix(_) => u64::try_from(
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            !entry.poslist.delete && rowid_u64_to_i64(entry.rowid).is_some()
+                        })
+                        .count(),
+                )
+                .unwrap_or(u64::MAX),
             };
             term_df.insert(term.clone(), df);
             // ONE pass over the (exact or prefix) doclist; bucket per matched rowid.
@@ -10068,6 +10071,12 @@ impl Fts5Table {
         queries: &[&str],
     ) -> std::result::Result<Fts5ScoreSnapshot, Fts5QueryError> {
         let tokenizer = self.create_tokenizer_instance();
+        let score_terms = score_terms_for_query_strings(
+            &self.columns,
+            queries,
+            tokenizer.as_ref(),
+            self.config.detail_mode(),
+        )?;
         let mut query = Fts5LazyQuery::new(
             reader,
             &self.columns,
@@ -10075,7 +10084,7 @@ impl Fts5Table {
             self.config.detail_mode(),
         )
         .await?;
-        let scores = query.precompute_scores(queries).await?;
+        let scores = query.precompute_scores(queries, &score_terms).await?;
         Ok(Fts5ScoreSnapshot::from_precomputed(
             self.columns.clone(),
             self.tokenizer_name.clone(),
