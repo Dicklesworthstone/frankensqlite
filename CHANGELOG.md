@@ -47,6 +47,22 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...m
 
 Post-v0.3.15 development continues on `main` (see the compare link).
 
+### FTS5: savepoints no longer clone the whole table (GH#405)
+
+`Fts5Table::begin` and `Fts5Table::savepoint` used to deep-clone the entire
+in-memory table state (inverted index, documents, shadow rows, locales), and
+the connection wraps every statement in an internal savepoint, so each INSERT
+into a large fts5 table cost O(table): on a 538,807-row table that was minutes
+per statement at 100 % of one core and a doubled resident set. `Fts5Table` now
+keeps an `Fts5UndoLog`: one inverse operation per mutated row (an insert
+records only its rowid; an update or delete records the previous content,
+locales and that row's postings), savepoints are positions in the log plus a
+copy of the small table header, and only the bulk rewrites (shadow-row
+materialization, contentless hydration, rebuild, bind) still fall back to a
+full snapshot. `rollback`, `rollback_to` and `release` keep their observable
+semantics (`f68fa54c1`, `afe829f4b`; downstream cass GH #413, bead
+`coding_agent_session_search-cjugu`).
+
 ### WAL: appended-tail reads no longer rescan the whole WAL per page (cass GH #382)
 
 `reclaim_disowned_in_range` (run by `checkpoint` and by the on-open reclamation
