@@ -49,11 +49,10 @@ fn stock_ranked(stock: &rusqlite::Connection, table: &str, query: &str) -> Vec<(
 /// `check_values`) on the bm25 score VALUES to 1e-6. Ties on score are broken by
 /// rowid on both sides so the comparison is stable.
 ///
-/// `check_values` is currently gated to the regular-content table: fsqlite's
-/// bm25 VALUE for a `content=''` contentless table diverges slightly from stock
-/// (a small pre-existing scoring-precision difference on the promote path,
-/// tracked separately) even though the rank ORDER is correct. The lazy-scoring
-/// work must not change either, so ORDER is asserted for both schemas.
+/// The lazy score source reads each doc's length from `_docsize` directly, so
+/// its bm25 matches stock for BOTH the regular-content and the contentless
+/// (`content=''`) table. `check_values` is retained as a knob but is asserted on
+/// every table here.
 fn assert_ranked_eq(
     label: &str,
     mut frank: Vec<(i64, f64)>,
@@ -180,7 +179,7 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
                     &format!("{table} MATCH {q:?} ORDER BY rank"),
                     frank_ranked(&frank),
                     &expected,
-                    table == "c",
+                    true,
                 );
             }
         }
@@ -209,7 +208,7 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
                 &format!("{table} MATCH 'beta' bm25(2.0)"),
                 frank_ranked(&frank),
                 &expected,
-                table == "c",
+                true,
             );
         }
 
