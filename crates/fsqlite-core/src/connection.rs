@@ -50296,7 +50296,7 @@ impl Connection {
 
         #[cfg(feature = "ext-fts5")]
         if self
-            .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)
+            .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids, replace)
             .await?
         {
             if lazy_contentless {
@@ -51141,6 +51141,7 @@ impl Connection {
         table_name: &str,
         rows: &[LiveVtabInsertRow],
         inserted_rowids: &[i64],
+        replace: bool,
     ) -> Result<bool> {
         if rows.len() != inserted_rowids.len() {
             return Err(FrankenError::Internal(format!(
@@ -51152,51 +51153,58 @@ impl Connection {
         let Some(layout) = self.rootpage_zero_fts5_persistence_layout(table_name)? else {
             return Ok(false);
         };
-        if !layout.has_internal_content_shadow {
-            return self
-                .persist_rootpage_zero_fts5_contentless_incremental_insert(
-                    table_name,
-                    rows,
-                    inserted_rowids,
-                    layout.column_count,
-                )
-                .await;
-        }
-
         // A content-backed FTS5 table must keep its durable inverted index in
         // lockstep with `_content`. Clearing `_data`/`_idx` and relying on a
         // FrankenSQLite reopen to rebuild from `_content` leaves a database
         // that live in-memory MATCH can query but stock SQLite correctly calls
-        // a malformed inverted index (GH #300). Re-encode the complete shadow
-        // set after the in-memory mutation so both engines observe the same
-        // committed index.
-        self.persist_rootpage_zero_fts5_shadow_rows(table_name)
-            .await
+        // a malformed inverted index (GH #300). The incremental append below
+        // keeps both in lockstep by writing this statement's `_content` rows
+        // alongside its new segment; only `INSERT OR REPLACE`, which retires
+        // postings that already live in older segments, still needs the full
+        // re-encode (GH #406).
+        if layout.has_internal_content_shadow && replace {
+            return self
+                .persist_rootpage_zero_fts5_shadow_rows(table_name)
+                .await;
+        }
+        self.persist_rootpage_zero_fts5_incremental_insert(
+            table_name,
+            rows,
+            inserted_rowids,
+            layout.column_count,
+            layout.has_internal_content_shadow,
+        )
+        .await
     }
 
-    /// Persist a contentless rootpage-zero FTS5 INSERT as an incremental
-    /// segment append.
+    /// Persist a rootpage-zero FTS5 INSERT as an incremental segment append.
     ///
     /// Avoids re-encoding the whole inverted index on every insert. The legacy
-    /// contentless path delegated to
-    /// [`Self::persist_rootpage_zero_fts5_shadow_rows`], which rebuilds the
-    /// single `_data` segment from the entire in-memory index on every INSERT —
-    /// O(table) per insert, O(table^2) over a batch rebuild. That wedged
-    /// `cass index --full` above ~15-30 MB of content (bd-sf8dx / cass#301).
+    /// path delegated to [`Self::persist_rootpage_zero_fts5_shadow_rows`],
+    /// which rebuilds the single `_data` segment from the entire in-memory
+    /// index — and rewrites every `_content`/`_docsize`/`_idx`/`_config` shadow
+    /// row — on every INSERT: O(table) per statement, O(N^2/k) for a load of N
+    /// rows in k statements. That wedged `cass index --full` above ~15-30 MB of
+    /// content on contentless tables (bd-sf8dx / cass#301) and made
+    /// content-backed bulk loads quadratic (GH #406).
     ///
     /// This appends one fresh segment (containing only the current statement's
     /// rows) onto the persisted structure: point-read the current structure +
     /// averages, encode the delta in O(new rows), then upsert the new leaf and
-    /// the two changed metadata rows. Until a real segment exists (the first
-    /// insert, or runs of empty/all-unindexed rows), it falls back to the full
-    /// encode, which also lays down the `_config`/`_idx`/`_docsize` shadows.
+    /// the two changed metadata rows. `has_content_shadow` additionally appends
+    /// this statement's `_content` rows, so a content-backed table's durable
+    /// index stays in lockstep with its content (GH #300). Until a real segment
+    /// exists (the first insert, or runs of empty/all-unindexed rows), it falls
+    /// back to the full encode, which also lays down the
+    /// `_config`/`_idx`/`_docsize` shadows.
     #[cfg(feature = "ext-fts5")]
-    async fn persist_rootpage_zero_fts5_contentless_incremental_insert(
+    async fn persist_rootpage_zero_fts5_incremental_insert(
         &self,
         table_name: &str,
         rows: &[LiveVtabInsertRow],
         inserted_rowids: &[i64],
         column_count: usize,
+        has_content_shadow: bool,
     ) -> Result<bool> {
         // The incremental append needs an existing `_data` shadow to read the
         // current structure from; without one, fall back to the full encode.
@@ -51288,7 +51296,7 @@ impl Connection {
             .unwrap_or(0)
             .saturating_add(1);
 
-        let flush = {
+        let (flush, content_rows) = {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
             let fts5 = instances
@@ -51304,7 +51312,30 @@ impl Connection {
                 .copied()
                 .zip(rows.iter().map(|row| row.values.as_slice()))
                 .collect();
-            fts5.encode_incremental_insert_flush(&new_docs, &structure, &averages, next_segid)?
+            let flush =
+                fts5.encode_incremental_insert_flush(&new_docs, &structure, &averages, next_segid)?;
+            // The statement's own `_content` rows, read back from the in-memory
+            // documents the `xUpdate` above just stored — the same values (and
+            // the same TEXT coercion) the full re-encode would have written for
+            // these rowids, but O(new rows) instead of O(table). (GH #406)
+            let mut content_rows: Vec<(i64, Vec<String>)> = Vec::new();
+            if has_content_shadow {
+                content_rows.reserve(inserted_rowids.len());
+                for rowid in inserted_rowids.iter().copied() {
+                    // Fail closed: skipping a row here would persist its
+                    // postings without its content and leave `_content` short
+                    // of the index — exactly the divergence GH #300 guards.
+                    let values = fts5.get_document(rowid).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "content-backed FTS5 table `{table_name}` has no in-memory document \
+                             for just-inserted rowid {rowid}; refusing to persist an incremental \
+                             segment whose `_content` rows would be missing"
+                        ))
+                    })?;
+                    content_rows.push((rowid, values.to_vec()));
+                }
+            }
+            (flush, content_rows)
         };
         let Some(flush) = flush else {
             return Ok(true);
@@ -51366,11 +51397,28 @@ impl Connection {
             .await?;
         }
 
+        // Append this statement's `_content` rows so a content-backed table's
+        // durable index and its content stay in lockstep (GH #300) without the
+        // whole-table `_content` rewrite the full re-encode performed (GH #406).
+        let content_name = format!("{table_name}_content");
+        if !content_rows.is_empty() && self.schema_table_exists(&content_name) {
+            self.upsert_storage_table_rows(
+                &content_name,
+                content_rows.into_iter().map(|(rowid, values)| {
+                    let mut row = Vec::with_capacity(values.len() + 1);
+                    row.push(SqliteValue::Integer(rowid));
+                    row.extend(values.into_iter().map(|value| SqliteValue::Text(value.into())));
+                    (rowid, row)
+                }),
+            )
+            .await?;
+        }
+
         tracing::debug!(
             table = table_name,
             segid = next_segid,
             new_rows = inserted_rowids.len(),
-            "fts5: appended incremental contentless segment (bd-sf8dx)"
+            "fts5: appended incremental segment (bd-sf8dx, GH#406)"
         );
 
         // Keep the segment count bounded (the read path walks all segments per
