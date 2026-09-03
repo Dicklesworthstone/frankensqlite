@@ -21076,19 +21076,8 @@ impl Connection {
             ));
         }
         let key = src.table_name.to_ascii_uppercase();
-        let column_count = {
-            let instances = self.vtab_instances.borrow();
-            instances
-                .get(&key)
-                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                .map(|fts5| fts5.columns().len())
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-                })?
-        };
         let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
         let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-        let weights = vec![1.0_f64; column_count];
 
         let fts5 = {
             let instances = self.vtab_instances.borrow();
@@ -21100,9 +21089,13 @@ impl Connection {
                     FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
                 })?
         };
-        let scored = self
+        // This is the plain-MATCH (idx_num == 1) scan: it yields matching
+        // rowids, and any `ORDER BY rank` / bm25()/snippet() scoring is applied
+        // separately through the aux context. Resolve rowids WITHOUT ranking so
+        // a plain MATCH does not pay (and discard) the O(hits^2) BM25 rank.
+        let matched = self
             .with_lazy_fts5_reader(&src.table_name, async |reader| {
-                fts5.search_rows_lazy(reader, &query_refs, &weights)
+                fts5.matched_rows_lazy(reader, &query_refs)
                     .await
                     .map_err(|error| {
                         FrankenError::function_error(format!("fts5 query failed: {error}"))
@@ -21110,9 +21103,9 @@ impl Connection {
             })
             .await?;
 
-        Ok(scored
+        Ok(matched
             .into_iter()
-            .map(|(rowid, _score, columns)| {
+            .map(|(rowid, columns)| {
                 let mut row = columns
                     .into_iter()
                     .take(src.col_names.len())

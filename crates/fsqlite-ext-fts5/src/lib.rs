@@ -8424,6 +8424,39 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         ranked
     }
 
+    /// Resolve the rowids a MATCH query selects, WITHOUT computing BM25 scores.
+    ///
+    /// Plain `WHERE t MATCH ?` (no `ORDER BY rank`, no `bm25()`/`snippet()`)
+    /// only needs the matching rowids; ranking is a separate aux-context path.
+    /// `search_queries_with_weights` scores every match, and BM25 scoring is
+    /// O(hits) per doc (each `bm25_score` rescans the term's full doclist to
+    /// find one doc), i.e. O(hits^2) overall — pure waste when the caller
+    /// discards the score. This skips ranking and the per-doc `_docsize`
+    /// prefetch, so a plain MATCH costs one doclist walk (`evaluate_queries`)
+    /// instead of the quadratic rank (bd-fts5-lazy perf). Results are returned
+    /// in ascending rowid order, matching stock FTS5's unordered-MATCH order.
+    pub async fn matched_rowids(
+        &mut self,
+        queries: &[&str],
+    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
+        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+        self.prefetch_query_doclists(queries).await?;
+        let t1 = std::time::Instant::now();
+        let (mut matching_docs, _query_terms) = self.evaluate_queries(queries)?;
+        matching_docs.sort_unstable();
+        matching_docs.dedup();
+        if timing {
+            eprintln!(
+                "FTS5_TIMING matched_rowids (unranked): prefetch_doclists={:?} evaluate+sort={:?} ({} docs)",
+                t1 - t0,
+                t1.elapsed(),
+                matching_docs.len(),
+            );
+        }
+        Ok(matching_docs)
+    }
+
     /// Point-read the `_content` row for a (result) `rowid`, so projection reads
     /// only the LIMITed result set rather than the whole corpus.
     pub async fn content_for_rowid(
@@ -9290,6 +9323,42 @@ impl Fts5Table {
         if timing {
             eprintln!(
                 "FTS5_TIMING content_loop: {n_ranked} rows in {:?}",
+                t_content.elapsed()
+            );
+        }
+        Ok(out)
+    }
+
+    /// Answer a plain (unranked) MATCH in lazy mode: resolve matching rowids
+    /// without BM25 scoring, then point-read `_content` for projection. Used by
+    /// the `idx_num == 1` scan path, which discards scores (ranked queries score
+    /// via a separate aux context). Avoids the O(hits^2) BM25 rank that
+    /// `search_rows_lazy` pays and throws away (bd-fts5-lazy perf).
+    pub async fn matched_rows_lazy<R: Fts5OnDiskReader>(
+        &self,
+        reader: &mut R,
+        queries: &[&str],
+    ) -> std::result::Result<Vec<(i64, Vec<String>)>, Fts5QueryError> {
+        let tokenizer = self.create_tokenizer_instance();
+        let mut query = Fts5LazyQuery::new(
+            reader,
+            &self.columns,
+            tokenizer.as_ref(),
+            self.config.detail_mode(),
+        )
+        .await?;
+        let rowids = query.matched_rowids(queries).await?;
+        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
+        let t_content = std::time::Instant::now();
+        let n = rowids.len();
+        let mut out = Vec::with_capacity(rowids.len());
+        for rowid in rowids {
+            let columns = query.content_for_rowid(rowid).await?.unwrap_or_default();
+            out.push((rowid, columns));
+        }
+        if timing {
+            eprintln!(
+                "FTS5_TIMING content_loop (unranked): {n} rows in {:?}",
                 t_content.elapsed()
             );
         }
