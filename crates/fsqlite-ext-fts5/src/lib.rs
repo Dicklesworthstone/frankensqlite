@@ -20,7 +20,7 @@ use fsqlite_func::ScalarFunction;
 // the concrete `VirtualTable::update` in this crate's tests (`use super::*`),
 // breaking the whole `--lib` build with E0034.
 use fsqlite_func::vtab::{
-    ColumnContext, IndexInfo, ShadowTablePolicy, TransactionalVtabState, VirtualTable,
+    ColumnContext, IndexInfo, ShadowTablePolicy, VirtualTable,
     VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory,
     VtabModuleMetadata, VtabRiskLevel,
 };
@@ -8762,6 +8762,7 @@ pub struct Fts5Table {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Fts5TableSnapshot {
     config: Fts5Config,
     tokenizer_name: String,
@@ -8814,6 +8815,7 @@ struct Fts5TableHeader {
 }
 
 /// One reversible step recorded inside a transaction. Undo runs newest first.
+#[derive(Clone)]
 enum Fts5UndoOp {
     /// The row did not exist before: undo removes it.
     RowInserted { rowid: i64 },
@@ -8839,11 +8841,21 @@ enum Fts5UndoOp {
 /// copy; `rollback_to` undoes the tail of the log back to that position and
 /// keeps the savepoint, `release` drops savepoint markers and keeps the log,
 /// exactly the observable semantics of the snapshot version.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Fts5UndoLog {
     base: Option<Fts5TableHeader>,
     ops: Vec<Fts5UndoOp>,
     savepoints: Vec<(i32, usize, Fts5TableHeader)>,
+}
+
+impl std::fmt::Debug for Fts5UndoLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fts5UndoLog")
+            .field("active", &self.is_active())
+            .field("ops", &self.ops.len())
+            .field("savepoints", &self.savepoints.len())
+            .finish()
+    }
 }
 
 impl Fts5UndoLog {
@@ -9187,6 +9199,7 @@ impl Fts5Table {
     }
 
     fn bind_validated_shadow_rows(&mut self, rows: Fts5ShadowRows, report: &Fts5ShadowOpenReport) {
+        self.record_bulk_mutation_for_undo();
         report.metadata.apply_to_runtime_config(&mut self.config);
         self.index = InvertedIndex::with_options_and_tokendata(
             self.config.columnsize_enabled(),
@@ -10658,7 +10671,8 @@ impl VirtualTable for Fts5Table {
     }
 
     fn begin(&mut self, _cx: &Cx) -> Result<()> {
-        self.txn_state.begin(self.snapshot_state());
+        let header = self.header_for_undo();
+        self.txn_state.begin(header);
         Ok(())
     }
 
@@ -10776,13 +10790,15 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-        let snapshot = self.txn_state.rollback();
-        self.restore_transaction_snapshot(snapshot);
+        if let Some((ops, header)) = self.txn_state.take_rollback() {
+            self.undo(ops, header);
+        }
         Ok(())
     }
 
     fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
-        self.txn_state.savepoint(n, self.snapshot_state());
+        let header = self.header_for_undo();
+        self.txn_state.savepoint(n, header);
         Ok(())
     }
 
@@ -10792,8 +10808,9 @@ impl VirtualTable for Fts5Table {
     }
 
     fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
-        let snapshot = self.txn_state.rollback_to(n);
-        self.restore_transaction_snapshot(snapshot);
+        if let Some((ops, header)) = self.txn_state.take_rollback_to(n) {
+            self.undo(ops, header);
+        }
         Ok(())
     }
 }
@@ -20271,6 +20288,187 @@ mod tests {
         assert_eq!(table.all_rows(), vec![(1, vec!["stable root".to_owned()])]);
         assert!(search_rowids(&table, "transient")?.is_empty());
         assert_eq!(search_rowids(&table, "stable")?, vec![1]);
+        Ok(())
+    }
+
+    /// frankensqlite#405: a savepoint inside a transaction must not clone the
+    /// table. Inserting rows records one row-level undo entry each and no
+    /// full snapshot; rolling back to the savepoint removes exactly the rows
+    /// inserted after it.
+    #[test]
+    fn test_fts5_undo_log_records_row_ops_not_snapshots_for_inserts()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        for rowid in 1..=40_i64 {
+            table
+                .update(
+                    &cx,
+                    &[
+                        SqliteValue::Null,
+                        SqliteValue::Integer(rowid),
+                        SqliteValue::Text(SmallText::from_string(format!(
+                            "shared token row{rowid}"
+                        ))),
+                    ],
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(41),
+                    SqliteValue::Text(SmallText::from_string("shared token late")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        assert_eq!(table.txn_state.recorded_ops(), 41);
+        assert_eq!(
+            table.txn_state.recorded_full_snapshots(),
+            0,
+            "row inserts must never record a full table snapshot"
+        );
+        assert_eq!(search_rowids(&table, "late")?, vec![41]);
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        assert_eq!(table.txn_state.recorded_ops(), 40);
+        assert!(search_rowids(&table, "late")?.is_empty());
+        assert_eq!(search_rowids(&table, "shared")?.len(), 40);
+        assert_eq!(table.all_rows().len(), 40);
+        // The savepoint stays open after ROLLBACK TO; a later rollback to it
+        // must be a no-op on the same state.
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        assert_eq!(table.all_rows().len(), 40);
+        table.commit(&cx).map_err(|err| err.to_string())?;
+        assert_eq!(table.txn_state.recorded_ops(), 0);
+        assert_eq!(table.all_rows().len(), 40);
+        Ok(())
+    }
+
+    /// frankensqlite#405: replacing and deleting existing rows under a
+    /// savepoint records their previous content, locales, postings and
+    /// column sizes, and ROLLBACK TO restores all of them exactly — including
+    /// the auto-rowid watermark and a row that was updated twice.
+    #[test]
+    fn test_fts5_undo_log_rollback_to_restores_replaced_and_deleted_rows()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body", "locale=1"])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Blob(encode_fts5_locale_blob("tr_TR", "stable alpha").into()),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("stable beta")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        let rows_before = table.all_rows();
+        let locales_before = table.all_locales();
+        let lengths_before = table.index.doc_lengths.clone();
+        let next_rowid_before = table.next_rowid;
+        let stable_before = search_rowids(&table, "stable")?;
+
+        // Update row 1 twice, delete row 2, insert row 3 with an auto rowid.
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("changed once")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("changed twice gamma")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table
+            .update(&cx, &[SqliteValue::Integer(2)])
+            .map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text(SmallText::from_string("fresh delta")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        assert_eq!(search_rowids(&table, "gamma")?, vec![1]);
+        assert!(search_rowids(&table, "beta")?.is_empty());
+        assert_eq!(search_rowids(&table, "delta")?, vec![3]);
+        assert_eq!(table.txn_state.recorded_full_snapshots(), 0);
+
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        assert_eq!(table.all_rows(), rows_before);
+        assert_eq!(table.all_locales(), locales_before);
+        assert_eq!(table.index.doc_lengths, lengths_before);
+        assert_eq!(table.next_rowid, next_rowid_before);
+        assert_eq!(search_rowids(&table, "stable")?, stable_before);
+        assert_eq!(search_rowids(&table, "alpha")?, vec![1]);
+        assert_eq!(search_rowids(&table, "beta")?, vec![2]);
+        assert!(search_rowids(&table, "gamma OR delta OR changed")?.is_empty());
+        table.commit(&cx).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    /// The bulk paths keep snapshot semantics: a rebuild inside a transaction
+    /// records one full snapshot and rolls back to the pre-rebuild table.
+    #[test]
+    fn test_fts5_undo_log_bulk_rebuild_rolls_back_via_snapshot()
+    -> std::result::Result<(), String> {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
+            .map_err(|err| err.to_string())?;
+        table.begin(&cx).map_err(|err| err.to_string())?;
+        table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("original row")),
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        table.savepoint(&cx, 1).map_err(|err| err.to_string())?;
+        table.rebuild_documents(vec![(7, vec!["rebuilt row".to_owned()])]);
+        assert_eq!(table.txn_state.recorded_full_snapshots(), 1);
+        assert_eq!(table.all_rows(), vec![(7, vec!["rebuilt row".to_owned()])]);
+        table.rollback_to(&cx, 1).map_err(|err| err.to_string())?;
+        assert_eq!(table.all_rows(), vec![(1, vec!["original row".to_owned()])]);
+        assert_eq!(search_rowids(&table, "original")?, vec![1]);
+        assert!(search_rowids(&table, "rebuilt")?.is_empty());
+        table.rollback(&cx).map_err(|err| err.to_string())?;
+        assert!(table.all_rows().is_empty());
+        assert!(!table.txn_state.is_active());
         Ok(())
     }
 
