@@ -3057,10 +3057,75 @@ pub struct Fts5ShadowOpen {
     pub report: Fts5ShadowOpenReport,
 }
 
+/// BM25 scoring inputs extracted for exactly the rows a MATCH query selected,
+/// so `ORDER BY rank` / `bm25()` can score a lazily-bound on-disk index WITHOUT
+/// hydrating the whole corpus into an in-memory index (the promote path).
+///
+/// It holds only what BM25 needs — corpus size `N`, average doc length, each
+/// query term's document frequency, each matched doc's length, and each
+/// `(term, matched-rowid)` pair's per-column term frequency — so scoring is
+/// O(query_terms) per row for ANY weights (the `rank` directive's or an explicit
+/// `bm25(...)` call's). Building it walks each term's doclist ONCE and buckets by
+/// rowid, so it is O(total hits), not the O(hits^2) of a per-row doclist rescan.
+#[derive(Debug, Clone, Default)]
+pub struct Fts5PrecomputedScores {
+    total_docs: u64,
+    avgdl: f64,
+    term_df: HashMap<String, u64>,
+    doc_len: HashMap<i64, u32>,
+    term_rowid_cols: HashMap<(String, i64), Vec<(u32, u32)>>,
+}
+
+impl Fts5PrecomputedScores {
+    /// BM25 for `rowid` over `query_terms` with per-column `weights`. This is the
+    /// exact BM25 of [`bm25_score`] / the lazy provider's `bm25_score`, reading
+    /// from the precomputed maps instead of an in-memory index, so scores are
+    /// bit-identical to the promote path for the same corpus.
+    fn bm25(&self, rowid: i64, query_terms: &[String], weights: &[f64]) -> f64 {
+        let n = self.total_docs as f64;
+        let avgdl = self.avgdl;
+        let dl = f64::from(self.doc_len.get(&rowid).copied().unwrap_or(0));
+        let mut score = 0.0;
+        for term in query_terms {
+            let df_int = self.term_df.get(term).copied().unwrap_or(0);
+            if df_int == 0 {
+                continue;
+            }
+            let df = df_int as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
+
+            let mut weighted_tf = 0.0;
+            if let Some(cols) = self.term_rowid_cols.get(&(term.clone(), rowid)) {
+                for &(column, tf) in cols {
+                    let col_weight = usize::try_from(column)
+                        .ok()
+                        .and_then(|index| weights.get(index).copied())
+                        .unwrap_or(1.0);
+                    weighted_tf += col_weight * f64::from(tf);
+                }
+            }
+            if weighted_tf == 0.0 {
+                continue;
+            }
+
+            let denom = if avgdl > 0.0 {
+                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+            } else {
+                weighted_tf + BM25_K1
+            };
+            score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
+        }
+        -score
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Fts5ScoreSource {
     InMemory(InvertedIndex),
     Shadow(Fts5ShadowRows),
+    /// Lazy on-disk scoring: BM25 inputs precomputed for the matched rows only,
+    /// so ranked queries do not promote (rebuild the whole corpus in memory).
+    Precomputed(Fts5PrecomputedScores),
 }
 
 #[derive(Debug, Clone)]
@@ -3093,6 +3158,25 @@ impl Fts5ScoreSnapshot {
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
                     .bm25_score(rowid, query_terms, weights)
             }
+            Fts5ScoreSource::Precomputed(scores) => Ok(scores.bm25(rowid, query_terms, weights)),
+        }
+    }
+
+    /// Build a snapshot that scores from precomputed lazy BM25 inputs (no
+    /// in-memory corpus). Used for ranked queries on lazily-bound on-disk tables
+    /// so `ORDER BY rank` / `bm25()` does not promote.
+    #[must_use]
+    pub fn from_precomputed(
+        columns: Vec<String>,
+        tokenizer_name: String,
+        detail: DetailMode,
+        scores: Fts5PrecomputedScores,
+    ) -> Self {
+        Self {
+            columns,
+            tokenizer_name,
+            detail,
+            source: Fts5ScoreSource::Precomputed(scores),
         }
     }
 }
@@ -8605,6 +8689,71 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         Ok(matching_docs)
     }
 
+    /// Extract the BM25 inputs for exactly the rows a MATCH query selects, so a
+    /// ranked query can score them WITHOUT promoting the corpus into memory.
+    ///
+    /// Resolves the matched rowids (like [`Self::matched_rowids`]) then, for each
+    /// query term, walks its recency-merged doclist ONCE and records the
+    /// per-column term frequency for every matched rowid — plus each term's
+    /// document frequency, each matched doc's length, and the corpus size /
+    /// average doc length. The result scores identically to the promote path
+    /// (same BM25 math) but is O(total hits), not O(hits^2).
+    pub async fn precompute_scores(
+        &mut self,
+        queries: &[&str],
+    ) -> std::result::Result<Fts5PrecomputedScores, Fts5QueryError> {
+        self.prefetch_query_doclists(queries).await?;
+        let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
+        self.prefetch_doc_lengths(&matching_docs).await?;
+
+        let matched: HashSet<i64> = matching_docs.iter().copied().collect();
+        let total_docs = self.total_docs()?;
+        let avgdl = self.avg_doc_length()?;
+
+        let mut term_df: HashMap<String, u64> = HashMap::new();
+        let mut term_rowid_cols: HashMap<(String, i64), Vec<(u32, u32)>> = HashMap::new();
+        for term in &query_terms {
+            if term_df.contains_key(term) {
+                continue;
+            }
+            term_df.insert(term.clone(), self.doc_frequency(term)?);
+            // ONE pass over the term's live doclist; bucket per matched rowid.
+            for entry in self.exact_entries(term)? {
+                if entry.poslist.delete {
+                    continue;
+                }
+                let Some(rowid) = rowid_u64_to_i64(entry.rowid) else {
+                    continue;
+                };
+                if !matched.contains(&rowid) {
+                    continue;
+                }
+                // Per-column term frequency, mirroring `term_column_frequencies`
+                // (offsets-per-column summed if a column repeats).
+                let mut by_col: BTreeMap<u32, u32> = BTreeMap::new();
+                for column in &entry.poslist.columns {
+                    let count = u32::try_from(column.offsets.len()).unwrap_or(u32::MAX);
+                    let slot = by_col.entry(column.column).or_insert(0);
+                    *slot = slot.saturating_add(count);
+                }
+                term_rowid_cols.insert((term.clone(), rowid), by_col.into_iter().collect());
+            }
+        }
+
+        let mut doc_len: HashMap<i64, u32> = HashMap::with_capacity(matching_docs.len());
+        for &rowid in &matching_docs {
+            doc_len.insert(rowid, self.doc_length(rowid)?);
+        }
+
+        Ok(Fts5PrecomputedScores {
+            total_docs,
+            avgdl,
+            term_df,
+            doc_len,
+            term_rowid_cols,
+        })
+    }
+
     /// Point-read the `_content` row for a (result) `rowid`, so projection reads
     /// only the LIMITed result set rather than the whole corpus.
     pub async fn content_for_rowid(
@@ -9800,6 +9949,33 @@ impl Fts5Table {
             detail: self.config.detail_mode(),
             source,
         }
+    }
+
+    /// Build a lazy (no-promote) auxiliary score snapshot for `queries` by
+    /// precomputing BM25 inputs for the matched rows through `reader`. Used for
+    /// ranked queries on a lazily-bound on-disk table so `ORDER BY rank` /
+    /// `bm25()` does not hydrate the corpus. Scores identically to
+    /// [`Self::auxiliary_score_snapshot`]'s promote path.
+    pub async fn lazy_auxiliary_score_snapshot<R: Fts5OnDiskReader>(
+        &self,
+        reader: &mut R,
+        queries: &[&str],
+    ) -> std::result::Result<Fts5ScoreSnapshot, Fts5QueryError> {
+        let tokenizer = self.create_tokenizer_instance();
+        let mut query = Fts5LazyQuery::new(
+            reader,
+            &self.columns,
+            tokenizer.as_ref(),
+            self.config.detail_mode(),
+        )
+        .await?;
+        let scores = query.precompute_scores(queries).await?;
+        Ok(Fts5ScoreSnapshot::from_precomputed(
+            self.columns.clone(),
+            self.tokenizer_name.clone(),
+            self.config.detail_mode(),
+            scores,
+        ))
     }
 
     #[must_use]

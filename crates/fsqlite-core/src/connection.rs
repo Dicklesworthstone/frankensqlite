@@ -21472,35 +21472,67 @@ impl Connection {
         }
 
         let key = src.table_name.to_ascii_uppercase();
-        {
-            let is_lazy = {
-                let instances = self.vtab_instances.borrow();
-                instances
-                    .get(&key)
-                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                    .is_some_and(Fts5Table::is_lazy_on_disk)
-            };
-            if is_lazy {
-                self.promote_lazy_fts5_table(&src.table_name).await?;
+        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+
+        let is_lazy = {
+            let instances = self.vtab_instances.borrow();
+            match instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            {
+                Some(fts5) => fts5.is_lazy_on_disk(),
+                None => return Ok(None),
             }
-        }
-        let instances = self.vtab_instances.borrow();
-        let instance = instances.get(&key).ok_or_else(|| {
-            FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-        })?;
-        let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() else {
-            return Ok(None);
         };
 
-        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-        let score_snapshot = fts5.auxiliary_score_snapshot();
+        // bd-fts5-lazy Fix C: for a lazily-bound on-disk table, score ranked
+        // queries (`ORDER BY rank` / `bm25()`) from a PRECOMPUTED snapshot built
+        // by point-reading only the matched rows' BM25 inputs — instead of
+        // promoting (rebuilding the whole corpus in memory). snippet()/highlight()
+        // do not consult the score source (they work off the projected row text +
+        // query_terms), so the precomputed source serves every aux consumer.
+        let (score_snapshot, column_count) = if is_lazy {
+            // Clone the (empty-index) lazy instance so no vtab borrow is held
+            // across the reader await; the clone is cheap for a lazy table.
+            let (fts5_clone, column_count) = {
+                let instances = self.vtab_instances.borrow();
+                match instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                {
+                    Some(fts5) => (fts5.clone(), fts5.columns().len()),
+                    None => return Ok(None),
+                }
+            };
+            let snapshot = self
+                .with_lazy_fts5_reader(&src.table_name, async |reader| {
+                    fts5_clone
+                        .lazy_auxiliary_score_snapshot(reader, &query_refs)
+                        .await
+                        .map_err(|error| {
+                            FrankenError::function_error(format!("fts5 query failed: {error}"))
+                        })
+                })
+                .await?;
+            (snapshot, column_count)
+        } else {
+            let instances = self.vtab_instances.borrow();
+            let Some(fts5) = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            else {
+                return Ok(None);
+            };
+            (fts5.auxiliary_score_snapshot(), fts5.columns().len())
+        };
+
         let query_terms = score_snapshot
             .query_terms_for_queries(&query_refs)
             .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?;
         Ok(Some(Fts5AuxTableContext {
             score_snapshot,
             query_terms,
-            column_count: fts5.columns().len(),
+            column_count,
             row_table_label: src.alias.clone().unwrap_or_else(|| src.table_name.clone()),
             rank_weights,
         }))
