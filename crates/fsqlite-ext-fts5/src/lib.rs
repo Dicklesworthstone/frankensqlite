@@ -6440,6 +6440,97 @@ impl InvertedIndex {
         }
     }
 
+    /// Copy of everything this index holds for `docid`: its postings under
+    /// every term and prefix term, its length, and whether it is counted. The
+    /// cost is proportional to the document's own terms (plus a scan of each
+    /// of those terms' posting lists), never to the table — this is what a
+    /// savepoint records for a row it is about to replace, instead of cloning
+    /// the whole index (frankensqlite#405).
+    #[allow(clippy::mutable_key_type)]
+    fn document_postings(&self, docid: i64) -> DocumentPostings {
+        let mut saved = DocumentPostings {
+            terms: Vec::new(),
+            prefix_terms: Vec::new(),
+            doc_length: self
+                .doc_lengths
+                .as_ref()
+                .and_then(|lengths| lengths.get(&docid).copied()),
+            counted: self.doc_ids.contains(&docid),
+        };
+        let Some(doc_refs) = self.doc_terms.get(&docid) else {
+            return saved;
+        };
+        for term in &doc_refs.terms {
+            if let Some(postings) = self.index.get(term) {
+                let mine: PostingList = postings
+                    .iter()
+                    .filter(|posting| posting.docid == docid)
+                    .cloned()
+                    .collect();
+                if !mine.is_empty() {
+                    saved.terms.push((term.clone(), mine));
+                }
+            }
+        }
+        for (prefix_length, prefix_keys) in &doc_refs.prefix_terms {
+            let Some(prefix_index) = self.prefix_indexes.get(prefix_length) else {
+                continue;
+            };
+            for prefix in prefix_keys {
+                if let Some(postings) = prefix_index.get(prefix) {
+                    let mine: PostingList = postings
+                        .iter()
+                        .filter(|posting| posting.docid == docid)
+                        .cloned()
+                        .collect();
+                    if !mine.is_empty() {
+                        saved
+                            .prefix_terms
+                            .push((*prefix_length, prefix.clone(), mine));
+                    }
+                }
+            }
+        }
+        saved
+    }
+
+    /// Inverse of [`Self::document_postings`]: drop whatever the index holds
+    /// for `docid` now and put the saved postings back. Postings are appended
+    /// to their term lists, the same placement a fresh insert gets.
+    #[allow(clippy::mutable_key_type)]
+    fn restore_document_postings(&mut self, docid: i64, saved: DocumentPostings) {
+        self.remove_document(docid);
+        if saved.counted {
+            self.doc_ids.insert(docid);
+        }
+        if let Some(length) = saved.doc_length
+            && let Some(doc_lengths) = self.doc_lengths.as_mut()
+        {
+            doc_lengths.insert(docid, length);
+        }
+        if saved.terms.is_empty() && saved.prefix_terms.is_empty() {
+            return;
+        }
+        let doc_refs = self.doc_terms.entry(docid).or_default();
+        for (term, postings) in saved.terms {
+            doc_refs.terms.insert(term.clone());
+            self.index.entry(term).or_default().extend(postings);
+        }
+        for (prefix_length, prefix, postings) in saved.prefix_terms {
+            doc_refs
+                .prefix_terms
+                .entry(prefix_length)
+                .or_default()
+                .insert(prefix.clone());
+            self.prefix_indexes
+                .entry(prefix_length)
+                .or_default()
+                .entry(prefix)
+                .or_default()
+                .extend(postings);
+        }
+    }
+
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
