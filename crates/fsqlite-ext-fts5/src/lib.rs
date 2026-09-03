@@ -8852,7 +8852,7 @@ impl std::fmt::Debug for Fts5UndoLog {
             .field("active", &self.is_active())
             .field("ops", &self.ops.len())
             .field("savepoints", &self.savepoints.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
