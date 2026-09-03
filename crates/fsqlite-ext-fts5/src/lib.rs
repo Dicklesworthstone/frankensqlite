@@ -3192,20 +3192,16 @@ impl Fts5ScoreSnapshot {
             // bd-fts5-prefix-bm25-unranked tracks prefix scoring on the promote
             // path.
             Fts5ScoreSource::InMemory(index) => {
-                let terms: Vec<String> =
-                    score_terms.iter().map(|t| t.text().to_owned()).collect();
+                let terms: Vec<String> = score_terms.iter().map(|t| t.text().to_owned()).collect();
                 Ok(bm25_score(index, rowid, &terms, weights))
             }
             Fts5ScoreSource::Shadow(rows) => {
-                let terms: Vec<String> =
-                    score_terms.iter().map(|t| t.text().to_owned()).collect();
+                let terms: Vec<String> = score_terms.iter().map(|t| t.text().to_owned()).collect();
                 let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
                     .bm25_score(rowid, &terms, weights)
             }
-            Fts5ScoreSource::Precomputed(scores) => {
-                Ok(scores.bm25(rowid, score_terms, weights))
-            }
+            Fts5ScoreSource::Precomputed(scores) => Ok(scores.bm25(rowid, score_terms, weights)),
         }
     }
 
@@ -10625,9 +10621,7 @@ fn extract_score_terms(expr: &Fts5Expr) -> Vec<Fts5ScoreTerm> {
             terms
         }
         Fts5Expr::Not(left, _) => extract_score_terms(left),
-        Fts5Expr::Near(operands, _) => {
-            operands.iter().flat_map(near_operand_score_terms).collect()
-        }
+        Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_score_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_score_terms(inner)
         }
