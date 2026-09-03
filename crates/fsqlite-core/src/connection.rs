@@ -14215,7 +14215,14 @@ impl Connection {
             // via `set_reject_mem_fallback(false)` or
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
-            allow_lazy_contentless_fts5: false,
+            // bd-fts5-lazy: contentless FTS5 (`content=''`, e.g. cass's
+            // fts_messages) is precisely the huge on-disk index the lazy read
+            // path exists for. Enabling it on the ordinary open path (not just
+            // schema-only opens) keeps `open` O(1) and answers MATCH by point-
+            // reading persisted segments, instead of hydrating the whole corpus
+            // into an in-memory index on every connection (the cass runaway).
+            // Non-lazy read/scan surfaces promote or fall back on demand.
+            allow_lazy_contentless_fts5: true,
             defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
