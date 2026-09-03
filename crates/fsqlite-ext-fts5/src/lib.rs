@@ -20,9 +20,8 @@ use fsqlite_func::ScalarFunction;
 // the concrete `VirtualTable::update` in this crate's tests (`use super::*`),
 // breaking the whole `--lib` build with E0034.
 use fsqlite_func::vtab::{
-    ColumnContext, IndexInfo, ShadowTablePolicy, VirtualTable,
-    VirtualTableCursor, VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory,
-    VtabModuleMetadata, VtabRiskLevel,
+    ColumnContext, IndexInfo, ShadowTablePolicy, VirtualTable, VirtualTableCursor,
+    VtabIntegrityPolicy, VtabLifecyclePolicy, VtabModuleFactory, VtabModuleMetadata, VtabRiskLevel,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::serial_type::{read_varint, write_varint};
@@ -8758,11 +8757,10 @@ pub struct Fts5Table {
     /// Next auto-generated rowid.
     next_rowid: i64,
     /// Snapshot-backed transaction/savepoint state for live VTAB writes.
-    txn_state: TransactionalVtabState<Fts5TableSnapshot>,
+    txn_state: Fts5UndoLog,
 }
 
 #[derive(Debug, Clone)]
-#[derive(Clone)]
 struct Fts5TableSnapshot {
     config: Fts5Config,
     tokenizer_name: String,
@@ -8920,7 +8918,8 @@ impl Fts5UndoLog {
                 |(_, position, header)| (*position, header.clone()),
             );
         let ops = self.ops.split_off(position);
-        self.savepoints.retain(|(existing, _, _)| *existing <= level);
+        self.savepoints
+            .retain(|(existing, _, _)| *existing <= level);
         Some((ops, header))
     }
 
@@ -9051,7 +9050,8 @@ impl Fts5Table {
     fn remove_row_state(&mut self, rowid: i64) {
         self.index.remove_document(rowid);
         self.documents.remove(&rowid);
-        self.row_locales.retain(|(existing_rowid, _column), _| *existing_rowid != rowid);
+        self.row_locales
+            .retain(|(existing_rowid, _column), _| *existing_rowid != rowid);
     }
 
     fn apply_undo_op(&mut self, op: Fts5UndoOp) {
@@ -20442,8 +20442,8 @@ mod tests {
     /// The bulk paths keep snapshot semantics: a rebuild inside a transaction
     /// records one full snapshot and rolls back to the pre-rebuild table.
     #[test]
-    fn test_fts5_undo_log_bulk_rebuild_rolls_back_via_snapshot()
-    -> std::result::Result<(), String> {
+    fn test_fts5_undo_log_bulk_rebuild_rolls_back_via_snapshot() -> std::result::Result<(), String>
+    {
         let cx = Cx::new();
         let mut table = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"])
             .map_err(|err| err.to_string())?;
