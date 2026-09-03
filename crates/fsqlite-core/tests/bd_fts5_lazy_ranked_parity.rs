@@ -151,18 +151,21 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
         let stock = rusqlite::Connection::open(&db_path).unwrap();
 
         // (table, query) pairs. Same query set on both the content ('c') and
-        // contentless ('d') tables.
-        // Exact-term / boolean ranked shapes with df<N terms and varying term
-        // frequency, so ORDER BY rank is a genuine discriminator. (Prefix ranked
-        // is intentionally excluded: fsqlite's prefix bm25 diverges from stock
-        // today — a separate pre-existing defect tracked on its own bead, not
-        // something this lazy-scoring safety net should assert or gate.)
+        // contentless ('d') tables. Exact-term / boolean / PREFIX ranked shapes
+        // with df<N terms and varying term frequency, so ORDER BY rank is a
+        // genuine discriminator. Prefix ranked scores a prefix as one unit (df =
+        // docs matching the prefix, tf = total prefix-matching positions), which
+        // the lazy score source now honors (bd-fts5-prefix-bm25-unranked).
         let queries = [
             "beta",               // df=40, varying tf -> distinct score tiers
             "gamma",              // df~17, higher idf
             "beta AND gamma",     // intersection, re-ranked
             "beta OR gamma",      // union, mixed frequencies
             "delta",              // df=40, overlaps beta docs
+            "bet*",               // prefix -> beta (single expanded term)
+            "gam*",               // prefix -> gamma
+            "pad*",               // prefix -> pad0..pad10 (multi-term aggregation)
+            "beta OR gam*",       // boolean mixing exact + prefix
             "uniq7",              // single doc
             "uniq9",              // deleted doc (must be empty)
         ];
