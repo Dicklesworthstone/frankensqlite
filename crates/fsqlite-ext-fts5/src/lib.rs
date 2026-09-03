@@ -3057,12 +3057,12 @@ pub struct Fts5ShadowOpen {
     pub report: Fts5ShadowOpenReport,
 }
 
-/// BM25 scoring inputs extracted for exactly the rows a MATCH query selected,
-/// so `ORDER BY rank` / `bm25()` can score a lazily-bound on-disk index WITHOUT
-/// hydrating the whole corpus into an in-memory index (the promote path).
+/// BM25 scoring inputs for exactly the rows a MATCH query selected.
 ///
-/// It holds only what BM25 needs — corpus size `N`, average doc length, each
-/// query term's document frequency, each matched doc's length, and each
+/// This lets `ORDER BY rank` / `bm25()` score a lazily-bound on-disk index
+/// WITHOUT hydrating the whole corpus into an in-memory index (the promote
+/// path). It holds only what BM25 needs — corpus size `N`, average doc length,
+/// each query term's document frequency, each matched doc's length, and each
 /// `(term, matched-rowid)` pair's per-column term frequency — so scoring is
 /// O(query_terms) per row for ANY weights (the `rank` directive's or an explicit
 /// `bm25(...)` call's). Building it walks each term's doclist ONCE and buckets by
@@ -3401,7 +3401,11 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
     if dbg {
         eprintln!(
             "FTS5_SCANDBG exact_postings segid={} pgno_first={} pgno_last={} start={} tombstone_pages={}",
-            segment.segid, segment.pgno_first, segment.pgno_last, start, segment.tombstone_page_count
+            segment.segid,
+            segment.pgno_first,
+            segment.pgno_last,
+            start,
+            segment.tombstone_page_count
         );
     }
     let mut stitcher = Fts5DoclistStitcher::new();
@@ -3507,14 +3511,22 @@ where
     let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
     let seg_total: usize = structure.levels.iter().map(|l| l.segments.len()).sum();
     if dbg {
-        eprintln!("FTS5_SCANDBG collect_doclist_recency: levels={} total_segments={seg_total}", structure.levels.len());
+        eprintln!(
+            "FTS5_SCANDBG collect_doclist_recency: levels={} total_segments={seg_total}",
+            structure.levels.len()
+        );
     }
     let mut tomb_calls = 0_u64;
     for level in &structure.levels {
         for segment in level.segments.iter().rev() {
             for (term, entries) in per_segment(reader, segment).await? {
                 if dbg {
-                    eprintln!("FTS5_SCANDBG   segment segid={} entries={} tombstone_pages={}", segment.segid, entries.len(), segment.tombstone_page_count);
+                    eprintln!(
+                        "FTS5_SCANDBG   segment segid={} entries={} tombstone_pages={}",
+                        segment.segid,
+                        entries.len(),
+                        segment.tombstone_page_count
+                    );
                 }
                 for entry in entries {
                     if !seen.insert((term.clone(), entry.rowid)) {
@@ -3540,7 +3552,10 @@ where
         }
     }
     if dbg {
-        eprintln!("FTS5_SCANDBG collect_doclist_recency DONE: out={} tomb_calls={tomb_calls}", out.len());
+        eprintln!(
+            "FTS5_SCANDBG collect_doclist_recency DONE: out={} tomb_calls={tomb_calls}",
+            out.len()
+        );
     }
     Ok(out)
 }
@@ -8563,7 +8578,10 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         {
             Some(block) => {
                 if dbg {
-                    eprintln!("FTS5_SCANDBG   structure block {} bytes; decoding", block.len());
+                    eprintln!(
+                        "FTS5_SCANDBG   structure block {} bytes; decoding",
+                        block.len()
+                    );
                 }
                 let s = Fts5StructureRecord::decode(&block).map_err(shadow_query_storage_error)?;
                 if dbg {
@@ -8577,7 +8595,11 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
                         for seg in &level.segments {
                             eprintln!(
                                 "FTS5_SCANDBG     L{li} segid={} pgno_first={} pgno_last={} tomb_pages={} entry_count={}",
-                                seg.segid, seg.pgno_first, seg.pgno_last, seg.tombstone_page_count, seg.entry_count
+                                seg.segid,
+                                seg.pgno_first,
+                                seg.pgno_last,
+                                seg.tombstone_page_count,
+                                seg.entry_count
                             );
                         }
                     }
