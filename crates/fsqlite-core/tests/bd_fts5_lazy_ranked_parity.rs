@@ -118,6 +118,13 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
                 if id % 7 == 0 {
                     parts.push("gamma gamma".to_owned());
                 }
+                // MULTI-TERM-PER-DOC prefix coverage: `shard0`/`shardx0` both
+                // start with `shard`, so `shard*` matches TWO distinct expanded
+                // terms in the SAME doc — its per-doc prefix term frequency must
+                // SUM both (regression guard for the prefix-doclist accumulation;
+                // a prefix where each doc matches only one expanded term, like
+                // `pad*`, does not exercise this).
+                parts.push(format!("shard{k} shardx{k}", k = id % 5));
                 let text = parts.join(" ");
                 stock
                     .execute(
@@ -164,7 +171,8 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
             "delta",              // df=40, overlaps beta docs
             "bet*",               // prefix -> beta (single expanded term)
             "gam*",               // prefix -> gamma
-            "pad*",               // prefix -> pad0..pad10 (multi-term aggregation)
+            "pad*",               // prefix -> pad0..pad10 (one term per doc)
+            "shard*",             // prefix -> shardK + shardxK (TWO terms per doc: tf must sum)
             "beta OR gam*",       // boolean mixing exact + prefix
             "uniq7",              // single doc
             "uniq9",              // deleted doc (must be empty)

@@ -8801,28 +8801,20 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
             if term_df.contains_key(term) {
                 continue;
             }
-            // An exact term scores from its own doclist (df from the index); a
-            // prefix scores from its AGGREGATED prefix doclist — one entry per
-            // doc matching the prefix, whose merged poslist is the total prefix
-            // term-frequency in that doc — with df = the count of those docs.
+            // An exact term scores from its own doclist; a prefix scores as ONE
+            // unit from its AGGREGATED prefix doclist. That doclist carries one
+            // entry per (expanded-term, doc), so a doc matching several expanded
+            // terms (e.g. `word5*` -> word50 AND word55 in one doc) appears
+            // multiple times: its per-column term frequencies must be SUMMED
+            // across those entries, and its document frequency counts the doc
+            // ONCE. Accumulating per rowid handles both exact (one entry/doc) and
+            // prefix (many) uniformly.
             let entries = match term {
                 Fts5ScoreTerm::Exact(text) => self.exact_entries(text)?,
                 Fts5ScoreTerm::Prefix(text) => self.prefix_entries(text)?,
             };
-            let df = match term {
-                Fts5ScoreTerm::Exact(text) => self.doc_frequency(text)?,
-                Fts5ScoreTerm::Prefix(_) => u64::try_from(
-                    entries
-                        .iter()
-                        .filter(|entry| {
-                            !entry.poslist.delete && rowid_u64_to_i64(entry.rowid).is_some()
-                        })
-                        .count(),
-                )
-                .unwrap_or(u64::MAX),
-            };
-            term_df.insert(term.clone(), df);
-            // ONE pass over the (exact or prefix) doclist; bucket per matched rowid.
+            let mut distinct_docs: HashSet<i64> = HashSet::new();
+            let mut per_rowid_cols: HashMap<i64, BTreeMap<u32, u32>> = HashMap::new();
             for entry in &entries {
                 if entry.poslist.delete {
                     continue;
@@ -8830,17 +8822,25 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
                 let Some(rowid) = rowid_u64_to_i64(entry.rowid) else {
                     continue;
                 };
+                distinct_docs.insert(rowid);
                 if !matched.contains(&rowid) {
                     continue;
                 }
-                // Per-column term frequency, mirroring `term_column_frequencies`
-                // (offsets-per-column summed if a column repeats).
-                let mut by_col: BTreeMap<u32, u32> = BTreeMap::new();
+                let by_col = per_rowid_cols.entry(rowid).or_default();
                 for column in &entry.poslist.columns {
                     let count = u32::try_from(column.offsets.len()).unwrap_or(u32::MAX);
                     let slot = by_col.entry(column.column).or_insert(0);
                     *slot = slot.saturating_add(count);
                 }
+            }
+            // Exact `doc_frequency` is the authoritative index count; a prefix's
+            // df is the number of DISTINCT docs matching the prefix.
+            let df = match term {
+                Fts5ScoreTerm::Exact(text) => self.doc_frequency(text)?,
+                Fts5ScoreTerm::Prefix(_) => u64::try_from(distinct_docs.len()).unwrap_or(u64::MAX),
+            };
+            term_df.insert(term.clone(), df);
+            for (rowid, by_col) in per_rowid_cols {
                 term_rowid_cols.insert((term.clone(), rowid), by_col.into_iter().collect());
             }
         }
