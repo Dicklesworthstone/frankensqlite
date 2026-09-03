@@ -3313,9 +3313,21 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
         .await?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
+    let dbg = std::env::var("FSQLITE_FTS5_SCANDBG").is_ok();
+    if dbg {
+        eprintln!(
+            "FTS5_SCANDBG exact_postings segid={} pgno_first={} pgno_last={} start={} tombstone_pages={}",
+            segment.segid, segment.pgno_first, segment.pgno_last, start, segment.tombstone_page_count
+        );
+    }
     let mut stitcher = Fts5DoclistStitcher::new();
     let mut pgno = start;
+    let mut pages_scanned = 0_u64;
     while pgno <= segment.pgno_last {
+        pages_scanned += 1;
+        if dbg && pages_scanned % 1000 == 0 {
+            eprintln!("FTS5_SCANDBG   scanning pgno={pgno} (pages_scanned={pages_scanned})");
+        }
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
         let block = reader
             .read_data_block(id)
@@ -3406,11 +3418,20 @@ where
     R: Fts5OnDiskReader,
     F: AsyncFnMut(&mut R, &Fts5StructureSegment) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>>,
 {
+    let dbg = std::env::var("FSQLITE_FTS5_SCANDBG").is_ok();
     let mut out = Vec::new();
     let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
+    let seg_total: usize = structure.levels.iter().map(|l| l.segments.len()).sum();
+    if dbg {
+        eprintln!("FTS5_SCANDBG collect_doclist_recency: levels={} total_segments={seg_total}", structure.levels.len());
+    }
+    let mut tomb_calls = 0_u64;
     for level in &structure.levels {
         for segment in level.segments.iter().rev() {
             for (term, entries) in per_segment(reader, segment).await? {
+                if dbg {
+                    eprintln!("FTS5_SCANDBG   segment segid={} entries={} tombstone_pages={}", segment.segid, entries.len(), segment.tombstone_page_count);
+                }
                 for entry in entries {
                     if !seen.insert((term.clone(), entry.rowid)) {
                         // An older segment's occurrence of this (term, rowid):
@@ -3422,6 +3443,10 @@ where
                         // for this term (and shadows older live occurrences).
                         continue;
                     }
+                    tomb_calls += 1;
+                    if dbg && tomb_calls % 1000 == 0 {
+                        eprintln!("FTS5_SCANDBG   tombstone-checked {tomb_calls} entries");
+                    }
                     if rowid_tombstoned_in_segment(reader, segment, entry.rowid).await? {
                         continue;
                     }
@@ -3429,6 +3454,9 @@ where
                 }
             }
         }
+    }
+    if dbg {
+        eprintln!("FTS5_SCANDBG collect_doclist_recency DONE: out={} tomb_calls={tomb_calls}", out.len());
     }
     Ok(out)
 }
@@ -8439,6 +8467,10 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         tokenizer: &'a dyn Fts5Tokenizer,
         detail: DetailMode,
     ) -> std::result::Result<Self, Fts5QueryError> {
+        let dbg = std::env::var("FSQLITE_FTS5_SCANDBG").is_ok();
+        if dbg {
+            eprintln!("FTS5_SCANDBG LazyQuery::new start (reading structure)");
+        }
         let column_count = columns.len();
         let structure = match reader
             .read_data_block(FTS5_STRUCTURE_ROWID)
@@ -8446,7 +8478,27 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
             .map_err(shadow_query_storage_error)?
         {
             Some(block) => {
-                Fts5StructureRecord::decode(&block).map_err(shadow_query_storage_error)?
+                if dbg {
+                    eprintln!("FTS5_SCANDBG   structure block {} bytes; decoding", block.len());
+                }
+                let s = Fts5StructureRecord::decode(&block).map_err(shadow_query_storage_error)?;
+                if dbg {
+                    let seg: usize = s.levels.iter().map(|l| l.segments.len()).sum();
+                    eprintln!(
+                        "FTS5_SCANDBG   structure decoded: levels={} segments={seg} origin_tracking={}",
+                        s.levels.len(),
+                        s.uses_origin_tracking()
+                    );
+                    for (li, level) in s.levels.iter().enumerate() {
+                        for seg in &level.segments {
+                            eprintln!(
+                                "FTS5_SCANDBG     L{li} segid={} pgno_first={} pgno_last={} tomb_pages={} entry_count={}",
+                                seg.segid, seg.pgno_first, seg.pgno_last, seg.tombstone_page_count, seg.entry_count
+                            );
+                        }
+                    }
+                }
+                s
             }
             None => Fts5StructureRecord::empty_legacy(0),
         };
@@ -8530,8 +8582,14 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         queries: &[&str],
     ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
         let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
+        if std::env::var("FSQLITE_FTS5_SCANDBG").is_ok() {
+            eprintln!("FTS5_SCANDBG matched_rowids start -> prefetch_query_doclists");
+        }
         let t0 = std::time::Instant::now();
         self.prefetch_query_doclists(queries).await?;
+        if std::env::var("FSQLITE_FTS5_SCANDBG").is_ok() {
+            eprintln!("FTS5_SCANDBG matched_rowids: prefetch DONE -> evaluate");
+        }
         let t1 = std::time::Instant::now();
         let (mut matching_docs, _query_terms) = self.evaluate_queries(queries)?;
         matching_docs.sort_unstable();
