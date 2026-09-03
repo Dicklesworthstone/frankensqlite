@@ -8401,10 +8401,27 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         self.prefetch_query_doclists(queries).await?;
+        let t1 = std::time::Instant::now();
         let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
+        let t2 = std::time::Instant::now();
+        let n_docs = matching_docs.len();
         self.prefetch_doc_lengths(&matching_docs).await?;
-        self.rank_matching_docs(matching_docs, &query_terms, weights)
+        let t3 = std::time::Instant::now();
+        let ranked = self.rank_matching_docs(matching_docs, &query_terms, weights);
+        let t4 = std::time::Instant::now();
+        if timing {
+            eprintln!(
+                "FTS5_TIMING search: prefetch_doclists={:?} evaluate={:?} ({n_docs} docs) prefetch_doclengths={:?} rank={:?}",
+                t1 - t0,
+                t2 - t1,
+                t3 - t2,
+                t4 - t3,
+            );
+        }
+        ranked
     }
 
     /// Point-read the `_content` row for a (result) `rowid`, so projection reads
@@ -9262,10 +9279,19 @@ impl Fts5Table {
         )
         .await?;
         let ranked = query.search_queries_with_weights(queries, weights).await?;
+        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
+        let t_content = std::time::Instant::now();
+        let n_ranked = ranked.len();
         let mut out = Vec::with_capacity(ranked.len());
         for (rowid, score) in ranked {
             let columns = query.content_for_rowid(rowid).await?.unwrap_or_default();
             out.push((rowid, score, columns));
+        }
+        if timing {
+            eprintln!(
+                "FTS5_TIMING content_loop: {n_ranked} rows in {:?}",
+                t_content.elapsed()
+            );
         }
         Ok(out)
     }
