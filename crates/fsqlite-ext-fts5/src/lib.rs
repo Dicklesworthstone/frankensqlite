@@ -3185,16 +3185,17 @@ impl Fts5ScoreSnapshot {
         weights: &[f64],
     ) -> std::result::Result<f64, Fts5QueryError> {
         match &self.source {
-            // The in-memory and shadow score sources look their doclists up by
-            // exact token text and cannot aggregate a prefix across matched
-            // terms, so a prefix contributes nothing here (unchanged behavior;
-            // the lazy Precomputed source below scores prefixes correctly).
-            // bd-fts5-prefix-bm25-unranked tracks prefix scoring on the promote
-            // path.
-            Fts5ScoreSource::InMemory(index) => {
-                let terms: Vec<String> = score_terms.iter().map(|t| t.text().to_owned()).collect();
-                Ok(bm25_score(index, rowid, &terms, weights))
-            }
+            // The in-memory index scores prefixes as one unit from their
+            // aggregated matching postings (bd-fts5-prefix-bm25-unranked).
+            Fts5ScoreSource::InMemory(index) => Ok(bm25_score_with_score_terms(
+                index,
+                rowid,
+                score_terms,
+                weights,
+            )),
+            // The shadow score source looks doclists up by exact token text and
+            // cannot aggregate a prefix, so a prefix contributes nothing here;
+            // this reverted path is not on the normal promote route.
             Fts5ScoreSource::Shadow(rows) => {
                 let terms: Vec<String> = score_terms.iter().map(|t| t.text().to_owned()).collect();
                 let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
@@ -7004,6 +7005,75 @@ pub fn bm25_score(
     }
 
     // Return negative score (lower = better, SQLite FTS5 convention).
+    -score
+}
+
+/// BM25 over score terms (exact or prefix) against an in-memory index.
+///
+/// Like [`bm25_score`], but a prefix operand is scored as ONE unit from its
+/// AGGREGATED matching postings (`get_prefix_postings`): its document frequency
+/// is the number of DISTINCT docs matching the prefix and its per-doc term
+/// frequency is the total position count across all prefix-matching terms —
+/// matching stock and the lazy [`Fts5PrecomputedScores`] path. (Plain
+/// [`bm25_score`] scores the literal prefix token, which no document contains,
+/// so a prefix contributes nothing there.)
+#[must_use]
+pub fn bm25_score_with_score_terms(
+    index: &InvertedIndex,
+    docid: i64,
+    score_terms: &[Fts5ScoreTerm],
+    weights: &[f64],
+) -> f64 {
+    let n = index.total_docs() as f64;
+    let avgdl = index.avg_doc_length();
+    let dl = f64::from(index.doc_length(docid));
+
+    let mut score = 0.0;
+    for term in score_terms {
+        let (postings, df_int): (Vec<&Posting>, u64) = match term {
+            Fts5ScoreTerm::Exact(text) => (
+                index.get_postings(text).iter().collect(),
+                index.doc_frequency(text),
+            ),
+            Fts5ScoreTerm::Prefix(text) => {
+                let postings = index.get_prefix_postings(text);
+                let distinct_docs: HashSet<i64> = postings.iter().map(|p| p.docid).collect();
+                (
+                    postings,
+                    u64::try_from(distinct_docs.len()).unwrap_or(u64::MAX),
+                )
+            }
+        };
+        if df_int == 0 {
+            continue;
+        }
+        let df = df_int as f64;
+        let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
+
+        let mut weighted_tf = 0.0;
+        for posting in &postings {
+            if posting.docid != docid {
+                continue;
+            }
+            let tf = posting.positions.len() as f64;
+            let col_weight = usize::try_from(posting.column)
+                .ok()
+                .and_then(|column| weights.get(column).copied())
+                .unwrap_or(1.0);
+            weighted_tf += col_weight * tf;
+        }
+        if weighted_tf == 0.0 {
+            continue;
+        }
+
+        let denom = if avgdl > 0.0 {
+            BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+        } else {
+            weighted_tf + BM25_K1
+        };
+        score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
+    }
+
     -score
 }
 

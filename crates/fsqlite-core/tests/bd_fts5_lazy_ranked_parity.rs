@@ -226,3 +226,69 @@ fn bd_fts5_lazy_ranked_parity_matches_stock() {
         conn.close().await.unwrap();
     });
 }
+
+/// Ranked parity for the IN-MEMORY score source: a table created and queried in
+/// ONE connection (never reopened) scores from the in-memory inverted index, not
+/// the lazy on-disk path. This exercises the promote-path prefix scoring
+/// (`bm25_score_with_score_terms`) that the reopen-driven test above does not.
+#[test]
+fn bd_fts5_inmemory_prefix_ranked_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        // Same corpus into stock (in-memory rusqlite) and fsqlite (in-memory,
+        // never persisted -> in-memory index). Terms chosen so a prefix expands
+        // to several terms AND several hit the same doc (tf must sum).
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock
+            .execute_batch("CREATE VIRTUAL TABLE t USING fts5(x);")
+            .unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x);")
+            .await
+            .unwrap();
+        for id in 1..=90_i64 {
+            let mut parts = vec![format!("uniq{id}")];
+            // 'beta' with varying tf.
+            if id % 2 == 0 {
+                let beta = vec!["beta"; ((id / 2 % 3) + 1) as usize].join(" ");
+                parts.push(beta);
+            }
+            // 'tag{k}' and 'tagx{k}' both start with 'tag' -> `tag*` matches two
+            // terms in the same doc (aggregation must sum their positions).
+            parts.push(format!("tag{k} tagx{k}", k = id % 4));
+            // a single-expansion prefix target.
+            if id % 5 == 0 {
+                parts.push("gamma gamma".to_owned());
+            }
+            let text = parts.join(" ");
+            stock
+                .execute("INSERT INTO t(rowid, x) VALUES (?1, ?2)", rusqlite::params![id, text])
+                .unwrap();
+            conn.execute_with_params(
+                "INSERT INTO t(rowid, x) VALUES (?1, ?2)",
+                &[SqliteValue::Integer(id), SqliteValue::from(text.as_str())],
+            )
+            .await
+            .unwrap();
+        }
+
+        for q in [
+            "beta", "gamma", "tag*", "gam*", "beta OR tag*", "beta AND tag*", "uniq7",
+        ] {
+            let frank = conn
+                .query(&format!(
+                    "SELECT rowid, rank FROM t WHERE t MATCH '{q}' ORDER BY rank, rowid;"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("frank in-memory ranked {q:?} failed: {e}"));
+            let expected = stock_ranked(&stock, "t", q);
+            assert_ranked_eq(
+                &format!("in-memory t MATCH {q:?} ORDER BY rank"),
+                frank_ranked(&frank),
+                &expected,
+                true,
+            );
+        }
+
+        conn.close().await.unwrap();
+    });
+}
