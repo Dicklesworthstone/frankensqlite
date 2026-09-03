@@ -3325,7 +3325,7 @@ async fn lazy_segment_exact_postings<R: Fts5OnDiskReader>(
     let mut pages_scanned = 0_u64;
     while pgno <= segment.pgno_last {
         pages_scanned += 1;
-        if dbg && pages_scanned % 1000 == 0 {
+        if dbg && pages_scanned.is_multiple_of(1000) {
             eprintln!("FTS5_SCANDBG   scanning pgno={pgno} (pages_scanned={pages_scanned})");
         }
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
@@ -3444,7 +3444,7 @@ where
                         continue;
                     }
                     tomb_calls += 1;
-                    if dbg && tomb_calls % 1000 == 0 {
+                    if dbg && tomb_calls.is_multiple_of(1000) {
                         eprintln!("FTS5_SCANDBG   tombstone-checked {tomb_calls} entries");
                     }
                     if rowid_tombstoned_in_segment(reader, segment, entry.rowid).await? {
