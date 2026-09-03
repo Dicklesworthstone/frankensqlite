@@ -8781,6 +8781,151 @@ struct DecodedColumnValues {
     locales: Vec<(usize, SmallText)>,
 }
 
+/// Everything the inverted index held for one document, saved so a savepoint
+/// rollback can put the row back without re-tokenizing it.
+#[derive(Clone)]
+struct DocumentPostings {
+    terms: Vec<(SmallText, PostingList)>,
+    prefix_terms: Vec<(usize, SmallText, PostingList)>,
+    doc_length: Option<u32>,
+    counted: bool,
+}
+
+/// The state of one row before a mutation replaced or deleted it.
+#[derive(Clone)]
+struct PreviousDocument {
+    values: Vec<String>,
+    locales: Vec<(usize, SmallText)>,
+    postings: DocumentPostings,
+}
+
+/// The small, table-level fields a savepoint remembers by value. Everything
+/// that scales with the table (index, documents, shadow rows, locales) is
+/// covered by the undo log instead.
+#[derive(Clone)]
+struct Fts5TableHeader {
+    config: Fts5Config,
+    tokenizer_name: String,
+    prefix_lengths: Vec<usize>,
+    indexed_columns: Vec<bool>,
+    lazy_on_disk: bool,
+    lazy_doc_count: usize,
+    next_rowid: i64,
+}
+
+/// One reversible step recorded inside a transaction. Undo runs newest first.
+enum Fts5UndoOp {
+    /// The row did not exist before: undo removes it.
+    RowInserted { rowid: i64 },
+    /// The row existed before: undo removes the current row and restores it.
+    RowReplaced {
+        rowid: i64,
+        previous: Box<PreviousDocument>,
+    },
+    /// A bulk rewrite (shadow-row materialization, contentless hydration,
+    /// rebuild, bind): undo restores the full snapshot taken just before it.
+    FullSnapshot(Box<Fts5TableSnapshot>),
+}
+
+/// Transaction and savepoint bookkeeping for an fts5 table (frankensqlite#405).
+///
+/// The previous implementation cloned the whole table state on every
+/// `begin` and `savepoint`, and frankensqlite wraps each statement in a
+/// savepoint, so every INSERT into a large table cost O(table): minutes per
+/// statement and a doubled resident set at half a million rows. This log
+/// records an inverse operation per mutated row instead — O(row) for the
+/// inserts that dominate bulk loads — and falls back to a snapshot only on
+/// the rare bulk rewrites. Savepoints are positions in the log plus a header
+/// copy; `rollback_to` undoes the tail of the log back to that position and
+/// keeps the savepoint, `release` drops savepoint markers and keeps the log,
+/// exactly the observable semantics of the snapshot version.
+#[derive(Default)]
+struct Fts5UndoLog {
+    base: Option<Fts5TableHeader>,
+    ops: Vec<Fts5UndoOp>,
+    savepoints: Vec<(i32, usize, Fts5TableHeader)>,
+}
+
+impl Fts5UndoLog {
+    const fn is_active(&self) -> bool {
+        self.base.is_some()
+    }
+
+    fn begin(&mut self, header: Fts5TableHeader) {
+        if self.base.is_none() {
+            self.base = Some(header);
+            self.ops.clear();
+            self.savepoints.clear();
+        }
+    }
+
+    fn commit(&mut self) {
+        self.base = None;
+        self.ops.clear();
+        self.savepoints.clear();
+    }
+
+    fn record(&mut self, op: Fts5UndoOp) {
+        if self.base.is_some() {
+            self.ops.push(op);
+        }
+    }
+
+    fn savepoint(&mut self, level: i32, header: Fts5TableHeader) {
+        if self.base.is_none() {
+            return;
+        }
+        self.savepoints.retain(|(existing, _, _)| *existing < level);
+        self.savepoints.push((level, self.ops.len(), header));
+    }
+
+    fn release(&mut self, level: i32) {
+        if self.base.is_none() {
+            return;
+        }
+        self.savepoints.retain(|(existing, _, _)| *existing < level);
+    }
+
+    /// Everything recorded since `begin`, newest last, plus the header to
+    /// restore; ends the transaction.
+    fn take_rollback(&mut self) -> Option<(Vec<Fts5UndoOp>, Fts5TableHeader)> {
+        let base = self.base.take()?;
+        self.savepoints.clear();
+        Some((std::mem::take(&mut self.ops), base))
+    }
+
+    /// Everything recorded since savepoint `level` (or since `begin` when no
+    /// such savepoint exists), newest last, plus the header to restore; the
+    /// savepoint itself stays open.
+    fn take_rollback_to(&mut self, level: i32) -> Option<(Vec<Fts5UndoOp>, Fts5TableHeader)> {
+        let base = self.base.as_ref()?;
+        let (position, header) = self
+            .savepoints
+            .iter()
+            .rfind(|(existing, _, _)| *existing == level)
+            .map_or_else(
+                || (0, base.clone()),
+                |(_, position, header)| (*position, header.clone()),
+            );
+        let ops = self.ops.split_off(position);
+        self.savepoints.retain(|(existing, _, _)| *existing <= level);
+        Some((ops, header))
+    }
+
+    #[cfg(test)]
+    fn recorded_full_snapshots(&self) -> usize {
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, Fts5UndoOp::FullSnapshot(_)))
+            .count()
+    }
+
+    #[cfg(test)]
+    fn recorded_ops(&self) -> usize {
+        self.ops.len()
+    }
+}
+
 impl Fts5Table {
     /// Create a new FTS5 table with the given column names.
     #[must_use]
@@ -8799,7 +8944,7 @@ impl Fts5Table {
             lazy_doc_count: 0,
             row_locales: HashMap::new(),
             next_rowid: 1,
-            txn_state: TransactionalVtabState::default(),
+            txn_state: Fts5UndoLog::default(),
         }
     }
 
@@ -8833,13 +8978,103 @@ impl Fts5Table {
         self.next_rowid = snapshot.next_rowid;
     }
 
-    fn restore_transaction_snapshot(&mut self, snapshot: Option<Fts5TableSnapshot>) -> bool {
-        if let Some(snapshot) = snapshot {
-            self.restore_state(snapshot);
-            true
-        } else {
-            false
+    fn header_for_undo(&self) -> Fts5TableHeader {
+        Fts5TableHeader {
+            config: self.config,
+            tokenizer_name: self.tokenizer_name.clone(),
+            prefix_lengths: self.prefix_lengths.clone(),
+            indexed_columns: self.indexed_columns.clone(),
+            lazy_on_disk: self.lazy_on_disk,
+            lazy_doc_count: self.lazy_doc_count,
+            next_rowid: self.next_rowid,
         }
+    }
+
+    fn restore_header(&mut self, header: Fts5TableHeader) {
+        self.config = header.config;
+        self.tokenizer_name = header.tokenizer_name;
+        self.prefix_lengths = header.prefix_lengths;
+        self.indexed_columns = header.indexed_columns;
+        self.lazy_on_disk = header.lazy_on_disk;
+        self.lazy_doc_count = header.lazy_doc_count;
+        self.next_rowid = header.next_rowid;
+    }
+
+    /// Record how to undo the mutation of `rowid` that is about to happen.
+    /// Call after any shadow-row materialization (so the row's current state
+    /// is the materialized one) and before the mutation itself.
+    fn record_row_mutation_for_undo(&mut self, rowid: i64) {
+        if !self.txn_state.is_active() {
+            return;
+        }
+        let op = match self.documents.get(&rowid) {
+            None => Fts5UndoOp::RowInserted { rowid },
+            Some(values) => Fts5UndoOp::RowReplaced {
+                rowid,
+                previous: Box::new(PreviousDocument {
+                    values: values.clone(),
+                    locales: self
+                        .row_locales
+                        .iter()
+                        .filter(|((existing_rowid, _), _)| *existing_rowid == rowid)
+                        .map(|((_, column), tag)| (*column, tag.clone()))
+                        .collect(),
+                    postings: self.index.document_postings(rowid),
+                }),
+            },
+        };
+        self.txn_state.record(op);
+    }
+
+    /// Record a full snapshot before a bulk rewrite of the table state.
+    fn record_bulk_mutation_for_undo(&mut self) {
+        if !self.txn_state.is_active() {
+            return;
+        }
+        let snapshot = self.snapshot_state();
+        self.txn_state
+            .record(Fts5UndoOp::FullSnapshot(Box::new(snapshot)));
+    }
+
+    fn remove_row_state(&mut self, rowid: i64) {
+        self.index.remove_document(rowid);
+        self.documents.remove(&rowid);
+        self.row_locales.retain(|(existing_rowid, _column), _| *existing_rowid != rowid);
+    }
+
+    fn apply_undo_op(&mut self, op: Fts5UndoOp) {
+        match op {
+            Fts5UndoOp::RowInserted { rowid } => {
+                self.remove_row_state(rowid);
+            }
+            Fts5UndoOp::RowReplaced { rowid, previous } => {
+                self.remove_row_state(rowid);
+                let PreviousDocument {
+                    values,
+                    locales,
+                    postings,
+                } = *previous;
+                self.index.restore_document_postings(rowid, postings);
+                self.documents.insert(rowid, values);
+                self.row_locales.extend(
+                    locales
+                        .into_iter()
+                        .map(|(column, tag)| ((rowid, column), tag)),
+                );
+            }
+            Fts5UndoOp::FullSnapshot(snapshot) => {
+                self.restore_state(*snapshot);
+            }
+        }
+    }
+
+    fn undo(&mut self, ops: Vec<Fts5UndoOp>, header: Fts5TableHeader) {
+        for op in ops.into_iter().rev() {
+            self.apply_undo_op(op);
+        }
+        // Row-level undo leaves no shadow-row cache to restore (mutations
+        // materialize it first); a bulk snapshot restores its own.
+        self.restore_header(header);
     }
 
     fn index_document_with_tokenizer(
@@ -8865,6 +9100,7 @@ impl Fts5Table {
         tokenizer: &dyn Fts5Tokenizer,
     ) {
         self.materialize_shadow_rows_for_mutation();
+        self.record_row_mutation_for_undo(rowid);
         if self.documents.contains_key(&rowid) {
             self.index.remove_document(rowid);
         }
@@ -8967,6 +9203,9 @@ impl Fts5Table {
     }
 
     fn materialize_shadow_rows_for_mutation(&mut self) {
+        if self.shadow_rows.is_some() {
+            self.record_bulk_mutation_for_undo();
+        }
         let Some(rows) = self.shadow_rows.take() else {
             return;
         };
@@ -8977,7 +9216,7 @@ impl Fts5Table {
             .into_iter()
             .map(|row| (row.rowid, row.values))
             .collect();
-        self.rebuild_documents(documents);
+        self.rebuild_documents_without_undo(documents);
         self.apply_docsize_rows(&docsize);
     }
 
@@ -8994,6 +9233,9 @@ impl Fts5Table {
     fn hydrate_contentless_index_from_segments(&mut self) -> Result<()> {
         if self.config.content_mode != ContentMode::Contentless {
             return Ok(());
+        }
+        if self.shadow_rows.is_some() {
+            self.record_bulk_mutation_for_undo();
         }
         let Some(rows) = self.shadow_rows.as_ref() else {
             return Ok(());
@@ -9149,6 +9391,7 @@ impl Fts5Table {
     /// Delete a document from the FTS5 table.
     pub fn delete_document(&mut self, rowid: i64) {
         self.materialize_shadow_rows_for_mutation();
+        self.record_row_mutation_for_undo(rowid);
         self.index.remove_document(rowid);
         self.documents.remove(&rowid);
         self.shadow_rows = None;
@@ -9160,6 +9403,11 @@ impl Fts5Table {
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
+        self.record_bulk_mutation_for_undo();
+        self.rebuild_documents_without_undo(rows);
+    }
+
+    fn rebuild_documents_without_undo(&mut self, rows: Vec<(i64, Vec<String>)>) {
         self.index = InvertedIndex::with_options_and_tokendata(
             self.config.columnsize_enabled(),
             &self.prefix_lengths,
