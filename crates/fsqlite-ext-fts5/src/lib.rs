@@ -3067,26 +3067,49 @@ pub struct Fts5ShadowOpen {
 /// O(query_terms) per row for ANY weights (the `rank` directive's or an explicit
 /// `bm25(...)` call's). Building it walks each term's doclist ONCE and buckets by
 /// rowid, so it is O(total hits), not the O(hits^2) of a per-row doclist rescan.
+/// A single BM25 scoring unit from a MATCH query: an exact term or a prefix
+/// operand (`x*`). Prefixes are scored as ONE unit — stock FTS5's document
+/// frequency is the number of docs matching the prefix and the per-doc term
+/// frequency is the total count of prefix-matching token positions — so the
+/// prefix's aggregated doclist, not the literal prefix string, drives scoring.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Fts5ScoreTerm {
+    Exact(String),
+    Prefix(String),
+}
+
+impl Fts5ScoreTerm {
+    /// The underlying token text (without the trailing `*` for a prefix).
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Exact(text) | Self::Prefix(text) => text,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Fts5PrecomputedScores {
     total_docs: u64,
     avgdl: f64,
-    term_df: HashMap<String, u64>,
+    term_df: HashMap<Fts5ScoreTerm, u64>,
     doc_len: HashMap<i64, u32>,
-    term_rowid_cols: HashMap<(String, i64), Vec<(u32, u32)>>,
+    term_rowid_cols: HashMap<(Fts5ScoreTerm, i64), Vec<(u32, u32)>>,
 }
 
 impl Fts5PrecomputedScores {
-    /// BM25 for `rowid` over `query_terms` with per-column `weights`. This is the
+    /// BM25 for `rowid` over `score_terms` with per-column `weights`. This is the
     /// exact BM25 of [`bm25_score`] / the lazy provider's `bm25_score`, reading
     /// from the precomputed maps instead of an in-memory index, so scores are
-    /// bit-identical to the promote path for the same corpus.
-    fn bm25(&self, rowid: i64, query_terms: &[String], weights: &[f64]) -> f64 {
+    /// bit-identical to the promote path for the same corpus. Exact and prefix
+    /// terms are keyed distinctly, so a prefix `al*` scores from its aggregated
+    /// prefix doclist rather than the (empty) literal `al` doclist.
+    fn bm25(&self, rowid: i64, score_terms: &[Fts5ScoreTerm], weights: &[f64]) -> f64 {
         let n = self.total_docs as f64;
         let avgdl = self.avgdl;
         let dl = f64::from(self.doc_len.get(&rowid).copied().unwrap_or(0));
         let mut score = 0.0;
-        for term in query_terms {
+        for term in score_terms {
             let df_int = self.term_df.get(term).copied().unwrap_or(0);
             if df_int == 0 {
                 continue;
