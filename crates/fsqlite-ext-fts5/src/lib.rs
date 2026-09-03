@@ -3168,20 +3168,44 @@ impl Fts5ScoreSnapshot {
         query_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
     }
 
+    /// The scoring units for `queries`, preserving exact-vs-prefix kind so BM25
+    /// scores a prefix operand correctly (from its aggregated prefix doclist).
+    pub fn score_terms_for_queries(
+        &self,
+        queries: &[&str],
+    ) -> std::result::Result<Vec<Fts5ScoreTerm>, Fts5QueryError> {
+        let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
+        score_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
+    }
+
     pub fn bm25_score_for_terms_with_weights(
         &self,
         rowid: i64,
-        query_terms: &[String],
+        score_terms: &[Fts5ScoreTerm],
         weights: &[f64],
     ) -> std::result::Result<f64, Fts5QueryError> {
         match &self.source {
-            Fts5ScoreSource::InMemory(index) => Ok(bm25_score(index, rowid, query_terms, weights)),
+            // The in-memory and shadow score sources look their doclists up by
+            // exact token text and cannot aggregate a prefix across matched
+            // terms, so a prefix contributes nothing here (unchanged behavior;
+            // the lazy Precomputed source below scores prefixes correctly).
+            // bd-fts5-prefix-bm25-unranked tracks prefix scoring on the promote
+            // path.
+            Fts5ScoreSource::InMemory(index) => {
+                let terms: Vec<String> =
+                    score_terms.iter().map(|t| t.text().to_owned()).collect();
+                Ok(bm25_score(index, rowid, &terms, weights))
+            }
             Fts5ScoreSource::Shadow(rows) => {
+                let terms: Vec<String> =
+                    score_terms.iter().map(|t| t.text().to_owned()).collect();
                 let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
-                    .bm25_score(rowid, query_terms, weights)
+                    .bm25_score(rowid, &terms, weights)
             }
-            Fts5ScoreSource::Precomputed(scores) => Ok(scores.bm25(rowid, query_terms, weights)),
+            Fts5ScoreSource::Precomputed(scores) => {
+                Ok(scores.bm25(rowid, score_terms, weights))
+            }
         }
     }
 
@@ -7171,6 +7195,25 @@ fn query_terms_for_query_strings(
     Ok(query_terms)
 }
 
+/// Like [`query_terms_for_query_strings`] but preserves each scoring unit's kind
+/// (exact vs prefix) for BM25.
+fn score_terms_for_query_strings(
+    columns: &[String],
+    queries: &[&str],
+    tokenizer: &dyn Fts5Tokenizer,
+    detail: DetailMode,
+) -> std::result::Result<Vec<Fts5ScoreTerm>, Fts5QueryError> {
+    let mut score_terms = Vec::new();
+    for query in queries {
+        let tokens = parse_fts5_query(query)?;
+        let expr = normalize_query_expr_with_tokenizer(build_expr(&tokens)?, tokenizer);
+        validate_detail_mode(&expr, detail)?;
+        validate_column_filters(&expr, columns)?;
+        score_terms.extend(extract_score_terms(&expr));
+    }
+    Ok(score_terms)
+}
+
 fn search_rows_with_weights_from_parts(
     index: &InvertedIndex,
     columns: &[String],
@@ -8746,24 +8789,42 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
     pub async fn precompute_scores(
         &mut self,
         queries: &[&str],
+        score_terms: &[Fts5ScoreTerm],
     ) -> std::result::Result<Fts5PrecomputedScores, Fts5QueryError> {
         self.prefetch_query_doclists(queries).await?;
-        let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
+        let (matching_docs, _query_terms) = self.evaluate_queries(queries)?;
         self.prefetch_doc_lengths(&matching_docs).await?;
 
         let matched: HashSet<i64> = matching_docs.iter().copied().collect();
         let total_docs = self.total_docs()?;
         let avgdl = self.avg_doc_length()?;
 
-        let mut term_df: HashMap<String, u64> = HashMap::new();
-        let mut term_rowid_cols: HashMap<(String, i64), Vec<(u32, u32)>> = HashMap::new();
-        for term in &query_terms {
+        let mut term_df: HashMap<Fts5ScoreTerm, u64> = HashMap::new();
+        let mut term_rowid_cols: HashMap<(Fts5ScoreTerm, i64), Vec<(u32, u32)>> = HashMap::new();
+        for term in score_terms {
             if term_df.contains_key(term) {
                 continue;
             }
-            term_df.insert(term.clone(), self.doc_frequency(term)?);
-            // ONE pass over the term's live doclist; bucket per matched rowid.
-            for entry in self.exact_entries(term)? {
+            // An exact term scores from its own doclist (df from the index); a
+            // prefix scores from its AGGREGATED prefix doclist — one entry per
+            // doc matching the prefix, whose merged poslist is the total prefix
+            // term-frequency in that doc — with df = the count of those docs.
+            let entries = match term {
+                Fts5ScoreTerm::Exact(text) => self.exact_entries(text)?,
+                Fts5ScoreTerm::Prefix(text) => self.prefix_entries(text)?,
+            };
+            let df = match term {
+                Fts5ScoreTerm::Exact(text) => self.doc_frequency(text)?,
+                Fts5ScoreTerm::Prefix(_) => entries
+                    .iter()
+                    .filter(|entry| {
+                        !entry.poslist.delete && rowid_u64_to_i64(entry.rowid).is_some()
+                    })
+                    .count() as u64,
+            };
+            term_df.insert(term.clone(), df);
+            // ONE pass over the (exact or prefix) doclist; bucket per matched rowid.
+            for entry in &entries {
                 if entry.poslist.delete {
                     continue;
                 }
@@ -10518,6 +10579,48 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
         Fts5Expr::Near(operands, _) => operands.iter().flat_map(near_operand_terms).collect(),
         Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
             extract_query_terms(inner)
+        }
+    }
+}
+
+/// Like [`extract_query_terms`] but preserves each scoring unit's kind (exact vs
+/// prefix), so BM25 scores a prefix operand from its aggregated prefix doclist
+/// instead of the (empty) literal-prefix exact doclist. A `PhrasePrefix`'s
+/// trailing prefix is a prefix unit; a `Near` prefix operand is treated as exact
+/// (its span logic already governs matching, and stock scores NEAR as a phrase).
+fn extract_score_terms(expr: &Fts5Expr) -> Vec<Fts5ScoreTerm> {
+    fn near_operand_score_terms(operand: &Fts5NearOperand) -> Vec<Fts5ScoreTerm> {
+        match operand {
+            Fts5NearOperand::Term(term) | Fts5NearOperand::Prefix(term) => {
+                vec![Fts5ScoreTerm::Exact(term.clone())]
+            }
+            Fts5NearOperand::Phrase(terms) => {
+                terms.iter().cloned().map(Fts5ScoreTerm::Exact).collect()
+            }
+        }
+    }
+
+    match expr {
+        Fts5Expr::Term(t) => vec![Fts5ScoreTerm::Exact(t.clone())],
+        Fts5Expr::Prefix(p) => vec![Fts5ScoreTerm::Prefix(p.clone())],
+        Fts5Expr::Phrase(words) => words.iter().cloned().map(Fts5ScoreTerm::Exact).collect(),
+        Fts5Expr::PhrasePrefix(words, prefix) => {
+            let mut terms: Vec<Fts5ScoreTerm> =
+                words.iter().cloned().map(Fts5ScoreTerm::Exact).collect();
+            terms.push(Fts5ScoreTerm::Prefix(prefix.clone()));
+            terms
+        }
+        Fts5Expr::And(l, r) | Fts5Expr::Or(l, r) => {
+            let mut terms = extract_score_terms(l);
+            terms.extend(extract_score_terms(r));
+            terms
+        }
+        Fts5Expr::Not(left, _) => extract_score_terms(left),
+        Fts5Expr::Near(operands, _) => {
+            operands.iter().flat_map(near_operand_score_terms).collect()
+        }
+        Fts5Expr::ColumnFilter(_, inner) | Fts5Expr::InitialToken(inner) => {
+            extract_score_terms(inner)
         }
     }
 }
