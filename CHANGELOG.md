@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) (2026-09-01). v0.3.2–v0.3.4 and v0.3.6–v0.3.14 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) (2026-09-03). v0.3.2–v0.3.4 and v0.3.6–v0.3.16 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...main) | HEAD | 2026-09-02 | Development after v0.3.15 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main) | HEAD | 2026-09-03 | Development after v0.3.16 |
+| [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
 | [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) | Release | 2026-09-01 | FTS5 stock-compat writer fix (GH#404) + GH#402 checkpoint watermark (super-linear autocommit fix) + `PRAGMA wal_checkpoint` cumulative-nBackfill parity + legacy-automerge origin-poisoning fix |
 | [v0.3.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.13) | Release | 2026-08-29 | GH#399 reader-slot release-failure follow-up (b1c4609d9) |
@@ -41,11 +42,97 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.15
+## [Unreleased] -- development on `main` since v0.3.16
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main>
 
-Post-v0.3.15 development continues on `main` (see the compare link).
+Post-v0.3.16 development continues on `main` (see the compare link).
+
+---
+
+## [0.3.16] -- 2026-09-03 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.15...v0.3.16>
+
+The headline is the FTS5 **lazy read path made usable at scale**: a downstream
+consumer (cass) with a large contentless FTS5 index saw `MATCH` queries hang or
+promote the whole corpus into memory on every short-lived process. This release
+turns plain `MATCH`, `ORDER BY rank`/`bm25()`, and prefix ranking into
+bounded, point-read operations that match stock SQLite's results without
+hydrating the corpus. Alongside it: the bd-9inpb page-allocator double-grant is
+closed, GH#405 makes FTS5 savepoints row-proportional, GH#382 removes a
+per-page WAL rescan, GH#406 makes content-backed INSERT an incremental append,
+and the dependency lockfile is refreshed.
+
+### FTS5 lazy MATCH is fast at scale — the cass runaway (Fix A / Fix B / Fix C)
+
+Measured against sqlite3 3.46.1 on a 400K-doc corpus, fresh process per query
+(the cass reality: one query per short-lived CLI). Three defects compounded:
+
+- **Fix A — plain MATCH scored BM25 it then discarded** (`a6712344a`). The lazy
+  `MATCH` scan computed a full BM25 ranking (used for nothing, since ordering is
+  a separate concern) and BM25 was O(hits²) — each doc rescanned the term's
+  whole doclist. Added `Fts5LazyQuery::matched_rowids` /
+  `Fts5Table::matched_rows_lazy` that resolve matching rowids without scoring.
+  Content `MATCH 'cargo'` (10 000 hits): **17 s → 0.4 s**.
+- **Fix B — contentless tables were not lazy on the ordinary open path**
+  (`1e4db3c69`). `allow_lazy_contentless_fts5` was enabled only for schema-only
+  opens, so a `content=''` table opened normally (cass's exact schema) was never
+  bound lazily and fell into the in-memory scan **unhydrated**, hanging on any
+  hit-bearing `MATCH`. Enabling it on `open_with_env_and_pager` routes contentless
+  MATCH through the point-read path. Contentless `MATCH`: **hang (>300 s) → 0.10 s**.
+- **Fix C — ranked MATCH promoted the whole corpus** (`07402981d`). `ORDER BY
+  rank` / `bm25()` rebuilt the entire corpus into an in-memory index (2.5–3 GB
+  RSS, 10–33 s). New `Fts5PrecomputedScores` extracts only the matched rows'
+  BM25 inputs (corpus size, average doc length, per-term document frequency,
+  per-row doc length, per-(term,row) column frequencies) via the on-disk reader
+  at aux-context build time, walking each term's doclist once (O(hits), not
+  O(hits²)). Ranked `MATCH 'cargo'`: **24.8 s / 2.5 GB → 0.30 s / 179 MB**
+  (content), **33.3 s / 2.95 GB → 0.10 s / 53 MB** (contentless), BM25 values
+  bit-identical to stock on both schemas. `snippet()`/`highlight()` need no
+  score source (they read the projected row text), so the precomputed source
+  serves every auxiliary consumer.
+
+Prefix ranking (`MATCH 'x*' ORDER BY rank`) is now scored correctly too: a
+prefix is one BM25 unit — document frequency is the number of distinct docs
+matching the prefix and per-doc term frequency is the total position count
+across all expanded terms — on both the lazy (`Fts5PrecomputedScores`,
+`42695407b`) and in-memory (`bm25_score_with_score_terms`, `89564725c`) score
+paths, via the new `Fts5ScoreTerm` classification (`ea11d3f16`). Guarded by the
+`bd_fts5_lazy_ranked_parity` differential keeper (rowid order + BM25 value to
+1e-6, lazy and in-memory, content and contentless, with multi-term prefixes).
+
+Residuals tracked, not shipped as blockers: prefix scoring and a small
+contentless BM25-value difference remain on the reverted *Shadow* score source,
+reached only when a contentless table is promoted via the rare
+delete-of-a-pre-origin-tracking-row edge (`bd-fts5-prefix-bm25-unranked`,
+`bd-fts5-contentless-promote-bm25-value`). All user-facing paths (lazy reopen,
+in-memory create+query) are correct.
+
+**Delivered capability:** contentless FTS5 search — plain, ranked, and prefix —
+answers in ~0.1 s on a large index without a per-connection corpus rebuild.
+**Representative commits:**
+[a6712344a](https://github.com/Dicklesworthstone/frankensqlite/commit/a6712344a),
+[1e4db3c69](https://github.com/Dicklesworthstone/frankensqlite/commit/1e4db3c69),
+[07402981d](https://github.com/Dicklesworthstone/frankensqlite/commit/07402981d),
+[42695407b](https://github.com/Dicklesworthstone/frankensqlite/commit/42695407b),
+[89564725c](https://github.com/Dicklesworthstone/frankensqlite/commit/89564725c).
+
+### Page allocator: EOF-growth double-grant closed under the reserved append lock (bd-9inpb)
+
+Two connections growing a database concurrently could each allocate the same
+fresh EOF page and both commit it, aliasing one physical page into two b-trees
+("2nd reference to page N", lost rows). The `bd-vnxjd` monotonicity gate only
+compared the new size against the peer-advanced floor, missing the equal-size
+case. `commit_flush` now, under the RESERVED append lock, re-derives the
+pre-floor snapshot size and refuses any batch whose freshly allocated pages fall
+in `(snapshot_db_size, durable_floor]` — first-committer-wins with a retryable
+`BusySnapshot` (`6f61702f9`). Verified with a firing repro
+(`am152_allocator_race_wal`, 8-way, stock-oracle-classified): 3 conclusive
+double-grants / 76 runs before, 0 / 80 after; perf-neutral at 1/2/4/8 writers.
+A separate 16-writer BEGIN-starvation regression the repro surfaced is filed at
+`bd-gh382-16writer-begin-starvation`. **Representative commit:**
+[6f61702f9](https://github.com/Dicklesworthstone/frankensqlite/commit/6f61702f9).
 
 ### FTS5: savepoints no longer clone the whole table (GH#405)
 
@@ -78,6 +165,23 @@ stable tail is indexed once and a changed tail costs one fresh pass; the answer
 is unchanged (newest frame wins). Receipt on that archive's copy: `PRAGMA
 wal_checkpoint(PASSIVE)` returned `0 | 48607 | 48607` in 53 s (commit
 `8d012706a`; downstream bead `coding_agent_session_search-g3zyo`).
+
+### FTS5: content-backed INSERT is an incremental segment append (GH#406)
+
+A content-backed FTS5 INSERT now persists as an incremental on-disk segment
+append rather than a full re-index, keeping bulk load proportional to the rows
+inserted (`2f046606b`, with quarter-timing instrumentation in the scaling
+keeper, `43cf32948`).
+
+### Dependencies: lockfile refreshed to latest semver-compatible versions
+
+`Cargo.lock` was refreshed (lockfile-only; no manifest constraints changed):
+`asupersync` 0.4.8 → 0.4.10 (the async runtime), `franken-*` 0.4.9, `blake3`
+1.8.7, `aes-gcm` 0.11.1, `smallvec` 1.16.0, `flate2` 1.1.10, `icu_*` 2.3.x, and
+~30 more. `tinyvec` is held at 1.12.0 (1.13.0 fails to compile here). Validated
+against the concurrency canon (`mvcc_concurrent_writers`, the concurrent-writer
+e2e) plus `check`/`clippy --workspace --all-targets -D warnings` and the FTS5
+suite before landing. See `UPGRADE_LOG.md` (`8935d7ecf`).
 
 ---
 
