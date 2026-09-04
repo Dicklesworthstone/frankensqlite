@@ -146,7 +146,7 @@ retained as useful evidence and is not counted as a completed product feature.
 | V10 | Structured async work and bounded cancellation | Async public path real; sync/truncate still blocking and coordinator task only awaits shutdown | `bd-2jpu6`, `bd-28z4i.1`, `bd-1b7j0.1`, `bd-33igf` |
 | V11 | Effective planner and bounded storage execution | Single-table planner genuinely wired; skip-scan and interpreter/fallback retirement incomplete | `bd-nax2y`, `bd-1dp9.6.7.3/.5/.6` |
 | V12 | Complete useful extensions | JSON/FTS5/Rtree real; FTS3, Geopoly vtab, automatic Session integration incomplete | `bd-26rjq`, `bd-9u4zp`; keep feature denominator intact |
-| V13 | FTS5 works on large consumer corpora with bounded memory | Lazy MATCH and shadow persistence real; scoring/full scans/writes can hydrate entire corpus | `bd-fts5-lazy-shadow-reads-itcc4.5/.6`, `bd-2nzo8.5.3` |
+| V13 | FTS5 works on large consumer corpora with bounded memory | Lazy MATCH, precomputed ranked scores and shadow persistence are real; full scans/mutations retain promotion paths; complete large-corpus acceptance remains open | `bd-fts5-lazy-shadow-reads-itcc4.5/.6`, `bd-2nzo8.5.3` |
 | V14 | PRAGMA resource controls change real engine behavior | cache_size/mmap_size/temp_store/threads stored but inert | `bd-dwjnq`; split concrete resources and prove effects |
 | V15 | Native ECS database through public SQL | INTEGRATION GAP; capsule/record/codec machinery exists, public pager remains compatibility path | `bd-3mgq5` needs granular runtime children |
 | V16 | Native crash-durable two-fsync commit and recoverable indexes | `native_commit` toggles booleans, accumulates markers; no actual fsync and SSI revalidation skipped | Reuse closed `bd-15jh` primitives; new durable integration and crash keepers |
@@ -186,9 +186,10 @@ replace the backlog or reopen every historical component.
 
 ### Bridge plan: deliver user-visible capabilities with separate proof
 
-**First restore a trustworthy execution baseline.** Resolve manifest/lock
-closure through the approved Cargo route, retain the current toolchain, and
-run the exact source core SQL oracle plus required workspace check/clippy/fmt.
+**First complete a trustworthy execution baseline.** The peer lock repair and
+71-test SQL run resolve the initial dependency blockage. Retain that locked
+source baseline and complete required workspace check/clippy/fmt and the
+remaining reproducibility checks through the approved Cargo route.
 Keep the failing GH407 SQL in its existing owner. Bind canonical concurrency
 selectors to actual file-backed overlap and reject falsely labeled sequential
 receipts. Correct authority contradictions and execute consumer examples.
@@ -309,7 +310,9 @@ user operation failed. Add these concrete adversarial acceptance boundaries:
   has a defined outcome. Current `pending.clear()` can abandon promises.
 - FTS5: cold-open a large index, run MATCH with BM25/snippet, make a small write,
   roll it back, and reopen. Record hydrated rows and peak RSS throughout, not
-  just lazy-open or small MATCH success. Preserve old real-corpus owners.
+  just lazy-open or small MATCH success. Preserve the already-wired lazy
+  precomputed score path and existing real-corpus owners; mutation/full-scan
+  promotion and full-sequence acceptance remain distinct from ranked reads.
 - Encryption: split compatibility and native implementation prerequisites so
   a usable compatibility encryption path is not blocked on the whole native
   architecture. Missing-key reopen, authenticated metadata, nonce uniqueness,
@@ -431,6 +434,25 @@ kept ciphertext randomization separate from canonical page comparison.
 This pass also refreshed the changing source evidence: the peer lock repair
 enabled the 71/0 RCH SQL result, and the observed missing-close warnings became
 an explicit existing-owner task rather than an unqualified lifecycle pass.
+
+**Refinement 4 — make pressure behavior achievable and credit landed FTS work.**
+The retention reaper (`bd-vhytr`) must preserve pins and promised history even
+when unrelated allocations or fully pinned history make the free-space target
+unreachable. Its acceptance now requires bounded reclamation and explicit
+pressure/admission outcomes, with deterministic quota injection and separate
+eligible/pinned/reclaimed byte evidence. It no longer requires filling the
+host filesystem or achieving an impossible unconditional free-space result.
+
+FTS lazy `.5` now independently runs the captured real corpus through public
+Connection; downstream `.6` adds actual cass integration without a closure
+loop. A source freshness check corrected the initial scoring diagnosis:
+`build_fts5_aux_context_for_source` already uses `lazy_auxiliary_score_snapshot`
+and `Fts5PrecomputedScores`, while snippet/highlight use projected text and
+query terms. This is real implemented work. Conditional full scans/mutations
+and maintenance still retain promotion paths. Matched-row/posting maps and
+materialized result vectors also require measured bounds on huge hit sets,
+including small LIMIT queries. The revised matrix and existing memory/test
+owners preserve that distinction; no fresh FTS performance claim is made.
 
 ### Historical assessment below
 
