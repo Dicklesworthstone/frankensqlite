@@ -3440,6 +3440,39 @@ impl PagerBackend {
         }
     }
 
+    /// GH#410: entries the durable freelist names that the pager refused to
+    /// load (reserved lock-byte page, out-of-range, duplicate, short chain).
+    #[must_use]
+    pub fn pending_freelist_repair(&self) -> u32 {
+        match self {
+            Self::Memory(p) => p.pending_freelist_repair(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.pending_freelist_repair(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.pending_freelist_repair(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.pending_freelist_repair(),
+        }
+    }
+
+    /// GH#410: republish the durable freelist without the entries that can
+    /// never legally be free. Returns how many were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the begin/commit failure; the durable image is unchanged.
+    pub async fn repair_durable_freelist(&self, cx: &Cx) -> Result<u32> {
+        match self {
+            Self::Memory(p) => p.repair_durable_freelist(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.repair_durable_freelist(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.repair_durable_freelist(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.repair_durable_freelist(cx).await,
+        }
+    }
+
     fn validate_namespace_binding(&self) -> Result<()> {
         match self {
             Self::Memory(p) => p.validate_namespace_binding(),
@@ -5533,6 +5566,7 @@ fn pragma_dispatches_without_schema(name: &str) -> bool {
         "function_list",
         "data_version",
         "encoding",
+        "repair_freelist",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
@@ -73040,6 +73074,25 @@ impl Connection {
                     self.backend_mode_label().to_owned().into(),
                 )],
             }]),
+            // GH#410: durable freelist repair. Reports (and, when the database
+            // is writable, republishes) the freelist entries the pager refused
+            // to load: the reserved lock-byte page, pages beyond the file,
+            // duplicates, or a trunk chain shorter than the page-1 count. An
+            // archive written by an older build that recorded the lock-byte
+            // page on a freelist leaf is repaired in place by this pragma; the
+            // returned value is how many entries were dropped.
+            "fsqlite.repair_freelist" | "repair_freelist" => {
+                if self.active_txn.borrow().is_some() {
+                    return Err(FrankenError::FunctionError(
+                        "PRAGMA fsqlite.repair_freelist cannot run inside a transaction".to_owned(),
+                    ));
+                }
+                let cx = self.op_cx()?;
+                let dropped = self.pager.repair_durable_freelist(&cx).await?;
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(dropped))],
+                }])
+            }
             "fsqlite.concurrent_mode" | "concurrent_mode" => {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;

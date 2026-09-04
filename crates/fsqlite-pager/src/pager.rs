@@ -7198,6 +7198,20 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// The append-gate double-consumption guard (bd-gh302/bd-0shxy) must
     /// only refuse durable-origin pops.
     durable_freelist_view: HashSet<u32>,
+    /// GH#410: the durable page-1 freelist metadata names more entries than
+    /// this pager could legally load — e.g. an archive whose trunk chain
+    /// records the reserved lock-byte page, a page beyond the file, or a
+    /// duplicate. `normalize_freelist` already dropped them from the live
+    /// list, but the DURABLE chain still names them and stock SQLite's
+    /// `quick_check` (and our own `integrity_check`) keeps reporting them.
+    /// While set, freelist metadata counts as dirty so the next commit
+    /// republishes a clean trunk chain and header count; the flag is cleared
+    /// by that publication and re-derived by the next committed-state refresh
+    /// if it did not land.
+    freelist_repair_pending: bool,
+    /// How many durable freelist entries the last durable load had to drop.
+    /// Reported by `PRAGMA fsqlite.repair_freelist`.
+    freelist_repair_dropped: u32,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
     /// Post-commit rollback-journal cleanup strategy (bd-sw2k5). Selects the
@@ -7772,7 +7786,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttempt<F> {
                 let upper_bound = inner.next_page.saturating_sub(1).max(projected_db_size);
                 let mut freelist = inner.freelist.clone();
                 self.allocator_delta.apply_to_freelist(&mut freelist);
-                normalize_freelist(&freelist, upper_bound)
+                normalize_freelist(&freelist, upper_bound, inner.page_size)
                     .into_iter()
                     .filter(|page| page.get() <= projected_db_size)
                     .collect()
@@ -9093,13 +9107,24 @@ impl<F: VfsFile> PagerInner<F> {
                 )
                 .await?
             };
-            Ok((db_size, freelist))
+            // GH#410: entries the durable chain names but that can never be
+            // legally free (the reserved lock-byte page, out-of-range pages,
+            // duplicates, a chain shorter than the header count) are dropped
+            // by `normalize_freelist`. Remember that the DURABLE image still
+            // names them so the next commit republishes a clean chain.
+            let dropped = u32::try_from(freelist.len())
+                .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
+            Ok((db_size, freelist, dropped))
         })
         .await;
-        let (db_size, freelist) = match full_refresh_result {
+        let (db_size, freelist, freelist_entries_dropped) = match full_refresh_result {
             Ok(refreshed) => refreshed,
             Err(err) => return Err(err),
         };
+        if freelist_entries_dropped > 0 && !self.access_mode.is_readonly() {
+            self.freelist_repair_pending = true;
+            self.freelist_repair_dropped = freelist_entries_dropped;
+        }
 
         // Cross-process monotonicity (#70): never shrink self.db_size from a
         // stale page-1 header we just happened to read from WAL. Another
@@ -9201,13 +9226,45 @@ impl<F: VfsFile> PagerInner<F> {
     }
 }
 
-fn normalize_freelist(pages: &[PageNumber], db_size: u32) -> Vec<PageNumber> {
+/// Normalize a freelist: drop entries that can never legally be free, and
+/// return the rest in descending page order without duplicates.
+///
+/// GH#410: the reserved lock-byte page (the page holding byte offset
+/// `0x4000_0000`) is neither allocatable nor freeable. It is filtered here so
+/// that the ONE routine every freelist crosses — durable load, in-memory
+/// merge, and page-1 serialization — cannot let it in. Filtering on load is
+/// also the repair half: an archive written by an older build whose durable
+/// trunk chain already names the lock-byte page drops it on the next open and
+/// re-serializes a clean chain on the next commit.
+/// Pop the next allocatable page off the in-memory freelist.
+///
+/// GH#410: the reserved lock-byte page must never be handed out. It cannot
+/// reach the freelist through any live path any more (`normalize_freelist`
+/// filters every durable load and every serialization, and `free_page`
+/// refuses it), but a corrupt in-memory list must still never produce it, so
+/// this discards it instead of allocating it.
+fn pop_allocatable_freelist_page<F: VfsFile>(inner: &mut PagerInner<F>) -> Option<PageNumber> {
+    let reserved = crate::journal::lock_byte_page(inner.page_size);
+    while let Some(page) = inner.freelist.pop() {
+        if page.get() != reserved {
+            return Some(page);
+        }
+        tracing::warn!(
+            page = page.get(),
+            "discarding the reserved lock-byte page found on the freelist"
+        );
+    }
+    None
+}
+
+fn normalize_freelist(pages: &[PageNumber], db_size: u32, page_size: PageSize) -> Vec<PageNumber> {
+    let reserved = crate::journal::lock_byte_page(page_size);
     let mut normalized: Vec<PageNumber> = pages
         .iter()
         .copied()
         .filter(|p| {
             let raw = p.get();
-            raw > 1 && raw <= db_size
+            raw > 1 && raw <= db_size && raw != reserved
         })
         .collect();
     if normalized
@@ -9645,7 +9702,7 @@ async fn load_freelist_from_disk<F: VfsFile>(
     }
 
     out.truncate(freelist_count as usize);
-    Ok(normalize_freelist(&out, db_size))
+    Ok(normalize_freelist(&out, db_size, page_size))
 }
 
 async fn load_freelist_from_committed_state<F: VfsFile>(
@@ -9739,7 +9796,7 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     }
 
     out.truncate(freelist_count as usize);
-    Ok(normalize_freelist(&out, db_size))
+    Ok(normalize_freelist(&out, db_size, inner.page_size))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9757,8 +9814,16 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
 ) -> Result<Vec<PageNumber>> {
     if committed_db_size == 0 {
         inner.freelist.clear();
+        inner.freelist_repair_pending = false;
+        inner.freelist_repair_dropped = 0;
         return Ok(Vec::new());
     }
+    // GH#410: this publication rewrites the whole trunk chain and page-1 count
+    // from the sanitized list, which IS the repair. A failed commit leaves the
+    // durable header unchanged, and the next committed-state refresh re-derives
+    // the flag from it.
+    inner.freelist_repair_pending = false;
+    inner.freelist_repair_dropped = 0;
 
     // Use next_page as the normalization bound so we keep valid in-memory EOF
     // pages returned by aborted concurrent transactions. Those pages were
@@ -9774,7 +9839,7 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     // See beads_rust#138.
     let mut predicted_freelist = inner.freelist.clone();
     return_pages_to_freelist(&mut predicted_freelist, pending_free_pages.iter().copied());
-    let predicted_normalized = normalize_freelist(&predicted_freelist, upper_bound);
+    let predicted_normalized = normalize_freelist(&predicted_freelist, upper_bound, inner.page_size);
     // NOTE: Do NOT normalize inner.freelist here — this runs during Phase A
     // where inner.lock() may be released before Phase B. Mutating the shared
     // freelist would leak a side-effect visible to concurrent transactions
@@ -17247,6 +17312,8 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
         let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
         let freelist_count = freelist.len();
+        let open_freelist_entries_dropped = u32::try_from(freelist_count)
+            .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -17279,6 +17346,12 @@ where
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                // GH#410: the durable chain named entries this load could not
+                // legally keep (reserved lock-byte page, out of range,
+                // duplicate, or a short chain). Arm the republication so the
+                // next commit rewrites a clean trunk chain and header count.
+                freelist_repair_pending: open_freelist_entries_dropped > 0,
+                freelist_repair_dropped: open_freelist_entries_dropped,
                 wal_reader_slot: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: initial_journal_mode,
@@ -17699,6 +17772,8 @@ where
                     .collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),
+                freelist_repair_pending: false,
+                freelist_repair_dropped: 0,
                 wal_reader_slot: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
                 journal_mode: JournalMode::Delete,
@@ -19468,7 +19543,7 @@ where
         let upper_bound = inner.next_page.saturating_sub(1).max(db_size);
         let mut freelist = inner.freelist.clone();
         return_pages_to_freelist(&mut freelist, restored_pages.iter().copied());
-        normalize_freelist(&freelist, upper_bound)
+        normalize_freelist(&freelist, upper_bound, inner.page_size)
             .into_iter()
             .filter(|page| page.get() <= db_size)
             .collect()
@@ -19601,6 +19676,9 @@ where
         inner: &PagerInner<V::File>,
         committed_db_size: u32,
     ) -> bool {
+        if inner.freelist_repair_pending {
+            return true;
+        }
         self.committed_durable_freelist_pages_with_inner(inner)
             != self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size)
     }
@@ -19612,6 +19690,9 @@ where
         committed_db_size: u32,
         pending_free_pages: &[PageNumber],
     ) -> bool {
+        if inner.freelist_repair_pending {
+            return true;
+        }
         if !pending_free_pages
             .iter()
             .any(|page| page.get() <= committed_db_size)
@@ -23719,10 +23800,10 @@ where
                         && (snapshot_gate_amplify_enabled()
                             || self.published_visible_commit_seq.get() == inner.commit_seq);
                     if sole_current_snapshot
-                        && let Some(idx) = inner
-                            .freelist
-                            .iter()
-                            .rposition(|page| page.get() > inner.db_size)
+                        && let Some(idx) = inner.freelist.iter().rposition(|page| {
+                            page.get() > inner.db_size
+                                && page.get() != crate::journal::lock_byte_page(inner.page_size)
+                        })
                     {
                         let page = inner.freelist.remove(idx);
                         if inner.durable_freelist_view.contains(&page.get()) {
@@ -23755,7 +23836,9 @@ where
                     // Without this arm, default (concurrent) transactions
                     // never reused committed free pages and every churn
                     // workload grew the file at EOF without bound.
-                    if sole_current_snapshot && let Some(page) = inner.freelist.pop() {
+                    if sole_current_snapshot
+                        && let Some(page) = pop_allocatable_freelist_page(&mut inner)
+                    {
                         let durable_origin = inner.durable_freelist_view.contains(&page.get());
                         if durable_origin {
                             self.allocated_from_durable_freelist.insert(page.get());
@@ -23777,7 +23860,7 @@ where
                         );
                         return Ok(page);
                     }
-                } else if let Some(page) = inner.freelist.pop() {
+                } else if let Some(page) = pop_allocatable_freelist_page(&mut inner) {
                     if inner.durable_freelist_view.contains(&page.get()) {
                         self.allocated_from_durable_freelist.insert(page.get());
                     }
@@ -23880,6 +23963,19 @@ where
                     what: "free page number".to_owned(),
                     value: page_no.get().to_string(),
                 });
+            }
+            // GH#410: the reserved lock-byte page is never allocated, so it is
+            // never legitimately freed either. A free reaching here means a
+            // damaged tree referenced it; swallow the free (leaving the page
+            // owned by nobody, which is its correct state) rather than letting
+            // it onto the freelist, where a later allocation would hand out
+            // the one page the file format forbids.
+            if page_no.get() == crate::journal::lock_byte_page(self.page_size()) {
+                tracing::warn!(
+                    page = page_no.get(),
+                    "refusing to free the reserved lock-byte page"
+                );
+                return Ok(());
             }
             if !self.contains_freed_page(page_no) {
                 self.freed_pages.push(page_no);
@@ -26856,6 +26952,52 @@ where
         }
         drop(wal_guard);
         attempt.apply(promote_to_freelist)
+    }
+
+    /// GH#410: how many entries the durable freelist names that this pager
+    /// refused to load (the reserved lock-byte page, pages beyond the file,
+    /// duplicates, or a trunk chain shorter than the header count).
+    ///
+    /// Non-zero means the durable page-1 metadata and trunk chain still
+    /// describe a freelist that `PRAGMA integrity_check` (and stock SQLite's
+    /// `quick_check`) will keep reporting until it is republished.
+    #[must_use]
+    pub fn pending_freelist_repair(&self) -> u32 {
+        self.inner
+            .lock()
+            .map_or(0, |inner| inner.freelist_repair_dropped)
+    }
+
+    /// GH#410: republish the durable freelist from the sanitized live list.
+    ///
+    /// Drives one minimal writer commit; the commit path already rewrites the
+    /// whole trunk chain and the page-1 head/count from the sanitized list, so
+    /// the illegal entries simply stop being named. Returns how many entries
+    /// were dropped (0 when nothing needed repair).
+    ///
+    /// # Errors
+    ///
+    /// Propagates begin/commit failures; the durable image is unchanged on
+    /// error and the repair stays armed for a later attempt.
+    pub async fn repair_durable_freelist(&self, cx: &Cx) -> Result<u32> {
+        let dropped = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.access_mode.is_readonly() || !inner.freelist_repair_pending {
+                return Ok(0);
+            }
+            inner.freelist_repair_dropped
+        };
+        let mut txn = self.begin(cx, TransactionMode::Immediate).await?;
+        match txn.commit(cx).await {
+            Ok(()) => Ok(dropped),
+            Err(error) => {
+                let _ = txn.rollback(cx).await;
+                Err(error)
+            }
+        }
     }
 
     /// bd-ioq6x Face-2 (GH#346): on-open reclamation sweep for the shared
@@ -30680,7 +30822,7 @@ mod tests {
         let p5 = PageNumber::new(5).unwrap();
         let p6 = PageNumber::new(6).unwrap();
 
-        let normalized = normalize_freelist(&[p3, p6, p4, p3, p5, p2], 5);
+        let normalized = normalize_freelist(&[p3, p6, p4, p3, p5, p2], 5, PageSize::DEFAULT);
 
         assert_eq!(
             normalized,
