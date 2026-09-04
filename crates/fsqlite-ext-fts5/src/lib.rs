@@ -3193,14 +3193,17 @@ impl Fts5ScoreSnapshot {
                 score_terms,
                 weights,
             )),
-            // The shadow score source looks doclists up by exact token text and
-            // cannot aggregate a prefix, so a prefix contributes nothing here;
-            // this reverted path is not on the normal promote route.
+            // The shadow score source (reached only when a contentless table is
+            // promoted via the delete-of-pre-origin-row edge) scores each score
+            // term from its aggregated doclist — a prefix as ONE unit via
+            // `prefix_entries` (df = distinct docs, tf = summed positions),
+            // matching stock and the in-memory/precomputed paths
+            // (bd-fts5-prefix-bm25-unranked-bm17v). Flattening to token text
+            // scored a prefix as zero.
             Fts5ScoreSource::Shadow(rows) => {
-                let terms: Vec<String> = score_terms.iter().map(|t| t.text().to_owned()).collect();
                 let tokenizer = create_capped_tokenizer(&self.tokenizer_name);
                 Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
-                    .bm25_score(rowid, &terms, weights)
+                    .bm25_for_score_terms(rowid, score_terms, weights)
             }
             Fts5ScoreSource::Precomputed(scores) => Ok(scores.bm25(rowid, score_terms, weights)),
         }
@@ -8469,6 +8472,84 @@ pub(crate) trait Fts5DoclistProvider {
                 weighted_tf += column_weight * tf;
             }
 
+            if weighted_tf == 0.0 {
+                continue;
+            }
+
+            let denom = if avgdl > 0.0 {
+                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
+            } else {
+                weighted_tf + BM25_K1
+            };
+            score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
+        }
+
+        Ok(-score)
+    }
+
+    /// BM25 over score terms (exact or prefix). Like [`Self::bm25_score`], but a
+    /// prefix operand is scored as ONE unit from its AGGREGATED prefix doclist
+    /// (`prefix_entries`): document frequency is the number of DISTINCT docs
+    /// matching the prefix and per-doc term frequency is the total position count
+    /// across all prefix-matching terms — matching stock and the lazy
+    /// `Fts5PrecomputedScores` path. For exact terms it is identical to
+    /// `bm25_score` (one entry per doc, df = distinct docs). Scoring a prefix by
+    /// its literal token (as string-flattened `bm25_score` did) misses every
+    /// other expanded term, understating the score.
+    fn bm25_for_score_terms(
+        &self,
+        rowid: i64,
+        score_terms: &[Fts5ScoreTerm],
+        weights: &[f64],
+    ) -> std::result::Result<f64, Fts5QueryError> {
+        let n = self.total_docs()? as f64;
+        let avgdl = self.avg_doc_length()?;
+        let dl = f64::from(self.doc_length(rowid)?);
+        let mut score = 0.0;
+
+        for term in score_terms {
+            let entries = match term {
+                Fts5ScoreTerm::Exact(text) => self.exact_entries(text)?,
+                Fts5ScoreTerm::Prefix(text) => self.prefix_entries(text)?,
+            };
+            // df = distinct live docs matching the unit; per-doc column term
+            // frequency for `rowid` summed across all (expanded-term) entries.
+            let mut distinct_docs: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
+            let mut by_col: BTreeMap<u32, u32> = BTreeMap::new();
+            for entry in &entries {
+                if entry.poslist.delete {
+                    continue;
+                }
+                let Some(entry_rowid) = rowid_u64_to_i64(entry.rowid) else {
+                    continue;
+                };
+                distinct_docs.insert(entry_rowid);
+                if entry_rowid != rowid {
+                    continue;
+                }
+                for column in &entry.poslist.columns {
+                    let count = u32::try_from(column.offsets.len()).unwrap_or(u32::MAX);
+                    let slot = by_col.entry(column.column).or_insert(0);
+                    *slot = slot.saturating_add(count);
+                }
+            }
+            let df_int = distinct_docs.len();
+            if df_int == 0 {
+                continue;
+            }
+            let df = df_int as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
+
+            let mut weighted_tf = 0.0;
+            for (column, tf_u32) in by_col {
+                let tf = f64::from(tf_u32);
+                let column_weight = usize::try_from(column)
+                    .ok()
+                    .and_then(|index| weights.get(index).copied())
+                    .unwrap_or(1.0);
+                weighted_tf += column_weight * tf;
+            }
             if weighted_tf == 0.0 {
                 continue;
             }
@@ -15575,6 +15656,72 @@ mod tests {
     },
 }"
         );
+    }
+
+    // bd-fts5-contentless-promote-bm25-value + bd-fts5-prefix-bm25-unranked
+    // (Shadow residuals): the Shadow score source (reached when a contentless
+    // table is promoted -> bind_shadow_rows) must score ranked BM25 — exact AND
+    // prefix — identically to the in-memory index (which matches stock). This
+    // compares the InMemory and Shadow `Fts5ScoreSnapshot`s the auxiliary ranking
+    // path uses. Before the fix: prefix scored 0 on Shadow, and exact values
+    // could drift; after: bit-identical.
+    #[test]
+    fn test_fts5_shadow_score_snapshot_matches_inmemory_bm25() {
+        let cx = Cx::new();
+        // A single-column corpus with df<N terms, varying tf, and prefix-shared
+        // tokens (shard/shardx both match `shard*` — several in one doc).
+        let build = || {
+            let mut t = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+            t.insert_document(1, &["beta beta beta shard shardx".to_owned()]);
+            t.insert_document(2, &["beta gamma shard".to_owned()]);
+            t.insert_document(3, &["gamma gamma shardx shardx".to_owned()]);
+            t.insert_document(4, &["beta delta shard shardx".to_owned()]);
+            t.insert_document(5, &["delta epsilon".to_owned()]);
+            t.insert_document(6, &["beta beta shardxy".to_owned()]);
+            t
+        };
+        let inmem = build();
+        let inmem_snap = inmem.auxiliary_score_snapshot();
+
+        // Promote-equivalent: encode this table's shadow rows and bind them into a
+        // fresh table, so its snapshot is Shadow-backed (as after a contentless
+        // promote).
+        let rows = inmem.encode_shadow_rows().unwrap();
+        let mut shadowed = Fts5Table::connect(&cx, &["fts5", "main", "docs", "body"]).unwrap();
+        shadowed.bind_shadow_rows(rows).unwrap();
+        let shadow_snap = shadowed.auxiliary_score_snapshot();
+
+        let weights = vec![1.0_f64];
+        // (query MATCH string, its score terms) covering exact, boolean, and
+        // prefix (single- and multi-expansion) units.
+        let cases: &[(&str, &[Fts5ScoreTerm])] = &[
+            ("beta", &[Fts5ScoreTerm::Exact("beta".to_owned())]),
+            ("gamma", &[Fts5ScoreTerm::Exact("gamma".to_owned())]),
+            ("delta", &[Fts5ScoreTerm::Exact("delta".to_owned())]),
+            ("shard*", &[Fts5ScoreTerm::Prefix("shard".to_owned())]),
+            ("shardx*", &[Fts5ScoreTerm::Prefix("shardx".to_owned())]),
+        ];
+        for (query, score_terms) in cases {
+            // Rows the query matches (from the in-memory index; == stock).
+            let matched = inmem.search(query).unwrap();
+            assert!(
+                !matched.is_empty(),
+                "case {query:?} matched nothing — corpus/query mismatch"
+            );
+            for (rowid, _) in matched {
+                let want = inmem_snap
+                    .bm25_score_for_terms_with_weights(rowid, score_terms, &weights)
+                    .unwrap();
+                let got = shadow_snap
+                    .bm25_score_for_terms_with_weights(rowid, score_terms, &weights)
+                    .unwrap();
+                assert!(
+                    (want - got).abs() < 1e-9,
+                    "Shadow BM25 diverged from in-memory for {query:?} rowid {rowid}: \
+                     in-memory={want} shadow={got}"
+                );
+            }
+        }
     }
 
     #[test]
