@@ -303,9 +303,19 @@ pub struct WalBackendAdapter<F: VfsFile> {
     checkpoint_backfill_watermark: Option<(WalGenerationIdentity, u32)>,
     /// Lazily built index of the appended tail; see [`AppendedTailIndex`].
     appended_tail_index: Option<AppendedTailIndex>,
-    /// How many times the appended-tail index was (re)built — the observable
-    /// that pins "one scan per stable tail" in tests.
+    /// How many times the appended-tail index was built from a full forward
+    /// pass over every frame — the observable that pins "one full scan per
+    /// generation" in tests. A pure append no longer forces a rebuild; see
+    /// [`Self::appended_tail_index_folds`].
     appended_tail_index_builds: u64,
+    /// How many times the appended-tail index was extended INCREMENTALLY by
+    /// folding in only the frames appended since the last lookup (same WAL
+    /// generation, tail grew, prior tail frame unchanged). This is O(appended
+    /// frames), not O(all frames): the fix for the 16-writer BEGIN/INSERT
+    /// starvation convoy (bd-gh382-16writer-begin-starvation) where the tail
+    /// moves on every peer commit and a full rebuild per commit — held under
+    /// the append gate — starved writers off their retry budget.
+    appended_tail_index_folds: u64,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
@@ -330,6 +340,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             checkpoint_backfill_watermark: None,
             appended_tail_index: None,
             appended_tail_index_builds: 0,
+            appended_tail_index_folds: 0,
         }
     }
 
@@ -353,6 +364,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             checkpoint_backfill_watermark: None,
             appended_tail_index: None,
             appended_tail_index_builds: 0,
+            appended_tail_index_folds: 0,
         }
     }
 
@@ -689,25 +701,85 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let frame_count = tail_frame.saturating_add(1);
         let generation = self.wal.generation_identity();
         let tail_checksum = self.wal.read_frame_header(cx, tail_frame).await?.checksum;
-        let current = self.appended_tail_index.as_ref().is_some_and(|index| {
-            index.generation == generation
-                && index.frame_count == frame_count
-                && index.tail_checksum == tail_checksum
-        });
-        if !current {
-            let mut latest_frame_by_page = HashMap::new();
-            for frame_index in 0..frame_count {
-                let header = self.wal.read_frame_header(cx, frame_index).await?;
-                latest_frame_by_page.insert(header.page_number, frame_index);
-            }
-            self.appended_tail_index = Some(AppendedTailIndex {
-                generation,
-                frame_count,
-                tail_checksum,
-                latest_frame_by_page,
-            });
-            self.appended_tail_index_builds = self.appended_tail_index_builds.saturating_add(1);
+
+        // Classify the cached index against the current physical tail:
+        //   Reuse    — identical stable tail (generation, frame count, and the
+        //              checksum on the last frame all match): serve as-is.
+        //   Fold     — same generation and the tail GREW, with the frame that
+        //              was previously the tail still carrying its recorded
+        //              checksum (proof the older frames are untouched, so the
+        //              WAL only appended). Fold in just the new frames.
+        //   Rebuild  — no usable index, a different generation (a WAL
+        //              reset/wrap can reuse frame slots), or the append-only
+        //              proof failed: one full forward pass.
+        //
+        // Folding is the fix for bd-gh382-16writer-begin-starvation: under many
+        // concurrent writers the tail advances on every peer commit, so keying
+        // reuse on the tail checksum alone rebuilt the whole (growing) WAL on
+        // every gate-held commit read — an O(frames) pass per commit that
+        // convoyed writers off their retry budget. Folding makes a grown tail
+        // cost O(appended frames) instead.
+        enum TailIndexPlan {
+            Reuse,
+            Fold { from_frame: usize },
+            Rebuild,
         }
+        let plan = match self.appended_tail_index.as_ref() {
+            Some(index)
+                if index.generation == generation
+                    && index.frame_count == frame_count
+                    && index.tail_checksum == tail_checksum =>
+            {
+                TailIndexPlan::Reuse
+            }
+            Some(index) if index.generation == generation && frame_count > index.frame_count => {
+                // The tail grew. Confirm append-only: the frame that used to be
+                // the tail must still carry the checksum we indexed it with.
+                let previous_tail_frame = index.frame_count.saturating_sub(1);
+                let previous_tail_checksum =
+                    self.wal.read_frame_header(cx, previous_tail_frame).await?.checksum;
+                if index.tail_checksum == previous_tail_checksum {
+                    TailIndexPlan::Fold {
+                        from_frame: index.frame_count,
+                    }
+                } else {
+                    TailIndexPlan::Rebuild
+                }
+            }
+            _ => TailIndexPlan::Rebuild,
+        };
+
+        match plan {
+            TailIndexPlan::Reuse => {}
+            TailIndexPlan::Fold { from_frame } => {
+                for frame_index in from_frame..frame_count {
+                    let header = self.wal.read_frame_header(cx, frame_index).await?;
+                    if let Some(index) = self.appended_tail_index.as_mut() {
+                        index.latest_frame_by_page.insert(header.page_number, frame_index);
+                    }
+                }
+                if let Some(index) = self.appended_tail_index.as_mut() {
+                    index.frame_count = frame_count;
+                    index.tail_checksum = tail_checksum;
+                }
+                self.appended_tail_index_folds = self.appended_tail_index_folds.saturating_add(1);
+            }
+            TailIndexPlan::Rebuild => {
+                let mut latest_frame_by_page = HashMap::new();
+                for frame_index in 0..frame_count {
+                    let header = self.wal.read_frame_header(cx, frame_index).await?;
+                    latest_frame_by_page.insert(header.page_number, frame_index);
+                }
+                self.appended_tail_index = Some(AppendedTailIndex {
+                    generation,
+                    frame_count,
+                    tail_checksum,
+                    latest_frame_by_page,
+                });
+                self.appended_tail_index_builds = self.appended_tail_index_builds.saturating_add(1);
+            }
+        }
+
         Ok(self
             .appended_tail_index
             .as_ref()
@@ -8660,7 +8732,10 @@ mod tests {
     /// The reclaim sweep asks `read_page_at_appended_tail` for every ledger
     /// page in turn. It must answer exactly like the backwards scan it
     /// replaced (newest frame wins, absent pages are `None`) while scanning
-    /// the tail once per stable tail, rebuilding only when the tail changes.
+    /// the tail once per stable tail. A pure append grows the tail and is
+    /// folded in incrementally (see the paired
+    /// [`appended_tail_growth_folds_incrementally_not_per_commit`]), never a
+    /// full fresh pass.
     #[test]
     fn appended_tail_reads_index_the_tail_once_per_stable_tail() {
         init_wal_publication_test_tracing();
@@ -8713,7 +8788,9 @@ mod tests {
             "a stable tail is indexed exactly once"
         );
 
-        // Appending changes the tail: the next lookup rebuilds, and sees it.
+        // Appending grows the tail: the next lookup FOLDS the new frame into
+        // the existing index (O(appended frames)) rather than rescanning the
+        // whole WAL, and still sees both the new page and the untouched ones.
         let p3 = sample_page(0x44);
         adapter
             .append_frame(&cx, 3, &p3, 3)
@@ -8732,8 +8809,86 @@ mod tests {
             Some(p1_new)
         );
         assert_eq!(
-            adapter.appended_tail_index_builds, 2,
-            "a changed tail costs exactly one fresh pass"
+            adapter.appended_tail_index_builds, 1,
+            "a grown tail is folded, never a second full pass"
+        );
+        assert_eq!(
+            adapter.appended_tail_index_folds, 1,
+            "the appended frame is folded in incrementally exactly once"
+        );
+    }
+
+    /// Regression guard for bd-gh382-16writer-begin-starvation: under many
+    /// concurrent writers the physical tail advances on every peer commit, so a
+    /// gate-held commit read (`read_durable_page_under_gate`) sees a grown tail
+    /// almost every time. Keying index reuse on the tail checksum alone (the
+    /// original GH#382 cache) rebuilt the ENTIRE growing WAL on every such read
+    /// — an O(frames) forward pass per commit, held under the append gate, that
+    /// convoyed writers off their retry budget ("exhausted retry budget at
+    /// BEGIN/INSERT after 0 retries"). With incremental folding, N commits that
+    /// each grow the tail cost ONE full build plus N cheap folds, not N full
+    /// builds — and every answer still matches the backwards scan exactly.
+    #[test]
+    fn appended_tail_growth_folds_incrementally_not_per_commit() {
+        init_wal_publication_test_tracing();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        // Seed a non-trivial tail so a full rebuild would be visibly expensive.
+        // Each frame is a commit that grows the db to `page` pages.
+        for page in 1..=200_u32 {
+            let image = sample_page(u8::try_from(page % 251).unwrap_or(0));
+            adapter
+                .append_frame(&cx, page, &image, page)
+                .expect("seed append");
+        }
+        adapter.sync(&cx).expect("publish seed");
+        // First lookup builds the index once.
+        let _ = adapter
+            .read_page_at_appended_tail(&cx, 1)
+            .expect("first tail read");
+        assert_eq!(adapter.appended_tail_index_builds, 1);
+        assert_eq!(adapter.appended_tail_index_folds, 0);
+
+        // Model 40 rounds of peer-commit churn: each round rewrites an existing
+        // page (the tail moves, db stays 200 pages) and this connection then
+        // reads a couple of pages under the gate — the exact shape that used to
+        // rebuild the whole index per commit.
+        for round in 0..40_u32 {
+            let page = 1_u32 + (round % 200);
+            let image = sample_page(u8::try_from((round % 250) + 1).unwrap_or(1));
+            adapter
+                .append_frame(&cx, page, &image, 200)
+                .expect("churn append");
+            adapter.sync(&cx).expect("publish churn");
+
+            let tail = adapter.wal.frame_count() - 1;
+            for probe in [page, 1_u32, 200_u32] {
+                let expected = adapter
+                    .scan_backwards_for_page(&cx, probe, tail)
+                    .expect("backwards scan");
+                let via_index = adapter
+                    .appended_tail_frame_for_page(&cx, probe, tail)
+                    .expect("indexed lookup");
+                assert_eq!(
+                    via_index, expected,
+                    "round {round} page {probe}: folded index must equal the scan"
+                );
+            }
+        }
+
+        // The whole run rebuilt the tail exactly ONCE; every grown tail after
+        // that was folded, not rescanned. Pre-fix this would have been one
+        // full O(frames) build per round.
+        assert_eq!(
+            adapter.appended_tail_index_builds, 1,
+            "churn must not force a second full rebuild (was one build per commit)"
+        );
+        assert!(
+            adapter.appended_tail_index_folds >= 40,
+            "each grown tail folds incrementally (folds={})",
+            adapter.appended_tail_index_folds
         );
     }
 
