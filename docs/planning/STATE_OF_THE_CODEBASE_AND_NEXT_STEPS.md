@@ -415,6 +415,23 @@ its transaction extension. Actual `br` validation found no missing references
 or augmented pair-closure cycles. `bv`'s cycle computation is skipped at this
 graph size, so its generic DAG advisory is not accepted as proof.
 
+**Refinement 3 — specify what survives remote failure and keep mode proofs separate.**
+Reviewed all native/encryption/history/horizon contracts again. Durable-object
+receipts now include a retention obligation across remote restart/compaction;
+they cannot merely attest that bytes existed in the past. Full quorum
+transaction success additionally requires recoverable authenticated remote
+commit-decision evidence before the client ACK, while follower application
+remains a separate state. This does not silently introduce a consensus promise.
+The local historical-SQL pair now explicitly delegates remote composition to
+the later combined keeper. Added `bd-1vwiy.5` for compatibility-mode encryption,
+history, checkpoint and retention: native-mode evidence cannot cover it.
+Updated the existing history matrix's inert test-path/Actions assumptions and
+kept ciphertext randomization separate from canonical page comparison.
+
+This pass also refreshed the changing source evidence: the peer lock repair
+enabled the 71/0 RCH SQL result, and the observed missing-close warnings became
+an explicit existing-owner task rather than an unqualified lifecycle pass.
+
 ### Historical assessment below
 
 The remainder preserves the earlier performance investigation and rejected
