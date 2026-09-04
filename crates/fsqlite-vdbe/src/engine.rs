@@ -7411,8 +7411,7 @@ impl VdbeEngine {
         }
         note_rebind(first_not_null_changed);
 
-        let ipk_label_changed =
-            !Arc::ptr_eq(&self.ipk_label_by_root_page, &ipk_label_by_root_page);
+        let ipk_label_changed = !Arc::ptr_eq(&self.ipk_label_by_root_page, &ipk_label_by_root_page);
         if ipk_label_changed {
             self.ipk_label_by_root_page = ipk_label_by_root_page;
         }
@@ -10993,7 +10992,9 @@ impl VdbeEngine {
                                             .get(&root_page)
                                             .map_or_else(
                                                 || "PRIMARY KEY constraint failed".to_owned(),
-                                                |label| format!("UNIQUE constraint failed: {label}"),
+                                                |label| {
+                                                    format!("UNIQUE constraint failed: {label}")
+                                                },
                                             );
                                         return Ok(Some(ExecOutcome::Error {
                                             code: ErrorCode::Constraint as i32,
@@ -11160,13 +11161,9 @@ impl VdbeEngine {
                                             // bd-977wx: name the IPK column so a
                                             // rowid/IPK collision reads as
                                             // `UNIQUE constraint failed: t.k`.
-                                            let message = self
-                                                .ipk_label_by_root_page
-                                                .get(&root)
-                                                .map_or_else(
-                                                    || {
-                                                        "PRIMARY KEY constraint failed".to_owned()
-                                                    },
+                                            let message =
+                                                self.ipk_label_by_root_page.get(&root).map_or_else(
+                                                    || "PRIMARY KEY constraint failed".to_owned(),
                                                     |label| {
                                                         format!("UNIQUE constraint failed: {label}")
                                                     },
@@ -24790,10 +24787,7 @@ mod tests {
                 }],
                 from: None,
                 where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column(
-                        ColumnRef::bare("rowid"),
-                        span(),
-                    )),
+                    left: Box::new(Expr::Column(ColumnRef::bare("rowid"), span())),
                     op: AstBinaryOp::Eq,
                     right: Box::new(Expr::Placeholder(PlaceholderType::Numbered(2), span())),
                     span: span(),
@@ -24831,10 +24825,7 @@ mod tests {
                     time_travel: None,
                 },
                 where_clause: Some(Expr::BinaryOp {
-                    left: Box::new(Expr::Column(
-                        ColumnRef::bare("rowid"),
-                        span(),
-                    )),
+                    left: Box::new(Expr::Column(ColumnRef::bare("rowid"), span())),
                     op: AstBinaryOp::Eq,
                     right: Box::new(Expr::Placeholder(PlaceholderType::Numbered(1), span())),
                     span: span(),

@@ -31,17 +31,26 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
 }
 async fn fq(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
     match conn.query(sql).await {
-        Ok(rows) => rows.iter().map(|r| r.values().iter().map(tag_f).collect()).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| r.values().iter().map(tag_f).collect())
+            .collect(),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
 fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
-    let Ok(mut st) = conn.prepare(sql) else { return vec![vec!["ERR".to_owned()]] };
+    let Ok(mut st) = conn.prepare(sql) else {
+        return vec![vec!["ERR".to_owned()]];
+    };
     let n = st.column_count();
     match st.query_map([], |row| {
-        Ok((0..n).map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i))).collect::<Vec<_>>())
+        Ok((0..n)
+            .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
+            .collect::<Vec<_>>())
     }) {
-        Ok(rows) => rows.collect::<Result<Vec<_>, _>>().unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
+        Ok(rows) => rows
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|_| vec![vec!["ERR".to_owned()]]),
         Err(_) => vec![vec!["ERR".to_owned()]],
     }
 }
@@ -59,7 +68,10 @@ fn string_scalar_functions_match_rusqlite_oracle() {
                 let fr = fq(&f, sql).await;
                 let rr = rq(&r, sql);
                 if fr != rr {
-                    $d.push(format!("  [{}]\n     frank= {:?}\n     stock= {:?}", $expr, fr, rr));
+                    $d.push(format!(
+                        "  [{}]\n     frank= {:?}\n     stock= {:?}",
+                        $expr, fr, rr
+                    ));
                 }
             }};
         }
@@ -70,12 +82,12 @@ fn string_scalar_functions_match_rusqlite_oracle() {
         q!(diffs, "substr('abcdef', -2, 1)");
         q!(diffs, "substr('abcdef', -3, 2)");
         q!(diffs, "substr('abcdef', 0)");
-        q!(diffs, "substr('abcdef', 0, 2)");     // count includes the phantom pos-0
-        q!(diffs, "substr('abcdef', 2, -1)");    // negative length -> chars before start
+        q!(diffs, "substr('abcdef', 0, 2)"); // count includes the phantom pos-0
+        q!(diffs, "substr('abcdef', 2, -1)"); // negative length -> chars before start
         q!(diffs, "substr('abcdef', 4, -2)");
         q!(diffs, "substr('abcdef', 10)");
         q!(diffs, "substr('abcdef', 2, 100)");
-        q!(diffs, "substr('héllo', 2, 2)");       // multibyte char indexing
+        q!(diffs, "substr('héllo', 2, 2)"); // multibyte char indexing
 
         // --- replace (incl empty needle -> stock returns original) ---
         q!(diffs, "replace('aXbXc', 'X', '-')");
@@ -123,7 +135,7 @@ fn string_scalar_functions_match_rusqlite_oracle() {
         q!(diffs, "hex('abc')");
         q!(diffs, "hex(x'0aff')");
         q!(diffs, "unhex('414243')");
-        q!(diffs, "unhex('zzz')");                 // invalid -> NULL
+        q!(diffs, "unhex('zzz')"); // invalid -> NULL
         q!(diffs, "quote(x'00ff10')");
         q!(diffs, "quote('it''s')");
         q!(diffs, "quote(NULL)");
@@ -142,6 +154,11 @@ fn string_scalar_functions_match_rusqlite_oracle() {
         q!(diffs, "1 || 2");
         q!(diffs, "'a' || NULL");
 
-        assert!(diffs.is_empty(), "{} string-scalar divergence(s) vs rusqlite:\n{}", diffs.len(), diffs.join("\n"));
+        assert!(
+            diffs.is_empty(),
+            "{} string-scalar divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
     });
 }

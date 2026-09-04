@@ -116,10 +116,7 @@ fn nd2ju_wr_pk_seek_returns_correct_rows() {
         }
 
         // Present key returns exactly its row.
-        let rows = c
-            .query("SELECT v FROM facts WHERE id = 'b'")
-            .await
-            .unwrap();
+        let rows = c.query("SELECT v FROM facts WHERE id = 'b'").await.unwrap();
         assert_eq!(rows.len(), 1, "expected one row for present PK");
         assert_eq!(rows[0].values()[0], fsqlite_types::SqliteValue::Integer(20));
 
@@ -128,7 +125,10 @@ fn nd2ju_wr_pk_seek_returns_correct_rows() {
             .query("SELECT v FROM facts WHERE id = 'zzz'")
             .await
             .unwrap();
-        assert!(rows.is_empty(), "expected no rows for absent PK, got {rows:?}");
+        assert!(
+            rows.is_empty(),
+            "expected no rows for absent PK, got {rows:?}"
+        );
 
         // LIMIT is honored on the single-row seek.
         let rows = c

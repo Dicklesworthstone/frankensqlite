@@ -32,7 +32,10 @@ fn assert_unique(msg: &str, expected: &str) {
 #[test]
 fn ipk_collision_reports_unique_constraint_977wx() {
     asupersync::test_utils::run_test(|| async {
-        let base = &["CREATE TABLE t(k INTEGER PRIMARY KEY, v)", "INSERT INTO t VALUES (1,10),(2,20)"];
+        let base = &[
+            "CREATE TABLE t(k INTEGER PRIMARY KEY, v)",
+            "INSERT INTO t VALUES (1,10),(2,20)",
+        ];
 
         // (1) plain INSERT duplicating an existing rowid/IPK.
         assert_unique(
@@ -56,7 +59,10 @@ fn ipk_collision_reports_unique_constraint_977wx() {
         // column, unaffected by the IPK-label path.
         assert_unique(
             &err_of(
-                &["CREATE TABLE u(k INTEGER PRIMARY KEY, e TEXT UNIQUE)", "INSERT INTO u VALUES (1,'a')"],
+                &[
+                    "CREATE TABLE u(k INTEGER PRIMARY KEY, e TEXT UNIQUE)",
+                    "INSERT INTO u VALUES (1,'a')",
+                ],
                 "INSERT INTO u VALUES (2,'a')",
             )
             .await,

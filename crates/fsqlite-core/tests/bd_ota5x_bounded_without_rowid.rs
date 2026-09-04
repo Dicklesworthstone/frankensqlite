@@ -265,10 +265,7 @@ fn bounded_integrity_rejects_orphan_rowid_child_of_without_rowid_parent() {
             .execute("PRAGMA journal_mode=DELETE;")
             .await
             .unwrap();
-        builder
-            .execute("PRAGMA foreign_keys=OFF;")
-            .await
-            .unwrap();
+        builder.execute("PRAGMA foreign_keys=OFF;").await.unwrap();
         builder
             .execute("CREATE TABLE wp(k TEXT PRIMARY KEY, d TEXT) WITHOUT ROWID;")
             .await
@@ -350,10 +347,7 @@ fn bounded_integrity_rejects_orphan_without_rowid_child() {
             .execute("PRAGMA journal_mode=DELETE;")
             .await
             .unwrap();
-        builder
-            .execute("PRAGMA foreign_keys=OFF;")
-            .await
-            .unwrap();
+        builder.execute("PRAGMA foreign_keys=OFF;").await.unwrap();
         builder
             .execute("CREATE TABLE rp(id INTEGER PRIMARY KEY, name TEXT);")
             .await
