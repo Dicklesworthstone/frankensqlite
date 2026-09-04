@@ -26096,6 +26096,33 @@ impl Connection {
             {
                 return Err(FrankenError::ReadOnly);
             }
+            // bd-8rjci: a write on a read-only handle must be refused BEFORE the
+            // fast lane runs — matching stock SQLite, which raises SQLITE_READONLY
+            // ("attempt to write a readonly database", code 8) for a no-op
+            // `DELETE ... WHERE 0` (changes no rows) exactly as for a row-changing
+            // write. `execute_statement_dispatch_impl` guards this for the
+            // dispatcher, but the precompiled/deferred DML fast lanes below bypass
+            // that dispatcher and short-circuit a no-op UPDATE/DELETE (0 rows
+            // match) before ever acquiring a write transaction, so the pager-level
+            // read-only check never fired and the statement wrongly returned
+            // `Ok(0)`.
+            //
+            // Gate only the MAIN-targeted fast lanes: a precompiled INSERT
+            // (`precompiled_dml`) and a direct/simple UPDATE|DELETE
+            // (`prepared_update_delete_fast_path`) both target the MAIN schema by
+            // construction — an attached-target, shadowed-main, virtual-table, or
+            // FTS5 write is classified onto the deferred dispatch path with no
+            // fast-path metadata and still funnels through the dispatcher's
+            // read-only guard. That preserves a write to a writable ATTACHed
+            // database from a read-only main and the read-only FTS5
+            // `integrity-check` (a syntactically-INSERT read) exception, both of
+            // which stock permits on a `mode=ro` main.
+            if self.pager.is_readonly()
+                && (stmt.precompiled_dml().is_some()
+                    || stmt.prepared_update_delete_fast_path().is_some())
+            {
+                return Err(FrankenError::ReadOnly);
+            }
             // bd-bld9w.3/.7: the precompiled/deferred DML fast paths below bypass
             // the statement dispatcher's guard_mutation_encoding_supported (that
             // guard has a single call site, in
