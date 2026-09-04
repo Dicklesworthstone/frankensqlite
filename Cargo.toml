@@ -70,6 +70,14 @@ uninlined_format_args = { level = "allow", priority = 1 }
 # Test-heavy patterns: these pedantic/nursery lints fire pervasively in the
 # 200+ harness test files and add noise without catching real bugs.
 assertions_on_constants = { level = "allow", priority = 1 }
+# `assert_is_empty` (new in nightly-2026-08-31) fires on every
+# `assert!(x.is_empty())` / `assert!(!x.is_empty())` in the suite — ~175 sites,
+# essentially all of them test assertions. Its suggested rewrite is
+# `assert_eq!(x, [] as [T; 0])`, which forces the element type (often a private
+# or deeply-pathed type) into the assertion and reads worse than the predicate
+# it replaces. The lint only changes the text of an assertion failure message;
+# it can never mask a defect, so the churn is not worth it.
+assert_is_empty = { level = "allow", priority = 1 }
 bool_to_int_with_if = { level = "allow", priority = 1 }
 case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
 collection_is_never_read = { level = "allow", priority = 1 }

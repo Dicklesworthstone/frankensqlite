@@ -162,15 +162,20 @@ impl LearnedIndex {
         let predicted = seg.predict(key);
 
         // Bounded search within [predicted - max_error, predicted + max_error].
-        let lo = predicted.saturating_sub(self.max_error);
+        // `predict` is unbounded above, so clamp both ends into the key slice:
+        // an out-of-range prediction must yield an empty scan, not a panic.
+        let lo = predicted
+            .saturating_sub(self.max_error)
+            .min(self.keys.len());
         let hi = predicted
             .saturating_add(self.max_error)
             .saturating_add(1)
             .min(self.keys.len());
 
         // Linear scan within the bounded range.
-        for i in lo..hi {
-            match self.keys[i].cmp(&key) {
+        for (offset, existing) in self.keys[lo..hi].iter().enumerate() {
+            let i = lo + offset;
+            match existing.cmp(&key) {
                 std::cmp::Ordering::Equal => {
                     let error = predicted.abs_diff(i);
                     record_lookup(error);

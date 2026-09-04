@@ -233,7 +233,7 @@ fn sample_gamma(rng: &mut SplitMix64, shape: f64) -> f64 {
     let c = 1.0 / (9.0 * d).sqrt();
     loop {
         let x = rng.next_normal();
-        let v_base = 1.0 + c * x;
+        let v_base = c.mul_add(x, 1.0);
         if v_base <= 0.0 {
             continue;
         }

@@ -2602,7 +2602,6 @@ pub mod pragma {
                         "loaded raptorq_repair_symbols from wal-fec sidecar"
                     );
                 }
-                Ok(PragmaOutput::Int(i64::from(mgr.raptorq_repair_symbols())))
             }
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let requested = parse_raptorq_repair_symbols(expr)?;
@@ -2616,10 +2615,9 @@ pub mod pragma {
                         "persisted raptorq_repair_symbols to wal-fec sidecar"
                     );
                 }
-
-                Ok(PragmaOutput::Int(i64::from(mgr.raptorq_repair_symbols())))
             }
         }
+        Ok(PragmaOutput::Int(i64::from(mgr.raptorq_repair_symbols())))
     }
 
     fn parse_raptorq_repair_symbols(expr: &Expr) -> Result<u8> {

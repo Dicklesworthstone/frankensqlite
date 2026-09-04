@@ -7221,6 +7221,10 @@ mod tests {
             200,
             50,
         );
+        // Spelled out term by term to mirror `estimate_cost`'s own arithmetic;
+        // folding it into `mul_add` would fuse roundings the implementation
+        // does not fuse, so the test would stop checking the formula as written.
+        #[allow(clippy::suboptimal_flops)]
         let expected = 50_f64.log2() + sel * 50.0 + sel * 200.0;
         assert!((cost - expected).abs() < 1e-10);
     }
@@ -7234,6 +7238,8 @@ mod tests {
             200,
             50,
         );
+        // Mirrors `estimate_cost` term by term; see the note above on `mul_add`.
+        #[allow(clippy::suboptimal_flops)]
         let expected = 50_f64.log2() + sel * 50.0;
         assert!((cost - expected).abs() < 1e-10);
     }
@@ -7261,11 +7267,11 @@ mod tests {
             "covering index must rank below a range scan: {covering} vs {range}"
         );
         // The gap is exactly the avoided table-access term: sel * table_pages.
+        let table_term = sel * 200.0;
+        let gap = range - covering;
         assert!(
-            ((range - covering) - sel * 200.0).abs() < 1e-9,
-            "covering/range gap should equal sel*table_pages (= {}), got {}",
-            sel * 200.0,
-            range - covering
+            (gap - table_term).abs() < 1e-9,
+            "covering/range gap should equal sel*table_pages (= {table_term}), got {gap}"
         );
 
         // With a row count, the covering scan also pays the cheaper per-row term

@@ -188,11 +188,11 @@ fn test_laplace_statistical_properties() {
         let result = engine.laplace(0.0, b, 1.0).unwrap(); // Lap(0, b/1) = Lap(0, 2)
         let noise = result.noisy_value;
         sum_noise += noise;
-        sum_noise_sq += noise * noise;
+        sum_noise_sq = noise.mul_add(noise, sum_noise_sq);
     }
 
     let mean = sum_noise / n as f64;
-    let variance = sum_noise_sq / n as f64 - mean * mean;
+    let variance = mean.mul_add(-mean, sum_noise_sq / n as f64);
     let expected_variance = 2.0 * b * b; // Var[Lap(0, b)] = 2b²
 
     assert!(mean.abs() < 0.1, "Laplace mean should be ~0, got {mean:.4}");
@@ -230,11 +230,11 @@ fn test_gaussian_statistical_properties() {
         let result = engine.gaussian(0.0, sens, 1.0, 1e-5).unwrap();
         let noise = result.noisy_value;
         sum_noise += noise;
-        sum_noise_sq += noise * noise;
+        sum_noise_sq = noise.mul_add(noise, sum_noise_sq);
     }
 
     let mean = sum_noise / n as f64;
-    let variance = sum_noise_sq / n as f64 - mean * mean;
+    let variance = mean.mul_add(-mean, sum_noise_sq / n as f64);
     let expected_variance = sigma * sigma;
 
     assert!(

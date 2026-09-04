@@ -162,7 +162,7 @@ fn zipf_page(seed: u64, page_count: u64, s: f64) -> u64 {
     let u = (mix64(seed) as f64 + 1.0) / (u64::MAX as f64 + 1.0);
     let one_minus_s = 1.0 - s;
     let cdf_scale = (page_count as f64).powf(one_minus_s) - 1.0;
-    let rank = (u * cdf_scale + 1.0).powf(1.0 / one_minus_s).floor() as u64;
+    let rank = u.mul_add(cdf_scale, 1.0).powf(1.0 / one_minus_s).floor() as u64;
     rank.clamp(1, page_count) - 1
 }
 

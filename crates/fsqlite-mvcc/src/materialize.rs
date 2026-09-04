@@ -400,7 +400,6 @@ impl WorkingPageState {
                     sort_key,
                 });
                 self.cells_by_key.insert(key_digest, idx);
-                Ok(())
             }
             CellDeltaKind::Update => {
                 let (key_digest, sort_key) = compute_cell_key_and_sort_key_from_delta(
@@ -424,7 +423,6 @@ impl WorkingPageState {
                     sort_key,
                 });
                 self.cells_by_key.insert(key_digest, idx);
-                Ok(())
             }
             CellDeltaKind::Delete => {
                 if !delta.cell_data.is_empty() {
@@ -442,9 +440,9 @@ impl WorkingPageState {
                     }
                 }
                 // Delete on non-existent is a no-op (idempotent)
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Build the final page from working state.

@@ -505,8 +505,8 @@ impl CommitSequenceCombiner {
     /// Claim a temporary slot for one-shot allocation.
     fn claim_slot(&self, tid: u64) -> usize {
         loop {
-            for i in 0..MAX_COMMIT_THREADS {
-                if self.owners[i]
+            for (i, owner) in self.owners.iter().enumerate() {
+                if owner
                     .compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {

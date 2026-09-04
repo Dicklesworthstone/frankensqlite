@@ -155,8 +155,8 @@ fn test_multi_group_encode() {
         let g_end = ((g + 1) * 2).min(10);
 
         let mut expected_parity = vec![0u8; 16];
-        for i in g_start..g_end {
-            for (j, b) in result.source_symbols[i].1.iter().enumerate() {
+        for (_, sym) in &result.source_symbols[g_start..g_end] {
+            for (j, b) in sym.iter().enumerate() {
                 expected_parity[j] ^= b;
             }
         }
@@ -433,8 +433,8 @@ fn test_conformance_summary() {
         let start = g * result.locality;
         let end = ((g + 1) * result.locality).min(result.k_source as usize);
         let mut expected = vec![0u8; 16];
-        for i in start..end {
-            for (j, b) in result.source_symbols[i].1.iter().enumerate() {
+        for (_, sym) in &result.source_symbols[start..end] {
+            for (j, b) in sym.iter().enumerate() {
                 expected[j] ^= b;
             }
         }

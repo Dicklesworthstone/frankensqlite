@@ -18647,7 +18647,6 @@ impl StagedPage {
                     return false;
                 }
                 buf.as_mut_slice().copy_from_slice(data);
-                true
             }
             StagedPageBacking::Owned(page_data) => {
                 if page_data.len() != data.len() {
@@ -18661,9 +18660,9 @@ impl StagedPage {
                     return false;
                 }
                 page_data.as_bytes_mut().copy_from_slice(data);
-                true
             }
         }
+        true
     }
 
     /// Attempt to overwrite this staged page with an owned [`PageData`].

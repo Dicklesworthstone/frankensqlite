@@ -136,7 +136,6 @@ fn run(args: &[String]) -> Result<(), String> {
                     .map_err(|error| format!("suite_json_serialize_failed: {error}"))?;
                 println!("{payload}");
             }
-            Ok(())
         }
         OutputMode::DryRunSummary | OutputMode::ExecuteSummary => {
             let mode = if config.mode == OutputMode::ExecuteSummary {
@@ -162,10 +161,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     .map_err(|error| format!("summary_json_serialize_failed: {error}"))?;
                 println!("{payload}");
             }
-
-            Ok(())
         }
     }
+
+    Ok(())
 }
 
 fn main() -> ExitCode {

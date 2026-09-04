@@ -608,11 +608,11 @@ mod tests {
         for _ in 0..n {
             let x = rng.sample_laplace(1.0);
             sum += x;
-            sum_sq += x * x;
+            sum_sq = x.mul_add(x, sum_sq);
         }
 
         let mean = sum / f64::from(n);
-        let variance = sum_sq / f64::from(n) - mean * mean;
+        let variance = f64::mul_add(mean, -mean, sum_sq / f64::from(n));
 
         // Laplace(0, 1): E[X] = 0, Var[X] = 2b² = 2.
         assert!(mean.abs() < 0.1, "Laplace mean should be ~0, got {mean:.4}");
@@ -634,11 +634,11 @@ mod tests {
         for _ in 0..n {
             let x = rng.sample_standard_normal();
             sum += x;
-            sum_sq += x * x;
+            sum_sq = x.mul_add(x, sum_sq);
         }
 
         let mean = sum / f64::from(n);
-        let variance = sum_sq / f64::from(n) - mean * mean;
+        let variance = f64::mul_add(mean, -mean, sum_sq / f64::from(n));
 
         // N(0, 1): E[X] = 0, Var[X] = 1.
         assert!(

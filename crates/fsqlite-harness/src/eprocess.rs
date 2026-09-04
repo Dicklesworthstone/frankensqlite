@@ -524,7 +524,7 @@ impl MixtureEProcess {
             } else {
                 i as f64 / (grid_size - 1) as f64
             };
-            let lambda = (log_lo + t * (log_hi - log_lo)).exp();
+            let lambda = f64::mul_add(t, log_hi - log_lo, log_lo).exp();
             let config = EProcessConfig {
                 p0,
                 lambda,

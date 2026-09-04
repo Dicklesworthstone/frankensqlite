@@ -159,7 +159,6 @@ fn run(args: &[String]) -> Result<(), String> {
             } else {
                 println!("{workflow}");
             }
-            Ok(())
         }
         OutputMode::ProbeDryRun | OutputMode::ProbeExecute => {
             let mode = if matches!(config.mode, OutputMode::ProbeExecute) {
@@ -183,7 +182,6 @@ fn run(args: &[String]) -> Result<(), String> {
                 })?;
                 println!("{payload}");
             }
-            Ok(())
         }
         OutputMode::MatrixJson => {
             if let Some(output) = &config.output {
@@ -193,10 +191,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     .map_err(|error| format!("durability_matrix_json_serialize_failed: {error}"))?;
                 println!("{payload}");
             }
-
-            Ok(())
         }
     }
+
+    Ok(())
 }
 
 fn main() -> ExitCode {

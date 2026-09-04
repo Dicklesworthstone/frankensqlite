@@ -3104,6 +3104,13 @@ impl Fts5PrecomputedScores {
     /// bit-identical to the promote path for the same corpus. Exact and prefix
     /// terms are keyed distinctly, so a prefix `al*` scores from its aggregated
     /// prefix doclist rather than the (empty) literal `al` doclist.
+    // BM25 accumulates each weighted term frequency as a separate multiply and
+    // add, exactly as stock SQLite's FTS5 does. Folding that into `mul_add`
+    // fuses the two roundings into one, which drifts from the reference scores
+    // the conformance keepers pin and from the sibling scoring paths in this
+    // file that stay unfused. Accuracy here means "matches SQLite", not
+    // "minimises error".
+    #[allow(clippy::suboptimal_flops)]
     fn bm25(&self, rowid: i64, score_terms: &[Fts5ScoreTerm], weights: &[f64]) -> f64 {
         let n = self.total_docs as f64;
         let avgdl = self.avgdl;
@@ -6957,7 +6964,14 @@ const BM25_IDF_FLOOR: f64 = 1.0e-6;
 ///
 /// Lower values mean better matches (following SQLite FTS5 convention where
 /// `rank` returns negative BM25 scores).
+// BM25 accumulates each weighted term frequency as a separate multiply and
+// add, exactly as stock SQLite's FTS5 does. Folding that into `mul_add`
+// fuses the two roundings into one, which drifts from the reference scores
+// the conformance keepers pin and from the sibling scoring paths in this
+// file that stay unfused. Accuracy here means "matches SQLite", not
+// "minimises error".
 #[must_use]
+#[allow(clippy::suboptimal_flops)]
 #[allow(clippy::similar_names)]
 pub fn bm25_score(
     index: &InvertedIndex,
@@ -7020,6 +7034,13 @@ pub fn bm25_score(
 /// matching stock and the lazy [`Fts5PrecomputedScores`] path. (Plain
 /// [`bm25_score`] scores the literal prefix token, which no document contains,
 /// so a prefix contributes nothing there.)
+// BM25 accumulates each weighted term frequency as a separate multiply and
+// add, exactly as stock SQLite's FTS5 does. Folding that into `mul_add`
+// fuses the two roundings into one, which drifts from the reference scores
+// the conformance keepers pin and from the sibling scoring paths in this
+// file that stay unfused. Accuracy here means "matches SQLite", not
+// "minimises error".
+#[allow(clippy::suboptimal_flops)]
 #[must_use]
 pub fn bm25_score_with_score_terms(
     index: &InvertedIndex,
@@ -8443,6 +8464,13 @@ pub(crate) trait Fts5DoclistProvider {
         Ok(frequencies.into_iter().collect())
     }
 
+    // BM25 accumulates each weighted term frequency as a separate multiply and
+    // add, exactly as stock SQLite's FTS5 does. Folding that into `mul_add`
+    // fuses the two roundings into one, which drifts from the reference scores
+    // the conformance keepers pin and from the sibling scoring paths in this
+    // file that stay unfused. Accuracy here means "matches SQLite", not
+    // "minimises error".
+    #[allow(clippy::suboptimal_flops)]
     fn bm25_score(
         &self,
         rowid: i64,
@@ -8496,6 +8524,13 @@ pub(crate) trait Fts5DoclistProvider {
     /// `bm25_score` (one entry per doc, df = distinct docs). Scoring a prefix by
     /// its literal token (as string-flattened `bm25_score` did) misses every
     /// other expanded term, understating the score.
+    // BM25 accumulates each weighted term frequency as a separate multiply and
+    // add, exactly as stock SQLite's FTS5 does. Folding that into `mul_add`
+    // fuses the two roundings into one, which drifts from the reference scores
+    // the conformance keepers pin and from the sibling scoring paths in this
+    // file that stay unfused. Accuracy here means "matches SQLite", not
+    // "minimises error".
+    #[allow(clippy::suboptimal_flops)]
     fn bm25_for_score_terms(
         &self,
         rowid: i64,

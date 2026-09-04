@@ -348,22 +348,16 @@ pub fn symbol_mul_into(coeff: u8, src: &[u8], out: &mut [u8]) -> Result<()> {
     );
 
     match coeff {
-        0 => {
-            out.fill(0);
-            Ok(())
-        }
-        1 => {
-            out.copy_from_slice(src);
-            Ok(())
-        }
+        0 => out.fill(0),
+        1 => out.copy_from_slice(src),
         _ => {
             let table = gf256_mul_table(coeff);
             for (dst_byte, src_byte) in out.iter_mut().zip(src.iter()) {
                 *dst_byte = table[usize::from(*src_byte)];
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 /// RaptorQ fused multiply-add (`dst ^= c * src`) in GF(256).

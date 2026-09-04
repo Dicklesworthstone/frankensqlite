@@ -12412,14 +12412,14 @@ fn emit_join_result_columns(
             ResultColumn::Star => {
                 // Emit all columns from all tables.
                 for (cursor_idx, (table, _)) in tables.iter().enumerate() {
-                    for col_idx in 0..table.columns.len() {
+                    for (col_idx, column) in table.columns.iter().enumerate() {
                         let dst = out_regs + reg_offset;
                         // bd-ghiey: an INTEGER PRIMARY KEY lives in the b-tree
                         // rowid, not the record — read it via Rowid (see the
                         // Expr-path note in `emit_join_expr`), so a `SELECT *`
                         // over a TEMP/shadowed table in a join projects the id
                         // instead of NULL.
-                        if table.columns[col_idx].is_ipk {
+                        if column.is_ipk {
                             b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
                         } else {
                             b.emit_op(
@@ -12440,9 +12440,9 @@ fn emit_join_result_columns(
                 for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
                     if join_qualifier_matches(Some(&table_name.name), table, *alias) {
                         matched = true;
-                        for col_idx in 0..table.columns.len() {
+                        for (col_idx, column) in table.columns.iter().enumerate() {
                             let dst = out_regs + reg_offset;
-                            if table.columns[col_idx].is_ipk {
+                            if column.is_ipk {
                                 b.emit_op(Opcode::Rowid, cursor_idx as i32, dst, 0, P4::None, 0);
                             } else {
                                 b.emit_op(
@@ -34499,10 +34499,7 @@ fn can_use_once_materialized_in_probe_source(
     _operand: &Expr,
     scan_ctx: &ScanCtx<'_>,
 ) -> bool {
-    if in_probe_source_references_outer_scan(probe_source, scan_ctx) {
-        return false;
-    }
-    true
+    !in_probe_source_references_outer_scan(probe_source, scan_ctx)
 }
 
 fn expr_contains_nested_subquery(expr: &Expr) -> bool {

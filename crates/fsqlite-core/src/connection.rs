@@ -71790,7 +71790,6 @@ impl Connection {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Prove every page in the image is owned by exactly one structure.
     ///
     /// `owners` decides residency: `integrity_check` passes a `Resident` owner

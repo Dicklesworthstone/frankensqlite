@@ -143,7 +143,7 @@ impl MpcCommitController {
         // been picked; `rho = 0` means "jump immediately", larger `rho` means
         // slower response.
         let alpha = 1.0 / (1.0 + self.rho);
-        let u = self.u_prev + alpha * (u_star - self.u_prev);
+        let u = alpha.mul_add(u_star - self.u_prev, self.u_prev);
         let u = u.clamp(0.0, self.max_rate);
         self.u_prev = u;
         u

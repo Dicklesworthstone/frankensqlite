@@ -502,7 +502,7 @@ mod tests {
         let observed = false_positives as f64 / probes as f64;
         let theoretical = qf.theoretical_fp_rate();
         assert!(
-            observed <= theoretical * 6.0 + 1e-3,
+            observed <= theoretical.mul_add(6.0, 1e-3),
             "FP rate too high: observed={observed}, theoretical={theoretical}"
         );
     }

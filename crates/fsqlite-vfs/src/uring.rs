@@ -1725,7 +1725,7 @@ mod tests {
     fn test_io_uring_vfs_name_and_status() {
         let vfs = IoUringVfs::new();
         assert_eq!(vfs.name(), "io_uring");
-        assert!(!vfs.status().is_empty());
+        assert_ne!(vfs.status(), "");
         assert_eq!(vfs.is_memory(), vfs.unix.is_memory());
     }
 
@@ -2604,11 +2604,11 @@ mod tests {
         let _guard = io_uring_test_guard();
         let vfs = IoUringVfs::new();
         let snap = vfs.status_snapshot();
-        assert!(!snap.backend.is_empty());
+        assert_ne!(snap.backend, "");
         assert!(!snap.disabled);
         assert!(snap.disable_reason.is_none());
-        assert!(!snap.initial_status.is_empty());
-        assert!(!snap.status.is_empty());
+        assert_ne!(snap.initial_status, "");
+        assert_ne!(snap.status, "");
     }
 
     #[test]

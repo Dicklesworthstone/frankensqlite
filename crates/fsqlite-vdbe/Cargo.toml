@@ -92,6 +92,10 @@ similar_names = { level = "allow", priority = 1 }
 too_many_lines = { level = "allow", priority = 1 }
 unreadable_literal = { level = "allow", priority = 1 }
 uninlined_format_args = { level = "allow", priority = 1 }
+# See the workspace `[workspace.lints.clippy]` note: `assert_is_empty` fires on
+# every `assert!(x.is_empty())` test assertion and only changes the failure
+# message, never correctness.
+assert_is_empty = { level = "allow", priority = 1 }
 assertions_on_constants = { level = "allow", priority = 1 }
 bool_to_int_with_if = { level = "allow", priority = 1 }
 case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }

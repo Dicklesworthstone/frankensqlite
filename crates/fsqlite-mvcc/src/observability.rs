@@ -619,17 +619,14 @@ pub(crate) fn set_conflict_heat_test_capture_enabled(enabled: bool) {
 }
 
 fn conflict_heat_recording_enabled() -> bool {
-    if !CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed) {
-        return false;
-    }
-
     #[cfg(test)]
     {
-        CONFLICT_HEAT_TEST_CAPTURE_ENABLED.get()
+        CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed)
+            && CONFLICT_HEAT_TEST_CAPTURE_ENABLED.get()
     }
     #[cfg(not(test))]
     {
-        true
+        CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed)
     }
 }
 

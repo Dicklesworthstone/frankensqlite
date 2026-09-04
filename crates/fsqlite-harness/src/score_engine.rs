@@ -221,7 +221,7 @@ fn regularized_ibeta(x: f64, a: f64, b: f64) -> f64 {
         // Even step: a_{2m}
         let aa = m_f64 * (b - m_f64) * x / ((qam + m2) * (a + m2));
 
-        d = 1.0 + aa * d;
+        d = aa.mul_add(d, 1.0);
         if d.abs() < TINY {
             d = TINY;
         }
@@ -235,7 +235,7 @@ fn regularized_ibeta(x: f64, a: f64, b: f64) -> f64 {
         // Odd step: a_{2m+1}
         let aa = -((a + m_f64) * (qab + m_f64) * x) / ((a + m2) * (qap + m2));
 
-        d = 1.0 + aa * d;
+        d = aa.mul_add(d, 1.0);
         if d.abs() < TINY {
             d = TINY;
         }

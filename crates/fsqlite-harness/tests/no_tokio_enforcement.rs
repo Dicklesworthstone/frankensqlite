@@ -199,6 +199,10 @@ fn visit_rs_files(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
 // ---------------------------------------------------------------------------
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_cx_parameter_on_vfs_trait() {
     use fsqlite_error::Result;
     use fsqlite_types::LockLevel;

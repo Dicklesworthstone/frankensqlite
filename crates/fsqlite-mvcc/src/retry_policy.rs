@@ -762,7 +762,7 @@ mod tests {
 
         assert!((ctrl.posterior(0).alpha - alpha_zero_before).abs() < 1e-10);
         assert!((ctrl.posterior(10).alpha - alpha_ten_before).abs() < 1e-10);
-        assert!((ctrl.posterior(5).alpha - (alpha_five_before * 0.95 + 1.0)).abs() < 1e-10);
+        assert!((ctrl.posterior(5).alpha - alpha_five_before.mul_add(0.95, 1.0)).abs() < 1e-10);
     }
 
     #[test]

@@ -40,6 +40,10 @@ fn workspace_root() -> &'static Path {
 // ---------------------------------------------------------------------------
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_cx_param_audit_vfs_traits() {
     fn _open<V: Vfs>(v: &V, cx: &Cx, flags: VfsOpenFlags) -> Result<(V::File, VfsOpenFlags)> {
         v.open(cx, Some(Path::new("x.db")), flags)
@@ -111,6 +115,10 @@ fn test_cx_param_audit_vfs_traits() {
 }
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_cx_param_audit_mvcc_pager_trait() {
     async fn _begin<P: MvccPager>(pager: &P, cx: &Cx) -> Result<P::Txn> {
         pager.begin(cx, TransactionMode::Deferred).await
@@ -154,6 +162,10 @@ fn test_cx_param_audit_mvcc_pager_trait() {
 }
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_cx_param_audit_btree_cursor_ops_trait() {
     async fn _index_move_to<C: BtreeCursorOps>(c: &mut C, cx: &Cx) -> Result<SeekResult> {
         c.index_move_to(cx, b"alpha").await
@@ -206,6 +218,10 @@ fn test_cx_param_audit_btree_cursor_ops_trait() {
 }
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_cx_param_audit_checkpoint_page_writer_trait() {
     async fn _write_page<W: CheckpointPageWriter>(w: &mut W, cx: &Cx) -> Result<()> {
         w.write_page(
@@ -258,6 +274,10 @@ impl CollationFunction for DummyCollation {
 }
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_pure_compute_exclusion_collation_compare_no_cx() {
     fn _compare<C: CollationFunction>(coll: &C, left: &[u8], right: &[u8]) -> Ordering {
         coll.compare(left, right)
@@ -266,6 +286,10 @@ fn test_pure_compute_exclusion_collation_compare_no_cx() {
 }
 
 #[test]
+// The `_`-prefixed local fns below are never called: they exist only to be
+// coerced to fn pointers so the trait signatures get type-checked. The
+// underscore is the signal, so keep it rather than rename to please the lint.
+#[allow(clippy::used_underscore_items)]
 fn test_pure_compute_exclusion_scalar_call_cpu_only_no_cx() {
     fn _invoke<S: ScalarFunction>(func: &S, args: &[SqliteValue]) -> Result<SqliteValue> {
         func.invoke(args)

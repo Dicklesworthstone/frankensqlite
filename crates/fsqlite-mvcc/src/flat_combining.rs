@@ -647,14 +647,14 @@ impl FlatCombiner {
         let mut current = self.value.load(Ordering::Acquire);
 
         // Scan all slots for pending requests.
-        for i in 0..MAX_FC_THREADS {
-            let state = self.slots[i].state.load(Ordering::Acquire);
+        for slot in &self.slots {
+            let state = slot.state.load(Ordering::Acquire);
             if state == SLOT_EMPTY || (state & RESULT_BIT) != 0 {
                 continue; // Empty or already has a result.
             }
 
             let op = state;
-            let arg = self.slots[i].payload.load(Ordering::Acquire);
+            let arg = slot.payload.load(Ordering::Acquire);
             batch_size += 1;
 
             let result = match op {
@@ -667,10 +667,8 @@ impl FlatCombiner {
             };
 
             // Publish result: set payload, then mark state as RESULT.
-            self.slots[i].payload.store(result, Ordering::Release);
-            self.slots[i]
-                .state
-                .store(RESULT_BIT | op, Ordering::Release);
+            slot.payload.store(result, Ordering::Release);
+            slot.state.store(RESULT_BIT | op, Ordering::Release);
         }
 
         self.value.store(current, Ordering::Release);
