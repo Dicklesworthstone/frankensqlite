@@ -1,5 +1,428 @@
 # State Of The Codebase And Next Steps
 
+## Reality check — 2026-09-04
+
+This section supersedes the historical assessment below for present-day status.
+It applies the complete `reality-check-for-project` workflow: documented goals,
+source and shipped behavior, backlog coverage, a bridge plan, ambition rounds,
+and repeated Beads refinement. It is an assessment and implementation backlog,
+not a claim that the planned engine changes have been implemented.
+
+### Verdict and evidence boundary
+
+FrankenSQLite is a substantial, functioning SQL database implementation. It is
+not finished, not established as a fully compatible SQLite replacement, and not
+yet delivering its full concurrent-writer, native durability, and distributed
+storage vision through production entrypoints. The principal problem is the
+distance between sophisticated component implementations and their integration
+into the database users actually open. A second problem is evidence that proves
+less than its surrounding prose or closed Bead implies.
+
+The source inspection started at `069063ea1076e3944e4e750b33284cc64d183f7e` on
+`main`, with pre-existing edits to `connection.rs` and two GH408 probe files.
+Peers continued editing that file during the review. Source findings identify
+symbols as well as paths; they are not an assertion that a clean exact revision
+was tested. No engine source was changed by this assessment.
+
+Current working-tree core SQL proof is **71 passed, 0 failed** after a peer's
+lock repair. Both the initial local conformance
+attempt and the permitted RCH retry on `vmi1227854` exited 101 before running a
+test: Cargo needed to update `Cargo.lock` under `--locked`. The manifest adds
+`stacker`, while that initial lock lacked `stacker` and `psm`. The first RCH content-receipt
+attempt separately rejected the existing `.doctor/latest` symlink; retrying the
+normal remote lane reached Cargo and confirmed the lock failure. Do not relax
+`--locked` or count either failure as a product-test result.
+
+A peer then repaired the working lock with stacker 0.1.25 and psm 0.1.32.
+The audit detected that change and launched a fresh locked conformance run on
+RCH worker `hz4`; it passed dependency resolution and started compiling at
+2026-09-04T22:26:03Z. Local HEAD had advanced to metadata commit
+`1449aa98cfebd7d9854f6ccc280fe7d78ee81941`, with peer source edits still present.
+This is a working-tree run, not clean-commit certification. It finished at
+2026-09-04T22:31:16Z with exit 0: 71 passed, 0 failed, 0 ignored, 0 filtered;
+test execution took 0.43 seconds after 5m11s compilation. All 71 named test
+verdicts were independently attributed despite interleaved logs. The suite
+also emitted 76 `drop_close` warnings about missing awaited close, so it does
+not prove region quiescence or complete transactional cleanup. That residual
+was added to existing async-test migration owner `bd-ybde3`. Workspace-wide
+check/clippy/fmt, full conformance and concurrency certification were not run
+by this assessment. No engine code was changed by this assessment.
+
+Shipped behavior was tested separately using the official Darwin arm64
+**v0.3.16** asset, published 2026-09-04, whose release manifest names source
+`90d340d9de1d0121b8715096166abff5d2c6d58a`. The archive SHA-256 matched the
+GitHub asset digest
+`0fb98eee3a828a270f222611537bb1b6b63144a1b0629efbc773451627efc8c1`.
+This checks archive integrity, not the minisign signature. The diagnostic
+oracle was Apple's SQLite **3.51.0**, not the canonical parity target 3.52.0;
+these probes are not a strict conformance certificate.
+
+- Passed on the released binary: basic CRUD, joins/CTEs/windows, savepoints,
+  JSON extraction/table iteration, FTS5 MATCH, R-tree, STRICT integer coercion,
+  and real `defer_foreign_keys` behavior. Ordinary tables, FTS5, and UTF-16LE
+  text reopened successfully. Stock SQLite read the files and returned
+  `integrity_check=ok`.
+- Four overlapping CLI processes each committed ten inserts to a disjoint
+  table. All forty rows and sums were correct, and stock integrity checking
+  passed. Process lifetimes overlapping does **not** prove transaction overlap,
+  SSI correctness, many-writer scaling, fairness, or crash safety.
+- Reproduced **GH407 / bd-0pkki**: an outer `COUNT(*)` over an `IN` subquery
+  containing `GROUP BY ... HAVING count(DISTINCT ...)` returned `NULL` where
+  stock returned `1`, both with successful exits. This is a silent wrong result.
+- `PRAGMA key` accepted a key, but the file retained the ordinary SQLite header
+  and stock SQLite read the plaintext without a key. Encryption is not wired.
+- FTS3 and the Geopoly virtual table explicitly failed as unimplemented.
+  File-backed historical SQL failed with a missing-snapshot error.
+
+Probe inputs, JSON outcomes, release metadata, hashes, and complete failed
+build logs are retained at
+`/tmp/frankensqlite-reality-20260904-wpCKDs`. That is a local audit bundle,
+not a permanent public artifact. The Beads contain the important reproductions
+and acceptance conditions so implementation does not depend on that directory.
+
+### Document authority and intake
+
+AGENTS.md (975 lines) and README.md (3,020 lines) were read completely. The
+parallel source-investigation lanes also completed the canonical comprehensive
+spec (18,208 lines), its CODEX companion (2,230), both identical spec-difference
+documents, all seventeen other planning documents (8,878), all 28 design
+documents, both ADRs, concurrency/invariant/recovery contracts, relevant crate
+READMEs and proof packs, FTS5 architecture and proof contracts, and worker/SDK
+documentation. The release architecture and connection-decomposition plans
+were read separately. Historical assurance essays were examined as analysis,
+not current test receipts.
+
+The performance negative ledger received its full 636-heading inventory plus
+the complete relevant entries; its entire 22,245-line historical body was not
+read. This assessment ran no optimization experiment and claims no new
+performance measurement. The source investigation traced each goal's runtime
+seam; it was not an exhaustive line-by-line audit of all Rust source.
+
+The documents disagree on important requirements. These are defects to repair
+in their existing sources, not permission to shrink the goal:
+
+1. Canonical spec §2.4 still prescribes serialized default BEGIN, directly
+   violating AGENTS and both live `concurrent_mode_default = true` constructors.
+   Preserve concurrent defaults; correct the stale specification.
+2. Commit visibility must use committed `CommitSeq`, with a retained floor
+   version for old snapshots. Older TxnId/in-flight algorithms are historical.
+   Resolve the spec's incompatible page-witness rules before implementing them.
+3. RaptorQ's probabilistic decoding cannot support “any K symbols always
+   reconstruct.” State rank-failure/slack and corruption-model assumptions.
+   TLA skeleton invariants equal to TRUE are not whole-engine checked proofs.
+4. “Wait-free modulo RwLock” and instruction-count-derived nanosecond worst-case
+   waits are not scheduler-independent progress proofs. A queue model defining
+   `L=min(C, lambda*W)` cannot trigger on `L>C`. Repair the actual mathematics.
+5. Process death, power loss, unsynced append failure, and durable-but-unpublished
+   commits have different outcomes. An un-fsynced write need not disappear on
+   process reopen; a durable commit must not be called rolled back just because
+   its notification was lost.
+6. README's synchronous examples, unavailable `defer_foreign_keys` claim,
+   universal aligned/no-copy page claims, and channel-coordinator description
+   conflict with current code. The C example confuses ROW (100) and DONE (101).
+7. Actions is disabled, verified live on 2026-09-04. Owner decision `bd-0p0sp`
+   keeps it off and uses DSR. Workflow membership is not an executed gate;
+   several old plans still require auto-publish or merge protection by Actions.
+
+### Vision checklist and gap coverage
+
+`PARTIAL` means some real implementation; `UNPROVEN` means the stated guarantee
+has not been demonstrated on the audited source; `INTEGRATION GAP` means useful
+components exist without the promised live database path. A passing shipped
+smoke is explicitly narrower than full acceptance. Closed primitive work is
+retained as useful evidence and is not counted as a completed product feature.
+
+| # | Concrete promised user outcome | Current reality | Existing owner / missing seam |
+|---|---|---|---|
+| V01 | Ordinary SQL through Rust and CLI | Real; released smoke and 71 working-tree core SQL oracle tests pass; lifecycle warnings remain | `bd-1dp9`, `bd-2yqp6`, `bd-ybde3`; complete reproducibility checks remain |
+| V02 | Full SQLite semantic parity | PARTIAL; GH407 wrong result, trigger limits, encoding/collation and WITHOUT ROWID residuals | `bd-0pkki`, `bd-3lj3`, `bd-nc5hv`, `bd-yqjjx` |
+| V03 | Concurrent writers enabled by default | Implemented in both constructors and harness defaults; preserve as an invariant | Existing MVCC/concurrency owners; never introduce global write serialization |
+| V04 | Page-level conflict handling with serializability and crash safety | Real live FCW/SSI and page ownership; unresolved allocator/orphan/multi-page frontiers | `bd-ioq6x`, `bd-i09t3`, `bd-filebacked-mvcc-planning-frontier-zvwzb`, existing keeper owners |
+| V05 | Concurrency evidence measures actual concurrent storage execution | Two named canonical suites run FrankenSQLite sequentially in memory | New selector/observed-overlap keeper under existing certification work |
+| V06 | High throughput and bounded tail latency from many writers | UNPROVEN at this source; physical commit awaits under registry guard | `bd-i0tn6`, `bd-1b7j0.1`, `bd-uh1fv`, `bd-kjw76`; profile before changing safe publication |
+| V07 | Cross-process MVCC/SSI/GC authority | PARTIAL; live process-local registry plus WAL/lock/certificate mechanisms | `bd-zywqc.20`, `bd-2385c`, `bd-1goc2` |
+| V08 | Stock-compatible durable files on supported OSes | Basic macOS reopen works; Windows lock plane real, shared-content mapping still heap-backed | Existing Windows lock receipt plus missing GH395 content-mapping owner |
+| V09 | Cross-database ATTACH transactions atomic through crashes | In-process transaction handling exists; crash window remains | `bd-attached-multidb-crash-atomicity-mhbf1` |
+| V10 | Structured async work and bounded cancellation | Async public path real; sync/truncate still blocking and coordinator task only awaits shutdown | `bd-2jpu6`, `bd-28z4i.1`, `bd-1b7j0.1`, `bd-33igf` |
+| V11 | Effective planner and bounded storage execution | Single-table planner genuinely wired; skip-scan and interpreter/fallback retirement incomplete | `bd-nax2y`, `bd-1dp9.6.7.3/.5/.6` |
+| V12 | Complete useful extensions | JSON/FTS5/Rtree real; FTS3, Geopoly vtab, automatic Session integration incomplete | `bd-26rjq`, `bd-9u4zp`; keep feature denominator intact |
+| V13 | FTS5 works on large consumer corpora with bounded memory | Lazy MATCH and shadow persistence real; scoring/full scans/writes can hydrate entire corpus | `bd-fts5-lazy-shadow-reads-itcc4.5/.6`, `bd-2nzo8.5.3` |
+| V14 | PRAGMA resource controls change real engine behavior | cache_size/mmap_size/temp_store/threads stored but inert | `bd-dwjnq`; split concrete resources and prove effects |
+| V15 | Native ECS database through public SQL | INTEGRATION GAP; capsule/record/codec machinery exists, public pager remains compatibility path | `bd-3mgq5` needs granular runtime children |
+| V16 | Native crash-durable two-fsync commit and recoverable indexes | `native_commit` toggles booleans, accumulates markers; no actual fsync and SSI revalidation skipped | Reuse closed `bd-15jh` primitives; new durable integration and crash keepers |
+| V17 | Durable SSI witnesses and independently replayable commit proofs | Object/model machinery exists; no demonstrated live durable witness plane in both modes | Reuse `bd-3t3.9`, `bd-1if1`; missing production bridge |
+| V18 | Ordinary database self-heals using RaptorQ | Optional FEC hooks/components exist; ordinary Connection adapter starts without hook | `bd-ewwia`, `bd-d1tdm`, native integration; require genuine corruption recovery |
+| V19 | Authenticated, encrypted pages and durable key rotation | Crypto modules exist; released PRAGMA key silently leaves plaintext | `bd-1vwiy`; real compat/native paths and wrong-key/restart tests |
+| V20 | Historical SQL survives reopen, DDL, compaction and retention | History infrastructure exists; file-backed SQL probe fails | `bd-cd7jt`, `bd-acg74`, `bd-yaomh.*`, `bd-1mt2x` |
+| V21 | Native replication, quorum durability and snapshot catch-up | Closed transport/model components; missing full source-SQL to durable follower SQL path | Closed `bd-1hi.19`/`bd-2kc4`; new live integration children |
+| V22 | Real tiered storage with safe local reclamation | Closed model components; no proven production upload/receipt/evict/refill path | Closed `bd-1hi.29`/`bd-2d3i.3`; `bd-28z4i.6.1` only partial coverage |
+| V23 | Durable epochs, authenticated bootstrap and retention-safe native compaction | Component state machines exist, real publication/restart obligations unproved | Reuse epoch/compaction machinery; new native integration children |
+| V24 | First-class SQL queues, leases, worker ranges and honest diagnostics | Closed track uses ordinary test-created tables and seeded diagnostic strings | Closed `bd-agent-swarm-coordination-transparency-8jr6u`; missing production registration/storage and telemetry |
+| V25 | SLO policy controls real execution safely | Closed pure evaluator/report; Production source and actuator remain future | Closed `bd-swarm-slo-resource-governor-qb256`; new sampler/actuator seams, reuse telemetry/composition owners |
+| V26 | Browser persistence, workers, SDK ownership and lifecycle | Promise/worker/memory path real; OPFS/IDB not implemented; transaction/dispose state defects | Existing WASM epics; refine `bd-3mwjr`, `bd-3r8ay`, `bd-odjvh` |
+| V27 | Consumable C/Rust interfaces and examples | Simple C facade real; step eagerly materializes rows; Rust/C README examples broken | Simple-use C acceptance was valid; new executable-example keeper, review `bd-2jpu6.6` against async architecture |
+| V28 | Honest release and parity certification | DSR release exists; Actions off; one locked SQL target passes, full exact-release proof remains open | `bd-1dp9.9.8`, `bd-zywqc.9`, `bd-wwqen.8`, DSR canary owner |
+| V29 | Byte-bounded memory, snapshot age, and mathematically justified progress | PARTIAL/UNPROVEN across live subsystems; stale proof claims cannot certify budgets | Existing trigger/resource work; verify complete live budget coverage and repair proofs |
+| V30 | Physical multi-WAL shards with atomic cross-shard decisions | Parallel buffer/segment machinery exists; ordinary adapter still has one WAL path | Current parallel-WAL owners plus staged `bd-6hdwo.23/.24` |
+| V31 | Durable consensus with explicit linearizable reads | No production election/log-agreement/read-consistency protocol found | Staged `bd-6hdwo.25/.26`, after real replication/snapshots |
+| V32 | GPU acceleration of real bulk RaptorQ work | No GPU provider found; CPU codec is real | Staged `bd-6hdwo.27/.28`, measured hardware admission and native snapshot consumer |
+| V33 | PMEM-native durability without ordinary WAL | No PMEM VFS/persistence-domain path found | Staged `bd-6hdwo.29/.30`; actual hardware proof required |
+| V34 | Public vectorized analytical SQL and parallel workers | Operator modules real but not live SQL dispatch; batch MakeRecord is a real narrower optimization | Refined `bd-b434d`, companion `bd-6hdwo.33` |
+| V35 | Persistent automatically materialized compressed column groups | In-memory cracking/batches exist, persistent dual-store integration absent | Staged `bd-6hdwo.31/.32` |
+
+The starting Beads snapshot contained **3,851** issues: 3,392 closed, 380 open,
+62 in progress, 2 explicitly blocked, 11 deferred, and 4 batch-pending.
+Derived blocked-by-dependency counts overlap those statuses. The closed share
+is not a percentage of product completion.
+
+Implementing every previously open/in-progress Bead would not, by itself,
+close the entire vision. Major SQL/browser/performance work is already covered,
+but several live-integration requirements are represented only by closed
+component tasks. Native work has coarse coverage without sufficient executable
+decomposition. Some open acceptance criteria are stale or permit simulated
+evidence, and an epic was incorrectly a blocking prerequisite of its own
+leaves. Refining that graph is part of this assessment, not an excuse to
+replace the backlog or reopen every historical component.
+
+### Bridge plan: deliver user-visible capabilities with separate proof
+
+**First restore a trustworthy execution baseline.** Resolve manifest/lock
+closure through the approved Cargo route, retain the current toolchain, and
+run the exact source core SQL oracle plus required workspace check/clippy/fmt.
+Keep the failing GH407 SQL in its existing owner. Bind canonical concurrency
+selectors to actual file-backed overlap and reject falsely labeled sequential
+receipts. Correct authority contradictions and execute consumer examples.
+
+**Stabilize compatibility correctness before performance surgery.** Existing
+P0 allocator, orphaned-page, multi-page update, busy-recovery and attached-DB
+owners retain their scopes. `bd-9inpb` is closed; its successful allocator
+repair does not close `bd-ioq6x`. Finish the live cross-process authority and
+Windows content mapping with real stock interoperability. Channel unification
+and moving physical I/O out of the registry must preserve allocation ownership,
+durable sequence reservation, publication order, cancellation and retry safety.
+Do not shorten the lock by dropping its current correctness protection.
+
+**Complete SQL and resource behavior in existing tracks.** Retire specific
+fallbacks only after their oracle coverage exists; preserve the real planner
+integration already landed. Extend FTS5 acceptance to ranked/snippet queries,
+small writes, rollback and reopen on the actual large corpus, measuring RSS and
+hydration. Wire resource PRAGMAs to real budgets. Finish heap trigger frames,
+extension functionality, browser storage and SDK transaction/lifecycle rules.
+Do not use nominal API presence, fake workers, or quick small-corpus MATCH as
+proof of those goals.
+
+**Build native mode as a vertical database path.** Reuse existing codecs and
+models, then add: durable authenticated object-store bootstrap; real two-fsync
+commit/recovery; a SQL pager that persists schema/pages/indexes; durable SSI
+witnesses and replayable proofs in both modes; streaming multi-block snapshots;
+retention-safe compaction; epoch/key transitions; genuine follower apply and
+quorum receipts; and real remote tier upload/refill/eviction. Each implementation
+has a separate test Bead. Encryption and historical SQL keep their canonical
+owners and gain mode-specific runtime acceptance. Compatibility stays available
+and concurrent writers stay enabled by default in both modes.
+
+**Finish closed features at their missing boundaries.** SQL coordination must
+register real queue/lease/range surfaces on a fresh Connection without test
+CREATE TABLE substitutes. Diagnostics must come from executed statements and
+actual conflicts/fallbacks. The SLO governor must first receive real shadow
+signals, then act at bounded cancel-aware admission/helper/checkpoint seams,
+with a verified kill switch. Reuse the evaluator and contracts; do not build
+another report/schema framework in place of the missing engine integration.
+
+**Qualify the exact release through DSR/local/RCH execution.** Run semantic,
+concurrency, crash, corruption and resource lanes separately; bind every result
+to revision, dirty-source manifest, platform, toolchain, feature set, command,
+profile, seed, oracle version, outcomes and artifact hashes. A skipped build,
+zero tests, unsupported mode, both-engines-error result or model-only test must
+not become a pass. Preserve the full canonical feature denominator. Performance
+claims require the same-source representative matrix, correct release-perf and
+portable-versus-native provenance, quiet-host authorization where needed, and
+the negative-results ledger before experimentation.
+
+### Shared implementation and test contract
+
+Every new implementation Bead states its runtime seam, prerequisite capability,
+error/cancellation behavior and observable user outcome. Every companion test
+Bead covers positive, boundary, failure and adversarial cases, including a
+negative control that fails when the intended path is bypassed. Storage tests
+use actual public Connection, pager and WAL/native files; process-kill tests
+use sacrificial test-owned database copies. No user or peer files may be deleted.
+
+Use existing crate test directories and runner infrastructure, never inert
+workspace-root tests. For relevant `bd-zywqc` fixes, enumerate all nine taxonomy
+categories or a permitted explicit exemption. Log with the canonical E2E schema
+(`run_id`, UTC timestamp, phase, event_type, scenario/seed and context paths),
+adding transaction/process/connection IDs, mode, observed overlap, commit and
+durability boundaries where applicable. Never log keys or plaintext secrets.
+Each closure names commands, revision, platform, actual test records, exit
+codes, first divergence and reproducible artifacts. Actions stays off.
+
+### Iteration record
+
+**Ambition 1 — replace native feature labels with a durable database sequence.**
+The initial bridge was too coarse about native storage. The following bounded
+capabilities preserve all native promises and make their prerequisites explicit.
+Every row receives a separate implementation and companion proof Bead; existing
+encryption/history owners retain their identities.
+
+| Node | Runtime deliverable | Prerequisite capabilities | Distinguishing acceptance |
+|---|---|---|---|
+| N0 | Correct snapshot ESI, genuine repair decoding, fail-closed codec errors | Existing codec | Permanently erase source ESI 0; reconstruct exact bytes from real repair symbols; no success-seed search |
+| N1 | Durable SymbolStore and authenticated native root bootstrap | Existing envelopes/logs | Actual native files reopen in another process; torn roots and wrong identities fail closed |
+| N4 | Durable witnesses and replayable SSI proof, both modes | N1 and live SSI | Recompute write-skew/phantom verdict from persisted evidence after process restart |
+| N2 | Real capsule/fsync1/marker/fsync2/publication/ACK | N1, N4 | Kill at every boundary; every acknowledged transaction survives; no phantom commit |
+| N3 | Public native SQL pager, schema, version and index storage | N2 | CRUD/DDL/index/transaction oracle after reopen; repair/rebuild indexes from committed history |
+| N5 | Consistent resumable multi-block checkpoint/snapshot | N0, N3, N4 | Transfer during writes with loss/reordering; second database agrees at one committed boundary |
+| N6 | Durable native compaction and retention | N3, N4, N5 | Cross-process old snapshots stay readable; kill/cancel every publish phase; measure real reclaimed bytes |
+| N7 | Authenticated epoch/policy rotation | N1, N2; native SQL for final keeper | Reject forged/future epochs and old-policy new publication; retain authenticated historical epochs |
+| N8 | Real follower apply, transport and durable remote quorum | N0, N3, N4, N7 | Follower SQL survives restart; pre-fsync ACK cannot count; duplicate/unauthorized identities cannot satisfy quorum |
+| N9 | Remote tier upload, verified receipt, safe eviction and refill | N6, N7; shared durable receipt contract | Interrupted upload retains local safety; historical reads refill real remote bytes after restart |
+| N10 | Real page encryption and key rotation | Compat path independent; native N3/N7 | Missing/wrong key fails after reopen; ciphertext repair and crash-safe KEK rewrap of the stable DEK |
+| N11 | Historical schema/page/index SQL | Native N3/N6; existing compatibility history path | DDL/drop/index changes, timestamp edges and retention races resolve to historical contents |
+| N12 | Same public SQL corpus in actual compat and native modes | N3 | A native label over memory/compat storage is rejected; results remain separated by mode |
+
+This decomposition exposed concrete defects before any network integration:
+`snapshot_shipping` passes `isi-k` to the locked asupersync codec that requires
+ESI >= K; both receive paths currently reconstruct only when all source symbols
+arrive; encoding failure and WASM paths can emit deterministic fake repair
+packets. Existing tests can call a run repaired merely because a repair packet
+was seen before every source packet eventually arrived. These are source
+deductions, not executed reproductions. N0 must fix the real codec call and
+decoder integration, with permanent erasure tests, before N5/N8 can qualify.
+
+N4 precedes N2: witness persistence integrates with the existing live SSI seam,
+so proof publication does not create a circular native-commit dependency.
+Existing component implementations and closure history remain credited where
+supported. Each original acceptance contract is assessed separately; closed
+status alone does not establish runtime integration.
+
+**Ambition 2 — test the consumer operation that defeats the abstraction.**
+The first native pass still allowed a component to report success while the
+user operation failed. Add these concrete adversarial acceptance boundaries:
+
+- SDK callback transaction ownership: pause a callback after writing A, issue
+  unrelated database write B, then roll back A. B must be explicitly refused or
+  execute outside A; a successful B must not disappear. Escaped transaction
+  handles reject after completion. Preserve callback errors if rollback fails.
+- SDK disposal: every in-flight request settles exactly once on close/crash,
+  later database and prepared-handle requests fail promptly, and repeated close
+  has a defined outcome. Current `pending.clear()` can abandon promises.
+- FTS5: cold-open a large index, run MATCH with BM25/snippet, make a small write,
+  roll it back, and reopen. Record hydrated rows and peak RSS throughout, not
+  just lazy-open or small MATCH success. Preserve old real-corpus owners.
+- Encryption: split compatibility and native implementation prerequisites so
+  a usable compatibility encryption path is not blocked on the whole native
+  architecture. Missing-key reopen, authenticated metadata, nonce uniqueness,
+  key rotation and ciphertext repair are independent required outcomes.
+- Native history: bind historical schema, roots and indexes together. Test
+  DROP/ALTER/index changes between snapshots, not only updates in one schema.
+  Retained history must survive compaction and remote refill; expired history
+  must fail explicitly rather than silently returning current rows.
+- Replication: permanently remove source symbols, use fixed loss schedules,
+  and require durable follower SQL after restart. Seeing a repair packet or
+  counting caller-provided store IDs cannot prove decoding or remote durability.
+- SLO enforcement: disconnect the actuator while leaving the evaluator/report
+  intact; the enforcement test must fail. Control actions must preserve SQL
+  correctness, bounded cleanup and concurrent defaults under composition.
+- A complete release run must actually execute every selected target. Bind
+  compiler/test outcomes and mode identities, reject zero-test/skip/paired-error
+  shortcuts, and retain the full feature denominator. Add these requirements
+  to existing certification/orchestrator owners instead of a new framework.
+
+**Ambition 3 — use mathematical structure to reduce uncertainty and work.**
+Additional sophistication is useful only if it improves an actual acceptance
+decision. Reuse existing mechanisms with these operational proof obligations:
+
+1. **Conflict histories and partial-order exploration.** Trace real read/write,
+   validation, durable publication and cancellation events; construct the
+   dependency graph and check forbidden cycles against recorded SQL outcomes.
+   Feed the same live seams into existing LabRuntime/DPOR work. Explore
+   independent-event equivalence classes instead of multiplying arbitrary
+   thread schedules. The independence relation itself needs counterexamples
+   involving allocation, page reuse, schema changes and witness retention.
+   A scheduler model or a TLA skeleton is explicitly narrower than this proof.
+2. **Durability as a state machine with a recoverable decision.** Define the
+   linearization and durable-decision points, enumerate crash/cancel cuts,
+   and require replay to reach the same terminal result. A lost ACK is an
+   uncertain completion requiring idempotent reconciliation, not automatic
+   rollback. Apply this to attached databases, native commit, key rotation,
+   compaction and remote receipts. Do not confuse process death with power loss.
+3. **Byte conservation and bounded retention.** Every variable subsystem must
+   identify who reserves bytes, who releases them, and what happens at a limit.
+   Cover pages/deltas, writes, witnesses, pins, indexes, symbols, sort/aggregate
+   state, trigger frames, request queues and buffers. Counters cannot be mere
+   reported estimates while allocations grow unbounded. Enforce live snapshot
+   age with the caller's monotonic budget and typed error; the standalone
+   TransactionManager's timeout test does not prove Connection enforcement.
+4. **Conditional performance models, measured on their assumptions.** Separate
+   offered load, admitted load, service time and queue depth; avoid a clamped
+   variable that makes overload detection impossible. Tail-latency claims need
+   measured arrival/service distributions and explicit scheduler assumptions.
+   Existing e-process/conformal machinery may monitor or prioritize evidence;
+   it cannot guarantee every safety predicate or predict an alarm before loss.
+5. **Decode and remote-durability uncertainty.** Include rank deficiency,
+   correlated losses, authentication failures, block identity and distinct
+   durable stores. Measure actual decoder rank/contribution, retain sufficient
+   local data until authenticated durable receipts meet policy, and fail closed
+   when assumptions cannot be established. No unconditional “any K” theorem.
+6. **Preserve distant goals without letting them hide current blockers.** The
+   §21 WAL-multiplexing, consensus, GPU, PMEM, vector execution and column-store
+   horizons remain explicit targets. Closed future-work compliance reports do
+   not implement them. Map them to existing runtime owners or staged follow-up
+   tasks with admission evidence, dependencies and honest platform boundaries.
+   They do not block compatibility correctness or justify hardware/fleet work
+   without its required authorization.
+
+These refinements are acceptance and implementation requirements, not fresh
+claims of mathematical verification or measured speed. The resulting Beads
+must preserve the actual user goals even when a proposed mechanism fails its
+correctness or keep gate.
+
+**Refinement 1 — lifecycle, semantic prerequisites and honest terminal scope.**
+Reviewed every newly created Bead and the modified existing SQL/SDK/FTS/native
+contracts. Converted implementation/test pairs to co-ready related work with
+their actual shared prerequisites; implementation closure requires the
+independent keeper, while the keeper can run against code still in progress.
+This removes a lifecycle deadlock that an acyclic graph alone did not detect.
+Populated structured acceptance criteria, corrected native/vector/SDK umbrella
+blocking edges, and tailored pure-doc/lock checks to avoid artificial tests.
+
+Native bootstrap proof now starts with compatibility SQL and actual durable
+witness-store operations, then requires full native SQL replay downstream.
+Added explicit protection of unpublished writer objects during compaction,
+directory-sync crash cuts, progressive read-only snapshots, real page/capsule
+corruption recovery, retained historical epochs and complete encrypted-copy
+coverage. Split pre-publication object durability receipts from post-marker
+follower apply (`bd-3mgq5.23/.24`), avoiding a quorum/publication deadlock.
+The later combined keeper (`bd-3mgq5.25`) proves history, encryption, compaction
+and remote refill together. A focused SDK keeper (`bd-6hdwo.34`) can run without
+waiting for unrelated streaming/pooling work. FTS/resource acceptance now
+addresses shared-cache arbitration, realistic posting work, isolated corpus
+mutation and resource-policy transitions. Distant PMEM/column-store milestones
+cannot close before their full promised behavior is delivered.
+
+**Refinement 2 — eliminate proof prerequisites that depend on their consumers.**
+Read the complete storage/native/resource contracts again and validated the
+full typed graph plus conceptual implementation-to-companion closure edges.
+Snapshot foundations now prove real durable pin/resume behavior; the later
+compactor and combined keeper prove transfer during compaction. Receipt
+foundations prove actual durable objects and local publication admission;
+downstream replication proves distinct follower-apply ACK and SQL. This removes
+two semantic cycles without reversing the correct capability dependencies.
+Completed missing descriptions/structured criteria, linked canonical owners,
+and separated SDK lifecycle/transaction subtargets so the base SDK can unblock
+its transaction extension. Actual `br` validation found no missing references
+or augmented pair-closure cycles. `bv`'s cycle computation is skipped at this
+graph size, so its generic DAG advisory is not accepted as proof.
+
+### Historical assessment below
+
+The remainder preserves the earlier performance investigation and rejected
+experiments. Its references to “current,” active blockers, and source state
+describe its original March-era context, not the September assessment above.
+
+---
+
 This document is a self-contained handoff for external review. It summarizes what FrankenSQLite is trying to do, where the largest performance gaps versus stock SQLite remain, what has already been tried, what worked, what failed, and what looks most promising next.
 
 ## Direct Answers Up Front
