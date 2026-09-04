@@ -638,6 +638,12 @@ fn take_pre_flush_dispatch_error_once() -> Option<FrankenError> {
 /// below the observed 2 MiB test-thread stack boundary: compiler changes can
 /// grow these frames, and the limit must fire before the process aborts. The
 /// regression test exercises this boundary on an explicit 4 MiB stack.
+///
+/// A level count cannot carry that guarantee on its own, because a level's
+/// byte cost belongs to the build rather than to the engine (GH#414). Bytes
+/// are charged separately by [`TRIGGER_STACK_BUDGET_BYTES`], which is what
+/// keeps the guarantee true in consumer builds that do not inherit this
+/// workspace's `[profile.dev]`.
 pub const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum number of rebuilds permitted when a reentrant metadata callback
@@ -780,6 +786,94 @@ fn trigger_program_depth_limit() -> usize {
     MAX_TRIGGER_PROGRAM_DEPTH
 }
 
+/// Native stack that trigger recursion may consume before admission stops
+/// (GH#414).
+///
+/// [`MAX_TRIGGER_DEPTH`] counts *levels*, and a level's cost in bytes is a
+/// property of the build, not of the engine: this workspace pins
+/// `[profile.dev] opt-level = 1`, but a consumer that keeps Cargo's default
+/// unoptimized dev profile gets frames large enough that eight levels overflow
+/// even a 32 MiB thread stack. A level cap calibrated against one profile is
+/// therefore no guarantee at all on the other side of the crate boundary, and
+/// the failure mode is a process abort rather than a `Result`.
+///
+/// So admission is charged in bytes as well as in levels. The outermost
+/// admission check records a stack mark; each deeper check measures how much
+/// stack the recursion has actually consumed since then, extrapolates one more
+/// level at the observed average cost, and refuses when that projection would
+/// exceed this budget. Bytes are measured, not assumed, so the guard adapts to
+/// whatever the consumer's optimization level produces.
+///
+/// The value is chosen so that it never binds in this workspace: eight levels
+/// cost ~2.1 MiB at `opt-level = 1`, leaving the level cap as the sole
+/// constraint and every existing depth test unchanged. It binds only where a
+/// level is an order of magnitude fatter, where it converts an abort into the
+/// documented `too many levels of trigger recursion` error.
+pub const TRIGGER_STACK_BUDGET_BYTES: usize = 3 << 20;
+
+thread_local! {
+    /// Stack mark taken at the outermost trigger admission check, and the
+    /// depth it was taken at. `None` while no trigger program is active.
+    static TRIGGER_STACK_BASE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`TRIGGER_STACK_BUDGET_BYTES`], so the byte
+    /// guard can be exercised without building a pathological frame.
+    static TRIGGER_STACK_BUDGET_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Effective trigger stack budget in bytes.
+#[inline]
+fn trigger_stack_budget_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TRIGGER_STACK_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
+        return budget;
+    }
+    TRIGGER_STACK_BUDGET_BYTES
+}
+
+/// Address of a local in the caller's frame, used as a stack high-water mark.
+///
+/// `#[inline(never)]` keeps the local at a fixed offset from this function's
+/// own frame, so differences between two calls measure the stack the recursion
+/// consumed in between rather than an inlining artifact.
+#[inline(never)]
+fn current_stack_mark() -> usize {
+    let marker: u8 = 0;
+    std::ptr::from_ref(&marker) as usize
+}
+
+/// Charge one prospective trigger level against the native-stack budget.
+///
+/// `depth` is the number of trigger frames already held. At depth 0 this only
+/// records the base mark; deeper calls project the next level's cost from the
+/// average observed so far. Stacks grow downward on every supported target, so
+/// a mark above the base yields a saturated zero and the guard simply declines
+/// to refuse — the level cap still applies.
+fn ensure_trigger_stack_budget_available(depth: usize) -> Result<()> {
+    let mark = current_stack_mark();
+    if depth == 0 {
+        TRIGGER_STACK_BASE.with(|cell| cell.set(Some(mark)));
+        return Ok(());
+    }
+    let Some(base) = TRIGGER_STACK_BASE.with(std::cell::Cell::get) else {
+        // No outermost mark (a frame pushed without going through admission);
+        // fall back to the level cap alone rather than guessing.
+        return Ok(());
+    };
+    let consumed = base.saturating_sub(mark);
+    // `depth >= 1` here, so this cannot divide by zero.
+    let projected = consumed.saturating_add(consumed / depth);
+    if projected > trigger_stack_budget_bytes() {
+        return Err(FrankenError::TriggerRecursionDepthExceeded);
+    }
+    Ok(())
+}
+
 /// Override the trigger depth limits on the current thread (test-only).
 ///
 /// bd-wymdl.2: sets BOTH the local trigger cap and the aggregate trigger/FK
@@ -824,6 +918,31 @@ impl Drop for TriggerDepthLimitOverrideGuard {
     fn drop(&mut self) {
         TRIGGER_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(self.previous_local));
         TRIGGER_PROGRAM_DEPTH_LIMIT_OVERRIDE.with(|cell| cell.set(self.previous_program));
+    }
+}
+
+/// RAII override for [`TRIGGER_STACK_BUDGET_BYTES`] (test-only, GH#414).
+///
+/// Lets a test drive the byte guard to its refusal edge without needing a
+/// build whose trigger frames are actually megabytes wide.
+#[cfg(test)]
+struct TriggerStackBudgetOverrideGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl TriggerStackBudgetOverrideGuard {
+    fn new(budget: usize) -> Self {
+        let previous = TRIGGER_STACK_BUDGET_OVERRIDE.with(std::cell::Cell::get);
+        TRIGGER_STACK_BUDGET_OVERRIDE.with(|cell| cell.set(Some(budget)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TriggerStackBudgetOverrideGuard {
+    fn drop(&mut self) {
+        TRIGGER_STACK_BUDGET_OVERRIDE.with(|cell| cell.set(self.previous));
     }
 }
 
@@ -64809,9 +64928,15 @@ impl Connection {
     /// Enforce both the native-stack trigger cap and the aggregate
     /// trigger/FK-action program cap immediately before acquiring a frame.
     fn ensure_trigger_admission_available(&self) -> Result<()> {
-        if self.trigger_frame_stack.borrow().len() >= trigger_depth_limit() {
+        let depth = self.trigger_frame_stack.borrow().len();
+        if depth >= trigger_depth_limit() {
             return Err(FrankenError::TriggerRecursionDepthExceeded);
         }
+        // GH#414: the level cap alone is only meaningful for builds whose
+        // frames are as small as this workspace's. Charge the measured native
+        // stack too, so an unoptimized consumer build raises the typed error
+        // instead of aborting the process on a stack overflow.
+        ensure_trigger_stack_budget_available(depth)?;
         self.ensure_trigger_program_admission_available()
     }
 
@@ -147177,6 +147302,7 @@ mod tests {
         MAX_TRIGGER_DEPTH, MAX_TRIGGER_PROGRAM_DEPTH, PagerBackend, PagerPublishedSnapshot,
         PragmaSchemaScope, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SharedRuntimeState,
         SimplePager, Snapshot, TriggerDepthLimitOverrideGuard, TriggerFrame, TriggerFrameGuard,
+        TriggerStackBudgetOverrideGuard,
         arm_settle_rollback_error_once, arm_trigger_stack_probe, attached_schema_key,
         bind_placeholders_in_select_for_fallback, build_canonical_hash_join_key,
         canonical_hash_join_value, canonicalize_select_placeholders,
@@ -175098,6 +175224,81 @@ mod tests {
                 over_limit.trigger_frame_stack.borrow().is_empty(),
                 "rejected boundary execution must unwind every admitted trigger frame"
             );
+        });
+    }
+
+    /// GH#414: trigger admission is charged in bytes as well as in levels.
+    ///
+    /// `MAX_TRIGGER_DEPTH` is calibrated against this workspace's
+    /// `[profile.dev] opt-level = 1`; a consumer building at Cargo's default
+    /// opt-level 0 gets frames wide enough that the level cap never fires
+    /// before the native stack is exhausted, turning a `Result` into a
+    /// process abort. Standing in for those wide frames with a starved byte
+    /// budget must produce the typed depth error at a level the count-based
+    /// cap would have admitted.
+    #[test]
+    fn trigger_stack_budget_refuses_a_level_the_depth_cap_would_admit() {
+        run_on_large_stack("trigger-stack-budget", || {
+            trigger_stack_budget_refuses_a_level_the_depth_cap_would_admit_body();
+        });
+    }
+
+    fn trigger_stack_budget_refuses_a_level_the_depth_cap_would_admit_body() {
+        asupersync::test_utils::run_test(|| async {
+            // Control: two levels are well inside both the level cap (8) and
+            // the real byte budget, so the chain runs to completion.
+            let admitted = build_bounded_trigger_chain(2).await;
+            admitted
+                .execute("UPDATE a SET n = 1;")
+                .await
+                .expect("two trigger levels are admissible under the real budget");
+            assert!(
+                admitted.trigger_frame_stack.borrow().is_empty(),
+                "successful execution must unwind every trigger frame"
+            );
+
+            // Same chain, same level cap, zero byte budget: the recursion has
+            // measurably consumed stack by the time the second level is
+            // considered, so admission must refuse it.
+            let starved = build_bounded_trigger_chain(2).await;
+            let error = {
+                let _budget = TriggerStackBudgetOverrideGuard::new(0);
+                starved
+                    .execute("UPDATE a SET n = 1;")
+                    .await
+                    .expect_err("a starved stack budget must refuse the next level")
+            };
+            assert!(
+                matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                "the byte guard must raise the typed depth error: {error:?}"
+            );
+            assert!(
+                starved.trigger_frame_stack.borrow().is_empty(),
+                "a refused level must unwind every admitted trigger frame"
+            );
+        });
+    }
+
+    /// GH#414: the byte budget must not bind in this workspace, or it would
+    /// silently lower the documented `MAX_TRIGGER_DEPTH`. A generous budget
+    /// and the real one must admit exactly the same boundary.
+    #[test]
+    fn trigger_stack_budget_does_not_bind_at_the_documented_depth() {
+        run_on_large_stack("trigger-stack-budget-headroom", || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+                {
+                    let _budget = TriggerStackBudgetOverrideGuard::new(usize::MAX);
+                    conn.execute("UPDATE a SET n = 1;")
+                        .await
+                        .expect("an unbounded byte budget must admit the level-cap boundary");
+                }
+
+                let real = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+                real.execute("UPDATE a SET n = 1;").await.expect(
+                    "TRIGGER_STACK_BUDGET_BYTES must leave the level cap the sole constraint",
+                );
+            });
         });
     }
 
