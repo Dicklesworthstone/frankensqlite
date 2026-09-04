@@ -181,3 +181,131 @@ fn small_unicode_value_substr_prefix_matches_stock() {
         }
     });
 }
+
+// GH#400 (remaining gap): the prefix LENGTH is a BOUND PARAMETER, e.g.
+// `substr(content, 1, ?1)`. Before the fix this fell to the generic
+// full-materialize scalar path (hydrating the whole overflow-backed value);
+// the register-mode `ColumnSubstrPrefix` opcode now reads only a bounded
+// window while staying byte-identical to stock SQLite.
+
+/// `substr(content, 1, ?1)` in FrankenSQLite with the length supplied as a
+/// bound parameter (not folded into the SQL text).
+async fn frank_prefix_bound(conn: &Connection, len: SqliteValue) -> SqliteValue {
+    let rows = conn
+        .query_with_params("SELECT substr(content, 1, ?1) FROM t WHERE id = 1;", &[len])
+        .await
+        .expect("frank substr (bound param)");
+    assert_eq!(rows.len(), 1);
+    rows[0].values()[0].clone()
+}
+
+/// Run one bound-parameter `substr` under the copy profile and return
+/// (result, overflow_bytes_read).
+async fn measured_prefix_bound(conn: &Connection, len: SqliteValue) -> (SqliteValue, u64) {
+    fsqlite_btree::reset_btree_copy_profile();
+    fsqlite_btree::set_btree_copy_profile_enabled(true);
+    let value = frank_prefix_bound(conn, len).await;
+    let profile = fsqlite_btree::btree_copy_profile_snapshot();
+    fsqlite_btree::set_btree_copy_profile_enabled(false);
+    (value, profile.overflow_chain_overflow_bytes)
+}
+
+/// Stock `substr(content, 1, ?1)` with the length bound to an arbitrary value.
+/// Returns `None` when stock yields NULL.
+fn stock_prefix_bound(db: &std::path::Path, len: rusqlite::types::Value) -> Option<String> {
+    let sqlite = rusqlite::Connection::open(db).expect("stock sqlite open");
+    sqlite
+        .query_row(
+            "SELECT substr(content, 1, ?1) FROM t WHERE id = 1",
+            [len],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("stock substr (bound)")
+}
+
+#[test]
+fn large_unicode_substr_prefix_bound_param_is_exact_and_bounded() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("substr-unicode-bound.db");
+        // 4-byte code points so char counting genuinely differs from bytes.
+        let payload_bytes = 1024 * 1024;
+        let (conn, content) = seed(&db, "\u{1D518}", payload_bytes).await;
+
+        let prefix = i64::try_from(PREFIX_CHARS).unwrap();
+        let (value, overflow_bytes) =
+            measured_prefix_bound(&conn, SqliteValue::Integer(prefix)).await;
+
+        // Correctness: exactly the first PREFIX_CHARS code points, byte-identical
+        // to stock SQLite (bound the same way).
+        let expected: String = content.chars().take(PREFIX_CHARS).collect();
+        assert_eq!(value, SqliteValue::Text(expected.clone().into()));
+        drop(conn);
+        assert_eq!(
+            stock_prefix_bound(&db, rusqlite::types::Value::Integer(prefix)),
+            Some(expected)
+        );
+
+        // Resource bound: the register-mode fast path read only a tiny window
+        // of the overflow chain, not the ~1 MiB payload. Pre-fix (bound param =
+        // full generic read) this is ~payload_bytes; the RED discriminator.
+        assert!(
+            overflow_bytes < 64 * 1024,
+            "bounded bound-param Unicode substr prefix read {overflow_bytes} overflow bytes of a \
+             {payload_bytes}-byte payload; expected a small bounded window"
+        );
+    });
+}
+
+#[test]
+fn bound_param_substr_prefix_matches_stock_across_lengths() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("substr-bound-mixed.db");
+        // 1-, 2-, 3-, and 4-byte code points interleaved.
+        let payload_bytes = 512 * 1024;
+        let (conn, content) = seed(&db, "a\u{00e9}\u{20ac}\u{1D518}", payload_bytes).await;
+
+        // Non-negative lengths straddling the internal read budget and the
+        // small-value fast-path threshold, supplied as bound parameters.
+        for n in [0i64, 1, 2, 5, 31, 32, 33, 200, 4096] {
+            let value = frank_prefix_bound(&conn, SqliteValue::Integer(n)).await;
+            let expected: String = content.chars().take(usize::try_from(n).unwrap()).collect();
+            assert_eq!(
+                value,
+                SqliteValue::Text(expected.into()),
+                "frank substr(content,1,?1={n}) mismatch"
+            );
+        }
+
+        // A negative length with start position 1 yields the empty string, not
+        // NULL and not a full read (stock parity).
+        let neg = frank_prefix_bound(&conn, SqliteValue::Integer(-3)).await;
+        assert_eq!(neg, SqliteValue::Text(String::new().into()));
+
+        // A NULL length yields NULL (stock parity). The generic scalar path
+        // mishandles this shape, so the bounded direct opcode must decide it.
+        let null_len = frank_prefix_bound(&conn, SqliteValue::Null).await;
+        assert_eq!(null_len, SqliteValue::Null);
+
+        drop(conn);
+        for n in [0usize, 1, 2, 5, 31, 32, 33, 200, 4096] {
+            let expected: String = content.chars().take(n).collect();
+            assert_eq!(
+                stock_prefix_bound(&db, rusqlite::types::Value::Integer(i64::try_from(n).unwrap())),
+                Some(expected),
+                "stock substr(content,1,?1={n})"
+            );
+        }
+        assert_eq!(
+            stock_prefix_bound(&db, rusqlite::types::Value::Integer(-3)),
+            Some(String::new()),
+            "stock substr(content,1,?1=-3) is the empty string"
+        );
+        assert_eq!(
+            stock_prefix_bound(&db, rusqlite::types::Value::Null),
+            None,
+            "stock substr(content,1,?1=NULL) is NULL"
+        );
+    });
+}

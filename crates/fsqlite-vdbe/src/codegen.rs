@@ -21,7 +21,8 @@ use fsqlite_error::ErrorCode;
 use fsqlite_func::{FunctionArity, FunctionRegistry};
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{
-    IndexCursorMeta, Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER,
+    COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER, IndexCursorMeta, Opcode, P4,
+    SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER,
 };
 use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
@@ -31729,28 +31730,53 @@ fn try_emit_column_substr_prefix(
     {
         return false;
     }
-    let Some(prefix_len) = literal_integer_value(&arg_list[2]) else {
-        return false;
-    };
-    let Ok(prefix_len) = i32::try_from(prefix_len) else {
-        return false;
-    };
-    if prefix_len < 0 {
-        return false;
-    }
     let Ok(col_idx) = i32::try_from(col_idx) else {
         return false;
     };
 
-    b.emit_op(
-        Opcode::ColumnSubstrPrefix,
-        ctx.cursor,
-        col_idx,
-        reg,
-        P4::Int(prefix_len),
-        0,
-    );
-    true
+    // Compile-time integer length: emit the immediate form (P5 == 0).
+    if let Some(prefix_len) = literal_integer_value(&arg_list[2]) {
+        let Ok(prefix_len) = i32::try_from(prefix_len) else {
+            return false;
+        };
+        if prefix_len < 0 {
+            return false;
+        }
+        b.emit_op(
+            Opcode::ColumnSubstrPrefix,
+            ctx.cursor,
+            col_idx,
+            reg,
+            P4::Int(prefix_len),
+            0,
+        );
+        return true;
+    }
+
+    // GH#400: the length is a bound parameter (e.g. `substr(col, 1, ?2)`).
+    // Materialize it into a scratch register and read it at run time, so the
+    // bounded prefix fast path still applies instead of falling back to a full
+    // column materialization. Any other non-literal length keeps the generic
+    // path (returning `false`).
+    if matches!(&arg_list[2], Expr::Placeholder(..)) {
+        let len_reg = b.alloc_temp();
+        // `emit_expr` assigns the placeholder's parameter index exactly as the
+        // generic path would, keeping anonymous-placeholder numbering aligned.
+        emit_expr(b, &arg_list[2], len_reg, Some(ctx));
+        b.emit_op(
+            Opcode::ColumnSubstrPrefix,
+            ctx.cursor,
+            col_idx,
+            reg,
+            P4::Int(len_reg),
+            COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER,
+        );
+        // `len_reg` is dead once the opcode above has consumed it.
+        b.free_temp(len_reg);
+        return true;
+    }
+
+    false
 }
 
 fn try_emit_column_octet_length(
@@ -43370,6 +43396,50 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::PureFunc),
             "direct prefix substr should not emit scalar function dispatch"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_substr_prefix_bound_param_uses_register_mode() {
+        // GH#400: a bound-parameter length must still use the bounded direct
+        // opcode (in register mode) rather than the generic full-materialize
+        // scalar dispatch. Before the fix this emitted `PureFunc` and no
+        // `ColumnSubstrPrefix`.
+        let stmt = select_sql("SELECT substr(b, 1, ?1) FROM t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::ColumnSubstrPrefix),
+            "bound-parameter prefix substr(column, 1, ?) should avoid full column materialization"
+        );
+        assert!(
+            !ops.contains(&Opcode::PureFunc),
+            "direct prefix substr should not emit scalar function dispatch"
+        );
+
+        let substr_op = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::ColumnSubstrPrefix)
+            .expect("ColumnSubstrPrefix opcode present");
+        assert_eq!(
+            substr_op.p5, COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER,
+            "bound-parameter length must be read from a register (P5 flag set)"
+        );
+        let len_reg = match &substr_op.p4 {
+            P4::Int(reg) => *reg,
+            _ => panic!("register-mode ColumnSubstrPrefix must carry Int(reg) in P4"),
+        };
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Variable && op.p2 == len_reg),
+            "the bound length register must be populated by a Variable opcode"
         );
     }
 

@@ -171,7 +171,8 @@ use fsqlite_mvcc::{concurrent_read_page, concurrent_write_page};
 use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{
-    Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT, SORTER_OPEN_TOP_N_REGISTER, VdbeOp,
+    COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER, Opcode, P4, SORTER_COMPARE_TOP_N_PREFLIGHT,
+    SORTER_OPEN_TOP_N_REGISTER, VdbeOp,
 };
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
@@ -14838,18 +14839,39 @@ impl VdbeEngine {
     }
 
     #[inline(always)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     async fn execute_column_substr_prefix_hot(&mut self, op: &VdbeOp) -> Result<()> {
         let Ok(col_idx) = usize::try_from(op.p2) else {
             self.set_reg_fast(op.p3, SqliteValue::Null);
             return Ok(());
         };
-        let P4::Int(prefix_len) = &op.p4 else {
+        let P4::Int(p4) = &op.p4 else {
             self.set_reg_fast(op.p3, SqliteValue::Null);
             return Ok(());
         };
-        let Ok(prefix_len) = usize::try_from(*prefix_len) else {
-            self.set_reg_fast(op.p3, SqliteValue::Null);
-            return Ok(());
+
+        let prefix_len = if (op.p5 & COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER) != 0 {
+            // GH#400: the length is a bound parameter held in register P4. Coerce
+            // it like C SQLite's `substr` length argument (`sqlite3_value_int`):
+            // a NULL length yields NULL, and — because the start position is
+            // fixed at 1 — a length <= 0 yields the empty prefix.
+            let len_value = self.get_reg(*p4);
+            if len_value.is_null() {
+                self.set_reg_fast(op.p3, SqliteValue::Null);
+                return Ok(());
+            }
+            let len = len_value.to_integer() as i32;
+            if len <= 0 { 0 } else { len as usize }
+        } else {
+            let Ok(prefix_len) = usize::try_from(*p4) else {
+                self.set_reg_fast(op.p3, SqliteValue::Null);
+                return Ok(());
+            };
+            prefix_len
         };
 
         if let Some(value) = self

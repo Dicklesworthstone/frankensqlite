@@ -10,6 +10,17 @@ pub const SORTER_OPEN_TOP_N_REGISTER: u16 = 0x0001;
 /// before any later read.
 pub const SORTER_COMPARE_TOP_N_PREFLIGHT: u16 = 0x0001;
 
+/// Read the `substr(column, 1, ?)` prefix length for `ColumnSubstrPrefix` from
+/// register P4 (interpreted as an `Int` register number) instead of treating P4
+/// as an immediate `Int(prefix_len)`.
+///
+/// Set when the length is a bound parameter (or other value not known at
+/// compile time), so the bounded prefix fast path still applies. The register
+/// value is coerced like C SQLite's `substr` length argument: a NULL length
+/// yields NULL, and (because the start position is fixed at 1) a length <= 0
+/// yields the empty prefix.
+pub const COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER: u16 = 0x0001;
+
 /// VDBE (Virtual Database Engine) opcodes.
 ///
 /// These correspond 1:1 to the upstream SQLite VDBE opcode set. Each opcode
@@ -563,14 +574,18 @@ pub enum Opcode {
     /// written by `Integer` and outputs exactly one column.
     FusedLiteralResultRow = 196,
 
-    /// Compute `SUBSTR(column, 1, P4)` directly from a table cursor column.
+    /// Compute `SUBSTR(column, 1, len)` directly from a table cursor column.
     ///
-    /// P1 = cursor number, P2 = logical column index, P3 = output register,
-    /// P4 = `Int(prefix_len)`, P5 = 0.
+    /// P1 = cursor number, P2 = logical column index, P3 = output register.
+    /// P4/P5 select where the prefix length comes from:
+    /// - default (P5 == 0): P4 = `Int(prefix_len)`, a compile-time literal.
+    /// - `COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER` set in P5: P4 = `Int(reg)` and
+    ///   the length is read from register `reg` at run time (a bound parameter),
+    ///   coerced like C SQLite's `substr` length argument.
     ///
     /// The engine may fast-path storage TEXT/BLOB payload prefixes without
     /// materializing the full column. Unsupported storage classes fall back to
-    /// the equivalent scalar `substr(value, 1, prefix_len)` behavior.
+    /// the equivalent scalar `substr(value, 1, len)` behavior.
     ColumnSubstrPrefix = 197,
 
     /// Compute `octet_length(column)` from a table cursor record header.
