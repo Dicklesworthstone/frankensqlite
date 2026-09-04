@@ -276,7 +276,7 @@ encryption/history owners retain their identities.
 | N5 | Consistent resumable multi-block checkpoint/snapshot | N0, N3, N4 | Transfer during writes with loss/reordering; second database agrees at one committed boundary |
 | N6 | Durable native compaction and retention | N3, N4, N5 | Cross-process old snapshots stay readable; kill/cancel every publish phase; measure real reclaimed bytes |
 | N7 | Authenticated epoch/policy rotation | N1, N2; native SQL for final keeper | Reject forged/future epochs and old-policy new publication; retain authenticated historical epochs |
-| N8 | Real follower apply, transport and durable remote quorum | N0, N3, N4, N7 | Follower SQL survives restart; pre-fsync ACK cannot count; duplicate/unauthorized identities cannot satisfy quorum |
+| N8 | Real follower apply, transport and durable remote quorum | N0, N3, N4, N5, N7 and durable object receipts | Follower SQL survives restart; pre-fsync ACK cannot count; duplicate/unauthorized identities cannot satisfy quorum |
 | N9 | Remote tier upload, verified receipt, safe eviction and refill | N6, N7; shared durable receipt contract | Interrupted upload retains local safety; historical reads refill real remote bytes after restart |
 | N10 | Real page encryption and key rotation | Compat path independent; native N3/N7 | Missing/wrong key fails after reopen; ciphertext repair and crash-safe KEK rewrap of the stable DEK |
 | N11 | Historical schema/page/index SQL | Native N3/N6; existing compatibility history path | DDL/drop/index changes, timestamp edges and retention races resolve to historical contents |
@@ -453,6 +453,86 @@ and maintenance still retain promotion paths. Matched-row/posting maps and
 materialized result vectors also require measured bounds on huge hit sets,
 including small LIMIT queries. The revised matrix and existing memory/test
 owners preserve that distinction; no fresh FTS performance claim is made.
+
+**Refinement 5 — complete the remaining self-contained parent contracts.**
+The full 100-Bead review found three existing rows without a description or
+structured acceptance. Their underlying outcomes were present in older
+comments, but the SDK scaffold also still accepted an inactive CI build.
+Revised `bd-3qdw1` around the existing package, actual ESM/CJS/declaration/worker
+artifacts and executed consumer resolution. Added explicit GH407 regression
+acceptance to `bd-0pkki` and full mode/composition/parity closure to `bd-1sf8n`.
+All original outcomes remain. Storage/native/resource review found no further
+capability-ordering or proof-ownership changes. Since this round did find
+changes, the review continued through a further convergence confirmation.
+
+**Refinement 6 — converged with no further Bead changes.**
+Rechecked the final contracts, vision coverage, implementation/test lifecycle,
+full dependency data and source-versus-release evidence. Independent reviews
+confirmed the storage/native/resource and SQL/SDK/FTS contracts, including the
+three last rewrites. No further actionable contradiction, omitted goal or
+closure cycle was found in the reviewed scope. This completes the three
+ambition passes and six refinement passes; the extra pass was necessary
+because the fifth still found changes.
+
+### Implementation handoff and validation
+
+The campaign is `bd-6hdwo`. It adds **75 Beads**: 35 implementation/test pairs,
+four additional independent test tasks, and the campaign epic. **39** of the
+new Beads are companion tests. **25 existing Beads** were refined, including
+canonical owners, dependencies and acceptance contracts. No implementation
+Bead was closed by this assessment.
+
+Every one of the 35 extracted vision goals now maps to existing, refined or
+new implementation/proof owners. This closes the identified planning coverage
+gaps, not the implementation gaps. Completing the old backlog alone would
+have missed those integration and proof obligations. Completing the revised
+contracts supplies a concrete route to the documented vision; execution must
+still demonstrate the promised outcomes, and new findings remain possible.
+
+| Workstream | Concrete owners and proof tasks |
+|---|---|
+| Locked baseline, authority, examples and observed concurrency | `bd-6hdwo.1` through `.8` |
+| Windows shared WAL contents | `bd-6hdwo.9/.10` |
+| SQL queues/leases/ranges, execution diagnostics, SLO sampling and control | `bd-6hdwo.11` through `.18` |
+| Live snapshot lifetime and complete byte accounting | `bd-6hdwo.19` through `.22` |
+| Native codecs, store, witnesses, commit, SQL, snapshots, compaction, epochs, replication, remote tier and dual-mode parity | `bd-3mgq5.1` through `.22` |
+| Durable object receipts and combined native history/encryption/remote proof | `bd-3mgq5.23` through `.25` |
+| Real cache, mmap, temp-store and auxiliary-thread controls | `bd-dwjnq.1` through `.8` |
+| Compatibility/native encryption and independent compatibility history composition | `bd-1vwiy.1` through `.5` |
+| Local native historical SQL | `bd-1mt2x.1/.2` |
+| Physical WAL multiplexing, consensus, GPU, PMEM and persistent column groups | `bd-6hdwo.23` through `.32` |
+| Public vector execution and focused real-worker SDK proof | `bd-6hdwo.33/.34`, with existing `bd-b434d`, `bd-3r8ay`, `bd-3mwjr` and `bd-odjvh` |
+| Full FTS consumer behavior and memory | Existing `bd-fts5-lazy-shadow-reads-itcc4.5/.6` and `bd-2nzo8.5.3` |
+
+Final tracker validation covered **all 3,926 issues**, with no missing
+references, blocking cycles, hierarchy cycles or cycles after adding the 35
+conceptual implementation-to-test closure requirements. All 100 campaign and
+refined rows have descriptions and structured acceptance; every new pair has
+its related companion and shared external prerequisites. `br sync --status`
+reported healthy, zero dirty rows and no DB/JSONL coverage drift.
+
+The required final `bv --robot-triage` completed at 2026-09-04T22:57:02Z.
+Its reader included 3,455 issues and omitted 471 older issues with unsupported
+types/statuses; every new campaign issue was included. The omissions include
+seven open issues, so `bv` counts and generic rankings are advisory. Its large
+graph cycle computation is skipped; the full-data checks above supply that
+proof. Do not interpret its ranking of a broad WASM epic as a low-effort
+implementation recommendation or derive a release ETA from the partial graph.
+
+The useful next work is the existing correctness frontier and GH407, alongside
+`bd-6hdwo.7/.8` for genuine file-backed concurrency evidence and the remaining
+baseline verification in `.1/.2`. Exact reservations and current ready/status
+checks still govern ownership. Independent source-ready work includes authority
+repair, Windows contents, real resource controls and the native codec/store
+foundations. Later native and hardware horizons retain their explicit
+prerequisites and platform authorization boundaries.
+
+`git diff --check` passed. UBS exited 0 on the three documentation/Beads files
+but reported no recognized source language; that is a non-applicable source
+scan, not an engine quality certificate. The historical assessment body is
+byte-for-byte preserved. Detailed tracker, release and RCH evidence remains in
+the local audit bundle named above; durable reproductions and acceptance are
+embedded in the relevant Beads.
 
 ### Historical assessment below
 
