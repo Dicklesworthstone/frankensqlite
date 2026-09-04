@@ -173,14 +173,17 @@ fn json_group_array_empty_group() {
     });
 }
 
+// bd-76x57 FIXED: the GROUP BY variant is now embedded too. `json_group_array` /
+// `json_group_object` in a grouped query route through the connection-level
+// grouped-aggregate evaluator (`eval_group_agg_join_expr`), which now derives
+// the JSON subtype of the aggregate argument from the argument EXPRESSION and
+// finalizes via `json_array_with_subtypes` / `json_object_with_subtypes` — the
+// same expr-derived channel e1823f046 gave the non-grouped path. The file-backed
+// GROUP BY (which otherwise compiles to the Sorter-backed VDBE storage
+// substrate) is routed off the substrate to this evaluator by
+// `select_group_by_storage_substrate_is_vdbe_eligible`. See the fsqlite-core
+// keeper bd_76x57_json_group_subtype_file_backed_group_by.
 #[test]
-#[ignore = "bd-76x57: PARTIALLY fixed. e1823f046 threads the JSON subtype through \
-            the non-grouped interpreted aggregate path (SELECT agg(json_object(..)) \
-            FROM t now embeds — see fsqlite-core keeper bd_76x57_json_group_subtype). \
-            But this test also covers the GROUP BY variant, which routes through a \
-            Sorter-backed path that still drops the subtype (verified: grouped case \
-            quotes). Un-ignore once the GROUP BY / compound-source agg paths gain the \
-            same expr-derived subtype (aggregate_arg_json_subtypes is reusable)."]
 fn json_group_aggregates_nested_json_subtype_embedded() {
     // bd-76x57 keeper: the canonical use — folding `json_object(...)` /
     // `json_array(...)` rows into a nested JSON array or object. The JSON subtype

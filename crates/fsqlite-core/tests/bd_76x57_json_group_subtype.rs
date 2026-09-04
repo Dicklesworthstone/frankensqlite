@@ -59,9 +59,10 @@ fn json_group_aggregates_preserve_json_subtype_76x57() {
             r#"{"x":{"n":1}}"#,
         );
 
-        // NOTE: the GROUP BY variant (SELECT agg(json_object(..)) FROM t GROUP BY g)
-        // routes through a different Sorter-backed path that still drops the
-        // subtype — tracked as remaining work on bd-76x57.
+        // The GROUP BY variant is covered by the keepers
+        // bd_76x57_json_group_subtype_file_backed_group_by (file-backed) and the
+        // fsqlite-e2e json_group_aggregates_nested_json_subtype_embedded
+        // (in-memory, vs rusqlite): the grouped evaluator now embeds too.
 
         // Regression guard: a PLAIN text argument carries no JSON subtype and
         // must stay quoted, not be embedded.

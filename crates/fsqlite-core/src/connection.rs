@@ -22167,6 +22167,24 @@ impl Connection {
             }
         }
 
+        // bd-76x57: the storage-substrate GROUP BY path serializes each
+        // aggregate argument through a Sorter, which drops the per-value JSON
+        // subtype, so `json_group_array(json_object(...))` would quote the
+        // nested JSON instead of embedding it. Route such queries to
+        // `execute_group_by_select`, whose expr-derived subtype channel
+        // (`aggregate_arg_json_subtypes`) embeds correctly. Only GROUP BY
+        // queries with a JSON-subtyped aggregate argument take the slower path;
+        // every other grouped aggregate keeps the fast substrate.
+        if columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. }
+                    if self.expr_has_json_subtyped_aggregate_arg(expr)
+            )
+        }) {
+            return false;
+        }
+
         columns.iter().any(|column| {
             matches!(
                 column,
@@ -87285,6 +87303,121 @@ impl Connection {
         }
     }
 
+    /// bd-76x57: does any result-column aggregate take a JSON-subtyped argument?
+    ///
+    /// The VDBE storage-substrate GROUP BY path serializes each aggregate
+    /// argument through a Sorter, which drops the per-value JSON subtype, so
+    /// `json_group_array(json_object(...))` would quote the nested JSON instead
+    /// of embedding it. When this returns true the query is routed off the
+    /// substrate to `execute_group_by_select`, whose expr-derived subtype
+    /// channel (`aggregate_arg_json_subtypes`) embeds it correctly. The subtype
+    /// is a property of the argument EXPRESSION, so this is a cheap static walk.
+    fn expr_has_json_subtyped_aggregate_arg(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::FunctionCall {
+                name,
+                args,
+                order_by,
+                filter,
+                over,
+                ..
+            } => {
+                if over.is_none()
+                    && is_current_aggregate_fn(name, args)
+                    && !is_scalar_max_min(name, args)
+                    && let FunctionArgs::List(exprs) = args
+                    && exprs
+                        .iter()
+                        .any(|arg| self.expr_result_json_subtype(arg) != 0)
+                {
+                    return true;
+                }
+                let args_hit = match args {
+                    FunctionArgs::List(exprs) => exprs
+                        .iter()
+                        .any(|arg| self.expr_has_json_subtyped_aggregate_arg(arg)),
+                    FunctionArgs::Star => false,
+                };
+                args_hit
+                    || order_by
+                        .iter()
+                        .any(|term| self.expr_has_json_subtyped_aggregate_arg(&term.expr))
+                    || filter
+                        .as_deref()
+                        .is_some_and(|f| self.expr_has_json_subtyped_aggregate_arg(f))
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_has_json_subtyped_aggregate_arg(left)
+                    || self.expr_has_json_subtyped_aggregate_arg(right)
+            }
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. } => self.expr_has_json_subtyped_aggregate_arg(inner),
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
+                self.expr_has_json_subtyped_aggregate_arg(inner)
+                    || self.expr_has_json_subtyped_aggregate_arg(low)
+                    || self.expr_has_json_subtyped_aggregate_arg(high)
+            }
+            Expr::In {
+                expr: inner, set, ..
+            } => {
+                self.expr_has_json_subtyped_aggregate_arg(inner)
+                    || matches!(set, InSet::List(values) if values
+                        .iter()
+                        .any(|v| self.expr_has_json_subtyped_aggregate_arg(v)))
+            }
+            Expr::Like {
+                expr: inner,
+                pattern,
+                escape,
+                ..
+            } => {
+                self.expr_has_json_subtyped_aggregate_arg(inner)
+                    || self.expr_has_json_subtyped_aggregate_arg(pattern)
+                    || escape
+                        .as_deref()
+                        .is_some_and(|e| self.expr_has_json_subtyped_aggregate_arg(e))
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|o| self.expr_has_json_subtyped_aggregate_arg(o))
+                    || whens.iter().any(|(w, t)| {
+                        self.expr_has_json_subtyped_aggregate_arg(w)
+                            || self.expr_has_json_subtyped_aggregate_arg(t)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(|e| self.expr_has_json_subtyped_aggregate_arg(e))
+            }
+            Expr::JsonAccess { expr, path, .. } => {
+                self.expr_has_json_subtyped_aggregate_arg(expr)
+                    || self.expr_has_json_subtyped_aggregate_arg(path)
+            }
+            Expr::RowValue(values, _) => values
+                .iter()
+                .any(|v| self.expr_has_json_subtyped_aggregate_arg(v)),
+            Expr::BoundOuterValue { .. }
+            | Expr::Literal(_, _)
+            | Expr::Column(_, _)
+            | Expr::Exists { .. }
+            | Expr::Subquery(_, _)
+            | Expr::Raise { .. }
+            | Expr::Placeholder(_, _) => false,
+        }
+    }
+
     fn compute_application_aggregate_with_registry(
         &self,
         name: &str,
@@ -114293,6 +114426,35 @@ fn prepare_application_aggregate_rows(
     entries.into_iter().map(|(args, _)| args).collect()
 }
 
+/// bd-76x57: the JSON subtype a scalar-call argument expression yields,
+/// resolved through the thread-local function registry (the free-function
+/// mirror of `Connection::expr_result_json_subtype`, used by the grouped
+/// aggregate evaluator below). Only a top-level scalar call whose
+/// `result_subtype()` is JSON qualifies; the property is constant across the
+/// group's rows, so a single static lookup suffices.
+#[cfg(feature = "ext-json")]
+fn expr_result_json_subtype_via_registry(expr: &Expr) -> u32 {
+    let Expr::FunctionCall { name, args, .. } = expr else {
+        return 0;
+    };
+    let num_args = match args {
+        FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+        FunctionArgs::Star => -1,
+    };
+    let is_json = with_current_sync_function_registry(|registry| {
+        registry.is_some_and(|registry| {
+            registry
+                .find_scalar(name, num_args)
+                .is_some_and(|func| func.result_subtype() == Some(fsqlite_func::JSON_SUBTYPE))
+        })
+    });
+    if is_json {
+        fsqlite_func::JSON_SUBTYPE
+    } else {
+        0
+    }
+}
+
 /// Evaluate an expression that may contain aggregate function calls against
 /// a group of rows. Aggregate sub-expressions are computed over the full
 /// group; the remaining scalar parts are evaluated against the first row.
@@ -114378,9 +114540,19 @@ fn eval_group_agg_join_expr(
                     });
                 }
                 let vals: Vec<SqliteValue> = items.into_iter().map(|(v, _)| v).collect();
-                Ok(SqliteValue::Text(
-                    fsqlite_ext_json::json_group_array(&vals)?.into(),
-                ))
+                // bd-76x57: embed a JSON-subtyped element (e.g. the result of
+                // json_object(...)/json_array(...)/json(...)) as nested JSON
+                // rather than quoting it as a string. The subtype is a static
+                // property of the argument expression, constant across the
+                // group's rows, so one registry lookup suffices.
+                let arg_subtype = expr_result_json_subtype_via_registry(arg);
+                let encoded = if arg_subtype != 0 {
+                    let subtypes = vec![arg_subtype; vals.len()];
+                    fsqlite_ext_json::json_array_with_subtypes(&vals, &subtypes)?
+                } else {
+                    fsqlite_ext_json::json_group_array(&vals)?
+                };
+                Ok(SqliteValue::Text(encoded.into()))
             } else {
                 // json_group_object(key, value)
                 if exprs.len() != 2 {
@@ -114417,9 +114589,24 @@ fn eval_group_agg_join_expr(
                 }
                 let pairs: Vec<(SqliteValue, SqliteValue)> =
                     items.into_iter().map(|(kv, _)| kv).collect();
-                Ok(SqliteValue::Text(
-                    fsqlite_ext_json::json_group_object(&pairs)?.into(),
-                ))
+                // bd-76x57: embed a JSON-subtyped VALUE (e.g. json_object(...))
+                // as nested JSON rather than quoting it. Keys stay text; only
+                // the value slot can carry a JSON subtype here.
+                let value_subtype = expr_result_json_subtype_via_registry(&exprs[1]);
+                let encoded = if value_subtype != 0 {
+                    let mut flat = Vec::with_capacity(pairs.len() * 2);
+                    let mut subtypes = Vec::with_capacity(pairs.len() * 2);
+                    for (key, value) in pairs {
+                        flat.push(key);
+                        flat.push(value);
+                        subtypes.push(0);
+                        subtypes.push(value_subtype);
+                    }
+                    fsqlite_ext_json::json_object_with_subtypes(&flat, &subtypes)?
+                } else {
+                    fsqlite_ext_json::json_group_object(&pairs)?
+                };
+                Ok(SqliteValue::Text(encoded.into()))
             }
         }
         Expr::FunctionCall {
