@@ -72,8 +72,8 @@ async fn post_commit_read_cost(conn: &Connection, tag: char) -> Duration {
 
 #[test]
 #[ignore = "GH#409 repro: currently RED. Measured 2026-09-04 on this fixture: \
-            4 000 rows -> 3.46 ms, 16 000 rows -> 22.03 ms for the first read after a \
-            one-row commit (ratio 6.4 for 4x data). Un-ignore with the fix."]
+            4 000 rows -> 3.5 ms, 16 000 rows -> 21 ms for the first read after a \
+            one-row commit (ratio ~6 for 4x data). Un-ignore with the fix."]
 fn gh409_first_read_after_a_commit_does_not_scale_with_the_database() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
@@ -103,5 +103,46 @@ fn gh409_first_read_after_a_commit_does_not_scale_with_the_database() {
         // The read is still correct after all that.
         let rows = small.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
         assert!(rows.is_empty() || matches!(rows[0].values()[0], SqliteValue::Integer(_)));
+    });
+}
+
+/// Diagnostic companion to the keeper above: enable the hot-path profile and
+/// print the counter delta for exactly one post-commit read, at two database
+/// sizes, so the term that scales with the image can be named rather than
+/// guessed at. Not an assertion; run it with `--ignored --nocapture`.
+#[test]
+#[ignore = "GH#409 diagnostic probe; run with --ignored --nocapture"]
+fn gh409_profile_the_first_read_after_a_commit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for (label, rows) in [("small", SMALL_ROWS), ("large", LARGE_ROWS)] {
+            let path = dir.path().join(format!("gh409_probe_{label}.db"));
+            let conn = build(&path.to_string_lossy(), rows).await;
+            // Warm: pay the one-time post-load hydration outside the window.
+            let _ = conn.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
+            conn.execute("INSERT INTO small(id, v) VALUES (900, 'w');")
+                .await
+                .unwrap();
+            let _ = conn.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
+
+            fsqlite_core::connection::set_hot_path_profile_enabled(true);
+            conn.execute("INSERT INTO small(id, v) VALUES (901, 'w');")
+                .await
+                .unwrap();
+            // Reset AFTER the write so every counter below describes the read
+            // alone, not the commit that re-armed it.
+            fsqlite_core::connection::reset_hot_path_profile();
+            let started = Instant::now();
+            let _ = conn
+                .query("SELECT n FROM t WHERE k = 'k7-nonexistent';")
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+            let snapshot = fsqlite_core::connection::hot_path_profile_snapshot();
+            fsqlite_core::connection::set_hot_path_profile_enabled(false);
+            println!("--- {label} ({rows} rows): post-commit read took {elapsed:?}");
+            println!("{snapshot:#?}");
+            conn.close().await.unwrap();
+        }
     });
 }
