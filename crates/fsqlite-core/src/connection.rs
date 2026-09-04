@@ -107167,6 +107167,7 @@ fn where_should_route_to_fallback_for_shortcircuit(
     select: &SelectStatement,
 ) -> bool {
     let SelectCore::Select {
+        columns,
         from: Some(from),
         where_clause: Some(where_expr),
         group_by,
@@ -107183,6 +107184,22 @@ fn where_should_route_to_fallback_for_shortcircuit(
         || !matches!(from.source, TableOrSubquery::Table { .. })
         || !group_by.is_empty()
         || having.is_some()
+    {
+        return false;
+    }
+    // GH#407: an UNGROUPED aggregate projection (`SELECT COUNT(*) ... WHERE
+    // 1=1 AND id IN (<grouped subquery>) AND ...`) has no `GROUP BY` and no
+    // `HAVING`, so the shape test above admitted it — but `execute_join_select`
+    // returns the FILTERED ROWS, not an aggregate over them. The caller then
+    // saw `COUNT(*)` evaluated per row (NULL) or, when nothing matched, no row
+    // at all, where stock returns exactly one row with the count. Aggregates
+    // belong on the VDBE path, which computes them; the short-circuit
+    // absorption this branch exists to preserve is a WHERE-evaluation
+    // property, and losing it for an aggregate query is strictly better than
+    // answering the wrong value.
+    if columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)))
     {
         return false;
     }
