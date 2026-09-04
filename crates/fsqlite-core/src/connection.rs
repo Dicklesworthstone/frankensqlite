@@ -638,6 +638,13 @@ fn take_pre_flush_dispatch_error_once() -> Option<FrankenError> {
 /// below the observed 2 MiB test-thread stack boundary: compiler changes can
 /// grow these frames, and the limit must fire before the process aborts. The
 /// regression test exercises this boundary on an explicit 4 MiB stack.
+///
+/// This is a *semantic* cap on how deep trigger recursion may go. It is not, on
+/// its own, a stack-safety guarantee: a frame count only bounds stack use under
+/// an assumed frame size, and the frame size depends on the consumer's
+/// optimization level, not on this workspace's `[profile.dev]` (GH#414). Stack
+/// safety is enforced separately and unconditionally by
+/// [`ensure_native_stack_headroom`], which measures the running thread.
 pub const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum number of rebuilds permitted when a reentrant metadata callback
@@ -650,7 +657,119 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 /// `SQLITE_MAX_TRIGGER_DEPTH` budget. FrankenSQLite's native Rust trigger
 /// recursion has the smaller [`MAX_TRIGGER_DEPTH`] stack-safety cap above, but
 /// the two program kinds must still share this semantic admission budget.
+///
+/// Like [`MAX_TRIGGER_DEPTH`] this is a semantic cap, not a byte budget: 50
+/// levels at this workspace's measured ~186 KiB/level already implies ~9.3 MiB
+/// of native stack, which is why the boundary tests spawn a 64 MiB thread.
+/// Stack safety comes from [`ensure_native_stack_headroom`] instead.
 pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
+
+/// Native stack that must still be free *after* the projected cost of the one
+/// additional trigger/FK-action level being admitted (GH#414).
+///
+/// The admitted level does not merely push a dispatch frame: it plans and runs
+/// a whole statement (VDBE dispatch, expression evaluation, b-tree descent),
+/// then unwinds, and the refusal path itself has to construct and propagate an
+/// error. This reserve is the slack that covers all of that plus measurement
+/// error in the per-level projection.
+const TRIGGER_STACK_RESERVE_BYTES: usize = 512 * 1024;
+
+/// Floor for the projected per-level native stack cost.
+///
+/// Applies before any level has been measured on the current thread, and as a
+/// lower bound afterwards so a level that happens to consume almost nothing
+/// (an FK cascade that resolves without descending, say) cannot shrink the
+/// projection below what a real statement costs.
+const TRIGGER_STACK_MIN_LEVEL_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// Native stack remaining when the outermost trigger/FK-action admission on
+    /// this thread was checked (GH#414). Deeper admissions divide the bytes
+    /// consumed since by the aggregate program depth to project one more level.
+    static TRIGGER_STACK_BASELINE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Remaining native stack of the running thread, when the platform can report
+/// it.
+///
+/// `stacker` is the rust-lang crate rustc itself uses for this; keeping the
+/// probe in a dependency is what lets every engine crate stay under the
+/// workspace-wide `unsafe_code = "forbid"`. `None` means "unknown", never
+/// "zero": wasm32 has no queryable thread stack bound, and `stacker` also
+/// returns `None` on a thread whose limit it cannot guess.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn remaining_native_stack() -> Option<usize> {
+    stacker::remaining_stack()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+const fn remaining_native_stack() -> Option<usize> {
+    None
+}
+
+/// Refuse one more recursive trigger/FK-action program level when the running
+/// thread does not have the native stack for it (GH#414).
+///
+/// [`MAX_TRIGGER_DEPTH`] and [`MAX_TRIGGER_PROGRAM_DEPTH`] count frames, and a
+/// frame count is a stack-safety cap only under an assumed frame size — here,
+/// this workspace's `[profile.dev] opt-level = 1`. A consumer building at
+/// Cargo's default opt-level 0 gets frames large enough that the documented
+/// caps are only reached after the stack is gone, so the process aborts with
+/// `fatal runtime error: stack overflow` instead of returning
+/// [`FrankenError::TriggerRecursionDepthExceeded`].
+///
+/// No *fixed* byte budget repairs that. A budget small enough for an 8 MiB
+/// stack (~3 MiB) truncates the documented aggregate depth of 50, and one large
+/// enough to preserve it (~16 MiB) is bigger than the stacks it is meant to
+/// protect. The budget therefore has to be measured against the running
+/// thread, so that the 64 MiB threads the boundary tests spawn and a consumer's
+/// 8 MiB main thread get different answers from the same code.
+///
+/// The projection is measured, not assumed: `depth == 0` records the remaining
+/// stack at the outermost admission, and each deeper admission divides the
+/// bytes consumed since by the aggregate depth to price one more level. That
+/// makes the check self-calibrating across optimization levels — the same code
+/// prices a level at ~186 KiB in this workspace and at ~4 MiB at opt-level 0.
+///
+/// `depth` must be the connection's *aggregate* recursive-program depth
+/// ([`Connection::active_recursive_program_depth`]): trigger frames and FK
+/// cascades descend on one native stack and are charged against one budget.
+///
+/// This can only ever turn an abort into a typed error. Where the remaining
+/// stack is unknown, or where the baseline says nothing about this frame, the
+/// frame caps stand alone exactly as they do today. It cannot help when a
+/// *single* level is larger than the whole stack — nothing at an admission
+/// point can — but at every measured frame size the engine has seen, the
+/// refusal lands with room to unwind.
+fn ensure_native_stack_headroom(depth: usize) -> Result<()> {
+    let Some(remaining) = remaining_native_stack() else {
+        return Ok(());
+    };
+    if depth == 0 {
+        TRIGGER_STACK_BASELINE.with(|cell| cell.set(Some(remaining)));
+        return Ok(());
+    }
+    // Only a baseline taken *above* the current frame prices a level. Anything
+    // else — no outermost sample yet, or a sample left behind by a shallower
+    // execution that already unwound on this thread — is re-seeded here, and
+    // the frame caps stand alone for this one admission.
+    let Some(consumed) = TRIGGER_STACK_BASELINE
+        .with(std::cell::Cell::get)
+        .filter(|baseline| *baseline > remaining)
+        .map(|baseline| baseline - remaining)
+    else {
+        TRIGGER_STACK_BASELINE.with(|cell| cell.set(Some(remaining)));
+        return Ok(());
+    };
+    let projected_level = (consumed / depth).max(TRIGGER_STACK_MIN_LEVEL_BYTES);
+    if remaining < projected_level.saturating_add(TRIGGER_STACK_RESERVE_BYTES) {
+        return Err(FrankenError::TriggerRecursionDepthExceeded);
+    }
+    Ok(())
+}
 
 /// bd-7mnz8 Phase 1: values produced by the pre-dispatch preparation phase of
 /// `execute_statement_impl_after_background_status`, returned by the hoisted
@@ -1184,6 +1303,23 @@ static FSQLITE_MEMDB_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 // A per-write in-txn refresh that took the fast path (bd-ixf69) never lands
 // here; N INSERTs in one txn must keep this O(1), not O(N).
 static FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS: AtomicU64 = AtomicU64::new(0);
+// GH#408: documents re-tokenized by the schema reload's live-vtab rebuild
+// (`rebuild_materialized_live_vtab_instances_from_reload` ->
+// `Fts5Table::rebuild_documents`). A reload that rebinds persisted segments,
+// or preserves an already-correct live instance, adds nothing here; a reload
+// that re-derives the inverted index adds the whole table. Must NOT grow with
+// the number of statement boundaries.
+static FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED: AtomicU64 = AtomicU64::new(0);
+// GH#408: `%_data` + `%_docsize` shadow rows decoded by the rootpage=0 reload
+// path (`read_fts5_shadow_rows_for_reload` -> `Fts5Table::apply_shadow_rows`).
+// Cheaper than re-tokenizing, but still O(persisted index) per reload.
+static FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
+// GH#408: reloads that bound the persisted segments lazily (O(1)) instead of
+// materializing the index.
+static FSQLITE_FTS5_RELOAD_LAZY_BINDS: AtomicU64 = AtomicU64::new(0);
+// GH#408 companion: reloads that kept an existing live FTS5 instance because
+// the persisted image it was built from is provably unchanged.
+static FSQLITE_FTS5_RELOAD_INSTANCES_PRESERVED: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
 // bd-otbu1 / I1: Retained autocommit counters for file-backed databases.
@@ -1507,6 +1643,19 @@ pub struct HotPathProfileSnapshot {
     /// scan (the schema-cookie fast path missed). Must stay O(1) per transaction
     /// regardless of write-statement count.
     pub memdb_txn_schema_full_scans: u64,
+    /// GH#408: documents re-tokenized by the schema reload's live-vtab rebuild.
+    /// Proportional to the FTS5 table size on every reload that re-derives the
+    /// in-memory index; zero when the reload rebinds persisted segments or
+    /// preserves an already-correct live instance.
+    pub fts5_reload_documents_retokenized: u64,
+    /// GH#408: `%_data` + `%_docsize` shadow rows decoded by the rootpage=0
+    /// reload path. O(persisted index) per reload when it fires.
+    pub fts5_reload_shadow_rows_decoded: u64,
+    /// GH#408: reloads that bound the persisted segments lazily (O(1)).
+    pub fts5_reload_lazy_binds: u64,
+    /// GH#408: reloads that kept an existing live FTS5 instance because the
+    /// persisted image it was built from is provably unchanged.
+    pub fts5_reload_instances_preserved: u64,
     pub execute_body_time_ns: u64,
     pub direct_write_flush_calls: u64,
     pub direct_write_flush_time_ns: u64,
@@ -1987,6 +2136,10 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMMIT_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMDB_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FTS5_RELOAD_LAZY_BINDS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FTS5_RELOAD_INSTANCES_PRESERVED.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_PARKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_RETAINED_AUTOCOMMIT_REUSES.store(0, AtomicOrdering::Relaxed);
@@ -2197,6 +2350,13 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         commit_refresh_count: FSQLITE_COMMIT_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         memdb_refresh_count: FSQLITE_MEMDB_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         memdb_txn_schema_full_scans: FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS
+            .load(AtomicOrdering::Relaxed),
+        fts5_reload_documents_retokenized: FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED
+            .load(AtomicOrdering::Relaxed),
+        fts5_reload_shadow_rows_decoded: FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED
+            .load(AtomicOrdering::Relaxed),
+        fts5_reload_lazy_binds: FSQLITE_FTS5_RELOAD_LAZY_BINDS.load(AtomicOrdering::Relaxed),
+        fts5_reload_instances_preserved: FSQLITE_FTS5_RELOAD_INSTANCES_PRESERVED
             .load(AtomicOrdering::Relaxed),
         execute_body_time_ns: FSQLITE_EXECUTE_BODY_TIME_NS.load(AtomicOrdering::Relaxed),
         direct_write_flush_calls: FSQLITE_DIRECT_WRITE_FLUSH_CALLS.load(AtomicOrdering::Relaxed),
@@ -64800,10 +64960,14 @@ impl Connection {
     /// Reject admission of one more trigger or FK-action program when the
     /// connection-wide aggregate recursion budget is already exhausted.
     fn ensure_trigger_program_admission_available(&self) -> Result<()> {
-        if self.active_recursive_program_depth() >= trigger_program_depth_limit() {
+        let depth = self.active_recursive_program_depth();
+        if depth >= trigger_program_depth_limit() {
             return Err(FrankenError::TriggerRecursionDepthExceeded);
         }
-        Ok(())
+        // GH#414: the frame caps above are semantic; this is what actually
+        // keeps the process off a stack overflow, on whatever stack and at
+        // whatever optimization level the consumer is running.
+        ensure_native_stack_headroom(depth)
     }
 
     /// Enforce both the native-stack trigger cap and the aggregate
@@ -64818,6 +64982,10 @@ impl Connection {
     /// Acquire one FK-action program slot, charging active trigger frames
     /// against the same aggregate recursion budget.
     fn enter_fk_cascade(&self) -> Result<FkCascadeDepthGuard<'_>> {
+        // GH#414: FK-action programs descend on the same native stack as
+        // trigger bodies and are charged against the same aggregate budget, so
+        // they answer to the same measured stack check.
+        ensure_native_stack_headroom(self.active_recursive_program_depth())?;
         FkCascadeDepthGuard::try_enter(
             &self.fk_cascade_depth,
             self.trigger_frame_stack
@@ -92468,6 +92636,9 @@ impl Connection {
         for (table_name, create_sql, _) in specs {
             let table_key = table_name.to_ascii_uppercase();
             if preserved_live_vtab_keys.contains(&table_key) {
+                if hot_path_profile_enabled() {
+                    FSQLITE_FTS5_RELOAD_INSTANCES_PRESERVED.fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 continue;
             }
             let create_stmt = match parse_single_statement(create_sql) {
@@ -92569,6 +92740,9 @@ impl Connection {
                         fts5.mark_lazy_on_disk(doc_count);
                         Ok(())
                     })?;
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FTS5_RELOAD_LAZY_BINDS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                     reloaded.insert_pending(table_key, &mut pending_instance)?;
                     continue;
                 }
@@ -92585,6 +92759,14 @@ impl Connection {
                         &create_stmt.args,
                     )
                     .await?;
+                // GH#408: the non-lazy rootpage=0 hydration. Cheaper than a
+                // re-tokenize, but still O(persisted index) per reload.
+                if hot_path_profile_enabled() {
+                    FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED.fetch_add(
+                        (rows.data.len() + rows.docsize.len() + rows.content.len()) as u64,
+                        AtomicOrdering::Relaxed,
+                    );
+                }
                 self.invoke_live_vtab_callback("asAnyMut", || {
                     let fts5 = pending_instance
                         .instance_mut()
@@ -92843,6 +93025,14 @@ impl Connection {
                             (*rowid, columns)
                         })
                         .collect::<Vec<_>>();
+                    // GH#408: this is the O(corpus) re-tokenize. Count the
+                    // documents (not the calls) so a keeper can separate "the
+                    // reload re-derived the whole index" from "the reload
+                    // rebound or preserved it".
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED
+                            .fetch_add(documents.len() as u64, AtomicOrdering::Relaxed);
+                    }
                     self.invoke_live_vtab_callback("asAnyMut", || {
                         let fts5 = pending_instance
                             .instance_mut()
@@ -175562,6 +175752,95 @@ mod tests {
         assert_eq!(MAX_TRIGGER_PROGRAM_DEPTH, 50);
         assert_eq!(trigger_depth_limit(), MAX_TRIGGER_DEPTH);
         assert_eq!(trigger_program_depth_limit(), MAX_TRIGGER_PROGRAM_DEPTH);
+    }
+
+    /// GH#414: the frame caps are calibrated against this workspace's own
+    /// `[profile.dev] opt-level = 1`, so on their own they are not a
+    /// stack-safety guarantee for a consumer building at Cargo's default
+    /// opt-level 0 — the reported failure was `fatal runtime error: stack
+    /// overflow` on a 32 MiB thread, before `MAX_TRIGGER_DEPTH` was reached.
+    ///
+    /// Rather than depend on an optimization level, this raises the frame caps
+    /// out of the way and runs a bounded trigger chain that cannot fit the
+    /// thread's stack. The measured-headroom check must convert the overflow
+    /// into the typed `TriggerRecursionDepthExceeded` and leave the connection
+    /// usable. A regression here aborts the whole test binary instead of
+    /// failing one test — which is precisely the downstream symptom.
+    #[test]
+    fn trigger_recursion_refuses_before_a_small_stack_overflows() {
+        // 4 MiB is the stack the documented cap was measured against, and is
+        // ample for opening a connection and running statements. A 128-level
+        // chain is not: at this workspace's measured ~210 KiB/level it wants
+        // ~27 MiB, and far more at a consumer's opt-level 0. So the refusal
+        // that must happen here is the byte check, not the frame cap.
+        std::thread::Builder::new()
+            .name("gh414-small-stack".to_owned())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                asupersync::test_utils::run_test(|| async {
+                    let _override = TriggerDepthLimitOverrideGuard::new(128);
+                    let conn = build_bounded_trigger_chain(128).await;
+                    let error = conn
+                        .execute("UPDATE a SET n = 1;")
+                        .await
+                        .expect_err("a chain that cannot fit this stack must be refused");
+                    assert!(
+                        matches!(&error, FrankenError::TriggerRecursionDepthExceeded),
+                        "the stack-headroom refusal must use the typed depth error, \
+                         got {error:?}"
+                    );
+                    assert_trigger_program_state_clean(&conn);
+                    let rows = conn
+                        .query("SELECT (SELECT n FROM a), (SELECT n FROM b);")
+                        .await
+                        .expect("the connection must stay usable after the refusal");
+                    assert_eq!(
+                        row_values(&rows[0]),
+                        vec![SqliteValue::Integer(0), SqliteValue::Integer(0)],
+                        "the refused statement must roll back every nested write"
+                    );
+                });
+            })
+            .expect("spawn small-stack trigger-recursion thread")
+            .join()
+            .expect("small-stack trigger-recursion thread panicked");
+    }
+
+    /// GH#414 companion: the headroom check must not bind at the documented
+    /// production caps on a stack that can afford them. `run_on_large_stack`
+    /// spawns the 64 MiB thread the aggregate depth of 50 requires (~9.3 MiB at
+    /// this workspace's measured per-level cost), and the exact boundary
+    /// behaviour asserted by `recursive_trigger_depth_limit_accepts_exact_
+    /// boundary_and_rejects_next` and `mixed_trigger_fk_trigger_boundary_is_
+    /// exactly_fifty` must be unchanged by the byte check.
+    #[test]
+    fn native_stack_headroom_admits_the_documented_depth_on_a_large_stack() {
+        run_on_large_stack("gh414-large-stack-headroom", || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = build_bounded_trigger_chain(MAX_TRIGGER_DEPTH).await;
+                conn.execute("UPDATE a SET n = 1;")
+                    .await
+                    .expect("the documented trigger depth must still be admitted");
+                assert_trigger_program_state_clean(&conn);
+            });
+        });
+    }
+
+    /// GH#414 unit coverage for the projection itself, without needing a real
+    /// recursion to drive it: the outermost admission only records a baseline,
+    /// and a deeper admission that has consumed almost nothing since must be
+    /// admitted. (The refusal side is proved end-to-end above; it cannot be
+    /// forced here without actually consuming the thread's stack.)
+    #[test]
+    fn native_stack_headroom_is_a_no_op_at_the_top_of_a_healthy_stack() {
+        run_on_large_stack("gh414-headroom-unit", || {
+            ensure_native_stack_headroom(0)
+                .expect("the outermost admission only records the baseline");
+            ensure_native_stack_headroom(1)
+                .expect("a level that consumed nothing must not be refused");
+            ensure_native_stack_headroom(MAX_TRIGGER_PROGRAM_DEPTH - 1)
+                .expect("the aggregate cap must be reachable on a stack that affords it");
+        });
     }
 
     /// Build `trigger → fk_links FK cascades → trigger`: DELETE FROM start

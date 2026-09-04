@@ -146,3 +146,69 @@ fn gh409_profile_the_first_read_after_a_commit() {
         }
     });
 }
+
+/// GH#409 attribution probe: the post-commit read's VDBE opcode profile showed
+/// `Next` once per row in the table, i.e. a full table scan, for a predicate on
+/// a column carrying a `UNIQUE` constraint. This prints the access path the
+/// planner and the emitted program choose for the keeper's exact shape, for an
+/// implicit `sqlite_autoindex_*`, an explicit `CREATE INDEX`, and a bound
+/// parameter, so the divergence can be named. Not an assertion.
+#[test]
+#[ignore = "GH#409 access-path probe; run with --ignored --nocapture"]
+fn gh409_probe_access_path_for_unique_column_equality() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gh409_access_path.db");
+        let conn = Connection::open(&path.to_string_lossy()).await.unwrap();
+        conn.execute("CREATE TABLE t (k TEXT NOT NULL UNIQUE, n INTEGER NOT NULL, pad TEXT);")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE e (k TEXT NOT NULL, n INTEGER NOT NULL);")
+            .await
+            .unwrap();
+        conn.execute("CREATE INDEX e_k ON e(k);").await.unwrap();
+        conn.execute("CREATE TABLE i (k INTEGER NOT NULL UNIQUE, n INTEGER NOT NULL);")
+            .await
+            .unwrap();
+        for n in 0..50_i64 {
+            conn.execute(&format!("INSERT INTO t(k, n, pad) VALUES ('k{n}', {n}, 'p');"))
+                .await
+                .unwrap();
+            conn.execute(&format!("INSERT INTO e(k, n) VALUES ('k{n}', {n});"))
+                .await
+                .unwrap();
+            conn.execute(&format!("INSERT INTO i(k, n) VALUES ({n}, {n});"))
+                .await
+                .unwrap();
+        }
+
+        for sql in [
+            "SELECT n FROM t WHERE k = 'k7'",
+            "SELECT n FROM t WHERE k = 'k7-nonexistent'",
+            "SELECT n FROM e WHERE k = 'k7'",
+            "SELECT n FROM i WHERE k = 7",
+            "SELECT n FROM t",
+        ] {
+            let eqp = conn
+                .query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let ops = conn
+                .query(&format!("EXPLAIN {sql}"))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| match &row.values()[1] {
+                    SqliteValue::Text(op) => op.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>();
+            println!("--- {sql}\n    eqp: {eqp}\n    ops: {ops:?}");
+        }
+        conn.close().await.unwrap();
+    });
+}

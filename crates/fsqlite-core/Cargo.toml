@@ -84,6 +84,10 @@ foldhash = "0.2.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 asupersync = { workspace = true }
+# GH#414: remaining-native-stack probe for the trigger/FK recursion caps.
+# Native-only: wasm32 has no queryable thread stack bound, and there the frame
+# caps stand alone exactly as they do today.
+stacker = { workspace = true }
 # Anonymous fixed-residency spools for bounded whole-image validation.
 # Native-only: `bounded_validation` is itself cfg'd off for wasm32.
 tempfile = { workspace = true }
