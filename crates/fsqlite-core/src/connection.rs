@@ -3587,6 +3587,20 @@ impl PagerBackend {
         }
     }
 
+    /// GH#408: canonical database file path (`":memory:"` for the memory VFS).
+    #[must_use]
+    pub fn db_path(&self) -> &Path {
+        match self {
+            Self::Memory(p) => p.db_path(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.db_path(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.db_path(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.db_path(),
+        }
+    }
+
     /// Propagate busy-timeout to the VFS file for cross-process lock retry.
     pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
         match self {
@@ -10623,6 +10637,51 @@ struct PendingLocalLiveVtabPreservation {
     table_keys: HashSet<String>,
 }
 
+/// GH#408: shared, process-global record of the last `CommitSeq` at which each
+/// materialized live-vtab table's PERSISTED content was modified, by ANY
+/// connection to that file. A schema reload otherwise re-tokenizes the whole
+/// fts5 corpus (`rebuild_documents`) whenever the visible commit sequence moves
+/// -- even for a commit that did not touch the table -- because the
+/// receipt-bound preservation only covers the one-shot reload after this
+/// connection's own commit. This stamp lets the reload PRESERVE an unchanged
+/// live instance across unrelated commits while still observing peer writes:
+/// a peer's commit to the table bumps the stamp, and the reload gate rebuilds
+/// whenever `last_modified(table) > instance.built_at`. Keyed by
+/// `(canonical file path, UPPERCASE table name)`; file-backed only. Soundness
+/// rests on the stamp being an OVER-approximation of writes (bumped from every
+/// live-vtab write dispatcher), so it can never miss a mutation.
+///
+/// SCOPE: this is a PROCESS-GLOBAL registry, so it observes every write by any
+/// `Connection` in THIS process (fsqlite's supported single-process,
+/// multi-`Connection` MVCC model). A cross-PROCESS writer's commit does not
+/// bump it, so preservation is NOT sound against an interleaved foreign-process
+/// write to the same fts5 table; making it so needs a durable file/WAL-backed
+/// per-table stamp (out of scope here, and multi-process multi-writer is itself
+/// unproven -- GH#70). The gate below still requires the schema cookie unchanged.
+static FTS5_TABLE_CONTENT_LAST_MODIFIED: OnceLock<Mutex<HashMap<(PathBuf, String), CommitSeq>>> =
+    OnceLock::new();
+
+fn fts5_content_registry() -> &'static Mutex<HashMap<(PathBuf, String), CommitSeq>> {
+    FTS5_TABLE_CONTENT_LAST_MODIFIED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fts5_stamp_content_modified(path: &Path, table_key: &str, seq: CommitSeq) {
+    let mut registry = lock_unpoisoned(fts5_content_registry());
+    let entry = registry
+        .entry((path.to_path_buf(), table_key.to_owned()))
+        .or_insert(seq);
+    if *entry < seq {
+        *entry = seq;
+    }
+}
+
+fn fts5_content_last_modified(path: &Path, table_key: &str) -> Option<CommitSeq> {
+    let registry = lock_unpoisoned(fts5_content_registry());
+    registry
+        .get(&(path.to_path_buf(), table_key.to_owned()))
+        .copied()
+}
+
 #[derive(Debug, Clone)]
 struct AnalyzePlan {
     targets: Vec<AnalyzeTarget>,
@@ -12328,6 +12387,16 @@ pub struct Connection {
     /// in a validated local commit. The receipt is tied to that commit sequence;
     /// any other committed write clears it before a later reload can reuse it.
     pending_local_live_vtab_preservation: RefCell<Option<PendingLocalLiveVtabPreservation>>,
+    /// GH#408: live-vtab table keys whose content was written in the current
+    /// (uncommitted) transaction; drained into the shared last-modified registry
+    /// at commit so peers can preserve unchanged instances across the write.
+    fts5_content_dirty: RefCell<HashSet<String>>,
+    /// GH#408: the visible `CommitSeq` each live-vtab instance was (re)built at.
+    fts5_instance_built_at: RefCell<HashMap<String, CommitSeq>>,
+    /// GH#408 test hook: per-connection count of full live-vtab content rebuilds
+    /// during schema reloads; the rebuild-counter keeper asserts it stays flat
+    /// when the fts5 table is untouched by an interleaved write.
+    fts5_reload_rebuild_count: Cell<u64>,
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
@@ -13868,6 +13937,9 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
+            fts5_content_dirty: RefCell::new(HashSet::new()),
+            fts5_instance_built_at: RefCell::new(HashMap::new()),
+            fts5_reload_rebuild_count: Cell::new(0),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
             post_image_publication_rebind_failure: RefCell::new(None),
@@ -14382,6 +14454,9 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
+            fts5_content_dirty: RefCell::new(HashSet::new()),
+            fts5_instance_built_at: RefCell::new(HashMap::new()),
+            fts5_reload_rebuild_count: Cell::new(0),
             closed: RefCell::new(false),
             post_vacuum_rebind_failure: RefCell::new(None),
             post_image_publication_rebind_failure: RefCell::new(None),
@@ -19528,6 +19603,40 @@ impl Connection {
         *self.pending_local_live_vtab_preservation.borrow_mut() = None;
     }
 
+    /// GH#408: mark a live-vtab table's persisted content as written this txn.
+    /// Called from every live-vtab write dispatcher (an over-approximation:
+    /// marking is idempotent and marking a non-fts5 table is harmless).
+    fn mark_live_vtab_content_dirty(&self, table_name: &str) {
+        self.fts5_content_dirty
+            .borrow_mut()
+            .insert(table_name.to_ascii_uppercase());
+    }
+
+    /// GH#408: at commit, stamp every table written this txn into the shared
+    /// per-file last-modified registry with the just-assigned commit sequence,
+    /// then clear the dirty set. File-backed only; a no-op with nothing dirty.
+    fn stamp_and_clear_fts5_content_dirty(&self) {
+        let dirty: Vec<String> = self.fts5_content_dirty.borrow_mut().drain().collect();
+        if dirty.is_empty() || self.pager.is_memory() {
+            return;
+        }
+        let Some(seq) = *self.last_local_commit_seq.borrow() else {
+            return;
+        };
+        let path = self.pager.db_path().to_path_buf();
+        for key in dirty {
+            fts5_stamp_content_modified(&path, &key, seq);
+        }
+    }
+
+    /// GH#408 test hook: this connection's count of full live-vtab content
+    /// rebuilds during schema reloads. Not part of the stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fts5_reload_rebuild_count(&self) -> u64 {
+        self.fts5_reload_rebuild_count.get()
+    }
+
     fn arm_pending_local_live_vtab_preservation(
         &self,
         txn_begin_visible_commit_seq: Option<CommitSeq>,
@@ -19561,14 +19670,38 @@ impl Connection {
         // from persisted rows so the live instance observes other connections'
         // writes. Only the exact locally enlisted table keys are eligible.
         let current_schema_cookie = *self.schema_cookie.borrow();
-        let receipt = self.pending_local_live_vtab_preservation.borrow();
-        receipt
-            .as_ref()
-            .filter(|receipt| {
-                reloaded_schema_cookie == current_schema_cookie
-                    && receipt.commit_seq == bound_visible_commit_seq
-            })
-            .map_or_else(HashSet::new, |receipt| receipt.table_keys.clone())
+        let mut keys = {
+            let receipt = self.pending_local_live_vtab_preservation.borrow();
+            receipt
+                .as_ref()
+                .filter(|receipt| {
+                    reloaded_schema_cookie == current_schema_cookie
+                        && receipt.commit_seq == bound_visible_commit_seq
+                })
+                .map_or_else(HashSet::new, |receipt| receipt.table_keys.clone())
+        };
+        // GH#408: ALSO preserve a live materialized vtab whose persisted content
+        // is provably unchanged since its instance was built (registry stamp <=
+        // built_at), even when the visible commit sequence moved for an unrelated
+        // commit. A peer's write to the table bumps the stamp above built_at and
+        // forces a rebuild, so this never serves a stale index. Requires the
+        // schema unchanged; a DROP/CREATE bumps the cookie and forces a rebuild.
+        if reloaded_schema_cookie == current_schema_cookie && !self.pager.is_memory() {
+            let path = self.pager.db_path().to_path_buf();
+            let built_at = self.fts5_instance_built_at.borrow();
+            let live = self.vtab_instances.borrow();
+            for (key, built) in built_at.iter() {
+                if !live.contains_key(key) {
+                    continue;
+                }
+                let lm = fts5_content_last_modified(&path, key);
+                let unchanged = lm.is_none_or(|last| last <= *built);
+                if unchanged {
+                    keys.insert(key.clone());
+                }
+            }
+        }
+        keys
     }
 
     fn enter_live_vtab_callback(&self, callback_name: &str) -> Result<LiveVtabCallbackGuard<'_>> {
@@ -50215,6 +50348,11 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<usize>> {
+        // GH#408: this is an INSERT into `insert.table` regardless of whether the
+        // streaming fast path applies (a fallback to Ok(None) still writes via the
+        // ordinary dispatcher), so stamp the table as content-dirty here — the
+        // streaming path persists rows directly and would otherwise be missed.
+        self.mark_live_vtab_content_dirty(insert.table.name.as_str());
         let InsertSource::Select(select_stmt) = &insert.source else {
             return Ok(None);
         };
@@ -50477,6 +50615,7 @@ impl Connection {
         rows: &[LiveVtabInsertRow],
         replace: bool,
     ) -> Result<Vec<i64>> {
+        self.mark_live_vtab_content_dirty(table_name);
         let cx = self.op_cx()?;
         #[cfg(feature = "ext-fts5")]
         let key = table_name.to_ascii_uppercase();
@@ -50617,6 +50756,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         let table_name = delete.table.name.name.clone();
+        self.mark_live_vtab_content_dirty(&table_name);
 
         // Enumerate the rowids to delete via the live scan path. `SELECT rowid`
         // routes through the same scan the user sees, so an empty/no-WHERE
@@ -50678,6 +50818,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         let table_name = update.table.name.name.clone();
+        self.mark_live_vtab_content_dirty(&table_name);
 
         // Contentless FTS5 keeps no old column values to preserve across an UPDATE,
         // so stock rejects UPDATE entirely on a plain contentless table and rejects
@@ -50801,6 +50942,7 @@ impl Connection {
         if rowids.is_empty() {
             return Ok(0);
         }
+        self.mark_live_vtab_content_dirty(table_name);
 
         #[cfg(feature = "ext-fts5")]
         let key = table_name.to_ascii_uppercase();
@@ -51229,6 +51371,7 @@ impl Connection {
 
     #[cfg(feature = "ext-fts5")]
     async fn persist_rootpage_zero_fts5_shadow_rows(&self, table_name: &str) -> Result<bool> {
+        self.mark_live_vtab_content_dirty(table_name);
         let root_page = {
             let schema = self.schema.borrow();
             schema
@@ -57918,6 +58061,9 @@ impl Connection {
                     && txn_begin_schema_generation == Some(self.schema_generation()),
                 live_vtab_commit_succeeded,
             );
+        }
+        if committed_write {
+            self.stamp_and_clear_fts5_content_dirty();
         }
         // A failed post-durable xCommit leaves that user object suspect. It was
         // removed from both registries above; run its Rust destructor only after
@@ -69837,6 +69983,9 @@ impl Connection {
                 txn_begin_schema_generation == Some(self.schema_generation()),
                 live_vtab_commit_succeeded,
             );
+        }
+        if committed_write {
+            self.stamp_and_clear_fts5_content_dirty();
         }
         if committed_write && let Some(schema_cookie) = schema_cookie_to_publish {
             self.publish_committed_schema_cookie(schema_cookie);
@@ -92691,6 +92840,8 @@ impl Connection {
                     .is_some())
             })?;
             if is_fts5 {
+                self.fts5_reload_rebuild_count
+                    .set(self.fts5_reload_rebuild_count.get().saturating_add(1));
                 // #368 defect 3: deferred-hydration repair open keeps the bare,
                 // empty FTS5 instance from connect() and skips ALL %_data
                 // reads/validation so a corrupt shadow can be opened for
@@ -93018,6 +93169,8 @@ impl Connection {
                 })?;
                 #[cfg(feature = "ext-fts5")]
                 if is_fts5 {
+                    self.fts5_reload_rebuild_count
+                        .set(self.fts5_reload_rebuild_count.get().saturating_add(1));
                     let documents = rows
                         .iter()
                         .map(|(rowid, values)| {
@@ -94316,6 +94469,24 @@ impl Connection {
                         .into_iter()
                         .filter(|key| !reloaded.contains_key(key)),
                 );
+                {
+                    // GH#408: after a reload at `bound_visible_commit_seq`, every
+                    // materialized live-vtab instance (rebuilt OR preserved)
+                    // reflects content valid at that sequence, so record it as
+                    // the instance's built_at for future preserve decisions.
+                    let mut built_at = self.fts5_instance_built_at.borrow_mut();
+                    for (table_name, _create_sql) in &pending_materialized_live_vtabs {
+                        built_at
+                            .insert(table_name.to_ascii_uppercase(), bound_visible_commit_seq);
+                    }
+                    // GH#408: rootpage-zero live vtabs (the common fts5 shape) are
+                    // rebuilt by a separate path; record their built_at too, or the
+                    // preserve gate can never fire for them.
+                    for (table_name, _, _) in &pending_rootpage_zero_virtual_tables {
+                        built_at
+                            .insert(table_name.to_ascii_uppercase(), bound_visible_commit_seq);
+                    }
+                }
                 Some((reloaded.into_instances(), preserved_live_vtab_keys))
             };
 
