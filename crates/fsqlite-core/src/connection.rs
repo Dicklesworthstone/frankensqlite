@@ -34033,8 +34033,15 @@ impl Connection {
                 // `SQL error at offset N:` prefix. Part C.
                 FrankenError::FunctionError(parse_error.message)
             }
-            fsqlite_parser::ParseErrorKind::Syntax
-            | fsqlite_parser::ParseErrorKind::RecursionLimit => FrankenError::ParseError {
+            fsqlite_parser::ParseErrorKind::RecursionLimit => {
+                // Stock reports a parser recursion/stack overflow verbatim as
+                // `parser stack overflow` (the message the parser already
+                // carries); surface it with NO `SQL error at offset N:`
+                // prefix, like the other stock-matching parse errors.
+                // bd-parser-errfmt-residuals-3giu1.
+                FrankenError::FunctionError(parse_error.message)
+            }
+            fsqlite_parser::ParseErrorKind::Syntax => FrankenError::ParseError {
                 offset: parse_error.span.start as usize,
                 detail: parse_error.message,
             },

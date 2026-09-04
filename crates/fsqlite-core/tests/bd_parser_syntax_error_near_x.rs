@@ -157,3 +157,82 @@ fn parser_trigger_body_restrictions_match_stock() {
         );
     });
 }
+
+#[test]
+fn parser_window_frame_bound_errors_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-parser-errfmt-residuals-3giu1: window-frame-bound rejections must
+        // read as stock SQLite (sqlite3 3.51, verified; also 3.53), NOT as the
+        // old frank-specific "window frame ... bound must ..." phrasings wrapped
+        // in a `SQL error at offset N:` prefix. Stock splits these into two
+        // shapes: grammar-level near-X (an UNBOUNDED bound in the wrong role)
+        // and the fixed `unsupported frame specification` (a semantically
+        // impossible start/end ordering). The frame is validated at parse time,
+        // so a minimal aggregate over-clause is enough to reach it.
+        let over =
+            |frame: &str| format!("SELECT sum(x) OVER (ORDER BY x {frame}) FROM (SELECT 1 AS x)");
+
+        // UNBOUNDED FOLLOWING as a frame START → near "FOLLOWING": syntax error.
+        assert_eq!(
+            err_of(&over("ROWS UNBOUNDED FOLLOWING")).await,
+            "near \"FOLLOWING\": syntax error",
+        );
+        assert_eq!(
+            err_of(&over("ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING")).await,
+            "near \"FOLLOWING\": syntax error",
+        );
+        // UNBOUNDED PRECEDING as a frame END → near "PRECEDING": syntax error.
+        assert_eq!(
+            err_of(&over("ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING")).await,
+            "near \"PRECEDING\": syntax error",
+        );
+        // A single-bound frame that starts after CURRENT ROW (e.g. `ROWS 1
+        // FOLLOWING`) → unsupported frame specification.
+        assert_eq!(
+            err_of(&over("ROWS 1 FOLLOWING")).await,
+            "unsupported frame specification",
+        );
+        // An end bound that precedes the start bound → unsupported frame
+        // specification.
+        assert_eq!(
+            err_of(&over("ROWS BETWEEN CURRENT ROW AND 1 PRECEDING")).await,
+            "unsupported frame specification",
+        );
+    });
+}
+
+#[test]
+fn parser_semantically_empty_input_is_a_noop_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        // bd-parser-errfmt-residuals-3giu1: stock's sqlite3_prepare_v2 treats
+        // empty / whitespace / comment / bare-`;` input as a no-op (SQLITE_OK
+        // with a NULL statement) — the C API and CLI return success with no
+        // rows, never a parse error. frank previously raised
+        // `SQL error at offset 0: no SQL statement provided`; query()/execute()
+        // must now agree with stock (matching execute_batch, which already
+        // treated these as no-ops).
+        let c = Connection::open(":memory:").await.unwrap();
+        for sql in [
+            "",
+            "   ",
+            "\n\t ",
+            ";",
+            " ; ; ",
+            "-- just a comment",
+            "/* block */",
+        ] {
+            let rows = c
+                .query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("empty input {sql:?} must be a no-op, got: {e}"));
+            assert!(rows.is_empty(), "empty input {sql:?} must yield no rows");
+            assert_eq!(
+                c.execute(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("execute {sql:?} must be a no-op, got: {e}")),
+                0,
+                "empty input {sql:?} must affect zero rows",
+            );
+        }
+    });
+}

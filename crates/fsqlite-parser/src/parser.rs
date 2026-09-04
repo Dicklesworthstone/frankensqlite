@@ -166,6 +166,18 @@ impl ParseError {
         error
     }
 
+    /// A semantic parse-error anchored at a SPECIFIC token, carrying a fixed
+    /// message that already matches stock SQLite verbatim (e.g. `unsupported
+    /// frame specification`). Tagged Semantic so the connection boundary
+    /// surfaces `message` VERBATIM, with NO `SQL error at offset N:` prefix.
+    /// bd-parser-errfmt-residuals-3giu1.
+    #[must_use]
+    pub(crate) fn semantic_at(message: impl Into<String>, token: Option<&Token>) -> Self {
+        let mut error = Self::at(message, token);
+        error.kind = ParseErrorKind::Semantic;
+        error
+    }
+
     #[must_use]
     pub(crate) fn expression_too_deep(max: u32, token: Option<&Token>) -> Self {
         let mut error = Self::at(
@@ -178,10 +190,12 @@ impl ParseError {
 
     #[must_use]
     fn recursion_limit(token: Option<&Token>) -> Self {
-        let mut error = Self::at(
-            format!("parser recursion limit exceeded (maximum depth {MAX_NATIVE_PARSE_DEPTH})"),
-            token,
-        );
+        // Stock SQLite surfaces a parser-recursion/stack overflow verbatim as
+        // `parser stack overflow` (sqlite3_errmsg; the CLI adds its own
+        // `Parse error near line N:` frame). The connection boundary routes
+        // RecursionLimit to FunctionError so this message is emitted with NO
+        // `SQL error at offset N:` prefix. bd-parser-errfmt-residuals-3giu1.
+        let mut error = Self::at("parser stack overflow", token);
         error.kind = ParseErrorKind::RecursionLimit;
         error
     }
@@ -2820,6 +2834,13 @@ fn parse_statements_with_scratch_inner(
 }
 
 /// Parse all statements from `sql` using caller-owned token/error lookaside.
+///
+/// Semantically-empty input (empty string, whitespace, comments, or bare
+/// `;` separators) parses to an empty statement list, matching stock SQLite:
+/// `sqlite3_prepare_v2` of such input returns `SQLITE_OK` with a NULL
+/// statement — a no-op, never a parse error. The single-statement callers
+/// below still reject an empty list on their own where exactly one statement
+/// is required. bd-parser-errfmt-residuals-3giu1.
 pub fn parse_statements_with_scratch(
     sql: &str,
     scratch: &mut StatementParseScratch,
@@ -2827,9 +2848,6 @@ pub fn parse_statements_with_scratch(
     let (statements, first_error) = parse_statements_with_scratch_inner(sql, scratch);
     if let Some(error) = first_error {
         return Err(error);
-    }
-    if statements.is_empty() {
-        return Err(ParseError::at("no SQL statement provided", None));
     }
     Ok(statements)
 }
@@ -7306,6 +7324,51 @@ mod tests {
             "the malformed UPDATE must be discarded"
         );
         assert_eq!(statements[0].to_string(), "SELECT 42");
+    }
+
+    #[test]
+    fn recursion_limit_error_uses_stock_parser_stack_overflow_text() {
+        // bd-parser-errfmt-residuals-3giu1: the native parser-recursion guard
+        // must surface stock SQLite's verbatim `parser stack overflow`
+        // (sqlite3_errmsg text), not a frank-specific "recursion limit
+        // exceeded" phrasing. Drive the depth counter straight to the cap so
+        // the guard fires without any real stack recursion.
+        let mut parser = Parser::from_sql("SELECT 1");
+        for _ in 0..MAX_NATIVE_PARSE_DEPTH {
+            parser
+                .enter_recursion()
+                .expect("depth below the cap must be accepted");
+        }
+        let error = parser
+            .enter_recursion()
+            .expect_err("exceeding the native recursion cap must be rejected");
+        assert_eq!(error.kind, ParseErrorKind::RecursionLimit);
+        assert_eq!(error.message, "parser stack overflow");
+    }
+
+    #[test]
+    fn semantically_empty_input_parses_to_no_statements() {
+        // bd-parser-errfmt-residuals-3giu1: stock's sqlite3_prepare_v2 treats
+        // empty / whitespace / comment / bare-`;` input as a no-op (SQLITE_OK,
+        // NULL statement) rather than a parse error. The multi-statement parse
+        // entry point mirrors that with an empty statement list and no error.
+        let mut scratch = StatementParseScratch::default();
+        for sql in [
+            "",
+            "   ",
+            "\n\t ",
+            ";",
+            " ; ; ",
+            "-- just a comment",
+            "/* block */",
+        ] {
+            let statements = parse_statements_with_scratch(sql, &mut scratch)
+                .unwrap_or_else(|error| panic!("empty input {sql:?} must not error: {error}"));
+            assert!(
+                statements.is_empty(),
+                "empty input {sql:?} must parse to zero statements"
+            );
+        }
     }
 
     #[test]

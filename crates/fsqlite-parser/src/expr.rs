@@ -205,14 +205,20 @@ pub(crate) fn validate_frame_start(
     has_explicit_end: bool,
 ) -> Result<(), ParseError> {
     if matches!(start.value, FrameBound::UnboundedFollowing) {
-        return Err(ParseError::at(
+        // Stock's grammar disallows UNBOUNDED FOLLOWING as a frame START and
+        // reports it as a plain syntax error at the FOLLOWING keyword.
+        // bd-parser-errfmt-residuals-3giu1.
+        return Err(ParseError::unexpected_at(
             "window frame starting bound must not be UNBOUNDED FOLLOWING",
             Some(&start.origin),
         ));
     }
     if !has_explicit_end && frame_bound_rank(&start.value) > 2 {
-        return Err(ParseError::at(
-            "single-bound window frame must not start after CURRENT ROW",
+        // A single-bound frame starting after CURRENT ROW (e.g. `ROWS 1
+        // FOLLOWING`) is stock's `unsupported frame specification`.
+        // bd-parser-errfmt-residuals-3giu1.
+        return Err(ParseError::semantic_at(
+            "unsupported frame specification",
             Some(&start.origin),
         ));
     }
@@ -224,14 +230,19 @@ pub(crate) fn validate_frame_end(
     end: &ParsedFrameBound,
 ) -> Result<(), ParseError> {
     if matches!(end.value, FrameBound::UnboundedPreceding) {
-        return Err(ParseError::at(
+        // Stock's grammar disallows UNBOUNDED PRECEDING as a frame END and
+        // reports it as a plain syntax error at the PRECEDING keyword.
+        // bd-parser-errfmt-residuals-3giu1.
+        return Err(ParseError::unexpected_at(
             "window frame ending bound must not be UNBOUNDED PRECEDING",
             Some(&end.origin),
         ));
     }
     if frame_bound_rank(&end.value) < frame_bound_rank(&start.value) {
-        return Err(ParseError::at(
-            "window frame ending bound must not precede its starting bound",
+        // An end bound that precedes the start bound is stock's
+        // `unsupported frame specification`. bd-parser-errfmt-residuals-3giu1.
+        return Err(ParseError::semantic_at(
+            "unsupported frame specification",
             Some(&end.origin),
         ));
     }
@@ -2760,6 +2771,10 @@ impl<'a> ParseMachine<'a> {
             .cloned()
             .ok_or_else(|| self.parser.err_here("expected window frame bound"))?;
         if self.parser.eat_kind(&TokenKind::KwUnbounded) {
+            // Anchor a rejected UNBOUNDED bound's diagnostic at the trailing
+            // PRECEDING/FOLLOWING keyword, matching stock's grammar-level
+            // `near "<kw>": syntax error`. bd-parser-errfmt-residuals-3giu1.
+            let keyword_origin = self.parser.peek_token().cloned();
             let bound = if self.parser.eat_kind(&TokenKind::KwPreceding) {
                 FrameBound::UnboundedPreceding
             } else {
@@ -2768,7 +2783,7 @@ impl<'a> ParseMachine<'a> {
             };
             self.values.push(MachineValue::FrameBound(ParsedFrameBound {
                 value: bound,
-                origin,
+                origin: keyword_origin.unwrap_or(origin),
             }));
         } else if matches!(
             self.parser.peek_kind(),
