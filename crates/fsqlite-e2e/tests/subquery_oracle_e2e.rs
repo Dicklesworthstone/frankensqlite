@@ -279,3 +279,48 @@ fn multi_column_in_subquery() {
         .await;
     });
 }
+
+/// GH#407 — a whole-table aggregate (e.g. COUNT(*)) whose WHERE places a
+/// grouped/HAVING IN-subquery in a short-circuitable position (behind an
+/// `AND`/`OR`/`NOT` connective) must still fold its aggregate. The bare form
+/// `WHERE col IN (grouped)` was already correct; the `<term> AND col IN
+/// (grouped)` form routed to the non-aggregating connection join executor and
+/// emitted a spurious NULL (COUNT(*) can never legally be NULL). The false /
+/// zero-prefix cases also pin the short-circuit polarity so E is absorbed.
+#[test]
+fn count_star_and_prefixed_in_grouped_subquery() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+            "INSERT INTO t VALUES (1,10,100),(2,10,200),(3,20,300),(4,20,300),(5,30,400)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // Bare form (control): already correct before the fix.
+                "SELECT COUNT(*) FROM t WHERE t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 1)",
+                // The GH#407 bug: a constant term precedes the IN(grouped/HAVING)
+                // in the AND-list -> used to return NULL, stock returns a count.
+                "SELECT COUNT(*) FROM t WHERE 1=1 AND t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 1)",
+                // A real (non-constant) predicate as the leading AND term.
+                "SELECT COUNT(*) FROM t WHERE t.g > 5 AND t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 2)",
+                // Same shape with a different implicit aggregate (SUM).
+                "SELECT SUM(v) FROM t WHERE 1=1 AND t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 1)",
+                // OR connective (also a short-circuitable position).
+                "SELECT COUNT(*) FROM t WHERE t.id = -999 OR t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 1)",
+                // False / zero prefix: the AND absorbs E; COUNT(*) is 0, not NULL.
+                "SELECT COUNT(*) FROM t WHERE 1=0 AND t.id IN \
+                   (SELECT id FROM t GROUP BY g HAVING COUNT(DISTINCT v) >= 1)",
+            ],
+            "count_star_and_prefixed_in_grouped_subquery",
+        )
+        .await;
+    });
+}

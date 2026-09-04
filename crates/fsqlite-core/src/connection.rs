@@ -36942,7 +36942,26 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    // GH#407: a whole-table aggregate (for example COUNT(*))
+                    // with a short-circuitable non-lowerable subquery in the
+                    // WHERE must still fold its aggregate. execute_join_select
+                    // projects one output per surviving row and never
+                    // initializes the implicit-aggregate accumulator, so the
+                    // bare `WHERE col IN (grouped)` fast path returned the right
+                    // count while `WHERE <term> AND col IN (grouped)` emitted a
+                    // spurious NULL. Route aggregate shapes through the
+                    // grouped-join executor — its inner scan still runs through
+                    // execute_join_select (single table with a subquery WHERE →
+                    // select_join_is_vdbe_eligible is false), so the per-row
+                    // short-circuit above is preserved — before aggregating.
+                    let mut rows = if has_group_by(&bound)
+                        || self.has_implicit_aggregation_with_registry(&bound)
+                        || has_ordered_aggregate(&bound)
+                    {
+                        self.execute_group_by_join_select(cx, &bound, None).await?
+                    } else {
+                        self.execute_join_select(&bound, None).await?
+                    };
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
