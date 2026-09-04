@@ -159,7 +159,9 @@ fn gh409_probe_access_path_for_unique_column_equality() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gh409_access_path.db");
-        let conn = Connection::open(&path.to_string_lossy()).await.unwrap();
+        let conn = Connection::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
         conn.execute("CREATE TABLE t (k TEXT NOT NULL UNIQUE, n INTEGER NOT NULL, pad TEXT);")
             .await
             .unwrap();
