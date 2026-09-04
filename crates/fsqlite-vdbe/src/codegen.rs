@@ -5019,20 +5019,53 @@ fn codegen_select_index_equality_scan(
         b.emit_label()
     };
 
-    // Exact seek (single-column ASC INTEGER-affinity index probed by an integer literal): the index's
-    // storage-class order matches the WHERE comparison's, so a 0-match seek is authoritative and the
-    // full-scan fallback (an affinity safety net) is unnecessary — an absent key then produces the empty
-    // result directly, making `WHERE col=<absent> LIMIT 1` / EXISTS O(log n) not O(n). Non-exact indexes
-    // keep the fallback. bd-eq-seek-fallback-zero-match.
+    // Exact seek (single-column ASC index whose stored key ordering already agrees with the WHERE
+    // comparison for this probe): a 0-match seek is authoritative, so the full-scan fallback — an
+    // affinity safety net — is unnecessary and an absent key produces the empty result directly. That
+    // makes `WHERE col = <absent>` O(log n) instead of O(n). Non-exact indexes keep the fallback.
+    // bd-eq-seek-fallback-zero-match.
+    //
+    // GH#409: the safety net exists because column affinity is applied to the comparison but not to the
+    // probe record, so a probe whose storage class the column's affinity would have converted can seek
+    // into the wrong region and miss a row that does match. That is only true when a conversion is
+    // actually implied. It is not implied when the literal's storage class is already the one the
+    // column's affinity produces — an integer literal against INTEGER affinity ('D'), or a string
+    // literal against TEXT affinity ('B'). In the TEXT case the ordering argument additionally needs the
+    // comparison collation to be the index's, so BINARY on both sides is required; integers are ordered
+    // identically under every collation, so the integer case does not.
+    //
+    // Without the TEXT case, every equality probe of a `TEXT ... UNIQUE` column that matches nothing
+    // fell through to a full table scan of the whole table — the O(image) post-commit read reported in
+    // GH#409, which was only ever hidden by the per-commit-epoch result caches above this layer.
+    let probe_column = idx_schema
+        .columns
+        .first()
+        .and_then(|name| table.column_index(name))
+        .and_then(|i| table.columns.get(i));
+    let index_collation_is_binary = idx_schema
+        .key_term_collation(0)
+        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
+    let probe_needs_no_affinity_conversion = probe_column.is_some_and(|column| {
+        match target_expr {
+            Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
+            Expr::Literal(Literal::String(_), _) => {
+                column.affinity == 'B'
+                    && index_collation_is_binary
+                    && column
+                        .collation
+                        .as_deref()
+                        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
+            }
+            _ => false,
+        }
+    });
+    // A partial index cannot make a 0-match seek authoritative: rows the index
+    // predicate excludes are absent from it but can still satisfy the WHERE, so
+    // those keep the fallback scan.
     let exact_seek = idx_schema.key_term_count() == 1
         && !idx_schema.key_term_descending(0)
-        && matches!(target_expr, Expr::Literal(Literal::Integer(_), _))
-        && idx_schema
-            .columns
-            .first()
-            .and_then(|name| table.column_index(name))
-            .and_then(|i| table.columns.get(i))
-            .is_some_and(|c| c.affinity == 'D');
+        && idx_schema.supports_direct_column_lookup()
+        && probe_needs_no_affinity_conversion;
     let seek_miss_label = if exact_seek {
         fast_path_done_label
     } else {

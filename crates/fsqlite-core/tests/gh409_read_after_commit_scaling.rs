@@ -15,7 +15,9 @@
 //! image. A whole-image pass shows up as a multiple; a bounded refresh does
 //! not.
 
-use fsqlite_core::connection::Connection;
+use fsqlite_core::connection::{
+    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+};
 use fsqlite_types::value::SqliteValue;
 use std::time::{Duration, Instant};
 
@@ -70,10 +72,31 @@ async fn post_commit_read_cost(conn: &Connection, tag: char) -> Duration {
     best
 }
 
+/// Count the VDBE opcodes executed by exactly one post-commit read.
+///
+/// This is the machine-independent half of the keeper: a whole-image pass shows
+/// up as one `Next`/`Column`/`Ne` per row in the table, so the opcode total
+/// grows with the fixture. A bounded read executes a constant program whatever
+/// the fixture size. Unlike wall time, it cannot be moved by a loaded host.
+async fn post_commit_read_opcodes(conn: &Connection, tag: char) -> u64 {
+    conn.execute(&format!("INSERT INTO small(id, v) VALUES (700, '{tag}');"))
+        .await
+        .unwrap();
+    set_hot_path_profile_enabled(true);
+    // Reset AFTER the write so the counters describe the read alone, not the
+    // commit that re-arms it.
+    reset_hot_path_profile();
+    let rows = conn
+        .query("SELECT n FROM t WHERE k = 'k7-nonexistent';")
+        .await
+        .unwrap();
+    let snapshot = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(false);
+    assert!(rows.is_empty(), "the probe read matches no row by design");
+    snapshot.vdbe.opcodes_executed_total
+}
+
 #[test]
-#[ignore = "GH#409 repro: currently RED. Measured 2026-09-04 on this fixture: \
-            4 000 rows -> 3.5 ms, 16 000 rows -> 21 ms for the first read after a \
-            one-row commit (ratio ~6 for 4x data). Un-ignore with the fix."]
 fn gh409_first_read_after_a_commit_does_not_scale_with_the_database() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
@@ -88,6 +111,20 @@ fn gh409_first_read_after_a_commit_does_not_scale_with_the_database() {
         // keeper measures.
         let _ = small.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
         let _ = large.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
+
+        // Primary, host-independent receipt: the executed program is bounded.
+        // Before the fix this was 20 754 opcodes at 4 000 rows and 80 018 at
+        // 16 000 — one `Next`/`Column`/`Ne`/`String8` per row, i.e. the full
+        // table scan the index-equality emitter fell back to whenever the seek
+        // matched nothing.
+        let small_opcodes = post_commit_read_opcodes(&small, 's').await;
+        let large_opcodes = post_commit_read_opcodes(&large, 'l').await;
+        assert!(
+            large_opcodes < 4 * small_opcodes.max(1) && large_opcodes < 1_000,
+            "the first read after a commit must execute a bounded program: \
+             {SMALL_ROWS} rows executed {small_opcodes} opcodes, {LARGE_ROWS} rows \
+             executed {large_opcodes} (data is 4x)"
+        );
 
         let small_cost = post_commit_read_cost(&small, 's').await;
         let large_cost = post_commit_read_cost(&large, 'l').await;
