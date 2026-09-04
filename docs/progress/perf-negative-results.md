@@ -22243,3 +22243,41 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   then MEASURE, since the zero-init tax is the dominant added cost. The
   `format_sqlite_float_into` write-into variant for the single Display caller
   (`value.rs` `impl Display`) is a separate, narrower lever left untried.
+
+## 2026-09-04 - REJECT (measured, GH#409): amortizing the `prepared_indexed_equality_cache` whole-table build does not move the post-commit read; the term was in the emitted bytecode
+
+- Target workload: the GH#409 shape — on a connection that has just committed a
+  write, the next `SELECT n FROM t WHERE k = <absent>` on a `TEXT ... UNIQUE`
+  column costs O(rows in the table). Fixture:
+  `crates/fsqlite-core/tests/gh409_read_after_commit_scaling.rs` (4 000 and
+  16 000 rows of ~1 KB, one-row `INSERT` into an unrelated table, then the read).
+- Files touched by the rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`
+  (`with_prepared_indexed_equality_cache_key`).
+- Candidate: the cache key carries `visible_commit_seq`, so every commit
+  invalidates it and the miss path rebuilds a `rowids_by_value` map over
+  `table.iter_rows()`. The candidate declined the fast path until the same key
+  had been probed several times, so the whole-table build could not be paid on
+  the first post-commit read.
+- Measured result: NO CHANGE. The post-commit read stayed at ~3.5 ms (4 000
+  rows) and ~21 ms (16 000 rows), and the per-row
+  `record_decode.decoded_values.text_count` stayed at 4 014 / 16 017. Reverted
+  rather than shipped as an unproven change to a hot path.
+- Where the term actually was: the VDBE opcode profile for exactly one
+  post-commit read showed `Next`/`Column`/`Ne`/`String8` once per table row
+  (20 754 opcodes at 4 000 rows, 80 018 at 16 000) with `SeekGE` executed once
+  and abandoned — `codegen_select_index_equality_scan` routes a zero-match seek
+  into its full-scan fallback, and its `exact_seek` exemption covered only
+  integer literals against INTEGER-affinity columns. Fixed in `069063ea1`:
+  17 opcodes at both sizes.
+- Durable lesson: `memdb_refresh_count` and the record-decode counters describe
+  *how much* decoding happened, not *which* loop did it. The VDBE
+  `opcode_execution_totals` in the same snapshot name the loop directly, and
+  should be the first thing read when a cost scales with row count. A per-commit
+  cost is not evidence of per-commit *work*: a result cache keyed on
+  `visible_commit_seq` makes any underlying O(n) read look like a per-commit
+  validation pass.
+- Retry condition: do not re-attempt cache-build amortization for this shape.
+  If a future workload is shown to be genuinely bound by the `rowids_by_value`
+  build (many distinct probe keys per commit epoch on a large table), measure it
+  against that workload, not against a read that matches nothing.
