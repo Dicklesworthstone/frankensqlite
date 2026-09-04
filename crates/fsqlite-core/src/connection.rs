@@ -5288,6 +5288,11 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     if full_name_is("fsqlite.backend_kind") || full_name_is("backend_kind") {
         return &["backend_kind"];
     }
+    // GH#410 durable freelist repair; reports how many illegal entries were
+    // dropped from the durable trunk chain.
+    if full_name_is("fsqlite.repair_freelist") || full_name_is("repair_freelist") {
+        return &["repair_freelist"];
+    }
     if full_name_is("fsqlite.backend_mode") || full_name_is("backend_mode") {
         return &["backend_mode"];
     }
@@ -5566,7 +5571,6 @@ fn pragma_dispatches_without_schema(name: &str) -> bool {
         "function_list",
         "data_version",
         "encoding",
-        "repair_freelist",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
@@ -70563,8 +70567,19 @@ impl Connection {
                 )
                 .await?;
 
+                // GH#410: the reserved lock-byte page is owned by nobody BY
+                // DESIGN — no b-tree may reference it and it may never be
+                // free. Enumerating it as an orphan is what put page 262145 on
+                // the freelist of a 10 GB archive: this very repair pass freed
+                // it, and integrity_check then reported the file as malformed.
+                // `first_unowned_database_page` already exempts it; so must
+                // this walk.
+                let reserved = fsqlite_pager::lock_byte_page(header.page_size);
                 let mut orphans = Vec::new();
                 for raw in 2..=total_pages {
+                    if raw == reserved {
+                        continue;
+                    }
                     if let Some(page) = PageNumber::new(raw)
                         && !owner_map.contains_key(&page)
                     {
@@ -73087,8 +73102,7 @@ impl Connection {
                         "PRAGMA fsqlite.repair_freelist cannot run inside a transaction".to_owned(),
                     ));
                 }
-                let cx = self.op_cx()?;
-                let dropped = self.pager.repair_durable_freelist(&cx).await?;
+                let dropped = self.repair_freelist().await?;
                 Ok(vec![Row {
                     values: vec![SqliteValue::Integer(i64::from(dropped))],
                 }])
@@ -75600,6 +75614,24 @@ impl Connection {
         }
 
         positions
+    }
+
+    /// GH#410: republish the durable freelist without the entries that can
+    /// never legally be free — above all the reserved lock-byte page, which
+    /// 0.3.13/0.3.14 writers could leave on a freelist leaf of a database
+    /// larger than 1 GiB.
+    ///
+    /// Returns how many entries were dropped; 0 when nothing needed repair.
+    /// Also reachable as `PRAGMA fsqlite.repair_freelist`, and run
+    /// automatically by the on-open migration repair pass.
+    ///
+    /// # Errors
+    ///
+    /// Propagates begin/commit failures; the durable image is unchanged and
+    /// the repair stays armed for a later attempt.
+    pub async fn repair_freelist(&self) -> Result<u32> {
+        let cx = self.op_cx()?;
+        self.pager.repair_durable_freelist(&cx).await
     }
 
     async fn pragma_database_header(&self) -> Result<Option<DatabaseHeader>> {

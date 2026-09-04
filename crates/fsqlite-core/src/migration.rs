@@ -284,6 +284,20 @@ pub(crate) async fn run_first_open_migration(
             // re-frees genuinely-orphaned in-range pages (a no-op otherwise), so
             // running it is safe even when the corruption is a different class.
             let mut repairs_applied = Vec::new();
+            // GH#410: drop entries the durable freelist names but that can
+            // never legally be free — the reserved lock-byte page above all,
+            // which 0.3.13/0.3.14 writers left on a freelist leaf of archives
+            // past 1 GiB. Runs FIRST: the orphaned-page walk below refuses to
+            // run at all while the freelist names the reserved page.
+            match conn.repair_freelist().await {
+                Ok(dropped) if dropped > 0 => {
+                    repairs_applied.push(format!("repair_freelist:{dropped}"));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "repair_freelist failed during migration");
+                }
+            }
             match conn.repair_orphaned_pages().await {
                 Ok(freed) if freed > 0 => {
                     repairs_applied.push(format!("repair_orphaned_pages:{freed}"));

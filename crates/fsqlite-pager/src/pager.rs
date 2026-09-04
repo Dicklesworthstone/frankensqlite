@@ -30831,6 +30831,52 @@ mod tests {
         );
     }
 
+    /// GH#410: the reserved lock-byte page is neither allocatable nor
+    /// freeable, so it must never survive normalization at any page size.
+    #[test]
+    fn test_normalize_freelist_drops_the_reserved_lock_byte_page() {
+        for raw in [512_u32, 1024, 4096, 65536] {
+            let page_size = PageSize::new(raw).unwrap();
+            let reserved = crate::journal::lock_byte_page(page_size);
+            let neighbour_below = PageNumber::new(reserved - 1).unwrap();
+            let neighbour_above = PageNumber::new(reserved + 1).unwrap();
+            let reserved_page = PageNumber::new(reserved).unwrap();
+
+            let normalized = normalize_freelist(
+                &[neighbour_above, reserved_page, neighbour_below],
+                reserved + 1,
+                page_size,
+            );
+
+            assert_eq!(
+                normalized,
+                vec![neighbour_above, neighbour_below],
+                "bead_id={BEAD_ID} case=normalize_freelist_drops_lock_byte_page page_size={raw}"
+            );
+        }
+    }
+
+    /// GH#410: a free of the reserved page — which only a damaged tree or an
+    /// orphan sweep can ask for — must be refused, not queued onto the
+    /// freelist where a later allocation would hand it out.
+    #[test]
+    fn test_free_page_refuses_the_reserved_lock_byte_page() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let reserved = PageNumber::new(crate::journal::lock_byte_page(PageSize::DEFAULT))
+                .expect("lock-byte page number");
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.free_page(&cx, reserved).await.unwrap();
+            assert!(
+                !txn.freed_pages.contains(&reserved),
+                "bead_id={BEAD_ID} case=free_page_refuses_lock_byte_page"
+            );
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
     #[test]
     fn test_freed_pages_are_quarantined_until_commit() {
         asupersync::test_utils::run_test(|| async {

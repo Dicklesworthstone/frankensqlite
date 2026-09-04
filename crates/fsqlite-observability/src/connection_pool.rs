@@ -749,7 +749,7 @@ fn projected_throughput_score(
     let overshoot_ratio =
         pool_size.saturating_sub(recommended_pool_size) as f64 / recommended_pool_size_f64;
 
-    let mut score = 45.0 + (useful_parallelism * 55.0) - (overshoot_ratio * 10.0);
+    let mut score = overshoot_ratio.mul_add(-10.0, useful_parallelism.mul_add(55.0, 45.0));
     score -= validation
         .findings
         .iter()
