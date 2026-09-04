@@ -5571,6 +5571,9 @@ fn pragma_dispatches_without_schema(name: &str) -> bool {
         "function_list",
         "data_version",
         "encoding",
+        // GH#410: whole-file repair, not per-schema — `PRAGMA repair_freelist`
+        // and `PRAGMA fsqlite.repair_freelist` name the same operation.
+        "repair_freelist",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
