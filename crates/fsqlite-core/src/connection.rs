@@ -655,8 +655,8 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 ///
 /// SQLite charges trigger bodies and recursive foreign-key actions against one
 /// `SQLITE_MAX_TRIGGER_DEPTH` budget. FrankenSQLite's native Rust trigger
-/// recursion has the smaller [`MAX_TRIGGER_DEPTH`] stack-safety cap above, but
-/// the two program kinds must still share this semantic admission budget.
+/// recursion has the smaller [`MAX_TRIGGER_DEPTH`] cap above, but the two
+/// program kinds must still share this semantic admission budget.
 ///
 /// Like [`MAX_TRIGGER_DEPTH`] this is a semantic cap, not a byte budget: 50
 /// levels at this workspace's measured ~186 KiB/level already implies ~9.3 MiB
@@ -734,7 +734,7 @@ const fn remaining_native_stack() -> Option<usize> {
 ///
 /// The projection is measured, not assumed: `depth == 0` records the remaining
 /// stack at the outermost admission, and each deeper admission divides the
-/// bytes consumed since by the aggregate depth to price one more level. That
+/// bytes consumed since by the levels admitted since to price one more. That
 /// makes the check self-calibrating across optimization levels — the same code
 /// prices a level at ~186 KiB in this workspace and at ~4 MiB at opt-level 0.
 ///
