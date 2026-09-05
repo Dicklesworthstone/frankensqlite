@@ -5708,7 +5708,7 @@ mod tests {
             active_status: sample_phase5_leaf("active"),
             completed_status: sample_phase5_leaf("completed"),
         };
-        let active = Phase5RchStatusEnvelope {
+        let mut active = Phase5RchStatusEnvelope {
             api_version: "1.0".to_owned(),
             command: "status".to_owned(),
             success: true,
@@ -5724,7 +5724,7 @@ mod tests {
                 },
             },
         };
-        let completed = Phase5RchStatusEnvelope {
+        let mut completed = Phase5RchStatusEnvelope {
             api_version: "1.0".to_owned(),
             command: "status".to_owned(),
             success: true,
@@ -5754,6 +5754,53 @@ mod tests {
             )
             .expect_err("wrong project must fail"),
             "phase5_active_status_not_bound_to_command"
+        );
+
+        let transcript = "Selected worker: worker-1\nRemote command finished: exit=0\n";
+        active.data.daemon.active_builds[0].project_id = "expected-project".to_owned();
+        completed.data.daemon.recent_builds[0].project_id = "expected-project".to_owned();
+        assert_eq!(
+            validate_phase5_rch_binding(
+                &receipt,
+                &execution,
+                &active,
+                &completed,
+                transcript,
+                "expected-project",
+            ),
+            Ok("worker-1".to_owned()),
+            "matching admitted and completed remote execution is the positive control"
+        );
+
+        // A workflow definition or disabled Actions status is not a run receipt.
+        let inactive_workflow = br#"{"enabled":false,"workflow_state":"disabled_manually","conclusion":"success","steps":[]}"#;
+        assert!(parse_phase5_status(inactive_workflow, "inactive_workflow").is_err());
+        let admitted = active.data.daemon.active_builds.pop().expect("control job");
+        assert_eq!(
+            validate_phase5_rch_binding(
+                &receipt,
+                &execution,
+                &active,
+                &completed,
+                transcript,
+                "expected-project",
+            )
+            .expect_err("claimed success cannot replace an observed admitted job"),
+            "phase5_active_status_job_cardinality_mismatch"
+        );
+        active.data.daemon.active_builds.push(admitted);
+        completed.data.daemon.recent_builds.clear();
+        assert_eq!(
+            validate_phase5_rch_binding(
+                &receipt,
+                &execution,
+                &active,
+                &completed,
+                transcript,
+                "expected-project",
+            )
+            .expect_err("admission without completed execution cannot certify a run"),
+            "phase5_completed_status_job_cardinality_mismatch"
         );
     }
 
@@ -6125,6 +6172,29 @@ mod tests {
                 .is_err()
         );
         assert!(validate_d4_observation_stdout(observation, &[0xff]).is_err());
+
+        // This real model checker succeeds without opening a database or running SQL.
+        // Its output therefore cannot replace the executed observation envelope.
+        let sections = [1, 2].map(|txn_id| fsqlite_mvcc::Section {
+            txn_id,
+            observations: std::collections::HashMap::from([(7, 11)]),
+        });
+        let model = fsqlite_mvcc::check_sheaf_consistency(&sections, None);
+        assert!(model.is_consistent(), "positive model-only control");
+        let model_only = serde_json::to_vec(&serde_json::json!({
+            "model": "sheaf_consistency",
+            "passed": model.is_consistent(),
+            "transactions": sections.len(),
+        }))
+        .expect("model result encoding");
+        assert!(
+            serde_json::from_slice::<ConcurrentWriteObservation>(&model_only).is_err(),
+            "a passing model lacks observed storage, SQL history and commit publication"
+        );
+        assert!(
+            validate_d4_observation_stdout(&model_only, line.as_bytes()).is_err(),
+            "a separately passing model cannot be substituted for captured observation bytes"
+        );
     }
 
     #[test]
