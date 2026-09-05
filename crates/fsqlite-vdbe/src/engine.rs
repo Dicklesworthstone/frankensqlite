@@ -4915,6 +4915,12 @@ thread_local! {
     /// production hot path is unaffected when observability is off.
     static FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Same rationale for the three invalidation reasons: a test that asserts
+    /// "exactly one pseudo-row invalidation and no position/write ones" is
+    /// otherwise measuring every thread in the process.
+    static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// Total number of decode-cache invalidations caused by row-position changes.
 static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -5741,6 +5747,9 @@ fn note_decode_cache_miss(collect_vdbe_metrics: bool) {
 fn reset_thread_decode_cache_metrics() {
     FSQLITE_VDBE_DECODE_CACHE_HITS_THREAD.with(|c| c.set(0));
     FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD.with(|c| c.set(0));
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_THREAD.with(|c| c.set(0));
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_THREAD.with(|c| c.set(0));
+    FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_THREAD.with(|c| c.set(0));
 }
 
 /// Test-only: this thread's decode-cache hit count since the last reset.
@@ -5755,6 +5764,17 @@ fn thread_decode_cache_misses() -> u64 {
     FSQLITE_VDBE_DECODE_CACHE_MISSES_THREAD.with(std::cell::Cell::get)
 }
 
+/// Test-only: this thread's decode-cache invalidation counts since the last
+/// reset, as `(position_change, write_mutation, pseudo_row_change)`.
+#[cfg(test)]
+fn thread_decode_cache_invalidations() -> (u64, u64, u64) {
+    (
+        FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_THREAD.with(std::cell::Cell::get),
+        FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_THREAD.with(std::cell::Cell::get),
+        FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_THREAD.with(std::cell::Cell::get),
+    )
+}
+
 fn note_decode_cache_invalidation(
     collect_vdbe_metrics: bool,
     reason: DecodeCacheInvalidationReason,
@@ -5766,14 +5786,20 @@ fn note_decode_cache_invalidation(
         DecodeCacheInvalidationReason::PositionChange => {
             FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_THREAD
+                .with(|c| c.set(c.get().saturating_add(1)));
         }
         DecodeCacheInvalidationReason::WriteMutation => {
             FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_TOTAL
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_THREAD
+                .with(|c| c.set(c.get().saturating_add(1)));
         }
         DecodeCacheInvalidationReason::PseudoRowChange => {
             FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_TOTAL
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_THREAD
+                .with(|c| c.set(c.get().saturating_add(1)));
         }
     }
 }
@@ -33088,7 +33114,12 @@ mod tests {
             ),
         );
 
-        let before = vdbe_metrics_snapshot();
+        // bd-p3963: measure this thread's counters, not the process-global
+        // snapshot. Enabling metrics is a global switch, so any other test
+        // decoding a record on another thread lands in the global deltas and
+        // makes these exact-count assertions fail purely under parallel load.
+        // Every decode below runs synchronously on this thread via `run_async`.
+        reset_thread_decode_cache_metrics();
         assert_eq!(
             run_async(engine.cursor_column(0, 0)).expect("pseudo row should decode"),
             SqliteValue::Integer(7)
@@ -33108,31 +33139,14 @@ mod tests {
             run_async(engine.cursor_column(0, 0)).expect("changed pseudo row should decode"),
             SqliteValue::Integer(9)
         );
-        let after = vdbe_metrics_snapshot();
 
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_pseudo_total
-                - before.decode_cache_invalidations_pseudo_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            0
-        );
+        assert_eq!(thread_decode_cache_hits(), 1);
+        assert_eq!(thread_decode_cache_misses(), 2);
+        let (position_invalidations, write_invalidations, pseudo_invalidations) =
+            thread_decode_cache_invalidations();
+        assert_eq!(pseudo_invalidations, 1);
+        assert_eq!(position_invalidations, 0);
+        assert_eq!(write_invalidations, 0);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
