@@ -73305,6 +73305,15 @@ impl Connection {
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
             let is_temp = pragma_schema_scope(pragma) == PragmaSchemaScope::Temp;
             let is_default = pragma_name == "default_cache_size";
+            if pragma.value.is_some() && is_temp {
+                // TEMP accepts the runtime suggestion before a default-setting
+                // write is refused, just like a file-backed schema does.
+                let mut state = self.pragma_state.borrow_mut();
+                state.temp_cache_size = next_state.temp_cache_size;
+                if is_default && state.query_only {
+                    return Err(FrankenError::ReadOnly);
+                }
+            }
             if pragma.value.is_some() && !is_temp {
                 // Resize before publishing the accepted runtime suggestion.
                 // SQLite keeps this connection-local setting even if a
