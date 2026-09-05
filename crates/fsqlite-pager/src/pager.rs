@@ -4595,13 +4595,19 @@ impl<F: VfsFile + 'static> BeginAdmission<F> {
     }
 
     fn complete(&mut self) -> Result<PagerMaintenanceLease> {
-        let maintenance_lease = self.maintenance_lease.take().ok_or_else(|| {
+        let mut maintenance_lease = self.maintenance_lease.take().ok_or_else(|| {
             FrankenError::internal("completed begin admission lost its maintenance lease")
         })?;
         self.external_lock.disarm();
         self.writer_baton_owned = false;
         self.coordination_owner.take();
         self.completed = true;
+        // Both begin paths call complete only after binding the transaction's
+        // visible snapshot. Admission/recovery leases alone are not snapshots.
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global().active_readers.inc();
+            maintenance_lease.counted_snapshot = true;
+        }
         Ok(maintenance_lease)
     }
 }
@@ -5796,6 +5802,10 @@ enum PagerMaintenanceLeaseKind {
 struct PagerMaintenanceLease {
     gate: Arc<PagerMaintenanceGate>,
     kind: PagerMaintenanceLeaseKind,
+    /// One live snapshot contribution, activated only after successful begin.
+    /// Moves with the lease through cache reuse and deferred cleanup, so a
+    /// completed SQL statement cannot prematurely decrement a held snapshot.
+    counted_snapshot: bool,
     /// Original lease kind retained while an open or transaction lease is
     /// upgraded for recovery. This receipt belongs to the persistent lease,
     /// not to one async recovery future: dropping that future must leave the
@@ -5926,6 +5936,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Open,
+            counted_snapshot: false,
             exclusive_upgrade_prior: None,
         })
     }
@@ -5987,6 +5998,7 @@ impl PagerMaintenanceGate {
             PagerMaintenanceLease {
                 gate: Arc::clone(self),
                 kind: PagerMaintenanceLeaseKind::Open,
+                counted_snapshot: false,
                 exclusive_upgrade_prior: None,
             },
             recovery_claim,
@@ -6029,6 +6041,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Transaction,
+            counted_snapshot: false,
             exclusive_upgrade_prior: None,
         })
     }
@@ -6049,6 +6062,7 @@ impl PagerMaintenanceGate {
         Ok(PagerMaintenanceLease {
             gate: Arc::clone(self),
             kind: PagerMaintenanceLeaseKind::Exclusive,
+            counted_snapshot: false,
             exclusive_upgrade_prior: None,
         })
     }
@@ -6204,6 +6218,10 @@ impl Drop for PagerMaintenanceLease {
             PagerMaintenanceLeaseKind::Exclusive => {
                 state.maintenance_active = false;
             }
+        }
+        drop(state);
+        if self.counted_snapshot {
+            fsqlite_observability::metrics::global().active_readers.dec();
         }
     }
 }

@@ -199,6 +199,7 @@ pub struct MetricsRegistry {
     pub page_lock_acquire_duration_seconds: Histogram,
     // ── gauges ──────────────────────────────────────────────────
     pub active_writers: Gauge,
+    /// Bound pager snapshots, including writer views and cached read snapshots.
     pub active_readers: Gauge,
     pub historical_pins_active: Gauge,
     pub wal_frames_pending_checkpoint: Gauge,
@@ -310,7 +311,7 @@ impl MetricsRegistry {
         gauge(
             &mut o,
             "fsqlite_active_readers",
-            "Active reader snapshots.",
+            "Pager snapshots held by readers or writers, including cached snapshots.",
             self.active_readers.get(),
         );
         gauge(

@@ -4,6 +4,86 @@ use fsqlite_types::value::SqliteValue;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn real_reader_gauge_tracks_held_snapshots() -> TestResult {
+    const MODE: &str = "FSQLITE_READER_GAUGE_TEST_MODE";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "real_reader_gauge_tracks_held_snapshots", "--nocapture"])
+                .env(MODE, mode)
+                .env("FRANKENSQLITE_METRICS_DISABLE", if mode == "disabled" { "1" } else { "0" })
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("reader_gauge mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} snapshot keeper failed");
+            assert!(stderr.contains("event=public_reader_snapshots_verified"));
+        }
+        return Ok(());
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
+    let gauge = &fsqlite_observability::metrics::global().active_readers;
+    let expect = |count, phase| {
+        assert_eq!(gauge.get(), if enabled { count } else { 0 }, "{phase}");
+    };
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let directory = tempfile::tempdir()?;
+            for memory in [true, false] {
+                let path = directory.path().join("reader-gauge.db");
+                let conn = Connection::open(if memory { ":memory:" } else { path.to_str().unwrap() }).await?;
+                assert!(conn.is_concurrent_mode_default());
+                expect(0, "open without a held transaction");
+                conn.execute("BEGIN").await?;
+                expect(1, "default concurrent transaction also owns a read snapshot");
+                assert!(conn.execute("BEGIN").await.is_err());
+                expect(1, "rejected nested BEGIN must not add a snapshot");
+                conn.execute("CREATE TABLE snapshots(id INTEGER PRIMARY KEY)").await?;
+                conn.execute("INSERT INTO snapshots VALUES(7)").await?;
+                conn.execute("SAVEPOINT s").await?;
+                conn.execute("INSERT INTO snapshots VALUES(8)").await?;
+                conn.execute("ROLLBACK TO s").await?;
+                conn.execute("RELEASE s").await?;
+                expect(1, "savepoint operations retain one snapshot");
+                conn.execute("COMMIT").await?;
+                expect(0, "explicit commit releases the snapshot");
+                for _ in 0..3 {
+                    let prepared = conn.prepare("SELECT id FROM snapshots").await?;
+                    assert_eq!(prepared.query().await?[0].values(), &[SqliteValue::Integer(7)]);
+                    // Memory reads retain one reusable pager snapshot; file
+                    // reads release it so external commits can become visible.
+                    expect(i64::from(memory), "completed prepared read snapshot lifetime");
+                }
+                conn.execute("BEGIN").await?;
+                expect(1, "BEGIN replaces a cached snapshot without double counting");
+                let other = Connection::open(":memory:").await?;
+                other.execute("BEGIN").await?;
+                expect(2, "held snapshots aggregate across databases");
+                conn.execute("ROLLBACK").await?;
+                expect(1, "one database rollback preserves the other's contribution");
+                other.close().await?;
+                expect(0, "awaited close releases an active snapshot");
+                conn.query("SELECT id FROM snapshots").await?;
+                expect(i64::from(memory), "autocommit read cache remains counted");
+                conn.close().await?;
+                expect(0, "close releases a cached snapshot");
+                eprintln!("event=public_reader_snapshots_verified mode={mode} memory={memory}");
+            }
+            let exposition = fsqlite_observability::metrics::render_prometheus();
+            if enabled {
+                assert!(exposition.lines().any(|line| line == "fsqlite_active_readers 0"));
+            } else {
+                assert!(exposition.is_empty());
+            }
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 fn real_schema_metrics_follow_public_cache_invalidations() -> TestResult {
     const MODE: &str = "FSQLITE_SCHEMA_METRICS_TEST_MODE";
     let Ok(mode) = std::env::var(MODE) else {
