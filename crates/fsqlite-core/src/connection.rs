@@ -56192,6 +56192,12 @@ impl Connection {
         self.retained_autocommit_read_count.set(0);
         // Advance commit clock if commit succeeded.
         if commit_result.is_ok() {
+            // A retained batch contributes one physical write commit, regardless
+            // of how many statements were parked. Count before fallible
+            // post-commit checkpointing; the committed writes already exist.
+            if txn_had_pending_writes && !fsqlite_observability::metrics::metrics_disabled() {
+                fsqlite_observability::metrics::global().commits_total.inc();
+            }
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
                 match self.pager.checkpoint(cx, CheckpointMode::Passive).await {
                     Ok(_) => {}
@@ -58122,6 +58128,12 @@ impl Connection {
                 let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
                 match txn.commit_and_retain(cx).await {
                     Ok(true) => {
+                        // This branch committed writes and returns before the
+                        // normal autocommit tail. Parking an uncommitted batch
+                        // above never reaches this counter.
+                        if !fsqlite_observability::metrics::metrics_disabled() {
+                            fsqlite_observability::metrics::global().commits_total.inc();
+                        }
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                             commit_txn_roundtrip_start,
@@ -58434,6 +58446,9 @@ impl Connection {
         }
 
         txn_result?;
+        if committed_write && !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global().commits_total.inc();
+        }
         if committed_write && schema_change_boundary {
             self.publish_committed_schema_cookie(self.schema_cookie());
         }
@@ -70385,6 +70400,12 @@ impl Connection {
         };
 
         // Commit succeeded; now consume and drop the handle.
+        // Count once after retry/in-doubt resolution, including a physically
+        // committed transaction whose later cleanup reports an error. Explicit
+        // read-only COMMIT also completes a transaction; implicit reads do not.
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global().commits_total.inc();
+        }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
         *self.active_txn.borrow_mut() = None;

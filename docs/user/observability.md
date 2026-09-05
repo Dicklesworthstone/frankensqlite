@@ -37,9 +37,9 @@ FRANKENSQLITE_METRICS_DISABLE=1 ./your-app
 
 Three ways to read the metrics. The **callable API**, both **serializers**, the
 **StatsD UDP push** transport, and the **HTTP `/metrics` endpoint** all ship
-today. What remains is *engine* wiring — auto-starting the endpoint from
-`Connection::open` / a `PRAGMA`, and incrementing the counters at their hot-path
-sites (see [Roadmap](#roadmap)).
+today. The SQL engine records `commits_total` at its commit success boundaries.
+Most other engine recording sites and endpoint auto-start from
+`Connection::open` / a `PRAGMA` still need wiring (see [Roadmap](#roadmap)).
 
 ### 1. Callable API (embedded scrape) — available now
 
@@ -165,12 +165,19 @@ as per-flush deltas.
 
 | Metric | Labels | Meaning | SLO recommendation |
 |--------|--------|---------|--------------------|
-| `fsqlite_commits_total` (`fsqlite.commits_total`) | — | Transactions committed. | Base rate for throughput dashboards; a sudden drop with steady request load signals stalls. |
+| `fsqlite_commits_total` (`fsqlite.commits_total`) | — | Completed explicit transactions, including read-only COMMIT, plus committed autocommit write transactions. | Base rate for transaction completion; a sudden drop with steady request load signals stalls. |
 | `fsqlite_conflicts_total` (`fsqlite.conflicts_total`) | `response=busy_snapshot` \| `rebased` | Write-write conflicts, split by how MVCC resolved them. | Alert when `rate(conflicts_total{response="busy_snapshot"}) / rate(commits_total) > 0.05` — busy-snapshot means a writer was turned away and must retry. A healthy `rebased` share is normal (the engine merged the writer forward). |
 | `fsqlite_sweeper_clears_total` (`fsqlite.sweeper_clears_total`) | — | Version-sweeper reclamation passes. | Should track roughly with commit volume; a flatline while `history_bytes` climbs indicates the sweeper is starved. |
 | `fsqlite_historical_snapshots_opened_total` (`fsqlite.historical_snapshots_opened_total`) | — | Time-travel / historical snapshots opened. | Informational; correlate with `historical_pins_active`. |
 | `fsqlite_schema_epoch_bumps_total` (`fsqlite.schema_epoch_bumps_total`) | — | Schema-epoch increments (DDL that invalidated cached plans). | A spike outside a deploy window suggests unexpected DDL churn. |
 | `fsqlite_integrity_check_runs_total` (`fsqlite.integrity_check_runs_total`) | `result=ok` \| `fail` | Integrity checks by outcome. | **Page immediately** on any increase of `result="fail"`. |
+
+The commit counter increments once after successful commit resolution, including
+busy retries. It excludes rollbacks, rejected commits, failed autocommit writes,
+implicit reads, and uncommitted retained batches. A retained batch counts once
+when flushed, regardless of its statement count. Post-commit cleanup errors do
+not undo an already counted commit. These are SQL engine commit counts; they do
+not count individual rows or internal pager maintenance transactions.
 
 ### Histograms (latency, seconds)
 
@@ -228,8 +235,12 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 - **Engine auto-start & `PRAGMA`** — auto-binding the HTTP endpoint from
   `Connection::open` and a `PRAGMA enable_metrics_http=1` control (default
   `localhost:9009`), so operators need no explicit `start_metrics_http` call.
-- **Engine hot-path wiring** — incrementing these metrics from the actual
-  fsync / commit / conflict / sweeper / integrity sites.
+- **Engine hot-path wiring** — restoring the remaining fsync / commit-latency /
+  conflict / sweeper / integrity recording sites. The commit counter is wired;
+  its public SQL keeper is
+  `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
+  (bd-zywqc.11.1.3). Other series being present in an exposition is not proof
+  that their engine producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
 
 [`StatsdEncoder`]: ../../crates/fsqlite-observability/src/metrics.rs

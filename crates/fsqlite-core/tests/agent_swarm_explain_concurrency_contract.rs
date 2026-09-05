@@ -4,6 +4,153 @@ use fsqlite_types::value::SqliteValue;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
+    // The registry is process-wide. Each mode runs in its own process so other
+    // tests cannot contaminate exact deltas or the once-read environment flag.
+    let Ok(mode) = std::env::var("FSQLITE_COMMIT_METRICS_TEST_MODE") else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "real_commit_metrics_count_public_durable_outcomes", "--nocapture"])
+                .env("FSQLITE_COMMIT_METRICS_TEST_MODE", mode)
+                .env("FRANKENSQLITE_METRICS_DISABLE", if mode == "disabled" { "1" } else { "0" })
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("commit_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} keeper failed");
+            assert!(stderr.contains("event=public_commit_metrics_verified"), "child must execute the SQL scenarios");
+        }
+        return Ok(());
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
+    assert_eq!(fsqlite_observability::metrics::metrics_disabled(), !enabled);
+    let counter = &fsqlite_observability::metrics::global().commits_total;
+    let delta = |before, expected| {
+        assert_eq!(counter.get() - before, if enabled { expected } else { 0 });
+    };
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("commit-metrics.db");
+            for path in [":memory:", file.to_str().expect("UTF-8 path")] {
+                let conn = Connection::open(path).await?;
+                assert!(conn.is_concurrent_mode_default());
+                conn.query("PRAGMA journal_mode=WAL;").await?;
+                conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;").await?;
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+                for id in 1..=3 {
+                    let before = counter.get();
+                    conn.execute("BEGIN;").await?;
+                    assert!(conn.is_concurrent_transaction());
+                    conn.execute(&format!("INSERT INTO t VALUES({id},10);")).await?;
+                    delta(before, 0);
+                    conn.execute("COMMIT;").await?;
+                    delta(before, 1);
+                    assert!(conn.execute("COMMIT;").await.is_err());
+                    delta(before, 1);
+                }
+                let before = counter.get();
+                conn.execute("BEGIN;").await?;
+                conn.execute("INSERT INTO t VALUES(99,10);").await?;
+                conn.execute("ROLLBACK;").await?;
+                conn.query("SELECT * FROM t;").await?;
+                delta(before, 0);
+                // Explicit read-only COMMIT is a transaction completion; an
+                // implicit read snapshot is not an autocommit write commit.
+                conn.execute("BEGIN;").await?;
+                conn.query("SELECT * FROM t;").await?;
+                conn.execute("COMMIT;").await?;
+                delta(before, 1);
+                for id in 4..=6 {
+                    let before = counter.get();
+                    conn.execute(&format!("INSERT INTO t VALUES({id},10);")).await?;
+                    delta(before, 1);
+                    assert!(conn.execute(&format!("INSERT INTO t VALUES({id},99);")).await.is_err());
+                    delta(before, 1);
+                }
+                let before = counter.get();
+                {
+                    let statement = conn.prepare("INSERT INTO t VALUES(?1,10);").await?;
+                    delta(before, 0);
+                    statement.execute_with_params(&[SqliteValue::Integer(7)]).await?;
+                    delta(before, 1);
+                    statement.execute_with_params(&[SqliteValue::Integer(8)]).await?;
+                    delta(before, 2);
+                }
+                conn.execute_batch("INSERT INTO t VALUES(9,10); INSERT INTO t VALUES(10,10);").await?;
+                delta(before, 4);
+                let before = counter.get();
+                assert_eq!(conn.query("SELECT count(*),sum(value) FROM t;").await?[0].values(), &[SqliteValue::Integer(10), SqliteValue::Integer(100)]);
+                conn.close().await?;
+                delta(before, 0);
+            }
+
+            // Explicit opt-out exercises the existing private-memory retained
+            // path. No default is changed, and parked writes must not count.
+            let conn = Connection::open(":memory:").await?;
+            assert!(conn.is_concurrent_mode_default());
+            conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").await?;
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);").await?;
+            let before = counter.get();
+            conn.execute("INSERT INTO t VALUES(1);").await?;
+            conn.execute("INSERT INTO t VALUES(2);").await?;
+            delta(before, 0);
+            conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;").await?;
+            delta(before, 1);
+            conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;").await?;
+            delta(before, 1);
+            conn.execute("INSERT INTO t VALUES(3);").await?;
+            delta(before, 2);
+            assert_eq!(conn.query("SELECT count(*) FROM t;").await?[0].values(), &[SqliteValue::Integer(3)]);
+            conn.close().await?;
+            delta(before, 2);
+
+            // Genuine SSI write skew: the rejected COMMIT is not counted,
+            // while the independent survivor publishes exactly once.
+            let path = dir.path().join("commit-metrics-ssi.db");
+            let path = path.to_str().expect("UTF-8 path");
+            let first = Connection::open(path).await?;
+            first.query("PRAGMA journal_mode=WAL;").await?;
+            for table in ["a", "b"] {
+                first.execute(&format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, value INTEGER);")).await?;
+                first.execute(&format!("INSERT INTO {table} VALUES(1,10);")).await?;
+            }
+            let second = Connection::open(path).await?;
+            let before = counter.get();
+            first.execute("BEGIN;").await?;
+            second.execute("BEGIN;").await?;
+            first.query("SELECT value FROM b;").await?;
+            second.query("SELECT value FROM a;").await?;
+            first.execute("UPDATE a SET value=11;").await?;
+            second.execute("UPDATE b SET value=11;").await?;
+            assert!(matches!(first.execute("COMMIT;").await, Err(fsqlite_error::FrankenError::BusySnapshot { .. })));
+            delta(before, 0);
+            first.execute("ROLLBACK;").await?;
+            second.execute("COMMIT;").await?;
+            delta(before, 1);
+            assert_eq!(first.query("SELECT value FROM a;").await?[0].values(), &[SqliteValue::Integer(10)]);
+            assert_eq!(first.query("SELECT value FROM b;").await?[0].values(), &[SqliteValue::Integer(11)]);
+            first.close().await?;
+            second.close().await?;
+            delta(before, 1);
+            let text = fsqlite_observability::metrics::render_prometheus();
+            if enabled {
+                assert!(text.lines().any(|line| line == format!("fsqlite_commits_total {}", counter.get())));
+                assert!(!text.contains("commit-metrics") && !text.contains("INSERT INTO"));
+            } else {
+                assert!(text.is_empty());
+                assert_eq!(counter.get(), 0);
+            }
+            eprintln!("bead_id=bd-zywqc.11.1.3 event=public_commit_metrics_verified mode={mode} commits={}", counter.get());
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 #[cfg(feature = "diagnostic-pragmas")]
 fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> TestResult {
     let mut outcome: TestResult = Ok(());
