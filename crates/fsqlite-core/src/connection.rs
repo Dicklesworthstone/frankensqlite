@@ -14769,6 +14769,10 @@ impl Connection {
             conn.close_best_effort_in_place().await;
             return Err(err);
         }
+        // Opt-in, process-wide startup only after a successful database open.
+        // The existing helper honors metrics-disable and tolerates bind errors.
+        #[cfg(not(target_arch = "wasm32"))]
+        fsqlite_observability::metrics_net::autostart_from_env();
         Ok(conn)
     }
 

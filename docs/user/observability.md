@@ -23,7 +23,7 @@ counters are lock-free atomics).
 | *(default)* | Recording enabled; poll via the callable API below. |
 | `FRANKENSQLITE_METRICS_DISABLE=1` | **Hard opt-out.** Every `inc`/`observe`/`set` becomes a branch-guarded no-op and the exposition functions return an empty string. Read once at process start via `LazyLock`, so the disable check adds a single predictable branch. |
 | `FRANKENSQLITE_STATSD_ADDR=host:port` | **Opt-in StatsD push.** Names the StatsD/DogStatsD server (e.g. `127.0.0.1:8125`) that `StatsdPusher::from_env()` sends to. Unset ⇒ no StatsD push. |
-| `FRANKENSQLITE_METRICS_BIND=host:port` | **Opt-in HTTP `/metrics`.** When `metrics_net::autostart_from_env()` is called, binds a Prometheus pull endpoint here (e.g. `127.0.0.1:9009`). Unset ⇒ no HTTP endpoint. Also gated by the hard opt-out above. |
+| `FRANKENSQLITE_METRICS_BIND=host:port` | **Opt-in HTTP `/metrics`.** The first successful native `Connection::open` calls `metrics_net::autostart_from_env()` to bind here (e.g. `127.0.0.1:9009`). Unset ⇒ no HTTP endpoint. Also gated by the hard opt-out above. |
 
 Set the environment variable before the process starts:
 
@@ -39,8 +39,15 @@ Three ways to read the metrics. The **callable API**, both **serializers**, the
 **StatsD UDP push** transport, and the **HTTP `/metrics` endpoint** all ship
 today. The SQL engine records `commits_total` at its commit success boundaries
 and `page_lock_acquire_duration_seconds` when a contended wait finishes.
-Most other engine recording sites and endpoint auto-start from
-`Connection::open` / a `PRAGMA` still need wiring (see [Roadmap](#roadmap)).
+Native database opens start the HTTP endpoint when the bind environment variable
+is set. Most other engine recording sites and the `PRAGMA` control still need
+wiring (see [Roadmap](#roadmap)).
+
+The bind setting is checked once per process at the first successful native
+open; the hard-disable flag is cached on first metrics use. Subsequent
+connections share the endpoint, which lives until process exit.
+A bind failure leaves database operations usable. Set the bind address before
+starting the process; changing it later does not retry or move the listener.
 
 ### 1. Callable API (embedded scrape) — available now
 
@@ -78,10 +85,9 @@ let addr = metrics_net::start_metrics_http("127.0.0.1:9009")?;
 metrics_net::autostart_from_env(); // honors FRANKENSQLITE_METRICS_BIND=127.0.0.1:9009
 ```
 
-> **Note.** The endpoint is available as a callable API today. Having the engine
-> *auto-start* it at `Connection::open` (and a `PRAGMA enable_metrics_http=1`
-> control with the default `localhost:9009` bind) is the remaining wiring tracked
-> on `bd-zywqc.11`.
+Native `Connection::open` calls `autostart_from_env` automatically. The
+`PRAGMA enable_metrics_http=1` control with the default `localhost:9009` bind
+remains tracked on `bd-zywqc.11`.
 
 Example output:
 
@@ -241,9 +247,11 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **Engine auto-start & `PRAGMA`** — auto-binding the HTTP endpoint from
-  `Connection::open` and a `PRAGMA enable_metrics_http=1` control (default
-  `localhost:9009`), so operators need no explicit `start_metrics_http` call.
+- **`PRAGMA` control** — `PRAGMA enable_metrics_http=1` (default
+  `localhost:9009`) remains unwired. Native `Connection::open` already starts
+  the endpoint from `FRANKENSQLITE_METRICS_BIND`; the public SQL and TCP keeper
+  is `real_metrics_http_starts_from_public_connection_open` in
+  `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs`.
 - **Engine hot-path wiring** — restoring the remaining fsync / commit-latency /
   conflict / sweeper / integrity recording sites. The commit counter is wired;
   its public SQL keeper is
