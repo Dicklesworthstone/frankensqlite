@@ -443,11 +443,13 @@ older serialized-default wording in this section and its companion document.
   Hot-plane overhead is bounded by `TxnSlot` count and hot bucket capacity
   (bitsets over slots); cold-plane evidence is append-only but GC-able by
   `safe_gc_seq` horizons.
-- PostgreSQL has proven SSI viable in production since 2011 with 3–7% OLTP
-  overhead (up to 10–20% on microbenchmarks) and ~0.5% false positive abort
-  rate. At page granularity, our false positive
-  rate will be somewhat higher, but the safe write-merge ladder (Section 5.10)
-  compensates by turning many apparent conflicts into successful merges.
+- PostgreSQL provides a production precedent for SSI; its
+  [transaction isolation documentation](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE)
+  describes dependency monitoring and serialization retries. Its workload
+  results do not establish FrankenSQLite's overhead or abort rate. The safe
+  write-merge ladder (Section 5.10) may reduce aborts when its implementation
+  and semantic admissibility checks support the workload; activation and a
+  measured benefit remain required before claiming that result.
 - Starting with SSI from day one means we never ship a correctness regression.
   We can always *reduce* abort rates later (finer witness keys + refinement,
   better victim selection), but we cannot retroactively fix applications that
@@ -475,8 +477,9 @@ older serialized-default wording in this section and its companion document.
 ### 3.1 What RaptorQ Is
 
 RaptorQ (RFC 6330) is a fountain code -- a class of erasure codes where the
-encoder can produce a practically unlimited stream of encoding symbols from K
-source symbols. Recovery requires a mathematically sufficient set of encoding
+encoder can produce additional encoding symbols on demand from K source
+symbols, within the finite ESI space and admitted codec/schedule limits.
+Recovery requires a mathematically sufficient set of encoding
 equations; symbol count alone does not guarantee decoding. Additional repair
 symbols can resolve a rank-deficient received set.
 
@@ -486,7 +489,8 @@ symbols can resolve a rank-deficient received set.
   polynomial-time encoding/decoding under real-world constraints.
 - **Systematic**: The first K encoding symbols ARE the source symbols (zero
   encoding overhead for the common no-loss case)
-- **Rateless**: Generate as many repair symbols as needed on-the-fly
+- **Rateless**: Generate additional repair symbols on demand at supported,
+  distinct ESIs, within the codec and schedule limits
 - **Self-describing**: Symbol sizes and block parameters must satisfy the
   admitted format/codec bounds; FrankenSQLite's widened OTI is described in §3.5.2.
 
@@ -810,8 +814,8 @@ to 4096-byte vectors.
 
 #### 3.2.3 Encoding Step by Step
 
-The RaptorQ encoding process transforms K source symbols into a potentially
-unlimited stream of encoding symbols. Here is the complete procedure:
+The RaptorQ encoding process transforms K source symbols into encoding symbols
+at supported, distinct ESIs within the admitted limits. The procedure is:
 
 **Step 1: Determine Coding Parameters**
 
@@ -1643,9 +1647,12 @@ DECODING:
         - On success: recover `changeset_bytes_padded` of length `K_source * symbol_size`.
           Parse `ChangesetHeader.total_len` from the decoded bytes and truncate to `total_len`
           to obtain the true `changeset_bytes` (padding in the final symbol is ignored).
-        - If failure (rare, ~1% at exactly K_source): stay in COLLECTING, wait for more
+        - If the received equations are rank-deficient: return to COLLECTING
+          for additional distinct admitted equations, within retry/resource limits.
+        - Validation, unsupported-layout and cancellation errors retain their
+          typed failure semantics; they are not evidence that more symbols help.
     Transition -> APPLYING (on successful decode)
-    Transition -> COLLECTING (on decode failure, need more symbols)
+    Transition -> COLLECTING (on recoverable rank deficiency, need more symbols)
 
 APPLYING:
     Entry: All K_source source symbols recovered.
