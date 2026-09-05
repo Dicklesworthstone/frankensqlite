@@ -10640,6 +10640,9 @@ struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    // TEMP has no pager header: retain its transactional default here.
+    // The independent runtime cache suggestion deliberately survives rollback.
+    temp_default_cache_size: i64,
     shadowed_main_tables: HashMap<String, TableSchema>,
     views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
@@ -68657,6 +68660,7 @@ impl Connection {
             db_version,
             schema: self.schema.borrow().clone(),
             temp_table_names: self.temp_table_names.borrow().clone(),
+            temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
             shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
@@ -68728,6 +68732,7 @@ impl Connection {
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
         (*self.temp_table_names.borrow_mut()).clone_from(&snap.temp_table_names);
+        self.pragma_state.borrow_mut().temp_default_cache_size = snap.temp_default_cache_size;
         (*self.shadowed_main_tables.borrow_mut()).clone_from(&snap.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&snap.views);
         *self.views_by_name.borrow_mut() = new_views_by_name;
