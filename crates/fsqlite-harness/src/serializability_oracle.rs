@@ -45,7 +45,7 @@ pub const CONCURRENT_WRITE_SOURCE_PATHS: [&str; 11] = [
     "crates/fsqlite-harness/src/release_certificate.rs",
     "crates/fsqlite-pager/src/pager.rs",
     "crates/fsqlite-pager/src/page_cache.rs",
-    "crates/fsqlite-mvcc/src/concurrent.rs",
+    "crates/fsqlite-mvcc/src/begin_concurrent.rs",
     "crates/fsqlite-vdbe/src/lib.rs",
 ];
 
@@ -84,9 +84,11 @@ pub struct ConcurrentCommitObservation {
     pub page_id: u32,
 }
 
-/// One executed keeper's observations. Internal consistency does not prove that
-/// this JSON was executed: strict D4 also binds its exact bytes to captured
-/// stdout, a successful named-test receipt, and the tested source tree.
+/// One executed keeper's observations.
+///
+/// Internal consistency does not prove that this JSON was executed: strict D4
+/// also binds its exact bytes to captured stdout, a successful named-test
+/// receipt, and the tested source tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrentWriteObservation {

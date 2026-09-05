@@ -539,8 +539,14 @@ fn prepared_pragma_getters_and_setters_match_rusqlite() -> TestResult {
                 assert_eq!(error.error_code(), ErrorCode::Error, "{sql}");
                 let oracle_error = rusqlite_rows(&rconn, sql)
                     .expect_err("SQLite unexpectedly accepted an unknown schema");
-                let Some(rusqlite::Error::SqliteFailure(code, Some(message))) =
-                    oracle_error.downcast_ref::<rusqlite::Error>()
+                let Some(
+                    rusqlite::Error::SqliteFailure(code, Some(message))
+                    | rusqlite::Error::SqlInputError {
+                        error: code,
+                        msg: message,
+                        ..
+                    },
+                ) = oracle_error.downcast_ref::<rusqlite::Error>()
                 else {
                     panic!("unexpected SQLite error for {sql}: {oracle_error}");
                 };

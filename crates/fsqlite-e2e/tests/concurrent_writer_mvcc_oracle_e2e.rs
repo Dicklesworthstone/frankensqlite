@@ -191,7 +191,12 @@ fn compiled_overlap_source_hashes() -> BTreeMap<String, String> {
     assert_eq!(sources.map(|(path, _)| path), CONCURRENT_WRITE_SOURCE_PATHS);
     sources
         .into_iter()
-        .map(|(path, bytes)| (path.to_owned(), format!("{:x}", Sha256::digest(bytes))))
+        .map(|(path, bytes)| {
+            (
+                path.to_owned(),
+                fsqlite_harness::bytes_to_lower_hex(Sha256::digest(bytes)),
+            )
+        })
         .collect()
 }
 
@@ -374,10 +379,9 @@ fn build_overlap_observation(
         test_target: CONCURRENT_WRITE_TEST_TARGET.to_owned(),
         test_name: CONCURRENT_WRITE_TEST_NAME.to_owned(),
         source_sha256: compiled_overlap_source_hashes(),
-        cargo_lock_sha256: format!(
-            "{:x}",
-            Sha256::digest(include_bytes!("../../../Cargo.lock"))
-        ),
+        cargo_lock_sha256: fsqlite_harness::bytes_to_lower_hex(Sha256::digest(include_bytes!(
+            "../../../Cargo.lock"
+        ))),
         storage: recorder.storage.clone(),
         commit_phases: recorder.phases.clone(),
     }

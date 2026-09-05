@@ -38,7 +38,7 @@ const DEFAULT_TIMEOUT_SECS: u32 = 300;
 const MAX_RETRIES: u32 = 2;
 
 /// Schema version for execution summary output.
-const EXECUTION_SUMMARY_SCHEMA_VERSION: &str = "1.0.0";
+const EXECUTION_SUMMARY_SCHEMA_VERSION: &str = "1.1.0";
 
 // ─── Manifest Types ─────────────────────────────────────────────────────
 
@@ -137,7 +137,24 @@ pub struct EnvVar {
     pub default_value: Option<String>,
 }
 
-/// The full execution manifest.
+/// Whether execution covers the full catalog or an explicitly selected subset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManifestRunScope {
+    /// All executable catalog entries, with the full scenario denominator.
+    FullSuite,
+    /// Exact catalog paths selected by the caller; never a full-suite certificate.
+    SelectedScripts {
+        /// Number of executable entries before selection.
+        catalog_script_count: usize,
+        /// Selected paths in canonical execution order.
+        selected_paths: Vec<String>,
+        /// Entries intentionally omitted, in canonical execution order.
+        omitted_paths: Vec<String>,
+    },
+}
+
+/// The execution manifest and its explicit catalog scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionManifest {
     /// Schema version for the manifest format.
@@ -146,6 +163,8 @@ pub struct ExecutionManifest {
     pub bead_id: String,
     /// Root seed used to derive all per-script seeds.
     pub root_seed: u64,
+    /// Full-suite or explicit subset identity, preserved in every summary.
+    pub run_scope: ManifestRunScope,
     /// Total timeout budget across all scripts (seconds).
     pub total_timeout_budget_secs: u64,
     /// All script entries in execution order.
@@ -172,6 +191,7 @@ pub struct ManifestCoverage {
 /// Dry-run summary of what the orchestrator would execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunSummary {
+    pub run_scope: ManifestRunScope,
     pub total_scripts: usize,
     pub total_timeout_budget_secs: u64,
     pub phases: Vec<PhaseSummary>,
@@ -190,9 +210,79 @@ pub struct PhaseSummary {
 }
 
 impl ExecutionManifest {
+    /// Select exact catalog paths while preserving commands, seeds, and order.
+    ///
+    /// Empty, unknown, duplicate, and repeated selections are errors. Coverage
+    /// continues to report the full catalog's uncovered scenario denominator.
+    pub fn select_scripts(mut self, paths: &[String]) -> Result<Self, String> {
+        if !matches!(self.run_scope, ManifestRunScope::FullSuite) {
+            return Err("script selection requires a full catalog manifest".to_owned());
+        }
+        if paths.is_empty() {
+            return Err("script selection must contain at least one catalog path".to_owned());
+        }
+        let mut requested = BTreeSet::new();
+        for path in paths {
+            if !requested.insert(path.as_str()) {
+                return Err(format!("duplicate script selector: {path}"));
+            }
+            if !self.entries.iter().any(|entry| entry.path == *path) {
+                return Err(format!("unknown executable catalog path: {path}"));
+            }
+        }
+
+        let catalog_script_count = self.entries.len();
+        let mut selected_paths = Vec::new();
+        let mut omitted_paths = Vec::new();
+        self.entries.retain(|entry| {
+            if requested.contains(entry.path.as_str()) {
+                selected_paths.push(entry.path.clone());
+                true
+            } else {
+                omitted_paths.push(entry.path.clone());
+                false
+            }
+        });
+        self.total_timeout_budget_secs = self
+            .entries
+            .iter()
+            .map(|entry| u64::from(entry.timeout_secs))
+            .sum();
+        self.coverage = compute_coverage(
+            &self.entries,
+            &e2e_traceability::build_canonical_inventory(),
+        );
+        self.run_scope = ManifestRunScope::SelectedScripts {
+            catalog_script_count,
+            selected_paths,
+            omitted_paths,
+        };
+        Ok(self)
+    }
+
     /// Validate the manifest for internal consistency.
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
+
+        if let ManifestRunScope::SelectedScripts {
+            catalog_script_count,
+            selected_paths,
+            omitted_paths,
+        } = &self.run_scope
+        {
+            let actual_paths: Vec<_> = self.entries.iter().map(|entry| &entry.path).collect();
+            if selected_paths.is_empty()
+                || selected_paths.iter().collect::<Vec<_>>() != actual_paths
+            {
+                errors.push("Selected script identity does not match manifest entries".to_owned());
+            }
+            let all_paths: BTreeSet<_> = selected_paths.iter().chain(omitted_paths).collect();
+            if all_paths.len() != *catalog_script_count
+                || selected_paths.len() + omitted_paths.len() != *catalog_script_count
+            {
+                errors.push("Selected and omitted paths do not partition the catalog".to_owned());
+            }
+        }
 
         // No duplicate paths
         let mut seen_paths = BTreeSet::new();
@@ -300,6 +390,7 @@ impl ExecutionManifest {
             .count();
 
         DryRunSummary {
+            run_scope: self.run_scope.clone(),
             total_scripts: self.entries.len(),
             total_timeout_budget_secs: self.total_timeout_budget_secs,
             phases: phase_summaries,
@@ -530,9 +621,10 @@ pub fn build_execution_manifest(root_seed: u64) -> ExecutionManifest {
     let coverage = compute_coverage(&entries, &matrix);
 
     ExecutionManifest {
-        schema_version: "1.0.0".to_owned(),
+        schema_version: "1.1.0".to_owned(),
         bead_id: BEAD_ID.to_owned(),
         root_seed,
+        run_scope: ManifestRunScope::FullSuite,
         total_timeout_budget_secs: total_timeout,
         entries,
         coverage,
@@ -651,6 +743,7 @@ pub struct ManifestExecutionSummary {
     pub manifest_schema_version: String,
     pub execution_mode: ManifestExecutionMode,
     pub root_seed: u64,
+    pub run_scope: ManifestRunScope,
     pub total_scripts: usize,
     pub passed_scripts: usize,
     pub failed_scripts: usize,
@@ -659,6 +752,9 @@ pub struct ManifestExecutionSummary {
     pub missing_scenarios: Vec<String>,
     pub artifact_index: Vec<ArtifactIndexEntry>,
     pub scripts: Vec<ScriptExecutionRecord>,
+    /// All selected entries actually executed and passed; false for dry runs.
+    pub selected_scripts_pass: bool,
+    /// Full-suite contract result only; always false for an explicit subset.
     pub overall_pass: bool,
 }
 
@@ -691,6 +787,13 @@ pub fn execute_manifest(
     manifest: &ExecutionManifest,
     mode: ManifestExecutionMode,
 ) -> io::Result<ManifestExecutionSummary> {
+    let validation_errors = manifest.validate();
+    if !validation_errors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            validation_errors.join("; "),
+        ));
+    }
     if matches!(mode, ManifestExecutionMode::Execute) {
         fs::create_dir_all(run_dir)?;
     }
@@ -813,8 +916,12 @@ pub fn execute_manifest(
         .filter(|record| matches!(record.status, ScriptExecutionStatus::MissingArtifacts))
         .count();
 
-    let script_failures = failed_scripts + timed_out_scripts + missing_artifact_scripts;
-    let overall_pass = missing_scenarios.is_empty() && script_failures == 0;
+    let selected_scripts_pass = matches!(mode, ManifestExecutionMode::Execute)
+        && !scripts.is_empty()
+        && passed_scripts == scripts.len();
+    let overall_pass = matches!(manifest.run_scope, ManifestRunScope::FullSuite)
+        && missing_scenarios.is_empty()
+        && selected_scripts_pass;
 
     Ok(ManifestExecutionSummary {
         schema_version: EXECUTION_SUMMARY_SCHEMA_VERSION.to_owned(),
@@ -822,6 +929,7 @@ pub fn execute_manifest(
         manifest_schema_version: manifest.schema_version.clone(),
         execution_mode: mode,
         root_seed: manifest.root_seed,
+        run_scope: manifest.run_scope.clone(),
         total_scripts: scripts.len(),
         passed_scripts,
         failed_scripts,
@@ -830,6 +938,7 @@ pub fn execute_manifest(
         missing_scenarios,
         artifact_index,
         scripts,
+        selected_scripts_pass,
         overall_pass,
     })
 }
@@ -947,7 +1056,7 @@ mod tests {
     fn manifest_builds() {
         let manifest = build_default_manifest();
         assert!(!manifest.entries.is_empty());
-        assert_eq!(manifest.schema_version, "1.0.0");
+        assert_eq!(manifest.schema_version, "1.1.0");
         assert_eq!(manifest.bead_id, BEAD_ID);
     }
 
@@ -1079,6 +1188,102 @@ mod tests {
     }
 
     #[test]
+    fn script_selection_preserves_canonical_identity_order_and_denominator() {
+        let full = build_execution_manifest(0x1234);
+        let oracle_path = "crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs";
+        let oracle = full
+            .entries
+            .iter()
+            .find(|entry| entry.path == oracle_path)
+            .expect("canonical oracle entry");
+        let first = &full.entries[0];
+        assert_ne!(first.path, oracle.path);
+        let selected = full
+            .clone()
+            .select_scripts(&[oracle.path.clone(), first.path.clone()])
+            .expect("exact catalog selectors");
+
+        assert_eq!(selected.entries, vec![first.clone(), oracle.clone()]);
+        assert_eq!(
+            selected.run_scope,
+            ManifestRunScope::SelectedScripts {
+                catalog_script_count: full.entries.len(),
+                selected_paths: vec![first.path.clone(), oracle.path.clone()],
+                omitted_paths: full
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.path != first.path && entry.path != oracle.path)
+                    .map(|entry| entry.path.clone())
+                    .collect(),
+            }
+        );
+        assert!(selected.validate().is_empty());
+        assert_eq!(selected.coverage.total_scripts, 2);
+        assert_eq!(selected.dry_run_summary().run_scope, selected.run_scope);
+        let full_scenarios: BTreeSet<_> = full
+            .entries
+            .iter()
+            .flat_map(|entry| entry.scenario_ids.iter().cloned())
+            .chain(full.coverage.uncovered_scenario_ids.iter().cloned())
+            .collect();
+        let selected_denominator: BTreeSet<_> = selected
+            .entries
+            .iter()
+            .flat_map(|entry| entry.scenario_ids.iter().cloned())
+            .chain(selected.coverage.uncovered_scenario_ids.iter().cloned())
+            .collect();
+        assert_eq!(selected_denominator, full_scenarios);
+        let decoded: ExecutionManifest =
+            serde_json::from_str(&selected.to_json().expect("selected manifest JSON"))
+                .expect("selected manifest roundtrip");
+        assert_eq!(decoded.run_scope, selected.run_scope);
+    }
+
+    #[test]
+    fn script_selection_rejects_empty_unknown_duplicate_and_reselection() {
+        let full = build_default_manifest();
+        let path = full.entries[0].path.clone();
+        assert!(full.clone().select_scripts(&[]).is_err());
+        for unknown in ["", "*", "scripts/absent.sh", "echo arbitrary command"] {
+            let error = full
+                .clone()
+                .select_scripts(&[path.clone(), unknown.to_owned()])
+                .expect_err("unknown selector must reject the whole request");
+            assert!(error.contains("unknown executable catalog path"));
+        }
+        assert!(
+            full.clone()
+                .select_scripts(&[path.clone(), path.clone()])
+                .expect_err("duplicate selector")
+                .contains("duplicate")
+        );
+        let selected = full
+            .select_scripts(std::slice::from_ref(&path))
+            .expect("selection");
+        assert!(selected.select_scripts(&[path]).is_err());
+    }
+
+    #[test]
+    fn selected_scope_identity_mismatch_refuses_before_execution() {
+        let temp = tempdir().expect("tempdir");
+        let full = build_default_manifest();
+        let path = full.entries[0].path.clone();
+        let mut selected = full.select_scripts(&[path]).expect("selection");
+        selected.entries.clear();
+        let run_dir = temp.path().join("must-not-create");
+        let error = execute_manifest(
+            temp.path(),
+            &run_dir,
+            &selected,
+            ManifestExecutionMode::Execute,
+        )
+        .expect_err("identity mismatch must not execute commands");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("Selected script identity"));
+        assert!(!run_dir.exists());
+    }
+
+    #[test]
     fn concurrency_scripts_are_retryable() {
         let manifest = build_default_manifest();
         for entry in &manifest.entries {
@@ -1197,9 +1402,10 @@ mod tests {
         scripts_per_kind.insert("RustHarnessTest".to_owned(), 1);
 
         ExecutionManifest {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: "1.1.0".to_owned(),
             bead_id: BEAD_ID.to_owned(),
             root_seed: 42,
+            run_scope: ManifestRunScope::FullSuite,
             total_timeout_budget_secs: u64::from(entry.timeout_secs),
             entries: vec![entry],
             coverage: ManifestCoverage {
@@ -1232,7 +1438,8 @@ mod tests {
         assert_eq!(summary.total_scripts, 1);
         assert_eq!(summary.scripts[0].status, ScriptExecutionStatus::DryRun);
         assert_eq!(summary.scripts[0].attempts, 0);
-        assert!(summary.overall_pass);
+        assert!(!summary.overall_pass);
+        assert!(!summary.selected_scripts_pass);
         assert_eq!(summary.artifact_index.len(), 1);
         assert!(!summary.artifact_index[0].checked);
     }
@@ -1259,6 +1466,42 @@ mod tests {
         assert_eq!(summary.scripts[0].status, ScriptExecutionStatus::Passed);
         assert_eq!(summary.scripts[0].attempts, 1);
         assert!(temp.path().join("artifacts/generated.txt").exists());
+    }
+
+    #[test]
+    fn selected_execution_success_never_claims_full_suite() {
+        let temp = tempdir().expect("tempdir");
+        // This is an orchestrator contract test, not concurrency evidence.
+        let mut manifest =
+            test_manifest(test_entry("echo selected-entry", &[], RetryPolicy::NoRetry));
+        manifest.run_scope = ManifestRunScope::SelectedScripts {
+            catalog_script_count: 2,
+            selected_paths: vec![manifest.entries[0].path.clone()],
+            omitted_paths: vec!["tests/not-selected.sh".to_owned()],
+        };
+        manifest.coverage.uncovered_scenario_ids = vec!["SQL-OMITTED".to_owned()];
+        let summary = execute_manifest(
+            temp.path(),
+            &temp.path().join("run"),
+            &manifest,
+            ManifestExecutionMode::Execute,
+        )
+        .expect("selected execution");
+        assert_eq!(summary.total_scripts, 1);
+        assert_eq!(summary.passed_scripts, 1);
+        assert!(summary.selected_scripts_pass);
+        assert!(!summary.overall_pass);
+        assert_eq!(summary.run_scope, manifest.run_scope);
+        assert_eq!(summary.missing_scenarios, vec!["SQL-OMITTED".to_owned()]);
+        assert_eq!(summary.scripts[0].attempts, 1);
+        let stdout = summary.scripts[0]
+            .stdout_log
+            .as_ref()
+            .expect("actual stdout log");
+        assert_eq!(
+            fs::read_to_string(temp.path().join(stdout)).expect("read stdout"),
+            "selected-entry\n"
+        );
     }
 
     #[test]
