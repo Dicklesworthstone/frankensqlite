@@ -12475,11 +12475,20 @@ pub struct Connection {
     /// Whether schema reload may keep a contentless FTS5 table in the
     /// bounded, on-disk lazy representation.
     ///
-    /// This is deliberately enabled only by the explicit schema-only open
-    /// family. Ordinary opens retain the historical hydrated representation,
-    /// whose mutation and auxiliary-command semantics are broader than the
-    /// repair-oriented lazy contract.
+    /// Enabled on every open path since `1e4db3c69`: a contentless
+    /// (`content=''`) FTS5 table is exactly the huge on-disk index the lazy
+    /// read path exists for, and hydrating the whole corpus per connection is
+    /// what made `open` unbounded for large corpora. Non-lazy read/scan
+    /// surfaces promote or fall back on demand. This flag says nothing about
+    /// the open *mode* — see `schema_only_open` for that.
     allow_lazy_contentless_fts5: bool,
+    /// True only for connections created through the schema-only open family
+    /// (`open_schema_only*` / `open_existing_schema_only*`, including the
+    /// deferred-FTS5 variants). Those connections promise bounded-memory,
+    /// pager-backed reads, so opportunistic whole-file hydration into
+    /// `MemDatabase` must never run on their behalf. See
+    /// `defer_memdb_row_hydration`.
+    schema_only_open: bool,
     /// #368 defect 3: when set, the schema reload keeps the bare (empty) FTS5
     /// vtab instance and does NOT read/validate its `%_data` shadow structure,
     /// so a database whose FTS5 shadow is corrupt (e.g. "structure segment
@@ -13971,6 +13980,7 @@ impl Connection {
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
             allow_lazy_contentless_fts5: true,
+            schema_only_open: true,
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
@@ -14499,6 +14509,7 @@ impl Connection {
             // into an in-memory index on every connection (the cass runaway).
             // Non-lazy read/scan surfaces promote or fall back on demand.
             allow_lazy_contentless_fts5: true,
+            schema_only_open: false,
             defer_fts5_hydration: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
@@ -23312,12 +23323,18 @@ impl Connection {
     /// schema-only family promise bounded-memory, pager-backed row reads, so
     /// the opportunistic prepared-query MemDB fast path must never bulk-
     /// hydrate the whole file into `MemDatabase` on their behalf. Derived
-    /// from the open mode: `allow_lazy_contentless_fts5` is set exclusively
-    /// by the schema-only open family (every variant — read-only, writable
+    /// from the open mode: `schema_only_open` is set exclusively by the
+    /// schema-only open family (every variant — read-only, writable
     /// existing-only, and deferred-FTS5), never by ordinary opens.
+    ///
+    /// This used to read `allow_lazy_contentless_fts5`, which happened to
+    /// carry the same value until `1e4db3c69` enabled lazy contentless FTS5
+    /// on the ordinary open path too. That accidental coupling silently
+    /// disabled the file-backed prepared MemDB fast path for *every*
+    /// connection; the two concerns now have separate fields.
     #[inline]
     fn defer_memdb_row_hydration(&self) -> bool {
-        self.allow_lazy_contentless_fts5
+        self.schema_only_open
     }
 
     #[inline]
