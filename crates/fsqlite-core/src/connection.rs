@@ -93840,6 +93840,16 @@ impl Connection {
                     let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn).await?;
                     *self.sqlite_sequence_cache.borrow_mut() = cache;
                 }
+                // Header metadata can change without a schema-cookie bump,
+                // including when ROLLBACK restores a prior default_cache_size.
+                // Hydrate from this transaction's already-read page 1 while
+                // preserving the connection-local runtime cache_size setting.
+                {
+                    let mut pragma_state = self.pragma_state.borrow_mut();
+                    pragma_state.user_version = i64::from(header.user_version.cast_signed());
+                    pragma_state.application_id = i64::from(header.application_id.cast_signed());
+                    pragma_state.default_cache_size = i64::from(header.default_cache_size);
+                }
                 // bd-#70 wedge extension: raise the finalized commit clock floor
                 // even on the schema-only fast path so plan-cache epoch lookups
                 // observe this cross-process commit.
@@ -134637,8 +134647,9 @@ impl<'a> SelectStructureResolver<'a> {
         }
 
         // fts5 `rank` / `bm25(<tbl>)` in ORDER BY resolve at execution via the
-        // fts5 auxiliary-scoring context (which promotes a lazy table), NOT
-        // against `col_map`. Collect the live-fts5 source labels so those terms
+        // fts5 auxiliary-scoring context (built from a point-read score snapshot
+        // for a lazy table — no promotion), NOT against `col_map`. Collect the
+        // live-fts5 source labels so those terms
         // bypass column-name resolution here — otherwise `ORDER BY rank` is
         // rejected at prepare with "no such column: rank" and never reaches the
         // executor that already handles it (bd-fts5-lazy-shadow-reads-itcc4.3).
@@ -202267,10 +202278,53 @@ mod transaction_lifecycle_tests {
                 docs_a_before,
                 "the exact locally enlisted vtab may use its validated one-shot receipt"
             );
+            // ENGINE CHANGE (GH#408, af5ea90f9): an uninvolved vtab is no longer
+            // rebuilt just because the visible commit sequence moved. Preserving
+            // it is now decided by CONTENT: `reload_memdb_from_txn_with_mode`
+            // point-reads the table's persisted `%_data` averages (row 1) and
+            // structure (row 10) records, `%_config`, the shadow root pages and
+            // the `sqlite_master` DDL text, and keeps the live instance only when
+            // every one of those bytes equals the stamp it was built from. FTS5
+            // rewrites averages+structure on every index mutation, so equal bytes
+            // prove an unchanged posting-list image no matter WHO wrote — this
+            // connection, a peer, or a foreign process. Rebuilding docs_b here
+            // would be pure waste: nothing has written to it.
+            assert_eq!(
+                live_vtab_instance_ptr(&conn_a, "docs_b"),
+                docs_b_before,
+                "an uninvolved vtab whose persisted content stamp still matches must be kept"
+            );
+
+            // ...and the converse, which is what makes the above SOUND: once a
+            // peer actually writes docs_b, its persisted stamp no longer matches,
+            // so the next reload must rebuild the instance and observe the write.
+            // A local commit on the other table is what moves this connection's
+            // visibility (and arms a receipt for DOCS_A only), so it is the
+            // reload that used to preserve docs_b unconditionally.
+            conn_b
+                .execute("INSERT INTO docs_b(rowid, body) VALUES (2, 'delta')")
+                .await
+                .unwrap();
+            conn_a
+                .execute("INSERT INTO docs_a(rowid, body) VALUES (3, 'zeta')")
+                .await
+                .unwrap();
+            let reload_cx = conn_a.op_cx().unwrap();
+            conn_a.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            let delta_rows = conn_a
+                .query("SELECT rowid FROM docs_b WHERE docs_b MATCH 'delta'")
+                .await
+                .unwrap();
+            assert_eq!(
+                delta_rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(2)]],
+                "the rebuilt instance must observe the peer's postings"
+            );
             assert_ne!(
                 live_vtab_instance_ptr(&conn_a, "docs_b"),
                 docs_b_before,
-                "an uninvolved vtab must be rebuilt even when another local vtab is preserved"
+                "a peer write changes the persisted content stamp, so the stale instance \
+                 must be discarded"
             );
         });
     }
@@ -202445,10 +202499,19 @@ mod transaction_lifecycle_tests {
             );
 
             conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
-            assert_ne!(
+            // ENGINE CHANGE (GH#408, af5ea90f9): the one-shot receipt is no
+            // longer the only thing that can preserve a live FTS5 instance. Once
+            // it is consumed, the reload falls back to the content-addressed
+            // proof — the table's persisted `%_data` averages/structure records,
+            // `%_config`, shadow root pages and DDL text all still equal the
+            // stamp the instance was built from, so re-deriving the index would
+            // recompute an identical one. (Before, every reload past the receipt
+            // re-tokenized the whole corpus: the GH#408 runaway.)
+            assert_eq!(
                 live_vtab_instance_ptr(&conn, "docs"),
                 after_ptr,
-                "after the one-shot receipt is consumed, supported FTS hydration must rebuild instead of using the custom-vtab fallback"
+                "a reload past the one-shot receipt must keep the instance when the persisted \
+                 content stamp is unchanged"
             );
 
             let rows = conn
@@ -202458,6 +202521,25 @@ mod transaction_lifecycle_tests {
             assert_eq!(
                 rows.iter().map(row_values).collect::<Vec<_>>(),
                 vec![vec![SqliteValue::Integer(1)]],
+            );
+
+            // The preserved instance is not frozen: a write mutates `%_data`, so
+            // the next reload's stamp comparison fails and the index is rebuilt
+            // from the new persisted image.
+            conn.execute("INSERT INTO docs(rowid, title, body) VALUES (2, 'bye', 'rust again');")
+                .await
+                .unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
+            let rows = conn
+                .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid;")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(row_values).collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2)],
+                ],
             );
         });
     }
@@ -210238,6 +210320,32 @@ SELECT x FROM t;
                 ids
             };
 
+            // Rowids in stock's *rank order* (best first), tie-broken by rowid so
+            // the comparison is stable. Unlike `stock_match` this deliberately
+            // does NOT sort: it is the oracle for the ranked-query ORDER below.
+            let stock_ranked_order = |q: &str| -> Vec<i64> {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                let mut stmt = sqlite
+                    .prepare(
+                        "SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rank, rowid",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .map(std::result::Result::unwrap)
+                    .collect()
+            };
+
+            async fn frank_rowids_in_order(conn: &Connection, sql: &str) -> Vec<i64> {
+                let rows = conn
+                    .query(sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+                rows.iter()
+                    .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+                    .collect()
+            }
+
             async fn frank_match_set(conn: &Connection, sql: &str) -> Vec<i64> {
                 let rows = conn
                     .query(sql)
@@ -210304,6 +210412,26 @@ SELECT x FROM t;
                 stock_match("rust"),
                 "ranked MATCH set must equal stock"
             );
+            // ENGINE CHANGE (bd-fts5-lazy Fix C, 07402981d): a ranked query no
+            // longer PROMOTES the table. `rank`/`bm25()` still need auxiliary
+            // scoring context, but `build_fts5_aux_context_for_source` now builds
+            // that context from a precomputed snapshot that point-reads only the
+            // matched rows' BM25 inputs (term frequencies from the segments,
+            // lengths from `_docsize`), instead of re-tokenizing the whole corpus
+            // into memory. Promotion is therefore no longer *evidence* of correct
+            // ranking — so this test asserts the thing that actually matters:
+            // the ranked ORDER equals stock's, on the lazy path. (The bm25 score
+            // VALUES are pinned against stock too, for both content and
+            // contentless tables, by tests/bd_fts5_lazy_ranked_parity.rs.)
+            assert_eq!(
+                frank_rowids_in_order(
+                    &conn,
+                    "SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rank, rowid"
+                )
+                .await,
+                stock_ranked_order("rust"),
+                "ranked MATCH order must equal stock without promoting"
+            );
             {
                 let instances = conn.vtab_instances.borrow();
                 let fts5 = instances
@@ -210311,8 +210439,9 @@ SELECT x FROM t;
                     .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                     .expect("docs should be an FTS5 table");
                 assert!(
-                    !fts5.is_lazy_on_disk(),
-                    "ranked MATCH should promote because rank needs auxiliary scoring context"
+                    fts5.is_lazy_on_disk(),
+                    "ranked MATCH must stay on the lazy segment-reader path: rank is scored \
+                     from a point-read snapshot, not by hydrating the corpus"
                 );
             }
 
@@ -210552,9 +210681,17 @@ SELECT x FROM t;
                     .get("DOCS_FTS")
                     .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                     .expect("docs_fts should reconnect as FTS5");
+                // ENGINE CHANGE (1e4db3c69): `allow_lazy_contentless_fts5` used to
+                // be set only for schema-only opens, so an ordinary reopen
+                // hydrated the whole contentless corpus per connection (and hung
+                // on any hit-bearing MATCH for a large index). Ordinary opens now
+                // bind contentless FTS5 lazily and answer from persisted
+                // segments. The *semantics* asserted below are unchanged — MATCH
+                // rowids, COUNT(*) from the averages row, and a full scan that
+                // returns rowids with NULL content — only the binding is lazy.
                 assert!(
-                    !fts5.is_lazy_on_disk(),
-                    "ordinary opens must retain hydrated contentless FTS5 semantics"
+                    fts5.is_lazy_on_disk(),
+                    "ordinary opens must bind contentless FTS5 lazily"
                 );
             }
             let rows = conn
@@ -211140,9 +211277,16 @@ SELECT x FROM t;
                     .get("DOCS_FTS")
                     .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
                     .expect("docs_fts should reconnect as FTS5");
+                // ENGINE CHANGE (1e4db3c69): ordinary opens now bind a
+                // contentless (`content=''`) FTS5 table lazily instead of
+                // hydrating its corpus. Everything asserted below is the
+                // behaviour that must survive that: stock-written segments answer
+                // MATCH, bm25()/rank rank a repeated term ahead of a single
+                // occurrence, `'rebuild'` is still rejected, and the rejected
+                // rebuild leaves the shadow segments intact.
                 assert!(
-                    !fts5.is_lazy_on_disk(),
-                    "ordinary opens must retain hydrated stock contentless FTS5 semantics"
+                    fts5.is_lazy_on_disk(),
+                    "ordinary opens must bind stock contentless FTS5 lazily"
                 );
             }
             let rows = conn

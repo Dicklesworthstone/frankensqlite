@@ -1085,9 +1085,10 @@ fn q11_cache_budget_oversized_transactions() {
 #[test]
 fn q12_cache_budget_independent_connections_and_close_orders() {
     asupersync::test_utils::run_test(|| async {
+        use fsqlite_types::value::SqliteValue;
         let run = CacheBudgetRun::new("q12_cache_budget_independent_connections_and_close_orders");
         let dir = tempfile::tempdir().unwrap();
-        for close_small_first in [true, false] {
+        for (close_small_first, small_setting) in [(true, 8), (false, -32)] {
             let path = dir
                 .path()
                 .join(format!("connections-{close_small_first}.db"));
@@ -1097,10 +1098,39 @@ fn q12_cache_budget_independent_connections_and_close_orders() {
             let small = fsqlite::Connection::open(path.to_str().unwrap())
                 .await
                 .unwrap();
+            let seeded_mode = small.query("PRAGMA journal_mode").await.unwrap();
+            assert!(matches!(
+                seeded_mode[0].values(),
+                [SqliteValue::Text(mode)] if mode.as_ref() == "delete"
+            ));
+            // The stock-created fixture starts in DELETE mode, whose reader
+            // blocks a writer's commit. WAL supplies the overlapping snapshot
+            // shape this keeper needs; concurrent-writer defaults stay enabled.
+            let selected_mode = small.query("PRAGMA journal_mode=WAL").await.unwrap();
+            assert!(matches!(
+                selected_mode[0].values(),
+                [SqliteValue::Text(mode)] if mode.as_ref() == "wal"
+            ));
             let large = fsqlite::Connection::open(path.to_str().unwrap())
                 .await
                 .unwrap();
-            small.execute("PRAGMA cache_size=8").await.unwrap();
+            let peer_mode = large.query("PRAGMA journal_mode").await.unwrap();
+            assert!(matches!(
+                peer_mode[0].values(),
+                [SqliteValue::Text(mode)] if mode.as_ref() == "wal"
+            ));
+            run.record(
+                "overlap_uses_wal",
+                &small,
+                json!({
+                    "seeded_mode": "delete", "journal_mode": "wal",
+                    "small_cache_setting": small_setting,
+                }),
+            );
+            small
+                .execute(&format!("PRAGMA cache_size={small_setting}"))
+                .await
+                .unwrap();
             large.execute("PRAGMA cache_size=128").await.unwrap();
             cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &initial).await;
             cache_budget_assert_rows(&large, CACHE_BUDGET_SELECT, &initial).await;
@@ -1129,7 +1159,10 @@ fn q12_cache_budget_independent_connections_and_close_orders() {
             cache_budget_assert_rows(&large, CACHE_BUDGET_SELECT, &committed).await;
             run.assert_quiescent_budget("small_after_overlap", &small, 8);
             run.assert_quiescent_budget("large_after_overlap", &large, 128);
-            assert_eq!(cache_budget_integer(&small, "PRAGMA cache_size").await, 8);
+            assert_eq!(
+                cache_budget_integer(&small, "PRAGMA cache_size").await,
+                small_setting
+            );
             assert_eq!(cache_budget_integer(&large, "PRAGMA cache_size").await, 128);
 
             if close_small_first {
@@ -1544,6 +1577,16 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
             let runtime_query = format!("PRAGMA {schema}.cache_size");
             let default_query = format!("PRAGMA {schema}.default_cache_size");
             let original_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
+            let mut header_fields = Vec::new();
+            if schema != "temp" {
+                for (name, changed) in [("user_version", -7_i64), ("application_id", -9_i64)] {
+                    let query = format!("PRAGMA {schema}.{name}");
+                    let original: i64 = oracle.query_row(&query, [], |r| r.get(0)).unwrap();
+                    assert_eq!(original, 0, "{query}: seeded header");
+                    assert_eq!(cache_budget_integer(&conn, &query).await, original);
+                    header_fields.push((query, changed, original));
+                }
+            }
             conn.execute("PRAGMA main.cache_size=8").await.unwrap();
             oracle.execute_batch("PRAGMA main.cache_size=8").unwrap();
             let setup = format!("PRAGMA {schema}.cache_size=8");
@@ -1554,6 +1597,14 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
             let setter = format!("PRAGMA {schema}.default_cache_size=32");
             conn.execute(&setter).await.unwrap();
             oracle.execute_batch(&setter).unwrap();
+            for (query, changed, _) in &header_fields {
+                let setter = format!("{query}={changed}");
+                conn.execute(&setter).await.unwrap();
+                oracle.execute_batch(&setter).unwrap();
+                let stock: i64 = oracle.query_row(query, [], |r| r.get(0)).unwrap();
+                assert_eq!(stock, *changed, "{query}: signed header accepted");
+                assert_eq!(cache_budget_integer(&conn, query).await, stock);
+            }
             assert_eq!(cache_budget_integer(&conn, &default_query).await, 32);
             conn.execute("ROLLBACK").await.unwrap();
             oracle.execute_batch("ROLLBACK").unwrap();
@@ -1569,6 +1620,11 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
                 cache_budget_integer(&conn, &default_query).await,
                 stock_default
             );
+            for (query, _, original) in &header_fields {
+                let stock: i64 = oracle.query_row(query, [], |r| r.get(0)).unwrap();
+                assert_eq!(stock, *original, "{query}: header rolled back");
+                assert_eq!(cache_budget_integer(&conn, query).await, stock);
+            }
             cache_budget_assert_rows(
                 &conn,
                 &format!("SELECT id, payload FROM {schema}.cache_budget ORDER BY id"),
@@ -1581,6 +1637,7 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
                 json!({
                     "schema": schema, "runtime_setting": stock_runtime,
                     "restored_default": stock_default,
+                    "header_fields_query_changed_original": header_fields,
                 }),
             );
             run.assert_quiescent_budget(

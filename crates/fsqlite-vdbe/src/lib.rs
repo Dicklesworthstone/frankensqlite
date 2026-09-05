@@ -2218,8 +2218,9 @@ pub mod pragma {
         }
     }
 
-    /// Derive the effective page-cache size in *pages* from `cache_size` (C
-    /// SQLite's numeric convention): a non-negative value is a literal page
+    /// Convert a cache-size suggestion into a resident-page target.
+    ///
+    /// Following SQLite's numeric convention, a non-negative value is a literal page
     /// count, a negative value is a budget of `-cache_size` KiB converted to
     /// pages by dividing by the page size. FrankenSQLite uses `0` for the
     /// per-page bookkeeping overhead C SQLite calls `szExtra` (a C-build malloc
