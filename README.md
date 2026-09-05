@@ -860,6 +860,25 @@ default. An ARC policy is also implemented and can be selected through
 retains ghost entries to detect changes in the workload. The README does not
 claim a universal competitive ratio for either implementation.
 
+`PRAGMA cache_size` sets the current connection's resident-page suggestion:
+positive values count pages, negative values specify KiB converted using the
+pager's actual page size at assignment, and zero retains no eligible clean
+pages after an operation finishes. Shrinking reclaims clean pages; dirty pages
+and pending reads can defer convergence. This does not reduce the transaction
+buffer pool's allocation ceiling or bound retained page handles, TEMP data,
+query results, or process memory. `Connection::memory_stats()` reports the
+suggestion as `page_cache.cache_page_budget`, separately from pool capacity.
+
+Connections to the same file keep independent suggestions. Attached schemas
+use their own child connection; TEMP keeps separate settings without resizing
+the main pager. `cache_size` lasts for the connection. For a file-backed
+schema, `default_cache_size` stores a default in its header for subsequent
+opens; TEMP's default is transaction-aware but remains local to the connection.
+A failed or rolled-back default write can still change the
+current runtime suggestion, matching SQLite. Public SQL regression coverage
+is in `crates/fsqlite-e2e/tests/bd_aztlm_page_cache_e2e.rs` (Q9–Q16);
+acceptance and outstanding verification are tracked by `bd-dwjnq.1/.2`.
+
 ### MVCC-Aware Structure (Optional ARC Policy)
 
 The optional ARC policy (`fsqlite-pager::arc_cache::ArcCache`) keys on
@@ -904,9 +923,10 @@ Ghost entries (B1/B2) store only the cache key, not page data. They let ARC lear
 
 ### Eviction Constraints (Optional ARC Policy)
 
-These constraints describe the ARC policy. The shipped default
-(`ShardedPageCache` with S3-FIFO) has no byte-based trigger and does not consult
-`PRAGMA cache_size` for a byte budget:
+These constraints describe the ARC policy. The current default
+(`ShardedPageCache` with S3-FIFO) converts `PRAGMA cache_size` to a fixed-page
+residency suggestion as described above; it has no separate byte-based
+allocation trigger:
 
 1. Never evict a pinned page (`ref_count > 0`).
 2. Never evict a dirty page (must flush to WAL first).
