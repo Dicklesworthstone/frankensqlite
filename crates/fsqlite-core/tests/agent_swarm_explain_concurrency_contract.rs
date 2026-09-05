@@ -511,7 +511,7 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
                     previous_txn = Some(card.txn);
                 }
                 let stats = first.query("PRAGMA fsqlite.ssi_evidence_stats;").await?;
-                for (key, expected) in [("capture_enabled", i64::from(capture)), ("capacity", 4096), ("retained", i64::from(capture)), ("pending", 0), ("pending_dropped", 0), ("retained_evicted", 0)] {
+                for (key, expected) in [("capture_enabled", i64::from(capture)), ("capacity", 4096), ("max_payload_bytes", 65_536), ("retained", i64::from(capture)), ("pending", 0), ("pending_dropped", 0), ("oversized_dropped", 0), ("retained_evicted", 0)] {
                     assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(name), SqliteValue::Integer(value)] if name.as_ref() == key && *value == expected)), "incorrect {key} stats: {stats:?}");
                 }
                 assert_eq!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.len(), 1, "shared conflict diagnostics are independent of connection-local SSI evidence capture");

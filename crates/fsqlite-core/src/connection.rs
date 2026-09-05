@@ -75447,9 +75447,11 @@ impl Connection {
                 Ok([
                     ("capture_enabled", u64::from(snapshot.capture_enabled)),
                     ("capacity", count(snapshot.capacity)),
+                    ("max_payload_bytes", count(snapshot.max_payload_bytes)),
                     ("retained", count(snapshot.retained)),
                     ("pending", count(snapshot.pending)),
                     ("pending_dropped", snapshot.pending_dropped),
+                    ("oversized_dropped", snapshot.oversized_dropped),
                     ("retained_evicted", snapshot.retained_evicted),
                 ]
                 .into_iter()

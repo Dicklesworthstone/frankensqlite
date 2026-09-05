@@ -1172,6 +1172,25 @@ pub struct SsiDecisionCardDraft {
 }
 
 impl SsiDecisionCardDraft {
+    fn heap_payload_bytes(&self) -> usize {
+        [
+            self.conflicting_txns
+                .capacity()
+                .saturating_mul(size_of::<TxnToken>()),
+            self.conflict_pages
+                .capacity()
+                .saturating_mul(size_of::<PageNumber>()),
+            self.read_set_pages
+                .capacity()
+                .saturating_mul(size_of::<PageNumber>()),
+            self.write_set
+                .capacity()
+                .saturating_mul(size_of::<PageNumber>()),
+        ]
+        .into_iter()
+        .fold(self.rationale.capacity(), usize::saturating_add)
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -1341,7 +1360,12 @@ struct PendingSsiEvidence {
     entries: VecDeque<SsiDecisionCardDraft>,
     enabled: bool,
     dropped: u64,
+    oversized_dropped: u64,
 }
+
+/// Maximum combined vector and string buffer capacity admitted per SSI draft.
+/// Oversized optional evidence is discarded without changing SSI validation.
+pub const MAX_SSI_EVIDENCE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// A coherent view of optional SSI evidence retention, not transaction totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1349,19 +1373,25 @@ pub struct SsiEvidenceRetentionSnapshot {
     pub capture_enabled: bool,
     /// Separate record-count limit for retained cards and queued drafts.
     pub capacity: usize,
+    /// Heap buffer budget per admitted draft, excluding fixed struct storage.
+    pub max_payload_bytes: usize,
     pub retained: usize,
     pub pending: usize,
     /// Drafts displaced before hashing because the pending queue was full.
     pub pending_dropped: u64,
+    /// Drafts rejected before queuing because their heap buffers exceeded budget.
+    pub oversized_dropped: u64,
     /// Hashed cards displaced from the retained window.
     pub retained_evicted: u64,
 }
 
 /// Bounded recent SSI decision evidence.
 ///
-/// Record counts are bounded; individual transaction witness payloads are not
-/// byte-limited. The chain covers appended cards, while pending overflow is
-/// reported separately as lost evidence.
+/// Retained cards, queued drafts and the batch being hashed each have a record
+/// count limit. Each admitted draft also has a heap-buffer capacity budget.
+/// Caller-side draft construction, allocator overhead and returned snapshot
+/// clones are outside this retention bound. The chain covers appended cards;
+/// pending overflow and oversized drafts are reported as lost evidence.
 #[derive(Debug)]
 pub struct SsiEvidenceLedger {
     state: Mutex<SsiEvidenceLedgerState>,
@@ -1379,6 +1409,7 @@ impl SsiEvidenceLedger {
                 entries: VecDeque::new(),
                 enabled: true,
                 dropped: 0,
+                oversized_dropped: 0,
             }),
             pending_capacity: capacity.max(1),
             pending: AtomicUsize::new(0),
@@ -1396,9 +1427,8 @@ impl SsiEvidenceLedger {
     /// Flush the queued batch before returning. Concurrent overflow, eviction
     /// or capture disabling may still discard this draft; retention is optional.
     pub fn record_sync(&self, draft: SsiDecisionCardDraft) {
-        if self.enqueue_pending(draft) {
-            self.flush_pending();
-        }
+        self.enqueue_pending(draft);
+        self.flush_pending();
     }
 
     /// Return all retained cards in insertion order.
@@ -1463,9 +1493,11 @@ impl SsiEvidenceLedger {
             with_locked(&self.pending_queue, |queue| SsiEvidenceRetentionSnapshot {
                 capture_enabled: queue.enabled,
                 capacity: state.capacity,
+                max_payload_bytes: MAX_SSI_EVIDENCE_PAYLOAD_BYTES,
                 retained: state.entries.len(),
                 pending: queue.entries.len(),
                 pending_dropped: queue.dropped,
+                oversized_dropped: queue.oversized_dropped,
                 retained_evicted: state.evicted,
             })
         })
@@ -1483,6 +1515,7 @@ impl SsiEvidenceLedger {
                     *state = SsiEvidenceLedgerState::new(state.capacity);
                     queue.entries.clear();
                     queue.dropped = 0;
+                    queue.oversized_dropped = 0;
                     self.pending.store(0, Ordering::Release);
                 }
             });
@@ -1492,6 +1525,10 @@ impl SsiEvidenceLedger {
     fn enqueue_pending(&self, draft: SsiDecisionCardDraft) -> bool {
         with_locked(&self.pending_queue, |queue| {
             if !queue.enabled {
+                return false;
+            }
+            if draft.heap_payload_bytes() > MAX_SSI_EVIDENCE_PAYLOAD_BYTES {
+                queue.oversized_dropped = queue.oversized_dropped.saturating_add(1);
                 return false;
             }
             if queue.entries.len() == self.pending_capacity {
@@ -2252,6 +2289,90 @@ mod tests {
     }
 
     #[test]
+    fn test_ssi_evidence_payload_budget_rejects_without_evicting_or_hashing() {
+        const LIMIT: usize = 64 * 1024;
+        let ledger = SsiEvidenceLedger::new(2);
+        ledger.record_sync(retention_draft(1));
+        let before = ledger.snapshot();
+        for field in 0..6 {
+            let mut draft = retention_draft(99);
+            match field {
+                0 => draft.rationale = "x".repeat(LIMIT + 1),
+                1 => {
+                    draft.conflicting_txns = Vec::with_capacity(LIMIT / size_of::<TxnToken>() + 1);
+                }
+                2 => {
+                    draft.conflict_pages = Vec::with_capacity(LIMIT / size_of::<PageNumber>() + 1);
+                }
+                3 => {
+                    draft.read_set_pages = Vec::with_capacity(LIMIT / size_of::<PageNumber>() + 1);
+                }
+                4 => {
+                    draft.write_set = Vec::with_capacity(LIMIT / size_of::<PageNumber>() + 1);
+                }
+                _ => {
+                    draft.read_set_pages = Vec::with_capacity(LIMIT / 2 / size_of::<PageNumber>());
+                    draft.write_set = Vec::with_capacity(LIMIT / 2 / size_of::<PageNumber>());
+                }
+            }
+            ledger.record_sync(draft);
+            assert_eq!(ledger.snapshot(), before, "oversized field {field}");
+        }
+
+        let held_state = ledger.state.lock().unwrap();
+        ledger.record_async(retention_draft(2));
+        let mut oversized = retention_draft(99);
+        oversized.rationale = "x".repeat(LIMIT + 1);
+        ledger.record_async(oversized);
+        assert_eq!(ledger.pending_count(), 1);
+        drop(held_state);
+        let cards = ledger.snapshot();
+        let control = SsiEvidenceLedger::new(2);
+        control.record_sync(retention_draft(1));
+        control.record_sync(retention_draft(2));
+        assert_eq!(
+            cards,
+            control.snapshot(),
+            "rejection must not alter the chain"
+        );
+        let stats = ledger.retention_snapshot();
+        assert_eq!((stats.pending_dropped, stats.retained_evicted), (0, 0));
+        assert_eq!(stats.oversized_dropped, 7);
+        assert_eq!(stats.max_payload_bytes, LIMIT);
+        ledger.set_capture_enabled(false);
+        let mut oversized = retention_draft(99);
+        oversized.rationale = "x".repeat(LIMIT + 1);
+        ledger.record_sync(oversized);
+        assert_eq!(ledger.retention_snapshot().oversized_dropped, 0);
+        assert!(ledger.snapshot().is_empty());
+        ledger.set_capture_enabled(true);
+        ledger.record_sync(retention_draft(3));
+        assert_eq!(ledger.snapshot()[0].txn.id.get(), 3);
+    }
+
+    #[test]
+    fn test_ssi_evidence_payload_budget_accepts_exact_boundary() {
+        const LIMIT: usize = 64 * 1024;
+        let ledger = SsiEvidenceLedger::new(1);
+        let draft = SsiDecisionCardDraft::new(
+            SsiDecisionType::CommitAllowed,
+            token(1, 1),
+            CommitSeq::new(10),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "x".repeat(LIMIT),
+        );
+        assert_eq!(draft.rationale.capacity(), LIMIT);
+        ledger.record_sync(draft);
+        let cards = ledger.snapshot();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].rationale.len(), LIMIT);
+        assert_eq!(cards[0].decision_epoch, 1);
+    }
+
+    #[test]
     fn test_ssi_evidence_ledger_pending_overflow_retains_recent_and_reports_loss() {
         let ledger = SsiEvidenceLedger::new(3);
         let held_state = ledger.state.lock().unwrap();
@@ -2332,9 +2453,11 @@ mod tests {
             SsiEvidenceRetentionSnapshot {
                 capture_enabled: false,
                 capacity: 2,
+                max_payload_bytes: MAX_SSI_EVIDENCE_PAYLOAD_BYTES,
                 retained: 0,
                 pending: 0,
                 pending_dropped: 0,
+                oversized_dropped: 0,
                 retained_evicted: 0,
             }
         );

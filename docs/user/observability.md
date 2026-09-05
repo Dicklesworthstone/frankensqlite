@@ -290,6 +290,22 @@ defaults, not measured guarantees.
 
 ---
 
+## Optional SSI evidence
+
+`PRAGMA fsqlite.ssi_evidence_stats` reports the retained and pending record
+counts, their capacity, and `max_payload_bytes`. Each admitted draft is limited
+to 65,536 bytes of combined vector and string buffer capacity, including spare
+capacity. Oversized evidence is dropped before queuing and increments
+`oversized_dropped`; it cannot evict a valid card or change the evidence chain.
+Pending-queue overflow and retained-card eviction have separate counters.
+
+This budget applies to optional diagnostic retention. SSI validation and commit
+decisions still use the complete transaction witnesses. Caller-side draft
+construction, allocator overhead and copies returned to diagnostic readers are
+outside this bound. Disabling evidence capture clears retained and queued
+evidence and resets its loss counters; it does not disable SSI validation or
+the shared conflict observer.
+
 ## Roadmap
 
 The recording registry, both serializers, the StatsD UDP push transport, and the
