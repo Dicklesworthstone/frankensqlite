@@ -1188,6 +1188,7 @@ dependencies = [
  "fsqlite-ext-session",
  "fsqlite-harness",
  "fsqlite-mvcc",
+ "fsqlite-observability",
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-types",

@@ -1058,6 +1058,32 @@ fn concurrent_same_table_inserts_non_overlapping_pks() {
 
 #[test]
 fn concurrent_insert_no_data_loss_8_threads() {
+    const MODE: &str = "FSQLITE_EIGHT_WRITER_METRICS_MODE";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "concurrent_insert_no_data_loss_8_threads",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .env(
+                    "FRANKENSQLITE_METRICS_DISABLE",
+                    if mode == "disabled" { "1" } else { "0" },
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("eight_writer_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} workload failed");
+            assert!(stderr.contains("event=eight_writer_commit_metrics_verified"));
+        }
+        return;
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
     asupersync::test_utils::run_test(|| async {
         let n_threads = 8usize;
         let rows_per_thread: i64 = 25;
@@ -1075,8 +1101,12 @@ fn concurrent_insert_no_data_loss_8_threads() {
                 .await
                 .unwrap();
             }
+            f.close().await.unwrap();
         }
 
+        let registry = fsqlite_observability::metrics::global();
+        let commits_before = registry.commits_total.get();
+        let samples_before = registry.commit_duration_seconds.count();
         let total_retries = Arc::new(AtomicU64::new(0));
         let barrier = Arc::new(Barrier::new(n_threads));
         let handles: Vec<_> = (0..n_threads)
@@ -1124,6 +1154,7 @@ fn concurrent_insert_no_data_loss_8_threads() {
                             }
                         }
                         retries.fetch_add(local_retries, Ordering::Relaxed);
+                        conn.close().await.unwrap();
                     });
                 })
             })
@@ -1133,6 +1164,19 @@ fn concurrent_insert_no_data_loss_8_threads() {
             h.join().expect("thread panicked");
         }
 
+        let expected_commits = if enabled {
+            u64::try_from(n_threads).unwrap() * u64::try_from(rows_per_thread).unwrap()
+        } else {
+            0
+        };
+        assert_eq!(
+            registry.commits_total.get() - commits_before,
+            expected_commits
+        );
+        assert_eq!(
+            registry.commit_duration_seconds.count() - samples_before,
+            expected_commits
+        );
         // Verify via independent rusqlite read
         let verify = rusqlite::Connection::open(f_tmp.path()).unwrap();
         for tid in 0..n_threads {
@@ -1145,7 +1189,25 @@ fn concurrent_insert_no_data_loss_8_threads() {
                 "thread {tid}: expected {rows_per_thread} rows, got {count} (retries: {})",
                 total_retries.load(Ordering::Relaxed)
             );
+            let mut statement = verify
+                .prepare(&format!("SELECT id,data FROM t_{tid} ORDER BY id"))
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let expected: Vec<_> = (0..rows_per_thread)
+                .map(|id| (id, format!("data_{tid}_{id}")))
+                .collect();
+            assert_eq!(rows, expected);
         }
+        eprintln!(
+            "event=eight_writer_commit_metrics_verified mode={mode} committed={expected_commits} retries={}",
+            total_retries.load(Ordering::Relaxed)
+        );
     });
 }
 

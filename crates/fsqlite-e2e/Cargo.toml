@@ -62,6 +62,7 @@ criterion = { workspace = true }
 flate2 = "1.1"
 jsonschema = { version = "0.48.5", default-features = false }
 fsqlite-ext-session = { workspace = true }
+fsqlite-observability = { workspace = true }
 fsqlite-pager = { workspace = true }
 # This unifies only for e2e test builds, not shipped binaries.
 fsqlite-mvcc = { workspace = true, features = ["commit-combiner-test-support", "ebr-reclaim-test-support"] }
