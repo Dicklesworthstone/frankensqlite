@@ -654,15 +654,14 @@ impl ConcurrentWriteObservation {
 
     fn validate_observed_storage(&self) -> Result<(), String> {
         let mut connections = BTreeSet::new();
-        let database = &self.storage[0].database_id;
+        let database = format!("{}:main", self.history.run_id);
         for storage in &self.storage {
             if storage.process_id.trim().is_empty()
                 || storage.connection_id.trim().is_empty()
-                || database.trim().is_empty()
-                || storage.database_id != *database
+                || storage.database_id != database
                 || !matches!(
                     storage.backend_kind.as_str(),
-                    "unix" | "io_uring" | "windows"
+                    "unix" | "iouring" | "windows"
                 )
                 || storage.storage_mode != "compatibility"
                 || !connections
@@ -681,9 +680,9 @@ impl ConcurrentWriteObservation {
         if !self.history.execution_lane_evidence.iter().any(|lane| {
             lane.required_lane == crate::test_inventory::ExecutionLane::MvccRequired
                 && lane.requirement_satisfied
-                && matches!(lane.backend_kind.as_str(), "unix" | "io_uring" | "windows")
+                && matches!(lane.backend_kind.as_str(), "unix" | "iouring" | "windows")
         }) || self.history.execution_lane_evidence.iter().any(|lane| {
-            !matches!(lane.backend_kind.as_str(), "unix" | "io_uring" | "windows")
+            !matches!(lane.backend_kind.as_str(), "unix" | "iouring" | "windows")
                 || lane.backend_mode != "parity_cert_strict"
                 || !self
                     .storage
@@ -1903,7 +1902,7 @@ mod tests {
                 .map(|txn| ConcurrentStorageObservation {
                     process_id: "process-0".to_owned(),
                     connection_id: txn.to_owned(),
-                    database_id: "run-ssi-1/database-0".to_owned(),
+                    database_id: "run-ssi-1:main".to_owned(),
                     backend_kind: "unix".to_owned(),
                     storage_mode: "compatibility".to_owned(),
                 })
@@ -1944,6 +1943,33 @@ mod tests {
         let mut value = serde_json::to_value(&observation).expect("value");
         value["threads"] = serde_json::json!(8);
         assert!(serde_json::from_value::<ConcurrentWriteObservation>(value).is_err());
+    }
+
+    #[test]
+    fn concurrent_observation_requires_public_backend_names_and_run_bound_database() {
+        for backend in ["unix", "iouring", "windows", "io_uring", "memory", "native"] {
+            let mut observation = concurrent_observation_fixture();
+            for storage in &mut observation.storage {
+                storage.backend_kind = backend.to_owned();
+            }
+            for lane in &mut observation.history.execution_lane_evidence {
+                lane.backend_kind = backend.to_owned();
+                lane.backend_identity = format!("{backend}:parity_cert_strict");
+            }
+            assert_eq!(
+                observation.validate().is_ok(),
+                matches!(backend, "unix" | "iouring" | "windows"),
+                "only actual file-backed PRAGMA backend names certify overlap: {backend}"
+            );
+        }
+        let mut stale_database = concurrent_observation_fixture();
+        for storage in &mut stale_database.storage {
+            storage.database_id = "different-run:main".to_owned();
+        }
+        assert!(
+            stale_database.validate().is_err(),
+            "equal database labels from another run cannot certify this run"
+        );
     }
 
     #[test]
