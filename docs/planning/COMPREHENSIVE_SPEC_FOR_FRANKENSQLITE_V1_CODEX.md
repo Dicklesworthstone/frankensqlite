@@ -1156,7 +1156,11 @@ Capsule contains:
 - SSI witnesses (debug/lab builds; can be feature-gated in release)
 - schema delta (DDL) if applicable
 
-During recovery/apply, the `commit_seq` from the marker is associated with the capsule and used as the “created_by” identifier for any committed versions it publishes.
+During recovery/apply, the marker's `commit_seq` orders visibility of the
+committed versions published from its capsule. It must not be substituted for
+`created_by`: that field carries the originating `TxnId`, whose identity is
+separate from commit order. Recovery must preserve that identity or represent
+its absence explicitly when the persisted format does not contain it.
 
 #### CommitMarkerRecord (V1 marker stream record)
 

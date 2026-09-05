@@ -1906,7 +1906,8 @@ Source data: K symbols (each symbol = one database page, typically 4096 bytes)
 
 Encoding:
     Source symbols:  C'[0], C'[1], ..., C'[K-1]     (the original pages)
-    Repair symbols:  generated on demand, unlimited quantity
+    Repair symbols:  generated on demand at supported, distinct ESIs,
+                     within codec and schedule limits
     Each repair symbol = GF(256) linear combination of intermediate symbols
 
 Decoder failure bounds from RFC 6330 §5.8, for its compliant decoder and
@@ -2184,29 +2185,33 @@ schedules, but the remaining space can still grow exponentially. A runtime
 claim must record bounds, enabledness/commutativity assumptions, completed
 exploration and the mapping from model actions to actual engine behavior.
 
-**Result:** For a 3-transaction MVCC scenario, naive enumeration might explore thousands of interleavings. Mazurkiewicz traces + DPOR reduce this to dozens of truly distinct schedules — each verified against all seven MVCC invariants. This is how FrankenSQLite achieves confidence in its concurrency model that random testing cannot provide.
+The goal is to check each distinct bounded schedule against the seven MVCC
+invariants while avoiding equivalent schedules. Any claimed reduction or
+coverage requires a completed exploration receipt with those bounds and
+assumptions; the method alone establishes neither count nor coverage.
 
 ### Formal Safety Proofs
 
-FrankenSQLite's MVCC system comes with six machine-checkable safety theorems. These aren't hand-wavy arguments — they're formal proofs grounded in the invariants and data structures described above.
+The following six safety and liveness arguments state obligations and
+assumptions for the MVCC implementation. They are not machine-checked proofs
+of the complete engine.
 
-**Theorem 1: Deadlock Freedom (structural impossibility)**
+**Theorem 1: No Page-Ownership Wait Cycles**
 
 ```
-Claim: The MVCC system is deadlock-free.
+Claim: Nonblocking page ownership does not create page-lock wait cycles.
 
 Proof:
     1. A deadlock requires a cycle in the wait-for graph.
     2. try_acquire() never blocks — it returns Err(SQLITE_BUSY) immediately
        if the lock is held by another transaction.
-    3. A transaction that does not wait cannot appear as an edge in the
-       wait-for graph.
-    4. A graph with no edges has no cycles.
-    5. No cycle ⟹ no deadlock.  QED ∎
+    3. This failed page-ownership acquisition adds no wait edge.
+    4. With no page-ownership wait edges, there is no cycle in that graph.
+    5. Therefore this mechanism cannot cause a page-lock deadlock. QED ∎
 
-Structural guarantee: deadlocks are impossible by construction (non-blocking),
-not merely detected and broken. There is no deadlock detector. There is no
-timeout. There is nothing to tune.
+Registry/shard mutexes, I/O and lifecycle waits have separate liveness
+obligations. This argument does not prove global deadlock freedom or remove
+the need for cancellation, deadlines and lock-order review elsewhere.
 ```
 
 **Theorem 2: Snapshot Isolation (consistent reads)**
@@ -2219,11 +2224,12 @@ Proof: For reading transaction T_r with snapshot S_r (where S_r.high is
 the CommitSeq at T_r's BEGIN), and any writer T_w that committed with
 commit_seq C_w and created versions {V_1, ..., V_k}:
 
-    visible(V_i, S_r) = (C_w <= S_r.high)
+    visible(V_i, S_r) = (0 < C_w <= S_r.high)
 
     This condition depends ONLY on C_w and S_r.high, not on i.
-    All versions of T_w share the same commit_seq C_w (assigned atomically
-    by the sequencer).
+    All versions of T_w share the same commit_seq C_w. The publication
+    frontier must advance only after the complete version set is installed,
+    with synchronization making those versions visible to snapshot readers.
     ∴ visible(V_i, S_r) has the same truth value for all i ∈ {1,...,k}.
 
     Exhaustive cases:
