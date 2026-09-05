@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -394,6 +394,45 @@ pub struct EcsRootPointer {
     pub root_auth_tag: [u8; 16],
 }
 
+/// Only damage to the root anchor itself permits automatic scan recovery.
+/// Keep this classification at the failing check, rather than inspecting error
+/// messages or retrying errors from authenticated objects later in bootstrap.
+#[derive(Debug)]
+enum RootPointerReadFailure {
+    Recoverable(FrankenError),
+    Terminal(FrankenError),
+}
+
+impl RootPointerReadFailure {
+    fn into_error(self) -> FrankenError {
+        match self {
+            Self::Recoverable(error) | Self::Terminal(error) => error,
+        }
+    }
+}
+
+impl From<FrankenError> for RootPointerReadFailure {
+    fn from(error: FrankenError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+fn required_symbol_auth_key(
+    symbol_auth_enabled: bool,
+    master_key: Option<&[u8; 32]>,
+) -> Result<Option<&[u8; 32]>> {
+    if symbol_auth_enabled {
+        master_key
+            .map(Some)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "symbol_auth enabled but master key is missing (reason=auth_failed)"
+                    .to_owned(),
+            })
+    } else {
+        Ok(None)
+    }
+}
+
 impl EcsRootPointer {
     /// Construct an unauthenticated root pointer (`symbol_auth=off`).
     #[must_use]
@@ -438,29 +477,46 @@ impl EcsRootPointer {
         symbol_auth_enabled: bool,
         master_key: Option<&[u8; 32]>,
     ) -> Result<Self> {
+        let auth_key = required_symbol_auth_key(symbol_auth_enabled, master_key)?;
+        Self::decode_classified(bytes, auth_key).map_err(RootPointerReadFailure::into_error)
+    }
+
+    fn decode_classified(
+        bytes: &[u8],
+        auth_key: Option<&[u8; 32]>,
+    ) -> std::result::Result<Self, RootPointerReadFailure> {
         if bytes.len() != ECS_ROOT_POINTER_BYTES {
-            return Err(FrankenError::DatabaseCorrupt {
+            let error = FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "ecs/root size mismatch: expected {ECS_ROOT_POINTER_BYTES}, got {}",
                     bytes.len()
                 ),
+            };
+            return Err(if bytes.len() < ECS_ROOT_POINTER_BYTES {
+                RootPointerReadFailure::Recoverable(error)
+            } else {
+                RootPointerReadFailure::Terminal(error)
             });
         }
         if bytes[0..4] != ECS_ROOT_POINTER_MAGIC {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "invalid ecs/root magic: {:02X?} (reason=bad_magic)",
-                    &bytes[0..4]
-                ),
-            });
+            return Err(RootPointerReadFailure::Terminal(
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "invalid ecs/root magic: {:02X?} (reason=bad_magic)",
+                        &bytes[0..4]
+                    ),
+                },
+            ));
         }
         let version = read_u32_le_at(bytes, 4, "root.version")?;
         if version != ECS_ROOT_POINTER_VERSION {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "unsupported ecs/root version {version} (expected {ECS_ROOT_POINTER_VERSION})"
-                ),
-            });
+            return Err(RootPointerReadFailure::Terminal(
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "unsupported ecs/root version {version} (expected {ECS_ROOT_POINTER_VERSION})"
+                    ),
+                },
+            ));
         }
 
         let mut manifest_id = [0_u8; 16];
@@ -481,23 +537,19 @@ impl EcsRootPointer {
                 computed_checksum = computed_checksum,
                 "ecs/root checksum verification failed"
             );
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "ecs/root checksum mismatch (reason=checksum_mismatch): stored={stored_checksum:#018X}, computed={computed_checksum:#018X}"
-                ),
-            });
+            return Err(RootPointerReadFailure::Recoverable(
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "ecs/root checksum mismatch (reason=checksum_mismatch): stored={stored_checksum:#018X}, computed={computed_checksum:#018X}"
+                    ),
+                },
+            ));
         }
 
         let mut root_auth_tag = [0_u8; 16];
         root_auth_tag.copy_from_slice(&bytes[40..56]);
 
-        if symbol_auth_enabled {
-            let Some(master_key) = master_key else {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "symbol_auth enabled but master key is missing (reason=auth_failed)"
-                        .to_owned(),
-                });
-            };
+        if let Some(master_key) = auth_key {
             let expected = compute_root_pointer_auth_tag(
                 master_key,
                 &bytes[..ECS_ROOT_POINTER_AUTH_INPUT_BYTES],
@@ -509,14 +561,19 @@ impl EcsRootPointer {
                     reason_code = "auth_failed",
                     "ecs/root auth-tag verification failed"
                 );
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "ecs/root auth tag verification failed (reason=auth_failed)".to_owned(),
-                });
+                return Err(RootPointerReadFailure::Terminal(
+                    FrankenError::DatabaseCorrupt {
+                        detail: "ecs/root auth tag verification failed (reason=auth_failed)"
+                            .to_owned(),
+                    },
+                ));
             }
         } else if root_auth_tag != [0_u8; 16] {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: "ecs/root auth tag must be all-zero when symbol_auth=off".to_owned(),
-            });
+            return Err(RootPointerReadFailure::Terminal(
+                FrankenError::DatabaseCorrupt {
+                    detail: "ecs/root auth tag must be all-zero when symbol_auth=off".to_owned(),
+                },
+            ));
         }
 
         Ok(Self {
@@ -766,7 +823,15 @@ pub fn read_root_pointer(
     symbol_auth_enabled: bool,
     master_key: Option<&[u8; 32]>,
 ) -> Result<EcsRootPointer> {
-    let bytes = fs::read(root_path).map_err(|err| {
+    let auth_key = required_symbol_auth_key(symbol_auth_enabled, master_key)?;
+    read_root_pointer_classified(root_path, auth_key).map_err(RootPointerReadFailure::into_error)
+}
+
+fn read_root_pointer_classified(
+    root_path: &Path,
+    auth_key: Option<&[u8; 32]>,
+) -> std::result::Result<EcsRootPointer, RootPointerReadFailure> {
+    let mut file = fs::File::open(root_path).map_err(|err| {
         error!(
             bead_id = ROOT_BOOTSTRAP_BEAD_ID,
             logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
@@ -775,9 +840,26 @@ pub fn read_root_pointer(
             error = %err,
             "failed reading ecs/root"
         );
-        FrankenError::Io(err)
+        if err.kind() == std::io::ErrorKind::NotFound {
+            RootPointerReadFailure::Recoverable(FrankenError::Io(err))
+        } else {
+            RootPointerReadFailure::Terminal(FrankenError::Io(err))
+        }
     })?;
-    EcsRootPointer::decode(&bytes, symbol_auth_enabled, master_key)
+    // One extra byte distinguishes the fixed format from an oversized file.
+    // Read the actual bytes, rather than trusting a racy metadata length, and
+    // never allocate in proportion to an untrusted root file's size.
+    let mut bytes = [0_u8; ECS_ROOT_POINTER_BYTES + 1];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(RootPointerReadFailure::Terminal(FrankenError::Io(err))),
+        }
+    }
+    EcsRootPointer::decode_classified(&bytes[..filled], auth_key)
 }
 
 /// Crash-safe `ecs/root` update: temp write -> fsync temp -> rename -> fsync dir.
@@ -863,6 +945,7 @@ pub fn bootstrap_native_mode(
     symbol_auth_enabled: bool,
     master_key: Option<&[u8; 32]>,
 ) -> Result<NativeBootstrapState> {
+    let auth_key = required_symbol_auth_key(symbol_auth_enabled, master_key)?;
     debug!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
@@ -882,10 +965,11 @@ pub fn bootstrap_native_mode(
         manifest_object_id = %root_pointer.manifest_object_id,
         "bootstrap steps 1-3 complete"
     );
-    bootstrap_from_root_pointer(layout, root_pointer)
+    bootstrap_from_root_pointer(layout, root_pointer, auth_key)
 }
 
-/// Bootstrap native mode, falling back to scan-based root recovery.
+/// Bootstrap native mode, recovering only a missing, torn, or checksum-corrupt root.
+/// Authentication, format, I/O, and object-validation failures are terminal.
 ///
 /// # Errors
 ///
@@ -895,9 +979,11 @@ pub fn bootstrap_native_mode_with_recovery(
     symbol_auth_enabled: bool,
     master_key: Option<&[u8; 32]>,
 ) -> Result<NativeBootstrapState> {
-    match bootstrap_native_mode(layout, symbol_auth_enabled, master_key) {
-        Ok(state) => Ok(state),
-        Err(initial_err) => {
+    let auth_key = required_symbol_auth_key(symbol_auth_enabled, master_key)?;
+    match read_root_pointer_classified(&layout.root_path(), auth_key) {
+        Ok(root_pointer) => bootstrap_from_root_pointer(layout, root_pointer, auth_key),
+        Err(RootPointerReadFailure::Terminal(error)) => Err(error),
+        Err(RootPointerReadFailure::Recoverable(initial_err)) => {
             debug!(
                 bead_id = ROOT_BOOTSTRAP_BEAD_ID,
                 logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
@@ -910,7 +996,7 @@ pub fn bootstrap_native_mode_with_recovery(
                 logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
                 reason_code = "retry_scan_recovery",
                 error = %initial_err,
-                "bootstrap from ecs/root failed; attempting scan-based recovery"
+                "ecs/root is missing or damaged; attempting scan-based recovery"
             );
 
             let recovered_pointer =
@@ -920,7 +1006,7 @@ pub fn bootstrap_native_mode_with_recovery(
             // Previously, write_root_pointer_atomic was called first, meaning a
             // bogus candidate would be persisted to disk even if validation failed,
             // leaving permanent corruption in ecs/root.
-            let state = bootstrap_from_root_pointer(layout, recovered_pointer)?;
+            let state = bootstrap_from_root_pointer(layout, recovered_pointer, auth_key)?;
 
             // Only persist the root pointer after full validation succeeds.
             write_root_pointer_atomic(&layout.root_path(), recovered_pointer)?;
@@ -939,6 +1025,7 @@ pub fn recover_root_pointer_from_scan(
     symbol_auth_enabled: bool,
     master_key: Option<&[u8; 32]>,
 ) -> Result<EcsRootPointer> {
+    let auth_key = required_symbol_auth_key(symbol_auth_enabled, master_key)?;
     let marker_tip = scan_latest_marker(layout.markers_dir().as_path())?;
     let mut grouped: BTreeMap<ObjectId, Vec<SymbolRecord>> = BTreeMap::new();
     let symbol_segments = sorted_segment_paths(layout.symbols_dir().as_path())?;
@@ -958,7 +1045,10 @@ pub fn recover_root_pointer_from_scan(
             "scan recovery inspecting symbol segment"
         );
         let scan = scan_symbol_segment(segment_path)?;
+        let epoch_key =
+            auth_key.map(|key| derive_epoch_auth_key(key, EpochId::new(scan.header.epoch_id)));
         for row in scan.records {
+            verify_bootstrap_symbol_auth(&row.record, scan.header.epoch_id, epoch_key.as_ref())?;
             grouped
                 .entry(row.record.object_id)
                 .or_default()
@@ -1029,6 +1119,7 @@ pub fn recover_root_pointer_from_scan(
 fn bootstrap_from_root_pointer(
     layout: &NativeBootstrapLayout,
     root_pointer: EcsRootPointer,
+    auth_key: Option<&[u8; 32]>,
 ) -> Result<NativeBootstrapState> {
     info!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
@@ -1042,6 +1133,7 @@ fn bootstrap_from_root_pointer(
         layout.symbols_dir().as_path(),
         root_pointer.manifest_object_id,
         root_pointer.ecs_epoch,
+        auth_key,
     )?;
     let manifest = RootManifest::decode(&manifest_bytes)?;
     info!(
@@ -1117,6 +1209,7 @@ fn bootstrap_from_root_pointer(
         layout.symbols_dir().as_path(),
         manifest.schema_snapshot,
         root_pointer.ecs_epoch,
+        auth_key,
     )?;
     info!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
@@ -1131,6 +1224,7 @@ fn bootstrap_from_root_pointer(
         layout.symbols_dir().as_path(),
         manifest.checkpoint_base,
         root_pointer.ecs_epoch,
+        auth_key,
     )?;
     info!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
@@ -1166,6 +1260,7 @@ fn fetch_object_payload(
     symbols_dir: &Path,
     object_id: ObjectId,
     root_epoch: EpochId,
+    auth_key: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>> {
     let mut records = Vec::new();
     let segments = sorted_segment_paths(symbols_dir)?;
@@ -1198,8 +1293,15 @@ fn fetch_object_payload(
                 ),
             });
         }
+        let epoch_key =
+            auth_key.map(|key| derive_epoch_auth_key(key, EpochId::new(scan.header.epoch_id)));
         for row in scan.records {
             if row.record.object_id == object_id {
+                verify_bootstrap_symbol_auth(
+                    &row.record,
+                    scan.header.epoch_id,
+                    epoch_key.as_ref(),
+                )?;
                 records.push(row.record);
             }
         }
@@ -1211,6 +1313,36 @@ fn fetch_object_payload(
         });
     }
     reconstruct_payload_from_source_symbols(records)
+}
+
+fn verify_bootstrap_symbol_auth(
+    record: &SymbolRecord,
+    segment_epoch: u64,
+    epoch_key: Option<&EpochAuthKey>,
+) -> Result<()> {
+    let Some(epoch_key) = epoch_key else {
+        return Ok(());
+    };
+    // SymbolRecord::verify_auth also serves auth-disabled callers and accepts
+    // the zero sentinel. Authenticated bootstrap must reject that sentinel.
+    if record.auth_tag == [0_u8; 16] || !record.verify_auth(epoch_key.as_bytes()) {
+        error!(
+            bead_id = ROOT_BOOTSTRAP_BEAD_ID,
+            logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
+            reason_code = "auth_failed",
+            object_id = %record.object_id,
+            segment_epoch,
+            esi = record.esi,
+            "bootstrap symbol authentication failed"
+        );
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "bootstrap symbol auth verification failed (reason=auth_failed): object={}, segment_epoch={segment_epoch}, esi={}",
+                record.object_id, record.esi
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Result<Vec<u8>> {
@@ -1902,6 +2034,460 @@ mod tests {
             schema_payload,
             checkpoint_payload,
         )
+    }
+
+    fn rewrite_bootstrap_fixture_segment(
+        layout: &NativeBootstrapLayout,
+        segment_epoch: u64,
+        mut transform: impl FnMut(SymbolRecord) -> SymbolRecord,
+    ) {
+        let path = layout.symbols_dir().join("segment-000001.log");
+        let scan = scan_symbol_segment(&path).expect("scan fixture segment");
+        let mut header = scan.header;
+        header.epoch_id = segment_epoch;
+        let mut bytes = header.encode().to_vec();
+        for row in scan.records {
+            bytes.extend_from_slice(&transform(row.record).to_bytes());
+        }
+        fs::write(path, bytes).expect("rewrite fixture segment");
+    }
+
+    fn write_authenticated_bootstrap_fixture(
+        layout: &NativeBootstrapLayout,
+        root_epoch: EpochId,
+        segment_epoch: EpochId,
+        master_key: &[u8; 32],
+    ) -> NativeBootstrapState {
+        let (manifest_id, manifest, marker, schema, checkpoint) =
+            write_valid_bootstrap_fixture(layout, root_epoch);
+        let epoch_key = derive_epoch_auth_key(master_key, segment_epoch);
+        rewrite_bootstrap_fixture_segment(layout, segment_epoch.get(), |record| {
+            record.with_auth_tag(epoch_key.as_bytes())
+        });
+        NativeBootstrapState {
+            root_pointer: EcsRootPointer::authed(manifest_id, root_epoch, master_key),
+            manifest,
+            latest_marker: marker,
+            schema_snapshot_bytes: schema,
+            checkpoint_base_bytes: checkpoint,
+        }
+    }
+
+    fn bootstrap_disk_snapshot(layout: &NativeBootstrapLayout) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut snapshot = BTreeMap::new();
+        let mut directories = vec![layout.ecs_dir.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).expect("read fixture directory") {
+                let entry = entry.expect("fixture entry");
+                if entry.file_type().expect("fixture file type").is_dir() {
+                    directories.push(entry.path());
+                } else {
+                    snapshot.insert(entry.path(), fs::read(entry.path()).expect("fixture bytes"));
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn assert_bootstrap_auth_rejected_without_writes(
+        layout: &NativeBootstrapLayout,
+        key: Option<&[u8; 32]>,
+        case: &str,
+    ) {
+        let before = bootstrap_disk_snapshot(layout);
+        for recover in [false, true] {
+            let result = if recover {
+                bootstrap_native_mode_with_recovery(layout, true, key)
+            } else {
+                bootstrap_native_mode(layout, true, key)
+            };
+            let error = result.expect_err(case);
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("auth_failed")),
+                "case={case} recover={recover} error={error}"
+            );
+            assert_eq!(
+                bootstrap_disk_snapshot(layout),
+                before,
+                "case={case} recover={recover}"
+            );
+            eprintln!(
+                "bead_id=bd-3mgq5.4 case={case} recover={recover} result=rejected reason=auth_failed disk_unchanged=true"
+            );
+        }
+    }
+
+    #[test]
+    fn test_native_bootstrap_authenticated_past_epoch_objects() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(3), &key);
+        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("write root");
+        let before = bootstrap_disk_snapshot(&layout);
+        assert_eq!(
+            bootstrap_native_mode(&layout, true, Some(&key)).expect("direct open"),
+            expected
+        );
+        assert_eq!(
+            bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+                .expect("open with recovery"),
+            expected
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), before);
+        eprintln!(
+            "bead_id=bd-3mgq5.4 case=past_epoch root_epoch=7 segment_epoch=3 authenticated_objects=3 disk_unchanged=true"
+        );
+    }
+
+    #[test]
+    fn test_native_bootstrap_root_auth_failure_is_terminal() {
+        for case in [
+            "wrong_key",
+            "missing_key",
+            "tampered_root_tag",
+            "zero_root_tag",
+        ] {
+            let (_tmp, layout) = create_layout();
+            let key = test_master_key();
+            let expected = write_authenticated_bootstrap_fixture(
+                &layout,
+                EpochId::new(7),
+                EpochId::new(7),
+                &key,
+            );
+            let mut bytes = expected.root_pointer.encode();
+            if case == "tampered_root_tag" {
+                bytes[40] ^= 1;
+            } else if case == "zero_root_tag" {
+                bytes[40..].fill(0);
+            }
+            fs::write(layout.root_path(), bytes).expect("write root");
+            let bad_key = [0x5A_u8; 32];
+            let supplied_key = match case {
+                "wrong_key" => Some(&bad_key),
+                "missing_key" => None,
+                _ => Some(&key),
+            };
+            assert_bootstrap_auth_rejected_without_writes(&layout, supplied_key, case);
+        }
+    }
+
+    #[test]
+    fn test_native_bootstrap_recovery_cannot_downgrade_authenticated_root() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(7), &key);
+        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("root");
+        let before = bootstrap_disk_snapshot(&layout);
+        let error = bootstrap_native_mode_with_recovery(&layout, false, None)
+            .expect_err("auth-disabled open cannot replace an authenticated root");
+        assert!(
+            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("symbol_auth=off"))
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), before);
+        assert_eq!(
+            bootstrap_native_mode(&layout, true, Some(&key)).expect("authenticated reopen"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_native_bootstrap_authenticates_every_referenced_object() {
+        for object in ["manifest", "schema", "checkpoint"] {
+            for damage in ["zero_tag", "wrong_tag", "changed_payload"] {
+                let (_tmp, layout) = create_layout();
+                let key = test_master_key();
+                let expected = write_authenticated_bootstrap_fixture(
+                    &layout,
+                    EpochId::new(7),
+                    EpochId::new(7),
+                    &key,
+                );
+                write_root_pointer_atomic(&layout.root_path(), expected.root_pointer)
+                    .expect("root");
+                let object_id = match object {
+                    "manifest" => expected.root_pointer.manifest_object_id,
+                    "schema" => expected.manifest.schema_snapshot,
+                    _ => expected.manifest.checkpoint_base,
+                };
+                rewrite_bootstrap_fixture_segment(&layout, 7, |mut record| {
+                    if record.object_id == object_id {
+                        match damage {
+                            "zero_tag" => record.auth_tag = [0_u8; 16],
+                            "wrong_tag" => record.auth_tag[0] ^= 1,
+                            _ => {
+                                let old_tag = record.auth_tag;
+                                record.symbol_data[0] ^= 1;
+                                record = SymbolRecord::new(
+                                    record.object_id,
+                                    record.oti,
+                                    record.esi,
+                                    record.symbol_data,
+                                    record.flags,
+                                );
+                                record.auth_tag = old_tag;
+                            }
+                        }
+                    }
+                    // Even payload tampering has a valid unkeyed frame checksum.
+                    assert!(record.verify_integrity());
+                    record
+                });
+                assert_bootstrap_auth_rejected_without_writes(
+                    &layout,
+                    Some(&key),
+                    &format!("{object}_{damage}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_bootstrap_recovers_only_authenticated_root_candidates() {
+        for damage in ["missing", "torn", "checksum"] {
+            let (_tmp, layout) = create_layout();
+            let key = test_master_key();
+            let expected = write_authenticated_bootstrap_fixture(
+                &layout,
+                EpochId::new(7),
+                EpochId::new(3),
+                &key,
+            );
+            if damage == "torn" {
+                fs::write(layout.root_path(), &expected.root_pointer.encode()[..17])
+                    .expect("torn root");
+            } else if damage == "checksum" {
+                let mut bytes = expected.root_pointer.encode();
+                bytes[12] ^= 1;
+                fs::write(layout.root_path(), bytes).expect("corrupt checksum");
+            }
+            let before = bootstrap_disk_snapshot(&layout);
+            for supplied_key in [None, Some(&[0x5A_u8; 32])] {
+                let error = bootstrap_native_mode_with_recovery(&layout, true, supplied_key)
+                    .expect_err("recovery must authenticate candidates");
+                assert!(
+                    matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("auth_failed"))
+                );
+                assert_eq!(bootstrap_disk_snapshot(&layout), before, "case={damage}");
+            }
+            let recovered = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+                .expect("authenticated recovery");
+            assert_eq!(recovered, expected);
+            assert_eq!(
+                read_root_pointer(&layout.root_path(), true, Some(&key)).expect("persisted root"),
+                expected.root_pointer
+            );
+            assert_eq!(
+                bootstrap_native_mode(&layout, true, Some(&key)).expect("reopen recovered root"),
+                expected
+            );
+            eprintln!(
+                "bead_id=bd-3mgq5.4 case={damage} bad_keys_rejected=2 result=recovered authenticated_objects=3"
+            );
+        }
+    }
+
+    #[test]
+    fn test_native_bootstrap_recovery_rejects_unsigned_candidates() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        write_valid_bootstrap_fixture(&layout, EpochId::new(7));
+        fs::write(layout.root_path(), [0_u8; 9]).expect("torn root");
+        let before = bootstrap_disk_snapshot(&layout);
+        let error = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+            .expect_err("unsigned manifest cannot be blessed by recovery");
+        assert!(
+            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("auth_failed"))
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), before);
+    }
+
+    #[test]
+    fn test_native_bootstrap_segment_epoch_is_bound_to_authentication() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(3), &key);
+        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("write root");
+        // Reframe the same valid records under another allowed epoch. The
+        // segment checksum is recomputed, but the epoch-3 MACs must fail.
+        rewrite_bootstrap_fixture_segment(&layout, 4, |record| record);
+        assert_bootstrap_auth_rejected_without_writes(
+            &layout,
+            Some(&key),
+            "relabeled_segment_epoch",
+        );
+    }
+
+    #[test]
+    fn test_native_bootstrap_authenticated_future_epoch_is_rejected() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(8), &key);
+        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("root");
+        let before = bootstrap_disk_snapshot(&layout);
+        for recover in [false, true] {
+            let result = if recover {
+                bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+            } else {
+                bootstrap_native_mode(&layout, true, Some(&key))
+            };
+            let error = result.expect_err("authentication cannot override the epoch upper bound");
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("future_epoch"))
+            );
+            assert_eq!(bootstrap_disk_snapshot(&layout), before);
+        }
+        fs::write(layout.root_path(), [0_u8; 9]).expect("torn root");
+        let torn_before = bootstrap_disk_snapshot(&layout);
+        let error = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+            .expect_err("scan must validate the recovered manifest's epoch bound");
+        assert!(
+            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("future_epoch"))
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), torn_before);
+    }
+
+    #[test]
+    fn test_native_bootstrap_root_format_and_io_errors_are_terminal() {
+        for case in ["version", "magic", "oversized", "directory"] {
+            let (_tmp, layout) = create_layout();
+            let key = test_master_key();
+            let expected = write_authenticated_bootstrap_fixture(
+                &layout,
+                EpochId::new(7),
+                EpochId::new(7),
+                &key,
+            );
+            let mut bytes = expected.root_pointer.encode();
+            match case {
+                "version" => {
+                    bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
+                    let checksum = xxhash_rust::xxh3::xxh3_64(&bytes[..32]);
+                    bytes[32..40].copy_from_slice(&checksum.to_le_bytes());
+                    let tag = compute_root_pointer_auth_tag(&key, &bytes[..40]);
+                    bytes[40..].copy_from_slice(&tag);
+                    fs::write(layout.root_path(), bytes).expect("unknown root version");
+                }
+                "magic" => {
+                    bytes[0] = b'X';
+                    fs::write(layout.root_path(), bytes).expect("wrong root format");
+                }
+                "oversized" => {
+                    let mut file = fs::File::create(layout.root_path()).expect("oversized root");
+                    file.write_all(&bytes).expect("root prefix");
+                    // Sparse file: the reader must inspect only the fixed-size
+                    // prefix, without allocating this declared length.
+                    file.set_len(4 * 1024 * 1024)
+                        .expect("large sparse root length");
+                }
+                _ => fs::create_dir(layout.root_path()).expect("root is a directory"),
+            }
+            // Do not snapshot the deliberately huge sparse root into memory.
+            let error = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+                .expect_err("format and I/O failures cannot trigger root replacement");
+            if case == "directory" {
+                assert!(matches!(error, FrankenError::Io(_)));
+                assert!(layout.root_path().is_dir());
+            } else {
+                assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
+                let mut prefix = [0_u8; ECS_ROOT_POINTER_BYTES];
+                fs::File::open(layout.root_path())
+                    .expect("root still present")
+                    .read_exact(&mut prefix)
+                    .expect("read retained root");
+                assert_eq!(prefix, bytes);
+                if case == "oversized" {
+                    assert_eq!(
+                        fs::metadata(layout.root_path()).expect("root length").len(),
+                        4 * 1024 * 1024
+                    );
+                    assert!(error.to_string().contains("got 57"), "{error}");
+                }
+            }
+            assert!(
+                fs::read_dir(&layout.ecs_dir)
+                    .expect("ecs entries")
+                    .all(|entry| !entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".root.tmp."))
+            );
+            eprintln!("bead_id=bd-3mgq5.4 case={case} result=terminal root_preserved=true");
+        }
+    }
+
+    #[test]
+    fn test_native_bootstrap_authenticated_manifest_epoch_failure_is_terminal() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let mut expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(7), &key);
+        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("root");
+        expected.manifest.ecs_epoch = EpochId::new(8);
+        let payload = expected.manifest.encode().expect("mismatched manifest");
+        let epoch_key = derive_epoch_auth_key(&key, EpochId::new(7));
+        rewrite_bootstrap_fixture_segment(&layout, 7, |record| {
+            if record.object_id == expected.root_pointer.manifest_object_id {
+                SymbolRecord::new(
+                    record.object_id,
+                    record.oti,
+                    record.esi,
+                    payload.clone(),
+                    record.flags,
+                )
+                .with_auth_tag(epoch_key.as_bytes())
+            } else {
+                record
+            }
+        });
+        let before = bootstrap_disk_snapshot(&layout);
+        let error = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+            .expect_err("must not rewrite a verified root to match a mismatched manifest");
+        assert!(
+            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("epoch_mismatch"))
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), before);
+    }
+
+    #[test]
+    fn test_native_bootstrap_recovery_validates_body_before_root_publication() {
+        let (_tmp, layout) = create_layout();
+        let key = test_master_key();
+        let mut expected =
+            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(7), &key);
+        expected.manifest.checkpoint_base = make_object_id(0xF1);
+        let payload = expected
+            .manifest
+            .encode()
+            .expect("manifest references absent checkpoint");
+        let epoch_key = derive_epoch_auth_key(&key, EpochId::new(7));
+        rewrite_bootstrap_fixture_segment(&layout, 7, |record| {
+            if record.object_id == expected.root_pointer.manifest_object_id {
+                SymbolRecord::new(
+                    record.object_id,
+                    record.oti,
+                    record.esi,
+                    payload.clone(),
+                    record.flags,
+                )
+                .with_auth_tag(epoch_key.as_bytes())
+            } else {
+                record
+            }
+        });
+        fs::write(layout.root_path(), [0_u8; 9]).expect("torn previous root");
+        let before = bootstrap_disk_snapshot(&layout);
+        let error = bootstrap_native_mode_with_recovery(&layout, true, Some(&key))
+            .expect_err("candidate body must validate before publishing repaired root");
+        assert!(
+            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("not found in symbol logs"))
+        );
+        assert_eq!(bootstrap_disk_snapshot(&layout), before);
     }
 
     #[test]
