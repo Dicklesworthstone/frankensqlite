@@ -14,8 +14,10 @@
 //! ```
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_observability::metrics;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_vfs::{SyncKind, VfsFile, VfsWriteCompletion};
 use tracing::{debug, error, warn};
 
@@ -536,7 +538,13 @@ impl<F: VfsFile> WalFile<F> {
         // next open. (Salts are randomized per generation — GH #201 — which
         // independently defends against stale-frame replay, but the barrier
         // remains the primary ordering guarantee.)
+        let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
         file.sync(cx, SyncFlags::NORMAL)?;
+        if let Some(started) = sync_started {
+            metrics::global()
+                .fsync_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
 
         let running_checksum = read_wal_header_checksum(&header_bytes)?;
 
@@ -1477,7 +1485,13 @@ impl<F: VfsFile> WalFile<F> {
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
 
+        let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
         self.file.sync(cx, flags)?;
+        if let Some(started) = sync_started {
+            metrics::global()
+                .fsync_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
         self.last_fsynced_frame_count = self.frame_count;
         Ok(())
     }
@@ -1529,7 +1543,13 @@ impl<F: VfsFile> WalFile<F> {
             crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
         }
 
+        let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
         self.file.durable_sync(cx, kind)?;
+        if let Some(started) = sync_started {
+            metrics::global()
+                .fsync_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
         self.last_fsynced_frame_count = self.frame_count;
 
         debug!(
@@ -1634,7 +1654,13 @@ impl<F: VfsFile> WalFile<F> {
 
         // Sync the WAL header to stable storage before writing new frames,
         // matching SQLite's walRestartHdr() behaviour.
+        let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
         self.file.sync(cx, SyncFlags::NORMAL)?;
+        if let Some(started) = sync_started {
+            metrics::global()
+                .fsync_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
 
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
@@ -2481,6 +2507,127 @@ mod tests {
         let wal3 = WalFile::open(&cx, file3).expect("open WAL");
         assert_eq!(wal3.frame_count(), 5);
         wal3.close(&cx).expect("close WAL");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn real_wal_barriers_record_successful_fsync_latency() {
+        const MODE: &str = "FSQLITE_REAL_WAL_FSYNC_METRICS_MODE";
+        let Ok(mode) = std::env::var(MODE) else {
+            for mode in ["enabled", "disabled"] {
+                let executable = std::env::current_exe().expect("test binary");
+                let output = std::process::Command::new(executable)
+                    .args([
+                        "--exact",
+                        "wal::tests::real_wal_barriers_record_successful_fsync_latency",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .output()
+                    .expect("run isolated real WAL test");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("{mode}: {stdout}\n{stderr}");
+                assert!(output.status.success(), "{mode}: {stderr}");
+                assert!(stderr.contains("real_wal_fsync_metrics_verified"));
+            }
+            return;
+        };
+        assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+        let histogram = &fsqlite_observability::metrics::global().fsync_duration_seconds;
+        let count = |n| if mode == "enabled" { n } else { 0 };
+        assert_eq!(histogram.count(), 0);
+        let directory = tempfile::tempdir().expect("real WAL directory").keep();
+        let path = directory.join("metrics.db-wal");
+        let cx = test_cx();
+        let vfs = fsqlite_vfs::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&path), flags).expect("real WAL file");
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        assert_eq!(
+            histogram.count(),
+            count(1),
+            "fresh header durability barrier"
+        );
+        for (i, flags) in [SyncFlags::NORMAL, SyncFlags::FULL, SyncFlags::DATAONLY]
+            .into_iter()
+            .enumerate()
+        {
+            let page_number = u32::try_from(i + 1).expect("small page number");
+            wal.append_frame(&cx, page_number, &sample_page(7), page_number)
+                .expect("append");
+            wal.sync(&cx, flags).expect("real sync");
+            assert_eq!(wal.last_fsynced_frame_count(), i + 1);
+            assert_eq!(
+                histogram.count(),
+                count(u64::try_from(i + 2).expect("small count"))
+            );
+        }
+        for (i, kind) in [
+            SyncKind::DataOnly,
+            SyncKind::DataAndMetadata,
+            SyncKind::FullDurable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            wal.durable_sync(&cx, kind)
+                .expect("real durability-intent sync");
+            assert_eq!(
+                histogram.count(),
+                count(u64::try_from(i + 5).expect("small count"))
+            );
+        }
+        let cancelled = Cx::new();
+        cancelled.transition_to_running();
+        cancelled.cancel();
+        assert!(matches!(
+            wal.durable_sync(&cancelled, SyncKind::FullDurable),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(
+            histogram.count(),
+            count(7),
+            "cancelled barrier is not successful"
+        );
+        wal.close(&cx).expect("close durable WAL");
+        let (file, _) = vfs
+            .open(&cx, Some(&path), flags)
+            .expect("reopen actual file");
+        let mut reopened = WalFile::open(&cx, file).expect("recover WAL");
+        assert_eq!(reopened.frame_count(), 3);
+        assert_eq!(
+            reopened.read_frame(&cx, 2).expect("read recovered frame").1,
+            sample_page(7)
+        );
+        assert_eq!(
+            histogram.count(),
+            count(7),
+            "read-only recovery does not sync"
+        );
+        reopened
+            .reset(&cx, 1, test_salts(), true)
+            .expect("reset WAL header");
+        assert_eq!(reopened.frame_count(), 0);
+        assert_eq!(
+            histogram.count(),
+            count(8),
+            "reset header durability barrier"
+        );
+        reopened.close(&cx).expect("close reset WAL");
+        if mode == "enabled" {
+            assert!(histogram.sum().is_finite() && histogram.sum() > 0.0);
+        } else {
+            assert_eq!(histogram.sum(), 0.0);
+        }
+        eprintln!(
+            "real_wal_fsync_metrics_verified mode={mode} path={}",
+            path.display()
+        );
     }
 
     #[test]

@@ -37,8 +37,9 @@ FRANKENSQLITE_METRICS_DISABLE=1 ./your-app
 
 Three ways to read the metrics. The **callable API**, both **serializers**, the
 **StatsD UDP push** transport, and the **HTTP `/metrics` endpoint** all ship
-today. The SQL engine records `commits_total` at its commit success boundaries
-and `page_lock_acquire_duration_seconds` when a contended wait finishes.
+today. The SQL engine records `commits_total` at its commit success boundaries,
+`page_lock_acquire_duration_seconds` when a contended wait finishes, and
+`fsync_duration_seconds` after successful WAL durability calls.
 Native database opens start the HTTP endpoint when the bind environment variable
 is set. `PRAGMA enable_metrics_http` can also start the shared endpoint. Most
 other engine recording sites still need wiring (see [Roadmap](#roadmap)).
@@ -206,7 +207,7 @@ Bucket bounds (`le`, seconds): `0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1,
 
 | Metric | Meaning | SLO recommendation |
 |--------|---------|--------------------|
-| `fsqlite_fsync_duration_seconds` (`fsqlite.fsync_duration_seconds`) | Time spent in `fsync`/durability barriers. | Track p99. On local SSD, p99 above ~10 ms usually means fsync contention or a slow device — the dominant cost in file-backed durability (see `bd-jyeus`). |
+| `fsqlite_fsync_duration_seconds` (`fsqlite.fsync_duration_seconds`) | Elapsed time for successful WAL VFS sync calls, including header creation/reset and frame durability. Failed or cancelled calls are excluded; an in-memory VFS has no physical disk flush. | Track the successful durability latency distribution; failures require separate error diagnostics. |
 | `fsqlite_commit_duration_seconds` (`fsqlite.commit_duration_seconds`) | End-to-end commit latency (validate → publish → durability). | Primary write-latency SLI. Compare p99 against your write-path budget; a gap vs. `fsync_duration_seconds` p99 isolates MVCC/publish cost from device cost. |
 | `fsqlite_page_lock_acquire_duration_seconds` (`fsqlite.page_lock_acquire_duration_seconds`) | Elapsed time per contended VDBE page-lock wait attempt, including holder change, timeout, cancellation, and deadlock-victim exits. | Compare tails with the workload's busy-timeout budget to locate page contention. |
 
@@ -260,14 +261,18 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **Engine hot-path wiring** — restoring the remaining fsync / commit-latency /
+- **Engine hot-path wiring** — restoring the remaining commit-latency /
   conflict / sweeper / integrity recording sites. The commit counter is wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
   (bd-zywqc.11.1.3). The page-lock wait histogram is wired at
   `fsqlite-vdbe::engine::wait_for_page_lock_holder_change`; its isolated
   `page_lock_wait_histogram_tracks_real_outcomes` keeper covers enabled and
-  disabled recording (bd-zywqc.11.1.1). Other series being present in an
+  disabled recording (bd-zywqc.11.1.1). WAL fsync timing covers `WalFile` creation,
+  reset, `sync`, and `durable_sync`; the real-file
+  `real_wal_barriers_record_successful_fsync_latency` keeper checks successful
+  counts, cancellation, reopen, and disabled mode. Clock reads are skipped when
+  metrics are disabled. Other series being present in an
   exposition is not proof that their engine producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
 

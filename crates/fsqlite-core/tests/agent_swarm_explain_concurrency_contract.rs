@@ -219,6 +219,7 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
     let enabled = mode == "enabled";
     assert_eq!(fsqlite_observability::metrics::metrics_disabled(), !enabled);
     let counter = &fsqlite_observability::metrics::global().commits_total;
+    let fsync = &fsqlite_observability::metrics::global().fsync_duration_seconds;
     let delta = |before, expected| {
         assert_eq!(counter.get() - before, if enabled { expected } else { 0 });
     };
@@ -231,16 +232,23 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
                 let conn = Connection::open(path).await?;
                 assert!(conn.is_concurrent_mode_default());
                 conn.query("PRAGMA journal_mode=WAL;").await?;
+                conn.execute("PRAGMA synchronous=FULL;").await?;
                 conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;").await?;
                 conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER);").await?;
                 for id in 1..=3 {
                     let before = counter.get();
+                    let fsync_before = fsync.count();
                     conn.execute("BEGIN;").await?;
                     assert!(conn.is_concurrent_transaction());
                     conn.execute(&format!("INSERT INTO t VALUES({id},10);")).await?;
                     delta(before, 0);
                     conn.execute("COMMIT;").await?;
                     delta(before, 1);
+                    if enabled && path != ":memory:" {
+                        assert!(fsync.count() > fsync_before, "durable SQL commit records a real WAL barrier");
+                    } else if !enabled {
+                        assert_eq!(fsync.count(), 0);
+                    }
                     assert!(conn.execute("COMMIT;").await.is_err());
                     delta(before, 1);
                 }
@@ -335,6 +343,8 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
             } else {
                 assert!(text.is_empty());
                 assert_eq!(counter.get(), 0);
+                assert_eq!(fsync.count(), 0);
+                assert_eq!(fsync.sum(), 0.0);
             }
             eprintln!("bead_id=bd-zywqc.11.1.3 event=public_commit_metrics_verified mode={mode} commits={}", counter.get());
             Ok(())
