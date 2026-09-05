@@ -139,10 +139,10 @@ claim by themselves.
 
 ## Architecture
 
-FrankenSQLite is organized as a 27-member Cargo workspace with strict layered dependencies:
+FrankenSQLite is organized as a 28-member Cargo workspace with layered dependencies:
 
 <div align="center">
-  <img src="site/spec-evolution/frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 27-member layered workspace" width="512">
+  <img src="site/spec-evolution/frankensqlite_diagram.webp" alt="FrankenSQLite layered architecture overview" width="512">
 </div>
 
 ### Crate Map
@@ -273,7 +273,8 @@ All threshold PRAGMAs clamp invalid low values to safe minimums.
 > closed [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
 > records the original validation milestone; the remaining multi-process work
 > is carried by the Beads tracker. The concurrent-writer certification track also
-> carries a reproduced implicit-autocommit writer failure (`bd-9inpb`), so the harness under
+> closed the double-allocation failure `bd-9inpb` on September 4; orphaned-page
+> churn remains tracked by `bd-ioq6x`. The harness under
 > `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the canonical source of
 > truth for what currently holds.
 
@@ -1373,10 +1374,11 @@ null Git provenance, asymmetric settings, or harness defects. They remain
 diagnostic history in `docs/progress/perf-negative-results.md`, not release
 evidence.
 
-The currently demonstrated file-backed path uses the Unix fallback rather than
-the intended io_uring data path. The shipped size-optimized profile is also
-unmeasured by a citation-grade matrix. Both facts are explicit release gates,
-not assumptions to hide behind `release-perf` results.
+The retained performance diagnostics used the Unix fallback. A later correctness
+receipt reporting the public `iouring` backend does not establish kernel I/O
+behavior or throughput. The intended data path and shipped size-optimized
+profile still require a citation-grade performance matrix; neither can be
+inferred from `release-perf` results.
 
 `bd-dqdoe` tracks the same-source performance re-verification. A release may
 restore numeric claims here only after the repository contains an immutable
@@ -2083,7 +2085,10 @@ you surgical precision for diagnosing problems.
 
 ### E-Processes: Anytime-Valid Invariant Monitoring
 
-Traditional statistical tests require a fixed sample size decided in advance. FrankenSQLite monitors its seven MVCC invariants using **e-processes** — sequential tests that provide valid confidence at *any* stopping time, with no peeking penalty.
+The monitoring design uses e-processes for sequential statistical evidence.
+Their anytime-valid threshold requires a valid conditional null model; it is
+not a proof that runtime instrumentation observes every invariant. Any observed
+hard correctness violation must fail immediately, regardless of its e-value.
 
 ```
 An e-process (E_t) is a non-negative supermartingale starting at 1:
@@ -2101,13 +2106,20 @@ Betting martingale update rule:
 
     where:
         X_t = 1 if invariant violation observed, 0 otherwise
-        p_0 = null hypothesis violation rate (0.001 = "invariant holds 99.9% of the time")
-        λ = bet size, constrained to (-1/(1-p_0), 1/p_0) for non-negativity
+        p_0 = upper bound on E[X_t | F_{t-1}] under the statistical null
+        λ = predictable bet, 0 ≤ λ ≤ 1/p_0 for this upper-tail null (0 < p_0 < 1)
 ```
 
-**Under H_0** (invariant holds): `E[X_t] = p_0`, so `E[E_t | E_{t-1}] = E_{t-1}` — the e-process is a martingale, staying near 1.
+**Under H_0**, conditioning on the full past gives expected multiplier at most
+one. Equality gives a martingale, but does not keep every sample path near one.
+A marginal mean alone is insufficient for that conditional guarantee.
 
-**Under H_1** (actual violation rate p_1 > p_0): the e-process grows exponentially at rate `KL(p_1 ∥ p_0)` per observation. A single genuine invariant violation at λ = 0.5 multiplies the e-value by ~1.5. After 20 violations, the e-value exceeds 3,300 — far past the rejection threshold of 20.
+For independent Bernoulli observations with rate p_1 and a fixed admissible λ,
+the expected log increment is
+`p_1 log(1+λ(1-p_0)) + (1-p_1) log(1-λp_0)`.
+It equals `KL(p_1 ∥ p_0)` only at the corresponding optimal bet, not for every
+λ. Detection time also depends on non-violation observations and overshoot;
+counting violations alone supplies no universal delay bound.
 
 **Monitored invariants:**
 
@@ -2129,11 +2141,17 @@ Configuration:
     max_evalue: 10¹⁵       // overflow guard
 ```
 
-**Why e-processes instead of fixed-sample tests?** A database runs continuously. You can't decide in advance how many operations to observe. E-processes let you monitor invariants in real-time, accumulating evidence over millions of operations, and flag violations the instant they become statistically significant — even if the violation rate is 0.01%.
+E-processes permit repeated threshold checks under their stated model. A null
+budget of 0.1% cannot promise detection of a smaller 0.01% rate. Statistical
+monitoring remains supplementary evidence; it never licenses a nonzero rate
+of known database correctness violations.
 
 ### Mazurkiewicz Traces: Exhaustive Concurrency Verification
 
-Testing concurrent code by running random interleavings is like testing a combination lock by trying random codes — you'll probably never find the bug. **Mazurkiewicz traces** provide exhaustive coverage by classifying all possible interleavings into equivalence classes, then testing exactly one representative from each class.
+Mazurkiewicz traces classify schedules by a proved independence relation.
+Exhaustive exploration is relative to a bounded model and its action semantics;
+it requires complete exploration and sound independence, not merely a trace
+library or a passing randomized run.
 
 ```
 A trace monoid M(Σ, I) is defined over:
@@ -2156,12 +2174,15 @@ The trace monoid M(Σ, I) = Σ* / ≡_I
 | `read(T1, P1)` | `read(T2, P2)` | Yes (if P1≠P2) | Different pages, read-read |
 | `read(T1, P1)` | `read(T2, P1)` | Yes | Read-read, same page (MVCC snapshots) |
 | `read(T1, P1)` | `write(T2, P1)` | **No** | Write changes what T1 might see |
-| `write(T1, P1)` | `write(T2, P2)` | Yes (if P1≠P2) | Different pages, no interaction |
+| `write(T1, P1)` | `write(T2, P2)` | Conditional | Different data pages alone do not exclude shared allocation, structural or SSI dependencies |
 | `write(T1, P1)` | `write(T2, P1)` | **No** | Same-page conflict |
-| `commit(T1)` | `commit(T2)` | **No** | Serialized through coordinator |
+| `commit(T1)` | `commit(T2)` | **No** | Shared validation and publication order |
 | `begin(T1)` | `begin(T2)` | **No** | Snapshot capture is ordering-dependent |
 
-**Foata normal form** organizes events into layers of mutually independent actions, providing a canonical representative for each trace class. Combined with **DPOR** (Dynamic Partial Order Reduction), which prunes equivalent schedules during exploration, this achieves exhaustive coverage of all behaviorally distinct interleavings without the combinatorial explosion of naive enumeration.
+Foata normal form groups independent actions. DPOR can reduce redundant
+schedules, but the remaining space can still grow exponentially. A runtime
+claim must record bounds, enabledness/commutativity assumptions, completed
+exploration and the mapping from model actions to actual engine behavior.
 
 **Result:** For a 3-transaction MVCC scenario, naive enumeration might explore thousands of interleavings. Mazurkiewicz traces + DPOR reduce this to dozens of truly distinct schedules — each verified against all seven MVCC invariants. This is how FrankenSQLite achieves confidence in its concurrency model that random testing cannot provide.
 
@@ -2379,7 +2400,10 @@ numeric claim about this implementation.
 
 ### Sheaf-Theoretic Consistency Checking
 
-In multi-process and distributed settings, pairwise consistency checks miss subtle anomalies where no two nodes disagree, but the global state is inconsistent. FrankenSQLite uses a **sheaf-theoretic consistency model** where each transaction's local view is a "section" over its read set, and the sheaf condition requires overlapping sections to agree.
+The sheaf component models each transaction's local view as a section over its
+read set. Its current `check_sheaf_consistency` checks overlapping synthetic
+sections against supplied observations/version chains. This is a model-level
+consistency check, not a serializability proof for actual multi-process SQL.
 
 ```
 Formalism:
@@ -2397,9 +2421,12 @@ Formalism:
         but cannot be glued into a single global section.
 ```
 
-**Why sheaves?** Pairwise comparisons can't detect "phantom global commits" — situations where no single pair of transactions disagrees, but the collective set of observations is impossible under any serial execution order. The sheaf condition catches these by checking whether all local views can be consistently glued together.
-
-**Result:** This is used in the conformance harness (`fsqlite-harness`) to verify that multi-process MVCC produces results consistent with some serial execution order — even when the anomaly would be invisible to any pairwise comparison.
+The broader gluing model remains a research goal. The existing sheaf/conformal
+E2E test constructs synthetic sections and arithmetic task signatures; it does
+not open database Connections. Actual SQL history is checked separately by
+`fsqlite-harness::serializability_oracle` and the file-backed concurrency
+keepers. Neither model output nor a successful task schedule can replace their
+observed storage, transaction, publication and stock-oracle evidence.
 
 ### Conformal Calibration (Design Target, Not a Current Release Gate)
 
@@ -2411,15 +2438,16 @@ prediction** for distribution-free confidence intervals.
 Nonconformity score:
     R_t = |observed_t - predicted_t|
 
-Threshold (finite-sample guarantee):
-    q = quantile_{(1-α)(n+1)/n}(R_1, ..., R_n)
+Threshold (exchangeable calibration and test scores, fixed scoring procedure):
+    k = ceil((n+1)(1-α))
+    q = kth ordered calibration score, or +infinity when k > n
 
 Coverage guarantee:
-    P(R_{n+1} ≤ q) ≥ 1 - α    for ANY distribution
+    P(R_{n+1} ≤ q) ≥ 1 - α    under those exchangeability conditions
 
-    No normality assumption. No parametric model.
-    Works for heavy-tailed latency distributions, bimodal throughput,
-    or any other pathological distribution real databases produce.
+    No normality assumption; heavy tails are allowed.
+    Arbitrary drift or temporal dependence does not satisfy the assumptions
+    merely because calibration is described as distribution-free.
 ```
 
 This is a proposed calibration design, not a local acceptance margin. The
@@ -2669,6 +2697,10 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 
 ### Phase-Specific Gates (Selected)
 
+These are target acceptance criteria, not a list of achieved results. Each
+numeric target needs its own dated, source-bound execution or benchmark before
+it can support a capability or performance claim.
+
 **Phase 3 (Trees and Parsing):**
 - B-tree proptest: 10,000-operation random sequence → all invariants hold
 - B-tree cursor iteration after random ops matches `BTreeMap` reference
@@ -2707,7 +2739,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | **R1: SSI abort rate too high** (Page-SSI is conservative, may false-positive) | High | Measure the current page-granular rate on the release matrix; refine SIREAD keys to page ranges if needed; evaluate the dormant intent-replay ladder only with repository benchmark evidence. PostgreSQL's row-granular results are prior art, not an estimate for this engine. |
 | **R2: RaptorQ overhead dominates CPU** | Medium | Symbol sizing policy per object type; cache decoded objects aggressively via ARC; profile/tune encoder/decoder hot paths |
 | **R3: Append-only storage grows without bound** | Medium | Checkpoint/compaction and enforced admission/retention budgets are required. Prune using protected snapshot.high in CommitSeq order; the horizon alone does not bound memory or storage growth. |
-| **R4: Bootstrap chicken-and-egg** (need index to find symbols, need symbols to build index) | Low | Symbol records are self-describing (header + OTI); one tiny mutable root pointer per database; rebuild-from-scan always possible as fallback |
+| **R4: Bootstrap chicken-and-egg** (need index to find symbols, need symbols to build index) | Low | Self-describing symbols and a root pointer permit scan recovery only with sufficient supported, authenticated records. Missing rank, metadata, keys or an unsupported layout must fail explicitly; full durable native bootstrap remains in progress. |
 | **R5: Multi-process MVCC coordination is complex** | High | Shared-memory coordination protocol fully specified; lease-based TxnSlot cleanup handles process crashes; validate in-process first (Phase 6), cross-process follows (Phase 7) |
 | **R6: File format compatibility vs innovation** | Medium | Compatibility runtime stays on standard SQLite files; Native/ECS work is an innovation layer pursued alongside parity harnesses and explicit status tracking |
 | **R7: Mergeable writes become a correctness minefield** | High | Strict merge safety ladder (Section above); proptest invariants + DPOR tests; start with deterministic rebase for small op subset, expand guided by benchmarks |
@@ -2980,7 +3012,11 @@ and the corresponding scope document is `docs/canonical_parity_contract.md`.
 A: The current runtime uses epoch-based reclamation rather than a periodic sweep. Commit-time version maintenance prunes unreachable versions, and retired arena slots are batch-freed only after all pinned readers have advanced past the retire epoch, keeping reclamation incremental without a background GC loop.
 
 **Q: What prevents a long-running reader from causing unbounded memory growth?**
-A: A reader that holds a snapshot open for a long time pins all page versions newer than its snapshot, preventing GC from reclaiming them. This is the same tradeoff PostgreSQL makes. In practice, connection timeouts and application-level query deadlines prevent runaway memory growth.
+A: A long-lived protected snapshot retains its floor version and newer history.
+Application-enforced transaction lifetime, bounded write admission and timely
+reclamation are needed to control growth. A query deadline alone does not end
+an idle transaction. Public active/idle lifetime enforcement remains tracked by
+`bd-6hdwo.19/.20`; no engine-wide memory bound is claimed from timeout settings.
 
 **Q: What is SSI and why does it matter?**
 A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: a transaction that would become a dangerous rw-antidependency pivot is aborted. PostgreSQL's SSI work is prior art, but its measured overhead is not evidence for FrankenSQLite; this implementation's cost is covered by the release matrix. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.

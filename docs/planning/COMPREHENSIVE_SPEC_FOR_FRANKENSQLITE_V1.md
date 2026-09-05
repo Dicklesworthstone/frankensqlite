@@ -19,6 +19,13 @@ needed to build the system is here. It supersedes and consolidates:
 Those documents remain in the repository for reference but this document is
 the source of truth. Where they conflict, this document wins.
 
+This is a target specification, not an execution receipt. The September 5,
+2026 source reconciliation in bd-6hdwo.3/.4 distinguishes current compatibility
+runtime behavior from native ECS, coordinator, reclamation-policy and merge
+integration still in progress. Pseudocode and conditional mathematical models
+remain implementation obligations; their presence does not prove a live path.
+`AGENTS.md` governs operation, including the default concurrent-writer policy.
+
 **Audience:** AI coding agents, human reviewers, and any collaborator who needs
 the full picture of what FrankenSQLite is, why it exists, and exactly how to
 build it.
@@ -3998,10 +4005,12 @@ at the end of a test.
 - **INV-6 (Commit Atomicity)**: Committed transaction's pages all become visible
 - **INV-7 (Serialized Mode Exclusivity)**: At most one serialized writer active at any time
 
-If an e-process detects a violation, it provides a **proof certificate** that
-the invariant was violated, including the exact sequence of operations that
-caused it. This is not a test that passes or fails -- it's a continuously
-running formal monitor.
+An e-process supplies statistical evidence against its declared null model.
+It does not itself provide a formal counterexample or prove that instrumentation
+observes every runtime event. Preserve the actual violating trace separately.
+Every observed hard correctness violation MUST fail immediately, independently
+of the statistical threshold; continuous integration of these monitors remains
+an implementation obligation.
 
 **Formal definition of an e-process:**
 
@@ -4012,9 +4021,9 @@ to a filtration `(F_t)` such that:
 2. `E_t >= 0` for all `t` (non-negative)
 3. `E[E_t | F_{t-1}] <= E_{t-1}` (supermartingale under the null hypothesis H_0)
 
-The null hypothesis H_0 asserts that the invariant holds (violation probability
-is at most `p_0`, typically 0.001). Each observation `X_t` is binary: 1 if a
-violation is detected, 0 otherwise.
+The statistical null bounds `E[X_t | F_{t-1}] <= p_0` given the full past.
+Each observation is binary. A positive p_0 is a monitoring-model tolerance,
+not permission for a known hard correctness violation.
 
 **Key property (Ville's inequality):** For any stopping time `tau` and
 significance level `alpha`:
@@ -4035,14 +4044,18 @@ E_t = E_{t-1} * (1 + lambda * (X_t - p_0))
 ```
 
 where:
-- `lambda` is the bet size, constrained to `(-1/(1-p_0), 1/p_0)` for non-negativity
+- `lambda` is predictable from the past and satisfies `0 <= lambda <= 1/p_0`
+  for this upper-tail null with `0 < p_0 < 1`
 - `X_t` is the observation (1 = violation, 0 = no violation)
 - `p_0` is the null hypothesis violation rate (e.g., 0.001)
 
-Under H_0, `E[X_t] = p_0`, so `E[E_t | E_{t-1}] = E_{t-1}` (martingale).
-Under the alternative H_1 (actual violation rate `p_1 > p_0`), the e-process
-grows exponentially at rate `KL(p_1 || p_0)` per observation, where KL is the
-Kullback-Leibler divergence.
+Under H_0, the conditional expected multiplier is at most one; equality gives
+a martingale. A marginal mean does not establish this guarantee. For iid
+Bernoulli observations of rate p_1 and fixed admissible lambda, the expected
+log increment is
+`p_1 log(1+lambda*(1-p_0)) + (1-p_1) log(1-lambda*p_0)`.
+It equals `KL(p_1 || p_0)` only at the corresponding optimal bet. Detection
+delay needs the actual bet, positive drift, boundary and overshoot assumptions.
 
 **Alien-artifact upgrade (recommended): Mixture e-processes (no hand-tuned λ)**
 
@@ -4115,17 +4128,13 @@ use asupersync::lab::oracle::eprocess::{EProcess, EProcessConfig};
 ///
 /// CALIBRATION NOTE (Alien-Artifact Discipline):
 /// Each invariant has qualitatively different violation characteristics.
-/// Using identical (p0, lambda, alpha) for all is wrong:
-///   - INV-1 (monotonicity) is enforced by AtomicU64 fetch_add. A violation
-///     implies a hardware fault. p0 should be ~10^-15.
-///   - INV-SSI-FP (false positive rate) has an EXPECTED baseline of ~0.5-5%.
-///     p0 = 0.001 would trigger false alarms constantly.
+/// A hardware atomic does not exclude overflow or identity-publication bugs.
+/// Hard correctness invariants fail immediately on observed violation; an SSI
+/// false-positive rate is a separate workload-dependent statistical quantity.
 ///
-/// Per-invariant power analysis: for a monitor with p0 and lambda, the
-/// expected detection delay (observations to reject H0) when the true
-/// violation rate is p1 is:
-///   N_detect ≈ log(1/alpha) / KL(p1 || p0)
-/// where KL is the Kullback-Leibler divergence.
+/// For a fixed bet, a log-boundary divided by positive expected log drift is
+/// only a delay heuristic under a stated arrival model. KL is the optimal-bet
+/// drift, not the drift of every configuration below.
 fn create_mvcc_monitors() -> Vec<EProcess> {
     vec![
         // INV-1: Monotonicity. Enforced by hardware atomics; any violation is a
@@ -4215,6 +4224,7 @@ fn observe_lock_exclusivity(
 // In the test loop, after each operation:
 let violated = observe_lock_exclusivity(&lock_table, &active_transactions);
 inv2_eprocess.observe(violated);
+assert!(!violated, "observed hard INV-2 violation; preserve the causal trace");
 if inv2_eprocess.rejected {
     panic!(
         "INV-2 violated: e-value {} >= threshold {} after {} observations",
@@ -4225,30 +4235,32 @@ if inv2_eprocess.rejected {
 }
 ```
 
-After 1000 operations with no violations, `E_1000 ~ 1.0` (fluctuates around 1
-due to the martingale property). If a bug causes even a single violation, the
-e-value jumps by a factor of `(1 + lambda * (1 - p_0))`. For INV-2's actual
+After n consecutive non-violations with a fixed bet,
+`E_n = (1-lambda*p_0)^n`; it decreases deterministically on that path.
+A violation multiplies it by `(1 + lambda * (1 - p_0))`. For the proposed INV-2
 config (lambda=0.999, p_0=1e-9, alpha=1e-6), this is approximately `2.0`,
-and the rejection threshold is `1/alpha = 1,000,000`. Each violation roughly
-doubles the e-value; ~20 violations (log2(10^6) ≈ 20) are sufficient to
-cross the threshold, even intermixed with millions of non-violations.
-(Pedagogical shorthand: with lambda=0.5, p_0=0.001, alpha=0.05, the jump
-would be ~1.5 with threshold 20 -- but those are not the actual INV-2 params.)
+and the rejection threshold is `1/alpha = 1,000,000`. The complete product,
+including intervening non-violation factors, determines threshold crossing;
+there is no unconditional count-of-violations bound. A direct observed INV-2
+failure aborts the test immediately rather than waiting for this threshold.
 
 ### 4.4 Mazurkiewicz Trace Monoid -- Systematic Interleaving
 
-Standard concurrency testing relies on random interleaving, which may miss
-rare but critical orderings. Asupersync's Mazurkiewicz trace implementation
-systematically explores ALL distinct interleavings (up to commutativity of
-independent operations).
+Random interleaving can miss rare orderings. Mazurkiewicz equivalence and DPOR
+can reduce a bounded model's schedule space when the independence relation
+preserves enabledness and observable behavior. A library's presence does not
+establish complete exploration or a sound mapping to the live engine.
 
 **For MVCC:** Given a scenario with N transactions each performing M operations,
-the trace monoid enumerates all non-equivalent orderings and verifies that:
+the intended completed exploration checks each non-equivalent ordering for:
 - Snapshot isolation holds for every ordering
 - First-committer-wins correctly identifies conflicts
 - GC never reclaims a version needed by an active transaction
 
-This provides exhaustive coverage that random testing cannot match.
+An exhaustive claim must identify finite bounds, action semantics, conservative
+independence, search completion and runtime correspondence. Distinct page IDs
+alone do not establish independence when actions share allocator, structural,
+publication or SSI metadata. Remaining schedules may still grow exponentially.
 
 **Formal definition:**
 
@@ -5772,10 +5784,10 @@ record is durably published (post-fsync). The engine MAY cache the current
 high-water `CommitSeq` in an `AtomicU64` for snapshot capture, but it MUST
 never get ahead of the durable publication point.
 
-*Violation consequence:* If TxnIds are reused or non-monotone, snapshot
-visibility becomes undefined. A transaction could see a "future" version as
-old, or fail to see a committed version. This leads to phantom reads, lost
-updates, and corrupted query results.
+*Violation consequence:* Reused transaction identities can alias lock ownership
+or SSI metadata. Incorrect CommitSeq ordering/publication can expose future
+versions or hide committed ones. These are separate invariants; TxnId is not
+the snapshot visibility clock.
 
 ---
 
@@ -14617,17 +14629,23 @@ ROLLBACK [TRANSACTION] TO [SAVEPOINT] savepoint-name;
 ```
 
 **Transaction modes:**
-- `DEFERRED` (default): No locks acquired until first read/write.
+- Plain `BEGIN` defaults to `CONCURRENT`, unless the caller explicitly disables
+  `fsqlite.concurrent_mode` (§2.4).
+- Explicit `DEFERRED`: Serialized-writer admission is deferred until a write.
 - `IMMEDIATE`: Acquires a RESERVED lock immediately (blocks other writers).
 - `EXCLUSIVE`: Acquires an EXCLUSIVE lock immediately (blocks readers too,
   in rollback journal mode; equivalent to IMMEDIATE in WAL mode).
 - `CONCURRENT`: FrankenSQLite extension. Enters MVCC concurrent writer mode
-  with Snapshot Isolation. Multiple CONCURRENT transactions can write
+  with SSI validation enabled by default; explicit `fsqlite.serializable = OFF`
+  selects plain Snapshot Isolation. Multiple CONCURRENT transactions can write
   simultaneously to different pages. Conflict on the same page results in
-  `SQLITE_BUSY_SNAPSHOT` for the second committer.
+  `SQLITE_BUSY` at page acquisition or `SQLITE_BUSY_SNAPSHOT` at stale-snapshot
+  commit validation, depending on when the conflict is observed.
 
-**Savepoints** form a stack. `RELEASE X` commits all work since `SAVEPOINT X`
-and removes X and all more recent savepoints from the stack. `ROLLBACK TO X`
+**Savepoints** form a stack. `RELEASE X` merges its work into the enclosing
+transaction and removes X and more recent savepoints. It performs a transaction
+commit only when releasing the outermost savepoint that opened that transaction.
+`ROLLBACK TO X`
 undoes all work since `SAVEPOINT X` but leaves X on the stack (allowing
 further work within the same savepoint scope).
 

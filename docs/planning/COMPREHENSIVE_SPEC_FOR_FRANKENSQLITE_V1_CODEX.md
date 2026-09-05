@@ -16,6 +16,12 @@ This document is intentionally **self-contained**: it includes the goals, constr
 
 If this file conflicts with `AGENTS.md`, `Cargo.toml`, `rust-toolchain.toml`, or `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`, treat those as authoritative and update this file to match.
 
+This companion describes the complete target, not proof that every component
+is connected. As reconciled on 2026-09-05 (bd-6hdwo.3/.4), the public runtime
+uses compatibility storage; native durable ECS, coordinator, replication and
+policy integration remain partly implemented. Preserve those obligations while
+requiring source-bound execution for each claim of working integration.
+
 ---
 
 ## Table of Contents
@@ -1570,7 +1576,8 @@ CacheKey = (pgno, version_tag)
 Where `version_tag` is:
 
 - `CommittedTip` for the newest committed version
-- or a `CommitSeq`/`TxnId`-derived tag for a historical version needed by an active snapshot
+- or the committed `CommitSeq` for a historical version needed by a protected
+  snapshot; a begin-order TxnId cannot substitute for commit visibility order
 
 Policy:
 
