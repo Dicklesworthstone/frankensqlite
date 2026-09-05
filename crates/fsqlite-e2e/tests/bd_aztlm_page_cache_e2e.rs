@@ -16,6 +16,14 @@
 //! | Q6 | concurrent_reads              | 8 threads reading same cache simultaneously           |
 //! | Q7 | e2e_insert_10k_oracle         | 10K row INSERT, verify cache serves correct pages     |
 //! | Q8 | e2e_concurrent_writers        | 4 concurrent writers, verify no data loss             |
+//! | Q9 | cache_budget_live_effect     | SQL cache settings change real residency and evictions |
+//! | Q10 | cache_budget_prepared       | Prepared setters and actual page-size conversion       |
+//! | Q11 | cache_budget_transactions   | Oversized write transactions commit and roll back      |
+//! | Q12 | cache_budget_connections    | Independent budgets, overlapping transactions, close   |
+//! | Q13 | cache_budget_schemas        | ATTACH and TEMP settings stay isolated                 |
+//! | Q14 | cache_budget_default_reopen | Header-backed defaults take effect and survive reopen  |
+//! | Q15 | cache_budget_readonly       | Failed header writes still change the runtime budget   |
+//! | Q16 | cache_budget_default_abort  | Main and ATTACH rollback restore only persisted defaults |
 //!
 //! ## Run
 //!
@@ -680,5 +688,804 @@ fn q8_e2e_concurrent_writers() {
             c_count, expected,
             "[Q8] csqlite verification: expected {expected}, got {c_count}"
         );
+    });
+}
+
+// bd-dwjnq.2: these keepers use the public SQL facade and real file-backed
+// pages. The budget is clean cache residency, not transaction staging, free
+// pool buffers, returned SQL rows, TEMP storage, or a process-memory ceiling.
+const CACHE_BUDGET_SELECT: &str = "SELECT id, payload FROM cache_budget ORDER BY id";
+type CacheBudgetRows = Vec<(i64, String)>;
+
+struct CacheBudgetRun {
+    test: &'static str,
+    run_id: String,
+    revision: String,
+}
+
+impl CacheBudgetRun {
+    fn new(test: &'static str) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map_or_else(
+                || {
+                    std::env::var("FSQLITE_TEST_SOURCE_REVISION")
+                        .unwrap_or_else(|_| "unavailable; see verifier source manifest".to_owned())
+                },
+                |value| value.trim().to_owned(),
+            );
+        Self {
+            test,
+            run_id: format!("bd-dwjnq.2-{}-{timestamp}-{test}", std::process::id()),
+            revision,
+        }
+    }
+
+    fn record(&self, phase: &str, conn: &fsqlite::Connection, data: serde_json::Value) {
+        let stats = conn.memory_stats().unwrap();
+        let peak = conn.page_cache_peak_snapshot().unwrap();
+        eprintln!(
+            "PAGE_CACHE_E2E:{}",
+            json!({
+                "bead_id": "bd-dwjnq.2",
+                "run_id": self.run_id,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                "test": self.test,
+                "phase": phase,
+                "event_type": "cache_budget_observation",
+                "source_revision": self.revision,
+                "source_note": "working-tree tests; verifier must also record source diff",
+                "platform": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "sqlite_oracle_version": rusqlite::version(),
+                "replay_command": REPLAY_CMD,
+                "page_size_bytes": stats.page_size_bytes,
+                "cache_page_budget": stats.page_cache.cache_page_budget,
+                "cached_pages": stats.page_cache.cached_pages,
+                "resident_bytes": stats.page_cache_used_bytes(),
+                "buffer_pool_capacity": stats.page_cache.pool_capacity,
+                "evictions": stats.page_cache.evictions,
+                "admits": stats.page_cache.admits,
+                "hits": stats.page_cache.hits,
+                "misses": stats.page_cache.misses,
+                "dirty_ratio_pct": stats.page_cache.dirty_ratio_pct,
+                "peak_cached_pages": peak.peak_cached_pages,
+                "peak_exact": peak.exact,
+                "data": data,
+            })
+        );
+    }
+
+    fn assert_quiescent_budget(&self, phase: &str, conn: &fsqlite::Connection, pages: usize) {
+        self.record(phase, conn, json!({"expected_budget_pages": pages}));
+        let stats = conn.memory_stats().unwrap();
+        assert!(
+            stats.page_cache.cached_pages <= pages,
+            "{phase}: completed operation retained {} pages with budget {pages}",
+            stats.page_cache.cached_pages
+        );
+        assert_eq!(stats.page_cache.cache_page_budget, pages, "{phase}");
+        assert!(stats.page_cache_used_bytes() <= pages.saturating_mul(stats.page_size_bytes));
+    }
+}
+
+fn cache_budget_oracle_rows(path: &std::path::Path) -> CacheBudgetRows {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.prepare(CACHE_BUDGET_SELECT)
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn seed_cache_budget_database(path: &std::path::Path, page_size: usize) -> CacheBudgetRows {
+    let mut conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA page_size={page_size};\
+         CREATE TABLE cache_budget(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);"
+    ))
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    for id in 1_i64..=64 {
+        let payload = format!("{id:04}:{}", "p".repeat(page_size / 2));
+        tx.execute(
+            "INSERT INTO cache_budget VALUES (?1, ?2)",
+            rusqlite::params![id, payload],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let actual_page_size: usize = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let page_count: usize = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(actual_page_size, page_size);
+    assert!(page_count > 8, "fixture must exceed the test budget");
+    conn.close().unwrap();
+    cache_budget_oracle_rows(path)
+}
+
+async fn cache_budget_integer(conn: &fsqlite::Connection, sql: &str) -> i64 {
+    let rows = conn.query(sql).await.unwrap();
+    assert_eq!(rows.len(), 1, "{sql}");
+    match rows[0].values() {
+        [fsqlite_types::value::SqliteValue::Integer(value)] => *value,
+        other => panic!("{sql}: expected one integer, got {other:?}"),
+    }
+}
+
+async fn cache_budget_assert_rows(
+    conn: &fsqlite::Connection,
+    sql: &str,
+    expected: &[(i64, String)],
+) {
+    use fsqlite_types::value::SqliteValue;
+    let rows = conn.query(sql).await.unwrap();
+    let actual: CacheBudgetRows = rows
+        .iter()
+        .map(|row| match row.values() {
+            [SqliteValue::Integer(id), SqliteValue::Text(payload)] => (*id, payload.to_string()),
+            other => panic!("{sql}: unexpected row {other:?}"),
+        })
+        .collect();
+    assert_eq!(actual.as_slice(), expected, "{sql}");
+}
+
+fn cache_budget_pages(setting: i64, actual_page_size: usize) -> usize {
+    if setting < 0 {
+        usize::try_from(setting.unsigned_abs() * 1024 / u64::try_from(actual_page_size).unwrap())
+            .unwrap()
+    } else {
+        usize::try_from(setting).unwrap()
+    }
+}
+
+#[test]
+fn q9_cache_budget_live_effect() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q9_cache_budget_live_effect");
+        let dir = tempfile::tempdir().unwrap();
+        for page_size in [4096, 8192] {
+            let path = dir.path().join(format!("budget-{page_size}.db"));
+            let expected = seed_cache_budget_database(&path, page_size);
+            let conn = fsqlite::Connection::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            let default_setting: i64 = oracle
+                .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(conn.memory_stats().unwrap().page_size_bytes, page_size);
+            run.assert_quiescent_budget(
+                "bootstrap_default",
+                &conn,
+                cache_budget_pages(default_setting, page_size),
+            );
+            for requested in [
+                "8",
+                "-32",
+                "0",
+                "2147483647",
+                "2147483648",
+                "-2147483648",
+                "-2147483649",
+                "9223372036854775807",
+                "-9223372036854775808",
+                "9223372036854775808",
+                "1e3",
+                "'123abc'",
+                "abc",
+            ] {
+                conn.execute("PRAGMA cache_size=256").await.unwrap();
+                cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+                let before = conn.memory_stats().unwrap();
+                run.record("warmed", &conn, json!({"next_setting": requested}));
+                assert!(
+                    before.page_cache.cached_pages > 8,
+                    "warm-up must create eviction work"
+                );
+                let setter = format!("PRAGMA cache_size={requested}");
+                oracle.execute_batch(&setter).unwrap();
+                let normalized: i64 = oracle
+                    .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                    .unwrap();
+                let budget = cache_budget_pages(normalized, page_size);
+                conn.execute(&setter).await.unwrap();
+                assert_eq!(
+                    cache_budget_integer(&conn, "PRAGMA cache_size").await,
+                    normalized
+                );
+                run.assert_quiescent_budget("after_setter", &conn, budget);
+                let after = conn.memory_stats().unwrap();
+                assert_eq!(
+                    after.page_cache.pool_capacity,
+                    before.page_cache.pool_capacity
+                );
+                if budget < before.page_cache.cached_pages {
+                    assert!(after.page_cache.evictions > before.page_cache.evictions);
+                }
+                conn.reset_page_cache_peak_residency().unwrap();
+                cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+                run.assert_quiescent_budget("after_full_scan", &conn, budget);
+            }
+            conn.close().await.unwrap();
+            assert_eq!(cache_budget_oracle_rows(&path), expected);
+        }
+    });
+}
+
+#[test]
+fn q10_cache_budget_prepared_and_actual_page_size() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q10_cache_budget_prepared_and_actual_page_size");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prepared.db");
+        let expected = seed_cache_budget_database(&path, 8192);
+        let conn = fsqlite::Connection::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        conn.execute("PRAGMA cache_size=256").await.unwrap();
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+        let before = conn.memory_stats().unwrap();
+        assert!(before.page_cache.cached_pages > 8);
+        {
+            let setter = conn.prepare("PRAGMA cache_size=8").await.unwrap();
+            setter.execute().await.unwrap();
+        }
+        run.assert_quiescent_budget("prepared_setter", &conn, 8);
+        assert!(conn.memory_stats().unwrap().page_cache.evictions > before.page_cache.evictions);
+        assert_eq!(cache_budget_integer(&conn, "PRAGMA cache_size").await, 8);
+
+        // Requesting a different page size on an existing file does not change
+        // its physical page size without rebuilding it. KiB uses the real pager.
+        conn.execute("PRAGMA page_size=4096").await.unwrap();
+        assert_eq!(conn.memory_stats().unwrap().page_size_bytes, 8192);
+        conn.execute("PRAGMA cache_size=-32").await.unwrap();
+        run.assert_quiescent_budget("negative_uses_actual_page_size", &conn, 4);
+        conn.execute("PRAGMA page_size=16384").await.unwrap();
+        run.assert_quiescent_budget("converted_page_count_stays_frozen", &conn, 4);
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+        run.assert_quiescent_budget("prepared_scan", &conn, 4);
+        conn.close().await.unwrap();
+        assert_eq!(cache_budget_oracle_rows(&path), expected);
+    });
+}
+
+#[test]
+fn q11_cache_budget_oversized_transactions() {
+    asupersync::test_utils::run_test(|| async {
+        use fsqlite_types::value::SqliteValue;
+        let run = CacheBudgetRun::new("q11_cache_budget_oversized_transactions");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transactions.db");
+        let initial = seed_cache_budget_database(&path, 4096);
+        let mut committed: CacheBudgetRows = initial
+            .iter()
+            .map(|(id, text)| (*id, format!("{text}:committed")))
+            .collect();
+        let conn = fsqlite::Connection::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        conn.execute("PRAGMA cache_size=256").await.unwrap();
+        conn.execute("BEGIN").await.unwrap();
+        let updated = conn
+            .execute("UPDATE cache_budget SET payload=payload || ':committed'")
+            .await
+            .unwrap();
+        assert_eq!(updated, initial.len());
+        let mut inserted = 0;
+        for (id, payload) in &initial {
+            let new_id = id + 100;
+            inserted += conn
+                .execute_with_params(
+                    "INSERT INTO cache_budget VALUES (?1, ?2)",
+                    &[
+                        SqliteValue::Integer(new_id),
+                        SqliteValue::Text(payload.clone().into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            committed.push((new_id, payload.clone()));
+        }
+        assert_eq!(inserted, initial.len());
+        conn.execute("PRAGMA cache_size=8").await.unwrap();
+        run.record(
+            "dirty_transaction_shrink",
+            &conn,
+            json!({"updated_rows": updated, "inserted_rows": inserted}),
+        );
+        conn.execute("COMMIT").await.unwrap();
+        run.assert_quiescent_budget("after_commit", &conn, 8);
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &committed).await;
+        run.assert_quiescent_budget("committed_scan", &conn, 8);
+
+        conn.execute("PRAGMA cache_size=256").await.unwrap();
+        conn.execute("BEGIN").await.unwrap();
+        let updated = conn
+            .execute("UPDATE cache_budget SET payload=payload || ':must-not-survive'")
+            .await
+            .unwrap();
+        let deleted = conn
+            .execute("DELETE FROM cache_budget WHERE id <= 16")
+            .await
+            .unwrap();
+        assert_eq!(updated, committed.len());
+        assert_eq!(deleted, 16);
+        conn.execute("PRAGMA cache_size=0").await.unwrap();
+        run.record(
+            "dirty_transaction_zero",
+            &conn,
+            json!({"updated_rows": updated, "deleted_rows": deleted}),
+        );
+        conn.execute("ROLLBACK").await.unwrap();
+        run.assert_quiescent_budget("after_rollback", &conn, 0);
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &committed).await;
+        run.assert_quiescent_budget("rolled_back_scan", &conn, 0);
+        conn.close().await.unwrap();
+        assert_eq!(cache_budget_oracle_rows(&path), committed);
+
+        let reopened = fsqlite::Connection::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            cache_budget_integer(&reopened, "PRAGMA cache_size").await,
+            -2000
+        );
+        run.assert_quiescent_budget("connection_setting_did_not_persist", &reopened, 500);
+        cache_budget_assert_rows(&reopened, CACHE_BUDGET_SELECT, &committed).await;
+        reopened.close().await.unwrap();
+    });
+}
+
+#[test]
+fn q12_cache_budget_independent_connections_and_close_orders() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q12_cache_budget_independent_connections_and_close_orders");
+        let dir = tempfile::tempdir().unwrap();
+        for close_small_first in [true, false] {
+            let path = dir
+                .path()
+                .join(format!("connections-{close_small_first}.db"));
+            let initial = seed_cache_budget_database(&path, 4096);
+            let mut committed = initial.clone();
+            committed.last_mut().unwrap().1.push_str(":writer");
+            let small = fsqlite::Connection::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            let large = fsqlite::Connection::open(path.to_str().unwrap())
+                .await
+                .unwrap();
+            small.execute("PRAGMA cache_size=8").await.unwrap();
+            large.execute("PRAGMA cache_size=128").await.unwrap();
+            cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &initial).await;
+            cache_budget_assert_rows(&large, CACHE_BUDGET_SELECT, &initial).await;
+            run.assert_quiescent_budget("small_before_overlap", &small, 8);
+            run.assert_quiescent_budget("large_before_overlap", &large, 128);
+            assert!(large.memory_stats().unwrap().page_cache.cached_pages > 8);
+
+            // The transactions really overlap. No serialized-mode opt-out,
+            // retry loop, or synthetic cache stands in for the public SQL path.
+            small.execute("BEGIN").await.unwrap();
+            cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &initial).await;
+            large.execute("BEGIN").await.unwrap();
+            large
+                .execute("UPDATE cache_budget SET payload=payload || ':writer' WHERE id=64")
+                .await
+                .unwrap();
+            large.execute("COMMIT").await.unwrap();
+            cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &initial).await;
+            run.record(
+                "reader_snapshot_after_writer_commit",
+                &small,
+                json!({"close_small_first": close_small_first}),
+            );
+            small.execute("ROLLBACK").await.unwrap();
+            cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &committed).await;
+            cache_budget_assert_rows(&large, CACHE_BUDGET_SELECT, &committed).await;
+            run.assert_quiescent_budget("small_after_overlap", &small, 8);
+            run.assert_quiescent_budget("large_after_overlap", &large, 128);
+            assert_eq!(cache_budget_integer(&small, "PRAGMA cache_size").await, 8);
+            assert_eq!(cache_budget_integer(&large, "PRAGMA cache_size").await, 128);
+
+            if close_small_first {
+                small.close().await.unwrap();
+                cache_budget_assert_rows(&large, CACHE_BUDGET_SELECT, &committed).await;
+                run.assert_quiescent_budget("small_closed_first", &large, 128);
+                assert!(large.memory_stats().unwrap().page_cache.cached_pages > 8);
+                large.close().await.unwrap();
+            } else {
+                large.close().await.unwrap();
+                cache_budget_assert_rows(&small, CACHE_BUDGET_SELECT, &committed).await;
+                run.assert_quiescent_budget("large_closed_first", &small, 8);
+                small.close().await.unwrap();
+            }
+            assert_eq!(cache_budget_oracle_rows(&path), committed);
+        }
+    });
+}
+
+#[test]
+fn q13_cache_budget_attach_and_temp_isolation() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q13_cache_budget_attach_and_temp_isolation");
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let aux_path = dir.path().join("aux.db");
+        let main_rows = seed_cache_budget_database(&main_path, 4096);
+        let aux_rows = seed_cache_budget_database(&aux_path, 8192);
+        let conn = fsqlite::Connection::open(main_path.to_str().unwrap())
+            .await
+            .unwrap();
+        conn.execute(&format!(
+            "ATTACH DATABASE '{}' AS aux",
+            aux_path.to_str().unwrap().replace('\'', "''")
+        ))
+        .await
+        .unwrap();
+        conn.execute("PRAGMA main.cache_size=16").await.unwrap();
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &main_rows).await;
+        conn.execute("PRAGMA aux.cache_size=-32").await.unwrap();
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA aux.page_size").await,
+            8192
+        );
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA aux.cache_size").await,
+            -32
+        );
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA main.cache_size").await,
+            16
+        );
+        run.assert_quiescent_budget("attached_setter_main_unchanged", &conn, 16);
+        cache_budget_assert_rows(
+            &conn,
+            "SELECT id, payload FROM aux.cache_budget ORDER BY id",
+            &aux_rows,
+        )
+        .await;
+
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA temp.cache_size").await,
+            0
+        );
+        conn.execute("CREATE TEMP TABLE temp_rows(id INTEGER PRIMARY KEY, payload TEXT)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO temp_rows VALUES (1, 'temporary'), (2, 'still here')")
+            .await
+            .unwrap();
+        conn.execute("PRAGMA temp.cache_size=1").await.unwrap();
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA temp.cache_size").await,
+            1
+        );
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA main.cache_size").await,
+            16
+        );
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA aux.cache_size").await,
+            -32
+        );
+        run.assert_quiescent_budget("temp_setter_main_unchanged", &conn, 16);
+        conn.execute("PRAGMA main.cache_size=8").await.unwrap();
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA temp.cache_size").await,
+            1
+        );
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA aux.cache_size").await,
+            -32
+        );
+        cache_budget_assert_rows(
+            &conn,
+            "SELECT id, payload FROM temp_rows ORDER BY id",
+            &[(1, "temporary".to_owned()), (2, "still here".to_owned())],
+        )
+        .await;
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &main_rows).await;
+        run.assert_quiescent_budget("all_schema_rows_preserved", &conn, 8);
+        conn.execute("DETACH DATABASE aux").await.unwrap();
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &main_rows).await;
+        run.assert_quiescent_budget("after_detach", &conn, 8);
+        conn.close().await.unwrap();
+        assert_eq!(cache_budget_oracle_rows(&main_path), main_rows);
+        assert_eq!(cache_budget_oracle_rows(&aux_path), aux_rows);
+    });
+}
+
+#[test]
+fn q14_cache_budget_default_survives_reopen() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q14_cache_budget_default_survives_reopen");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("default.db");
+        let expected = seed_cache_budget_database(&path, 4096);
+        let conn = fsqlite::Connection::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let numeric_oracle = rusqlite::Connection::open_in_memory().unwrap();
+        for requested in [
+            "-2147483648",
+            "'123abc'",
+            "1e3",
+            "9223372036854775808",
+            "abc",
+        ] {
+            let setter = format!("PRAGMA default_cache_size={requested}");
+            numeric_oracle.execute_batch(&setter).unwrap();
+            let runtime: i64 = numeric_oracle
+                .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap();
+            let persisted: i64 = numeric_oracle
+                .query_row("PRAGMA default_cache_size", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(&setter).await.unwrap();
+            assert_eq!(
+                cache_budget_integer(&conn, "PRAGMA cache_size").await,
+                runtime
+            );
+            assert_eq!(
+                cache_budget_integer(&conn, "PRAGMA default_cache_size").await,
+                persisted
+            );
+            run.record(
+                "default_numeric_oracle",
+                &conn,
+                json!({
+                    "requested": requested, "runtime": runtime, "persisted": persisted,
+                }),
+            );
+            cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+            run.assert_quiescent_budget(
+                "default_numeric_scan",
+                &conn,
+                cache_budget_pages(runtime, 4096),
+            );
+        }
+        numeric_oracle.close().unwrap();
+        conn.execute("PRAGMA cache_size=256").await.unwrap();
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+        let before = conn.memory_stats().unwrap();
+        assert!(before.page_cache.cached_pages > 8);
+        conn.execute("PRAGMA default_cache_size=-8").await.unwrap();
+        assert_eq!(
+            cache_budget_integer(&conn, "PRAGMA default_cache_size").await,
+            8
+        );
+        assert_eq!(cache_budget_integer(&conn, "PRAGMA cache_size").await, 8);
+        run.assert_quiescent_budget("default_applies_to_live_pager", &conn, 8);
+        assert!(conn.memory_stats().unwrap().page_cache.evictions > before.page_cache.evictions);
+        cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+        run.assert_quiescent_budget("default_scan", &conn, 8);
+        conn.close().await.unwrap();
+
+        let oracle = rusqlite::Connection::open(&path).unwrap();
+        let stock_default: i64 = oracle
+            .query_row("PRAGMA default_cache_size", [], |r| r.get(0))
+            .unwrap();
+        let stock_current: i64 = oracle
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stock_default, 8);
+        assert_eq!(stock_current, 8);
+        oracle.close().unwrap();
+        let reopened = fsqlite::Connection::open(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            cache_budget_integer(&reopened, "PRAGMA cache_size").await,
+            stock_current
+        );
+        assert_eq!(
+            cache_budget_integer(&reopened, "PRAGMA default_cache_size").await,
+            stock_default
+        );
+        run.assert_quiescent_budget("persisted_default_bootstrap", &reopened, 8);
+        cache_budget_assert_rows(&reopened, CACHE_BUDGET_SELECT, &expected).await;
+        run.assert_quiescent_budget("persisted_default_scan", &reopened, 8);
+        reopened.close().await.unwrap();
+        assert_eq!(cache_budget_oracle_rows(&path), expected);
+    });
+}
+
+#[test]
+fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
+    asupersync::test_utils::run_test(|| async {
+        let run =
+            CacheBudgetRun::new("q15_cache_budget_readonly_header_failure_keeps_runtime_change");
+        let dir = tempfile::tempdir().unwrap();
+        for readonly_file in [false, true] {
+            let path = dir.path().join(format!("readonly-{readonly_file}.db"));
+            let oracle_path = dir
+                .path()
+                .join(format!("oracle-readonly-{readonly_file}.db"));
+            let expected = seed_cache_budget_database(&path, 4096);
+            assert_eq!(seed_cache_budget_database(&oracle_path, 4096), expected);
+            let conn = if readonly_file {
+                fsqlite::Connection::open_schema_only(path.to_str().unwrap())
+                    .await
+                    .unwrap()
+            } else {
+                fsqlite::Connection::open(path.to_str().unwrap())
+                    .await
+                    .unwrap()
+            };
+            let oracle = if readonly_file {
+                rusqlite::Connection::open_with_flags(
+                    &oracle_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap()
+            } else {
+                rusqlite::Connection::open(&oracle_path).unwrap()
+            };
+            conn.execute("PRAGMA cache_size=8").await.unwrap();
+            oracle.execute_batch("PRAGMA cache_size=8").unwrap();
+            if !readonly_file {
+                conn.execute("PRAGMA query_only=ON").await.unwrap();
+                oracle.execute_batch("PRAGMA query_only=ON").unwrap();
+            }
+            let original_default: i64 = oracle
+                .query_row("PRAGMA default_cache_size", [], |r| r.get(0))
+                .unwrap();
+            let stock_error = oracle
+                .execute_batch("PRAGMA default_cache_size=32")
+                .unwrap_err();
+            assert_eq!(
+                stock_error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ReadOnly)
+            );
+            let actual_error = conn
+                .execute("PRAGMA default_cache_size=32")
+                .await
+                .unwrap_err();
+            run.record(
+                "readonly_header_error",
+                &conn,
+                json!({
+                    "readonly_file": readonly_file,
+                    "stock_error": stock_error.to_string(),
+                    "actual_error": actual_error.to_string(),
+                }),
+            );
+            assert!(matches!(
+                actual_error,
+                fsqlite_error::FrankenError::ReadOnly
+            ));
+            let stock_runtime: i64 = oracle
+                .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stock_runtime, 32);
+            assert_eq!(
+                cache_budget_integer(&conn, "PRAGMA cache_size").await,
+                stock_runtime
+            );
+            assert_eq!(
+                cache_budget_integer(&conn, "PRAGMA default_cache_size").await,
+                original_default
+            );
+            assert_eq!(
+                oracle
+                    .query_row("PRAGMA default_cache_size", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                original_default
+            );
+            cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
+            run.assert_quiescent_budget("readonly_runtime_budget_really_grew", &conn, 32);
+            assert!(conn.memory_stats().unwrap().page_cache.cached_pages > 8);
+            conn.close().await.unwrap();
+            oracle.close().unwrap();
+            assert_eq!(cache_budget_oracle_rows(&path), expected);
+        }
+    });
+}
+
+#[test]
+fn q16_cache_budget_rollback_restores_header_not_runtime() {
+    asupersync::test_utils::run_test(|| async {
+        let run = CacheBudgetRun::new("q16_cache_budget_rollback_restores_header_not_runtime");
+        let dir = tempfile::tempdir().unwrap();
+        for schema in ["main", "aux"] {
+            let main_path = dir.path().join(format!("rollback-{schema}.db"));
+            let oracle_main = dir.path().join(format!("oracle-rollback-{schema}.db"));
+            let expected = seed_cache_budget_database(&main_path, 4096);
+            assert_eq!(seed_cache_budget_database(&oracle_main, 4096), expected);
+            let conn = fsqlite::Connection::open(main_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let oracle = rusqlite::Connection::open(&oracle_main).unwrap();
+            let affected_path = if schema == "aux" {
+                let aux = dir.path().join("rollback-aux-child.db");
+                let oracle_aux = dir.path().join("oracle-rollback-aux-child.db");
+                assert_eq!(seed_cache_budget_database(&aux, 4096), expected);
+                assert_eq!(seed_cache_budget_database(&oracle_aux, 4096), expected);
+                conn.execute(&format!(
+                    "ATTACH '{}' AS aux",
+                    aux.to_str().unwrap().replace('\'', "''")
+                ))
+                .await
+                .unwrap();
+                oracle
+                    .execute("ATTACH ?1 AS aux", [oracle_aux.to_str().unwrap()])
+                    .unwrap();
+                aux
+            } else {
+                main_path.clone()
+            };
+            let runtime_query = format!("PRAGMA {schema}.cache_size");
+            let default_query = format!("PRAGMA {schema}.default_cache_size");
+            let original_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
+            conn.execute("PRAGMA main.cache_size=8").await.unwrap();
+            let setup = format!("PRAGMA {schema}.cache_size=8");
+            conn.execute(&setup).await.unwrap();
+            oracle.execute_batch(&setup).unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            oracle.execute_batch("BEGIN").unwrap();
+            let setter = format!("PRAGMA {schema}.default_cache_size=32");
+            conn.execute(&setter).await.unwrap();
+            oracle.execute_batch(&setter).unwrap();
+            assert_eq!(cache_budget_integer(&conn, &default_query).await, 32);
+            conn.execute("ROLLBACK").await.unwrap();
+            oracle.execute_batch("ROLLBACK").unwrap();
+            let stock_runtime: i64 = oracle.query_row(&runtime_query, [], |r| r.get(0)).unwrap();
+            let stock_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
+            assert_eq!(stock_runtime, 32);
+            assert_eq!(stock_default, original_default);
+            assert_eq!(
+                cache_budget_integer(&conn, &runtime_query).await,
+                stock_runtime
+            );
+            assert_eq!(
+                cache_budget_integer(&conn, &default_query).await,
+                stock_default
+            );
+            cache_budget_assert_rows(
+                &conn,
+                &format!("SELECT id, payload FROM {schema}.cache_budget ORDER BY id"),
+                &expected,
+            )
+            .await;
+            run.record(
+                "default_header_rolled_back",
+                &conn,
+                json!({
+                    "schema": schema, "runtime_setting": stock_runtime,
+                    "restored_default": stock_default,
+                }),
+            );
+            run.assert_quiescent_budget(
+                "after_default_rollback",
+                &conn,
+                if schema == "main" { 32 } else { 8 },
+            );
+            conn.close().await.unwrap();
+            oracle.close().unwrap();
+            let reopened = rusqlite::Connection::open(&affected_path).unwrap();
+            assert_eq!(
+                reopened
+                    .query_row("PRAGMA default_cache_size", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                original_default
+            );
+            reopened.close().unwrap();
+            assert_eq!(cache_budget_oracle_rows(&affected_path), expected);
+        }
     });
 }

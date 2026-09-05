@@ -293,6 +293,10 @@ pub(crate) struct HeightTracked<T> {
 
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
+    // Cache PRAGMAs interpret numeric token spelling, not the decoded number.
+    // Only from_sql can retain that spelling; caller-built token streams have
+    // already lost e.g. the distinction between 1e3 and 1000.0.
+    pragma_source_sql: Option<String>,
     pub(crate) pos: usize,
     pub(crate) errors: Vec<ParseError>,
     pub(crate) depth: u32,
@@ -329,6 +333,7 @@ impl Parser {
         }
         Self {
             tokens,
+            pragma_source_sql: None,
             pos: 0,
             errors: Vec::new(),
             depth: 0,
@@ -374,7 +379,20 @@ impl Parser {
 
     #[must_use]
     pub fn from_sql(sql: &str) -> Self {
-        Self::new(Lexer::tokenize(sql))
+        let mut parser = Self::new(Lexer::tokenize(sql));
+        parser.preserve_pragma_source(sql);
+        parser
+    }
+
+    fn preserve_pragma_source(&mut self, sql: &str) {
+        // Ordinary SQL does not need a second copy of its source text.
+        if self
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::KwPragma)
+        {
+            self.pragma_source_sql = Some(sql.to_owned());
+        }
     }
 
     pub fn parse_all(&mut self) -> (Vec<Statement>, Vec<ParseError>) {
@@ -2601,7 +2619,43 @@ impl Parser {
         Ok(Statement::Attach(AttachStatement { expr, schema }))
     }
 
-    fn parse_pragma_value_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_pragma_value_expr(
+        &mut self,
+        preserve_numeric_spelling: bool,
+    ) -> Result<Expr, ParseError> {
+        if preserve_numeric_spelling && let Some(sql) = &self.pragma_source_sql {
+            let signed = matches!(self.peek(), TokenKind::Plus | TokenKind::Minus);
+            let offset = usize::from(signed);
+            if matches!(
+                self.peek_nth(offset),
+                TokenKind::Integer(_) | TokenKind::OversizedInt(_) | TokenKind::Float(_)
+            ) {
+                let token = &self.tokens[self.pos + offset];
+                let raw = &sql[token.span.start as usize..token.span.end as usize];
+                if raw.contains('_') {
+                    let mut error = ParseError::at(
+                        "numeric separators are not valid PRAGMA arguments",
+                        Some(token),
+                    );
+                    error.kind = ParseErrorKind::UnexpectedToken;
+                    return Err(error);
+                }
+                // SQLite's plus_num grammar drops unary '+', but its minus_num
+                // grammar prepends '-'. Whitespace/comments between sign and
+                // number are not part of the numeric argument.
+                let value = if matches!(self.peek(), TokenKind::Minus) {
+                    format!("-{raw}")
+                } else {
+                    raw.to_owned()
+                };
+                let span = Span::new(self.current_span().start, token.span.end);
+                if signed {
+                    self.advance();
+                }
+                self.advance();
+                return Ok(Expr::Literal(Literal::String(value), span));
+            }
+        }
         // SQLite allows ON/OFF for many boolean pragmas. Treat `ON` as `TRUE`
         // in PRAGMA value position (OFF is tokenized as an identifier, so the
         // regular expression parser handles it).
@@ -2633,10 +2687,14 @@ impl Parser {
     fn parse_pragma(&mut self) -> Result<Statement, ParseError> {
         self.expect_kw(&TokenKind::KwPragma)?;
         let name = self.parse_qualified_name()?;
+        let preserve_numeric_spelling = name.name.eq_ignore_ascii_case("cache_size")
+            || name.name.eq_ignore_ascii_case("default_cache_size");
         let value = if self.eat(&TokenKind::Eq) || self.eat(&TokenKind::EqEq) {
-            Some(PragmaValue::Assign(self.parse_pragma_value_expr()?))
+            Some(PragmaValue::Assign(
+                self.parse_pragma_value_expr(preserve_numeric_spelling)?,
+            ))
         } else if self.eat(&TokenKind::LeftParen) {
-            let v = self.parse_pragma_value_expr()?;
+            let v = self.parse_pragma_value_expr(preserve_numeric_spelling)?;
             self.expect_token(&TokenKind::RightParen)?;
             Some(PragmaValue::Call(v))
         } else {
@@ -2818,11 +2876,13 @@ fn parse_statements_with_scratch_inner(
     Lexer::tokenize_into_with_interner(sql, &mut scratch.tokens, &mut scratch.identifier_interner);
     let mut parser = Parser {
         tokens: std::mem::take(&mut scratch.tokens),
+        pragma_source_sql: None,
         pos: 0,
         errors: std::mem::take(&mut scratch.errors),
         depth: 0,
         has_with: false,
     };
+    parser.preserve_pragma_source(sql);
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
     scratch.tokens.clear();
@@ -5117,6 +5177,72 @@ mod tests {
     fn pragma() {
         let stmt = parse_one("PRAGMA journal_mode = WAL");
         assert!(matches!(stmt, Statement::Pragma(_)));
+    }
+
+    #[test]
+    fn pragma_cache_size_preserves_numeric_spelling_across_sql_entrypoints() {
+        fn argument(statement: Statement) -> String {
+            let Statement::Pragma(pragma) = statement else {
+                panic!("expected PRAGMA");
+            };
+            let Some(
+                PragmaValue::Assign(Expr::Literal(Literal::String(value), _))
+                | PragmaValue::Call(Expr::Literal(Literal::String(value), _)),
+            ) = pragma.value
+            else {
+                panic!("expected preserved cache argument: {pragma:?}");
+            };
+            value
+        }
+
+        let mut scratch = StatementParseScratch::default();
+        for (sql, expected) in [
+            ("PRAGMA cache_size=1e3", "1e3"),
+            ("PRAGMA main.cache_size=-1E-3", "-1E-3"),
+            ("PRAGMA temp.CACHE_SIZE(+ /* sign */ 0x10)", "0x10"),
+            ("PRAGMA aux.default_cache_size=- 0x10", "-0x10"),
+            (
+                "PRAGMA cache_size=9223372036854775808",
+                "9223372036854775808",
+            ),
+            (
+                "PRAGMA cache_size=-9223372036854775809",
+                "-9223372036854775809",
+            ),
+            ("PRAGMA cache_size='123abc'", "123abc"),
+        ] {
+            assert_eq!(argument(parse_one(sql)), expected, "ordinary: {sql}");
+            let mut statements = parse_statements_with_scratch(sql, &mut scratch).expect(sql);
+            assert_eq!(statements.len(), 1, "scratch: {sql}");
+            assert_eq!(argument(statements.remove(0)), expected, "scratch: {sql}");
+            let (statement, tail) = parse_first_statement_with_tail(sql).expect(sql).expect(sql);
+            assert_eq!(tail, sql.len(), "tail: {sql}");
+            assert_eq!(argument(statement), expected, "tail: {sql}");
+        }
+    }
+
+    #[test]
+    fn pragma_cache_size_numeric_spelling_does_not_change_other_parsing() {
+        let Statement::Pragma(pragma) = parse_one("PRAGMA busy_timeout=1e3") else {
+            panic!("expected PRAGMA");
+        };
+        assert!(matches!(pragma.value,
+            Some(PragmaValue::Assign(Expr::Literal(Literal::Float(value), _))) if value == 1000.0
+        ));
+
+        // Public token-only callers cannot recover text the lexer discarded.
+        let mut parser = Parser::new(Lexer::tokenize("PRAGMA cache_size=1e3"));
+        let Statement::Pragma(pragma) = parser.parse_statement().expect("token-only parse") else {
+            panic!("expected PRAGMA");
+        };
+        assert!(matches!(pragma.value,
+            Some(PragmaValue::Assign(Expr::Literal(Literal::Float(value), _))) if value == 1000.0
+        ));
+
+        for sql in ["PRAGMA cache_size=1_0", "PRAGMA default_cache_size=0x1_0"] {
+            assert!(parse_first_statement_with_tail(sql).is_err(), "{sql}");
+        }
+        assert!(Parser::from_sql("SELECT 1e3").pragma_source_sql.is_none());
     }
 
     #[test]

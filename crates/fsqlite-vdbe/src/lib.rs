@@ -1554,6 +1554,9 @@ pub mod pragma {
         pub synchronous: String,
         /// Page cache size (negative = KiB, positive = pages).
         pub cache_size: i64,
+        /// TEMP schema's independent suggestion. TEMP rows currently live in
+        /// MemDatabase, so this must never resize the main pager's cache.
+        pub temp_cache_size: i64,
         /// Page size in bytes (512..=65536, power of two).
         pub page_size: u32,
         /// Busy timeout in milliseconds for lock contention.
@@ -1581,6 +1584,8 @@ pub mod pragma {
         /// reports the compiled default (`-2000`). Stock stores `abs(N)` as a
         /// page count (legacy `sqlite3AbsInt32`); loaded from the header at open.
         pub default_cache_size: i64,
+        /// TEMP schema's connection-local default, with no main-header write.
+        pub temp_default_cache_size: i64,
         /// Foreign key enforcement toggle (`PRAGMA foreign_keys`).
         pub foreign_keys: bool,
         /// Recursive trigger toggle (`PRAGMA recursive_triggers`).
@@ -1646,6 +1651,7 @@ pub mod pragma {
                 journal_mode: "wal".to_owned(),
                 synchronous: "NORMAL".to_owned(),
                 cache_size: -2000,
+                temp_cache_size: 0,
                 page_size: 4096,
                 busy_timeout_ms: 5000,
                 temp_store: 0,
@@ -1656,6 +1662,7 @@ pub mod pragma {
                 user_version: 0,
                 application_id: 0,
                 default_cache_size: 0,
+                temp_default_cache_size: 0,
                 foreign_keys: false,
                 recursive_triggers: false,
                 query_only: false,
@@ -1735,7 +1742,7 @@ pub mod pragma {
             return apply_synchronous(state, stmt);
         }
         if name.eq_ignore_ascii_case("cache_size") {
-            return apply_cache_size(state, stmt);
+            return Ok(apply_cache_size(state, stmt));
         }
         if name.eq_ignore_ascii_case("page_size") {
             return apply_page_size(state, stmt);
@@ -1768,7 +1775,7 @@ pub mod pragma {
             return apply_application_id(state, stmt);
         }
         if name.eq_ignore_ascii_case("default_cache_size") {
-            return apply_default_cache_size(state, stmt);
+            return Ok(apply_default_cache_size(state, stmt));
         }
         if name.eq_ignore_ascii_case("foreign_keys") {
             return apply_foreign_keys(state, stmt);
@@ -2111,18 +2118,81 @@ pub mod pragma {
         }
     }
 
-    fn apply_cache_size(
-        state: &mut ConnectionPragmaState,
-        stmt: &PragmaStatement,
-    ) -> Result<PragmaOutput> {
+    fn apply_cache_size(state: &mut ConnectionPragmaState, stmt: &PragmaStatement) -> PragmaOutput {
+        let cache_size = if stmt
+            .name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+        {
+            &mut state.temp_cache_size
+        } else {
+            &mut state.cache_size
+        };
         match &stmt.value {
-            None => Ok(PragmaOutput::Int(state.cache_size)),
+            None => PragmaOutput::Int(*cache_size),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let val = parse_integer_expr(expr)?;
-                state.cache_size = val;
-                Ok(PragmaOutput::Int(val))
+                let val = i64::from(parse_cache_pragma_int32(expr));
+                *cache_size = val;
+                PragmaOutput::Int(val)
             }
         }
+    }
+
+    /// Cache PRAGMAs use SQLite's integer-prefix conversion, including zero
+    /// for overflow/non-numeric input. Source parsing retains numeric lexemes
+    /// as strings; an AST constructed directly has only its numeric value.
+    fn cache_pragma_argument_text(expr: &Expr) -> String {
+        match expr {
+            Expr::Literal(Literal::String(value), _) => value.clone(),
+            Expr::Literal(Literal::Integer(value), _) => value.to_string(),
+            Expr::Literal(Literal::Float(value), _) => value.to_string(),
+            Expr::Column(column, _) => column.column.to_string(),
+            Expr::UnaryOp {
+                op: UnaryOp::Plus,
+                expr,
+                ..
+            } => cache_pragma_argument_text(expr),
+            Expr::UnaryOp {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => {
+                format!("-{}", cache_pragma_argument_text(expr))
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn parse_cache_pragma_int32(expr: &Expr) -> i32 {
+        let text = cache_pragma_argument_text(expr);
+        // A sign selects decimal parsing even when followed by "0x". Do not
+        // trim leading whitespace; trailing non-digits terminate the prefix.
+        let (negative, digits, radix) = if let Some(digits) = text.strip_prefix('-') {
+            (true, digits, 10_i64)
+        } else if let Some(digits) = text.strip_prefix('+') {
+            (false, digits, 10)
+        } else if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (false, digits, 16)
+        } else {
+            (false, text.as_str(), 10)
+        };
+        let limit = i64::from(i32::MAX) + i64::from(negative);
+        let mut value = 0_i64;
+        for byte in digits.bytes() {
+            let digit = match byte {
+                b'0'..=b'9' => i64::from(byte - b'0'),
+                b'a'..=b'f' if radix == 16 => i64::from(byte - b'a') + 10,
+                b'A'..=b'F' if radix == 16 => i64::from(byte - b'A') + 10,
+                _ => break,
+            };
+            // value <= 2^31 before multiplication, so this cannot overflow i64.
+            value = value * radix + digit;
+            if value > limit {
+                return 0;
+            }
+        }
+        i32::try_from(if negative { -value } else { value }).unwrap_or(0)
     }
 
     fn apply_page_size(
@@ -2156,7 +2226,8 @@ pub mod pragma {
     /// artifact that must not be matched byte-for-byte), so the negative form
     /// differs from stock by that constant — the *algebra* is what conforms
     /// (GH #275 / bd-uaxab).
-    fn cache_pages_from_size(cache_size: i64, page_size: u32) -> i64 {
+    #[must_use]
+    pub fn cache_pages_from_size(cache_size: i64, page_size: u32) -> i64 {
         if cache_size >= 0 {
             cache_size
         } else {
@@ -2327,16 +2398,35 @@ pub mod pragma {
     fn apply_default_cache_size(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
-    ) -> Result<PragmaOutput> {
+    ) -> PragmaOutput {
+        let (default_cache_size, cache_size) = if stmt
+            .name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"))
+        {
+            (
+                &mut state.temp_default_cache_size,
+                &mut state.temp_cache_size,
+            )
+        } else {
+            (&mut state.default_cache_size, &mut state.cache_size)
+        };
         // Header 0 ("unset") is reported to the caller as the compiled default.
-        let report = |stored: i64| if stored == 0 { -2000 } else { stored };
+        let report = |stored: i64| {
+            if stored == 0 {
+                -2000
+            } else {
+                stored.saturating_abs()
+            }
+        };
         match &stmt.value {
-            None => Ok(PragmaOutput::Int(report(state.default_cache_size))),
+            None => PragmaOutput::Int(report(*default_cache_size)),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let stored = parse_integer_expr(expr)?.saturating_abs();
-                state.default_cache_size = stored;
-                state.cache_size = stored;
-                Ok(PragmaOutput::Int(report(stored)))
+                let stored = i64::from(parse_cache_pragma_int32(expr).saturating_abs());
+                *default_cache_size = stored;
+                *cache_size = stored;
+                PragmaOutput::Int(report(stored))
             }
         }
     }
@@ -3708,6 +3798,119 @@ mod tests {
     fn apply_sql(state: &mut pragma::ConnectionPragmaState, sql: &str) -> pragma::PragmaOutput {
         let stmt = parse_pragma(sql).expect("parse pragma");
         pragma::apply_connection_pragma(state, &stmt).expect("apply pragma")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_connection_pragma_cache_size_numeric_oracle() {
+        use pragma::PragmaOutput::Int;
+
+        let oracle = rusqlite::Connection::open_in_memory().expect("SQLite oracle");
+        oracle
+            .execute_batch("CREATE TEMP TABLE cache_argument_probe(x);")
+            .expect("TEMP schema");
+        let mut state = pragma::ConnectionPragmaState::default();
+        for schema in ["main", "temp"] {
+            for name in ["cache_size", "default_cache_size"] {
+                for value in [
+                    "0",
+                    "8",
+                    "-8",
+                    "2147483647",
+                    "2147483648",
+                    "-2147483648",
+                    "-2147483649",
+                    "9223372036854775808",
+                    "-9223372036854775809",
+                    "'123abc'",
+                    "'123_45'",
+                    "'123.45'",
+                    "'123e3'",
+                    "' 123'",
+                    "'\t123'",
+                    "'123 '",
+                    "'+123abc'",
+                    "'-123abc'",
+                    "'--123'",
+                    "'0x10'",
+                    "'-0x10'",
+                    "'+0x10'",
+                    "0x10",
+                    "+0x10",
+                    "-0x10",
+                    "0x7fffffff",
+                    "0x80000000",
+                    "0xffffffff",
+                    "0x100000000",
+                    "'0x0000000010g'",
+                    "'0xg'",
+                    "'0x8000000000000000'",
+                    "'00000000000000000000001'",
+                    "'2147483648x'",
+                    "'-2147483648x'",
+                    "'2147483647x'",
+                    "1.5",
+                    "1e3",
+                    "1E-3",
+                    "+ 1.9",
+                    "- 1.9",
+                    ".5",
+                    "-.5",
+                    "abc",
+                    "TRUE",
+                    "FALSE",
+                    "ON",
+                    "OFF",
+                ] {
+                    let sql = format!("PRAGMA {schema}.{name}={value}");
+                    oracle.execute_batch(&sql).expect(&sql);
+                    let expected: i64 = oracle
+                        .query_row(&format!("PRAGMA {schema}.{name}"), [], |row| row.get(0))
+                        .expect("oracle readback");
+                    assert_eq!(apply_sql(&mut state, &sql), Int(expected), "{sql}");
+                    for observed_schema in ["main", "temp"] {
+                        let query = format!("PRAGMA {observed_schema}.cache_size");
+                        let expected: i64 = oracle
+                            .query_row(&query, [], |row| row.get(0))
+                            .expect("oracle effective request");
+                        assert_eq!(
+                            apply_sql(&mut state, &query),
+                            Int(expected),
+                            "{sql}: {query}"
+                        );
+                    }
+                    eprintln!(
+                        "bead_id=bd-dwjnq.2 event=cache_argument_oracle sqlite={} sql={sql:?} readback={expected}",
+                        rusqlite::version()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_connection_pragma_default_cache_size_signed_header_readback() {
+        use pragma::PragmaOutput::Int;
+
+        for (stored, expected) in [(0, -2000), (-32, 32), (i64::from(i32::MIN), 2_147_483_648)] {
+            let mut state = pragma::ConnectionPragmaState {
+                default_cache_size: stored,
+                temp_default_cache_size: stored,
+                ..pragma::ConnectionPragmaState::default()
+            };
+            assert_eq!(
+                apply_sql(&mut state, "PRAGMA main.default_cache_size"),
+                Int(expected)
+            );
+            assert_eq!(
+                apply_sql(&mut state, "PRAGMA temp.default_cache_size"),
+                Int(expected)
+            );
+            assert_eq!(
+                state.default_cache_size, stored,
+                "readback must not rewrite the header"
+            );
+        }
     }
 
     #[test]

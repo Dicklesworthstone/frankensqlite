@@ -3481,7 +3481,9 @@ impl ConnectionMemoryStats {
             .saturating_mul(self.page_size_bytes)
     }
 
-    /// Page-cache capacity bytes (`pool_capacity * page_size_bytes`).
+    /// Hard buffer-pool capacity bytes, including transaction staging buffers.
+    /// The PRAGMA cache_size residency suggestion is reported separately by
+    /// `page_cache.cache_page_budget`.
     #[must_use]
     pub const fn page_cache_capacity_bytes(self) -> usize {
         self.page_cache
@@ -4629,6 +4631,18 @@ impl PagerBackend {
             Self::Unix(p) => p.cache_metrics_snapshot(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_metrics_snapshot(),
+        }
+    }
+
+    fn set_cache_page_budget(&self, page_budget: usize) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.set_cache_page_budget(page_budget),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.set_cache_page_budget(page_budget),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.set_cache_page_budget(page_budget),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.set_cache_page_budget(page_budget),
         }
     }
 
@@ -14045,6 +14059,7 @@ impl Connection {
             conn.register_cache_pages_module();
             conn.bootstrap_journal_mode_from_storage(false).await?;
             conn.bootstrap_pragma_state_from_storage();
+            conn.apply_cache_size_to_pager(conn.pragma_state.borrow().cache_size)?;
             if writable {
                 conn.apply_current_journal_mode_to_pager().await?;
             } else {
@@ -14054,6 +14069,7 @@ impl Connection {
             // Explicitly load schema only — never hydrate row data.
             conn.reload_memdb_from_pager_with_mode(&op_cx, false)
                 .await?;
+            conn.bootstrap_cache_size_from_storage()?;
             conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
             conn.sync_change_tracking_context();
             conn.attach_connection_pool_metrics();
@@ -14581,6 +14597,7 @@ impl Connection {
             conn.bootstrap_journal_mode_from_storage(storage_was_empty)
                 .await?;
             conn.bootstrap_pragma_state_from_storage();
+            conn.apply_cache_size_to_pager(conn.pragma_state.borrow().cache_size)?;
             conn.apply_current_journal_mode_to_pager().await?;
             conn.apply_current_synchronous_to_pager()?;
             // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
@@ -14591,6 +14608,7 @@ impl Connection {
             if !pager_is_memory || !storage_was_empty {
                 conn.reload_memdb_from_pager(&op_cx).await?;
             }
+            conn.bootstrap_cache_size_from_storage()?;
             conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
             conn.sync_change_tracking_context();
             conn.attach_connection_pool_metrics();
@@ -19473,6 +19491,18 @@ impl Connection {
                     if pragma_attached_scope_is_global(&pragma.name.name) {
                         return Ok(None);
                     }
+                    let writes_cache_header = pragma.name.name.eq_ignore_ascii_case("default_cache_size")
+                        && pragma.value.is_some();
+                    let cache_header_write_forbidden = writes_cache_header
+                        && self.pragma_state.borrow().query_only;
+                    if writes_cache_header
+                        && !cache_header_write_forbidden
+                        && self.in_transaction.get()
+                    {
+                        // Its header write belongs to the outer transaction;
+                        // its runtime cache suggestion survives a rollback.
+                        self.ensure_attached_child_transaction(&target_schema).await?;
+                    }
                     let mut rewritten = pragma.clone();
                     rewritten.name.schema = pragma
                         .name
@@ -19487,6 +19517,16 @@ impl Connection {
                         });
                     let mut rows = self
                         .with_attached_connection_async(&target_schema, async |conn| {
+                            if cache_header_write_forbidden {
+                                // query_only belongs to the outer connection.
+                                // Like stock, accept the child cache suggestion
+                                // even though its persistent write is refused.
+                                let mut next_state = conn.pragma_state.borrow().clone();
+                                fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, &rewritten)?;
+                                conn.apply_cache_size_to_pager(next_state.cache_size)?;
+                                conn.pragma_state.borrow_mut().cache_size = next_state.cache_size;
+                                return Err(FrankenError::ReadOnly);
+                            }
                             conn.execute_statement(&Statement::Pragma(rewritten), params)
                                 .await
                         })
@@ -24114,6 +24154,37 @@ impl Connection {
     fn bootstrap_pragma_state_from_storage(&self) {
         let mut pragma = self.pragma_state.borrow_mut();
         pragma.page_size = self.pager.page_size().get();
+    }
+
+    /// Resolve the disk-cache suggestion once, using the live pager's page
+    /// size. Later PRAGMA page_size requests must not reinterpret a previously
+    /// assigned KiB budget, nor change the transaction buffer-pool ceiling.
+    fn apply_cache_size_to_pager(&self, cache_size: i64) -> Result<()> {
+        let pages = fsqlite_vdbe::pragma::cache_pages_from_size(
+            cache_size,
+            self.pager.page_size().get(),
+        );
+        let pages = usize::try_from(pages).map_err(|_| FrankenError::OutOfRange {
+            what: "cache_size page budget".to_owned(),
+            value: pages.to_string(),
+        })?;
+        self.pager.set_cache_page_budget(pages)
+    }
+
+    /// Called only at open, after the header has been read. Ordinary schema
+    /// reloads preserve this connection's later PRAGMA cache_size assignments.
+    fn bootstrap_cache_size_from_storage(&self) -> Result<()> {
+        let cache_size = {
+            let mut state = self.pragma_state.borrow_mut();
+            if state.default_cache_size != 0 {
+                state.cache_size = state
+                    .default_cache_size
+                    .saturating_abs()
+                    .min(i64::from(i32::MAX));
+            }
+            state.cache_size
+        };
+        self.apply_cache_size_to_pager(cache_size)
     }
 
     /// Register or clear sqlite3_trace_v2-compatible callbacks.
@@ -73229,6 +73300,55 @@ impl Connection {
         let result_columns = pragma_result_columns(pragma);
         // First try connection-level knobs (journal_mode, synchronous, etc.).
         let pragma_name = pragma.name.name.to_ascii_lowercase();
+        if matches!(pragma_name.as_str(), "cache_size" | "default_cache_size") {
+            let mut next_state = self.pragma_state.borrow().clone();
+            let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
+            let is_temp = pragma_schema_scope(pragma) == PragmaSchemaScope::Temp;
+            let is_default = pragma_name == "default_cache_size";
+            if pragma.value.is_some() && !is_temp {
+                // Resize before publishing the accepted runtime suggestion.
+                // SQLite keeps this connection-local setting even if a
+                // default_cache_size header write later fails or rolls back.
+                self.apply_cache_size_to_pager(next_state.cache_size)?;
+                self.pragma_state.borrow_mut().cache_size = next_state.cache_size;
+                if is_default {
+                    // The parser has normalized this to a nonnegative i32.
+                    // A failed write preserves the old header-backed default.
+                    if self.pragma_state.borrow().query_only {
+                        return Err(FrankenError::ReadOnly);
+                    }
+                    let stored = i32::try_from(next_state.default_cache_size).map_err(|_| {
+                        FrankenError::OutOfRange {
+                            what: "default_cache_size".to_owned(),
+                            value: next_state.default_cache_size.to_string(),
+                        }
+                    })?;
+                    self.update_database_header_metadata(None, None, None, Some(stored), None)
+                        .await?;
+                }
+            }
+            if pragma.value.is_some() {
+                let mut state = self.pragma_state.borrow_mut();
+                if is_temp {
+                    // TEMP rows live in MemDatabase, with no main-file header
+                    // or pager cache. Keep the suggestion schema-local.
+                    state.temp_cache_size = next_state.temp_cache_size;
+                    state.temp_default_cache_size = next_state.temp_default_cache_size;
+                } else {
+                    state.cache_size = next_state.cache_size;
+                    state.default_cache_size = next_state.default_cache_size;
+                }
+            }
+            return if result_columns.is_empty() {
+                Ok(Vec::new())
+            } else if let fsqlite_vdbe::pragma::PragmaOutput::Int(value) = output {
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(value)],
+                }])
+            } else {
+                Err(FrankenError::internal("cache-size pragma returned a non-integer"))
+            };
+        }
         let maybe_prior_journal_mode = if pragma_name == "journal_mode" && pragma.value.is_some() {
             Some(self.pragma_state.borrow().journal_mode.clone())
         } else {
@@ -73380,22 +73500,6 @@ impl Connection {
                         )
                         .await?;
                     }
-                }
-                "default_cache_size" => {
-                    // bd-n7eih (GH#354): persist the header-backed default cache
-                    // size (abs(N), stashed by apply_default_cache_size) into
-                    // header bytes 48..52 so an explicit set survives reopen.
-                    let default_cache_size = self.pragma_state.borrow().default_cache_size;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let default_cache_size = default_cache_size as i32;
-                    self.update_database_header_metadata(
-                        None,
-                        None,
-                        None,
-                        Some(default_cache_size),
-                        None,
-                    )
-                    .await?;
                 }
                 "schema_version" => {
                     let raw = parse_pragma_nonnegative_usize(pragma_value, "schema_version")?;

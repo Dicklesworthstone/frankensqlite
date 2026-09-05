@@ -115,6 +115,8 @@ pub struct PageCacheLightweightSnapshot {
     pub evictions: u64,
     pub cached_pages: usize,
     pub pool_capacity: usize,
+    /// Requested resident-page target, independent of the buffer-pool ceiling.
+    pub cache_page_budget: usize,
 }
 
 impl PageCacheLightweightSnapshot {
@@ -209,6 +211,9 @@ pub struct PageCacheMetricsSnapshot {
     pub cached_pages: usize,
     /// Configured buffer-pool capacity (max page buffers).
     pub pool_capacity: usize,
+    /// Requested resident-page target. Dirty pages and active read flights
+    /// may temporarily prevent convergence; this is not a total-memory cap.
+    pub cache_page_budget: usize,
     /// Percent of cached pages currently dirty (0-100).
     pub dirty_ratio_pct: u64,
     /// Adaptive cache "recent" list size (ARC-compatible gauge).
@@ -1174,6 +1179,7 @@ impl PageCache {
             evictions: self.evictions.get(),
             cached_pages,
             pool_capacity: self.pool.capacity(),
+            cache_page_budget: self.pool.capacity(),
             // The legacy non-sharded cache still stores raw `PageBuf`s, so it
             // does not expose per-page dirty state yet.
             dirty_ratio_pct: 0,
@@ -2543,6 +2549,7 @@ impl InFlightReadLeader<'_> {
         self.flight.completed.store(true, Ordering::Release);
         self.flight.notify.notify_waiters();
         self.finished = true;
+        self.cache.trim_to_page_budget();
     }
 }
 
@@ -2579,6 +2586,9 @@ pub struct ShardedPageCache {
     pool: PageBufPool,
     /// Configured page size.
     page_size: PageSize,
+    /// Live residency target. Transaction staging and idle pool allocations
+    /// retain their independent hard allocation ceiling.
+    cache_page_budget: AtomicUsize,
     /// Fast-path flat array for single-connection mode (bd-fzr07).
     /// When `Some`, page lookups bypass sharded mutexes and use direct indexing.
     fast_array: Option<Mutex<FastPageArray>>,
@@ -2748,6 +2758,7 @@ impl ShardedPageCache {
             shard_mask,
             shard_shift,
             overflow_clean_probe_cursor: AtomicUsize::new(0),
+            cache_page_budget: AtomicUsize::new(pool.capacity()),
             pool,
             page_size,
             fast_array: None,
@@ -2830,6 +2841,91 @@ impl ShardedPageCache {
     #[inline]
     pub fn is_fast_path_enabled(&self) -> bool {
         self.use_fast_path.load(Ordering::Relaxed)
+    }
+
+    /// Set the live resident-page target without restricting transaction
+    /// staging allocations. The caller has already converted KiB to pages.
+    ///
+    /// Clean pages are reclaimed immediately when no miss flight is active.
+    /// Dirty pages are preserved, and trimming is retried after publication,
+    /// successful writeback, and read-flight completion or cancellation.
+    /// A zero target allows transient reads and retains no eligible pages.
+    pub fn set_cache_page_budget(&self, page_budget: usize) {
+        self.cache_page_budget.store(page_budget, Ordering::Release);
+        // Rebuild only the existing policy's bounded history. This is a cold
+        // resize operation, not a resident-page reconstruction on admission.
+        let capacity = page_budget.min(self.pool.capacity()).max(1);
+        let policy = match self.eviction_policy() {
+            PageCacheEvictionPolicy::Arbitrary => PageCacheEvictionPolicy::Arbitrary,
+            PageCacheEvictionPolicy::S3Fifo(_) => {
+                PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(capacity))
+            }
+            PageCacheEvictionPolicy::Arc(_) => {
+                PageCacheEvictionPolicy::Arc(ArcEvictionConfig::new(capacity))
+            }
+            PageCacheEvictionPolicy::S3FifoAdaptive(_) => {
+                PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(capacity))
+            }
+        };
+        self.set_eviction_policy(policy);
+        self.trim_to_page_budget();
+    }
+
+    /// Requested resident-page target, distinct from [`PageBufPool::capacity`].
+    #[must_use]
+    pub fn cache_page_budget(&self) -> usize {
+        self.cache_page_budget.load(Ordering::Acquire)
+    }
+
+    /// Count the active representation without constructing diagnostics.
+    /// The common fast-array and flat-only cases are O(1); overflow adds one
+    /// short lock per configured shard, whose count is bounded at creation.
+    fn budget_resident_pages(&self) -> usize {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            return fast.lock().len();
+        }
+        let flat = self.flat_slots.len();
+        if self.shards_dirty.load(Ordering::Acquire) {
+            flat + self
+                .shards
+                .iter()
+                .map(|shard| shard.lock().len())
+                .sum::<usize>()
+        } else {
+            flat
+        }
+    }
+
+    fn trim_to_page_budget(&self) {
+        let budget = self.cache_page_budget();
+        if self.budget_resident_pages() <= budget {
+            return;
+        }
+        // A flight may have read stale VFS bytes while a writer publishes a
+        // newer cache image. Keep that image resident until the flight has
+        // resolved its callback (GH #197), including for a zero target. The
+        // existing flight-registration lock closes the registration/eviction
+        // race. It is never held across I/O or a user callback.
+        let flights = self.in_flight_reads.lock();
+        if !flights.is_empty() {
+            return;
+        }
+        let excess = self
+            .budget_resident_pages()
+            .saturating_sub(self.cache_page_budget());
+        // Bound work to this observed excess even if another thread keeps
+        // admitting pages. Every admission retries after releasing its tier
+        // lock, and no dirty entry is discarded to satisfy the target.
+        for _ in 0..excess {
+            if self.budget_resident_pages() <= self.cache_page_budget()
+                || self.take_clean_buffer().is_none()
+            {
+                break;
+            }
+        }
+        drop(flights);
     }
 
     /// Set the eviction policy used by [`Self::evict_any`].
@@ -2969,6 +3065,7 @@ impl ShardedPageCache {
             {
                 entry.mark_clean();
             }
+            self.trim_to_page_budget();
             return;
         }
 
@@ -2979,6 +3076,8 @@ impl ShardedPageCache {
                 && entry.matches_write_snapshot(snapshot)
             {
                 entry.mark_clean();
+                drop(guard);
+                self.trim_to_page_budget();
                 return;
             }
         }
@@ -2989,6 +3088,7 @@ impl ShardedPageCache {
         {
             entry.mark_clean();
         }
+        self.trim_to_page_budget();
     }
 
     fn page_write_snapshot(&self, page_no: PageNumber) -> Option<PageWriteSnapshot> {
@@ -3442,7 +3542,6 @@ impl ShardedPageCache {
                         self.note_page_access_without_metrics(page_no);
                         self.record_eviction_admit(page_no);
                     }
-                    leader.finish();
                     tracing::debug!(page = page_no.get(), "page-cache read complete");
 
                     // The VFS image can become stale while the async read is
@@ -3454,6 +3553,7 @@ impl ShardedPageCache {
                     if let Some(result) = self.with_page(page_no, |data| {
                         callback.take().expect("page callback used once")(data)
                     }) {
+                        leader.finish();
                         return Ok(result);
                     }
                 }
@@ -3509,6 +3609,7 @@ impl ShardedPageCache {
             } else {
                 self.record_eviction_access(page_no);
             }
+            self.trim_to_page_budget();
             return Ok(result);
         }
 
@@ -3523,6 +3624,7 @@ impl ShardedPageCache {
         } else {
             self.record_eviction_access(page_no);
         }
+        self.trim_to_page_budget();
         Ok(result)
     }
 
@@ -3558,6 +3660,7 @@ impl ShardedPageCache {
             } else {
                 self.record_eviction_access(page_no);
             }
+            self.trim_to_page_budget();
             return;
         }
         // Flat slots first; overflow to shard.
@@ -3571,6 +3674,7 @@ impl ShardedPageCache {
         } else {
             self.record_eviction_access(page_no);
         }
+        self.trim_to_page_budget();
     }
 
     /// Evict a specific page from the cache.
@@ -4008,6 +4112,7 @@ impl ShardedPageCache {
                 evictions: arr.evictions,
                 cached_pages,
                 pool_capacity: self.pool.capacity(),
+                cache_page_budget: self.cache_page_budget(),
             };
         }
         let mut total_hits = self.flat_slots.hits.load(Ordering::Relaxed);
@@ -4031,6 +4136,7 @@ impl ShardedPageCache {
             evictions: total_evictions,
             cached_pages: total_pages,
             pool_capacity: self.pool.capacity(),
+            cache_page_budget: self.cache_page_budget(),
         }
     }
 
@@ -4078,6 +4184,7 @@ impl ShardedPageCache {
                 evictions: arr.evictions,
                 cached_pages: arr.len(),
                 pool_capacity: self.pool.capacity(),
+                cache_page_budget: self.cache_page_budget(),
                 dirty_ratio_pct: percent_ratio_u64(dirty_pages, arr.len()),
                 t1_size,
                 t2_size,
@@ -4154,6 +4261,7 @@ impl ShardedPageCache {
             evictions: total_evictions,
             cached_pages: total_pages,
             pool_capacity: self.pool.capacity(),
+            cache_page_budget: self.cache_page_budget(),
             dirty_ratio_pct: percent_ratio_u64(dirty_pages, total_pages),
             t1_size,
             t2_size,
@@ -6463,6 +6571,188 @@ mod tests {
                 "newer resident image must win over the stale late miss-fill (GH #197)"
             );
         });
+    }
+
+    #[test]
+    fn cache_page_budget_shrink_and_admission_cover_every_tier() {
+        for fast_path in [false, true] {
+            let mut cache = ShardedPageCache::with_pool_and_shards_and_flat_capacity(
+                PageBufPool::new(PageSize::DEFAULT, 32),
+                PageSize::DEFAULT,
+                4,
+                2,
+            );
+            if fast_path {
+                cache.enable_fast_path();
+            }
+            cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(32)));
+            for raw_page in 1..=8 {
+                let mut buffer = cache.pool.acquire().unwrap();
+                buffer.as_mut_slice().fill(u8::try_from(raw_page).unwrap());
+                cache.insert_buffer(PageNumber::new(raw_page).unwrap(), buffer);
+            }
+            if !fast_path {
+                assert!(cache.shards.iter().any(|shard| !shard.lock().pages.is_empty()));
+            }
+            let retained = cache.get_shared(PageNumber::ONE).unwrap();
+            let before = cache.metrics_lightweight_snapshot();
+            cache.set_cache_page_budget(2);
+            let after = cache.metrics_lightweight_snapshot();
+            assert_eq!(after.cache_page_budget, 2);
+            assert_eq!(after.cached_pages, 2);
+            assert_eq!(after.evictions - before.evictions, 6);
+            assert_eq!(after.pool_capacity, 32);
+            assert!(retained.as_bytes().iter().all(|&byte| byte == 1));
+
+            for raw_page in 9..=24 {
+                cache.insert_buffer(
+                    PageNumber::new(raw_page).unwrap(),
+                    cache.pool.acquire().unwrap(),
+                );
+                assert_eq!(cache.budget_resident_pages(), 2);
+            }
+            cache.set_cache_page_budget(0);
+            assert_eq!(cache.budget_resident_pages(), 0);
+            cache.insert_buffer(PageNumber::ONE, cache.pool.acquire().unwrap());
+            assert_eq!(cache.budget_resident_pages(), 0);
+            cache.set_cache_page_budget(usize::MAX);
+            assert_eq!(cache.cache_page_budget(), usize::MAX);
+            assert_eq!(cache.pool.capacity(), 32);
+            assert_eq!(cache.diagnostic_snapshot_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                cache.reconstructed_victim_scan_calls.load(Ordering::Relaxed),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn cache_page_budget_preserves_dirty_bytes_until_successful_writeback() {
+        run_async_test(|| async {
+            for fast_path in [false, true] {
+                let (cx, file) = setup();
+                let mut cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 8);
+                if fast_path {
+                    cache.enable_fast_path();
+                }
+                cache
+                    .insert_fresh(PageNumber::ONE, |bytes| bytes.fill(0xD7))
+                    .unwrap();
+                cache.insert_buffer(PageNumber::new(2).unwrap(), cache.pool.acquire().unwrap());
+                cache.set_cache_page_budget(0);
+                assert_eq!(cache.budget_resident_pages(), 1);
+                assert_eq!(cache.metrics_snapshot().dirty_ratio_pct, 100);
+                let retained = cache.get_shared(PageNumber::ONE).unwrap();
+                cache.write_page(&cx, &file, PageNumber::ONE).await.unwrap();
+                assert_eq!(cache.budget_resident_pages(), 0);
+                let mut persisted = vec![0; PageSize::DEFAULT.as_usize()];
+                assert_eq!(
+                    file.read(&cx, &mut persisted, 0).await.unwrap(),
+                    persisted.len()
+                );
+                assert!(persisted.iter().all(|&byte| byte == 0xD7));
+                assert_eq!(retained.as_bytes(), persisted);
+            }
+        });
+    }
+
+    #[test]
+    fn cache_page_budget_zero_read_returns_newer_writer_image_without_rereading() {
+        run_async_test(|| async {
+            for fast_path in [false, true] {
+                for dirty in [false, true] {
+                    let cx = Cx::new();
+                    let mut cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 8);
+                    if fast_path {
+                        cache.enable_fast_path();
+                    }
+                    cache.set_cache_page_budget(0);
+                    let cache = Arc::new(cache);
+                    let file = ControlledReadFile::publishing_replacement(
+                        vec![0x11; PageSize::DEFAULT.as_usize()],
+                        Arc::clone(&cache),
+                        PageNumber::ONE,
+                        0xA9,
+                        dirty,
+                    );
+                    let value = cache
+                        .read_page(&cx, &file, PageNumber::ONE, |bytes| {
+                            assert!(bytes.iter().all(|&byte| byte == 0xA9));
+                            bytes[0]
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(value, 0xA9);
+                    assert_eq!(file.read_calls(), 1);
+                    assert_eq!(cache.budget_resident_pages(), usize::from(dirty));
+                    assert!(cache.in_flight_reads.lock().is_empty());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cache_page_budget_cancelled_read_reclaims_and_hands_off_at_zero() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 8);
+        cache.set_cache_page_budget(0);
+        let file =
+            ControlledReadFile::first_pending_then_ready(vec![0x6B; PageSize::DEFAULT.as_usize()]);
+        let cx = Cx::new();
+        let mut leader = Box::pin(cache.read_page(&cx, &file, PageNumber::ONE, |data| data[0]));
+        let mut follower = Box::pin(cache.read_page(&cx, &file, PageNumber::ONE, |data| data[0]));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(leader.as_mut().poll(&mut task_cx).is_pending());
+        assert!(follower.as_mut().poll(&mut task_cx).is_pending());
+        cache.insert_buffer(PageNumber::new(2).unwrap(), cache.pool.acquire().unwrap());
+        assert_eq!(
+            cache.budget_resident_pages(),
+            1,
+            "active flight defers trimming"
+        );
+        drop(leader);
+        assert_eq!(
+            cache.budget_resident_pages(),
+            0,
+            "cancellation resumes trimming"
+        );
+        assert!(matches!(
+            follower.as_mut().poll(&mut task_cx),
+            Poll::Ready(Ok(0x6B))
+        ));
+        assert_eq!(file.read_calls(), 2);
+        assert_eq!(cache.budget_resident_pages(), 0);
+        assert!(cache.in_flight_reads.lock().is_empty());
+    }
+
+    #[test]
+    fn cache_page_budget_read_error_releases_flight_and_deferred_clean_pages() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 8));
+        cache.set_cache_page_budget(0);
+        let file = ControlledReadFile::publishing_replacement(
+            vec![0x11; 16],
+            Arc::clone(&cache),
+            PageNumber::ONE,
+            0xA9,
+            false,
+        );
+        let cx = Cx::new();
+        let mut read = Box::pin(cache.read_page(&cx, &file, PageNumber::ONE, |_| -> () {
+            panic!("a short VFS read must never call the user callback");
+        }));
+        let mut task_cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            read.as_mut().poll(&mut task_cx),
+            Poll::Ready(Err(FrankenError::DatabaseCorrupt { .. }))
+        ));
+        assert_eq!(file.read_calls(), 1);
+        assert_eq!(cache.budget_resident_pages(), 0);
+        assert!(cache.in_flight_reads.lock().is_empty());
     }
 
     #[test]
@@ -11296,6 +11586,7 @@ mod tests {
             evictions: 10,
             cached_pages: 15,
             pool_capacity: 100,
+            cache_page_budget: 100,
             dirty_ratio_pct: 30,
             t1_size: 5,
             t2_size: 10,
@@ -11354,6 +11645,7 @@ mod tests {
             evictions: 0,
             cached_pages: 0,
             pool_capacity: 0,
+            cache_page_budget: 0,
         };
         assert_eq!(snap.total_accesses(), 100);
         let rate = snap.hit_rate_percent();
@@ -11376,6 +11668,7 @@ mod tests {
             evictions: 3,
             cached_pages: 50,
             pool_capacity: 100,
+            cache_page_budget: 100,
             dirty_ratio_pct: 25,
             t1_size: 30,
             t2_size: 20,

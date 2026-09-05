@@ -2316,6 +2316,7 @@ mod tests {
                 admits: 0,
                 evictions: 0,
                 cached_pages: 8,
+                cache_page_budget: 32,
                 pool_capacity: 32,
                 dirty_ratio_pct: 0,
                 t1_size: 0,
@@ -2347,6 +2348,7 @@ mod tests {
                 admits: 0,
                 evictions: 0,
                 cached_pages: 64,
+                cache_page_budget: 128,
                 pool_capacity: 128,
                 dirty_ratio_pct: 0,
                 t1_size: 0,
@@ -2390,6 +2392,7 @@ mod tests {
                 admits: 0,
                 evictions: 0,
                 cached_pages: 96,
+                cache_page_budget: 128,
                 pool_capacity: 128,
                 dirty_ratio_pct: 0,
                 t1_size: 0,
@@ -2755,6 +2758,94 @@ mod wasm_tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn wasm_replication_repairs_fail_explicitly_without_fake_output() {
+        use fsqlite_core::replication_receiver::{PacketResult, ReplicationReceiver};
+        use fsqlite_core::replication_sender::{PageEntry, ReplicationSender, SenderConfig};
+        use fsqlite_core::snapshot_shipping::{
+            SnapshotPacketResult, SnapshotReceiver, SnapshotSender,
+        };
+        use fsqlite_types::cx::Cx;
+
+        let cx = Cx::new();
+        let mut pages = vec![PageEntry::new(1, vec![0x37; 128])];
+        let config = SenderConfig {
+            symbol_size: 128,
+            max_isi_multiplier: 2,
+        };
+        let mut sender = ReplicationSender::new();
+        sender
+            .prepare(128, &mut pages, config.clone())
+            .expect("prepare");
+        sender.start_streaming().expect("stream");
+        let first = sender.next_packet(&cx).expect("source").expect("packet");
+        assert_eq!(first.k_source, 2);
+        let second = sender.next_packet(&cx).expect("source").expect("packet");
+        for _ in 0..2 {
+            assert!(matches!(
+                sender.next_packet(&cx),
+                Err(FrankenError::NotImplemented(_))
+            ));
+        }
+
+        let mut snapshot_sender =
+            SnapshotSender::prepare(128, &mut pages, config).expect("snapshot");
+        for _ in 0..first.k_source {
+            snapshot_sender
+                .next_packet(&cx)
+                .expect("source")
+                .expect("packet");
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                snapshot_sender.next_packet(&cx),
+                Err(FrankenError::NotImplemented(_))
+            ));
+        }
+
+        // This deliberately relabeled source payload is an unsupported-input
+        // negative control, never evidence of a genuine repair symbol.
+        let mut unsupported_repair = first.clone();
+        unsupported_repair.esi = first.k_source;
+        let mut receiver = ReplicationReceiver::new();
+        receiver
+            .process_parsed_packet(&cx, &second)
+            .expect("surviving source");
+        assert!(matches!(
+            receiver.process_parsed_packet(&cx, &unsupported_repair),
+            Err(FrankenError::NotImplemented(_))
+        ));
+        assert!(receiver.decode_audit_entries().is_empty());
+        assert_eq!(
+            receiver
+                .process_parsed_packet(&cx, &first)
+                .expect("source retry"),
+            PacketResult::DecodeReady
+        );
+        let decoded = receiver.apply_pending().expect("source assembly");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].pages[0].page_data, pages[0].page_bytes);
+        assert!(decoded[0].decode_proof.is_none());
+
+        let mut snapshot_receiver = SnapshotReceiver::new(1, 128);
+        snapshot_receiver
+            .process_packet(&cx, &second)
+            .expect("surviving source");
+        assert!(matches!(
+            snapshot_receiver.process_packet(&cx, &unsupported_repair),
+            Err(FrankenError::NotImplemented(_))
+        ));
+        assert_eq!(
+            snapshot_receiver
+                .process_packet(&cx, &first)
+                .expect("source retry"),
+            SnapshotPacketResult::BlockDecoded(0)
+        );
+        let blocks = snapshot_receiver.take_decoded_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].pages[0].page_data, pages[0].page_bytes);
+    }
 
     #[wasm_bindgen_test]
     async fn wasm_memory_vfs_paths_and_open_are_host_independent() {

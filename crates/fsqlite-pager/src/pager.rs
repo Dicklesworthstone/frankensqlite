@@ -15453,6 +15453,20 @@ where
         Ok(self.cache.metrics_snapshot())
     }
 
+    /// Apply an already-resolved resident-page budget to this pager's cache.
+    /// Dirty pages and active read flights defer reclamation until safe;
+    /// transaction staging retains its independent buffer-pool ceiling.
+    pub fn set_cache_page_budget(&self, page_budget: usize) -> Result<()> {
+        self.cache.set_cache_page_budget(page_budget);
+        Ok(())
+    }
+
+    /// Resident-page target, independent of total pool or snapshot memory.
+    #[must_use]
+    pub fn cache_page_budget(&self) -> usize {
+        self.cache.cache_page_budget()
+    }
+
     /// Install a write-set page ceiling for every transaction this pager opens.
     ///
     /// `0` clears it. Used by the reserved schema-only builder create path so a
@@ -28437,6 +28451,61 @@ mod tests {
                 assert!(pager.cache.contains(page_no));
             }
             txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cache_page_budget_does_not_limit_concurrent_write_set_or_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open_with_cx_and_page_buffer_max(
+                &cx,
+                MemoryVfs::new(),
+                Path::new("/cache_budget_write_set.db"),
+                PageSize::DEFAULT,
+                Some(64),
+            )
+            .await
+            .unwrap();
+            pager.set_cache_page_budget(1).unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut pages = Vec::new();
+            for marker in 1_u8..=8 {
+                let page = writer.allocate_page(&cx).await.unwrap();
+                writer
+                    .write_page(&cx, page, &sample_page(marker))
+                    .await
+                    .unwrap();
+                pages.push((page, marker));
+            }
+            assert!(writer.write_set.len() > pager.cache_page_budget());
+            writer.commit(&cx).await.unwrap();
+            let committed = pager.cache_metrics_snapshot().unwrap();
+            assert_eq!(committed.cache_page_budget, 1);
+            assert_eq!(committed.pool_capacity, 64);
+            assert!(committed.cached_pages <= 1);
+
+            pager.set_cache_page_budget(0).unwrap();
+            let mut rollback = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            for &(page, _) in &pages {
+                rollback
+                    .write_page(&cx, page, &sample_page(0xEE))
+                    .await
+                    .unwrap();
+            }
+            rollback.rollback(&cx).await.unwrap();
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for &(page, marker) in &pages {
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                    sample_page(marker)
+                );
+            }
+            reader.commit(&cx).await.unwrap();
+            let after = pager.cache_metrics_snapshot().unwrap();
+            assert_eq!(after.cache_page_budget, 0);
+            assert_eq!(after.cached_pages, 0);
+            assert_eq!(after.pool_capacity, 64);
         });
     }
 
