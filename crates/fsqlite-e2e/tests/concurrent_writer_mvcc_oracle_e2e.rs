@@ -580,7 +580,12 @@ fn observed_disjoint_writer_overlap_for_certificate() {
     let observation = build_overlap_observation(&run_id, &recorder, final_state);
     observation
         .validate()
-        .expect("actual history must prove committed disjoint writer overlap");
+        .unwrap_or_else(|error| {
+            panic!(
+                "actual history must prove committed disjoint writer overlap: {error}; storage={:?}; commit_phases={:?}",
+                observation.storage, observation.commit_phases
+            )
+        });
     println!(
         "{CONCURRENT_WRITE_OBSERVATION_PREFIX}{}",
         serde_json::to_string(&observation).expect("compact observed concurrency JSON")

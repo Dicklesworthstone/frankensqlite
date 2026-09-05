@@ -1947,6 +1947,33 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_observation_requires_public_backend_names_and_run_bound_database() {
+        for backend in ["unix", "iouring", "windows", "io_uring", "memory", "native"] {
+            let mut observation = concurrent_observation_fixture();
+            for storage in &mut observation.storage {
+                storage.backend_kind = backend.to_owned();
+            }
+            for lane in &mut observation.history.execution_lane_evidence {
+                lane.backend_kind = backend.to_owned();
+                lane.backend_identity = format!("{backend}:parity_cert_strict");
+            }
+            assert_eq!(
+                observation.validate().is_ok(),
+                matches!(backend, "unix" | "iouring" | "windows"),
+                "only actual file-backed PRAGMA backend names certify overlap: {backend}"
+            );
+        }
+        let mut stale_database = concurrent_observation_fixture();
+        for storage in &mut stale_database.storage {
+            storage.database_id = "different-run:main".to_owned();
+        }
+        assert!(
+            stale_database.validate().is_err(),
+            "equal database labels from another run cannot certify this run"
+        );
+    }
+
+    #[test]
     fn concurrent_observation_rejects_sequential_and_same_page_writers() {
         let mut sequential = concurrent_observation_fixture();
         for event in &mut sequential.history.events {
