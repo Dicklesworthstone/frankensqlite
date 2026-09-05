@@ -328,12 +328,35 @@ pub fn ensure_symbol_segment(segment_path: &Path, header: SymbolSegmentHeader) -
     Ok(())
 }
 
+fn validate_symbol_append_record(record: &SymbolRecord) -> Result<()> {
+    let expected_len = u32_to_usize(record.oti.t, "symbol_size")?;
+    if record.symbol_data.len() != expected_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "symbol payload length {} differs from OTI.t {}",
+                record.symbol_data.len(),
+                record.oti.t
+            ),
+        });
+    }
+    if !record.verify_integrity() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "symbol record checksum mismatch before append".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Append one SymbolRecord using packed (no-padding) layout.
+///
+/// Invalid payload lengths and frame checksums are rejected before file creation
+/// or append. Epoch-key authentication is the caller's separate responsibility.
 pub fn append_symbol_record(
     symbols_dir: &Path,
     header: SymbolSegmentHeader,
     record: &SymbolRecord,
 ) -> Result<SymbolLogOffset> {
+    validate_symbol_append_record(record)?;
     let segment_path = symbol_segment_path(symbols_dir, header.segment_id);
     ensure_symbol_segment(&segment_path, header)?;
 
@@ -377,6 +400,7 @@ pub fn append_symbol_record(
 /// Append one SymbolRecord in optional aligned layout.
 ///
 /// This does not alter logical SymbolRecord bytes: only on-disk padding is added.
+/// Record shape and checksum validation precede all filesystem mutation.
 pub fn append_symbol_record_aligned(
     symbols_dir: &Path,
     header: SymbolSegmentHeader,
@@ -388,6 +412,7 @@ pub fn append_symbol_record_aligned(
             "sector_size must be non-zero for aligned symbol append".to_owned(),
         ));
     }
+    validate_symbol_append_record(record)?;
 
     let segment_path = symbol_segment_path(symbols_dir, header.segment_id);
     ensure_symbol_segment(&segment_path, header)?;
@@ -1501,6 +1526,59 @@ mod tests {
         assert_eq!(scan.records[0].record.symbol_data.len(), 1024);
         assert_eq!(scan.records[4].record.symbol_data.len(), 4096);
         manager.rotate(2, 43, 200).expect("rotation succeeds");
+    }
+
+    #[test]
+    fn test_symbol_append_rejects_invalid_records_before_mutation() {
+        for aligned in [false, true] {
+            for existing in [false, true] {
+                for corruption in 0..4 {
+                    let dir = tempdir().expect("tempdir");
+                    let symbols = dir.path().join("symbols");
+                    let header = SymbolSegmentHeader::new(1, 42, 100);
+                    let path = symbol_segment_path(&symbols, 1);
+                    let valid = test_record(7, 0, 1024, 0x44);
+                    let append = |record: &SymbolRecord| {
+                        if aligned {
+                            append_symbol_record_aligned(&symbols, header, record, 4096)
+                                .map(|entry| entry.offset)
+                        } else {
+                            append_symbol_record(&symbols, header, record)
+                        }
+                    };
+                    if existing {
+                        append(&valid).expect("valid initial record");
+                    }
+                    let before = fs::read(&path).ok();
+                    let mut invalid = valid.clone();
+                    match corruption {
+                        0 => invalid.frame_xxh3 ^= 1,
+                        1 => invalid.symbol_data[0] ^= 0x80,
+                        2 => {
+                            invalid.symbol_data.pop();
+                        }
+                        _ => invalid.oti.t = u32::MAX,
+                    }
+                    assert!(
+                        matches!(append(&invalid), Err(FrankenError::DatabaseCorrupt { .. })),
+                        "invalid record admitted: aligned={aligned}, existing={existing}, corruption={corruption}"
+                    );
+                    assert_eq!(fs::read(&path).ok(), before, "segment bytes changed");
+                    if !existing {
+                        assert!(!symbols.exists(), "rejection created the symbols directory");
+                    }
+                    let offset = append(&valid).expect("valid append after rejection");
+                    assert_eq!(
+                        read_symbol_record_at_offset(&path, offset, 1024).expect("read valid followup"),
+                        valid
+                    );
+                    if let Some(before) = before {
+                        let after = fs::read(&path).expect("read final segment");
+                        assert_eq!(&after[..before.len()], before);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
