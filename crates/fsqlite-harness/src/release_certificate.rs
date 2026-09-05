@@ -60,6 +60,10 @@ use crate::parity_verification_workflow::{
 use crate::performance_release_admission::validate_gate as validate_performance_admission_gate;
 use crate::performance_release_admission::{PerformanceAdmissionGate, authorized_artifact_paths};
 use crate::score_engine::BayesianScorecard;
+use crate::serializability_oracle::{
+    CONCURRENT_WRITE_OBSERVATION_PREFIX, CONCURRENT_WRITE_SOURCE_PATHS, CONCURRENT_WRITE_TEST_NAME,
+    CONCURRENT_WRITE_TEST_TARGET, ConcurrentWriteObservation,
+};
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.8.4";
@@ -287,6 +291,8 @@ struct D4ScenarioArtifact {
     exit_code: i32,
     concurrent_mode_default: bool,
     certifying_fallback_events: usize,
+    concurrent_write_observation: Option<StrictEvidenceRef>,
+    concurrent_write_execution: Option<StrictEvidenceRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2368,13 +2374,14 @@ fn validate_workflow_evidence(
 }
 
 fn validate_d4_runtime_path_proof(
-    evidence_root: &Path,
+    config: &StrictCertificateRunConfig,
     proof: &D4RuntimePathProof,
     input: &StrictCertificateEvidenceInput,
     manifest_index: &BTreeMap<String, (String, u64)>,
     now_unix_ms: u128,
     freshness_budget_ms: u128,
 ) -> Result<(), String> {
+    let evidence_root = &config.evidence_root;
     if proof.schema_version != D4_RUNTIME_PATH_PROOF_SCHEMA
         || proof.source_commit != input.candidate_git_sha
         || proof.run_id != input.run_id
@@ -2449,8 +2456,176 @@ fn validate_d4_runtime_path_proof(
                 scenario.scenario
             ));
         }
+        if payload.scenario == "concurrent_write_read" {
+            validate_d4_concurrent_observation(
+                config,
+                input,
+                payload,
+                manifest_index,
+                now_unix_ms,
+                freshness_budget_ms,
+            )?;
+        } else if payload.concurrent_write_observation.is_some()
+            || payload.concurrent_write_execution.is_some()
+        {
+            return Err("d4_concurrent_observation_on_wrong_scenario".to_owned());
+        }
     }
     Ok(())
+}
+
+fn d4_concurrent_test_argv() -> Vec<String> {
+    [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "fsqlite-e2e",
+        "--test",
+        CONCURRENT_WRITE_TEST_TARGET,
+        "-j",
+        "2",
+        CONCURRENT_WRITE_TEST_NAME,
+        "--",
+        "--exact",
+        "--show-output",
+        "--test-threads=1",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+fn validate_d4_observation_stdout(observation: &[u8], stdout: &[u8]) -> Result<(), String> {
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|error| format!("d4_concurrent_stdout_not_utf8: {error}"))?;
+    let observations = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(CONCURRENT_WRITE_OBSERVATION_PREFIX))
+        .collect::<Vec<_>>();
+    if observations.len() != 1 || observations[0].as_bytes() != observation {
+        return Err("d4_concurrent_observation_stdout_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_d4_compiled_source_hashes(
+    observed: &BTreeMap<String, String>,
+    observed_lock: &str,
+    tested_sources: &BTreeMap<String, String>,
+    tested_lock: &str,
+) -> Result<(), String> {
+    if observed.len() != CONCURRENT_WRITE_SOURCE_PATHS.len()
+        || tested_sources.len() != CONCURRENT_WRITE_SOURCE_PATHS.len()
+        || CONCURRENT_WRITE_SOURCE_PATHS.iter().any(|path| {
+            tested_sources
+                .get(*path)
+                .is_none_or(|hash| !is_lower_hex(hash, 64))
+                || observed.get(*path) != tested_sources.get(*path)
+        })
+        || !is_lower_hex(tested_lock, 64)
+        || observed_lock != tested_lock
+    {
+        return Err("d4_concurrent_observation_compiled_source_or_lock_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_d4_observation_source(
+    config: &StrictCertificateRunConfig,
+    input: &StrictCertificateEvidenceInput,
+    observation: &ConcurrentWriteObservation,
+) -> Result<(), String> {
+    let history = &observation.history;
+    if history.engine_git_sha != config.tested_candidate_git_sha
+        || history.engine_dirty
+        || history.run_id != input.run_id
+        || history.trace_id != input.trace_id
+        || history.scenario_id != input.scenario_id
+        || history.seed != input.seed
+    {
+        return Err("d4_concurrent_observation_run_or_source_mismatch".to_owned());
+    }
+    let mut tested_sources = BTreeMap::new();
+    for path in CONCURRENT_WRITE_SOURCE_PATHS {
+        let bytes = git_blob_at_commit(
+            &config.workspace_root,
+            &config.tested_candidate_git_sha,
+            path,
+        )?;
+        tested_sources.insert(path.to_owned(), sha256_bytes(&bytes));
+    }
+    let lock = git_blob_at_commit(
+        &config.workspace_root,
+        &config.tested_candidate_git_sha,
+        "Cargo.lock",
+    )?;
+    validate_d4_compiled_source_hashes(
+        &observation.source_sha256,
+        &observation.cargo_lock_sha256,
+        &tested_sources,
+        &sha256_bytes(&lock),
+    )
+}
+
+fn validate_d4_concurrent_observation(
+    config: &StrictCertificateRunConfig,
+    input: &StrictCertificateEvidenceInput,
+    scenario: &D4ScenarioArtifact,
+    manifest_index: &BTreeMap<String, (String, u64)>,
+    now_unix_ms: u128,
+    freshness_budget_ms: u128,
+) -> Result<(), String> {
+    let observation_ref = scenario
+        .concurrent_write_observation
+        .as_ref()
+        .ok_or_else(|| "d4_concurrent_observation_missing".to_owned())?;
+    let execution_ref = scenario
+        .concurrent_write_execution
+        .as_ref()
+        .ok_or_else(|| "d4_concurrent_execution_missing".to_owned())?;
+    let observation: LoadedStrictEvidence<ConcurrentWriteObservation> = load_strict_json(
+        &config.evidence_root,
+        observation_ref,
+        input.generated_unix_ms,
+        now_unix_ms,
+        freshness_budget_ms,
+    )?;
+    require_manifest_binding(manifest_index, &observation)?;
+    observation.value.validate()?;
+    validate_d4_observation_source(config, input, &observation.value)?;
+    let canonical = serde_json::to_vec(&observation.value)
+        .map_err(|error| format!("d4_concurrent_observation_encode_failed: {error}"))?;
+    if observation.bytes != canonical {
+        return Err("d4_concurrent_observation_not_exact_emitted_encoding".to_owned());
+    }
+    let execution: LoadedStrictEvidence<Phase5RunEvidence> = load_strict_json(
+        &config.evidence_root,
+        execution_ref,
+        input.generated_unix_ms,
+        now_unix_ms,
+        freshness_budget_ms,
+    )?;
+    require_manifest_binding(manifest_index, &execution)?;
+    let argv = d4_concurrent_test_argv();
+    if execution.value.execution.argv != argv {
+        return Err("d4_concurrent_execution_selector_mismatch".to_owned());
+    }
+    let binding = Phase5LeafBinding::CandidateManifest(manifest_index);
+    let validated = validate_phase5_run(
+        &config.evidence_root,
+        &config.tested_candidate_git_sha,
+        &execution.value,
+        &binding,
+        &config.candidate_rch_project_id,
+    )?;
+    validate_phase5_exact_test_transcript(&validated.transcript, &argv)?;
+    let stdout = load_bound_phase5_leaf(
+        &config.evidence_root,
+        &config.tested_candidate_git_sha,
+        &execution.value.execution.stdout.leaf,
+        &binding,
+    )?;
+    validate_d4_observation_stdout(&observation.bytes, &stdout)
 }
 
 fn validate_policy(policy: &CertificationPolicy) -> Result<(), String> {
@@ -5113,7 +5288,7 @@ fn build_and_publish_strict_certificate_at(
     )?;
     validate_results_jsonl(&results.bytes, &input, &traceability.value, &manifest_index)?;
     validate_d4_runtime_path_proof(
-        &config.evidence_root,
+        config,
         &d4.value,
         &input,
         &manifest_index,
@@ -5930,6 +6105,73 @@ mod tests {
             serde_json::from_value::<D4ScenarioArtifact>(payload).is_err(),
             "unknown D4 fields must fail closed"
         );
+    }
+
+    #[test]
+    fn d4_concurrent_observation_must_match_unique_captured_stdout_bytes() {
+        let observation = br#"{"history":"validator-fixture"}"#;
+        let line = format!(
+            "{CONCURRENT_WRITE_OBSERVATION_PREFIX}{}\n",
+            std::str::from_utf8(observation).expect("fixture utf8")
+        );
+        validate_d4_observation_stdout(observation, line.as_bytes()).expect("exact emitted bytes");
+        assert!(validate_d4_observation_stdout(observation, b"").is_err());
+        assert!(
+            validate_d4_observation_stdout(observation, format!("{line}{line}").as_bytes())
+                .is_err()
+        );
+        assert!(
+            validate_d4_observation_stdout(br#"{"history":"fabricated-overlap"}"#, line.as_bytes())
+                .is_err()
+        );
+        assert!(validate_d4_observation_stdout(observation, &[0xff]).is_err());
+    }
+
+    #[test]
+    fn d4_concurrent_execution_rejects_zero_skipped_or_wrong_named_tests() {
+        let argv = d4_concurrent_test_argv();
+        let valid = format!(
+            "test {CONCURRENT_WRITE_TEST_NAME} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        );
+        validate_phase5_exact_test_transcript(&valid, &argv)
+            .expect("actual named-test transcript shape");
+        for invalid in [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n".to_owned(),
+            format!("test {CONCURRENT_WRITE_TEST_NAME} ... ignored\n\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"),
+            valid.replace(CONCURRENT_WRITE_TEST_NAME, "sequential_memory_threads_8"),
+            "compilation skipped\n".to_owned(),
+        ] {
+            assert!(validate_phase5_exact_test_transcript(&invalid, &argv).is_err(), "accepted invalid execution: {invalid}");
+        }
+    }
+
+    #[test]
+    fn d4_concurrent_compiled_source_binding_rejects_stale_lock_and_subsets() {
+        let tested = CONCURRENT_WRITE_SOURCE_PATHS
+            .into_iter()
+            .map(|path| (path.to_owned(), sha256_bytes(path.as_bytes())))
+            .collect::<BTreeMap<_, _>>();
+        let lock = sha256_bytes(b"tested lock bytes");
+        validate_d4_compiled_source_hashes(&tested, &lock, &tested, &lock)
+            .expect("exact source binding");
+        let mut stale = tested.clone();
+        stale.insert(
+            CONCURRENT_WRITE_SOURCE_PATHS[3].to_owned(),
+            sha256_bytes(b"stale connection source"),
+        );
+        assert!(validate_d4_compiled_source_hashes(&stale, &lock, &tested, &lock).is_err());
+        assert!(
+            validate_d4_compiled_source_hashes(
+                &tested,
+                &sha256_bytes(b"stale lock"),
+                &tested,
+                &lock
+            )
+            .is_err()
+        );
+        let mut subset = tested.clone();
+        subset.remove(CONCURRENT_WRITE_SOURCE_PATHS[0]);
+        assert!(validate_d4_compiled_source_hashes(&subset, &lock, &tested, &lock).is_err());
     }
 
     #[test]

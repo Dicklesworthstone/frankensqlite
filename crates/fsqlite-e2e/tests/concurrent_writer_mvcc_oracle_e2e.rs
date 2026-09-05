@@ -6,7 +6,7 @@
 //! file-backed databases, then compare final table state for correctness.
 //!
 //! Coverage:
-//!   - Disjoint-partition inserts (no page contention, should scale linearly)
+//!   - Disjoint-partition inserts with final-state oracle comparison
 //!   - Same-table concurrent inserts into non-overlapping PK ranges
 //!   - Read snapshot isolation (reader sees pre-commit state during writes)
 //!   - Write-write conflict on same row (SSI must abort one writer)
@@ -14,15 +14,581 @@
 //!   - Concurrent DDL + DML interleaving
 #![recursion_limit = "512"]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use fsqlite::SqliteValue;
+use fsqlite_harness::failure_bundle::{ExecutionLaneEvidence, ObservedExecutionLane};
+use fsqlite_harness::serializability_oracle::{
+    BeginMode, CONCURRENT_WRITE_OBSERVATION_PREFIX, CONCURRENT_WRITE_OBSERVATION_SCHEMA,
+    CONCURRENT_WRITE_SOURCE_PATHS, CONCURRENT_WRITE_TEST_NAME, CONCURRENT_WRITE_TEST_TARGET,
+    ConcurrentCommitObservation, ConcurrentCommitPhase, ConcurrentStorageObservation,
+    ConcurrentWriteObservation, HistoryEvent, HistoryOperation, HistoryValue, HistoryWorkload,
+    ScheduleProvenance, TRANSACTION_HISTORY_SCHEMA_VERSION, TransactionHistory,
+};
+use fsqlite_harness::test_inventory::ExecutionLane;
+use sha2::{Digest, Sha256};
+use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 const RETRY_LIMIT: u32 = 200;
 const RETRY_BACKOFF: Duration = Duration::from_micros(200);
+
+#[derive(Default)]
+struct OverlapRecorder {
+    order: u64,
+    events: Vec<HistoryEvent>,
+    phases: Vec<ConcurrentCommitObservation>,
+    storage: Vec<ConcurrentStorageObservation>,
+}
+
+impl OverlapRecorder {
+    fn next_order(&mut self) -> u64 {
+        let order = self.order;
+        self.order = self
+            .order
+            .checked_add(1)
+            .expect("bounded observation order");
+        order
+    }
+}
+
+#[derive(Clone)]
+struct ObservedWriter {
+    process_id: String,
+    connection_id: String,
+    transaction_id: String,
+    database_id: String,
+    table: &'static str,
+    root_page: u32,
+    recorder: Arc<Mutex<OverlapRecorder>>,
+    tracing_transaction: Arc<AtomicBool>,
+    // Compare only while both opened handles are alive; never serialize this token.
+    file_identity: Arc<Mutex<Option<fsqlite_vfs::FileIdentity>>>,
+}
+
+impl ObservedWriter {
+    fn record(&self, operation: HistoryOperation) {
+        let mut recorder = self.recorder.lock().expect("history recorder");
+        let logical_time = recorder.next_order();
+        let event_id = u64::try_from(recorder.events.len()).expect("bounded history");
+        recorder.events.push(HistoryEvent {
+            event_id,
+            logical_time,
+            process_id: self.process_id.clone(),
+            connection_id: self.connection_id.clone(),
+            transaction_id: Some(self.transaction_id.clone()),
+            operation,
+        });
+    }
+}
+
+#[derive(Default)]
+struct CommitTraceFields(BTreeMap<String, String>);
+
+impl tracing::field::Visit for CommitTraceFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl CommitTraceFields {
+    fn number(&self, name: &str) -> u64 {
+        self.0
+            .get(name)
+            .expect("production commit trace field")
+            .parse()
+            .expect("numeric production commit trace field")
+    }
+}
+
+struct CommitTraceLayer(ObservedWriter);
+
+impl<S: tracing::Subscriber> Layer<S> for CommitTraceLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "fsqlite_core::connection"
+            || !self.0.tracing_transaction.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut fields = CommitTraceFields::default();
+        event.record(&mut fields);
+        let phase = match fields.0.get("visibility_decision").map(String::as_str) {
+            Some("commit_plan_clean") => ConcurrentCommitPhase::CommitPlanClean,
+            Some("commit_published") => ConcurrentCommitPhase::CommitPublished,
+            _ => return,
+        };
+        let mut recorder = self.0.recorder.lock().expect("commit trace recorder");
+        let logical_time = recorder.next_order();
+        recorder.phases.push(ConcurrentCommitObservation {
+            logical_time,
+            process_id: self.0.process_id.clone(),
+            connection_id: self.0.connection_id.clone(),
+            transaction_id: self.0.transaction_id.clone(),
+            phase,
+            engine_txn_id: fields.number("txn_id"),
+            snapshot_high: fields.number("snapshot_high"),
+            commit_seq: fields.number("commit_seq"),
+            page_id: u32::try_from(fields.number("page_id")).expect("page number fits u32"),
+        });
+    }
+}
+
+fn compiled_overlap_source_hashes() -> BTreeMap<String, String> {
+    let sources: [(&str, &[u8]); 11] = [
+        ("Cargo.toml", include_bytes!("../../../Cargo.toml")),
+        (
+            "rust-toolchain.toml",
+            include_bytes!("../../../rust-toolchain.toml"),
+        ),
+        (
+            "crates/fsqlite-core/Cargo.toml",
+            include_bytes!("../../fsqlite-core/Cargo.toml"),
+        ),
+        (
+            "crates/fsqlite-core/src/connection.rs",
+            include_bytes!("../../fsqlite-core/src/connection.rs"),
+        ),
+        (
+            "crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs",
+            include_bytes!("concurrent_writer_mvcc_oracle_e2e.rs"),
+        ),
+        (
+            "crates/fsqlite-harness/src/serializability_oracle.rs",
+            include_bytes!("../../fsqlite-harness/src/serializability_oracle.rs"),
+        ),
+        (
+            "crates/fsqlite-harness/src/release_certificate.rs",
+            include_bytes!("../../fsqlite-harness/src/release_certificate.rs"),
+        ),
+        (
+            "crates/fsqlite-pager/src/pager.rs",
+            include_bytes!("../../fsqlite-pager/src/pager.rs"),
+        ),
+        (
+            "crates/fsqlite-pager/src/page_cache.rs",
+            include_bytes!("../../fsqlite-pager/src/page_cache.rs"),
+        ),
+        (
+            "crates/fsqlite-mvcc/src/concurrent.rs",
+            include_bytes!("../../fsqlite-mvcc/src/concurrent.rs"),
+        ),
+        (
+            "crates/fsqlite-vdbe/src/lib.rs",
+            include_bytes!("../../fsqlite-vdbe/src/lib.rs"),
+        ),
+    ];
+    assert_eq!(sources.map(|(path, _)| path), CONCURRENT_WRITE_SOURCE_PATHS);
+    sources
+        .into_iter()
+        .map(|(path, bytes)| (path.to_owned(), format!("{:x}", Sha256::digest(bytes))))
+        .collect()
+}
+
+impl ObservedWriter {
+    async fn execute(
+        &self,
+        path: &str,
+        ready: mpsc::SyncSender<()>,
+        commit_allowed: mpsc::Receiver<()>,
+    ) {
+        let conn = fsqlite::Connection::open(path)
+            .await
+            .expect("open observed writer");
+        conn.set_reject_mem_fallback(true);
+        conn.set_strict_mem_fallback_rejection(true);
+        let identity = conn
+            .file_identity()
+            .await
+            .expect("open-file identity")
+            .expect("file-backed writer requires an opened file identity");
+        {
+            let mut shared = self.file_identity.lock().expect("identity comparison");
+            if let Some(first) = *shared {
+                assert!(
+                    first == identity,
+                    "both live Connections must hold the same file object"
+                );
+            } else {
+                *shared = Some(identity);
+            }
+        }
+        let backend_rows = conn
+            .query("PRAGMA fsqlite.backend_kind")
+            .await
+            .expect("actual backend");
+        let SqliteValue::Text(backend_kind) = &backend_rows[0].values()[0] else {
+            panic!("backend kind must be text");
+        };
+        assert_ne!(backend_kind.as_ref(), "memory");
+        assert_eq!(
+            fsqlite_query_sorted(&conn, "PRAGMA journal_mode")
+                .await
+                .expect("journal mode"),
+            vec![vec!["wal".to_owned()]],
+        );
+        assert_eq!(
+            fsqlite_query_sorted(&conn, "PRAGMA fsqlite.backend_mode")
+                .await
+                .expect("actual fallback mode"),
+            vec![vec!["parity_cert_strict".to_owned()]],
+        );
+        self.recorder
+            .lock()
+            .expect("storage recorder")
+            .storage
+            .push(ConcurrentStorageObservation {
+                process_id: self.process_id.clone(),
+                connection_id: self.connection_id.clone(),
+                database_id: self.database_id.clone(),
+                backend_kind: backend_kind.to_string(),
+                storage_mode: "compatibility".to_owned(),
+            });
+        conn.reset_fallback_decision_evidence();
+        conn.execute("BEGIN")
+            .await
+            .expect("default concurrent BEGIN");
+        let snapshot = conn
+            .current_concurrent_snapshot_seq()
+            .expect("live concurrent snapshot");
+        self.record(HistoryOperation::Begin {
+            mode: BeginMode::Concurrent,
+        });
+        self.tracing_transaction.store(true, Ordering::Relaxed);
+        let sql = format!("UPDATE {} SET value = 1 WHERE id = 1", self.table);
+        assert_eq!(conn.execute(&sql).await.expect("disjoint page write"), 1);
+        self.record(HistoryOperation::Write {
+            key: self.table.to_owned(),
+            value: HistoryValue::Integer(1),
+            page_number: Some(self.root_page),
+        });
+        assert_eq!(conn.current_concurrent_snapshot_seq(), Some(snapshot));
+        ready
+            .send(())
+            .expect("report completed write while transaction is active");
+        commit_allowed
+            .recv_timeout(Duration::from_secs(30))
+            .expect("both writers must finish writing before either commits");
+        conn.execute("COMMIT")
+            .await
+            .expect("disjoint writer COMMIT must succeed");
+        self.record(HistoryOperation::Commit);
+        self.tracing_transaction.store(false, Ordering::Relaxed);
+        assert!(conn.last_local_commit_seq().expect("completed publication") > snapshot);
+        let fallback = conn.fallback_decision_snapshot();
+        assert!(
+            !fallback.truncated && fallback.decisions.is_empty(),
+            "no unobserved or allowed fallback"
+        );
+        conn.close().await.expect("close observed writer");
+    }
+}
+
+fn overlap_identity(name: &str, fallback: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn build_overlap_observation(
+    run_id: &str,
+    recorder: &Arc<Mutex<OverlapRecorder>>,
+) -> ConcurrentWriteObservation {
+    let recorder = recorder.lock().expect("complete overlap observations");
+    let trace_id = overlap_identity("FSQLITE_PROOF_TRACE_ID", run_id);
+    let scenario_id = overlap_identity("FSQLITE_PROOF_SCENARIO_ID", "concurrent_write_read");
+    let seed = std::env::var("FSQLITE_PROOF_SEED").map_or(0x006d_7708, |value| {
+        value.parse().expect("explicit proof seed must be u64")
+    });
+    let lane_evidence = recorder
+        .storage
+        .iter()
+        .map(|storage| {
+            assert_eq!(
+                recorder
+                    .phases
+                    .iter()
+                    .filter(|phase| { phase.connection_id == storage.connection_id })
+                    .count(),
+                2,
+                "each writer must produce both actual commit trace phases"
+            );
+            ExecutionLaneEvidence::from_observations(
+                ExecutionLane::MvccRequired,
+                vec![
+                    ObservedExecutionLane::SqlResult,
+                    ObservedExecutionLane::PagerBacked,
+                    ObservedExecutionLane::Mvcc,
+                ],
+                &trace_id,
+                run_id,
+                &scenario_id,
+                "UPDATE",
+                &storage.backend_kind,
+                "parity_cert_strict",
+                format!("{}:parity_cert_strict", storage.backend_kind),
+                Vec::new(),
+                true,
+            )
+        })
+        .collect();
+    let mut history = TransactionHistory {
+        schema_version: TRANSACTION_HISTORY_SCHEMA_VERSION.to_owned(),
+        run_id: run_id.to_owned(),
+        trace_id,
+        scenario_id,
+        seed,
+        engine_git_sha: overlap_identity(
+            "FSQLITE_CANDIDATE_GIT_SHA",
+            "identified-by-compiled-source-hashes",
+        ),
+        engine_dirty: std::env::var("FSQLITE_CANDIDATE_DIRTY").as_deref() != Ok("0"),
+        workload: HistoryWorkload::Register,
+        schedule: ScheduleProvenance::observation_only(
+            "distinct OS threads; real SQL completions and core commit trace events on one logical clock",
+        ),
+        execution_lane_evidence: lane_evidence,
+        concurrent_mode_enabled: true,
+        reopen_concurrent_mode_enabled: None,
+        initial_state: BTreeMap::from([
+            ("overlap_a".to_owned(), HistoryValue::Integer(0)),
+            ("overlap_b".to_owned(), HistoryValue::Integer(0)),
+        ]),
+        final_state: BTreeMap::from([
+            ("overlap_a".to_owned(), HistoryValue::Integer(1)),
+            ("overlap_b".to_owned(), HistoryValue::Integer(1)),
+        ]),
+        final_state_sha256: String::new(),
+        events: recorder.events.clone(),
+    };
+    history.refresh_final_state_hash();
+    ConcurrentWriteObservation {
+        schema_version: CONCURRENT_WRITE_OBSERVATION_SCHEMA.to_owned(),
+        history,
+        test_target: CONCURRENT_WRITE_TEST_TARGET.to_owned(),
+        test_name: CONCURRENT_WRITE_TEST_NAME.to_owned(),
+        source_sha256: compiled_overlap_source_hashes(),
+        cargo_lock_sha256: format!(
+            "{:x}",
+            Sha256::digest(include_bytes!("../../../Cargo.lock"))
+        ),
+        storage: recorder.storage.clone(),
+        commit_phases: recorder.phases.clone(),
+    }
+}
+
+const STOCK_REOPEN_PREFIX: &str = "FSQLITE_STOCK_REOPEN_OBSERVATION=";
+
+fn verify_overlap_stock_child(path: &std::path::Path) {
+    let parent: u32 = std::env::var("FSQLITE_CONCURRENCY_PARENT_PID")
+        .expect("parent process identity")
+        .parse()
+        .expect("parent PID");
+    assert_ne!(
+        parent,
+        std::process::id(),
+        "stock verifier must be a separate process"
+    );
+    let stock =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("independent stock reopen");
+    for table in ["overlap_a", "overlap_b"] {
+        assert_eq!(
+            rusqlite_query_sorted(
+                &stock,
+                &format!("SELECT id, value FROM {table} ORDER BY id")
+            )
+            .expect("stock exact rows"),
+            vec![vec!["1".to_owned(), "1".to_owned()]],
+        );
+    }
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("stock integrity check");
+    assert_eq!(integrity, "ok");
+    println!(
+        "{STOCK_REOPEN_PREFIX}{}",
+        serde_json::json!({
+            "process_id": std::process::id(), "parent_process_id": parent,
+            "sqlite_version": rusqlite::version(), "retained_rows": 2, "integrity": integrity,
+        })
+    );
+}
+
+fn run_overlap_stock_child(path: &std::path::Path) {
+    let child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            CONCURRENT_WRITE_TEST_NAME,
+            "--show-output",
+            "--test-threads=1",
+        ])
+        .env("FSQLITE_CONCURRENCY_STOCK_REOPEN_DB", path)
+        .env(
+            "FSQLITE_CONCURRENCY_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .output()
+        .expect("spawn stock verifier process");
+    assert!(
+        child.status.success(),
+        "stock child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let stdout = String::from_utf8(child.stdout).expect("child UTF-8 output");
+    let receipts: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(STOCK_REOPEN_PREFIX))
+        .collect();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "one actual stock reopen observation required"
+    );
+    let receipt: serde_json::Value = serde_json::from_str(receipts[0]).expect("stock receipt JSON");
+    assert_eq!(receipt["parent_process_id"], std::process::id());
+    assert_ne!(receipt["process_id"], std::process::id());
+    assert_eq!(receipt["retained_rows"], 2);
+    assert_eq!(receipt["integrity"], "ok");
+    // Keep the actual child observation, without duplicating its libtest completion records.
+    println!("{STOCK_REOPEN_PREFIX}{}", receipts[0]);
+}
+
+fn seed_overlap_database(path: &str) -> [u32; 2] {
+    let roots = {
+        let stock = rusqlite::Connection::open(path).expect("stock seed");
+        stock
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE overlap_a(id INTEGER PRIMARY KEY, value INTEGER);
+             CREATE TABLE overlap_b(id INTEGER PRIMARY KEY, value INTEGER);
+             INSERT INTO overlap_a VALUES(1,0);
+             INSERT INTO overlap_b VALUES(1,0);",
+            )
+            .expect("two preallocated table leaves");
+        ["overlap_a", "overlap_b"].map(|table| {
+            stock
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name=?1",
+                    [table],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("actual table root page")
+        })
+    };
+    assert!(roots[0] > 1 && roots[1] > 1 && roots[0] != roots[1]);
+    assert_eq!(
+        &std::fs::read(path).expect("actual database header")[..16],
+        b"SQLite format 3\0"
+    );
+    roots
+}
+
+#[test]
+fn observed_disjoint_writer_overlap_for_certificate() {
+    if let Some(path) = std::env::var_os("FSQLITE_CONCURRENCY_STOCK_REOPEN_DB") {
+        // This same executable supplies the independent stock-only child. It emits
+        // no concurrency observation, so a child-only run cannot certify overlap.
+        verify_overlap_stock_child(std::path::Path::new(&path));
+        return;
+    }
+    let database = tempfile::NamedTempFile::new().expect("fresh file-backed database");
+    let path = database
+        .path()
+        .to_str()
+        .expect("UTF-8 fixture path")
+        .to_owned();
+    let roots = seed_overlap_database(&path);
+    let fallback_id = format!(
+        "bd-6hdwo.8-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current timestamp")
+            .as_nanos()
+    );
+    let run_id = overlap_identity("FSQLITE_PROOF_RUN_ID", &fallback_id);
+    let recorder = Arc::new(Mutex::new(OverlapRecorder::default()));
+    let file_identity = Arc::new(Mutex::new(None));
+    thread::scope(|scope| {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(2);
+        let mut permissions = Vec::new();
+        let mut workers = Vec::new();
+        for (index, table) in ["overlap_a", "overlap_b"].into_iter().enumerate() {
+            let writer = ObservedWriter {
+                process_id: std::process::id().to_string(),
+                connection_id: format!("{}:writer-{index}", std::process::id()),
+                transaction_id: format!("writer-{index}:attempt-0"),
+                database_id: format!("{run_id}:main"),
+                table,
+                root_page: roots[index],
+                recorder: Arc::clone(&recorder),
+                tracing_transaction: Arc::new(AtomicBool::new(false)),
+                file_identity: Arc::clone(&file_identity),
+            };
+            let worker_path = path.clone();
+            let ready = ready_tx.clone();
+            let (allowed_tx, allowed_rx) = mpsc::sync_channel(1);
+            permissions.push(allowed_tx);
+            workers.push(scope.spawn(move || {
+                let subscriber =
+                    tracing_subscriber::registry().with(CommitTraceLayer(writer.clone()));
+                tracing::subscriber::with_default(subscriber, || {
+                    asupersync::test_utils::run_test(|| async {
+                        writer.execute(&worker_path, ready, allowed_rx).await;
+                    });
+                });
+            }));
+        }
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("both transactions must hold completed disjoint writes");
+        }
+        for permission in permissions {
+            permission
+                .send(())
+                .expect("release already-overlapping writers to commit");
+        }
+        for worker in workers {
+            worker.join().expect("observed writer panicked");
+        }
+    });
+    run_overlap_stock_child(database.path());
+    let observation = build_overlap_observation(&run_id, &recorder);
+    observation
+        .validate()
+        .expect("actual history must prove committed disjoint writer overlap");
+    println!(
+        "{CONCURRENT_WRITE_OBSERVATION_PREFIX}{}",
+        serde_json::to_string(&observation).expect("compact observed concurrency JSON")
+    );
+}
+
+#[test]
+#[should_panic(expected = "BOTH_ERR")]
+fn concurrent_oracle_refuses_two_query_errors() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = tempfile::NamedTempFile::new().unwrap();
+        let stock = tempfile::NamedTempFile::new().unwrap();
+        compare_query_results(
+            "both query errors must fail the oracle",
+            frank.path().to_str().unwrap(),
+            stock.path().to_str().unwrap(),
+            &["SELECT required_value FROM absent_table"],
+        )
+        .await;
+    });
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -104,7 +670,11 @@ async fn compare_query_results(label: &str, f_path: &str, r_path: &str, queries:
             (Ok(a), Err(e)) => {
                 mismatches.push(format!("CSQL_ERR {q}\n  frank: {a:?}\n  err: {e}"));
             }
-            (Err(_), Err(_)) => {}
+            (Err(a), Err(b)) => {
+                mismatches.push(format!(
+                    "BOTH_ERR {q}\n  frank: {a}\n  csql: {b}\n  expected successful query results"
+                ));
+            }
         }
     }
     assert!(
@@ -113,6 +683,7 @@ async fn compare_query_results(label: &str, f_path: &str, r_path: &str, queries:
         mismatches.len(),
         mismatches.join("\n")
     );
+    f.close().await.expect("close frank oracle connection");
 }
 
 // ── Test 1: Disjoint-partition concurrent inserts ──────────────────────
@@ -475,6 +1046,59 @@ fn concurrent_insert_no_data_loss_8_threads() {
 
 // ── Test 4: Read isolation — reader sees consistent snapshot ───────────
 
+async fn verify_held_reader_snapshot(
+    path: &str,
+    ready: mpsc::SyncSender<u64>,
+    committed: mpsc::Receiver<u64>,
+) {
+    let conn = fsqlite::Connection::open(path).await.unwrap();
+    conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+    conn.execute("BEGIN").await.unwrap();
+    let before = fsqlite_query_sorted(&conn, "SELECT id, val FROM snap ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        before,
+        vec![
+            vec!["1".to_owned(), "100".to_owned()],
+            vec!["2".to_owned(), "200".to_owned()],
+        ],
+        "reader should see initial state"
+    );
+    let snapshot = conn
+        .current_concurrent_snapshot_seq()
+        .expect("BEGIN must activate the concurrent snapshot by default");
+    ready.send(snapshot).expect("reader ready");
+    let writer_commit = committed
+        .recv_timeout(Duration::from_secs(30))
+        .expect("writer must durably commit while the reader transaction remains open");
+    assert!(
+        writer_commit > snapshot,
+        "writer must publish after the reader snapshot"
+    );
+    let during = fsqlite_query_sorted(&conn, "SELECT id, val FROM snap ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        during, before,
+        "reader must retain its snapshot after the writer actually commits"
+    );
+    conn.execute("COMMIT").await.unwrap();
+    let after = fsqlite_query_sorted(&conn, "SELECT id, val FROM snap ORDER BY id")
+        .await
+        .expect("refresh reader after ending snapshot");
+    assert_eq!(
+        after,
+        vec![
+            vec!["1".to_owned(), "999".to_owned()],
+            vec!["2".to_owned(), "200".to_owned()],
+            vec!["3".to_owned(), "300".to_owned()],
+        ],
+        "the next reader transaction must observe both committed writes"
+    );
+    conn.close().await.expect("close reader");
+}
+
 #[test]
 fn read_snapshot_isolation_during_concurrent_write() {
     asupersync::test_utils::run_test(|| async {
@@ -495,44 +1119,19 @@ fn read_snapshot_isolation_during_concurrent_write() {
                 .unwrap();
         }
 
-        let writer_started = Arc::new(Barrier::new(2));
+        let (reader_ready_tx, reader_ready_rx) = mpsc::sync_channel(1);
+        let (writer_committed_tx, writer_committed_rx) = mpsc::sync_channel(1);
         let fp = f_path.clone();
-        let ws = writer_started.clone();
 
         let reader_handle = thread::spawn(move || {
             asupersync::test_utils::run_test(|| async {
-                let conn = fsqlite::Connection::open(&fp).await.unwrap();
-                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
-
-                conn.execute("BEGIN").await.unwrap();
-                let before = fsqlite_query_sorted(&conn, "SELECT id, val FROM snap ORDER BY id")
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    before,
-                    vec![
-                        vec!["1".to_owned(), "100".to_owned()],
-                        vec!["2".to_owned(), "200".to_owned()]
-                    ],
-                    "reader should see initial state"
-                );
-
-                ws.wait();
-                thread::sleep(Duration::from_millis(50));
-
-                let during = fsqlite_query_sorted(&conn, "SELECT id, val FROM snap ORDER BY id")
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    during, before,
-                    "reader inside txn should still see snapshot (MVCC isolation)"
-                );
-
-                conn.execute("COMMIT").await.unwrap();
+                verify_held_reader_snapshot(&fp, reader_ready_tx, writer_committed_rx).await;
             });
         });
 
-        writer_started.wait();
+        let reader_snapshot = reader_ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("reader must begin and read before writer starts");
 
         let wconn = fsqlite::Connection::open(&f_path).await.unwrap();
         wconn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
@@ -541,16 +1140,34 @@ fn read_snapshot_isolation_during_concurrent_write() {
             .execute("INSERT INTO snap VALUES (3, 300);")
             .await
             .unwrap();
-        if let Err(e) = wconn
+        wconn
             .execute("UPDATE snap SET val = 999 WHERE id = 1;")
             .await
-        {
-            drop(wconn.execute("ROLLBACK").await);
-            eprintln!("writer UPDATE failed (may be bd-jamrd): {e}");
-        }
-        drop(wconn.execute("COMMIT").await);
+            .expect("writer UPDATE must succeed");
+        wconn
+            .execute("COMMIT")
+            .await
+            .expect("writer COMMIT must succeed");
+        let writer_commit = wconn
+            .last_local_commit_seq()
+            .expect("writer publication sequence");
+        assert!(writer_commit > reader_snapshot);
+        writer_committed_tx
+            .send(writer_commit)
+            .expect("notify reader after publication");
 
         reader_handle.join().expect("reader thread panicked");
+        wconn.close().await.expect("close writer");
+        let stock = rusqlite::Connection::open(&f_path).expect("stock reopen of written file");
+        assert_eq!(
+            rusqlite_query_sorted(&stock, "SELECT id, val FROM snap ORDER BY id")
+                .expect("stock retained rows"),
+            vec![
+                vec!["1".to_owned(), "999".to_owned()],
+                vec!["2".to_owned(), "200".to_owned()],
+                vec!["3".to_owned(), "300".to_owned()],
+            ]
+        );
     });
 }
 

@@ -825,17 +825,13 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         ScriptEntryBuilder::new(
             "crates/fsqlite-e2e/tests/correctness_concurrent_writes.rs",
             ScriptKind::RustE2eTest,
-            "Concurrent multi-thread write correctness",
+            "Sequential in-memory FrankenSQLite oracle against threaded stock SQLite writes",
         )
         .bead("bd-244z")
-        .command("cargo test -p fsqlite-e2e --test correctness_concurrent_writes")
-        .scenarios(&["CON-3", "MVCC-3"])
-        .storage(&[
-            StorageMode::InMemory,
-            StorageMode::FileBacked,
-            StorageMode::Wal,
-        ])
-        .concurrency(&[ConcurrencyMode::ConcurrentWriters])
+        .command("cargo test --locked -p fsqlite-e2e --test correctness_concurrent_writes")
+        .scenarios(&["COR-REFERENCE-1"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
         .timeout(120)
         .build(),
     );
@@ -858,10 +854,25 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         ScriptEntryBuilder::new(
             "crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs",
             ScriptKind::RustE2eTest,
-            "MVCC concurrent writer stress tests",
+            "Stock SQLite scaling with sequential in-memory FrankenSQLite baselines",
         )
-        .command("cargo test -p fsqlite-e2e --test mvcc_concurrent_writers")
-        .scenarios(&["MVCC-4", "CON-5"])
+        .command("cargo test --locked -p fsqlite-e2e --test mvcc_concurrent_writers")
+        .scenarios(&["COR-REFERENCE-2"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs",
+            ScriptKind::RustE2eTest,
+            "File-backed distinct-Connection writes and snapshot isolation with stock reopen",
+        )
+        .bead("bd-6hdwo.7")
+        .command("cargo test --locked -p fsqlite-e2e --test concurrent_writer_mvcc_oracle_e2e -j2 -- --show-output --test-threads=1")
+        .scenarios(&["CON-3", "MVCC-3", "MVCC-4", "CON-5"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
         .concurrency(&[
             ConcurrencyMode::ConcurrentWriters,

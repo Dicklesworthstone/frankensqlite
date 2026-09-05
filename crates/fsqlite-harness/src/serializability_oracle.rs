@@ -26,6 +26,79 @@ pub const SERIALIZABILITY_REPORT_SCHEMA_VERSION: &str = "fsqlite.serializability
 pub const HISTORY_SNAPSHOT_KEY: &str = "serializability_history_json";
 /// Canonical failure-bundle snapshot containing the oracle report.
 pub const REPORT_SNAPSHOT_KEY: &str = "serializability_report_json";
+/// Executed file-backed disjoint-writer observation consumed by strict D4 proof.
+pub const CONCURRENT_WRITE_OBSERVATION_SCHEMA: &str = "fsqlite.concurrent-write-observation.v1";
+/// Exactly one compact JSON observation is emitted after the positive keeper passes.
+pub const CONCURRENT_WRITE_OBSERVATION_PREFIX: &str = "FSQLITE_CONCURRENT_WRITE_OBSERVATION=";
+/// Canonical integration target producing the observation.
+pub const CONCURRENT_WRITE_TEST_TARGET: &str = "concurrent_writer_mvcc_oracle_e2e";
+/// Canonical positive test, selected with `--exact` by certificate evidence.
+pub const CONCURRENT_WRITE_TEST_NAME: &str = "observed_disjoint_writer_overlap_for_certificate";
+/// Compiled source bytes that every producer must identify, without selectable subsets.
+pub const CONCURRENT_WRITE_SOURCE_PATHS: [&str; 11] = [
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    "crates/fsqlite-core/Cargo.toml",
+    "crates/fsqlite-core/src/connection.rs",
+    "crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs",
+    "crates/fsqlite-harness/src/serializability_oracle.rs",
+    "crates/fsqlite-harness/src/release_certificate.rs",
+    "crates/fsqlite-pager/src/pager.rs",
+    "crates/fsqlite-pager/src/page_cache.rs",
+    "crates/fsqlite-mvcc/src/concurrent.rs",
+    "crates/fsqlite-vdbe/src/lib.rs",
+];
+
+/// Storage observed for one live connection. `database_id` is a run-bound label
+/// assigned after comparing open handles; it must never encode a VFS `FileIdentity`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrentStorageObservation {
+    pub process_id: String,
+    pub connection_id: String,
+    pub database_id: String,
+    pub backend_kind: String,
+    pub storage_mode: String,
+}
+
+/// Production commit trace phase, distinct from a successful SQL COMMIT return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrentCommitPhase {
+    CommitPlanClean,
+    CommitPublished,
+}
+
+/// A production trace correlated to the calling connection and transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrentCommitObservation {
+    pub logical_time: u64,
+    pub process_id: String,
+    pub connection_id: String,
+    pub transaction_id: String,
+    pub phase: ConcurrentCommitPhase,
+    pub engine_txn_id: u64,
+    pub snapshot_high: u64,
+    pub commit_seq: u64,
+    pub page_id: u32,
+}
+
+/// One executed keeper's observations. Internal consistency does not prove that
+/// this JSON was executed: strict D4 also binds its exact bytes to captured
+/// stdout, a successful named-test receipt, and the tested source tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrentWriteObservation {
+    pub schema_version: String,
+    pub history: TransactionHistory,
+    pub test_target: String,
+    pub test_name: String,
+    pub source_sha256: BTreeMap<String, String>,
+    pub cargo_lock_sha256: String,
+    pub storage: Vec<ConcurrentStorageObservation>,
+    pub commit_phases: Vec<ConcurrentCommitObservation>,
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     crate::bytes_to_lower_hex(Sha256::digest(bytes))
@@ -515,6 +588,246 @@ impl TransactionHistory {
                 errors.join("; ")
             ))
         }
+    }
+}
+
+struct ObservedConcurrentWriter<'a> {
+    connection: (&'a str, &'a str),
+    last_write: u64,
+    plan_time: u64,
+    commit_sequence: u64,
+    pages: BTreeSet<u32>,
+    keys: BTreeSet<&'a str>,
+}
+
+impl ConcurrentWriteObservation {
+    /// Check observations and independently recompute serializability. Execution
+    /// and source authenticity are checked separately by the strict certificate.
+    pub fn validate(&self) -> Result<SerializabilityReport, String> {
+        self.validate_observation_shape()?;
+        let report = check_history(&self.history)?;
+        if report.verdict != OracleVerdict::Serializable {
+            return Err("concurrent observation is not serializable".to_owned());
+        }
+        self.validate_observed_storage()?;
+        self.validate_phase_order()?;
+        let writers = self.observed_committed_writers()?;
+        let overlaps = writers.iter().enumerate().any(|(index, left)| {
+            writers.iter().skip(index + 1).any(|right| {
+                left.connection != right.connection
+                    && left.commit_sequence != right.commit_sequence
+                    && left.pages.is_disjoint(&right.pages)
+                    && left.keys.is_disjoint(&right.keys)
+                    && left.last_write.max(right.last_write) < left.plan_time.min(right.plan_time)
+            })
+        });
+        if !overlaps {
+            return Err(
+                "concurrent observation lacks two overlapping disjoint committed writers"
+                    .to_owned(),
+            );
+        }
+        Ok(report)
+    }
+
+    fn validate_observation_shape(&self) -> Result<(), String> {
+        if self.schema_version != CONCURRENT_WRITE_OBSERVATION_SCHEMA
+            || self.test_target != CONCURRENT_WRITE_TEST_TARGET
+            || self.test_name != CONCURRENT_WRITE_TEST_NAME
+            || self.source_sha256.len() != CONCURRENT_WRITE_SOURCE_PATHS.len()
+            || CONCURRENT_WRITE_SOURCE_PATHS.iter().any(|path| {
+                self.source_sha256
+                    .get(*path)
+                    .is_none_or(|hash| !is_sha256(hash))
+            })
+            || !is_sha256(&self.cargo_lock_sha256)
+            || !(2..=64).contains(&self.storage.len())
+            || self.history.events.len() > 4096
+            || self.commit_phases.len() > 8192
+        {
+            return Err("concurrent observation source, selector, or bounds invalid".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_observed_storage(&self) -> Result<(), String> {
+        let mut connections = BTreeSet::new();
+        let database = &self.storage[0].database_id;
+        for storage in &self.storage {
+            if storage.process_id.trim().is_empty()
+                || storage.connection_id.trim().is_empty()
+                || database.trim().is_empty()
+                || storage.database_id != *database
+                || !matches!(
+                    storage.backend_kind.as_str(),
+                    "unix" | "io_uring" | "windows"
+                )
+                || storage.storage_mode != "compatibility"
+                || !connections
+                    .insert((storage.process_id.as_str(), storage.connection_id.as_str()))
+            {
+                return Err("concurrent observation storage wiring invalid".to_owned());
+            }
+        }
+        for event in &self.history.events {
+            if event.transaction_id.is_some()
+                && !connections.contains(&(event.process_id.as_str(), event.connection_id.as_str()))
+            {
+                return Err("concurrent observation transaction lacks storage wiring".to_owned());
+            }
+        }
+        if !self.history.execution_lane_evidence.iter().any(|lane| {
+            lane.required_lane == crate::test_inventory::ExecutionLane::MvccRequired
+                && lane.requirement_satisfied
+                && matches!(lane.backend_kind.as_str(), "unix" | "io_uring" | "windows")
+        }) || self.history.execution_lane_evidence.iter().any(|lane| {
+            !matches!(lane.backend_kind.as_str(), "unix" | "io_uring" | "windows")
+                || lane.backend_mode != "parity_cert_strict"
+                || !self
+                    .storage
+                    .iter()
+                    .any(|storage| storage.backend_kind == lane.backend_kind)
+        }) {
+            return Err("concurrent observation execution lane mismatch".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_phase_order(&self) -> Result<(), String> {
+        let mut times = BTreeSet::new();
+        for event in &self.history.events {
+            if !times.insert(event.logical_time) {
+                return Err("concurrent observation logical clock is not unique".to_owned());
+            }
+        }
+        let mut phases = BTreeSet::new();
+        for phase in &self.commit_phases {
+            let events = self
+                .history
+                .events
+                .iter()
+                .filter(|event| {
+                    event.transaction_id.as_deref() == Some(phase.transaction_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            let (Some(first), Some(last)) = (events.first(), events.last()) else {
+                return Err("concurrent observation trace has no transaction".to_owned());
+            };
+            if !times.insert(phase.logical_time)
+                || !phases.insert((phase.transaction_id.as_str(), phase.phase))
+                || first.process_id != phase.process_id
+                || first.connection_id != phase.connection_id
+                || !matches!(
+                    first.operation,
+                    HistoryOperation::Begin {
+                        mode: BeginMode::Concurrent
+                    }
+                )
+                || phase.logical_time <= first.logical_time
+                || phase.logical_time >= last.logical_time
+                || phase.engine_txn_id == 0
+                || phase.page_id == 0
+                || phase.commit_seq <= phase.snapshot_high
+                || (phase.phase == ConcurrentCommitPhase::CommitPublished
+                    && !matches!(last.operation, HistoryOperation::Commit))
+            {
+                return Err(
+                    "concurrent observation trace chronology or identity invalid".to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn observed_committed_writers(&self) -> Result<Vec<ObservedConcurrentWriter<'_>>, String> {
+        let mut writers = Vec::new();
+        let mut engine_transactions = BTreeSet::new();
+        let mut commit_sequences = BTreeSet::new();
+        for terminal in self
+            .history
+            .events
+            .iter()
+            .filter(|event| matches!(event.operation, HistoryOperation::Commit))
+        {
+            let events = self
+                .history
+                .events
+                .iter()
+                .filter(|event| event.transaction_id == terminal.transaction_id)
+                .collect::<Vec<_>>();
+            let writes = events
+                .iter()
+                .filter_map(|event| match &event.operation {
+                    HistoryOperation::Write {
+                        key, page_number, ..
+                    } => Some((event.logical_time, key.as_str(), *page_number)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if writes.is_empty() {
+                continue;
+            }
+            let transaction = terminal
+                .transaction_id
+                .as_deref()
+                .expect("validated history transaction");
+            let plan = self
+                .commit_phases
+                .iter()
+                .find(|phase| {
+                    phase.transaction_id == transaction
+                        && phase.phase == ConcurrentCommitPhase::CommitPlanClean
+                })
+                .ok_or_else(|| {
+                    "concurrent observation committed writer lacks plan trace".to_owned()
+                })?;
+            let published = self
+                .commit_phases
+                .iter()
+                .find(|phase| {
+                    phase.transaction_id == transaction
+                        && phase.phase == ConcurrentCommitPhase::CommitPublished
+                })
+                .ok_or_else(|| {
+                    "concurrent observation committed writer lacks publication trace".to_owned()
+                })?;
+            let last_write = writes
+                .iter()
+                .map(|write| write.0)
+                .max()
+                .expect("nonempty writes");
+            let pages = writes
+                .iter()
+                .filter_map(|write| write.2)
+                .collect::<BTreeSet<_>>();
+            if writes
+                .iter()
+                .any(|write| write.2.is_none_or(|page| page == 0))
+                || !pages.contains(&plan.page_id)
+                || plan.page_id != published.page_id
+                || plan.engine_txn_id != published.engine_txn_id
+                || plan.snapshot_high != published.snapshot_high
+                || plan.commit_seq > published.commit_seq
+                || last_write >= plan.logical_time
+                || plan.logical_time >= published.logical_time
+                || !engine_transactions.insert((terminal.process_id.as_str(), plan.engine_txn_id))
+                || !commit_sequences.insert(published.commit_seq)
+            {
+                return Err("concurrent observation writer phases or pages mismatch".to_owned());
+            }
+            writers.push(ObservedConcurrentWriter {
+                connection: (
+                    terminal.process_id.as_str(),
+                    terminal.connection_id.as_str(),
+                ),
+                last_write,
+                plan_time: plan.logical_time,
+                commit_sequence: published.commit_seq,
+                pages,
+                keys: writes.iter().map(|write| write.1).collect(),
+            });
+        }
+        Ok(writers)
     }
 }
 
@@ -1496,6 +1809,224 @@ mod tests {
                 event(5, 5, Some("t2"), HistoryOperation::Commit),
             ],
         )
+    }
+
+    // A typed validator fixture, not evidence that the engine executed. The
+    // public integration keeper supplies the independently executed observation.
+    fn concurrent_observation_history_fixture() -> TransactionHistory {
+        use crate::failure_bundle::ObservedExecutionLane;
+        use crate::test_inventory::ExecutionLane;
+
+        let mut history = base_history(
+            HistoryWorkload::Register,
+            vec![
+                event(
+                    0,
+                    0,
+                    Some("t1"),
+                    HistoryOperation::Begin {
+                        mode: BeginMode::Concurrent,
+                    },
+                ),
+                event(
+                    1,
+                    1,
+                    Some("t2"),
+                    HistoryOperation::Begin {
+                        mode: BeginMode::Concurrent,
+                    },
+                ),
+                event(
+                    2,
+                    2,
+                    Some("t1"),
+                    HistoryOperation::Write {
+                        key: "x".to_owned(),
+                        value: HistoryValue::Integer(1),
+                        page_number: Some(2),
+                    },
+                ),
+                event(
+                    3,
+                    3,
+                    Some("t2"),
+                    HistoryOperation::Write {
+                        key: "y".to_owned(),
+                        value: HistoryValue::Integer(2),
+                        page_number: Some(3),
+                    },
+                ),
+                event(4, 6, Some("t1"), HistoryOperation::Commit),
+                event(5, 9, Some("t2"), HistoryOperation::Commit),
+            ],
+        );
+        history.final_state = BTreeMap::from([
+            ("x".to_owned(), HistoryValue::Integer(1)),
+            ("y".to_owned(), HistoryValue::Integer(2)),
+        ]);
+        history.refresh_final_state_hash();
+        history.execution_lane_evidence = vec![ExecutionLaneEvidence::from_observations(
+            ExecutionLane::MvccRequired,
+            vec![
+                ObservedExecutionLane::SqlResult,
+                ObservedExecutionLane::PagerBacked,
+                ObservedExecutionLane::Mvcc,
+            ],
+            &history.trace_id,
+            &history.run_id,
+            &history.scenario_id,
+            "update",
+            "unix",
+            "parity_cert_strict",
+            "unix:parity_cert_strict",
+            Vec::new(),
+            true,
+        )];
+        history
+    }
+
+    fn concurrent_observation_fixture() -> ConcurrentWriteObservation {
+        ConcurrentWriteObservation {
+            schema_version: CONCURRENT_WRITE_OBSERVATION_SCHEMA.to_owned(),
+            history: concurrent_observation_history_fixture(),
+            test_target: CONCURRENT_WRITE_TEST_TARGET.to_owned(),
+            test_name: CONCURRENT_WRITE_TEST_NAME.to_owned(),
+            source_sha256: CONCURRENT_WRITE_SOURCE_PATHS
+                .into_iter()
+                .map(|path| (path.to_owned(), "a".repeat(64)))
+                .collect(),
+            cargo_lock_sha256: "b".repeat(64),
+            storage: ["t1", "t2"]
+                .into_iter()
+                .map(|txn| ConcurrentStorageObservation {
+                    process_id: "process-0".to_owned(),
+                    connection_id: txn.to_owned(),
+                    database_id: "run-ssi-1/database-0".to_owned(),
+                    backend_kind: "unix".to_owned(),
+                    storage_mode: "compatibility".to_owned(),
+                })
+                .collect(),
+            commit_phases: [("t1", 1, 2, 4, 5), ("t2", 2, 3, 7, 8)]
+                .into_iter()
+                .flat_map(|(txn, seq, page, plan, published)| {
+                    [
+                        (ConcurrentCommitPhase::CommitPlanClean, plan),
+                        (ConcurrentCommitPhase::CommitPublished, published),
+                    ]
+                    .map(|(phase, logical_time)| ConcurrentCommitObservation {
+                        logical_time,
+                        process_id: "process-0".to_owned(),
+                        connection_id: txn.to_owned(),
+                        transaction_id: txn.to_owned(),
+                        phase,
+                        engine_txn_id: seq,
+                        snapshot_high: 0,
+                        commit_seq: seq,
+                        page_id: page,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn concurrent_observation_validates_disjoint_history_and_round_trip() {
+        let observation = concurrent_observation_fixture();
+        let report = observation.validate().expect("valid typed observation");
+        assert_eq!(report.committed_transaction_count, 2);
+        assert_eq!(report.verdict, OracleVerdict::Serializable);
+        let encoded = serde_json::to_string(&observation).expect("encode observation");
+        let decoded: ConcurrentWriteObservation =
+            serde_json::from_str(&encoded).expect("decode observation");
+        assert_eq!(decoded, observation);
+        let mut value = serde_json::to_value(&observation).expect("value");
+        value["threads"] = serde_json::json!(8);
+        assert!(serde_json::from_value::<ConcurrentWriteObservation>(value).is_err());
+    }
+
+    #[test]
+    fn concurrent_observation_rejects_sequential_and_same_page_writers() {
+        let mut sequential = concurrent_observation_fixture();
+        for event in &mut sequential.history.events {
+            if event.transaction_id.as_deref() == Some("t2") {
+                event.logical_time = match event.operation {
+                    HistoryOperation::Begin { .. } => 7,
+                    HistoryOperation::Write { .. } => 8,
+                    HistoryOperation::Commit => 11,
+                    _ => unreachable!("fixture operation"),
+                };
+            }
+        }
+        sequential
+            .history
+            .events
+            .sort_by_key(|event| event.logical_time);
+        for (index, event) in sequential.history.events.iter_mut().enumerate() {
+            event.event_id = u64::try_from(index).expect("event count");
+        }
+        sequential.commit_phases[2].logical_time = 9;
+        sequential.commit_phases[3].logical_time = 10;
+        assert_eq!(
+            check_history(&sequential.history)
+                .expect("sequential history remains serializable")
+                .verdict,
+            OracleVerdict::Serializable
+        );
+        assert!(
+            sequential
+                .validate()
+                .expect_err("sequential is not concurrency proof")
+                .contains("overlapping")
+        );
+
+        let mut same_page = concurrent_observation_fixture();
+        if let HistoryOperation::Write { page_number, .. } =
+            &mut same_page.history.events[3].operation
+        {
+            *page_number = Some(2);
+        }
+        same_page.commit_phases[2].page_id = 2;
+        same_page.commit_phases[3].page_id = 2;
+        assert!(
+            same_page
+                .validate()
+                .expect_err("same page is not disjoint proof")
+                .contains("overlapping")
+        );
+    }
+
+    #[test]
+    fn concurrent_observation_rejects_missing_wiring_source_and_commit_phases() {
+        let valid = concurrent_observation_fixture();
+        let mut missing = valid.clone();
+        missing.storage.clear();
+        assert!(missing.validate().is_err());
+        let mut memory = valid.clone();
+        memory.storage[0].backend_kind = "memory".to_owned();
+        assert!(memory.validate().is_err());
+        let mut mislabeled = valid.clone();
+        mislabeled.storage[0].storage_mode = "native".to_owned();
+        assert!(mislabeled.validate().is_err());
+        let mut wrong_database = valid.clone();
+        wrong_database.storage[1].database_id = "other/database".to_owned();
+        assert!(wrong_database.validate().is_err());
+        let mut no_source = valid.clone();
+        no_source
+            .source_sha256
+            .remove(CONCURRENT_WRITE_SOURCE_PATHS[0]);
+        assert!(no_source.validate().is_err());
+        let mut no_publication = valid.clone();
+        no_publication.commit_phases.remove(1);
+        assert!(no_publication.validate().is_err());
+        let mut late_publication = valid.clone();
+        late_publication.commit_phases[1].logical_time = 10;
+        assert!(late_publication.validate().is_err());
+        let mut wrong_engine = valid.clone();
+        wrong_engine.commit_phases[1].engine_txn_id = 90;
+        assert!(wrong_engine.validate().is_err());
+        let mut duplicate_time = valid;
+        duplicate_time.commit_phases[1].logical_time = 4;
+        assert!(duplicate_time.validate().is_err());
     }
 
     fn cycle_history() -> TransactionHistory {

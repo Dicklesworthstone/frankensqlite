@@ -56,9 +56,16 @@ truth are:
    fsqlite currently guarantees under swarm-write load. What it fails
    on (check `crates/fsqlite-e2e/artifacts/swarm-multiprocess/` for
    captured forensic bundles) is what fsqlite does *not* yet guarantee.
-2. **`crates/fsqlite-e2e/tests/correctness_concurrent_writes.rs`** and
-   **`crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs`** — in-process
-   multi-Connection concurrency tests.
+2. **`crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs`** —
+   file-backed tests using distinct Connections on OS threads, including
+   snapshot isolation and stock SQLite reads of retained data. The canonical
+   E2E inventory selects this target for concurrent-writer scenarios.
+   `correctness_concurrent_writes.rs` and `mvcc_concurrent_writers.rs` keep
+   useful sequential in-memory FrankenSQLite reference checks; their threaded
+   stock SQLite runs do not prove FrankenSQLite transaction overlap. A test
+   target or requested writer count is not execution evidence: concurrency
+   acceptance requires observed overlapping transactions, actual storage
+   wiring and successful named test results for the identified source.
 3. **`docs/canonical_parity_contract.md`** — the SQLite-compatibility
    surface contract; multi-process WAL behavior must match stock SQLite
    for anything this doc classifies as supported.
