@@ -485,3 +485,86 @@ fn parameterized_upsert_do_update_matches_stock() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// The remaining accepted golden diffs.
+//
+// `upsert_on_conflict_do_update` also gained an `Affinity` over the DO UPDATE's
+// rewritten row image (regs 13..17) before the index-delete/rewrite, and its
+// rewrite `Insert` dropped from `OPFLAG_ISUPDATE|OE_REPLACE` to
+// `OPFLAG_ISUPDATE|OE_ABORT` (bd-sque1: a DO UPDATE that moves a row onto an
+// existing key must raise, not clobber). `select_window_boundary` grew a
+// first-row latch and an empty-group NULL path for the bare column beside the
+// aggregate (GH #226 / bd-9zlcs).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upsert_do_update_applies_affinity_to_the_rewrite_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                // The SET values have the wrong storage classes for their
+                // columns: 'title' is TEXT affinity fed an integer, 'score' is
+                // INTEGER affinity fed a numeric string. Both must be coerced
+                // before the row is stored, so `typeof` and the index reads
+                // below agree with stock.
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (1, 7, 'x', 'x', 0) \
+                 ON CONFLICT (id) DO UPDATE SET title = 77, score = '123'",
+            ],
+            &state_plus(&[
+                "SELECT id, title, typeof(title), score, typeof(score) FROM docs WHERE id = 1",
+                "SELECT id FROM docs WHERE title = '77'",
+                "SELECT id FROM docs WHERE score = 123",
+            ]),
+            "upsert_do_update_affinity",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn upsert_do_update_key_collision_aborts_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                // The DO UPDATE moves row 1 onto rowid 2, which already exists.
+                // Stock raises SQLITE_CONSTRAINT rather than clobbering row 2,
+                // and the whole statement must leave the table untouched.
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (1, 7, 'x', 'x', 0) ON CONFLICT (id) DO UPDATE SET id = 2",
+            ],
+            &state_plus(&["SELECT id, title, score FROM docs WHERE id IN (1, 2) ORDER BY id"]),
+            "upsert_do_update_key_collision",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn bare_column_beside_aggregate_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &["CREATE TABLE empty_events(id INTEGER PRIMARY KEY, category_id INTEGER, score INTEGER)"],
+            &[],
+            &[
+                // Implicit aggregate over a non-empty table: the bare column
+                // takes the FIRST scanned row.
+                "SELECT category_id, sum(score) FROM events",
+                // ...and over an empty one: stock returns a single (NULL, NULL)
+                // row, which is what the empty-group path exists for.
+                "SELECT category_id, sum(score) FROM empty_events",
+                "SELECT category_id, count(*), sum(score) FROM empty_events",
+                // The golden's own window shape.
+                "SELECT category_id, sum(score) OVER (PARTITION BY category_id ORDER BY score) \
+                 FROM events ORDER BY category_id, score",
+                "SELECT category_id, sum(score) OVER (PARTITION BY category_id ORDER BY score) \
+                 FROM empty_events",
+            ],
+            "bare_column_beside_aggregate",
+        )
+        .await;
+    });
+}
