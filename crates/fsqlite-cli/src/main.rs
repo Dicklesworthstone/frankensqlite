@@ -136,7 +136,9 @@ impl OutputMode {
 
     const fn separator(self) -> &'static str {
         match self {
-            Self::List => " | ",
+            // sqlite3's default list mode joins columns with a bare `|`
+            // (`SEP_Column`), which its oracle-diff tooling reads back.
+            Self::List => "|",
             Self::Column => "  ",
             Self::Csv | Self::Quote => ",",
             Self::Tabs => "\t",
@@ -1088,17 +1090,29 @@ where
     Ok(())
 }
 
+/// sqlite3 `.mode line` right-aligns column names in a field at least this
+/// wide (shell.c `MODE_Line`: `int w = 5;`).
+const LINE_MODE_MIN_NAME_WIDTH: usize = 5;
+
 fn write_line_rows<W>(rows: &[Row], column_names: &[String], out: &mut W) -> io::Result<()>
 where
     W: Write,
 {
+    // sqlite3 pads every name to the longest one (minimum 5) so the `=` signs
+    // line up: `   id = 1` / `name = x`.
+    let name_width = column_names
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(LINE_MODE_MIN_NAME_WIDTH);
     for (row_index, row) in rows.iter().enumerate() {
         for (column_index, value) in row.values().iter().enumerate() {
             let name = column_names
                 .get(column_index)
                 .map(String::as_str)
                 .unwrap_or("column");
-            writeln!(out, "{name} = {}", render_display_value(value))?;
+            writeln!(out, "{name:>name_width$} = {}", render_display_value(value))?;
         }
         if row_index + 1 < rows.len() {
             writeln!(out)?;
@@ -1138,18 +1152,23 @@ fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
     }
 }
 
+/// `list` / `column` / `line` value rendering, matching sqlite3's display
+/// modes (bd-zy4es): they print `sqlite3_column_text()` verbatim — bare text
+/// (no SQL quoting), an empty string for NULL (the default `.nullvalue`), a
+/// blob's raw bytes, and the engine's REAL-to-TEXT form for numbers.
 fn render_display_value(value: &SqliteValue) -> String {
+    render_raw_value(value)
+}
+
+/// Bare text for `list`/`column`/`line`/`csv`/`tabs`: what sqlite3 gets from
+/// `sqlite3_column_text()`. A blob that is not valid UTF-8 has its invalid
+/// sequences replaced with U+FFFD; sqlite3 would write the raw bytes, which a
+/// `String`-based writer cannot carry.
+fn render_raw_value(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Null => String::from("NULL"),
-        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
-        SqliteValue::Blob(bytes) => {
-            let mut rendered = String::from("X'");
-            for byte in bytes.iter() {
-                let _ = write!(rendered, "{byte:02X}");
-            }
-            rendered.push('\'');
-            rendered
-        }
+        SqliteValue::Null => String::new(),
+        SqliteValue::Text(text) => text.to_string(),
+        SqliteValue::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         _ => value.to_string(),
     }
 }
@@ -1160,14 +1179,16 @@ fn render_display_value(value: &SqliteValue) -> String {
 /// the stored value bit for bit.
 const QUOTE_MODE_REAL_PRECISION: usize = 20;
 
-/// `.mode quote` value rendering. Matches sqlite3's SQL-literal output, which
-/// differs from [`render_display_value`] in two ways: blob hex is lowercase
-/// (`X'0aff'`) and reals carry sqlite3's `%!.20g` expansion (`0.1` ->
-/// `0.1000000000000000056`, `1e300` -> `1.000000000000000052e+300`) instead of
-/// the 17-digit REAL-to-TEXT form, so oracle byte-diff tooling compares
-/// cleanly (bd-7p5z3).
+/// `.mode quote` value rendering: sqlite3's SQL-literal output (shell.c
+/// `MODE_Quote`). NULL is bare, text is `'..'` with `''` escaping, integers are
+/// bare, blob hex is lowercase (`X'0aff'`), and reals carry sqlite3's `%!.20g`
+/// expansion (`0.1` -> `0.1000000000000000056`, `1e300` ->
+/// `1.000000000000000052e+300`) instead of the 17-digit REAL-to-TEXT form, so
+/// oracle byte-diff tooling compares cleanly (bd-7p5z3).
 fn render_quote_value(value: &SqliteValue) -> String {
     match value {
+        SqliteValue::Null => String::from("NULL"),
+        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
         SqliteValue::Blob(bytes) => {
             let mut rendered = String::from("X'");
             for byte in bytes.iter() {
@@ -1177,15 +1198,7 @@ fn render_quote_value(value: &SqliteValue) -> String {
             rendered
         }
         SqliteValue::Float(real) => format_sqlite_float_g(*real, QUOTE_MODE_REAL_PRECISION),
-        _ => render_display_value(value),
-    }
-}
-
-fn render_raw_value(value: &SqliteValue) -> String {
-    match value {
-        SqliteValue::Null => String::new(),
-        SqliteValue::Text(text) => text.to_string(),
-        _ => value.to_string(),
+        SqliteValue::Integer(_) => value.to_string(),
     }
 }
 
@@ -2351,8 +2364,8 @@ mod tests {
 
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, OutputMode, OutputOptions,
-        ShellOptions, format_row, highlight_sql, parse_args, render_prompt, run,
-        run_with_shell_options, statement_complete, write_delimited_rows,
+        ShellOptions, format_row, highlight_sql, parse_args, render_display_value, render_prompt,
+        run, run_with_shell_options, statement_complete, write_delimited_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -2688,8 +2701,9 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             assert_eq!(exit_code, 0);
 
             let stdout = String::from_utf8(out).expect("output should be utf-8");
+            // sqlite3 list mode: bare `|` separator, unquoted text (bd-zy4es).
             assert!(
-                stdout.contains("1 | 'x'"),
+                stdout.contains("1|x"),
                 "expected rendered row in output, got: {stdout}",
             );
         });
@@ -3032,9 +3046,15 @@ SELECT 1 AS one, 'x' AS two;\n\
                 stdout.contains("one") && stdout.contains("two"),
                 "expected headers in column mode output, got: {stdout}",
             );
+            // sqlite3 column mode prints text bare (`x`, not `'x'`), each
+            // cell padded to its header width: `1    x  ` (bd-zy4es).
             assert!(
-                stdout.contains("1") && stdout.contains("'x'"),
+                stdout.contains("1    x"),
                 "expected row data in column mode output, got: {stdout}",
+            );
+            assert!(
+                !stdout.contains("'x'"),
+                "column mode must not SQL-quote text, got: {stdout}",
             );
         });
     }
@@ -3252,18 +3272,20 @@ SELECT x'0aff' AS b;\n\
     /// digits of long expansions, so only the version-stable entries are
     /// compared there and the skipped ones are named on stderr. Skips with a
     /// message when no `sqlite3` binary is on PATH.
-    #[test]
-    fn test_mode_quote_matches_system_sqlite3_shell_bd_7p5z3() {
+    /// The system `sqlite3` shell's `(major, minor, full --version line)`, or
+    /// `None` (with a SKIP note on stderr) when there is no usable binary on
+    /// PATH — the stock-shell differentials below then do not run.
+    fn system_sqlite3_version() -> Option<(u32, u32, String)> {
         let Ok(version_output) = std::process::Command::new("sqlite3")
             .arg("--version")
             .output()
         else {
             eprintln!("SKIP: no `sqlite3` binary on PATH; stock shell differential not run");
-            return;
+            return None;
         };
         if !version_output.status.success() {
             eprintln!("SKIP: `sqlite3 --version` failed; stock shell differential not run");
-            return;
+            return None;
         }
         let version_text = String::from_utf8_lossy(&version_output.stdout)
             .trim()
@@ -3276,8 +3298,12 @@ SELECT x'0aff' AS b;\n\
             .map(|part| part.parse::<u32>().unwrap_or(0));
         let major = version_parts.next().unwrap_or(0);
         let minor = version_parts.next().unwrap_or(0);
-        let exact_float_decode = (major, minor) >= (3, 53);
+        Some((major, minor, version_text))
+    }
 
+    /// Pipes `script` through the system `sqlite3` shell on a fresh in-memory
+    /// database and returns its stdout.
+    fn system_sqlite3_stdout(script: &[u8]) -> Vec<u8> {
         let mut child = std::process::Command::new("sqlite3")
             .arg(":memory:")
             .stdin(std::process::Stdio::piped())
@@ -3288,9 +3314,7 @@ SELECT x'0aff' AS b;\n\
         {
             use std::io::Write as _;
             let mut stdin = child.stdin.take().expect("sqlite3 stdin");
-            stdin
-                .write_all(&quote_mode_script())
-                .expect("write script to sqlite3");
+            stdin.write_all(script).expect("write script to sqlite3");
         }
         let stock = child.wait_with_output().expect("sqlite3 output");
         assert!(
@@ -3298,7 +3322,18 @@ SELECT x'0aff' AS b;\n\
             "sqlite3 failed: {}",
             String::from_utf8_lossy(&stock.stderr)
         );
-        let stock_lines: Vec<String> = String::from_utf8_lossy(&stock.stdout)
+        stock.stdout
+    }
+
+    #[test]
+    fn test_mode_quote_matches_system_sqlite3_shell_bd_7p5z3() {
+        let Some((major, minor, version_text)) = system_sqlite3_version() else {
+            return;
+        };
+        let exact_float_decode = (major, minor) >= (3, 53);
+
+        let stock_stdout = system_sqlite3_stdout(&quote_mode_script());
+        let stock_lines: Vec<String> = String::from_utf8_lossy(&stock_stdout)
             .lines()
             .map(str::to_owned)
             .collect();
@@ -3329,6 +3364,137 @@ SELECT x'0aff' AS b;\n\
                 }
             }
         });
+    }
+
+    /// bd-zy4es: one script exercising every display mode the shell shares with
+    /// sqlite3 — `list` (bare `|`, unquoted text, empty NULL, raw blob bytes),
+    /// `column`, `line`, `tabs`, `csv`, with and without headers. The reals are
+    /// short exact binary fractions so their text is identical on every SQLite
+    /// version, and the CSV section only carries fields both quoting rules
+    /// leave bare (stock also quotes empty strings, spaces, control bytes and
+    /// non-ASCII — a separate gap). `tabs` runs before `csv` because the stock
+    /// shell keeps CSV's CRLF row separator for later modes.
+    const DISPLAY_MODE_SCRIPT: &str = concat!(
+        "CREATE TABLE t(id INTEGER, name TEXT, note TEXT, b BLOB, r REAL, n);\n",
+        "INSERT INTO t VALUES(1, 'plain', 'it''s \"quoted\"', x'4142', 1.5, NULL);\n",
+        "INSERT INTO t VALUES(2, 'has|pipe', 'tab\there', x'0a41', -2.5, NULL);\n",
+        "INSERT INTO t VALUES(3, 'z', 'a,b', x'43', 100.0, 7);\n",
+        ".mode list\n",
+        "SELECT id, name, note, b, r, n FROM t ORDER BY id;\n",
+        "SELECT NULL, '', 'NULL', x'';\n",
+        ".headers on\n",
+        "SELECT id, name FROM t WHERE id = 1;\n",
+        ".mode column\n",
+        "SELECT id, name, r, n FROM t ORDER BY id;\n",
+        ".mode line\n",
+        "SELECT id, name AS a_longer_name, r, n FROM t WHERE id <= 2 ORDER BY id;\n",
+        ".mode tabs\n",
+        "SELECT id, name, note, r, n FROM t ORDER BY id;\n",
+        ".mode csv\n",
+        "SELECT id, name, b, r, n FROM t ORDER BY id;\n",
+    );
+
+    /// Byte-exact stdout of `sqlite3 :memory: < DISPLAY_MODE_SCRIPT` — identical
+    /// on sqlite3 3.46.1 (Linux) and 3.51.0 (macOS). Note the blob `x'0a41'`
+    /// printed as its raw bytes (a line break then `A`), the empty NULL cells,
+    /// the right-aligned `line` names and the padded `column` cells.
+    const DISPLAY_MODE_STOCK_OUTPUT: &str = concat!(
+        "1|plain|it's \"quoted\"|AB|1.5|\n",
+        "2|has|pipe|tab\there|\n",
+        "A|-2.5|\n",
+        "3|z|a,b|C|100.0|7\n",
+        "||NULL|\n",
+        "id|name\n",
+        "1|plain\n",
+        "id  name      r      n\n",
+        "--  --------  -----  -\n",
+        "1   plain     1.5     \n",
+        "2   has|pipe  -2.5    \n",
+        "3   z         100.0  7\n",
+        "           id = 1\n",
+        "a_longer_name = plain\n",
+        "            r = 1.5\n",
+        "            n = \n",
+        "\n",
+        "           id = 2\n",
+        "a_longer_name = has|pipe\n",
+        "            r = -2.5\n",
+        "            n = \n",
+        "id\tname\tnote\tr\tn\n",
+        "1\tplain\tit's \"quoted\"\t1.5\t\n",
+        "2\thas|pipe\ttab\there\t-2.5\t\n",
+        "3\tz\ta,b\t100.0\t7\n",
+        "id,name,b,r,n\r\n",
+        "1,plain,AB,1.5,\r\n",
+        "2,has|pipe,\"\nA\",-2.5,\r\n",
+        "3,z,C,100.0,7\r\n",
+    );
+
+    /// bd-zy4es: `list`/`column`/`line`/`tabs`/`csv` output is byte-identical
+    /// to the sqlite3 shell's. The fsqlite shell must reproduce the pinned stock
+    /// output, and when a `sqlite3` binary is on PATH (3.33+, the modern
+    /// `column` layout) that binary must reproduce it too, closing the
+    /// fsqlite == stock differential live.
+    #[test]
+    fn test_display_modes_match_stock_sqlite3_shell_bd_zy4es() {
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(DISPLAY_MODE_SCRIPT.as_bytes().to_vec());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+            assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+            let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+            assert_eq!(
+                stdout, DISPLAY_MODE_STOCK_OUTPUT,
+                "fsqlite display modes must print exactly what the sqlite3 shell prints"
+            );
+        });
+
+        let Some((major, minor, version_text)) = system_sqlite3_version() else {
+            return;
+        };
+        if (major, minor) < (3, 33) {
+            eprintln!(
+                "SKIP: sqlite3 {version_text} predates the 3.33 column-mode layout; \
+                 live stock differential not run"
+            );
+            return;
+        }
+        let stock_stdout = system_sqlite3_stdout(DISPLAY_MODE_SCRIPT.as_bytes());
+        assert_eq!(
+            String::from_utf8_lossy(&stock_stdout),
+            DISPLAY_MODE_STOCK_OUTPUT,
+            "system sqlite3 {version_text} disagrees with the pinned stock output"
+        );
+    }
+
+    /// bd-zy4es: a blob that is not valid UTF-8 cannot be carried by the
+    /// `String`-based writers byte for byte, so its invalid sequences become
+    /// U+FFFD; valid UTF-8 blobs and every other value come through verbatim.
+    #[test]
+    fn test_render_display_value_is_bare_text_bd_zy4es() {
+        use fsqlite::SqliteValue;
+
+        assert_eq!(render_display_value(&SqliteValue::Null), "");
+        assert_eq!(render_display_value(&SqliteValue::from("it's")), "it's");
+        assert_eq!(render_display_value(&SqliteValue::from("")), "");
+        assert_eq!(render_display_value(&SqliteValue::Integer(-7)), "-7");
+        assert_eq!(
+            render_display_value(&SqliteValue::Float(0.1 + 0.2)),
+            "0.30000000000000004"
+        );
+        assert_eq!(
+            render_display_value(&SqliteValue::from(b"AB".to_vec())),
+            "AB"
+        );
+        assert_eq!(
+            render_display_value(&SqliteValue::from(vec![0xff, b'A'])),
+            "\u{fffd}A"
+        );
     }
 
     #[test]
@@ -3613,7 +3779,8 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                 .await
                 .expect("query_row should succeed");
             let rendered = format_row(&row);
-            assert_eq!(rendered, "10 | 'abc' | NULL");
+            // sqlite3 list mode: `|` separator, bare text, NULL empty (bd-zy4es).
+            assert_eq!(rendered, "10|abc|");
         });
     }
 
