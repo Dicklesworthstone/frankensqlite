@@ -188,7 +188,7 @@ as per-flush deltas.
 |--------|--------|---------|--------------------|
 | `fsqlite_commits_total` (`fsqlite.commits_total`) | — | Completed explicit transactions, including read-only COMMIT, plus committed autocommit write transactions. | Base rate for transaction completion; a sudden drop with steady request load signals stalls. |
 | `fsqlite_conflicts_total` (`fsqlite.conflicts_total`) | `response=busy_snapshot` \| `rebased` | Rejected MVCC commit attempts, or successfully committed rebased transactions. | Compare rejected attempts with committed transactions to measure retry pressure. The `rebased` series reports successful merges in the MVCC transaction-manager API. |
-| `fsqlite_sweeper_clears_total` (`fsqlite.sweeper_clears_total`) | — | Version-sweeper reclamation passes. | Should track roughly with commit volume; a flatline while `history_bytes` climbs indicates the sweeper is starved. |
+| `fsqlite_sweeper_clears_total` (`fsqlite.sweeper_clears_total`) | — | Completed version-store GC passes, including empty passes and passes blocked from reclaiming pinned versions. | Use to check GC activity; an increase does not prove that versions or bytes were reclaimed. |
 | `fsqlite_historical_snapshots_opened_total` (`fsqlite.historical_snapshots_opened_total`) | — | Time-travel / historical snapshots opened. | Informational; correlate with `historical_pins_active`. |
 | `fsqlite_schema_epoch_bumps_total` (`fsqlite.schema_epoch_bumps_total`) | — | Schema-epoch increments (DDL that invalidated cached plans). | A spike outside a deploy window suggests unexpected DDL churn. |
 | `fsqlite_integrity_check_runs_total` (`fsqlite.integrity_check_runs_total`) | `result=ok` \| `fail` | Integrity checks by outcome. | **Page immediately** on any increase of `result="fail"`. |
@@ -209,6 +209,11 @@ requires hot-path profiling. The MVCC API counts a successful rebase once per
 committed transaction, regardless of page count. Partial rebases followed by an
 abort, invalid-state calls, and ordinary successful commits do not increment
 that series. This does not establish a public SQL rebase path.
+
+The sweeper counter increments after `VersionStore::gc_tick` completes its
+pruning and retirement work. It counts passes, not freed versions or bytes:
+reader guards can keep retired versions pinned across multiple passes. Calls
+that return before invoking the version-store collector do not increment it.
 
 ### Histograms (latency, seconds)
 
@@ -279,7 +284,7 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **Engine hot-path wiring** — restoring the remaining sweeper / schema /
+- **Engine hot-path wiring** — restoring the remaining schema /
   integrity recording sites. Commit counts and successful commit latency are wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
@@ -292,8 +297,12 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
   counts, cancellation, reopen, and disabled mode. Clock reads are skipped when
   metrics are disabled. Conflict outcomes are checked by the public SQL keeper
   and `fsqlite-mvcc::lifecycle::tests::real_conflict_metrics_count_terminal_transaction_outcomes`,
-  including a multi-page merge followed by an abort. Other series being present in an
-  exposition is not proof that their engine producers run.
+  including a multi-page merge followed by an abort. Completed GC passes are
+  recorded by `VersionStore::gc_tick`; the real
+  `real_sweeper_metrics_follow_completed_gc_passes` keeper checks pinned-version
+  protection, recycling after guard release, empty passes, and disabled mode.
+  Other series being present in an exposition is not proof that their engine
+  producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
 
 [`StatsdEncoder`]: ../../crates/fsqlite-observability/src/metrics.rs

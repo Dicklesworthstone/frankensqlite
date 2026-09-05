@@ -1260,6 +1260,11 @@ impl VersionStore {
             );
         }
 
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global()
+                .sweeper_clears_total
+                .inc();
+        }
         result
     }
 
@@ -2776,6 +2781,61 @@ mod tests {
         assert_eq!(reused_idx.chunk(), retired_idx.chunk());
         assert_eq!(reused_idx.offset(), retired_idx.offset());
         assert_ne!(reused_idx.generation(), retired_idx.generation());
+    }
+
+    #[test]
+    fn real_sweeper_metrics_follow_completed_gc_passes() {
+        const CHILD: &str = "FSQLITE_GC_METRICS_KEEPER_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["enabled", "disabled"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "invariants::tests::real_sweeper_metrics_follow_completed_gc_passes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("sweeper_metrics mode={mode}\n{stdout}\n{stderr}");
+                assert!(output.status.success(), "isolated {mode} keeper failed");
+                assert!(stderr.contains("event=real_sweeper_metrics_verified"));
+            }
+            return;
+        };
+        assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+        let enabled = mode == "enabled";
+        let counter = &fsqlite_observability::metrics::global().sweeper_clears_total;
+        assert_eq!(counter.get(), 0);
+        // Four real passes: prune one old version, preserve its retired slot
+        // while a reader pins it, then recycle it after releasing that guard.
+        test_gc_tick_recycles_retired_slot_for_next_publish_after_guard_release();
+        assert_eq!(counter.get(), if enabled { 4 } else { 0 });
+        let empty = VersionStore::new(PageSize::DEFAULT);
+        let result = empty.gc_tick(&mut GcTodo::new(), CommitSeq::ZERO);
+        assert_eq!(result.versions_freed, 0);
+        assert_eq!(result.pages_pruned, 0);
+        assert_eq!(counter.get(), if enabled { 5 } else { 0 });
+        let exposition = fsqlite_observability::metrics::render_prometheus();
+        if enabled {
+            assert!(
+                exposition
+                    .lines()
+                    .any(|line| line == "fsqlite_sweeper_clears_total 5")
+            );
+        } else {
+            assert!(exposition.is_empty());
+        }
+        eprintln!(
+            "event=real_sweeper_metrics_verified mode={mode} passes={}",
+            counter.get()
+        );
     }
 
     #[test]
