@@ -143,9 +143,62 @@ fn defer_foreign_keys_unresolved_orphan_errors_at_commit_gh161() {
             "BEGIN",
             "DELETE FROM parent WHERE id=1",
         ] {
-            agree_exec(&f, &r, s).await;
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
         }
-        agree_exec(&f, &r, "COMMIT").await;
+        for attempt in 1..=2 {
+            let frank_error = f.execute("COMMIT").await.unwrap_err();
+            let stock_error = r.execute_batch("COMMIT").unwrap_err();
+            assert!(matches!(
+                frank_error,
+                fsqlite_error::FrankenError::ForeignKeyViolation
+            ));
+            assert!(matches!(
+                stock_error,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+            ));
+            assert!(f.in_transaction(), "failed COMMIT must retain the transaction");
+            assert!(!r.is_autocommit());
+            assert_agree(&f, &r, "PRAGMA defer_foreign_keys").await;
+            assert_eq!(
+                fq(&f, "PRAGMA defer_foreign_keys").await,
+                vec![vec!["1".to_owned()]],
+                "failed COMMIT must retain deferral and its pending obligation"
+            );
+            eprintln!(
+                "FK_ORACLE phase=failed_commit attempt={attempt} \
+                 sqlite_version={} active=true defer_foreign_keys=1 \
+                 error=SQLITE_CONSTRAINT_FOREIGNKEY",
+                rusqlite::version()
+            );
+        }
+
+        f.execute("ROLLBACK").await.unwrap();
+        r.execute_batch("ROLLBACK").unwrap();
+        assert!(!f.in_transaction());
+        assert!(r.is_autocommit());
+        assert_agree(&f, &r, "PRAGMA defer_foreign_keys").await;
+        assert_eq!(
+            fq(&f, "PRAGMA defer_foreign_keys").await,
+            vec![vec!["0".to_owned()]]
+        );
+        assert_agree(&f, &r, "SELECT id FROM parent ORDER BY id").await;
+        assert_agree(&f, &r, "SELECT id, pid FROM child ORDER BY id").await;
+        assert_eq!(
+            fq(&f, "SELECT id FROM parent ORDER BY id").await,
+            vec![vec!["1".to_owned()]]
+        );
+        assert_eq!(
+            fq(&f, "SELECT id, pid FROM child ORDER BY id").await,
+            vec![vec!["10".to_owned(), "1".to_owned()]]
+        );
+        eprintln!(
+            "FK_ORACLE phase=rollback active=false defer_foreign_keys=0 \
+             parent_rows=1 child_rows=1"
+        );
+        f.close().await.unwrap();
+        r.close().unwrap();
     });
 }
 
