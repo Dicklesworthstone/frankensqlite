@@ -3,76 +3,76 @@ source: crates/fsqlite-planner/tests/golden_decision_contract_snapshots.rs
 expression: indexed_join
 ---
 {
-  "case": "decision_indexed_join",
-  "query_text": "SELECT users.id, orders.id FROM users, orders WHERE users.email = ?1 AND orders.product_id = ?2",
-  "state": {
-    "tables": [
-      {
-        "name": "users",
-        "n_pages": 200,
-        "n_rows": 50000,
-        "source": "analyze"
-      },
-      {
-        "name": "orders",
-        "n_pages": 1000,
-        "n_rows": 500000,
-        "source": "analyze"
-      }
-    ],
-    "indexes": [
-      {
-        "name": "idx_users_email",
-        "table": "users",
-        "columns": [
-          "email"
-        ],
-        "unique": true,
-        "n_pages": 30
-      },
-      {
-        "name": "idx_orders_product_id",
-        "table": "orders",
-        "columns": [
-          "product_id"
-        ],
-        "unique": false,
-        "n_pages": 80
-      }
-    ],
-    "where_term_count": 2,
-    "needed_column_count": null,
-    "cross_join_pairs": 0
-  },
   "action": {
+    "access_paths": [
+      {
+        "estimated_cost": 12.570746785383243,
+        "estimated_rows": 1.0,
+        "index": "idx_users_email",
+        "kind": "index_scan_equality",
+        "table": "users"
+      },
+      {
+        "estimated_cost": 16.30771237954945,
+        "estimated_rows": 50000.0,
+        "index": "idx_orders_product_id",
+        "kind": "index_scan_equality",
+        "table": "orders"
+      }
+    ],
+    "beam_width": 5,
     "join_order": [
       "users",
       "orders"
     ],
-    "access_paths": [
+    "star_query_detected": false,
+    "total_estimated_cost": 28.878459164932693
+  },
+  "calibration": null,
+  "case": "decision_indexed_join",
+  "loss": {
+    "actual_cost": null,
+    "estimated_cost": 28.878459164932693,
+    "estimated_rows": 50000.0
+  },
+  "query_text": "SELECT users.id, orders.id FROM users, orders WHERE users.email = ?1 AND orders.product_id = ?2",
+  "state": {
+    "cross_join_pairs": 0,
+    "indexes": [
       {
+        "columns": [
+          "email"
+        ],
+        "n_pages": 30,
+        "name": "idx_users_email",
         "table": "users",
-        "kind": "index_scan_equality",
-        "index": "idx_users_email",
-        "estimated_cost": 12.570746785383243,
-        "estimated_rows": 1.0
+        "unique": true
       },
       {
+        "columns": [
+          "product_id"
+        ],
+        "n_pages": 80,
+        "name": "idx_orders_product_id",
         "table": "orders",
-        "kind": "index_scan_equality",
-        "index": "idx_orders_product_id",
-        "estimated_cost": 16.30771237954945,
-        "estimated_rows": 50000.0
+        "unique": false
       }
     ],
-    "total_estimated_cost": 28.878459164932693,
-    "beam_width": 5,
-    "star_query_detected": false
-  },
-  "loss": {
-    "estimated_cost": 28.878459164932693,
-    "estimated_rows": 50000.0,
-    "actual_cost": null
-  },
-  "calibration": null
+    "needed_column_count": null,
+    "tables": [
+      {
+        "n_pages": 200,
+        "n_rows": 50000,
+        "name": "users",
+        "source": "analyze"
+      },
+      {
+        "n_pages": 1000,
+        "n_rows": 500000,
+        "name": "orders",
+        "source": "analyze"
+      }
+    ],
+    "where_term_count": 2
+  }
 }

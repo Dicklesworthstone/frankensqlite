@@ -3,43 +3,43 @@ source: crates/fsqlite-planner/tests/golden_decision_contract_snapshots.rs
 expression: single_table
 ---
 {
-  "case": "decision_single_table_full_scan",
-  "query_text": "SELECT * FROM t",
-  "state": {
-    "tables": [
+  "action": {
+    "access_paths": [
       {
-        "name": "t",
-        "n_pages": 10,
-        "n_rows": 100,
-        "source": "heuristic"
+        "estimated_cost": 11.0,
+        "estimated_rows": 100.0,
+        "index": null,
+        "kind": "full_table_scan",
+        "table": "t"
       }
     ],
-    "indexes": [],
-    "where_term_count": 0,
-    "needed_column_count": null,
-    "cross_join_pairs": 0
-  },
-  "action": {
+    "beam_width": 1,
     "join_order": [
       "t"
     ],
-    "access_paths": [
+    "star_query_detected": false,
+    "total_estimated_cost": 11.0
+  },
+  "calibration": null,
+  "case": "decision_single_table_full_scan",
+  "loss": {
+    "actual_cost": null,
+    "estimated_cost": 11.0,
+    "estimated_rows": 100.0
+  },
+  "query_text": "SELECT * FROM t",
+  "state": {
+    "cross_join_pairs": 0,
+    "indexes": [],
+    "needed_column_count": null,
+    "tables": [
       {
-        "table": "t",
-        "kind": "full_table_scan",
-        "index": null,
-        "estimated_cost": 11.0,
-        "estimated_rows": 100.0
+        "n_pages": 10,
+        "n_rows": 100,
+        "name": "t",
+        "source": "heuristic"
       }
     ],
-    "total_estimated_cost": 11.0,
-    "beam_width": 1,
-    "star_query_detected": false
-  },
-  "loss": {
-    "estimated_cost": 11.0,
-    "estimated_rows": 100.0,
-    "actual_cost": null
-  },
-  "calibration": null
+    "where_term_count": 0
+  }
 }

@@ -62,6 +62,35 @@ fn where_terms(select: &SelectStatement) -> Result<Vec<WhereTerm<'_>>, String> {
     }
 }
 
+/// Rewrite a JSON tree so every object's keys are in lexicographic order.
+///
+/// `serde_json`'s object type is `IndexMap` when the `preserve_order` feature
+/// is on and `BTreeMap` when it is off, so the same contract serialises to
+/// insertion order or to lexicographic order depending on which crates share
+/// the build. `fsqlite-ext-json` enables `preserve_order` for SQLite JSON1
+/// key-order parity, and Cargo unifies that feature into every build that
+/// contains both crates: these goldens therefore passed under
+/// `cargo test --workspace` and failed under `cargo test -p fsqlite-planner`
+/// (or vice versa) with no planner change at all. Canonicalising here pins the
+/// golden bytes to one order under either resolution.
+fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, nested)| (key, canonicalize(nested)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonicalize).collect()),
+        other => other,
+    }
+}
+
 fn render_contract_case(
     name: &str,
     sql: &str,
@@ -94,7 +123,7 @@ fn render_contract_case(
         "loss": contract.loss,
         "calibration": contract.calibration,
     });
-    serde_json::to_string_pretty(&stable_contract).map_err(|error| error.to_string())
+    serde_json::to_string_pretty(&canonicalize(stable_contract)).map_err(|error| error.to_string())
 }
 
 #[test]
