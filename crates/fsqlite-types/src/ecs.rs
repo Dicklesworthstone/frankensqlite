@@ -539,6 +539,8 @@ pub enum SystematicLayoutError {
     MissingSystematicStartFlag,
     /// Missing required source symbol.
     MissingSystematicSymbol { expected_esi: u32 },
+    /// Fewer records were supplied than the advertised source-symbol count.
+    InsufficientSymbolRecords { required: usize, available: usize },
     /// Duplicate source symbol with the same ESI.
     DuplicateSystematicSymbol { esi: u32 },
     /// Source symbols are not laid out as `ESI 0..K-1` contiguously.
@@ -631,6 +633,13 @@ impl fmt::Display for SystematicLayoutError {
             Self::MissingSystematicSymbol { expected_esi } => {
                 write!(f, "missing systematic symbol esi={expected_esi}")
             }
+            Self::InsufficientSymbolRecords {
+                required,
+                available,
+            } => write!(
+                f,
+                "insufficient records for systematic run: required {required}, available {available}"
+            ),
             Self::DuplicateSystematicSymbol { esi } => {
                 write!(f, "duplicate systematic symbol esi={esi}")
             }
@@ -739,23 +748,33 @@ pub fn layout_systematic_run(
 ) -> Result<Vec<SymbolRecord>, SystematicLayoutError> {
     let first = records
         .first()
-        .ok_or(SystematicLayoutError::EmptySymbolSet)?
-        .clone();
-    let source_symbols = source_symbol_count(first.oti)?;
-    let source_symbols_u64 = source_symbol_count_u64(first.oti)?;
+        .ok_or(SystematicLayoutError::EmptySymbolSet)?;
+    let object_id = first.object_id;
+    let oti = first.oti;
+    let source_symbols = source_symbol_count(oti)?;
+    let source_symbols_u64 = source_symbol_count_u64(oti)?;
     let source_symbols_u32 = u32::try_from(source_symbols_u64).map_err(|_| {
         SystematicLayoutError::SourceSymbolCountExceedsEsiRange {
             source_symbols: source_symbols_u64,
         }
     })?;
-    let symbol_size =
-        usize::try_from(first.oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
+    let symbol_size = usize::try_from(oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
+
+    // Advertised F/T must not allocate more slots than the caller supplied
+    // records. Missing ESIs and duplicates are still checked below when this
+    // necessary coverage bound holds.
+    if source_symbols > records.len() {
+        return Err(SystematicLayoutError::InsufficientSymbolRecords {
+            required: source_symbols,
+            available: records.len(),
+        });
+    }
 
     let mut systematic = vec![None; source_symbols];
     let mut repairs = Vec::new();
 
     for mut record in records {
-        validate_record_shape(&record, first.object_id, first.oti, symbol_size)?;
+        validate_record_shape(&record, object_id, oti, symbol_size)?;
         record.flags.remove(SymbolRecordFlags::SYSTEMATIC_RUN_START);
         if record.esi < source_symbols_u32 {
             let idx = usize::try_from(record.esi).expect("ESI < K fits usize");
@@ -802,10 +821,6 @@ pub fn validate_systematic_run(records: &[SymbolRecord]) -> Result<usize, System
     })?;
     let symbol_size =
         usize::try_from(first.oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
-
-    if source_symbols == 0 {
-        return Ok(0);
-    }
 
     for expected_idx in 0..source_symbols {
         let record = records.get(expected_idx).ok_or_else(|| {
@@ -1749,6 +1764,85 @@ mod tests {
                 );
                 assert_eq!(layout_systematic_run(records), Err(expected));
             }
+        }
+    }
+
+    #[test]
+    fn test_systematic_layout_bounds_advertised_count_before_allocation() {
+        let oti = Oti {
+            f: u64::from(u32::MAX),
+            al: 1,
+            t: 1,
+            z: 1,
+            n: 1,
+        };
+        let record = SymbolRecord::new(
+            ObjectId::from_bytes([0x7A; 16]),
+            oti,
+            0,
+            vec![0],
+            SymbolRecordFlags::SYSTEMATIC_RUN_START,
+        );
+        assert!(record.verify_integrity());
+        let expected = SystematicLayoutError::InsufficientSymbolRecords {
+            required: usize::try_from(u32::MAX).expect("32-bit ESI namespace"),
+            available: 1,
+        };
+        assert_eq!(layout_systematic_run(vec![record]), Err(expected));
+
+        let (records, _, _) = make_symbol_run(ObjectId::from_bytes([0x7B; 16]), 3, 8, 1);
+        // Enough total records cannot hide a missing source ESI or a duplicate.
+        let missing = vec![records[0].clone(), records[2].clone(), records[3].clone()];
+        assert_eq!(
+            layout_systematic_run(missing),
+            Err(SystematicLayoutError::MissingSystematicSymbol { expected_esi: 1 })
+        );
+        let duplicate = vec![records[0].clone(), records[0].clone(), records[2].clone()];
+        assert_eq!(
+            layout_systematic_run(duplicate),
+            Err(SystematicLayoutError::DuplicateSystematicSymbol { esi: 0 })
+        );
+    }
+
+    #[test]
+    fn test_empty_systematic_object_still_validates_supplied_records() {
+        let object_id = ObjectId::from_bytes([0x7C; 16]);
+        let oti = Oti {
+            f: 0,
+            al: 1,
+            t: 8,
+            z: 1,
+            n: 1,
+        };
+        let valid = SymbolRecord::new(object_id, oti, 0, vec![0; 8], SymbolRecordFlags::empty());
+        assert_eq!(validate_systematic_run(std::slice::from_ref(&valid)), Ok(0));
+        assert_eq!(
+            reconstruct_systematic_happy_path(std::slice::from_ref(&valid)),
+            Ok(Vec::new())
+        );
+        let wrong_object = SymbolRecord::new(
+            ObjectId::from_bytes([0x7D; 16]),
+            oti,
+            1,
+            vec![0; 8],
+            SymbolRecordFlags::empty(),
+        );
+        let wrong_oti = SymbolRecord::new(
+            object_id,
+            Oti { f: 1, ..oti },
+            1,
+            vec![0; 8],
+            SymbolRecordFlags::empty(),
+        );
+        let mut short_payload = valid.clone();
+        short_payload.symbol_data.truncate(1);
+        let mut corrupt = valid.clone();
+        corrupt.symbol_data[0] ^= 1;
+        for invalid in [wrong_object, wrong_oti, short_payload, corrupt] {
+            let records = vec![valid.clone(), invalid];
+            assert!(validate_systematic_run(&records).is_err());
+            assert!(reconstruct_systematic_happy_path(&records).is_err());
+            assert!(layout_systematic_run(records).is_err());
         }
     }
 

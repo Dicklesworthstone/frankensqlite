@@ -739,7 +739,7 @@ pub struct SystematicRunLocator {
     pub segment_id: u64,
     /// Inclusive start of the ESI range (always 0 for systematic runs).
     pub esi_start: u32,
-    /// Inclusive end of the ESI range (`K-1`).
+    /// Inclusive end of the ESI range (`K-1`, or 0 for an empty object).
     pub esi_end_inclusive: u32,
     /// Locator offsets in ascending ESI order.
     pub offsets: Vec<SymbolLogOffset>,
@@ -871,6 +871,11 @@ fn fast_path_unavailable_esi(object_id: ObjectId, expected_esi: u32, detail: &st
     );
 }
 
+/// Read the run using object identity and OTI supplied by the caller.
+///
+/// The caller must authenticate this metadata when symbol authentication is
+/// required. An empty object has no source symbols to authenticate here; its
+/// locator must still match the object, have zero ESI bounds and no offsets.
 pub fn read_systematic_fast_path(
     symbols_dir: &Path,
     run: &SystematicRunLocator,
@@ -942,14 +947,6 @@ fn build_systematic_fast_path_plan(
             return None;
         }
     };
-    if source_symbols == 0 {
-        return Some(SystematicFastPathPlan {
-            source_symbols,
-            symbol_size: 0,
-            transfer_len: 0,
-            total_len: 0,
-        });
-    }
     if run.object_id != object_id {
         fast_path_unavailable(object_id, "locator object mismatch");
         return None;
@@ -973,6 +970,14 @@ fn build_systematic_fast_path_plan(
     if run.esi_end_inclusive != expected_end {
         fast_path_unavailable(object_id, "locator ESI range mismatch");
         return None;
+    }
+    if source_symbols == 0 {
+        return Some(SystematicFastPathPlan {
+            source_symbols,
+            symbol_size: 0,
+            transfer_len: 0,
+            total_len: 0,
+        });
     }
 
     let Ok(symbol_size) = usize::try_from(oti.t) else {
@@ -2005,6 +2010,81 @@ mod tests {
         expected.extend_from_slice(&r2.symbol_data);
         expected.truncate(usize::try_from(oti.f).expect("f fits usize"));
         assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn test_systematic_fast_path_empty_object_checks_locator_identity() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let epoch_key = [0xA3_u8; 32];
+        let record = systematic_record(
+            25,
+            Oti {
+                f: 0,
+                al: 4,
+                t: 8,
+                z: 1,
+                n: 1,
+            },
+            0,
+            0x71,
+            false,
+        )
+        .with_auth_tag(&epoch_key);
+        let offset = manager
+            .append(&record)
+            .expect("persist empty-object metadata");
+        let path = symbol_segment_path(dir.path(), offset.segment_id);
+        let before = fs::read(&path).expect("stored bytes");
+        // Supply metadata only after checking the actual stored envelope and MAC.
+        // Passing a key to the empty read alone cannot authenticate any symbols.
+        let stored = read_symbol_record_at_offset(&path, offset, 8).expect("stored metadata");
+        assert!(stored.verify_integrity());
+        assert!(stored.verify_auth(&epoch_key));
+        let object_id = stored.object_id;
+        let oti = stored.oti;
+        let run = SystematicRunLocator {
+            object_id,
+            segment_id: offset.segment_id,
+            esi_start: 0,
+            esi_end_inclusive: 0,
+            offsets: Vec::new(),
+        };
+        assert_eq!(
+            read_systematic_fast_path(dir.path(), &run, object_id, oti, Some(&epoch_key))
+                .expect("authenticated empty-object metadata"),
+            Some(Vec::new())
+        );
+        assert_eq!(fs::read(&path).expect("unchanged stored metadata"), before);
+        eprintln!(
+            "bead_id=bd-3mgq5.4 case=empty_object_locator damage=none metadata_authenticated=true result=empty_object disk_unchanged=true"
+        );
+        for case in [
+            "wrong_object",
+            "nonzero_start",
+            "nonzero_end",
+            "nonempty_offsets",
+        ] {
+            let mut bad = run.clone();
+            match case {
+                "wrong_object" => bad.object_id = ObjectId::from_bytes([26_u8; 16]),
+                "nonzero_start" => bad.esi_start = 1,
+                "nonzero_end" => bad.esi_end_inclusive = 1,
+                "nonempty_offsets" => bad.offsets.push(offset),
+                _ => unreachable!(),
+            }
+            let result =
+                read_systematic_fast_path(dir.path(), &bad, object_id, oti, Some(&epoch_key))
+                    .expect("invalid empty locator requests fallback");
+            assert!(
+                result.is_none(),
+                "case={case} must not return a fake object"
+            );
+            assert_eq!(fs::read(&path).expect("unchanged stored metadata"), before);
+            eprintln!(
+                "bead_id=bd-3mgq5.4 case=empty_object_locator damage={case} metadata_authenticated=true result=fallback disk_unchanged=true"
+            );
+        }
     }
 
     #[test]
