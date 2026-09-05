@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 
 use fsqlite_types::sync_primitives::SystemTime;
@@ -1258,6 +1258,7 @@ struct SsiEvidenceLedgerState {
     next_epoch: u64,
     chain_tip: [u8; 32],
     entries: VecDeque<SsiDecisionCard>,
+    evicted: u64,
 }
 
 impl SsiEvidenceLedgerState {
@@ -1267,6 +1268,7 @@ impl SsiEvidenceLedgerState {
             next_epoch: 1,
             chain_tip: [0_u8; 32],
             entries: VecDeque::new(),
+            evicted: 0,
         }
     }
 
@@ -1314,6 +1316,7 @@ impl SsiEvidenceLedgerState {
 
         if self.entries.len() == self.capacity {
             let _ = self.entries.pop_front();
+            self.evicted = self.evicted.saturating_add(1);
         }
         self.entries.push_back(SsiDecisionCard {
             decision_id: draft.decision_id,
@@ -1333,13 +1336,36 @@ impl SsiEvidenceLedgerState {
     }
 }
 
-/// Bounded append-only ledger for SSI decision cards.
+#[derive(Debug)]
+struct PendingSsiEvidence {
+    entries: VecDeque<SsiDecisionCardDraft>,
+    enabled: bool,
+    dropped: u64,
+}
+
+/// A coherent view of optional SSI evidence retention, not transaction totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsiEvidenceRetentionSnapshot {
+    pub capture_enabled: bool,
+    /// Separate record-count limit for retained cards and queued drafts.
+    pub capacity: usize,
+    pub retained: usize,
+    pub pending: usize,
+    /// Drafts displaced before hashing because the pending queue was full.
+    pub pending_dropped: u64,
+    /// Hashed cards displaced from the retained window.
+    pub retained_evicted: u64,
+}
+
+/// Bounded recent SSI decision evidence. Record counts are bounded; individual
+/// transaction witness payloads are not byte-limited. The chain covers appended
+/// cards, while pending overflow is reported separately as lost evidence.
 #[derive(Debug)]
 pub struct SsiEvidenceLedger {
     state: Mutex<SsiEvidenceLedgerState>,
-    pending_queue: Mutex<VecDeque<SsiDecisionCardDraft>>,
+    pending_queue: Mutex<PendingSsiEvidence>,
+    pending_capacity: usize,
     pending: AtomicUsize,
-    flush_in_progress: AtomicBool,
 }
 
 impl SsiEvidenceLedger {
@@ -1347,22 +1373,29 @@ impl SsiEvidenceLedger {
     pub fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(SsiEvidenceLedgerState::new(capacity)),
-            pending_queue: Mutex::new(VecDeque::new()),
+            pending_queue: Mutex::new(PendingSsiEvidence {
+                entries: VecDeque::new(),
+                enabled: true,
+                dropped: 0,
+            }),
+            pending_capacity: capacity.max(1),
             pending: AtomicUsize::new(0),
-            flush_in_progress: AtomicBool::new(false),
         }
     }
 
-    /// Non-blocking append path used from commit/abort critical sections.
+    /// Queue a draft without waiting for the card-state lock. The short queue
+    /// mutex can still contend; this is not a lock-free operation.
     pub fn record_async(&self, draft: SsiDecisionCardDraft) {
-        self.enqueue_pending(draft);
-        self.try_flush_pending();
+        if self.enqueue_pending(draft) {
+            self.try_flush_pending();
+        }
     }
 
     /// Synchronous append used by callers that need visibility before return.
     pub fn record_sync(&self, draft: SsiDecisionCardDraft) {
-        self.enqueue_pending(draft);
-        self.flush_pending();
+        if self.enqueue_pending(draft) {
+            self.flush_pending();
+        }
     }
 
     /// Return all retained cards in insertion order.
@@ -1417,44 +1450,64 @@ impl SsiEvidenceLedger {
         self.pending.load(Ordering::Acquire)
     }
 
-    fn enqueue_pending(&self, draft: SsiDecisionCardDraft) {
-        with_locked(&self.pending_queue, |queue| {
-            queue.push_back(draft);
-            let _ = self.pending.fetch_add(1, Ordering::AcqRel);
+    /// Read retention counters without draining queued drafts.
+    #[must_use]
+    pub fn retention_snapshot(&self) -> SsiEvidenceRetentionSnapshot {
+        with_locked(&self.state, |state| {
+            with_locked(&self.pending_queue, |queue| SsiEvidenceRetentionSnapshot {
+                capture_enabled: queue.enabled,
+                capacity: state.capacity,
+                retained: state.entries.len(),
+                pending: queue.entries.len(),
+                pending_dropped: queue.dropped,
+                retained_evicted: state.evicted,
+            })
+        })
+    }
+
+    /// Disable and clear this ledger's optional evidence, or resume capture.
+    /// This does not change SSI validation, conflict metrics or tracing.
+    pub fn set_capture_enabled(&self, enabled: bool) {
+        // All operations needing both locks use state -> queue. A flusher that
+        // already took a batch finishes before disable clears its output.
+        with_locked(&self.state, |state| {
+            with_locked(&self.pending_queue, |queue| {
+                queue.enabled = enabled;
+                if !enabled {
+                    *state = SsiEvidenceLedgerState::new(state.capacity);
+                    queue.entries.clear();
+                    queue.dropped = 0;
+                    self.pending.store(0, Ordering::Release);
+                }
+            });
         });
     }
 
-    fn try_flush_pending(&self) {
-        while self.pending.load(Ordering::Acquire) > 0 {
-            if self
-                .flush_in_progress
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
+    fn enqueue_pending(&self, draft: SsiDecisionCardDraft) -> bool {
+        with_locked(&self.pending_queue, |queue| {
+            if !queue.enabled {
+                return false;
             }
+            if queue.entries.len() == self.pending_capacity {
+                let _ = queue.entries.pop_front();
+                queue.dropped = queue.dropped.saturating_add(1);
+            } else {
+                let _ = self.pending.fetch_add(1, Ordering::AcqRel);
+            }
+            queue.entries.push_back(draft);
+            true
+        })
+    }
 
-            let drained = self.try_with_locked_state(|state| self.drain_pending_into(state));
-            self.flush_in_progress.store(false, Ordering::Release);
-            if drained.is_none() {
-                return;
-            }
+    fn try_flush_pending(&self) {
+        if self.pending.load(Ordering::Acquire) > 0 {
+            let _ = self.try_with_locked_state(|state| self.drain_pending_into(state));
         }
     }
 
     fn flush_pending(&self) {
-        while self.pending.load(Ordering::Acquire) > 0 {
-            if self
-                .flush_in_progress
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                std::thread::yield_now();
-                continue;
-            }
-
+        if self.pending.load(Ordering::Acquire) > 0 {
             with_locked(&self.state, |state| self.drain_pending_into(state));
-            self.flush_in_progress.store(false, Ordering::Release);
         }
     }
 
@@ -1473,18 +1526,17 @@ impl SsiEvidenceLedger {
     }
 
     fn drain_pending_into(&self, state: &mut SsiEvidenceLedgerState) {
-        loop {
-            let mut batch = with_locked(&self.pending_queue, std::mem::take);
-            if batch.is_empty() {
-                return;
-            }
-
-            let drained = batch.len();
-            while let Some(draft) = batch.pop_front() {
-                state.append(draft);
-            }
-            let _ = self.pending.fetch_sub(drained, Ordering::AcqRel);
+        // One bounded batch per lock acquisition. Producers can fill another
+        // bounded queue during hashing, but cannot keep this flusher draining
+        // forever and prevent diagnostic readers from acquiring state.
+        let mut batch = with_locked(&self.pending_queue, |queue| {
+            std::mem::take(&mut queue.entries)
+        });
+        let drained = batch.len();
+        while let Some(draft) = batch.pop_front() {
+            state.append(draft);
         }
+        let _ = self.pending.fetch_sub(drained, Ordering::AcqRel);
     }
 }
 
@@ -2177,6 +2229,168 @@ mod tests {
         assert_eq!(cards[0].txn.id.get(), 21);
         assert_eq!(cards[1].txn.id.get(), 22);
         assert_eq!(ledger.pending.load(Ordering::Acquire), 0);
+    }
+
+    fn retention_draft(id: u64) -> SsiDecisionCardDraft {
+        SsiDecisionCardDraft::new(
+            SsiDecisionType::AbortWriteSkew,
+            token(id, 1),
+            CommitSeq::new(10),
+            Vec::new(),
+            vec![page(7)],
+            vec![page(7)],
+            vec![page(9)],
+            "retention_test",
+        )
+        .with_timestamp_unix_ns(id)
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_pending_overflow_retains_recent_and_reports_loss() {
+        let ledger = SsiEvidenceLedger::new(3);
+        let held_state = ledger.state.lock().unwrap();
+        for id in 1..=10 {
+            ledger.record_async(retention_draft(id));
+            assert!(ledger.pending_count() <= 3);
+        }
+        assert_eq!(ledger.pending_count(), 3);
+        drop(held_state);
+        let stats = ledger.retention_snapshot();
+        assert_eq!(
+            (stats.retained, stats.pending, stats.pending_dropped),
+            (0, 3, 7)
+        );
+        let cards = ledger.snapshot();
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.txn.id.get())
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.decision_epoch)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        ledger.record_sync(retention_draft(11));
+        let stats = ledger.retention_snapshot();
+        assert_eq!(
+            (
+                stats.retained,
+                stats.pending,
+                stats.pending_dropped,
+                stats.retained_evicted
+            ),
+            (3, 0, 7, 1)
+        );
+        let cards = ledger.snapshot();
+        assert_eq!(cards.last().unwrap().txn.id.get(), 11);
+        assert_eq!(cards.last().unwrap().decision_epoch, 4);
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_zero_capacity_bounds_pending_and_retained() {
+        let ledger = SsiEvidenceLedger::new(0);
+        let held_state = ledger.state.lock().unwrap();
+        ledger.record_async(retention_draft(1));
+        ledger.record_async(retention_draft(2));
+        assert_eq!(ledger.pending_count(), 1);
+        drop(held_state);
+        assert_eq!(ledger.snapshot()[0].txn.id.get(), 2);
+        let stats = ledger.retention_snapshot();
+        assert_eq!(
+            (stats.capacity, stats.retained, stats.pending_dropped),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_disable_clears_pending_without_resurrection() {
+        let ledger = SsiEvidenceLedger::new(2);
+        ledger.record_sync(retention_draft(1));
+        let held_state = ledger.state.lock().unwrap();
+        for id in 2..=4 {
+            ledger.record_async(retention_draft(id));
+        }
+        drop(held_state);
+        ledger.set_capture_enabled(false);
+        ledger.record_async(retention_draft(5));
+        ledger.record_sync(retention_draft(6));
+        assert!(ledger.snapshot().is_empty());
+        assert_eq!(ledger.pending_count(), 0);
+        assert_eq!(
+            ledger.retention_snapshot(),
+            SsiEvidenceRetentionSnapshot {
+                capture_enabled: false,
+                capacity: 2,
+                retained: 0,
+                pending: 0,
+                pending_dropped: 0,
+                retained_evicted: 0,
+            }
+        );
+        ledger.set_capture_enabled(true);
+        ledger.record_sync(retention_draft(7));
+        assert_eq!(
+            ledger
+                .snapshot()
+                .iter()
+                .map(|card| card.txn.id.get())
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_concurrent_readers_account_for_every_record() {
+        let ledger = SsiEvidenceLedger::new(16);
+        let start = std::sync::Barrier::new(6);
+        std::thread::scope(|scope| {
+            for producer in 0..4 {
+                let ledger = &ledger;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for offset in 1..=128 {
+                        ledger.record_async(retention_draft(producer * 128 + offset));
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let ledger = &ledger;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..128 {
+                        let cards = ledger.snapshot();
+                        assert!(cards.len() <= 16);
+                        assert!(
+                            cards
+                                .windows(2)
+                                .all(|pair| pair[0].decision_epoch < pair[1].decision_epoch
+                                    && pair[0].chain_hash != pair[1].chain_hash)
+                        );
+                        let stats = ledger.retention_snapshot();
+                        assert!(stats.retained <= 16 && stats.pending <= 16);
+                    }
+                });
+            }
+        });
+        let cards = ledger.snapshot();
+        let stats = ledger.retention_snapshot();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(ledger.pending_count(), 0);
+        assert_eq!(
+            u64::try_from(cards.len()).unwrap() + stats.retained_evicted + stats.pending_dropped,
+            512
+        );
+        assert_eq!(
+            cards.last().unwrap().decision_epoch + stats.pending_dropped,
+            512
+        );
     }
 
     #[test]

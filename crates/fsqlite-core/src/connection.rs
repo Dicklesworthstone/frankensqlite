@@ -5736,6 +5736,12 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
         if full_name_is("fsqlite.ssi_decisions") || full_name_is("ssi_decisions") {
             return &PRAGMA_SSI_DECISIONS_COLUMNS;
         }
+        if full_name_is("fsqlite.ssi_evidence_stats") || full_name_is("ssi_evidence_stats") {
+            return &PRAGMA_NAME_VALUE_COLUMNS;
+        }
+        if full_name_is("fsqlite.ssi_evidence_capture") || full_name_is("ssi_evidence_capture") {
+            return &["ssi_evidence_capture"];
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -75336,6 +75342,38 @@ impl Connection {
                 let cards = self.ssi_evidence_ledger.query(&query);
                 Ok(ssi_decision_cards_to_rows(&cards))
             }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.ssi_evidence_capture" | "ssi_evidence_capture" => {
+                if let Some(value) = pragma.value.as_ref() {
+                    self.set_ssi_evidence_capture_enabled(parse_pragma_bool(value)?);
+                }
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(
+                        self.ssi_evidence_retention_snapshot().capture_enabled,
+                    ))],
+                }])
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.ssi_evidence_stats" | "ssi_evidence_stats" => {
+                let snapshot = self.ssi_evidence_retention_snapshot();
+                let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+                Ok([
+                    ("capture_enabled", u64::from(snapshot.capture_enabled)),
+                    ("capacity", count(snapshot.capacity)),
+                    ("retained", count(snapshot.retained)),
+                    ("pending", count(snapshot.pending)),
+                    ("pending_dropped", snapshot.pending_dropped),
+                    ("retained_evicted", snapshot.retained_evicted),
+                ]
+                .into_iter()
+                .map(|(name, value)| Row {
+                    values: vec![
+                        SqliteValue::Text(name.into()),
+                        SqliteValue::Integer(i64::try_from(value).unwrap_or(i64::MAX)),
+                    ],
+                })
+                .collect())
+            }
             // ── RaptorQ repair observability PRAGMAs (bd-t6sv2.3) ──────────
             #[cfg(not(target_arch = "wasm32"))]
             "fsqlite.raptorq_stats" | "raptorq_stats" | "fsqlite_raptorq_stats" => {
@@ -76866,6 +76904,21 @@ impl Connection {
     #[must_use]
     pub fn ssi_decisions_snapshot(&self) -> Vec<SsiDecisionCard> {
         self.ssi_evidence_ledger.snapshot()
+    }
+
+    /// Inspect connection-local SSI evidence capacity and losses without
+    /// flushing pending drafts. These counts are not transaction totals.
+    #[must_use]
+    pub fn ssi_evidence_retention_snapshot(
+        &self,
+    ) -> fsqlite_mvcc::ssi_abort_policy::SsiEvidenceRetentionSnapshot {
+        self.ssi_evidence_ledger.retention_snapshot()
+    }
+
+    /// Toggle connection-local SSI decision evidence. Disabling clears it;
+    /// validation, shared conflict metrics and ordinary tracing are unaffected.
+    pub fn set_ssi_evidence_capture_enabled(&self, enabled: bool) {
+        self.ssi_evidence_ledger.set_capture_enabled(enabled);
     }
 
     /// Query SSI decision cards by transaction id, decision type, and/or time range.

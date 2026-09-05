@@ -5,6 +5,69 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
 #[cfg(feature = "diagnostic-pragmas")]
+fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("ssi-retention.db");
+            let path = path.to_str().expect("temporary path is UTF-8");
+            let monitor = Connection::open(path).await?;
+            monitor.query("PRAGMA journal_mode=WAL;").await?;
+            monitor.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+            monitor.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+            monitor.execute("INSERT INTO a VALUES(1,10);").await?;
+            monitor.execute("INSERT INTO b VALUES(1,20);").await?;
+            let first = Connection::open(path).await?;
+            let second = Connection::open(path).await?;
+            assert!(first.is_concurrent_mode_default() && second.is_concurrent_mode_default());
+            let mut previous_txn = None;
+            for (round, capture) in [true, false, true].into_iter().enumerate() {
+                first.execute(if capture {
+                    "PRAGMA fsqlite.ssi_evidence_capture=ON;"
+                } else {
+                    "PRAGMA fsqlite.ssi_evidence_capture=OFF;"
+                }).await?;
+                let enabled = first.query("PRAGMA ssi_evidence_capture;").await?;
+                assert_eq!(enabled[0].values(), &[SqliteValue::Integer(i64::from(capture))]);
+                assert!(first.ssi_decisions_snapshot().is_empty(), "disable clears the previous round's evidence");
+                monitor.query("PRAGMA fsqlite.conflict_reset;").await?;
+                first.execute("BEGIN;").await?;
+                second.execute("BEGIN;").await?;
+                first.query("SELECT value FROM b WHERE id=1;").await?;
+                second.query("SELECT value FROM a WHERE id=1;").await?;
+                first.execute("UPDATE a SET value=11 WHERE id=1;").await?;
+                second.execute("UPDATE b SET value=value+1 WHERE id=1;").await?;
+                let error = first.execute("COMMIT;").await.expect_err("capture must not affect SSI rejection");
+                assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }));
+                let cards = first.ssi_decisions_snapshot();
+                assert_eq!(cards.len(), usize::from(capture));
+                if let Some(card) = cards.first() {
+                    assert_ne!(previous_txn, Some(card.txn));
+                    previous_txn = Some(card.txn);
+                }
+                let stats = first.query("PRAGMA fsqlite.ssi_evidence_stats;").await?;
+                for (key, expected) in [("capture_enabled", i64::from(capture)), ("capacity", 4096), ("retained", i64::from(capture)), ("pending", 0), ("pending_dropped", 0), ("retained_evicted", 0)] {
+                    assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(name), SqliteValue::Integer(value)] if name.as_ref() == key && *value == expected)), "incorrect {key} stats: {stats:?}");
+                }
+                assert_eq!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.len(), 1, "shared conflict diagnostics are independent of connection-local SSI evidence capture");
+                second.execute("COMMIT;").await?;
+                assert_eq!(monitor.query("SELECT value FROM a WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(10)]);
+                assert_eq!(monitor.query("SELECT value FROM b WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(21 + i64::try_from(round)?) ]);
+                assert!(monitor.ssi_decisions_snapshot().is_empty(), "other connections do not inherit decision cards");
+            }
+            let before = first.ssi_evidence_retention_snapshot();
+            assert!(first.execute("PRAGMA ssi_evidence_capture='invalid';").await.is_err());
+            assert_eq!(first.ssi_evidence_retention_snapshot(), before, "invalid control does not mutate evidence");
+            eprintln!("bead_id=bd-6hdwo.14 event=public_ssi_retention_capture_verified stats={before:?}");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
 fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
     let mut outcome: TestResult = Ok(());
     asupersync::test_utils::run_test(|| async {
