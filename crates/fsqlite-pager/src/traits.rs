@@ -1747,6 +1747,39 @@ impl TransactionKind {
         }
     }
 
+    /// Free-page ownership over the full live integrity extent. Catalog
+    /// reload continues to use [`Self::live_freelist_pages`].
+    #[must_use]
+    pub fn live_integrity_freelist_pages(&self) -> Vec<PageNumber> {
+        match self {
+            Self::Memory(txn) => txn.live_integrity_freelist_pages(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.live_integrity_freelist_pages(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.live_integrity_freelist_pages(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.live_integrity_freelist_pages(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
+        }
+    }
+
+    /// Transaction-private page reservations, separate from reusable free
+    /// pages (see [`SimpleTransaction::live_reserved_pages`]). Mock and drained
+    /// transactions have no private allocator reservations.
+    #[must_use]
+    pub fn live_reserved_pages(&self) -> Vec<PageNumber> {
+        match self {
+            Self::Memory(txn) => txn.live_reserved_pages(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.live_reserved_pages(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.live_reserved_pages(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.live_reserved_pages(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
+        }
+    }
+
     /// The in-transaction database size in pages (see
     /// [`SimpleTransaction::live_db_size`]). Used as the page-extent bound by
     /// `PRAGMA integrity_check` (GH#113) so the walk does not flag pages

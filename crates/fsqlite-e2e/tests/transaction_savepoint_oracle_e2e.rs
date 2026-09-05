@@ -285,3 +285,174 @@ fn savepoint_reuse_name_after_release() {
         .await;
     });
 }
+
+async fn indexed_overflow_live_integrity(file_backed: bool, journal_mode: Option<&str>) {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let path = directory.path().join("private-reservations.db");
+    let f = Connection::open(if file_backed {
+        path.to_str().expect("UTF-8 test path")
+    } else {
+        ":memory:"
+    })
+    .await
+    .expect("open FrankenSQLite");
+    assert!(f.is_concurrent_mode_default());
+    if let Some(mode) = journal_mode {
+        f.execute(&format!("PRAGMA journal_mode={mode}"))
+            .await
+            .expect("configure real journal mode");
+        assert_eq!(
+            frank_rows(&f, "PRAGMA journal_mode").await.unwrap(),
+            vec![vec![format!("'{}'", mode.to_lowercase())]]
+        );
+    }
+    let r = rusqlite::Connection::open_in_memory().expect("open stock oracle");
+    for sql in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY,u INTEGER UNIQUE,k INTEGER,v TEXT)",
+        "CREATE INDEX idx_t_k ON t(k)",
+        "BEGIN",
+    ] {
+        f.execute(sql).await.expect("FrankenSQLite setup");
+        r.execute_batch(sql).expect("stock setup");
+    }
+    let payload = "x".repeat(9000);
+    for id in 1..=512 {
+        let sql = format!("INSERT INTO t VALUES({id},{id},{},'{payload}')", id % 13);
+        f.execute(&sql)
+            .await
+            .expect("FrankenSQLite overflow insert");
+        r.execute_batch(&sql).expect("stock overflow insert");
+    }
+    let overflow_insert = format!("INSERT INTO t VALUES(1003,1003,8,'{payload}')");
+    for sql in [
+        "SAVEPOINT outer_sp",
+        &overflow_insert,
+        "UPDATE t SET k=99,v='changed' WHERE id<=10",
+        "SAVEPOINT inner_sp",
+        "DELETE FROM t WHERE id BETWEEN 11 AND 30",
+        "RELEASE inner_sp",
+        "INSERT INTO t VALUES(1001,1001,7,'first'),(1002,1,8,'duplicate')",
+        "ROLLBACK TO outer_sp",
+        "UPDATE t SET k=88 WHERE id=512",
+        "ROLLBACK TO outer_sp",
+        "RELEASE outer_sp",
+        "COMMIT",
+    ] {
+        let actual = f.execute(sql).await;
+        let expected = r.execute_batch(sql);
+        let should_succeed = !sql.contains("duplicate");
+        assert_eq!(actual.is_ok(), should_succeed, "{sql}: {actual:?}");
+        assert_eq!(expected.is_ok(), should_succeed, "{sql}: {expected:?}");
+        if !should_succeed {
+            assert!(
+                matches!(
+                    &actual,
+                    Err(fsqlite_error::FrankenError::UniqueViolation { .. })
+                ),
+                "the rejected statement must reach UNIQUE enforcement: {actual:?}"
+            );
+            assert_eq!(
+                expected
+                    .as_ref()
+                    .unwrap_err()
+                    .sqlite_error()
+                    .expect("stock UNIQUE error")
+                    .extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            );
+        }
+        for query in [
+            "SELECT id,u,k,v FROM t ORDER BY id",
+            "SELECT id FROM t INDEXED BY idx_t_k WHERE k=7 ORDER BY id",
+        ] {
+            assert_eq!(
+                frank_rows(&f, query).await.expect("FrankenSQLite rows"),
+                sqlite_rows(&r, query).expect("stock rows"),
+                "file_backed={file_backed} after {sql}: {query}"
+            );
+        }
+        assert_eq!(
+            frank_rows(&f, "PRAGMA integrity_check")
+                .await
+                .expect("live integrity query"),
+            vec![vec!["'ok'".to_owned()]],
+            "file_backed={file_backed} after {sql}"
+        );
+        assert_eq!(
+            sqlite_rows(&r, "PRAGMA integrity_check").expect("stock integrity"),
+            vec![vec!["'ok'".to_owned()]]
+        );
+        eprintln!("event=private_reservation_integrity file_backed={file_backed} step={sql}");
+    }
+    // A rollback can leave private reservations above the old database bound.
+    // Grow past that range in a later transaction on the same live connection:
+    // a lost reservation must become a real orphan, not stay hidden at EOF.
+    for sql in [
+        "BEGIN",
+        "SAVEPOINT abort_sp",
+        &overflow_insert,
+        "ROLLBACK TO abort_sp",
+        "RELEASE abort_sp",
+        "ROLLBACK",
+    ] {
+        f.execute(sql).await.expect("whole-transaction rollback");
+        r.execute_batch(sql)
+            .expect("stock whole-transaction rollback");
+    }
+    f.execute("BEGIN")
+        .await
+        .expect("begin growth after rollback");
+    r.execute_batch("BEGIN").expect("stock begin growth");
+    for id in 513..=640 {
+        let sql = format!("INSERT INTO t VALUES({id},{id},{},'{payload}')", id % 13);
+        f.execute(&sql).await.expect("growth after rollback");
+        r.execute_batch(&sql).expect("stock growth after rollback");
+    }
+    f.execute("COMMIT").await.expect("commit later growth");
+    r.execute_batch("COMMIT")
+        .expect("stock commit later growth");
+    for query in [
+        "SELECT id,u,k,v FROM t ORDER BY id",
+        "SELECT id FROM t INDEXED BY idx_t_k WHERE k=7 ORDER BY id",
+        "PRAGMA integrity_check",
+    ] {
+        assert_eq!(
+            frank_rows(&f, query)
+                .await
+                .expect("rows after later growth"),
+            sqlite_rows(&r, query).expect("stock rows after later growth"),
+            "file_backed={file_backed} growth after rollback: {query}"
+        );
+    }
+    eprintln!("event=private_reservation_integrity file_backed={file_backed} step=later_growth");
+    f.close().await.expect("await FrankenSQLite close");
+    if file_backed {
+        let reopened = rusqlite::Connection::open(&path).expect("stock physical reopen");
+        for query in [
+            "SELECT id,u,k,v FROM t ORDER BY id",
+            "SELECT id FROM t INDEXED BY idx_t_k WHERE k=7 ORDER BY id",
+            "PRAGMA integrity_check",
+        ] {
+            assert_eq!(
+                sqlite_rows(&reopened, query).expect("reopened stock rows"),
+                sqlite_rows(&r, query).expect("reference stock rows"),
+                "stock physical reopen: {query}"
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_overflow_live_integrity_memory_pywfi() {
+    asupersync::test_utils::run_test(|| indexed_overflow_live_integrity(false, None));
+}
+
+#[test]
+fn indexed_overflow_live_integrity_file_pywfi() {
+    asupersync::test_utils::run_test(|| indexed_overflow_live_integrity(true, Some("WAL")));
+}
+
+#[test]
+fn indexed_overflow_live_integrity_file_rollback_journal_qkk9h() {
+    asupersync::test_utils::run_test(|| indexed_overflow_live_integrity(true, Some("DELETE")));
+}

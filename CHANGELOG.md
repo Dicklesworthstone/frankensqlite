@@ -85,6 +85,12 @@ Full workspace and all-features release validation remain in progress.
 - Repair impossible freelist entries, keep the reserved lock-byte page out of
   the freelist, and accept unqualified `PRAGMA repair_freelist` (GH#410).
   Cancelled commit preparation preserves allocations still owned by savepoints.
+- Account for private reservations and freed high pages during live integrity
+  checks while retaining catalog visibility rules and corruption detection.
+  Return savepoint-discarded allocations at transaction end, preserving their
+  ownership across failed or cancelled commit preparation. File guards cover
+  later growth through the same or another connection in WAL and rollback-journal
+  modes, followed by stock SQLite reopen.
 - Fold appended WAL frames into the existing tail index. Native trigger and FK
   cascade admission uses measured remaining stack where available; unknown
   stack size and wasm retain the existing depth caps (GH#414).

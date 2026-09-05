@@ -71293,7 +71293,7 @@ impl Connection {
             .active_txn
             .borrow()
             .as_ref()
-            .map(|txn| (txn.live_freelist_pages(), txn.live_db_size()));
+            .map(|txn| (txn.live_integrity_freelist_pages(), txn.live_db_size()));
         self.with_integrity_txn(async |cx, txn| {
             let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let page1_bytes = page1.as_ref();
@@ -72605,6 +72605,25 @@ impl Connection {
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
+        }
+
+        // A batch lease can have unissued pages below an already-issued high
+        // page. Rolled-back allocations likewise remain transaction-private
+        // until their owner reuses or returns them. Claim these separately:
+        // they are neither orphaned nor available on the shared freelist.
+        // Marking before the tree/freelist walks still rejects an invalid
+        // reference to a reserved page as duplicate ownership. This shared
+        // walk also keeps orphan repair from reclaiming private reservations.
+        for page in txn.live_reserved_pages() {
+            if page.get() <= total_pages {
+                Self::record_integrity_page_owner(
+                    Some(&mut *owners),
+                    page_size,
+                    page,
+                    total_pages,
+                    "transaction-private reservation".to_owned(),
+                )?;
+            }
         }
 
         Self::walk_integrity_btree_pages(
@@ -253951,6 +253970,229 @@ mod pager_routing_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_file_reservation_lifecycle_pywfi_qkk9h() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            for journal in ["WAL", "DELETE"] {
+                for (exit, peer_growth) in [
+                    ("commit", false),
+                    ("clean_commit", false),
+                    ("rollback", false),
+                    ("drop", false),
+                    ("commit", true),
+                    ("clean_commit", true),
+                    ("rollback", true),
+                    ("drop", true),
+                ] {
+                    let path = directory
+                        .path()
+                        .join(format!("{journal}-{exit}-{peer_growth}.db"));
+                    let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+                    assert!(conn.is_concurrent_mode_default());
+                    conn.execute(&format!("PRAGMA journal_mode={journal}"))
+                        .await
+                        .unwrap();
+                    let mode = conn.query("PRAGMA journal_mode").await.unwrap();
+                    assert!(mode[0].values()[0]
+                        .as_text()
+                        .unwrap()
+                        .eq_ignore_ascii_case(journal));
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,k INTEGER,v TEXT)")
+                        .await
+                        .unwrap();
+                    conn.execute("CREATE INDEX idx_t_k ON t(k)")
+                        .await
+                        .unwrap();
+                    let cx = Cx::new();
+                    if conn.retained_autocommit_txn.borrow().is_some() {
+                        conn.flush_retained_autocommit_txn(&cx).await.unwrap();
+                    }
+                    conn.invalidate_cached_write_txn(&cx).await;
+                    conn.invalidate_cached_read_snapshot(&cx).await;
+                    // Exercise the production file pager and WAL adapter
+                    // directly, without adding an unreachable committed page.
+                    // Rewriting the existing header makes the dirty-commit
+                    // path run while preserving all SQL-visible contents.
+                    let mut txn = conn
+                        .pager
+                        .begin(&cx, TransactionMode::Concurrent)
+                        .await
+                        .unwrap();
+                    if exit != "clean_commit" {
+                        let header = txn.get_page(&cx, PageNumber::ONE).await.unwrap();
+                        txn.write_page_data(&cx, PageNumber::ONE, header)
+                            .await
+                            .unwrap();
+                    }
+                    txn.savepoint(&cx, "discard_growth").unwrap();
+                    txn.allocate_page(&cx).await.unwrap();
+                    let discarded = txn.allocate_page(&cx).await.unwrap();
+                    txn.write_page(
+                        &cx,
+                        discarded,
+                        &vec![0x5a; conn.pager.page_size().as_usize()],
+                    )
+                    .await
+                    .unwrap();
+                    txn.rollback_to_savepoint(&cx, "discard_growth").unwrap();
+                    txn.release_savepoint(&cx, "discard_growth").unwrap();
+                    assert!(!txn.live_reserved_pages().is_empty());
+                    match exit {
+                        "commit" | "clean_commit" => txn.commit(&cx).await.unwrap(),
+                        "rollback" => txn.rollback(&cx).await.unwrap(),
+                        _ => {}
+                    }
+                    drop(txn);
+
+                    // A different connection must also be able to grow past
+                    // the abandoned range while the original owner stays open.
+                    let peer = if peer_growth {
+                        Some(Connection::open(path.to_str().unwrap()).await.unwrap())
+                    } else {
+                        None
+                    };
+                    let grower = peer.as_ref().unwrap_or(&conn);
+                    let payload = "q".repeat(9000);
+                    grower.execute("BEGIN").await.unwrap();
+                    for id in 1..=256 {
+                        grower
+                            .execute(&format!("INSERT INTO t VALUES({id},{},'{payload}')", id % 13))
+                            .await
+                            .unwrap();
+                    }
+                    grower.execute("COMMIT").await.unwrap();
+                    let integrity = grower.query("PRAGMA integrity_check").await.unwrap();
+                    assert_eq!(integrity.len(), 1);
+                    assert_eq!(
+                        integrity[0].values(),
+                        &[SqliteValue::Text("ok".into())],
+                        "journal={journal} exit={exit} peer_growth={peer_growth}"
+                    );
+                    let indexed = grower
+                        .query("SELECT id FROM t INDEXED BY idx_t_k WHERE k=7 ORDER BY id")
+                        .await
+                        .unwrap();
+                    let expected_ids: Vec<i64> = (1..=256).filter(|id| id % 13 == 7).collect();
+                    assert_eq!(
+                        indexed
+                            .iter()
+                            .map(|row| row.values()[0].as_integer().unwrap())
+                            .collect::<Vec<_>>(),
+                        expected_ids
+                    );
+                    if let Some(peer) = peer {
+                        peer.close().await.unwrap();
+                    }
+                    conn.close().await.unwrap();
+
+                    let stock = rusqlite::Connection::open(&path).unwrap();
+                    let mut statement = stock.prepare("SELECT id,k,v FROM t ORDER BY id").unwrap();
+                    let rows = statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    let expected: Vec<_> = (1_i64..=256)
+                        .map(|id| (id, id % 13, payload.clone()))
+                        .collect();
+                    assert_eq!(
+                        rows, expected,
+                        "journal={journal} exit={exit} peer_growth={peer_growth}"
+                    );
+                    let stock_integrity: String = stock
+                        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        stock_integrity, "ok",
+                        "journal={journal} exit={exit} peer_growth={peer_growth}"
+                    );
+                    eprintln!("event=private_reservation_file_lifecycle journal={journal} exit={exit} peer_growth={peer_growth} stock_rows=256 integrity=ok");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_live_reservations_do_not_hide_orphans_or_aliases_pywfi() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            let cx = Cx::new();
+            let orphan = {
+                let mut active = conn.active_txn.borrow_mut();
+                let txn = active.as_mut().unwrap();
+                let orphan = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, orphan, &vec![0; conn.pager.page_size().as_usize()])
+                    .await
+                    .unwrap();
+                orphan
+            };
+            let rows = conn.query("PRAGMA integrity_check;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            let message = rows[0].values()[0].as_text().unwrap();
+            assert!(
+                message.contains(&format!("page {} is never used", orphan.get())),
+                "{message}"
+            );
+            conn.execute("ROLLBACK;").await.unwrap();
+
+            conn.execute("BEGIN;").await.unwrap();
+            {
+                let mut active = conn.active_txn.borrow_mut();
+                let txn = active.as_mut().unwrap();
+                txn.allocate_page(&cx).await.unwrap();
+                txn.allocate_page(&cx).await.unwrap();
+                txn.allocate_page(&cx).await.unwrap();
+                let reserved = txn.live_reserved_pages()[0];
+                let mut schema = conn.schema.borrow().clone();
+                // Deliberately corrupt the table-root claim to name an actual
+                // private lease page. Ownership must fail before reading it.
+                schema
+                    .iter_mut()
+                    .find(|table| table.name == "t")
+                    .unwrap()
+                    .root_page = i32::try_from(reserved.get()).unwrap();
+                let mut map = HashMap::new();
+                let mut owners = super::PageOwnershipSink::Resident(&mut map);
+                let free = txn.live_integrity_freelist_pages();
+                let total_pages = txn.live_db_size();
+                let error = Connection::validate_page_ownership_in_txn(
+                    &cx,
+                    txn,
+                    conn.pager.page_size(),
+                    0,
+                    total_pages,
+                    0,
+                    0,
+                    false,
+                    &schema,
+                    Some(&free),
+                    &mut owners,
+                )
+                .await
+                .unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains("referenced multiple times"), "{message}");
+                assert!(
+                    message.contains("transaction-private reservation"),
+                    "{message}"
+                );
+            }
+            conn.execute("ROLLBACK;").await.unwrap();
+            conn.close().await.unwrap();
+        });
     }
 
     #[test]
