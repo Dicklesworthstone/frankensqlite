@@ -17,7 +17,7 @@ fn rows() -> usize {
     let count = std::env::var("AOJ0G_ROWS").map_or(10_000, |value| {
         value.parse().expect("AOJ0G_ROWS is an integer")
     });
-    assert!(count >= BATCH && count % BATCH == 0);
+    assert!(count >= BATCH && count.is_multiple_of(BATCH));
     count
 }
 

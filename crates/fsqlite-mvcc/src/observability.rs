@@ -844,6 +844,8 @@ pub fn emit_fcw_base_drift(
 ///
 /// Called when SSI validation detects a dangerous structure (write skew)
 /// and the transaction must abort.
+/// Edge counts describe discovery in this validation attempt. A sticky
+/// `marked_for_abort` flag alone does not supply those counts.
 pub fn emit_ssi_abort(
     observer: &SharedObserver,
     txn: TxnToken,
@@ -874,6 +876,10 @@ pub fn emit_ssi_abort(
 }
 
 /// Emit a conflict-resolved event (merge succeeded).
+///
+/// No current prepare path produces a successful merge. This helper must only
+/// be wired after actual conflict resolution and committed publication, never
+/// from a clean plan or a proposed merge.
 pub fn emit_conflict_resolved(
     observer: &SharedObserver,
     txn: TxnId,

@@ -5556,6 +5556,28 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
 
     #[cfg(feature = "diagnostic-pragmas")]
     {
+        if full_name_is("fsqlite.fallback_capture") || full_name_is("fallback_capture") {
+            return &["fallback_capture"];
+        }
+        if full_name_is("fsqlite.fallback_events") || full_name_is("fallback_events") {
+            return &[
+                "event_id",
+                "connection_id",
+                "statement_id",
+                "transaction_id",
+                "statement_kind",
+                "decision_reason",
+                "decision_outcome",
+                "source_context",
+                "storage_backend",
+            ];
+        }
+        if full_name_is("fsqlite.fallback_stats") || full_name_is("fallback_stats") {
+            return &PRAGMA_NAME_VALUE_COLUMNS;
+        }
+        if full_name_is("fsqlite.fallback_reset") || full_name_is("fallback_reset") {
+            return &PRAGMA_STATUS_COLUMNS;
+        }
         if full_name_is("fsqlite.jit_enable")
             || full_name_is("jit_enable")
             || full_name_is("fsqlite_jit_enable")
@@ -11609,10 +11631,40 @@ pub struct FallbackDecisionSnapshot {
     pub truncated: bool,
 }
 
+/// A routing event from an executing statement, without SQL text or parameters.
+///
+/// Connection and transaction identities are scoped to the live database in
+/// this process. Statement identities are connection-local; nested execution
+/// and the guarded autocommit busy retries retain their outer identity.
+/// Schema reprepare and SQL-rewrite retries can start a new identity. An
+/// allowed routing decision does not certify that the statement succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackExecutionRecord {
+    pub event_id: u64,
+    pub connection_id: Option<u64>,
+    pub statement_id: u64,
+    pub transaction_id: Option<u64>,
+    pub statement_kind: &'static str,
+    pub decision_reason: &'static str,
+    pub decision_outcome: &'static str,
+    pub source_context: &'static str,
+    pub storage_backend: &'static str,
+}
+
+/// The latest 64 actual routing events; aggregate decision counts are separate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FallbackExecutionSnapshot {
+    pub events: Vec<FallbackExecutionRecord>,
+    pub dropped_events: u64,
+}
+
 #[derive(Debug, Default)]
 struct FallbackDecisionCapture {
     decisions: Vec<FallbackDecisionRecord>,
     truncated: bool,
+    executions: VecDeque<FallbackExecutionRecord>,
+    last_event_id: u64,
+    dropped_events: u64,
 }
 
 impl FallbackDecisionCapture {
@@ -11640,9 +11692,75 @@ impl FallbackDecisionCapture {
         }
     }
 
+    fn record_execution(&mut self, mut event: FallbackExecutionRecord) {
+        // SQL exposes exact signed identities. Exhaustion drops evidence rather
+        // than wrapping or aliasing an earlier event, and never changes SQL.
+        if self.last_event_id >= i64::MAX as u64 {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+            return;
+        }
+        self.last_event_id += 1;
+        event.event_id = self.last_event_id;
+        if self.executions.len() == MAX_FALLBACK_DECISION_EVIDENCE {
+            self.executions.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        self.executions.push_back(event);
+    }
+
+    fn execution_snapshot(&self) -> FallbackExecutionSnapshot {
+        FallbackExecutionSnapshot {
+            events: self.executions.iter().cloned().collect(),
+            dropped_events: self.dropped_events,
+        }
+    }
+
     fn reset(&mut self) {
         self.decisions.clear();
         self.truncated = false;
+        self.executions.clear();
+        self.dropped_events = 0;
+        // Keep identities monotone across explicit evidence resets.
+    }
+}
+
+struct FallbackStatementGuard<'a> {
+    slot: &'a Cell<Option<u64>>,
+    previous: Option<u64>,
+}
+
+impl Drop for FallbackStatementGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.set(self.previous);
+    }
+}
+
+/// Installs statement attribution only while its inner future is being polled.
+/// Keeping the guard across `Pending` would mistake an unrelated future for
+/// nested execution and could restore a stale identity after cancellation.
+struct FallbackStatementFuture<'a, T> {
+    conn: &'a Connection,
+    statement_id: Option<u64>,
+    inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+}
+
+impl<T> Future for FallbackStatementFuture<'_, T> {
+    type Output = T;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.statement_id.is_none() {
+            this.statement_id = this.conn.allocate_fallback_statement_id();
+        }
+        let previous = this.conn.fallback_statement_id.replace(this.statement_id);
+        let _scope = FallbackStatementGuard {
+            slot: &this.conn.fallback_statement_id,
+            previous,
+        };
+        this.inner.as_mut().poll(cx)
     }
 }
 
@@ -12526,6 +12644,9 @@ pub struct Connection {
     /// Bounded structured evidence emitted from the authoritative fallback
     /// decision point. This remains active even when tracing is disabled.
     fallback_decision_capture: RefCell<FallbackDecisionCapture>,
+    fallback_capture_enabled: Cell<bool>,
+    fallback_statement_id: Cell<Option<u64>>,
+    last_fallback_statement_id: Cell<u64>,
     // ── Virtual table module registry (bd-196x4) ────────────────────────────
     /// Registered virtual-table module factories, keyed by module name
     /// (uppercased).  Used by `CREATE VIRTUAL TABLE ... USING module(args)`.
@@ -14002,6 +14123,9 @@ impl Connection {
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
+            fallback_capture_enabled: Cell::new(true),
+            fallback_statement_id: Cell::new(None),
+            last_fallback_statement_id: Cell::new(0),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
@@ -14534,6 +14658,9 @@ impl Connection {
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
+            fallback_capture_enabled: Cell::new(true),
+            fallback_statement_id: Cell::new(None),
+            last_fallback_statement_id: Cell::new(0),
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
@@ -22145,6 +22272,47 @@ impl Connection {
         self.fallback_decision_capture.borrow().snapshot()
     }
 
+    /// Latest bounded execution events. This excludes prepare-only activity and
+    /// diagnostics reads, and never includes SQL text, parameters or paths.
+    #[must_use]
+    pub fn fallback_execution_snapshot(&self) -> FallbackExecutionSnapshot {
+        self.fallback_decision_capture.borrow().execution_snapshot()
+    }
+
+    /// Enable or disable connection-local fallback evidence. Disabling clears
+    /// retained evidence; routing policy and ordinary tracing are unaffected.
+    pub fn set_fallback_capture_enabled(&self, enabled: bool) {
+        self.fallback_capture_enabled.set(enabled);
+        if !enabled {
+            self.reset_fallback_decision_evidence();
+        }
+    }
+
+    fn allocate_fallback_statement_id(&self) -> Option<u64> {
+        if let Some(statement_id) = self.fallback_statement_id.get() {
+            return Some(statement_id);
+        }
+        if self.fallback_capture_enabled.get() {
+            let last = self.last_fallback_statement_id.get();
+            if last < i64::MAX as u64 {
+                self.last_fallback_statement_id.set(last + 1);
+                return Some(last + 1);
+            }
+        }
+        None
+    }
+
+    fn with_fallback_statement<'a, T>(
+        &'a self,
+        inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+    ) -> FallbackStatementFuture<'a, T> {
+        FallbackStatementFuture {
+            conn: self,
+            statement_id: None,
+            inner,
+        }
+    }
+
     /// Clear all connection-local fallback-decision evidence.
     pub fn reset_fallback_decision_evidence(&self) {
         self.fallback_decision_capture.borrow_mut().reset();
@@ -22338,9 +22506,9 @@ impl Connection {
         );
         let statement_fingerprint =
             Self::fallback_statement_fingerprint(statement_kind, decision_reason);
-        self.fallback_decision_capture
-            .borrow_mut()
-            .record(FallbackDecisionRecord {
+        if self.fallback_capture_enabled.get() {
+            let mut capture = self.fallback_decision_capture.borrow_mut();
+            capture.record(FallbackDecisionRecord {
                 statement_kind: statement_kind.to_owned(),
                 fallback_boundary: fallback_boundary.clone(),
                 decision_reason: decision_reason.to_owned(),
@@ -22349,6 +22517,20 @@ impl Connection {
                 first_failure_diagnostic: first_failure_diag.clone(),
                 occurrences: 1,
             });
+            if let Some(statement_id) = self.fallback_statement_id.get() {
+                capture.record_execution(FallbackExecutionRecord {
+                    event_id: 0,
+                    connection_id: self.pool_metrics.get().map(|metrics| metrics.connection_id),
+                    statement_id,
+                    transaction_id: *self.concurrent_session_id.borrow(),
+                    statement_kind,
+                    decision_reason,
+                    decision_outcome,
+                    source_context,
+                    storage_backend: self.pager_backend_label(),
+                });
+            }
+        }
         let backend_identity = self.backend_identity();
         let (run_id, scenario_id) = statement_reuse_log_context_from_env();
         if decision_outcome == "denied" {
@@ -22396,6 +22578,12 @@ impl Connection {
         statement_kind: &'static str,
         decision_reason: &'static str,
     ) -> Result<()> {
+        // Honour the caller's cancellation before admitting or recording the
+        // fallback. Some in-memory branches reach this point before page I/O
+        // supplies its usual checkpoint.
+        self.op_cx_after_background_status()
+            .checkpoint()
+            .map_err(|_| FrankenError::Abort)?;
         let mode = self.backend_mode_label();
         let reject_mem = *self.reject_mem_fallback.borrow();
         let strict_reject = *self.reject_mem_fallback_strict.borrow();
@@ -22466,6 +22654,11 @@ impl Connection {
         statement_kind: &'static str,
         decision_reason: &'static str,
     ) -> Result<MemFallbackRejectionOverrideGuard<'_>> {
+        // Cancellation must precede both strict-denial capture and the
+        // temporary policy change that admits this internal fallback.
+        self.op_cx_after_background_status()
+            .checkpoint()
+            .map_err(|_| FrankenError::Abort)?;
         let previous_reject = *self.reject_mem_fallback.borrow();
         if previous_reject && *self.reject_mem_fallback_strict.borrow() {
             let (decision_outcome, first_failure_diag) = self.log_fallback_decision_event(
@@ -26363,16 +26556,19 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
-        self.background_status()?;
-        // bd-wymdl (defect 3): the single chokepoint for every prepared DML
-        // path -- `execute_prepared`, `PreparedStatement::execute`, and
-        // `PreparedStatement::execute_with_params` all funnel here. Without
-        // settlement, a statement prepared before a transaction and executed
-        // after that transaction's guard was dropped would write inside the
-        // abandoned transaction instead of rolling it back first.
-        self.settle_pending_transaction_cleanup().await?;
-        self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
-            .await
+        self.with_fallback_statement(Box::pin(async {
+            self.background_status()?;
+            // bd-wymdl (defect 3): the single chokepoint for every prepared DML
+            // path -- `execute_prepared`, `PreparedStatement::execute`, and
+            // `PreparedStatement::execute_with_params` all funnel here. Without
+            // settlement, a statement prepared before a transaction and executed
+            // after that transaction's guard was dropped would write inside the
+            // abandoned transaction instead of rolling it back first.
+            self.settle_pending_transaction_cleanup().await?;
+            self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
+                .await
+        }))
+        .await
     }
 
     /// Whether the connection is at an autocommit statement boundary, i.e. a
@@ -26512,8 +26708,8 @@ impl Connection {
         stmt: &'a PreparedStatement<'_>,
         params: &'a [SqliteValue],
         force_skip_statement_savepoint_in_explicit_txn: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<usize>> + 'a>> {
-        Box::pin(async move {
+    ) -> FallbackStatementFuture<'a, Result<usize>> {
+        self.with_fallback_statement(Box::pin(async move {
             let _record_profile_scope =
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             if !std::ptr::eq(self, stmt.conn) {
@@ -26795,7 +26991,7 @@ impl Connection {
                     .await?
                     .len())
             }
-        })
+        }))
     }
 
     async fn query_prepared_with_params_after_background_status(
@@ -26803,49 +26999,78 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        if !std::ptr::eq(self, stmt.conn) {
-            return Err(FrankenError::internal(
-                "prepared statement belongs to a different connection",
-            ));
-        }
-        if stmt.dml_dispatch.is_some() {
-            return Err(FrankenError::Internal(
-                "DML prepared statements must be executed through \
-                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                    .to_owned(),
-            ));
-        }
-        if stmt.may_observe_change_tracking {
-            self.sync_change_tracking_context();
-        }
-        let op_cx = self.op_cx_after_background_status();
-        if let Some(statement @ Statement::Pragma(_)) = stmt.deferred_query_statement.as_deref() {
-            // A PRAGMA can have zero result columns and still carry a side
-            // effect. Dispatch it through the generic statement path rather
-            // than establishing the read-only snapshot used by SELECTs.
-            stmt.ensure_schema_unchanged(&op_cx).await?;
-            let rows_result = self
-                .execute_statement_after_background_status(statement, Some(params))
-                .await;
-            if rows_result.is_ok() {
-                self.note_connection_statement_execution_count(1);
+        self.with_fallback_statement(Box::pin(async {
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::CoreConnection);
+            if !std::ptr::eq(self, stmt.conn) {
+                return Err(FrankenError::internal(
+                    "prepared statement belongs to a different connection",
+                ));
             }
-            return rows_result;
-        }
-        if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(mut rows) = self
-                .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+            if stmt.dml_dispatch.is_some() {
+                return Err(FrankenError::Internal(
+                    "DML prepared statements must be executed through \
+                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
+                        .to_owned(),
+                ));
+            }
+            if stmt.may_observe_change_tracking {
+                self.sync_change_tracking_context();
+            }
+            let op_cx = self.op_cx_after_background_status();
+            if let Some(statement @ Statement::Pragma(_)) = stmt.deferred_query_statement.as_deref()
+            {
+                // A PRAGMA can have zero result columns and still carry a side
+                // effect. Dispatch it through the generic statement path rather
+                // than establishing the read-only snapshot used by SELECTs.
+                stmt.ensure_schema_unchanged(&op_cx).await?;
+                let rows_result = self
+                    .execute_statement_after_background_status(statement, Some(params))
+                    .await;
+                if rows_result.is_ok() {
+                    self.note_connection_statement_execution_count(1);
+                }
+                return rows_result;
+            }
+            if self
+                .retained_autocommit_overlay_dirty_fast_path(stmt)
+                .is_some()
+            {
+                let _overlay_entry_proof = stmt
+                    .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                    .await?;
+                if let Some(mut rows) = self
+                    .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+                    .await?
+                {
+                    let fast_path =
+                        stmt.prepared_query_fast_path_metadata("retained overlay query fast path")?;
+                    fast_path.record_query_hit();
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            target: "fsqlite.execute_path",
+                            path = "fast",
+                            reason = "retained_autocommit_overlay_query",
+                        );
+                    }
+                    if stmt.distinct {
+                        let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                        dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
+                    }
+                    self.note_connection_statement_execution_count(1);
+                    return Ok(rows);
+                }
+            }
+            if self
+                .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
                 .await?
+                && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
             {
                 let fast_path =
-                    stmt.prepared_query_fast_path_metadata("retained overlay query fast path")?;
+                    stmt.prepared_query_fast_path_metadata("clean memory query fast path")?;
                 fast_path.record_query_hit();
                 if hot_path_profile_enabled() {
                     FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -26854,7 +27079,8 @@ impl Connection {
                     tracing::debug!(
                         target: "fsqlite.execute_path",
                         path = "fast",
-                        reason = "retained_autocommit_overlay_query",
+                        reason = fast_path.query_trace_reason(),
+                        read_boundary = "skipped_clean_memory_memdb",
                     );
                 }
                 if stmt.distinct {
@@ -26864,68 +27090,42 @@ impl Connection {
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
-        }
-        if self
-            .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
-            .await?
-            && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
-        {
-            let fast_path =
-                stmt.prepared_query_fast_path_metadata("clean memory query fast path")?;
-            fast_path.record_query_hit();
-            if hot_path_profile_enabled() {
-                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            if self
+                .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
+                .await?
+                && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
+            {
+                let fast_path =
+                    stmt.prepared_query_fast_path_metadata("clean file-backed query fast path")?;
+                fast_path.record_query_hit();
+                if hot_path_profile_enabled() {
+                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "fast",
+                        reason = fast_path.query_trace_reason(),
+                        read_boundary = "skipped_clean_file_backed_memdb",
+                    );
+                }
+                if stmt.distinct {
+                    let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
+                }
+                self.note_connection_statement_execution_count(1);
+                return Ok(rows);
             }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "fast",
-                    reason = fast_path.query_trace_reason(),
-                    read_boundary = "skipped_clean_memory_memdb",
-                );
-            }
-            if stmt.distinct {
-                let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-                dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-            }
-            self.note_connection_statement_execution_count(1);
-            return Ok(rows);
-        }
-        if self
-            .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
-            .await?
-            && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
-        {
-            let fast_path =
-                stmt.prepared_query_fast_path_metadata("clean file-backed query fast path")?;
-            fast_path.record_query_hit();
-            if hot_path_profile_enabled() {
-                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "fast",
-                    reason = fast_path.query_trace_reason(),
-                    read_boundary = "skipped_clean_file_backed_memdb",
-                );
-            }
-            if stmt.distinct {
-                let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-                dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-            }
-            self.note_connection_statement_execution_count(1);
-            return Ok(rows);
-        }
-        let prepared_auto_read = self
-            .prepare_connection_for_prepared_read(stmt, &op_cx)
-            .await?;
-        let entry_proof = stmt
-            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-            .await?;
-        if let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)? {
-            let fast_path =
-                match stmt.prepared_query_fast_path_metadata("prepared query fast path outcome") {
+            let prepared_auto_read = self
+                .prepare_connection_for_prepared_read(stmt, &op_cx)
+                .await?;
+            let entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
+            if let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)? {
+                let fast_path = match stmt
+                    .prepared_query_fast_path_metadata("prepared query fast path outcome")
+                {
                     Ok(fast_path) => fast_path,
                     Err(err) => {
                         self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
@@ -26933,7 +27133,122 @@ impl Connection {
                         return Err(err);
                     }
                 };
-            fast_path.record_query_hit();
+                fast_path.record_query_hit();
+                if hot_path_profile_enabled() {
+                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "fast",
+                        reason = fast_path.query_trace_reason(),
+                    );
+                }
+                if stmt.distinct {
+                    let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
+                }
+                self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                    .await?;
+                self.note_connection_statement_execution_count(1);
+                return Ok(rows);
+            }
+            if let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
+                && let Some(rows) =
+                    self.execute_top_category_cte_join_fast_path(select, Some(params))?
+            {
+                if hot_path_profile_enabled() {
+                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                    .await?;
+                self.note_connection_statement_execution_count(1);
+                return Ok(rows);
+            }
+            // bd-z22mq: prepared lane for the memoized rowid-bucket SUM+GROUP BY
+            // shape. The deferred route below re-enters the full statement
+            // pipeline (structure validation, subquery rewrite, autocommit
+            // wrapping, dispatch cascade) on every execution; when the deferred
+            // select is structurally identical to the memo, those stages are
+            // provably identity/no-ops (the memoized select already passed them,
+            // and DDL / write commits / registry changes drop the memo), so jump
+            // straight to the mem-scan lane. This runs AFTER
+            // `prepare_connection_for_prepared_read` (retained-autocommit mirror
+            // rehydration) and the schema-unchanged proof, mirroring the
+            // CTE-join fast path above; the lane re-checks its dynamic guards and
+            // reads live rows, and a refusal falls through unchanged. DISTINCT
+            // and parameterized executions are excluded as in the dispatch-level
+            // short-circuit.
+            if params.is_empty()
+                && let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
+                && !is_distinct_select(select)
+            {
+                let memo_rows_result = {
+                    let memo_slot = self.group_by_bucket_fast_memo.borrow();
+                    match memo_slot.as_ref() {
+                        Some(memo) if memo.select == *select => self
+                            .try_execute_rowid_bucket_sum_group_by_mem_scan(
+                                memo.root_page,
+                                &memo.table_schema,
+                                &memo.effective_label,
+                                &memo.group_by_exprs,
+                                &memo.result_descriptors,
+                            ),
+                        _ => Ok(None),
+                    }
+                };
+                match memo_rows_result {
+                    Ok(Some(rows)) => {
+                        // Preserve strict parity-cert accounting: this is the same
+                        // fallback the deferred dispatch would have taken.
+                        let log_result =
+                            self.log_mem_execution_fallback("select", "group_by_fallback");
+                        self.finish_prepared_read_autocommit(
+                            prepared_auto_read,
+                            log_result.is_ok(),
+                            &op_cx,
+                        )
+                        .await?;
+                        log_result?;
+                        if hot_path_profile_enabled() {
+                            FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        self.note_connection_statement_execution_count(1);
+                        return Ok(rows);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                            .await?;
+                        return Err(err);
+                    }
+                }
+            }
+            if let Some(statement) = &stmt.deferred_query_statement {
+                if hot_path_profile_enabled() {
+                    FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "slow",
+                        reason = "deferred_query_statement",
+                    );
+                }
+                let rows_result = self
+                    .execute_statement_after_background_status(statement.as_ref(), Some(params))
+                    .await;
+                self.finish_prepared_read_autocommit(
+                    prepared_auto_read,
+                    rows_result.is_ok(),
+                    &op_cx,
+                )
+                .await?;
+                if rows_result.is_ok() {
+                    self.note_connection_statement_execution_count(1);
+                }
+                return rows_result;
+            }
             if hot_path_profile_enabled() {
                 FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -26941,145 +27256,37 @@ impl Connection {
                 tracing::debug!(
                     target: "fsqlite.execute_path",
                     path = "fast",
-                    reason = fast_path.query_trace_reason(),
+                    reason = if stmt.db.is_some() { "table_query" } else { "program_execute" },
                 );
             }
+            let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+            let rows_result = if stmt.db.is_some() {
+                stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
+                    .await
+            } else {
+                execute_program_with_postprocess(
+                    stmt.program.as_ref(),
+                    Some(params),
+                    stmt.func_registry.as_ref(),
+                    Some(&self.collation_registry),
+                    &op_cx,
+                    stmt.expression_postprocess.as_ref(),
+                    page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                )
+                .await
+            };
+            record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
+                .await?;
+            let mut rows = rows_result?;
             if stmt.distinct {
                 let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                 dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
             }
-            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
-                .await?;
             self.note_connection_statement_execution_count(1);
-            return Ok(rows);
-        }
-        if let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
-            && let Some(rows) =
-                self.execute_top_category_cte_join_fast_path(select, Some(params))?
-        {
-            if hot_path_profile_enabled() {
-                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
-                .await?;
-            self.note_connection_statement_execution_count(1);
-            return Ok(rows);
-        }
-        // bd-z22mq: prepared lane for the memoized rowid-bucket SUM+GROUP BY
-        // shape. The deferred route below re-enters the full statement
-        // pipeline (structure validation, subquery rewrite, autocommit
-        // wrapping, dispatch cascade) on every execution; when the deferred
-        // select is structurally identical to the memo, those stages are
-        // provably identity/no-ops (the memoized select already passed them,
-        // and DDL / write commits / registry changes drop the memo), so jump
-        // straight to the mem-scan lane. This runs AFTER
-        // `prepare_connection_for_prepared_read` (retained-autocommit mirror
-        // rehydration) and the schema-unchanged proof, mirroring the
-        // CTE-join fast path above; the lane re-checks its dynamic guards and
-        // reads live rows, and a refusal falls through unchanged. DISTINCT
-        // and parameterized executions are excluded as in the dispatch-level
-        // short-circuit.
-        if params.is_empty()
-            && let Some(Statement::Select(select)) = stmt.deferred_query_statement.as_deref()
-            && !is_distinct_select(select)
-        {
-            let memo_rows_result = {
-                let memo_slot = self.group_by_bucket_fast_memo.borrow();
-                match memo_slot.as_ref() {
-                    Some(memo) if memo.select == *select => self
-                        .try_execute_rowid_bucket_sum_group_by_mem_scan(
-                            memo.root_page,
-                            &memo.table_schema,
-                            &memo.effective_label,
-                            &memo.group_by_exprs,
-                            &memo.result_descriptors,
-                        ),
-                    _ => Ok(None),
-                }
-            };
-            match memo_rows_result {
-                Ok(Some(rows)) => {
-                    // Preserve strict parity-cert accounting: this is the same
-                    // fallback the deferred dispatch would have taken.
-                    let log_result = self.log_mem_execution_fallback("select", "group_by_fallback");
-                    self.finish_prepared_read_autocommit(
-                        prepared_auto_read,
-                        log_result.is_ok(),
-                        &op_cx,
-                    )
-                    .await?;
-                    log_result?;
-                    if hot_path_profile_enabled() {
-                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    self.note_connection_statement_execution_count(1);
-                    return Ok(rows);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
-                        .await?;
-                    return Err(err);
-                }
-            }
-        }
-        if let Some(statement) = &stmt.deferred_query_statement {
-            if hot_path_profile_enabled() {
-                FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "slow",
-                    reason = "deferred_query_statement",
-                );
-            }
-            let rows_result = self
-                .execute_statement_after_background_status(statement.as_ref(), Some(params))
-                .await;
-            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
-                .await?;
-            if rows_result.is_ok() {
-                self.note_connection_statement_execution_count(1);
-            }
-            return rows_result;
-        }
-        if hot_path_profile_enabled() {
-            FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-            tracing::debug!(
-                target: "fsqlite.execute_path",
-                path = "fast",
-                reason = if stmt.db.is_some() { "table_query" } else { "program_execute" },
-            );
-        }
-        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-        let rows_result = if stmt.db.is_some() {
-            stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
-                .await
-        } else {
-            execute_program_with_postprocess(
-                stmt.program.as_ref(),
-                Some(params),
-                stmt.func_registry.as_ref(),
-                Some(&self.collation_registry),
-                &op_cx,
-                stmt.expression_postprocess.as_ref(),
-                page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
-            )
-            .await
-        };
-        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
-            .await?;
-        let mut rows = rows_result?;
-        if stmt.distinct {
-            let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-            dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-        }
-        self.note_connection_statement_execution_count(1);
-        Ok(rows)
+            Ok(rows)
+        }))
+        .await
     }
 
     async fn query_prepared_with_params_for_each_after_background_status<F>(
@@ -27091,122 +27298,126 @@ impl Connection {
     where
         F: FnMut(&Row) -> Result<()>,
     {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        if !std::ptr::eq(self, stmt.conn) {
-            return Err(FrankenError::internal(
-                "prepared statement belongs to a different connection",
-            ));
-        }
-        if stmt.dml_dispatch.is_some() {
-            return Err(FrankenError::Internal(
-                "DML prepared statements must be executed through \
+        self.with_fallback_statement(Box::pin(async {
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::CoreConnection);
+            if !std::ptr::eq(self, stmt.conn) {
+                return Err(FrankenError::internal(
+                    "prepared statement belongs to a different connection",
+                ));
+            }
+            if stmt.dml_dispatch.is_some() {
+                return Err(FrankenError::Internal(
+                    "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                    .to_owned(),
-            ));
-        }
-        if stmt.may_observe_change_tracking {
-            self.sync_change_tracking_context();
-        }
-        if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let op_cx = self.op_cx_after_background_status();
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(rows) = self
-                .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
-                .await?
+                        .to_owned(),
+                ));
+            }
+            if stmt.may_observe_change_tracking {
+                self.sync_change_tracking_context();
+            }
+            if self
+                .retained_autocommit_overlay_dirty_fast_path(stmt)
+                .is_some()
             {
-                let fast_path = stmt.prepared_query_fast_path_metadata(
-                    "retained overlay streaming query fast path",
-                )?;
-                fast_path.record_query_hit();
-                if hot_path_profile_enabled() {
-                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                let op_cx = self.op_cx_after_background_status();
+                let _overlay_entry_proof = stmt
+                    .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                    .await?;
+                if let Some(rows) = self
+                    .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+                    .await?
+                {
+                    let fast_path = stmt.prepared_query_fast_path_metadata(
+                        "retained overlay streaming query fast path",
+                    )?;
+                    fast_path.record_query_hit();
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            target: "fsqlite.execute_path",
+                            path = "fast_streaming",
+                            reason = "retained_autocommit_overlay_query",
+                        );
+                    }
+                    self.note_connection_statement_execution_count(1);
+                    for row in rows {
+                        f(&row)?;
+                    }
+                    return Ok(());
                 }
-                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        target: "fsqlite.execute_path",
-                        path = "fast_streaming",
-                        reason = "retained_autocommit_overlay_query",
-                    );
-                }
-                self.note_connection_statement_execution_count(1);
+            }
+
+            let can_stream_with_row_handler =
+                stmt.db.is_some() && stmt.deferred_query_statement.is_none() && !stmt.distinct;
+
+            if !can_stream_with_row_handler {
+                let rows = self
+                    .query_prepared_with_params_after_background_status(stmt, params)
+                    .await?;
                 for row in rows {
                     f(&row)?;
                 }
                 return Ok(());
             }
-        }
 
-        let can_stream_with_row_handler =
-            stmt.db.is_some() && stmt.deferred_query_statement.is_none() && !stmt.distinct;
-
-        if !can_stream_with_row_handler {
-            let rows = self
-                .query_prepared_with_params_after_background_status(stmt, params)
+            let op_cx = self.op_cx_after_background_status();
+            let prepared_auto_read = self
+                .prepare_connection_for_prepared_read(stmt, &op_cx)
                 .await?;
-            for row in rows {
-                f(&row)?;
+            let entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
+            if hot_path_profile_enabled() {
+                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            return Ok(());
-        }
-
-        let op_cx = self.op_cx_after_background_status();
-        let prepared_auto_read = self
-            .prepare_connection_for_prepared_read(stmt, &op_cx)
-            .await?;
-        let entry_proof = stmt
-            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-            .await?;
-        if hot_path_profile_enabled() {
-            FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-            tracing::debug!(
-                target: "fsqlite.execute_path",
-                path = "fast_streaming",
-                reason = "table_query_row_handler",
-            );
-        }
-        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
-        let mut callback_error: Option<FrankenError> = None;
-        let mut bridging_handler = |row: &Row| match f(row) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                callback_error = Some(err);
-                Err(FrankenError::Abort)
+            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                tracing::debug!(
+                    target: "fsqlite.execute_path",
+                    path = "fast_streaming",
+                    reason = "table_query_row_handler",
+                );
             }
-        };
-        let raw_rows_result = stmt
-            .execute_table_query_with_row_handler(
+            let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+            let mut callback_error: Option<FrankenError> = None;
+            let mut bridging_handler = |row: &Row| match f(row) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    callback_error = Some(err);
+                    Err(FrankenError::Abort)
+                }
+            };
+            let raw_rows_result = stmt
+                .execute_table_query_with_row_handler(
+                    &op_cx,
+                    Some(params),
+                    entry_proof.publication,
+                    &mut bridging_handler,
+                )
+                .await;
+            record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+            let callback_failed = callback_error.is_some();
+            self.finish_prepared_read_autocommit(
+                prepared_auto_read,
+                raw_rows_result.is_ok() || callback_failed,
                 &op_cx,
-                Some(params),
-                entry_proof.publication,
-                &mut bridging_handler,
             )
-            .await;
-        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-        let callback_failed = callback_error.is_some();
-        self.finish_prepared_read_autocommit(
-            prepared_auto_read,
-            raw_rows_result.is_ok() || callback_failed,
-            &op_cx,
-        )
-        .await?;
-        if raw_rows_result.is_ok() || callback_failed {
-            self.note_connection_statement_execution_count(1);
-        }
-        match (raw_rows_result, callback_error) {
-            (Err(FrankenError::Abort), Some(err)) => Err(err),
-            (result, None) => result,
-            (Ok(()), Some(err)) => Err(FrankenError::Internal(format!(
-                "query row handler captured callback error without aborting execution: {err}"
-            ))),
-            (Err(err), Some(_)) => Err(err),
-        }
+            .await?;
+            if raw_rows_result.is_ok() || callback_failed {
+                self.note_connection_statement_execution_count(1);
+            }
+            match (raw_rows_result, callback_error) {
+                (Err(FrankenError::Abort), Some(err)) => Err(err),
+                (result, None) => result,
+                (Ok(()), Some(err)) => Err(FrankenError::Internal(format!(
+                    "query row handler captured callback error without aborting execution: {err}"
+                ))),
+                (Err(err), Some(_)) => Err(err),
+            }
+        }))
+        .await
     }
 
     async fn query_prepared_row_after_background_status(
@@ -27214,36 +27425,62 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Row> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
-        if !std::ptr::eq(self, stmt.conn) {
-            return Err(FrankenError::internal(
-                "prepared statement belongs to a different connection",
-            ));
-        }
-        if stmt.dml_dispatch.is_some() {
-            return Err(FrankenError::Internal(
-                "DML prepared statements must be executed through \
+        self.with_fallback_statement(Box::pin(async {
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::CoreConnection);
+            if !std::ptr::eq(self, stmt.conn) {
+                return Err(FrankenError::internal(
+                    "prepared statement belongs to a different connection",
+                ));
+            }
+            if stmt.dml_dispatch.is_some() {
+                return Err(FrankenError::Internal(
+                    "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
-                    .to_owned(),
-            ));
-        }
-        if stmt.may_observe_change_tracking {
-            self.sync_change_tracking_context();
-        }
-        let op_cx = self.op_cx_after_background_status();
-        if self
-            .retained_autocommit_overlay_dirty_fast_path(stmt)
-            .is_some()
-        {
-            let _overlay_entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                .await?;
-            if let Some(row_outcome) = self
-                .try_execute_retained_autocommit_query_row_fast_path(stmt, params, &op_cx)
+                        .to_owned(),
+                ));
+            }
+            if stmt.may_observe_change_tracking {
+                self.sync_change_tracking_context();
+            }
+            let op_cx = self.op_cx_after_background_status();
+            if self
+                .retained_autocommit_overlay_dirty_fast_path(stmt)
+                .is_some()
+            {
+                let _overlay_entry_proof = stmt
+                    .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                    .await?;
+                if let Some(row_outcome) = self
+                    .try_execute_retained_autocommit_query_row_fast_path(stmt, params, &op_cx)
+                    .await?
+                {
+                    let fast_path = stmt.prepared_query_fast_path_metadata(
+                        "retained overlay query row fast path",
+                    )?;
+                    fast_path.record_query_row_hit();
+                    if hot_path_profile_enabled() {
+                        FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                        tracing::debug!(
+                            target: "fsqlite.execute_path",
+                            path = "fast",
+                            reason = "retained_autocommit_overlay_query_row",
+                        );
+                    }
+                    self.note_connection_statement_execution_count(1);
+                    return direct_query_row_outcome_result(row_outcome);
+                }
+            }
+            if self
+                .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
                 .await?
+                && let Some(row_outcome) =
+                    self.try_execute_prepared_query_row_fast_path(stmt, params)?
             {
                 let fast_path =
-                    stmt.prepared_query_fast_path_metadata("retained overlay query row fast path")?;
+                    stmt.prepared_query_fast_path_metadata("clean memory query row fast path")?;
                 fast_path.record_query_row_hit();
                 if hot_path_profile_enabled() {
                     FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -27252,77 +27489,101 @@ impl Connection {
                     tracing::debug!(
                         target: "fsqlite.execute_path",
                         path = "fast",
-                        reason = "retained_autocommit_overlay_query_row",
+                        reason = fast_path.query_row_trace_reason(),
+                        read_boundary = "skipped_clean_memory_memdb",
                     );
                 }
                 self.note_connection_statement_execution_count(1);
                 return direct_query_row_outcome_result(row_outcome);
             }
-        }
-        if self
-            .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
-            .await?
-            && let Some(row_outcome) =
-                self.try_execute_prepared_query_row_fast_path(stmt, params)?
-        {
-            let fast_path =
-                stmt.prepared_query_fast_path_metadata("clean memory query row fast path")?;
-            fast_path.record_query_row_hit();
-            if hot_path_profile_enabled() {
-                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "fast",
-                    reason = fast_path.query_row_trace_reason(),
-                    read_boundary = "skipped_clean_memory_memdb",
-                );
-            }
-            self.note_connection_statement_execution_count(1);
-            return direct_query_row_outcome_result(row_outcome);
-        }
-        if self
-            .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
-            .await?
-            && let Some(row_outcome) =
-                self.try_execute_prepared_query_row_fast_path(stmt, params)?
-        {
-            let fast_path =
-                stmt.prepared_query_fast_path_metadata("clean file-backed query row fast path")?;
-            fast_path.record_query_row_hit();
-            if hot_path_profile_enabled() {
-                FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "fast",
-                    reason = fast_path.query_row_trace_reason(),
-                    read_boundary = "skipped_clean_file_backed_memdb",
-                );
-            }
-            self.note_connection_statement_execution_count(1);
-            return direct_query_row_outcome_result(row_outcome);
-        }
-        let prepared_auto_read = self
-            .prepare_connection_for_prepared_read(stmt, &op_cx)
-            .await?;
-        let entry_proof = stmt
-            .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-            .await?;
-        if let Some(row_outcome) = self.try_execute_prepared_query_row_fast_path(stmt, params)? {
-            let fast_path = match stmt
-                .prepared_query_fast_path_metadata("prepared query row fast path outcome")
+            if self
+                .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
+                .await?
+                && let Some(row_outcome) =
+                    self.try_execute_prepared_query_row_fast_path(stmt, params)?
             {
-                Ok(fast_path) => fast_path,
-                Err(err) => {
-                    self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
-                        .await?;
-                    return Err(err);
+                let fast_path = stmt
+                    .prepared_query_fast_path_metadata("clean file-backed query row fast path")?;
+                fast_path.record_query_row_hit();
+                if hot_path_profile_enabled() {
+                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
-            };
-            fast_path.record_query_row_hit();
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "fast",
+                        reason = fast_path.query_row_trace_reason(),
+                        read_boundary = "skipped_clean_file_backed_memdb",
+                    );
+                }
+                self.note_connection_statement_execution_count(1);
+                return direct_query_row_outcome_result(row_outcome);
+            }
+            let prepared_auto_read = self
+                .prepare_connection_for_prepared_read(stmt, &op_cx)
+                .await?;
+            let entry_proof = stmt
+                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
+                .await?;
+            if let Some(row_outcome) =
+                self.try_execute_prepared_query_row_fast_path(stmt, params)?
+            {
+                let fast_path = match stmt
+                    .prepared_query_fast_path_metadata("prepared query row fast path outcome")
+                {
+                    Ok(fast_path) => fast_path,
+                    Err(err) => {
+                        self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                            .await?;
+                        return Err(err);
+                    }
+                };
+                fast_path.record_query_row_hit();
+                if hot_path_profile_enabled() {
+                    FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "fast",
+                        reason = fast_path.query_row_trace_reason(),
+                    );
+                }
+                self.note_connection_statement_execution_count(1);
+                let row_result = direct_query_row_outcome_result(row_outcome);
+                self.finish_prepared_read_autocommit(
+                    prepared_auto_read,
+                    query_row_completed_without_engine_failure(&row_result),
+                    &op_cx,
+                )
+                .await?;
+                return row_result;
+            }
+            if let Some(statement) = &stmt.deferred_query_statement {
+                if hot_path_profile_enabled() {
+                    FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        target: "fsqlite.execute_path",
+                        path = "slow",
+                        reason = "deferred_query_statement",
+                    );
+                }
+                let rows_result = self
+                    .execute_statement_after_background_status(statement.as_ref(), params)
+                    .await;
+                self.finish_prepared_read_autocommit(
+                    prepared_auto_read,
+                    rows_result.is_ok(),
+                    &op_cx,
+                )
+                .await?;
+                if rows_result.is_ok() {
+                    self.note_connection_statement_execution_count(1);
+                }
+                return exactly_one_row_or_error(rows_result?);
+            }
             if hot_path_profile_enabled() {
                 FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -27330,114 +27591,75 @@ impl Connection {
                 tracing::debug!(
                     target: "fsqlite.execute_path",
                     path = "fast",
-                    reason = fast_path.query_row_trace_reason(),
+                    reason = if stmt.db.is_some() {
+                        "table_query_row"
+                    } else {
+                        "program_query_row"
+                    },
                 );
             }
-            self.note_connection_statement_execution_count(1);
-            let row_result = direct_query_row_outcome_result(row_outcome);
-            self.finish_prepared_read_autocommit(
-                prepared_auto_read,
-                query_row_completed_without_engine_failure(&row_result),
-                &op_cx,
-            )
-            .await?;
-            return row_result;
-        }
-        if let Some(statement) = &stmt.deferred_query_statement {
-            if hot_path_profile_enabled() {
-                FSQLITE_SLOW_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-                tracing::debug!(
-                    target: "fsqlite.execute_path",
-                    path = "slow",
-                    reason = "deferred_query_statement",
-                );
-            }
-            let rows_result = self
-                .execute_statement_after_background_status(statement.as_ref(), params)
-                .await;
-            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
-                .await?;
-            if rows_result.is_ok() {
-                self.note_connection_statement_execution_count(1);
-            }
-            return exactly_one_row_or_error(rows_result?);
-        }
-        if hot_path_profile_enabled() {
-            FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        if tracing::enabled!(target: "fsqlite.execute_path", tracing::Level::DEBUG) {
-            tracing::debug!(
-                target: "fsqlite.execute_path",
-                path = "fast",
-                reason = if stmt.db.is_some() {
-                    "table_query_row"
+            if stmt.can_use_query_row_result_row_cap() {
+                let row_result = if stmt.db.is_some() {
+                    stmt.execute_table_query_row_with_row_cap(
+                        &op_cx,
+                        params,
+                        QUERY_ROW_RESULT_ROW_CAP,
+                        entry_proof.publication,
+                    )
+                    .await
                 } else {
-                    "program_query_row"
-                },
-            );
-        }
-        if stmt.can_use_query_row_result_row_cap() {
-            let row_result = if stmt.db.is_some() {
-                stmt.execute_table_query_row_with_row_cap(
-                    &op_cx,
-                    params,
-                    QUERY_ROW_RESULT_ROW_CAP,
-                    entry_proof.publication,
-                )
-                .await
+                    execute_program_exactly_one_row_with_row_cap(
+                        stmt.program.as_ref(),
+                        params,
+                        stmt.func_registry.as_ref(),
+                        Some(&self.collation_registry),
+                        &op_cx,
+                        page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                        Some(QUERY_ROW_RESULT_ROW_CAP),
+                    )
+                    .await
+                };
+                let completed = query_row_completed_without_engine_failure(&row_result);
+                self.finish_prepared_read_autocommit(prepared_auto_read, completed, &op_cx)
+                    .await?;
+                if completed {
+                    self.note_connection_statement_execution_count(1);
+                    if let Ok(row) = &row_result {
+                        self.maybe_store_count_indexed_rowid_probe_result(stmt, params, row);
+                    }
+                }
+                return row_result;
+            }
+            let rows_result = if stmt.db.is_some() {
+                stmt.execute_table_query(&op_cx, params, entry_proof.publication)
+                    .await
             } else {
-                execute_program_exactly_one_row_with_row_cap(
+                execute_program_with_postprocess(
                     stmt.program.as_ref(),
                     params,
                     stmt.func_registry.as_ref(),
                     Some(&self.collation_registry),
                     &op_cx,
+                    stmt.expression_postprocess.as_ref(),
                     page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
-                    Some(QUERY_ROW_RESULT_ROW_CAP),
                 )
                 .await
             };
-            let completed = query_row_completed_without_engine_failure(&row_result);
-            self.finish_prepared_read_autocommit(prepared_auto_read, completed, &op_cx)
+            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
                 .await?;
-            if completed {
-                self.note_connection_statement_execution_count(1);
-                if let Ok(row) = &row_result {
-                    self.maybe_store_count_indexed_rowid_probe_result(stmt, params, row);
-                }
+            let mut rows = rows_result?;
+            self.note_connection_statement_execution_count(1);
+            if stmt.distinct {
+                let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
             }
-            return row_result;
-        }
-        let rows_result = if stmt.db.is_some() {
-            stmt.execute_table_query(&op_cx, params, entry_proof.publication)
-                .await
-        } else {
-            execute_program_with_postprocess(
-                stmt.program.as_ref(),
-                params,
-                stmt.func_registry.as_ref(),
-                Some(&self.collation_registry),
-                &op_cx,
-                stmt.expression_postprocess.as_ref(),
-                page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
-            )
-            .await
-        };
-        self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
-            .await?;
-        let mut rows = rows_result?;
-        self.note_connection_statement_execution_count(1);
-        if stmt.distinct {
-            let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-            dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
-        }
-        let row_result = exactly_one_row_or_error(rows);
-        if let Ok(row) = &row_result {
-            self.maybe_store_count_indexed_rowid_probe_result(stmt, params, row);
-        }
-        row_result
+            let row_result = exactly_one_row_or_error(rows);
+            if let Ok(row) = &row_result {
+                self.maybe_store_count_indexed_rowid_probe_result(stmt, params, row);
+            }
+            row_result
+        }))
+        .await
     }
 
     fn retained_autocommit_overlay_fast_path(
@@ -35830,8 +36052,8 @@ impl Connection {
         &'a self,
         statement: &'a Statement,
         params: Option<&'a [SqliteValue]>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>> {
-        Box::pin(async move {
+    ) -> FallbackStatementFuture<'a, Result<Vec<Row>>> {
+        self.with_fallback_statement(Box::pin(async move {
             // bd-b4u1r (GH #367) + #335: extend the autocommit conflict retry
             // from PRAGMA (bd-tc8u7) to plain reads. A bare `SELECT` at an
             // autocommit boundary can transiently observe a SQLITE_BUSY-family
@@ -35909,7 +36131,7 @@ impl Connection {
                 }
             }
             result
-        })
+        }))
     }
 
     fn execute_statement_once_after_background_status<'a>(
@@ -74219,6 +74441,67 @@ impl Connection {
             "fsqlite.differential_status"
             | "differential_status"
             | "fsqlite_differential_status" => Ok(self.differential_status_rows()),
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.fallback_capture" | "fallback_capture" => {
+                if let Some(ref value) = pragma.value {
+                    self.set_fallback_capture_enabled(parse_pragma_bool(value)?);
+                }
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(
+                        self.fallback_capture_enabled.get(),
+                    ))],
+                }])
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.fallback_events" | "fallback_events" => {
+                let identity = |value: Option<u64>| {
+                    value
+                        .and_then(|value| i64::try_from(value).ok())
+                        .map_or(SqliteValue::Null, SqliteValue::Integer)
+                };
+                Ok(self
+                    .fallback_execution_snapshot()
+                    .events
+                    .into_iter()
+                    .map(|event| Row {
+                        values: vec![
+                            identity(Some(event.event_id)),
+                            identity(event.connection_id),
+                            identity(Some(event.statement_id)),
+                            identity(event.transaction_id),
+                            SqliteValue::Text(event.statement_kind.into()),
+                            SqliteValue::Text(event.decision_reason.into()),
+                            SqliteValue::Text(event.decision_outcome.into()),
+                            SqliteValue::Text(event.source_context.into()),
+                            SqliteValue::Text(event.storage_backend.into()),
+                        ],
+                    })
+                    .collect())
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.fallback_stats" | "fallback_stats" => {
+                let capture = self.fallback_decision_capture.borrow();
+                Ok([
+                    ("retained_events", capture.executions.len() as u64),
+                    ("dropped_events", capture.dropped_events),
+                    ("capacity", MAX_FALLBACK_DECISION_EVIDENCE as u64),
+                ]
+                .into_iter()
+                .map(|(name, value)| Row {
+                    values: vec![
+                        SqliteValue::Text(name.into()),
+                        SqliteValue::Integer(i64::try_from(value).unwrap_or(i64::MAX)),
+                    ],
+                })
+                .collect())
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.fallback_reset" | "fallback_reset" => {
+                self.reset_fallback_decision_evidence();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
             // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.conflict_stats" | "conflict_stats" => {
@@ -74277,6 +74560,14 @@ impl Connection {
                                     .collect::<Vec<_>>()
                                     .join(",")
                                     .into(),
+                            ),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("hotspot_window_events".into()),
+                            SqliteValue::Integer(
+                                i64::try_from(snap.hotspot_window_events).unwrap_or(i64::MAX),
                             ),
                         ],
                     },
@@ -217711,6 +218002,348 @@ mod pager_routing_tests {
     }
 
     #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_fallback_execution_public_sql_prepared_identity_and_privacy() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            let transaction_id = *conn.concurrent_session_id.borrow();
+            assert!(transaction_id.is_some(), "default BEGIN remains concurrent");
+            let stmt = conn
+                .prepare("WITH c(x) AS (SELECT ?1) SELECT x FROM c")
+                .await
+                .unwrap();
+            assert!(
+                conn.fallback_execution_snapshot().events.is_empty(),
+                "prepare is not execution"
+            );
+            for value in ["private_payload_first", "private_payload_second"] {
+                let rows = stmt
+                    .query_with_params(&[SqliteValue::Text(value.into())])
+                    .await
+                    .unwrap();
+                assert_eq!(rows[0].values()[0].as_text(), Some(value));
+                assert_eq!(conn.fallback_statement_id.get(), None);
+            }
+            let snapshot = conn.fallback_execution_snapshot();
+            assert_eq!(snapshot.events.len(), 2);
+            assert!(snapshot.events[0].statement_id < snapshot.events[1].statement_id);
+            for event in &snapshot.events {
+                assert_eq!(event.transaction_id, transaction_id);
+                assert_eq!(
+                    event.connection_id,
+                    conn.pool_metrics.get().map(|metrics| metrics.connection_id)
+                );
+                assert!(event.connection_id.is_some());
+                assert_eq!(event.decision_reason, "with_clause_materialization");
+                assert_eq!(event.source_context, "execute_statement_dispatch");
+                assert_eq!(event.decision_outcome, "allowed_compatibility_fallback");
+                assert_eq!(event.storage_backend, "memory");
+            }
+            let rows = conn.query("PRAGMA fsqlite.fallback_events").await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values().len(), 9);
+            assert_eq!(
+                rows[0].values()[2],
+                SqliteValue::Integer(i64::try_from(snapshot.events[0].statement_id).unwrap())
+            );
+            assert_eq!(
+                rows[0].values()[5].as_text(),
+                Some("with_clause_materialization")
+            );
+            assert!(!format!("{snapshot:?}{rows:?}").contains("private_payload"));
+            conn.query("SELECT 99").await.unwrap();
+            assert_eq!(
+                conn.fallback_execution_snapshot(),
+                snapshot,
+                "unrelated SQL and diagnostic reads must not manufacture events"
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_fallback_execution_recent_eviction_disable_reset_and_synthetic_rows() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let sql = "WITH c(x) AS (SELECT 7) SELECT x FROM c";
+            for _ in 0..MAX_FALLBACK_DECISION_EVIDENCE + 3 {
+                assert_eq!(
+                    conn.query(sql).await.unwrap()[0].values()[0],
+                    SqliteValue::Integer(7)
+                );
+            }
+            let snapshot = conn.fallback_execution_snapshot();
+            assert_eq!(snapshot.events.len(), MAX_FALLBACK_DECISION_EVIDENCE);
+            assert_eq!(snapshot.dropped_events, 3);
+            assert_eq!(snapshot.events[0].event_id, 4);
+            assert!(
+                snapshot
+                    .events
+                    .windows(2)
+                    .all(|events| events[0].event_id + 1 == events[1].event_id)
+            );
+            let last = snapshot.events.last().unwrap().event_id;
+            let stats = conn.query("PRAGMA fsqlite.fallback_stats").await.unwrap();
+            assert_eq!(stats[1].values()[1], SqliteValue::Integer(3));
+            conn.execute("PRAGMA fsqlite.fallback_capture = OFF")
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query("PRAGMA fsqlite.fallback_capture").await.unwrap()[0].values()[0],
+                SqliteValue::Integer(0)
+            );
+            conn.query(sql).await.unwrap();
+            assert_eq!(
+                conn.fallback_execution_snapshot(),
+                FallbackExecutionSnapshot::default()
+            );
+            assert_eq!(
+                conn.fallback_decision_snapshot(),
+                FallbackDecisionSnapshot::default()
+            );
+            conn.execute("PRAGMA fsqlite.fallback_capture = ON")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE diagnostic_contract(reason TEXT); INSERT INTO diagnostic_contract VALUES ('compatibility_fallback')").await.unwrap();
+            conn.query("SELECT reason FROM diagnostic_contract")
+                .await
+                .unwrap();
+            assert!(
+                conn.query("PRAGMA fsqlite.fallback_events")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "ordinary contract rows cannot supply execution provenance"
+            );
+            conn.query(sql).await.unwrap();
+            assert_eq!(
+                conn.fallback_execution_snapshot().events[0].event_id,
+                last + 1
+            );
+            conn.execute("PRAGMA fsqlite.fallback_reset").await.unwrap();
+            assert!(conn.fallback_execution_snapshot().events.is_empty());
+            conn.query(sql).await.unwrap();
+            assert_eq!(
+                conn.fallback_execution_snapshot().events[0].event_id,
+                last + 2
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_fallback_execution_denial_cancel_and_nested_scope_restore() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let sql = "WITH c(x) AS (SELECT 7) SELECT x FROM c";
+            conn.set_strict_mem_fallback_rejection(true);
+            assert!(
+                conn.query(sql)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("in-memory fallback disabled")
+            );
+            let denied = conn.fallback_execution_snapshot();
+            assert_eq!(denied.events.len(), 1);
+            assert_eq!(denied.events[0].decision_outcome, "denied");
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            conn.set_strict_mem_fallback_rejection(false);
+            conn.with_fallback_statement(Box::pin(async {
+                let outer_id = conn.fallback_statement_id.get();
+                conn.query(sql).await.unwrap();
+                assert_eq!(conn.fallback_statement_id.get(), outer_id);
+                assert_eq!(
+                    conn.fallback_execution_snapshot()
+                        .events
+                        .last()
+                        .unwrap()
+                        .statement_id,
+                    outer_id.unwrap()
+                );
+            }))
+            .await;
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            let mut pending = Box::pin(conn.with_fallback_statement(Box::pin(async {
+                assert!(conn.fallback_statement_id.get().is_some());
+                std::future::pending::<()>().await;
+            })));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(pending.as_mut().poll(&mut context).is_pending());
+            assert_eq!(
+                conn.fallback_statement_id.get(),
+                None,
+                "a suspended future must not retain poll context"
+            );
+            drop(pending);
+            assert_eq!(
+                conn.fallback_statement_id.get(),
+                None,
+                "dropping a suspended scope must restore context"
+            );
+            let before_cancel = conn.fallback_execution_snapshot();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                assert!(matches!(conn.query(sql).await, Err(FrankenError::Abort)));
+            }
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            assert_eq!(
+                conn.fallback_execution_snapshot(),
+                before_cancel,
+                "cancel before dispatch must not claim a fallback ran"
+            );
+            conn.query(sql).await.unwrap();
+            let after = conn.fallback_execution_snapshot();
+            assert_eq!(after.events.len(), before_cancel.events.len() + 1);
+            assert!(
+                after.events.last().unwrap().statement_id
+                    > before_cancel.events.last().unwrap().statement_id
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_fallback_execution_public_batch_prepared_dml() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE sink(x INTEGER); BEGIN")
+                .await
+                .unwrap();
+            let transaction_id = *conn.concurrent_session_id.borrow();
+            let affected = conn
+                .execute_many_with_params_skip_statement_savepoint_in_explicit_txn(
+                    "WITH c(x) AS (SELECT ?1) INSERT INTO sink SELECT x FROM c",
+                    &[
+                        vec![SqliteValue::Integer(21)],
+                        vec![SqliteValue::Integer(22)],
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(affected, 2);
+            let snapshot = conn.fallback_execution_snapshot();
+            let inserts: Vec<_> = snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.statement_kind == "insert"
+                        && event.decision_reason == "with_clause_materialization"
+                })
+                .collect();
+            assert_eq!(
+                inserts.len(),
+                2,
+                "each actual batch parameter execution needs evidence"
+            );
+            assert!(inserts[0].statement_id < inserts[1].statement_id);
+            assert!(
+                inserts
+                    .iter()
+                    .all(|event| event.transaction_id == transaction_id)
+            );
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            let rows = conn.query("SELECT x FROM sink ORDER BY x").await.unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![SqliteValue::Integer(21), SqliteValue::Integer(22)]
+            );
+            conn.execute("ROLLBACK").await.unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_fallback_execution_non_lifo_pending_scopes_do_not_leak_identity() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let observed_a = Cell::new(None);
+            let observed_b = Cell::new(None);
+            let finish_b = Cell::new(false);
+            let mut a = Box::pin(conn.with_fallback_statement(Box::pin(std::future::poll_fn(
+                |_| {
+                    let identity = conn.fallback_statement_id.get();
+                    assert!(identity.is_some());
+                    if let Some(previous) = observed_a.replace(identity) {
+                        assert_eq!(identity, Some(previous));
+                    }
+                    std::task::Poll::<()>::Pending
+                },
+            ))));
+            let mut b = Box::pin(conn.with_fallback_statement(Box::pin(std::future::poll_fn(
+                |_| {
+                    let identity = conn.fallback_statement_id.get();
+                    assert!(identity.is_some());
+                    if let Some(previous) = observed_b.replace(identity) {
+                        assert_eq!(
+                            identity,
+                            Some(previous),
+                            "resuming B must keep its identity"
+                        );
+                    }
+                    if finish_b.get() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                },
+            ))));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(a.as_mut().poll(&mut context).is_pending());
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            assert!(b.as_mut().poll(&mut context).is_pending());
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            assert_ne!(
+                observed_a.get(),
+                observed_b.get(),
+                "independent futures cannot share attribution"
+            );
+            assert!(a.as_mut().poll(&mut context).is_pending());
+            drop(a);
+            assert_eq!(
+                conn.fallback_statement_id.get(),
+                None,
+                "cancelling A before B must not publish context"
+            );
+            finish_b.set(true);
+            assert!(b.as_mut().poll(&mut context).is_ready());
+            drop(b);
+            assert_eq!(
+                conn.fallback_statement_id.get(),
+                None,
+                "finishing B must not restore cancelled A"
+            );
+            assert!(
+                conn.fallback_execution_snapshot().events.is_empty(),
+                "poll bookkeeping alone is not execution evidence"
+            );
+            let rows = conn
+                .query("WITH c(x) AS (SELECT 47) SELECT x FROM c")
+                .await
+                .unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(47));
+            let snapshot = conn.fallback_execution_snapshot();
+            assert_eq!(snapshot.events.len(), 1);
+            assert!(snapshot.events[0].statement_id > observed_b.get().unwrap());
+            assert_eq!(
+                snapshot.events[0].decision_reason,
+                "with_clause_materialization"
+            );
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            eprintln!(
+                "bead_id=bd-6hdwo.14 case=non_lifo_poll_attribution independent_ids=true stale_context=false real_sql_rows=1 real_fallback_events=1"
+            );
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_select_routes_through_pager_with_autocommit() {
         asupersync::test_utils::run_test(|| async {
             // A simple table-backed SELECT with autocommit should work via the
@@ -221803,6 +222436,24 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
+            let before_cancel = conn.fallback_decision_snapshot();
+            let before_events = conn.fallback_execution_snapshot();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                assert!(matches!(
+                    conn.disable_mem_fallback_rejection_for_internal_scope(
+                        "select",
+                        "view_materialization",
+                    ),
+                    Err(FrankenError::Abort)
+                ));
+                assert!(*conn.reject_mem_fallback.borrow());
+            }
+            assert_eq!(conn.fallback_decision_snapshot(), before_cancel);
+            assert_eq!(conn.fallback_execution_snapshot(), before_events);
+
             let err = match conn
                 .disable_mem_fallback_rejection_for_internal_scope("select", "view_materialization")
             {
@@ -221833,6 +222484,25 @@ mod pager_routing_tests {
                 *conn.reject_mem_fallback.borrow(),
                 "parity-cert fallback rejection must default ON"
             );
+
+            let before_cancel = conn.fallback_decision_snapshot();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                assert!(matches!(
+                    conn.disable_mem_fallback_rejection_for_internal_scope(
+                        "select",
+                        "with_clause_materialization",
+                    ),
+                    Err(FrankenError::Abort)
+                ));
+                assert!(
+                    *conn.reject_mem_fallback.borrow(),
+                    "cancelled helper entry must not change rejection policy"
+                );
+            }
+            assert_eq!(conn.fallback_decision_snapshot(), before_cancel);
 
             {
                 let _guard = conn

@@ -5,11 +5,11 @@
 //!
 //! # Design Principles
 //!
-//! - **Zero-cost when unused:** All observation is opt-in via the
-//!   [`ConflictObserver`] trait. When no observer is registered, conflict
-//!   emission compiles to nothing (the default [`NoOpObserver`] is inlined).
-//! - **Non-blocking:** Observers MUST NOT acquire page locks or block writers.
-//!   Conflict tracing is purely diagnostic.
+//! - **Optional capture:** The [`ConflictObserver`] trait controls event capture;
+//!   ordinary tracing is a separate decision at the producer.
+//! - **No page-lock acquisition:** Built-in observers serialize their own
+//!   bounded state updates with mutexes, without acquiring database page locks.
+//!   Observation must not participate in write ownership or commit decisions.
 //! - **Shared foundation:** Types defined here are reused by downstream
 //!   observability beads (bd-t6sv2.2, .3, .5, .6, .8, .12).
 
@@ -1002,10 +1002,45 @@ impl ConflictRingBuffer {
 // ConflictMetrics — aggregated statistics
 // ---------------------------------------------------------------------------
 
+/// Number of recent page contention/drift events represented by hotspot counts.
+/// Lifetime conflict counters are independent of this bounded window.
+pub const CONFLICT_HOTSPOT_WINDOW_EVENTS: usize = 1024;
+
+#[derive(Default)]
+struct PageHotspotWindow {
+    pages: VecDeque<PageNumber>,
+    counts: HashMap<PageNumber, u64>,
+}
+
+impl PageHotspotWindow {
+    fn record(&mut self, page: PageNumber) {
+        if self.pages.len() == CONFLICT_HOTSPOT_WINDOW_EVENTS
+            && let Some(expired) = self.pages.pop_front()
+            && let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.counts.entry(expired)
+        {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+        self.pages.push_back(page);
+        *self.counts.entry(page).or_insert(0) += 1;
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.counts.clear();
+    }
+}
+
 /// Aggregated conflict statistics exposed via PRAGMA.
 ///
-/// All counters are atomic for lock-free updates from the hot path.
-/// Statistics are per-connection (not global).
+/// Lifetime counters are atomic. Recent hotspot recording uses a mutex and
+/// retains at most 1024 page events and 1024 distinct page entries. An observer
+/// may be shared by several connections; snapshots are not atomic across all
+/// counters and hotspot state.
 pub struct ConflictMetrics {
     /// Total conflict events (contention + drift + abort).
     pub conflicts_total: AtomicU64,
@@ -1021,8 +1056,8 @@ pub struct ConflictMetrics {
     pub ssi_aborts: AtomicU64,
     /// Successful conflict resolutions via merge.
     pub conflicts_resolved: AtomicU64,
-    /// Per-page contention counts (behind mutex, not hot path).
-    page_hotspots: Mutex<HashMap<PageNumber, u64>>,
+    /// Exact page frequencies within the bounded recent event window.
+    page_hotspots: Mutex<PageHotspotWindow>,
     /// Creation time for rate calculations.
     created_at: Instant,
 }
@@ -1039,7 +1074,7 @@ impl ConflictMetrics {
             fcw_merge_successes: AtomicU64::new(0),
             ssi_aborts: AtomicU64::new(0),
             conflicts_resolved: AtomicU64::new(0),
-            page_hotspots: Mutex::new(HashMap::new()),
+            page_hotspots: Mutex::new(PageHotspotWindow::default()),
             created_at: Instant::now(),
         }
     }
@@ -1050,7 +1085,7 @@ impl ConflictMetrics {
             ConflictEvent::PageLockContention { page, .. } => {
                 self.conflicts_total.fetch_add(1, Ordering::Relaxed);
                 self.page_contentions.fetch_add(1, Ordering::Relaxed);
-                *self.page_hotspots.lock().entry(*page).or_insert(0) += 1;
+                self.page_hotspots.lock().record(*page);
             }
             ConflictEvent::FcwBaseDrift {
                 page,
@@ -1066,7 +1101,7 @@ impl ConflictMetrics {
                         self.fcw_merge_successes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                *self.page_hotspots.lock().entry(*page).or_insert(0) += 1;
+                self.page_hotspots.lock().record(*page);
             }
             ConflictEvent::SsiAbort { .. } => {
                 self.conflicts_total.fetch_add(1, Ordering::Relaxed);
@@ -1107,14 +1142,16 @@ impl ConflictMetrics {
         self.conflicts_total.load(Ordering::Relaxed) as f64 / elapsed_secs
     }
 
-    /// Top N pages by contention count.
+    /// Top N pages by frequency in the latest 1024 page contention/drift events.
+    /// Ties are ordered by page number. Counts exclude older page events and
+    /// SSI abort/resolution events, which do not identify a single hot page.
     #[must_use]
     pub fn top_hotspots(&self, n: usize) -> Vec<(PageNumber, u64)> {
         let mut entries: Vec<(PageNumber, u64)> = {
-            let map = self.page_hotspots.lock();
-            map.iter().map(|(&k, &v)| (k, v)).collect()
+            let window = self.page_hotspots.lock();
+            window.counts.iter().map(|(&k, &v)| (k, v)).collect()
         };
-        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+        entries.sort_by_key(|&(page, count)| (std::cmp::Reverse(count), page));
         entries.truncate(n);
         entries
     }
@@ -1134,6 +1171,7 @@ impl ConflictMetrics {
             conflicts_per_second: self.conflicts_per_second(),
             elapsed_secs: self.created_at.elapsed().as_secs_f64(),
             top_hotspots: self.top_hotspots(10),
+            hotspot_window_events: CONFLICT_HOTSPOT_WINDOW_EVENTS,
         }
     }
 }
@@ -1157,6 +1195,8 @@ pub struct ConflictMetricsSnapshot {
     pub conflicts_per_second: f64,
     pub elapsed_secs: f64,
     pub top_hotspots: Vec<(PageNumber, u64)>,
+    /// Maximum page events represented by `top_hotspots`, not lifetime totals.
+    pub hotspot_window_events: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,6 +1705,68 @@ mod tests {
         }
         assert_eq!(m.top_hotspots(5).len(), 5);
         assert_eq!(m.top_hotspots(0).len(), 0);
+    }
+
+    #[test]
+    fn metrics_hotspot_window_evicts_old_pages_without_losing_lifetime_totals() {
+        let metrics = ConflictMetrics::new();
+        let window = u32::try_from(CONFLICT_HOTSPOT_WINDOW_EVENTS).unwrap();
+        for page in 1..=window * 3 {
+            metrics.record(&make_contention_event(page, 1, 2));
+        }
+        let recent = metrics.top_hotspots(usize::MAX);
+        assert_eq!(recent.len(), CONFLICT_HOTSPOT_WINDOW_EVENTS);
+        assert_eq!(recent.first(), Some(&(page(window * 2 + 1), 1)));
+        assert_eq!(recent.last(), Some(&(page(window * 3), 1)));
+        assert_eq!(
+            metrics.page_contentions.load(Ordering::Relaxed),
+            u64::from(window * 3)
+        );
+        {
+            let retained = metrics.page_hotspots.lock();
+            assert_eq!(retained.pages.len(), CONFLICT_HOTSPOT_WINDOW_EVENTS);
+            assert_eq!(retained.counts.len(), CONFLICT_HOTSPOT_WINDOW_EVENTS);
+        }
+        // A newly hot page must displace obsolete history, rather than being
+        // dropped because a first-seen-page map filled up long ago.
+        for _ in 0..CONFLICT_HOTSPOT_WINDOW_EVENTS {
+            metrics.record(&ConflictEvent::FcwBaseDrift {
+                page: page(1),
+                loser: txn(1),
+                winner_commit_seq: CommitSeq::new(10),
+                merge_attempted: false,
+                merge_succeeded: false,
+                timestamp_ns: 0,
+            });
+        }
+        assert_eq!(
+            metrics.top_hotspots(usize::MAX),
+            vec![(page(1), u64::from(window))]
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.conflicts_total, u64::from(window * 4));
+        assert_eq!(snapshot.fcw_drifts, u64::from(window));
+        assert_eq!(
+            snapshot.hotspot_window_events,
+            CONFLICT_HOTSPOT_WINDOW_EVENTS
+        );
+        assert_eq!(metrics.page_hotspots.lock().counts.len(), 1);
+        metrics.record(&make_contention_event(1, 1, 2));
+        assert_eq!(
+            metrics.top_hotspots(usize::MAX),
+            vec![(page(1), u64::from(window))],
+            "expiring and inserting the same page must preserve its window count"
+        );
+        assert_eq!(
+            metrics.conflicts_total.load(Ordering::Relaxed),
+            u64::from(window * 4) + 1
+        );
+        metrics.reset();
+        assert!(metrics.top_hotspots(usize::MAX).is_empty());
+        assert!(metrics.page_hotspots.lock().pages.is_empty());
+        metrics.record(&make_contention_event(2, 1, 2));
+        assert_eq!(metrics.top_hotspots(usize::MAX), vec![(page(2), 1)]);
+        assert_eq!(metrics.conflicts_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]

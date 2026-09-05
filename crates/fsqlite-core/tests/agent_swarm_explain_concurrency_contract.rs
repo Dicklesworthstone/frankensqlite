@@ -3,6 +3,72 @@ use fsqlite_types::value::SqliteValue;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("actual-ssi-diagnostics.db");
+            let path = path.to_str().expect("temporary path is UTF-8");
+            let monitor = Connection::open(path).await?;
+            let mode = monitor.query("PRAGMA journal_mode=WAL;").await?;
+            assert_eq!(mode[0].values(), &[SqliteValue::Text("wal".into())]);
+            monitor.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+            monitor.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+            monitor.execute("INSERT INTO a VALUES(1,10);").await?;
+            monitor.execute("INSERT INTO b VALUES(1,20);").await?;
+
+            // Ordinary contract rows cannot manufacture a real engine event.
+            monitor.execute("CREATE TABLE fsqlite_explain_concurrency_contract(event TEXT);").await?;
+            monitor.execute("INSERT INTO fsqlite_explain_concurrency_contract VALUES('SsiAbort Pivot');").await?;
+            monitor.query("PRAGMA fsqlite.conflict_reset;").await?;
+            assert!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.is_empty());
+
+            let first = Connection::open(path).await?;
+            let second = Connection::open(path).await?;
+            assert!(first.is_concurrent_mode_default() && second.is_concurrent_mode_default());
+            first.execute("BEGIN;").await?;
+            second.execute("BEGIN;").await?;
+            assert!(first.is_concurrent_transaction() && second.is_concurrent_transaction());
+            assert_eq!(first.query("SELECT value FROM b WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(20)]);
+            assert_eq!(second.query("SELECT value FROM a WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(10)]);
+            first.execute("UPDATE a SET value=11 WHERE id=1;").await?;
+            second.execute("UPDATE b SET value=21 WHERE id=1;").await?;
+            assert!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.is_empty());
+            let error = first.execute("COMMIT;").await.expect_err("real write skew must be rejected");
+            assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }), "unexpected rejection: {error:?}");
+
+            let cards = first.ssi_decisions_snapshot();
+            assert_eq!(cards.len(), 1, "one real rejection creates one SSI decision");
+            let events = monitor.query("PRAGMA fsqlite.conflict_log;").await?;
+            assert_eq!(events.len(), 1, "the other connection observes exactly one abort");
+            let SqliteValue::Text(event) = &events[0].values()[2] else {
+                panic!("conflict log event must be text: {:?}", events[0].values());
+            };
+            assert!(event.contains("SsiAbort") && event.contains("reason: Pivot"));
+            assert!(event.contains("in_edge_count: 1,") && event.contains("out_edge_count: 1,"));
+            assert!(event.contains(&format!("txn: {:?}", cards[0].txn)), "event and actual decision must identify the same transaction");
+            let stats = monitor.query("PRAGMA fsqlite.conflict_stats;").await?;
+            for (name, expected) in [("conflicts_total", 1), ("ssi_aborts", 1), ("fcw_drifts", 0), ("page_contentions", 0), ("conflicts_resolved", 0)] {
+                assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(key), SqliteValue::Integer(value)] if key.as_ref() == name && *value == expected)), "missing exact metric {name}={expected}: {stats:?}");
+            }
+
+            second.execute("COMMIT;").await?;
+            assert_eq!(monitor.query("SELECT value FROM a WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(10)]);
+            assert_eq!(monitor.query("SELECT value FROM b WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(21)]);
+            assert_eq!(rows_to_values(&monitor.query("PRAGMA fsqlite.conflict_log;").await?), rows_to_values(&events), "clean commit and reads add no conflict or resolution");
+            eprintln!("bead_id=bd-6hdwo.14 event=public_ssi_conflict_observed txn={:?} events={:?} stats={:?}", cards[0].txn, rows_to_values(&events), rows_to_values(&stats));
+            monitor.query("PRAGMA fsqlite.conflict_reset;").await?;
+            assert!(first.query("PRAGMA fsqlite.conflict_log;").await?.is_empty(), "reset applies to the shared observer");
+            Ok(())
+        }
+        .await;
+    });
+    outcome
+}
+
 struct ConcurrencyDiagnostic<'a> {
     event_seq: i64,
     diagnostic_surface: &'a str,

@@ -41,7 +41,8 @@ use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, Tr
 use crate::lifecycle::MvccError;
 use crate::observability::{
     ConflictHeatContext, ConflictHeatEdge, ConflictHeatObservation, ConflictOverlapDirection,
-    conflict_heat_telemetry_enabled, record_conflict_heat_observation,
+    conflict_heat_telemetry_enabled, emit_fcw_base_drift, emit_ssi_abort,
+    record_conflict_heat_observation,
 };
 use crate::rcu::{ActiveTxnSnapshotEntry, QsbrHandle, RcuActiveTxnSnapshotTable};
 use crate::ssi_validation::{
@@ -2998,6 +2999,36 @@ pub fn concurrent_commit(
     }
 }
 
+/// Record rejected FCW pages, preserving each page's authoritative sequence.
+/// The summary's maximum sequence is not necessarily the winner for every page.
+fn record_prepare_fcw_conflicts(
+    result: &FcwResult,
+    commit_index: &CommitIndex,
+    lock_table: &InProcessPageLockTable,
+    txn: TxnId,
+) {
+    if lock_table.observer().is_none() {
+        return;
+    }
+    if let FcwResult::Conflict {
+        conflicting_pages, ..
+    } = result
+    {
+        for &page in conflicting_pages {
+            if let Some(winner_commit_seq) = commit_index.latest(page) {
+                emit_fcw_base_drift(
+                    lock_table.observer(),
+                    page,
+                    txn,
+                    winner_commit_seq,
+                    false,
+                    false,
+                );
+            }
+        }
+    }
+}
+
 /// Commit a concurrent transaction with full SSI validation.
 ///
 /// This version takes the registry mutably to perform cross-transaction SSI
@@ -3022,6 +3053,7 @@ pub fn prepare_concurrent_commit_with_ssi(
 
         // Step 1: First-committer-wins validation.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
+        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
         if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -3048,6 +3080,8 @@ pub fn prepare_concurrent_commit_with_ssi(
     };
 
     if marked_for_abort {
+        // This early exit has no discovered edge counts. Do not fabricate an
+        // SsiAbort observation from sticky flags alone.
         tracing::warn!(
             txn = %txn_id,
             "prepare_concurrent_commit_with_ssi: marked_for_abort"
@@ -3222,6 +3256,15 @@ pub fn prepare_concurrent_commit_with_ssi(
             .iter()
             .any(|edge| !edge.source_is_active && edge.source_has_in_rw)
         {
+            if lock_table.observer().is_some() {
+                emit_ssi_abort(
+                    lock_table.observer(),
+                    txn,
+                    fsqlite_observability::SsiAbortCategory::CommittedPivot,
+                    incoming_edges.len(),
+                    0, // This write-only validation has no outgoing read edges.
+                );
+            }
             tracing::warn!(
                 ?txn,
                 dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
@@ -3362,6 +3405,24 @@ pub fn prepare_concurrent_commit_with_ssi(
     };
 
     if let Some(reason) = abort_reason {
+        let category = match reason {
+            SsiAbortReason::Pivot => fsqlite_observability::SsiAbortCategory::Pivot,
+            SsiAbortReason::CommittedPivot => {
+                fsqlite_observability::SsiAbortCategory::CommittedPivot
+            }
+            SsiAbortReason::MarkedForAbort => {
+                fsqlite_observability::SsiAbortCategory::MarkedForAbort
+            }
+        };
+        if lock_table.observer().is_some() {
+            emit_ssi_abort(
+                lock_table.observer(),
+                txn,
+                category,
+                incoming_edges.len(),
+                outgoing_edges.len(),
+            );
+        }
         tracing::warn!(
             ?txn,
             ?reason,
@@ -3435,6 +3496,7 @@ pub fn prepare_concurrent_commit_fcw_only(
 
         // FCW (Step 1) — mandatory for MVCC write-write invariants.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
+        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
         if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -3461,6 +3523,8 @@ pub fn prepare_concurrent_commit_fcw_only(
     };
 
     if marked_for_abort {
+        // No edge discovery ran in this path, so its sticky abort flag cannot
+        // supply the counts required by SsiAbort telemetry.
         tracing::warn!(
             txn = %txn_id,
             "prepare_concurrent_commit_fcw_only: marked_for_abort"
@@ -5398,6 +5462,317 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 8: FCW validation with clean write set.
     // -----------------------------------------------------------------------
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_prepare_conflict_observer_fcw_preserves_each_winner_and_opt_out() {
+        for with_ssi in [false, true] {
+            for enabled in [false, true] {
+                let observer = Arc::new(fsqlite_observability::MetricsObserver::new(8));
+                let mut lock_table = InProcessPageLockTable::with_observer(observer.clone());
+                if !enabled {
+                    lock_table.set_observer(None);
+                }
+                let commit_index = CommitIndex::new();
+                let mut registry = ConcurrentRegistry::new();
+                let loser = registry.begin_concurrent(test_snapshot(10)).unwrap();
+                let loser_txn = registry.get(loser).unwrap().token().id;
+
+                // Publish two real commits, so each stale page has a different winner.
+                for (page, seq) in [(5, 11), (6, 12)] {
+                    let winner = registry.begin_concurrent(test_snapshot(seq - 1)).unwrap();
+                    concurrent_write_page(
+                        &mut registry.get_mut(winner).unwrap(),
+                        &lock_table,
+                        winner,
+                        test_page(page),
+                        test_data(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        concurrent_commit_with_ssi(
+                            &mut registry,
+                            &commit_index,
+                            &lock_table,
+                            winner,
+                            CommitSeq::new(seq),
+                        ),
+                        Ok(CommitSeq::new(seq))
+                    );
+                }
+                assert!(
+                    observer.log().is_empty(),
+                    "clean commits are not resolutions"
+                );
+                for page in [5, 6] {
+                    concurrent_write_page(
+                        &mut registry.get_mut(loser).unwrap(),
+                        &lock_table,
+                        loser,
+                        test_page(page),
+                        test_data(),
+                    )
+                    .unwrap();
+                }
+                let prepare = if with_ssi {
+                    prepare_concurrent_commit_with_ssi
+                } else {
+                    super::prepare_concurrent_commit_fcw_only
+                };
+                let (error, result) = prepare(
+                    &mut registry,
+                    &commit_index,
+                    &lock_table,
+                    loser,
+                    CommitSeq::new(13),
+                )
+                .expect_err("stale writes must fail regardless of observation");
+                assert_eq!(error, MvccError::BusySnapshot);
+                let FcwResult::Conflict {
+                    mut conflicting_pages,
+                    conflicting_commit_seq,
+                } = result
+                else {
+                    panic!("expected actual FCW conflict, got {result:?}");
+                };
+                conflicting_pages.sort();
+                assert_eq!(conflicting_pages, vec![test_page(5), test_page(6)]);
+                assert_eq!(conflicting_commit_seq, CommitSeq::new(12));
+                let events = observer.log().snapshot();
+                let metrics = observer.metrics().snapshot();
+                assert_eq!(events.len(), usize::from(enabled) * 2);
+                let expected_count = u64::from(enabled) * 2;
+                assert_eq!(metrics.fcw_drifts, expected_count);
+                assert_eq!(metrics.conflicts_total, expected_count);
+                assert_eq!(metrics.page_contentions, 0);
+                assert_eq!(metrics.ssi_aborts, 0);
+                assert_eq!(metrics.fcw_merge_attempts, 0);
+                assert_eq!(metrics.fcw_merge_successes, 0);
+                assert_eq!(metrics.conflicts_resolved, 0);
+                for event in &events {
+                    let fsqlite_observability::ConflictEvent::FcwBaseDrift {
+                        page,
+                        loser: event_loser,
+                        winner_commit_seq,
+                        merge_attempted,
+                        merge_succeeded,
+                        ..
+                    } = event
+                    else {
+                        panic!("unexpected event: {event:?}");
+                    };
+                    assert_eq!(*event_loser, loser_txn);
+                    assert_eq!(Some(*winner_commit_seq), commit_index.latest(*page));
+                    assert!(!*merge_attempted && !*merge_succeeded);
+                }
+                if enabled {
+                    let pages = events
+                        .iter()
+                        .map(|event| match event {
+                            fsqlite_observability::ConflictEvent::FcwBaseDrift { page, .. } => {
+                                *page
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(pages, BTreeSet::from([test_page(5), test_page(6)]));
+                }
+                let retry = prepare(
+                    &mut registry,
+                    &commit_index,
+                    &lock_table,
+                    loser,
+                    CommitSeq::new(13),
+                );
+                assert!(matches!(
+                    retry,
+                    Err((MvccError::InvalidState, FcwResult::Clean))
+                ));
+                assert_eq!(
+                    observer.log().snapshot(),
+                    events,
+                    "invalid retry adds no event"
+                );
+                eprintln!(
+                    "bead_id=bd-6hdwo.13 event=fcw_prepare_observed with_ssi={with_ssi} enabled={enabled} events={events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prepare_conflict_observer_pivot_has_discovered_edge_counts() {
+        for enabled in [false, true] {
+            let observer = Arc::new(fsqlite_observability::MetricsObserver::new(8));
+            let mut lock_table = InProcessPageLockTable::with_observer(observer.clone());
+            if !enabled {
+                lock_table.set_observer(None);
+            }
+            let commit_index = CommitIndex::new();
+            let mut registry = ConcurrentRegistry::new();
+            let pivot = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            let peer = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            let reader = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            for (session, read, write) in [(pivot, 10, 20), (peer, 20, 10), (reader, 20, 30)] {
+                let mut handle = registry.get_mut(session).unwrap();
+                handle.record_read(test_page(read));
+                concurrent_write_page(
+                    &mut handle,
+                    &lock_table,
+                    session,
+                    test_page(write),
+                    test_data(),
+                )
+                .unwrap();
+            }
+            let token = registry.get(pivot).unwrap().token();
+            let result = concurrent_commit_with_ssi(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                pivot,
+                CommitSeq::new(11),
+            );
+            assert_eq!(
+                result,
+                Err((
+                    MvccError::BusySnapshot,
+                    FcwResult::Abort {
+                        reason: SsiAbortReason::Pivot
+                    }
+                ))
+            );
+            assert!(
+                registry.get(pivot).is_none(),
+                "wrapper must still abort the rejected txn"
+            );
+            assert_eq!(commit_index.latest(test_page(20)), None);
+            let events = observer.log().snapshot();
+            let metrics = observer.metrics().snapshot();
+            assert_eq!(events.len(), usize::from(enabled));
+            assert_eq!(metrics.ssi_aborts, u64::from(enabled));
+            assert_eq!(metrics.conflicts_total, u64::from(enabled));
+            assert_eq!(metrics.page_contentions, 0);
+            assert_eq!(metrics.fcw_drifts, 0);
+            assert_eq!(metrics.conflicts_resolved, 0);
+            if enabled {
+                assert!(
+                    matches!(events.as_slice(), [fsqlite_observability::ConflictEvent::SsiAbort {
+                    txn,
+                    reason: fsqlite_observability::SsiAbortCategory::Pivot,
+                    in_edge_count: 2,
+                    out_edge_count: 1,
+                    ..
+                }] if *txn == token)
+                );
+            }
+            assert!(matches!(
+                concurrent_commit_with_ssi(
+                    &mut registry,
+                    &commit_index,
+                    &lock_table,
+                    pivot,
+                    CommitSeq::new(11)
+                ),
+                Err((MvccError::InvalidState, FcwResult::Clean))
+            ));
+            assert_eq!(
+                observer.log().snapshot(),
+                events,
+                "abort cleanup must not double-count"
+            );
+            eprintln!(
+                "bead_id=bd-6hdwo.13 event=ssi_pivot_observed enabled={enabled} events={events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepare_conflict_observer_committed_pivot_covers_both_discovery_paths() {
+        for writer_reads in [false, true] {
+            let observer = Arc::new(fsqlite_observability::MetricsObserver::new(8));
+            let lock_table = InProcessPageLockTable::with_observer(observer.clone());
+            let commit_index = CommitIndex::new();
+            let mut registry = ConcurrentRegistry::new();
+            let prior_reader = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            let committed_reader = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            let writer = registry.begin_concurrent(test_snapshot(10)).unwrap();
+            registry
+                .get_mut(prior_reader)
+                .unwrap()
+                .record_read(test_page(20));
+            {
+                let mut handle = registry.get_mut(committed_reader).unwrap();
+                handle.record_read(test_page(10));
+                concurrent_write_page(
+                    &mut handle,
+                    &lock_table,
+                    committed_reader,
+                    test_page(20),
+                    test_data(),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                concurrent_commit_with_ssi(
+                    &mut registry,
+                    &commit_index,
+                    &lock_table,
+                    committed_reader,
+                    CommitSeq::new(11)
+                ),
+                Ok(CommitSeq::new(11))
+            );
+            assert!(
+                observer.log().is_empty(),
+                "an incoming edge alone is not an abort"
+            );
+            {
+                let mut handle = registry.get_mut(writer).unwrap();
+                if writer_reads {
+                    handle.record_read(test_page(30));
+                }
+                concurrent_write_page(&mut handle, &lock_table, writer, test_page(10), test_data())
+                    .unwrap();
+            }
+            let token = registry.get(writer).unwrap().token();
+            assert_eq!(
+                concurrent_commit_with_ssi(
+                    &mut registry,
+                    &commit_index,
+                    &lock_table,
+                    writer,
+                    CommitSeq::new(12)
+                ),
+                Err((
+                    MvccError::BusySnapshot,
+                    FcwResult::Abort {
+                        reason: SsiAbortReason::CommittedPivot
+                    }
+                ))
+            );
+            let events = observer.log().snapshot();
+            assert!(
+                matches!(events.as_slice(), [fsqlite_observability::ConflictEvent::SsiAbort {
+                txn,
+                reason: fsqlite_observability::SsiAbortCategory::CommittedPivot,
+                in_edge_count: 1,
+                out_edge_count: 0,
+                ..
+            }] if *txn == token)
+            );
+            let metrics = observer.metrics().snapshot();
+            assert_eq!(metrics.ssi_aborts, 1);
+            assert_eq!(metrics.conflicts_total, 1);
+            assert_eq!(metrics.page_contentions, 0);
+            assert_eq!(metrics.fcw_drifts, 0);
+            assert_eq!(metrics.conflicts_resolved, 0);
+            assert_eq!(commit_index.latest(test_page(10)), None);
+            eprintln!(
+                "bead_id=bd-6hdwo.13 event=ssi_committed_pivot_observed writer_reads={writer_reads} events={events:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_fcw_validation_clean() {
         let commit_index = CommitIndex::new();
