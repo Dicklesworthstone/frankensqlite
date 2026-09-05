@@ -807,12 +807,14 @@ fn seed_cache_budget_database(path: &std::path::Path, page_size: usize) -> Cache
         .unwrap();
     }
     tx.commit().unwrap();
-    let actual_page_size: usize = conn
+    let raw_page_size: i64 = conn
         .query_row("PRAGMA page_size", [], |r| r.get(0))
         .unwrap();
-    let page_count: usize = conn
+    let raw_page_count: i64 = conn
         .query_row("PRAGMA page_count", [], |r| r.get(0))
         .unwrap();
+    let actual_page_size = usize::try_from(raw_page_size).expect("page_size must fit usize");
+    let page_count = usize::try_from(raw_page_count).expect("page_count must fit usize");
     assert_eq!(actual_page_size, page_size);
     assert!(page_count > 8, "fixture must exceed the test budget");
     conn.close().unwrap();
