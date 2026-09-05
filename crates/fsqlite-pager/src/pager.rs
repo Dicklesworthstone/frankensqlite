@@ -35029,6 +35029,177 @@ mod tests {
     }
 
     #[test]
+    fn test_savepoint_journal_failed_commit_preserves_allocation_ownership() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let header = txn.get_page(&cx, PageNumber::ONE).await.unwrap();
+            txn.write_page_data(&cx, PageNumber::ONE, header).await.unwrap();
+            let reserved_before = txn.allocate_page(&cx).await.unwrap();
+            txn.savepoint(&cx, "outer").unwrap();
+            let written_after = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page_data(&cx, written_after, PageData::from_vec(sample_page(0x22)))
+                .await.unwrap();
+
+            // Exhaust commit's staging pool without changing database bytes.
+            let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+            let held = pool.acquire().unwrap();
+            txn.pool = pool.clone();
+            txn.cache = Arc::new(ShardedPageCache::with_pool(pool, PageSize::DEFAULT));
+            let error = txn.commit(&cx).await.expect_err("commit must fail before publication");
+            assert!(matches!(error, FrankenError::PageBufferCapacityExhausted { .. }));
+            drop(held);
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.allocated_from_eof, vec![reserved_before]);
+            assert!(txn.savepoint_quarantined_allocations.contains(&written_after));
+            assert!(
+                !txn.inner.lock().unwrap().freelist.contains(&reserved_before),
+                "an allocation restored to this transaction must not also be grantable to a peer"
+            );
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_savepoint_journal_tracks_mutations_not_resident_pages() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..128 {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page_data(&cx, page, PageData::from_vec(sample_page(0x11)))
+                    .await
+                    .unwrap();
+                pages.push(page);
+            }
+            txn.savepoint(&cx, "outer").unwrap();
+            assert!(txn.savepoint_journal.undo.is_empty());
+            assert!(txn.write_set.values().all(|page| page.published.get().is_none()));
+            for marker in 0..32 {
+                txn.write_page(&cx, pages[0], &sample_page(marker)).await.unwrap();
+            }
+            assert_eq!(txn.savepoint_journal.undo.len(), 1);
+            txn.savepoint(&cx, "inner").unwrap();
+            txn.write_page(&cx, pages[0], &sample_page(0x44)).await.unwrap();
+            txn.release_savepoint(&cx, "inner").unwrap();
+            txn.write_page(&cx, pages[0], &sample_page(0x55)).await.unwrap();
+            assert_eq!(txn.savepoint_journal.undo.len(), 3);
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.get_page(&cx, pages[0]).await.unwrap().as_bytes(), sample_page(0x11));
+            let mut sorted_pages = pages.clone();
+            sorted_pages.sort_unstable();
+            assert_eq!(txn.write_pages_sorted, sorted_pages);
+            txn.write_page(&cx, pages[0], &sample_page(0x66)).await.unwrap();
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.get_page(&cx, pages[0]).await.unwrap().as_bytes(), sample_page(0x11));
+            txn.release_savepoint(&cx, "outer").unwrap();
+            assert!(txn.savepoint_journal.undo.is_empty());
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_savepoint_journal_owned_take_mutate_restore_keeps_cow_views() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page_data(&cx, page, PageData::from_vec(sample_page(0x11)))
+                .await.unwrap();
+            txn.savepoint(&cx, "outer").unwrap();
+            assert!(txn.try_mutate_staged_page_data(page, &mut |data| {
+                data.as_bytes_mut()[0] = 0x22;
+            }));
+            txn.savepoint(&cx, "inner").unwrap();
+            let mut taken = txn.try_take_staged_page_data(page).unwrap();
+            let reader = taken.clone();
+            taken.as_bytes_mut()[0] = 0x33;
+            txn.restore_staged_page_data(&cx, page, taken).await.unwrap();
+            txn.rollback_to_savepoint(&cx, "inner").unwrap();
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes()[0], 0x22);
+            txn.release_savepoint(&cx, "inner").unwrap();
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes()[0], 0x11);
+            assert_eq!(reader.as_bytes()[0], 0x22);
+            assert!(txn.accounted_write_pages.contains(&page));
+            assert_eq!(txn.write_pages_sorted, vec![page]);
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_savepoint_journal_restores_freed_order_and_accounting() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            pager.set_write_set_page_limit(4).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let mut pages = Vec::new();
+            for _ in 0..4 {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x11)).await.unwrap();
+                pages.push(page);
+            }
+            for page in &pages[..3] {
+                txn.free_page(&cx, *page).await.unwrap();
+            }
+            let freed = txn.freed_pages.clone();
+            let accounted = txn.accounted_write_pages.clone();
+            let sorted = txn.write_pages_sorted.clone();
+            txn.savepoint(&cx, "outer").unwrap();
+            txn.write_page_data(&cx, pages[0], PageData::from_vec(sample_page(0x22)))
+                .await.unwrap();
+            txn.free_page(&cx, pages[3]).await.unwrap();
+            txn.savepoint(&cx, "inner").unwrap();
+            txn.write_page(&cx, pages[1], &sample_page(0x33)).await.unwrap();
+            txn.release_savepoint(&cx, "inner").unwrap();
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.freed_pages, freed);
+            assert_eq!(txn.freed_pages_index, freed.iter().copied().collect());
+            assert_eq!(txn.accounted_write_pages, accounted);
+            assert_eq!(txn.write_pages_sorted, sorted);
+            assert_eq!(pager.write_set_stats().unwrap().current_dirty_pages, 1);
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_savepoint_journal_seals_before_bulk_commit_rewrites() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0x11)).await.unwrap();
+            txn.savepoint(&cx, "outer").unwrap();
+            txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
+            txn.savepoint(&cx, "inner").unwrap();
+            txn.write_page(&cx, page, &sample_page(0x33)).await.unwrap();
+            txn.seal_savepoints_for_commit().unwrap();
+            assert!(txn.savepoint_journal.undo.is_empty());
+            assert!(txn.savepoint_stack.iter().all(|entry| entry.commit_snapshot.is_some()));
+            // Commit helpers drain/replace staging directly. Their recovery
+            // image must not depend on statement mutation hooks.
+            txn.write_set.clear();
+            txn.write_pages_sorted.clear();
+            txn.reset_current_write_set_accounting();
+            txn.rollback_to_savepoint(&cx, "inner").unwrap();
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes()[0], 0x22);
+            txn.savepoint(&cx, "new").unwrap();
+            txn.write_page(&cx, page, &sample_page(0x44)).await.unwrap();
+            txn.release_savepoint(&cx, "new").unwrap();
+            txn.release_savepoint(&cx, "inner").unwrap();
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes()[0], 0x11);
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_savepoint_basic_rollback_to() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;

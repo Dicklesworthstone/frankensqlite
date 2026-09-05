@@ -1320,12 +1320,14 @@ fn verify_bootstrap_symbol_auth(
     segment_epoch: u64,
     epoch_key: Option<&EpochAuthKey>,
 ) -> Result<()> {
-    let Some(epoch_key) = epoch_key else {
-        return Ok(());
+    let valid_auth = match epoch_key {
+        Some(key) => record.auth_tag != [0_u8; 16] && record.verify_auth(key.as_bytes()),
+        None => record.auth_tag == [0_u8; 16],
     };
     // SymbolRecord::verify_auth also serves auth-disabled callers and accepts
-    // the zero sentinel. Authenticated bootstrap must reject that sentinel.
-    if record.auth_tag == [0_u8; 16] || !record.verify_auth(epoch_key.as_bytes()) {
+    // the zero sentinel. Bootstrap must enforce the selected mode in both
+    // directions, including scan recovery when no valid root is available.
+    if !valid_auth {
         error!(
             bead_id = ROOT_BOOTSTRAP_BEAD_ID,
             logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
@@ -1333,6 +1335,7 @@ fn verify_bootstrap_symbol_auth(
             object_id = %record.object_id,
             segment_epoch,
             esi = record.esi,
+            symbol_auth_enabled = epoch_key.is_some(),
             "bootstrap symbol authentication failed"
         );
         return Err(FrankenError::DatabaseCorrupt {
@@ -1346,13 +1349,12 @@ fn verify_bootstrap_symbol_auth(
 }
 
 fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Result<Vec<u8>> {
-    records.sort_by_key(|record| record.esi);
+    records.sort_unstable_by_key(|record| record.esi);
     let Some(first) = records.first() else {
         return Err(FrankenError::DatabaseCorrupt {
             detail: "cannot reconstruct payload from empty symbol set".to_owned(),
         });
     };
-    // Save OTI before consuming the Vec so the borrow on `first` is released.
     let first_oti = first.oti;
     let symbol_size_u64 = u64::from(first_oti.t);
     if symbol_size_u64 == 0 {
@@ -1361,37 +1363,20 @@ fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Re
         });
     }
 
-    let transfer_len_usize = u64_to_usize(first_oti.f, "oti.f")?;
     let source_symbols = first_oti.f.div_ceil(symbol_size_u64);
-    let source_symbols_usize = u64_to_usize(source_symbols, "source_symbols")?;
     let symbol_size_usize = u32_to_usize(first_oti.t, "oti.t")?;
-    let total_bytes = source_symbols_usize
-        .checked_mul(symbol_size_usize)
-        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "reconstruction size overflow".to_owned(),
-        })?;
-    let mut out = vec![0_u8; total_bytes];
-    let mut seen = vec![false; source_symbols_usize];
-
-    for record in records {
-        if u64::from(record.esi) >= source_symbols {
-            continue;
+    let mut available_payload_bytes = 0_usize;
+    // Validate repair records too, before deciding which ESIs contribute to
+    // this systematic reconstruction. No allocation is based on OTI.f yet.
+    for record in &records {
+        if record.object_id != first.object_id {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "inconsistent object id across object symbols".to_owned(),
+            });
         }
         if record.oti != first_oti {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "inconsistent OTI across object symbols".to_owned(),
-            });
-        }
-        let idx = u32_to_usize(record.esi, "esi")?;
-        let start =
-            idx.checked_mul(symbol_size_usize)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "symbol offset overflow".to_owned(),
-                })?;
-        let end = checked_add(start, symbol_size_usize, "symbol_end")?;
-        if end > out.len() {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: "symbol write out of bounds during reconstruction".to_owned(),
             });
         }
         if record.symbol_data.len() != symbol_size_usize {
@@ -1399,14 +1384,57 @@ fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Re
                 detail: "symbol size does not match OTI.t".to_owned(),
             });
         }
-        out[start..end].copy_from_slice(&record.symbol_data);
-        seen[idx] = true;
+        available_payload_bytes = checked_add(
+            available_payload_bytes,
+            record.symbol_data.len(),
+            "available symbol payload bytes",
+        )?;
     }
 
-    if !seen.iter().all(|bit| *bit) {
+    // Complete unique source coverage bounds output by bytes already admitted.
+    // Identical retries are harmless; conflicting duplicates are equivocation.
+    let mut next_source_esi = 0_u64;
+    let mut previous: Option<&SymbolRecord> = None;
+    for record in &records {
+        let esi = u64::from(record.esi);
+        if esi >= source_symbols {
+            break;
+        }
+        if esi == next_source_esi {
+            next_source_esi += 1;
+            previous = Some(record);
+        } else if esi < next_source_esi {
+            if previous.is_none_or(|prior| prior.symbol_data != record.symbol_data) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("conflicting source symbols at ESI {esi}"),
+                });
+            }
+        } else {
+            break;
+        }
+    }
+    if next_source_esi != source_symbols {
         return Err(FrankenError::DatabaseCorrupt {
             detail: "insufficient source symbols to reconstruct object payload".to_owned(),
         });
+    }
+
+    let transfer_len_usize = u64_to_usize(first_oti.f, "oti.f")?;
+    let total_bytes = u64_to_usize(source_symbols, "source_symbols")?
+        .checked_mul(symbol_size_usize)
+        .filter(|total| *total <= available_payload_bytes)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "reconstruction size exceeds available symbol payload bytes".to_owned(),
+        })?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_bytes)
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    next_source_esi = 0;
+    for record in &records {
+        if next_source_esi < source_symbols && u64::from(record.esi) == next_source_esi {
+            out.extend_from_slice(&record.symbol_data);
+            next_source_esi += 1;
+        }
     }
     out.truncate(transfer_len_usize);
     Ok(out)
@@ -2175,22 +2203,64 @@ mod tests {
 
     #[test]
     fn test_native_bootstrap_recovery_cannot_downgrade_authenticated_root() {
-        let (_tmp, layout) = create_layout();
-        let key = test_master_key();
-        let expected =
-            write_authenticated_bootstrap_fixture(&layout, EpochId::new(7), EpochId::new(7), &key);
-        write_root_pointer_atomic(&layout.root_path(), expected.root_pointer).expect("root");
-        let before = bootstrap_disk_snapshot(&layout);
-        let error = bootstrap_native_mode_with_recovery(&layout, false, None)
-            .expect_err("auth-disabled open cannot replace an authenticated root");
-        assert!(
-            matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("symbol_auth=off"))
-        );
-        assert_eq!(bootstrap_disk_snapshot(&layout), before);
-        assert_eq!(
-            bootstrap_native_mode(&layout, true, Some(&key)).expect("authenticated reopen"),
-            expected
-        );
+        for root_state in ["valid", "missing", "torn", "checksum", "unsigned"] {
+            let (_tmp, layout) = create_layout();
+            let key = test_master_key();
+            let expected = write_authenticated_bootstrap_fixture(
+                &layout,
+                EpochId::new(7),
+                EpochId::new(7),
+                &key,
+            );
+            let scan = scan_symbol_segment(&layout.symbols_dir().join("segment-000001.log"))
+                .expect("signed fixture segment");
+            let epoch_key = derive_epoch_auth_key(&key, EpochId::new(scan.header.epoch_id));
+            assert!(!scan.records.is_empty());
+            assert!(scan.records.iter().all(|row| {
+                row.record.auth_tag != [0_u8; 16] && row.record.verify_auth(epoch_key.as_bytes())
+            }));
+            let mut bytes = expected.root_pointer.encode();
+            match root_state {
+                "valid" => fs::write(layout.root_path(), bytes).expect("root"),
+                "missing" => {}
+                "torn" => fs::write(layout.root_path(), &bytes[..17]).expect("torn root"),
+                "checksum" => {
+                    bytes[12] ^= 1;
+                    fs::write(layout.root_path(), bytes).expect("checksum-corrupt root");
+                }
+                "unsigned" => write_root_pointer_atomic(
+                    &layout.root_path(),
+                    EcsRootPointer::unauthed(
+                        expected.root_pointer.manifest_object_id,
+                        expected.root_pointer.ecs_epoch,
+                    ),
+                )
+                .expect("unsigned root with signed body"),
+                _ => unreachable!(),
+            }
+            let before = bootstrap_disk_snapshot(&layout);
+            let result = bootstrap_native_mode_with_recovery(&layout, false, None);
+            let after = bootstrap_disk_snapshot(&layout);
+            eprintln!(
+                "bead_id=bd-3mgq5.4 case=auth_off_recovery root_state={root_state} signed_records={} open_succeeded={} disk_unchanged={}",
+                scan.records.len(),
+                result.is_ok(),
+                after == before
+            );
+            let error = result.expect_err("auth-disabled recovery cannot downgrade signed data");
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { detail }
+                    if detail.contains("symbol_auth=off") || detail.contains("auth_failed")),
+                "root_state={root_state} error={error}"
+            );
+            assert_eq!(after, before, "root_state={root_state}");
+            if root_state == "valid" {
+                assert_eq!(
+                    bootstrap_native_mode(&layout, true, Some(&key)).expect("authenticated reopen"),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -2488,6 +2558,156 @@ mod tests {
             matches!(&error, FrankenError::DatabaseCorrupt { detail } if detail.contains("not found in symbol logs"))
         );
         assert_eq!(bootstrap_disk_snapshot(&layout), before);
+    }
+
+    fn reconstruction_symbol(f: u64, t: u32, esi: u32, payload: &[u8]) -> SymbolRecord {
+        SymbolRecord::new(
+            make_object_id(0xA5),
+            Oti {
+                f,
+                al: 1,
+                t,
+                z: 1,
+                n: 1,
+            },
+            esi,
+            payload.to_vec(),
+            SymbolRecordFlags::empty(),
+        )
+    }
+
+    #[test]
+    fn test_reconstruction_bounds_declared_length_before_allocation() {
+        let record = reconstruction_symbol(u64::MAX, 1, 0, &[0xA5]);
+        let error = reconstruct_payload_from_source_symbols(vec![record])
+            .expect_err("one byte cannot admit an unbounded transfer length");
+        assert!(matches!(&error, FrankenError::DatabaseCorrupt { detail }
+            if detail.contains("insufficient source symbols")));
+        eprintln!(
+            "bead_id=bd-3mgq5.4 case=reconstruction_bound declared_bytes={} admitted_payload_bytes=1 result=insufficient_sources",
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn test_reconstruction_reorders_deduplicates_and_truncates_sources() {
+        let first = reconstruction_symbol(5, 2, 0, &[1, 2]);
+        let second = reconstruction_symbol(5, 2, 1, &[3, 4]);
+        let third = reconstruction_symbol(5, 2, 2, &[5, 99]);
+        let repair = reconstruction_symbol(5, 2, 9, &[80, 81]);
+        let mut repeated = second.clone();
+        repeated.flags = SymbolRecordFlags::SYSTEMATIC_RUN_START;
+        let payload =
+            reconstruct_payload_from_source_symbols(vec![repair, third, repeated, first, second])
+                .expect("complete unique sources with an identical retry");
+        assert_eq!(payload, [1, 2, 3, 4, 5]);
+        eprintln!(
+            "bead_id=bd-3mgq5.4 case=reconstruction_complete source_symbols=3 identical_duplicates=1 repair_symbols=1 output_bytes=5"
+        );
+    }
+
+    #[test]
+    fn test_reconstruction_rejects_missing_and_conflicting_sources() {
+        for case in ["missing_first", "gap", "missing_last", "equivocation"] {
+            let mut records = vec![
+                reconstruction_symbol(5, 2, 0, &[1, 2]),
+                reconstruction_symbol(5, 2, 1, &[3, 4]),
+                reconstruction_symbol(5, 2, 2, &[5, 99]),
+            ];
+            match case {
+                "missing_first" => {
+                    records.remove(0);
+                }
+                "gap" => {
+                    records.remove(1);
+                }
+                "missing_last" => {
+                    records.remove(2);
+                }
+                "equivocation" => records.push(reconstruction_symbol(5, 2, 1, &[3, 9])),
+                _ => unreachable!(),
+            }
+            records.push(reconstruction_symbol(5, 2, 8, &[80, 81]));
+            let error = reconstruct_payload_from_source_symbols(records)
+                .expect_err("repairs and conflicting duplicates cannot supply missing sources");
+            let expected = if case == "equivocation" {
+                "conflicting source symbols"
+            } else {
+                "insufficient source symbols"
+            };
+            assert!(
+                matches!(&error, FrankenError::DatabaseCorrupt { detail }
+                if detail.contains(expected)),
+                "case={case} error={error}"
+            );
+            eprintln!("bead_id=bd-3mgq5.4 case={case} result=rejected reason={expected}");
+        }
+    }
+
+    #[test]
+    fn test_reconstruction_validates_source_and_repair_metadata() {
+        for esi in [0, 9] {
+            for damage in ["oti", "payload_length", "object_id"] {
+                let source = reconstruction_symbol(2, 2, 0, &[1, 2]);
+                let bad = match damage {
+                    "oti" => reconstruction_symbol(3, 2, esi, &[1, 2]),
+                    "payload_length" => reconstruction_symbol(2, 2, esi, &[1]),
+                    "object_id" => SymbolRecord::new(
+                        make_object_id(0xA6),
+                        source.oti,
+                        esi,
+                        vec![1, 2],
+                        SymbolRecordFlags::empty(),
+                    ),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    bad.verify_integrity(),
+                    "fixture has a valid unkeyed checksum"
+                );
+                let error = reconstruct_payload_from_source_symbols(vec![source, bad])
+                    .expect_err("all records must have consistent metadata before allocation");
+                let expected = match damage {
+                    "oti" => "inconsistent OTI",
+                    "payload_length" => "symbol size does not match",
+                    "object_id" => "inconsistent object id",
+                    _ => unreachable!(),
+                };
+                assert!(
+                    matches!(&error, FrankenError::DatabaseCorrupt { detail }
+                    if detail.contains(expected)),
+                    "esi={esi} damage={damage} error={error}"
+                );
+                eprintln!(
+                    "bead_id=bd-3mgq5.4 case=reconstruction_metadata esi={esi} damage={damage} result=rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconstruction_empty_and_zero_length_boundaries() {
+        let empty = reconstruct_payload_from_source_symbols(Vec::new())
+            .expect_err("no symbols means no OTI");
+        assert!(matches!(&empty, FrankenError::DatabaseCorrupt { detail }
+            if detail.contains("empty symbol set")));
+        let zero_size =
+            reconstruct_payload_from_source_symbols(vec![reconstruction_symbol(0, 0, 0, &[])])
+                .expect_err("zero symbol size is invalid even for an empty object");
+        assert!(
+            matches!(&zero_size, FrankenError::DatabaseCorrupt { detail }
+            if detail.contains("symbol_size=0"))
+        );
+        assert_eq!(
+            reconstruct_payload_from_source_symbols(vec![reconstruction_symbol(0, 2, 0, &[1, 2])])
+                .expect("zero transfer length with valid metadata"),
+            Vec::<u8>::new()
+        );
+        let short =
+            reconstruct_payload_from_source_symbols(vec![reconstruction_symbol(0, 2, 0, &[1])])
+                .expect_err("zero transfer length does not bypass record validation");
+        assert!(matches!(&short, FrankenError::DatabaseCorrupt { detail }
+            if detail.contains("symbol size does not match")));
     }
 
     #[test]

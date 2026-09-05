@@ -312,18 +312,10 @@ pub fn ensure_symbol_segment(segment_path: &Path, header: SymbolSegmentHeader) -
         Err(e) => return Err(e.into()),
     }
 
-    let bytes = fs::read(segment_path)?;
-    if bytes.len() < SYMBOL_SEGMENT_HEADER_BYTES {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "existing segment {} shorter than header: {} bytes",
-                segment_path.display(),
-                bytes.len()
-            ),
-        });
-    }
-
-    let existing = SymbolSegmentHeader::decode(&bytes[..SYMBOL_SEGMENT_HEADER_BYTES])?;
+    // Admission checks only the fixed header. Reading the entire segment here
+    // makes even a one-record append allocate for every previous record.
+    let mut file = fs::File::open(segment_path)?;
+    let existing = read_symbol_segment_header(&mut file)?;
     if existing != header {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -583,6 +575,12 @@ fn read_symbol_bytes(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
     })
 }
 
+fn read_symbol_segment_header(reader: &mut impl Read) -> Result<SymbolSegmentHeader> {
+    let mut bytes = [0_u8; SYMBOL_SEGMENT_HEADER_BYTES];
+    read_symbol_bytes(reader, &mut bytes)?;
+    SymbolSegmentHeader::decode(&bytes)
+}
+
 fn read_located_symbol(
     reader: &mut (impl Read + Seek),
     file_len: u64,
@@ -590,9 +588,7 @@ fn read_located_symbol(
     max_symbol_bytes: u32,
     aligned_slot: Option<(u32, u32)>,
 ) -> Result<SymbolRecord> {
-    let mut segment_bytes = [0_u8; SYMBOL_SEGMENT_HEADER_BYTES];
-    read_symbol_bytes(reader, &mut segment_bytes)?;
-    let header = SymbolSegmentHeader::decode(&segment_bytes)?;
+    let header = read_symbol_segment_header(reader)?;
     if header.segment_id != offset.segment_id {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -1568,6 +1564,49 @@ mod tests {
         fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
             self.file.seek(position)
         }
+    }
+
+    #[test]
+    fn test_existing_segment_admission_reads_only_header() {
+        let dir = tempdir().expect("tempdir");
+        let header = SymbolSegmentHeader::new(7, 42, 100);
+        let path = symbol_segment_path(dir.path(), header.segment_id);
+        ensure_symbol_segment(&path, header).expect("create segment");
+        let file = OpenOptions::new().write(true).open(&path).expect("open");
+        let sparse_len = 64_u64 * 1024 * 1024;
+        file.set_len(sparse_len).expect("unrelated sparse tail");
+
+        let mut counted = CountedSymbolFile {
+            file: fs::File::open(&path).expect("open for header read"),
+            bytes_read: 0,
+        };
+        assert_eq!(read_symbol_segment_header(&mut counted).unwrap(), header);
+        assert_eq!(counted.bytes_read, SYMBOL_SEGMENT_HEADER_BYTES);
+        ensure_symbol_segment(&path, header).expect("admit existing segment");
+        let wrong_epoch = SymbolSegmentHeader::new(7, 43, 100);
+        assert!(matches!(
+            ensure_symbol_segment(&path, wrong_epoch),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert_eq!(file.metadata().unwrap().len(), sparse_len);
+
+        let corrupt_path = dir.path().join("corrupt-header.log");
+        let mut corrupt = header.encode();
+        corrupt[32] ^= 1;
+        fs::write(&corrupt_path, corrupt).unwrap();
+        assert!(matches!(
+            ensure_symbol_segment(&corrupt_path, header),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert_eq!(fs::read(&corrupt_path).unwrap(), corrupt);
+
+        let truncated_path = dir.path().join("truncated-header.log");
+        fs::write(&truncated_path, &header.encode()[..39]).unwrap();
+        assert!(matches!(
+            ensure_symbol_segment(&truncated_path, header),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert_eq!(fs::read(&truncated_path).unwrap(), header.encode()[..39]);
     }
 
     #[test]

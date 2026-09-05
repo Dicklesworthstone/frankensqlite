@@ -11,8 +11,15 @@
 use fsqlite::Connection;
 use std::time::Instant;
 
-const ROWS: usize = 10_000;
 const BATCH: usize = 1_000;
+
+fn rows() -> usize {
+    let count = std::env::var("AOJ0G_ROWS").map_or(10_000, |value| {
+        value.parse().expect("AOJ0G_ROWS is an integer")
+    });
+    assert!(count >= BATCH && count % BATCH == 0);
+    count
+}
 
 async fn run_case_with_commit_every_batch(name: &str, key_mod: Option<usize>) {
     let conn = Connection::open(":memory:").await.unwrap();
@@ -21,7 +28,7 @@ async fn run_case_with_commit_every_batch(name: &str, key_mod: Option<usize>) {
         .unwrap();
     conn.execute("CREATE INDEX idx_t_k ON t(k);").await.unwrap();
     let mut batch_times = Vec::new();
-    for batch_start in (0..ROWS).step_by(BATCH) {
+    for batch_start in (0..rows()).step_by(BATCH) {
         conn.execute("BEGIN;").await.unwrap();
         let start = Instant::now();
         for i in batch_start..batch_start + BATCH {
@@ -61,7 +68,7 @@ async fn run_case(name: &str, with_index: bool, key_mod: Option<usize>) {
     }
     conn.execute("BEGIN;").await.unwrap();
     let mut batch_times = Vec::new();
-    for batch_start in (0..ROWS).step_by(BATCH) {
+    for batch_start in (0..rows()).step_by(BATCH) {
         let start = Instant::now();
         for i in batch_start..batch_start + BATCH {
             let k = key_mod.map_or(i, |m| i % m);
