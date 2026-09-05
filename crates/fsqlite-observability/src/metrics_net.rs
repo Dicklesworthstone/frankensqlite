@@ -19,6 +19,51 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Once;
 
 use crate::metrics::{metrics_disabled, render_prometheus};
+use fsqlite_types::sync_primitives::Mutex;
+
+/// Loopback address used by a boolean SQL enable without an environment override.
+pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9009";
+
+// Only endpoint control uses this mutex; SQL execution and metric recording do
+// not. Publish the address after both bind and thread creation succeed, so a
+// concurrent enable cannot mistake an in-flight or failed attempt for success.
+static MANAGED_ENDPOINT: Mutex<Option<SocketAddr>> = Mutex::new(None);
+
+/// Address of the endpoint started through environment or SQL control.
+#[must_use]
+pub fn metrics_http_address() -> Option<SocketAddr> {
+    *MANAGED_ENDPOINT.lock()
+}
+
+/// Resolve the environment override or the default loopback address.
+#[must_use]
+pub fn default_bind() -> String {
+    std::env::var("FRANKENSQLITE_METRICS_BIND")
+        .ok()
+        .filter(|bind| !bind.is_empty())
+        .unwrap_or_else(|| DEFAULT_METRICS_BIND.to_owned())
+}
+
+/// Start or reuse the endpoint shared by environment and SQL control.
+///
+/// Returns its actual address, or `None` when metrics are disabled. Once started,
+/// subsequent callers receive the same address even if they request another.
+/// Failed starts leave the endpoint unset, allowing an explicit retry.
+///
+/// # Errors
+/// Propagates bind, local-address and thread-spawn errors.
+pub fn ensure_metrics_http(bind: &str) -> std::io::Result<Option<SocketAddr>> {
+    if metrics_disabled() {
+        return Ok(None);
+    }
+    let mut endpoint = MANAGED_ENDPOINT.lock();
+    if let Some(address) = *endpoint {
+        return Ok(Some(address));
+    }
+    let address = start_metrics_http(bind)?;
+    *endpoint = Some(address);
+    Ok(Some(address))
+}
 
 /// Serve `GET /metrics` on `bind` from a named daemon thread.
 ///
@@ -46,8 +91,9 @@ pub fn start_metrics_http(bind: &str) -> std::io::Result<SocketAddr> {
 /// Start the HTTP endpoint from `FRANKENSQLITE_METRICS_BIND` when it is set.
 ///
 /// No-op when the variable is unset or the subsystem is disabled. Idempotent —
-/// safe to call on every connection open; only the first call binds. A bind
-/// failure is swallowed (a metrics endpoint must never take down the engine).
+/// safe to call on every connection open; only the first call attempts startup.
+/// A bind failure is swallowed (a metrics endpoint must never take down the
+/// engine), and SQL control can explicitly retry after such a failure.
 pub fn autostart_from_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -57,7 +103,7 @@ pub fn autostart_from_env() {
         if let Ok(bind) = std::env::var("FRANKENSQLITE_METRICS_BIND")
             && !bind.is_empty()
         {
-            let _ = start_metrics_http(&bind);
+            let _ = ensure_metrics_http(&bind);
         }
     });
 }
@@ -131,6 +177,81 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
         response
+    }
+
+    #[test]
+    fn managed_endpoint_is_shared_after_successful_bind() {
+        const MODE: &str = "FSQLITE_MANAGED_HTTP_TEST_MODE";
+        let Ok(mode) = std::env::var(MODE) else {
+            for mode in ["enabled", "disabled"] {
+                let executable = std::env::current_exe().expect("test binary");
+                let output = std::process::Command::new(executable)
+                    .args([
+                        "--exact",
+                        "metrics_net::tests::managed_endpoint_is_shared_after_successful_bind",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .env("FRANKENSQLITE_METRICS_BIND", "127.0.0.1:0")
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .output()
+                    .expect("run isolated endpoint test");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{mode}: {stderr}");
+                assert!(stderr.contains("managed_endpoint_verified"));
+            }
+            return;
+        };
+        assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+        assert_eq!(metrics_http_address(), None);
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupied port");
+        let blocked = ensure_metrics_http(&occupied.local_addr().expect("address").to_string());
+        if mode == "enabled" {
+            assert_eq!(
+                blocked.expect_err("real occupied bind must fail").kind(),
+                std::io::ErrorKind::AddrInUse,
+            );
+        } else {
+            assert_eq!(blocked.expect("disabled start performs no bind"), None);
+        }
+        assert_eq!(
+            metrics_http_address(),
+            None,
+            "failed start publishes no address"
+        );
+        let barrier = std::sync::Barrier::new(8);
+        let addresses = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        ensure_metrics_http(&default_bind()).expect("concurrent start")
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("start thread"))
+                .collect::<Vec<_>>()
+        });
+        assert!(addresses.iter().all(|address| *address == addresses[0]));
+        assert_eq!(metrics_http_address(), addresses[0]);
+        if mode == "enabled" {
+            let address = addresses[0].expect("successful endpoint");
+            assert_ne!(address.port(), 0);
+            assert_eq!(
+                ensure_metrics_http(&occupied.local_addr().expect("address").to_string())
+                    .expect("already running endpoint is reused"),
+                Some(address),
+            );
+            assert!(http_get(address, "/metrics").starts_with("HTTP/1.1 200 OK"));
+        } else {
+            assert_eq!(addresses[0], None);
+        }
+        eprintln!("managed_endpoint_verified mode={mode}");
     }
 
     #[test]

@@ -40,14 +40,15 @@ Three ways to read the metrics. The **callable API**, both **serializers**, the
 today. The SQL engine records `commits_total` at its commit success boundaries
 and `page_lock_acquire_duration_seconds` when a contended wait finishes.
 Native database opens start the HTTP endpoint when the bind environment variable
-is set. Most other engine recording sites and the `PRAGMA` control still need
-wiring (see [Roadmap](#roadmap)).
+is set. `PRAGMA enable_metrics_http` can also start the shared endpoint. Most
+other engine recording sites still need wiring (see [Roadmap](#roadmap)).
 
 The bind setting is checked once per process at the first successful native
 open; the hard-disable flag is cached on first metrics use. Subsequent
 connections share the endpoint, which lives until process exit.
-A bind failure leaves database operations usable. Set the bind address before
-starting the process; changing it later does not retry or move the listener.
+A bind failure during open leaves database operations usable. Set the bind
+address before starting the process; later opens do not retry or move the
+listener. SQL control can explicitly retry a failed start.
 
 ### 1. Callable API (embedded scrape) — available now
 
@@ -85,9 +86,21 @@ let addr = metrics_net::start_metrics_http("127.0.0.1:9009")?;
 metrics_net::autostart_from_env(); // honors FRANKENSQLITE_METRICS_BIND=127.0.0.1:9009
 ```
 
-Native `Connection::open` calls `autostart_from_env` automatically. The
-`PRAGMA enable_metrics_http=1` control with the default `localhost:9009` bind
-remains tracked on `bd-zywqc.11`.
+Native `Connection::open` calls `autostart_from_env` automatically. SQL can
+query or enable the same process-wide listener:
+
+```sql
+PRAGMA enable_metrics_http;                    -- 0 before start, 1 after success
+PRAGMA enable_metrics_http=1;                  -- env override or 127.0.0.1:9009
+PRAGMA enable_metrics_http='127.0.0.1:9009';    -- explicit address
+```
+
+An explicit enable reports bind errors to its caller, and a later enable can
+retry. Repeated enables reuse the successful listener; supplying another
+address does not move it or create a second listener. `=0` is a no-op: this
+control has no runtime shutdown, and the listener lives until process exit.
+The hard-disable environment flag prevents both startup paths. HTTP control
+requires a native target.
 
 Example output:
 
@@ -247,11 +260,6 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **`PRAGMA` control** — `PRAGMA enable_metrics_http=1` (default
-  `localhost:9009`) remains unwired. Native `Connection::open` already starts
-  the endpoint from `FRANKENSQLITE_METRICS_BIND`; the public SQL and TCP keeper
-  is `real_metrics_http_starts_from_public_connection_open` in
-  `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs`.
 - **Engine hot-path wiring** — restoring the remaining fsync / commit-latency /
   conflict / sweeper / integrity recording sites. The commit counter is wired;
   its public SQL keeper is

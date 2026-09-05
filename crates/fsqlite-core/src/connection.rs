@@ -5324,6 +5324,7 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
                 | "encoding"
                 | "foreign_keys"
                 | "defer_foreign_keys"
+                | "enable_metrics_http"
                 | "recursive_triggers"
                 | "query_only"
                 | "writable_schema"
@@ -5369,6 +5370,9 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
     }
     if name_is("defer_foreign_keys") {
         return &["defer_foreign_keys"];
+    }
+    if name_is("enable_metrics_http") {
+        return &["enable_metrics_http"];
     }
     if name_is("recursive_triggers") {
         return &["recursive_triggers"];
@@ -73721,6 +73725,38 @@ impl Connection {
                     self.defer_foreign_keys.get(),
                 ))],
             }]);
+        }
+
+        // This is process-wide endpoint control, not per-connection pragma
+        // state. Explicit enable reports bind errors without poisoning SQL;
+        // zero is a no-op because the listener lives until process exit.
+        if pragma_name == "enable_metrics_http" {
+            #[cfg(target_arch = "wasm32")]
+            return Err(FrankenError::function_error(
+                "metrics HTTP endpoint requires a native target",
+            ));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use fsqlite_observability::metrics_net;
+
+                if let Some(value) = pragma.value.as_ref() {
+                    let expr = match value {
+                        PragmaValue::Assign(expr) | PragmaValue::Call(expr) => expr,
+                    };
+                    let bind = match expr {
+                        Expr::Literal(Literal::String(address), _) => address.clone(),
+                        _ if parse_pragma_bool(value)? => metrics_net::default_bind(),
+                        _ => return Ok(Vec::new()),
+                    };
+                    metrics_net::ensure_metrics_http(&bind)?;
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(
+                        metrics_net::metrics_http_address().is_some(),
+                    ))],
+                }]);
+            }
         }
 
         // GH #251 (bd-gh-pragma-optimize-analyze): `PRAGMA optimize(MASK)` runs

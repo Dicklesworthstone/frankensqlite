@@ -98,6 +98,105 @@ fn real_metrics_http_starts_from_public_connection_open() -> TestResult {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn metrics_http_pragma_controls_one_live_endpoint() -> TestResult {
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    const MODE: &str = "FSQLITE_HTTP_PRAGMA_TEST_MODE";
+    const ADDRESS: &str = "FSQLITE_HTTP_PRAGMA_TEST_ADDRESS";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["manual", "env", "disabled"] {
+            let reservation = TcpListener::bind("127.0.0.1:0")?;
+            let address = reservation.local_addr()?.to_string();
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", "metrics_http_pragma_controls_one_live_endpoint", "--nocapture"])
+                .env(MODE, mode)
+                .env(ADDRESS, &address)
+                .env("FRANKENSQLITE_METRICS_DISABLE", if mode == "disabled" { "1" } else { "0" });
+            if mode == "manual" {
+                command.env_remove("FRANKENSQLITE_METRICS_BIND");
+            } else {
+                command.env("FRANKENSQLITE_METRICS_BIND", &address);
+            }
+            drop(reservation);
+            let output = command.output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("http_pragma mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} PRAGMA keeper failed");
+            assert!(stderr.contains("event=public_metrics_http_pragma_verified"));
+        }
+        return Ok(());
+    };
+    assert!(matches!(mode.as_str(), "manual" | "env" | "disabled"));
+    let address: SocketAddr = std::env::var(ADDRESS)?.parse()?;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(conn.is_concurrent_mode_default());
+            let query = "PRAGMA enable_metrics_http;";
+            let prepared = conn.prepare(query).await?;
+            assert_eq!(prepared.column_names(), &["enable_metrics_http"]);
+            let initial = i64::from(mode == "env");
+            assert_eq!(conn.query(query).await?[0].values(), &[SqliteValue::Integer(initial)]);
+            assert!(conn.execute("PRAGMA enable_metrics_http=2;").await.is_err());
+            conn.execute("PRAGMA enable_metrics_http=0;").await?;
+            assert_eq!(conn.query(query).await?[0].values(), &[SqliteValue::Integer(initial)]);
+            if mode == "manual" {
+                let occupied = TcpListener::bind(address)?;
+                let error = conn.execute(&format!("PRAGMA enable_metrics_http='{address}';"))
+                    .await.expect_err("occupied endpoint must report its bind failure");
+                assert!(matches!(error, fsqlite_error::FrankenError::Io(_)));
+                assert_eq!(conn.query(query).await?[0].values(), &[SqliteValue::Integer(0)]);
+                assert_eq!(conn.query("SELECT 42;").await?[0].values(), &[SqliteValue::Integer(42)]);
+                drop(occupied);
+                conn.execute(&format!("PRAGMA enable_metrics_http='{address}';")).await?;
+            } else {
+                conn.execute("PRAGMA enable_metrics_http=1;").await?;
+            }
+            let enabled = i64::from(mode != "disabled");
+            assert_eq!(conn.query(query).await?[0].values(), &[SqliteValue::Integer(enabled)]);
+            let peer = Connection::open(":memory:").await?;
+            assert_eq!(peer.query(query).await?[0].values(), &[SqliteValue::Integer(enabled)]);
+            // A second enable must share the first listener, even when its
+            // requested address is occupied by an unrelated real socket.
+            let second = TcpListener::bind("127.0.0.1:0")?;
+            peer.execute(&format!("PRAGMA enable_metrics_http='{}';", second.local_addr()?)).await?;
+            conn.execute("CREATE TABLE http_pragma_rows(id INTEGER);").await?;
+            conn.execute("BEGIN;").await?;
+            conn.execute("INSERT INTO http_pragma_rows VALUES(7);").await?;
+            conn.execute("COMMIT;").await?;
+            conn.execute("PRAGMA enable_metrics_http=0;").await?;
+            assert_eq!(conn.query(query).await?[0].values(), &[SqliteValue::Integer(enabled)]);
+            if enabled == 1 {
+                let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response)?;
+                assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+                assert!(response.lines().any(|line| line == "fsqlite_commits_total 2"));
+                assert!(!response.contains("http_pragma_rows"));
+            } else {
+                let unused = TcpListener::bind(address)?;
+                assert_eq!(unused.local_addr()?, address);
+            }
+            peer.close().await?;
+            drop(prepared);
+            conn.close().await?;
+            eprintln!("bead_id=bd-zywqc.11.1 event=public_metrics_http_pragma_verified mode={mode}");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
     // The registry is process-wide. Each mode runs in its own process so other
     // tests cannot contaminate exact deltas or the once-read environment flag.
