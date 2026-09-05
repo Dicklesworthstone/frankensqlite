@@ -119,6 +119,12 @@ Full workspace and all-features release validation remain in progress.
   Display writers preserve raw blob bytes up to the first NUL. Column mode
   enables headers unless explicitly overridden; empty result sets emit nothing.
   Stock-shell comparisons cover all 256 byte values in CSV.
+- Await connection shutdown on shell exit, startup errors, command completion
+  and database switching. Open transactions roll back, and committed WAL data
+  receives the existing opportunistic close checkpoint. A failed `.open`
+  preserves the current connection and transaction. Eight real-file scenarios
+  verify committed rows and integrity through stock SQLite, including a copy
+  of the main database without its WAL sidecar (bd-uo4uk).
 - Replace placeholder replication repair bytes with actual RaptorQ encoding
   under caller `Cx` cancellation and admission checks. Harden root bootstrap
   authentication, supported layout checks, systematic-record reconstruction and

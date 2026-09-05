@@ -302,50 +302,61 @@ where
         };
     let mut output_options = OutputOptions::default();
 
-    if let Some(path) = options.init_path.as_deref() {
-        let Some(outcome) = execute_script_file(
-            path,
+    // Keep every post-open exit inside this block so shutdown is awaited for
+    // EOF, dot-command exit, startup failure and command-mode completion.
+    let exit_code = async {
+        if let Some(path) = options.init_path.as_deref() {
+            let Some(outcome) = execute_script_file(
+                path,
+                &mut connection,
+                &mut current_db_path,
+                &mut output_options,
+                out,
+                err,
+                shell_options.nested_script(),
+            )
+            .await
+            else {
+                return 1;
+            };
+            if shell_options.fail_on_error && outcome.had_error {
+                return 1;
+            }
+            if outcome.flow == ShellFlow::Exit {
+                return 0;
+            }
+        }
+
+        if let Some(command) = options.command {
+            return run_command(
+                &mut connection,
+                &mut current_db_path,
+                &mut output_options,
+                &command,
+                out,
+                err,
+            )
+            .await;
+        }
+
+        run_repl(
             &mut connection,
             &mut current_db_path,
             &mut output_options,
+            input,
             out,
             err,
-            shell_options.nested_script(),
+            shell_options,
         )
         .await
-        else {
-            return 1;
-        };
-        if shell_options.fail_on_error && outcome.had_error {
-            return 1;
-        }
-        if outcome.flow == ShellFlow::Exit {
-            return 0;
-        }
     }
+    .await;
 
-    if let Some(command) = options.command {
-        return run_command(
-            &mut connection,
-            &mut current_db_path,
-            &mut output_options,
-            &command,
-            out,
-            err,
-        )
-        .await;
+    if let Err(error) = connection.close_in_place().await {
+        let _ = writeln!(err, "error: closing database: {error}");
+        return 1;
     }
-
-    run_repl(
-        &mut connection,
-        &mut current_db_path,
-        &mut output_options,
-        input,
-        out,
-        err,
-        shell_options,
-    )
-    .await
+    exit_code
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1700,8 +1711,17 @@ where
 
         match Connection::open(&path).await {
             Ok(new_connection) => {
-                *connection = new_connection;
-                *current_db_path = path;
+                if let Err(error) = connection.close_in_place().await {
+                    let _ = writeln!(err, "error: closing current database: {error}");
+                    *had_error = true;
+                    if let Err(cleanup_error) = new_connection.close().await {
+                        let _ =
+                            writeln!(err, "error: closing replacement database: {cleanup_error}");
+                    }
+                } else {
+                    *connection = new_connection;
+                    *current_db_path = path;
+                }
             }
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
@@ -3256,6 +3276,98 @@ SELECT 1 AS one, 'two,three' AS two;\n\
                 assert_eq!(error.kind(), io::ErrorKind::WriteZero);
             }
             conn.close().await.expect("close");
+        });
+    }
+
+    #[test]
+    fn test_shell_shutdown_checkpoints_commits_and_rolls_back_open_writes_uo4uk() {
+        asupersync::test_utils::run_test(|| async {
+            for (case, ending, expected_exit) in [
+                ("eof", "", 0),
+                ("quit", ".quit\n", 0),
+                ("command", "", 0),
+                ("init_exit", ".quit\n", 0),
+                ("init_error", "SELECT missing_shutdown_column;\n", 1),
+                ("script_error", "SELECT missing_shutdown_column;\n", 1),
+                ("switch", ".open :memory:\nSELECT 77;\n", 0),
+                ("failed_switch", "", 0),
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().join("shell.db");
+                let ending = if case == "failed_switch" {
+                    format!(
+                        ".open '{}'\nSELECT id FROM shutdown_rows ORDER BY id;\n",
+                        dir.path().join("missing-parent/other.db").display()
+                    )
+                } else {
+                    ending.to_owned()
+                };
+                let script = format!(
+                    "PRAGMA journal_mode=WAL;\nPRAGMA wal_autocheckpoint=0;\n\
+                     CREATE TABLE shutdown_rows(id INTEGER PRIMARY KEY, value TEXT);\n\
+                     INSERT INTO shutdown_rows VALUES(1, 'committed');\n\
+                     BEGIN;\nINSERT INTO shutdown_rows VALUES(2, 'must roll back');\n{ending}"
+                );
+                let mut args = vec![OsString::from("fsqlite"), path.clone().into_os_string()];
+                let input_bytes = if case.starts_with("init_") {
+                    let init = dir.path().join("init.sql");
+                    fs::write(&init, &script).expect("write init script");
+                    args.extend([OsString::from("--init"), init.into_os_string()]);
+                    // An init exit or error must bypass this failing command.
+                    args.extend([
+                        OsString::from("-c"),
+                        OsString::from("SELECT missing_after_init;"),
+                    ]);
+                    Vec::new()
+                } else if case == "command" {
+                    args.extend([OsString::from("-c"), OsString::from(script)]);
+                    Vec::new()
+                } else {
+                    script.into_bytes()
+                };
+                let mut input = Cursor::new(input_bytes);
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let mut shell_options = ShellOptions::batch();
+                shell_options.fail_on_error = case != "failed_switch";
+                let exit =
+                    run_with_shell_options(args, &mut input, &mut out, &mut err, shell_options)
+                        .await;
+                assert_eq!(exit, expected_exit, "case={case}, stderr={err:?}");
+                if case == "failed_switch" {
+                    assert!(!err.is_empty(), "failed open must report an error");
+                    assert!(out.ends_with(b"1\n2\n"), "old transaction lost: {out:?}");
+                } else if expected_exit == 0 {
+                    assert!(err.is_empty(), "case={case}, stderr={err:?}");
+                } else {
+                    assert!(String::from_utf8_lossy(&err).contains("missing_shutdown_column"));
+                    assert!(!String::from_utf8_lossy(&err).contains("missing_after_init"));
+                }
+                // Copy only the main file: a successful oracle read proves
+                // the close checkpoint, not recovery by consulting the WAL.
+                let checkpoint_image = dir.path().join("checkpoint-image.db");
+                fs::copy(&path, &checkpoint_image).expect("copy main database only");
+                for oracle_path in [&checkpoint_image, &path] {
+                    let oracle = rusqlite::Connection::open(oracle_path).expect("stock reopen");
+                    let rows: Vec<(i64, String)> = oracle
+                        .prepare("SELECT id, value FROM shutdown_rows ORDER BY id")
+                        .unwrap_or_else(|error| {
+                            panic!("case={case}, path={oracle_path:?}: {error}")
+                        })
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .expect("stock query")
+                        .collect::<Result<_, _>>()
+                        .expect("stock rows");
+                    assert_eq!(rows, [(1, "committed".to_owned())], "case={case}");
+                    let integrity: String = oracle
+                        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                        .expect("stock integrity");
+                    assert_eq!(integrity, "ok", "case={case}");
+                }
+                eprintln!(
+                    "event=shell_shutdown_verified case={case} rows=1 checkpoint=true rollback=true"
+                );
+            }
         });
     }
 
