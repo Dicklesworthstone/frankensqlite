@@ -4,6 +4,100 @@ use fsqlite_types::value::SqliteValue;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn real_metrics_http_starts_from_public_connection_open() -> TestResult {
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    const MODE: &str = "FSQLITE_HTTP_METRICS_TEST_MODE";
+    const ADDRESS: &str = "FSQLITE_HTTP_METRICS_TEST_ADDRESS";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled", "unset", "occupied"] {
+            let reservation = TcpListener::bind("127.0.0.1:0")?;
+            let address = reservation.local_addr()?.to_string();
+            // Keep the occupied-port case reserved for the whole child run.
+            // Other modes release this OS-selected port immediately before
+            // spawning; any intervening bind collision fails the keeper.
+            let reservation = (mode == "occupied").then_some(reservation);
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args(["--exact", "real_metrics_http_starts_from_public_connection_open", "--nocapture"])
+                .env(MODE, mode)
+                .env(ADDRESS, &address)
+                .env("FRANKENSQLITE_METRICS_DISABLE", if mode == "disabled" { "1" } else { "0" });
+            if mode == "unset" {
+                command.env_remove("FRANKENSQLITE_METRICS_BIND");
+            } else {
+                command.env("FRANKENSQLITE_METRICS_BIND", &address);
+            }
+            let output = command.output()?;
+            drop(reservation);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("http_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} HTTP keeper failed");
+            assert!(stderr.contains("event=public_metrics_http_verified"));
+        }
+        return Ok(());
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled" | "unset" | "occupied"));
+    let address: SocketAddr = std::env::var(ADDRESS)?.parse()?;
+    let scrape = || -> TestResult<String> {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain; version=0.0.4"));
+        Ok(response)
+    };
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            assert!(conn.is_concurrent_mode_default());
+            let peer = Connection::open(":memory:").await?;
+            if mode == "enabled" {
+                assert!(scrape()?.lines().any(|line| line == "fsqlite_commits_total 0"));
+            }
+            conn.execute("CREATE TABLE private_metric_rows(id INTEGER PRIMARY KEY, body TEXT);").await?;
+            conn.execute("BEGIN;").await?;
+            conn.execute("INSERT INTO private_metric_rows VALUES(1,'private metric payload');").await?;
+            conn.execute("COMMIT;").await?;
+            conn.execute("BEGIN;").await?;
+            conn.execute("INSERT INTO private_metric_rows VALUES(2,'rolled back');").await?;
+            conn.execute("ROLLBACK;").await?;
+            assert_eq!(conn.query("SELECT count(*) FROM private_metric_rows;").await?[0].values(), &[SqliteValue::Integer(1)]);
+            assert_eq!(peer.query("SELECT 42;").await?[0].values(), &[SqliteValue::Integer(42)]);
+            match mode.as_str() {
+                "enabled" => {
+                    let response = scrape()?;
+                    assert!(response.lines().any(|line| line == "fsqlite_commits_total 2"));
+                    assert!(!response.contains("private_metric_rows"));
+                    assert!(!response.contains("private metric payload"));
+                }
+                "disabled" | "unset" => {
+                    let unused_port = TcpListener::bind(address)?;
+                    assert_eq!(unused_port.local_addr()?, address, "normal opens must not bind");
+                }
+                "occupied" => {
+                    assert!(TcpListener::bind(address).is_err(), "parent still owns the port");
+                }
+                _ => unreachable!("mode checked before execution"),
+            }
+            peer.close().await?;
+            conn.close().await?;
+            eprintln!("bead_id=bd-zywqc.11.1 event=public_metrics_http_verified mode={mode}");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
     // The registry is process-wide. Each mode runs in its own process so other
     // tests cannot contaminate exact deltas or the once-read environment flag.
