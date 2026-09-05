@@ -190,8 +190,8 @@ as per-flush deltas.
 | `fsqlite_conflicts_total` (`fsqlite.conflicts_total`) | `response=busy_snapshot` \| `rebased` | Rejected MVCC commit attempts, or successfully committed rebased transactions. | Compare rejected attempts with committed transactions to measure retry pressure. The `rebased` series reports successful merges in the MVCC transaction-manager API. |
 | `fsqlite_sweeper_clears_total` (`fsqlite.sweeper_clears_total`) | — | Completed version-store GC passes, including empty passes and passes blocked from reclaiming pinned versions. | Use to check GC activity; an increase does not prove that versions or bytes were reclaimed. |
 | `fsqlite_historical_snapshots_opened_total` (`fsqlite.historical_snapshots_opened_total`) | — | Time-travel / historical snapshots opened. | Informational; correlate with `historical_pins_active`. |
-| `fsqlite_schema_epoch_bumps_total` (`fsqlite.schema_epoch_bumps_total`) | — | Schema-epoch increments (DDL that invalidated cached plans). | A spike outside a deploy window suggests unexpected DDL churn. |
-| `fsqlite_integrity_check_runs_total` (`fsqlite.integrity_check_runs_total`) | `result=ok` \| `fail` | Integrity checks by outcome. | **Page immediately** on any increase of `result="fail"`. |
+| `fsqlite_schema_epoch_bumps_total` (`fsqlite.schema_epoch_bumps_total`) | — | Local main or TEMP schema-epoch increments that invalidate cached plans, including DDL later rolled back. | Track local schema churn; this is not a count of committed DDL statements. |
+| `fsqlite_integrity_check_runs_total` (`fsqlite.integrity_check_runs_total`) | `result=ok` \| `fail` | Completed public `integrity_check` and `quick_check` calls by validation outcome. | Investigate any failure: its diagnostic distinguishes corruption from an operational error. |
 
 The commit counter increments once after successful commit resolution, including
 busy retries. It excludes rollbacks, rejected commits, failed autocommit writes,
@@ -214,6 +214,13 @@ The sweeper counter increments after `VersionStore::gc_tick` completes its
 pruning and retirement work. It counts passes, not freed versions or bytes:
 reader guards can keep retired versions pinned across multiple passes. Calls
 that return before invoking the version-store collector do not increment it.
+
+The schema counter follows local DDL epochs, including explicit schema-cookie
+updates. Loading a peer's schema does not count as a new local invalidation.
+The integrity counter records the validator's result before formatting its
+diagnostic. Informational notes appended after an `ok` verdict do not turn that
+check into a failure. An open failure or a request that never reaches the
+validator is not a completed check.
 
 ### Histograms (latency, seconds)
 
@@ -246,12 +253,17 @@ this timing path skips clock reads and registry access.
 
 | Metric | Meaning | SLO recommendation |
 |--------|---------|--------------------|
-| `fsqlite_active_writers` (`fsqlite.active_writers`) | Writer lanes currently active. | Capacity signal; compare against your intended concurrency. |
+| `fsqlite_active_writers` (`fsqlite.active_writers`) | Concurrent transactions registered in this process, summed across databases; includes a concurrent `BEGIN` before its first write. | Capacity signal for concurrent writer admission; not a count of connections or serialized-mode transactions. |
 | `fsqlite_active_readers` (`fsqlite.active_readers`) | Active reader snapshots. | Capacity signal. |
 | `fsqlite_historical_pins_active` (`fsqlite.historical_pins_active`) | Historical snapshots currently pinned (holding old versions alive). | A steadily rising value pins version history and blocks the sweeper — alert if it grows unbounded. |
 | `fsqlite_wal_frames_pending_checkpoint` (`fsqlite.wal_frames_pending_checkpoint`) | WAL frames not yet checkpointed. | Alert when it grows without bound — checkpointing is falling behind writes. |
 | `fsqlite_history_records_count` (`fsqlite.history_records_count`) | Records retained in the history sidecar. | Watch alongside `historical_pins_active`; unbounded growth means retained history is not being reclaimed. |
 | `fsqlite_history_bytes` (`fsqlite.history_bytes`) | Bytes retained in the history sidecar. | Disk-budget signal for time-travel retention. |
+
+The writer gauge follows successful concurrent-registry admission and removal.
+Rejected admission and duplicate removal leave it unchanged. Recycling a
+removed handle does not keep it active, and dropping a registry releases its
+remaining contribution without resetting other databases' counts.
 
 ---
 
@@ -284,8 +296,8 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **Engine hot-path wiring** — restoring the remaining schema /
-  integrity recording sites. Commit counts and successful commit latency are wired;
+- **Engine hot-path wiring** — remaining history/snapshot and active-state gauge
+  producers, plus accurate WAL checkpoint backlog accounting. Commit counts and successful commit latency are wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
   (bd-zywqc.11.1.3). The page-lock wait histogram is wired at
@@ -301,6 +313,15 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
   recorded by `VersionStore::gc_tick`; the real
   `real_sweeper_metrics_follow_completed_gc_passes` keeper checks pinned-version
   protection, recycling after guard release, empty passes, and disabled mode.
+  Schema epochs are checked by the public
+  `real_schema_metrics_follow_public_cache_invalidations` keeper, including
+  prepared-statement refresh, TEMP changes, rollback, and peer reload.
+  `adversarial_bit_flip::real_integrity_metrics_count_clean_and_corrupt_public_checks`
+  checks both public validation PRAGMAs against clean and structurally corrupted
+  files also checked by stock SQLite. Both keepers cover disabled recording.
+  The concurrent-writer gauge is checked by
+  `real_active_writer_gauge_tracks_registry_lifetimes` and by live HTTP scrapes
+  around a public concurrent transaction.
   Other series being present in an exposition is not proof that their engine
   producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.

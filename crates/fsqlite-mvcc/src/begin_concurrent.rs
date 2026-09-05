@@ -1071,9 +1071,14 @@ impl ConcurrentRegistry {
                 serializable,
             )))
         };
-        self.active.insert(session_id, handle);
+        let newly_registered = self.active.insert(session_id, handle).is_none();
         self.active_snapshot_highs.insert(session_id, snapshot.high);
         self.increment_gc_horizon_count(snapshot.high);
+        if newly_registered && !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global()
+                .active_writers
+                .inc();
+        }
         Ok(session_id)
     }
 
@@ -1135,6 +1140,11 @@ impl ConcurrentRegistry {
     /// Remove a session (after commit or abort).
     pub fn remove(&mut self, session_id: u64) -> Option<SharedConcurrentHandle> {
         let handle = self.active.remove(&session_id)?;
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global()
+                .active_writers
+                .dec();
+        }
         if let Some(snapshot_high) = self.active_snapshot_highs.remove(&session_id) {
             self.decrement_gc_horizon_count(snapshot_high);
         } else {
@@ -1532,6 +1542,17 @@ impl ConcurrentRegistry {
 impl Default for ConcurrentRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for ConcurrentRegistry {
+    fn drop(&mut self) {
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            let gauge = &fsqlite_observability::metrics::global().active_writers;
+            for _ in 0..self.active.len() {
+                gauge.dec();
+            }
+        }
     }
 }
 
@@ -5483,6 +5504,87 @@ mod tests {
         }
         let result = registry.begin_concurrent(test_snapshot(1));
         assert_eq!(result.unwrap_err(), MvccError::Busy);
+    }
+
+    #[test]
+    fn real_active_writer_gauge_tracks_registry_lifetimes() {
+        const MODE: &str = "FSQLITE_WRITER_GAUGE_TEST_MODE";
+        let Ok(mode) = std::env::var(MODE) else {
+            for mode in ["enabled", "disabled"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "begin_concurrent::tests::real_active_writer_gauge_tracks_registry_lifetimes",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("writer_gauge mode={mode}\n{stdout}\n{stderr}");
+                assert!(output.status.success(), "isolated {mode} keeper failed");
+                assert!(stderr.contains("event=real_active_writer_gauge_verified"));
+            }
+            return;
+        };
+        assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+        let enabled = mode == "enabled";
+        let gauge = &fsqlite_observability::metrics::global().active_writers;
+        let count = |expected| assert_eq!(gauge.get(), if enabled { expected } else { 0 });
+        count(0);
+        let mut first = ConcurrentRegistry::new();
+        let mut second = ConcurrentRegistry::new();
+        let one = first.begin_concurrent(test_snapshot(10)).unwrap();
+        count(1);
+        let two = second.begin_concurrent(test_snapshot(20)).unwrap();
+        count(2);
+        let detached = first.remove(one).unwrap();
+        count(1);
+        assert!(first.remove(one).is_none());
+        first.recycle_handle(detached);
+        count(1);
+        let recycled = first.begin_concurrent(test_snapshot(30)).unwrap();
+        count(2);
+        assert!(first.remove_and_recycle(recycled));
+        assert!(!first.remove_and_recycle(recycled));
+        count(1);
+        second.next_session_id = 0;
+        assert_eq!(
+            second.begin_concurrent(test_snapshot(30)),
+            Err(MvccError::InvalidState)
+        );
+        count(1);
+        assert!(second.remove(two).is_some());
+        count(0);
+        drop(second);
+        for _ in 0..MAX_CONCURRENT_WRITERS {
+            first.begin_concurrent(test_snapshot(40)).unwrap();
+        }
+        let maximum = i64::try_from(MAX_CONCURRENT_WRITERS).unwrap();
+        count(maximum);
+        assert_eq!(
+            first.begin_concurrent(test_snapshot(40)),
+            Err(MvccError::Busy)
+        );
+        count(maximum);
+        drop(first);
+        count(0);
+        let exposition = fsqlite_observability::metrics::render_prometheus();
+        if enabled {
+            assert!(
+                exposition
+                    .lines()
+                    .any(|line| line == "fsqlite_active_writers 0")
+            );
+        } else {
+            assert!(exposition.is_empty());
+        }
+        eprintln!("event=real_active_writer_gauge_verified mode={mode}");
     }
 
     // -----------------------------------------------------------------------

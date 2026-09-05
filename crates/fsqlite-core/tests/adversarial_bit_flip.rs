@@ -59,6 +59,73 @@ fn flip_bit(db: &str, offset: usize, mask: u8) {
     std::fs::write(db, &bytes).expect("write corrupted image");
 }
 
+#[test]
+fn real_integrity_metrics_count_clean_and_corrupt_public_checks() {
+    const MODE: &str = "FSQLITE_INTEGRITY_METRICS_TEST_MODE";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "real_integrity_metrics_count_clean_and_corrupt_public_checks",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .env(
+                    "FRANKENSQLITE_METRICS_DISABLE",
+                    if mode == "disabled" { "1" } else { "0" },
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("integrity_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} integrity keeper failed");
+            assert!(stderr.contains("event=public_integrity_metrics_verified"));
+        }
+        return;
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
+    let registry = fsqlite_observability::metrics::global();
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, page_size) = build_clean_db(dir.path(), "integrity-metrics.db").await;
+        assert!(matches!(stock_verdict(&db), Verdict::SilentlyAccepted(lines) if lines == ["ok"]));
+        let ok_before = registry.integrity_check_ok_total.get();
+        let fail_before = registry.integrity_check_fail_total.get();
+        let conn = Connection::open(&db).await.unwrap();
+        assert!(conn.is_concurrent_mode_default());
+        for (index, sql) in ["PRAGMA integrity_check;", "PRAGMA quick_check;"].into_iter().enumerate() {
+            let rows = conn.query(sql).await.unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Text("ok".into())]);
+            assert_eq!(registry.integrity_check_ok_total.get() - ok_before, if enabled { u64::try_from(index + 1).unwrap() } else { 0 });
+            assert_eq!(registry.integrity_check_fail_total.get(), fail_before);
+        }
+        conn.close().await.unwrap();
+        flip_bit(&db, page_size, 0x08);
+        assert!(matches!(stock_verdict(&db), Verdict::Caught));
+        let conn = Connection::open(&db).await.expect("fixture reaches the public checker");
+        for (index, sql) in ["PRAGMA integrity_check;", "PRAGMA quick_check;"].into_iter().enumerate() {
+            let rows = conn.query(sql).await.expect("checker returns a corruption verdict");
+            assert!(matches!(&rows[0].values()[0], SqliteValue::Text(text) if text.as_ref() != "ok"));
+            assert_eq!(registry.integrity_check_fail_total.get() - fail_before, if enabled { u64::try_from(index + 1).unwrap() } else { 0 });
+            assert_eq!(registry.integrity_check_ok_total.get() - ok_before, if enabled { 2 } else { 0 });
+        }
+        conn.close().await.unwrap();
+        let exposition = fsqlite_observability::metrics::render_prometheus();
+        if enabled {
+            assert!(exposition.lines().any(|line| line == format!("fsqlite_integrity_check_runs_total{{result=\"ok\"}} {}", registry.integrity_check_ok_total.get())));
+            assert!(exposition.lines().any(|line| line == format!("fsqlite_integrity_check_runs_total{{result=\"fail\"}} {}", registry.integrity_check_fail_total.get())));
+        } else {
+            assert_eq!(registry.integrity_check_ok_total.get(), 0);
+            assert_eq!(registry.integrity_check_fail_total.get(), 0);
+            assert!(exposition.is_empty());
+        }
+        eprintln!("event=public_integrity_metrics_verified mode={mode}");
+    });
+}
+
 /// Whether an engine caught the corruption. `SilentlyAccepted` carries the
 /// rows returned so a failure message can show what leaked through.
 #[derive(Debug)]

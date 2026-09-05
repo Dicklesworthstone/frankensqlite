@@ -27137,11 +27137,8 @@ impl Connection {
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
-            let prepared_auto_read = self
+            let (prepared_auto_read, entry_proof) = self
                 .prepare_connection_for_prepared_read(stmt, &op_cx)
-                .await?;
-            let entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
                 .await?;
             if let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)? {
                 let fast_path = match stmt
@@ -27385,11 +27382,8 @@ impl Connection {
             }
 
             let op_cx = self.op_cx_after_background_status();
-            let prepared_auto_read = self
+            let (prepared_auto_read, entry_proof) = self
                 .prepare_connection_for_prepared_read(stmt, &op_cx)
-                .await?;
-            let entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
                 .await?;
             if hot_path_profile_enabled() {
                 FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -27540,11 +27534,8 @@ impl Connection {
                 self.note_connection_statement_execution_count(1);
                 return direct_query_row_outcome_result(row_outcome);
             }
-            let prepared_auto_read = self
+            let (prepared_auto_read, entry_proof) = self
                 .prepare_connection_for_prepared_read(stmt, &op_cx)
-                .await?;
-            let entry_proof = stmt
-                .ensure_schema_unchanged_with_prebound_publication(&op_cx)
                 .await?;
             if let Some(row_outcome) =
                 self.try_execute_prepared_query_row_fast_path(stmt, params)?
@@ -56284,7 +56275,7 @@ impl Connection {
         &self,
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
-    ) -> Result<bool> {
+    ) -> Result<(bool, PreparedDmlEntryProof)> {
         self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
         self.refresh_memdb_from_cached_write_txn_if_stale(cx)
             .await?;
@@ -56352,8 +56343,20 @@ impl Connection {
         // Match the generic statement path: establish an autocommit read
         // snapshot after any retained-autocommit flush so prepared reads see
         // the same pager/memdb view as ad-hoc SELECT execution.
-        self.ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
-            .await
+        let prepared_auto_read = self
+            .ensure_autocommit_txn_mode_with_cx(TransactionMode::ReadOnly, cx, None)
+            .await?;
+        match stmt.ensure_schema_unchanged_with_prebound_publication(cx).await {
+            Ok(entry_proof) => Ok((prepared_auto_read, entry_proof)),
+            Err(error) => {
+                // A transparent re-prepare must not inherit this failed
+                // attempt's read-only transaction. Preserve an explicit
+                // caller-owned transaction, which we did not open here.
+                self.finish_prepared_read_autocommit(prepared_auto_read, false, cx)
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Mark a table as dirty in the retained autocommit batch.
@@ -92688,6 +92691,9 @@ impl Connection {
         // reach this path, so they leave local_ddl_epoch untouched.
         self.local_ddl_epoch
             .set(self.local_ddl_epoch.get().wrapping_add(1));
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global().schema_epoch_bumps_total.inc();
+        }
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.clear_compilation_reuse_caches();
@@ -92718,6 +92724,9 @@ impl Connection {
         // Same-connection TEMP DDL: advance the local DDL epoch (GH #239).
         self.local_ddl_epoch
             .set(self.local_ddl_epoch.get().wrapping_add(1));
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            fsqlite_observability::metrics::global().schema_epoch_bumps_total.inc();
+        }
         self.parse_cache.borrow_mut().clear();
         self.clear_compilation_reuse_caches();
         self.table_execution_metadata_cache.borrow_mut().take();

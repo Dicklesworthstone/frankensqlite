@@ -4,6 +4,88 @@ use fsqlite_types::value::SqliteValue;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn real_schema_metrics_follow_public_cache_invalidations() -> TestResult {
+    const MODE: &str = "FSQLITE_SCHEMA_METRICS_TEST_MODE";
+    let Ok(mode) = std::env::var(MODE) else {
+        for mode in ["enabled", "disabled"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "real_schema_metrics_follow_public_cache_invalidations", "--nocapture"])
+                .env(MODE, mode)
+                .env("FRANKENSQLITE_METRICS_DISABLE", if mode == "disabled" { "1" } else { "0" })
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("schema_metrics mode={mode}\n{stdout}\n{stderr}");
+            assert!(output.status.success(), "isolated {mode} schema keeper failed");
+            assert!(stderr.contains("event=public_schema_metrics_verified"));
+        }
+        return Ok(());
+    };
+    assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+    let enabled = mode == "enabled";
+    let counter = &fsqlite_observability::metrics::global().schema_epoch_bumps_total;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("schema-metrics.db");
+            let path = path.to_str().expect("UTF-8 temporary path");
+            let conn = Connection::open(path).await?;
+            assert!(conn.is_concurrent_mode_default());
+            let before = counter.get();
+            let delta = |expected| assert_eq!(counter.get() - before, if enabled { expected } else { 0 });
+            conn.execute("CREATE TABLE metric_schema(id INTEGER PRIMARY KEY);").await.expect("create schema metric table");
+            delta(1);
+            conn.execute("INSERT INTO metric_schema VALUES(1);").await.expect("insert schema metric row");
+            {
+                let prepared = conn.prepare("SELECT * FROM metric_schema;").await?;
+                assert_eq!(prepared.query().await?[0].values(), &[SqliteValue::Integer(1)]);
+                conn.execute("ALTER TABLE metric_schema ADD COLUMN added TEXT;").await.expect("ALTER after prepared read");
+                delta(2);
+                assert_eq!(prepared.query().await?[0].values(), &[SqliteValue::Integer(1), SqliteValue::Null]);
+            }
+            conn.execute("CREATE TABLE IF NOT EXISTS metric_schema(id INTEGER);").await?;
+            assert!(conn.execute("CREATE TABLE metric_schema(id INTEGER);").await.is_err());
+            conn.query("SELECT * FROM metric_schema;").await?;
+            delta(2);
+            conn.execute("CREATE INDEX metric_schema_idx ON metric_schema(added);").await.expect("CREATE INDEX after prepared read");
+            delta(3);
+            conn.execute("CREATE TEMP TABLE metric_temp(value INTEGER);").await.expect("create TEMP metric table");
+            delta(4);
+            conn.execute("DROP TABLE metric_temp;").await.expect("drop TEMP metric table");
+            delta(5);
+            conn.execute("BEGIN;").await?;
+            conn.execute("CREATE TABLE metric_rolled_back(value INTEGER);").await.expect("create table in explicit transaction");
+            delta(6);
+            conn.execute("ROLLBACK;").await?;
+            assert!(conn.query("SELECT * FROM metric_rolled_back;").await.is_err());
+            // The local cache was invalidated even though DDL was rolled back.
+            delta(6);
+            let peer = Connection::open(path).await?;
+            peer.query("SELECT * FROM metric_schema;").await?;
+            delta(6);
+            conn.execute("CREATE TABLE metric_peer_visible(value INTEGER);").await.expect("create table while peer is open");
+            delta(7);
+            peer.query("SELECT * FROM metric_peer_visible;").await?;
+            delta(7);
+            peer.close().await?;
+            conn.close().await?;
+            delta(7);
+            let exposition = fsqlite_observability::metrics::render_prometheus();
+            if enabled {
+                assert!(exposition.lines().any(|line| line == format!("fsqlite_schema_epoch_bumps_total {}", counter.get())));
+            } else {
+                assert_eq!(counter.get(), 0);
+                assert!(exposition.is_empty());
+            }
+            eprintln!("event=public_schema_metrics_verified mode={mode} bumps={}", counter.get());
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn real_metrics_http_starts_from_public_connection_open() -> TestResult {
     use std::io::{Read as _, Write as _};
@@ -65,8 +147,14 @@ fn real_metrics_http_starts_from_public_connection_open() -> TestResult {
             }
             conn.execute("CREATE TABLE private_metric_rows(id INTEGER PRIMARY KEY, body TEXT);").await?;
             conn.execute("BEGIN;").await?;
+            if mode == "enabled" {
+                assert!(scrape()?.lines().any(|line| line == "fsqlite_active_writers 1"));
+            }
             conn.execute("INSERT INTO private_metric_rows VALUES(1,'private metric payload');").await?;
             conn.execute("COMMIT;").await?;
+            if mode == "enabled" {
+                assert!(scrape()?.lines().any(|line| line == "fsqlite_active_writers 0"));
+            }
             conn.execute("BEGIN;").await?;
             conn.execute("INSERT INTO private_metric_rows VALUES(2,'rolled back');").await?;
             conn.execute("ROLLBACK;").await?;

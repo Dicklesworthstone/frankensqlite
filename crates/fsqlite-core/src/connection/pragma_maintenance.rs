@@ -3,7 +3,16 @@ use super::*;
 
 impl Connection {
     pub(super) async fn pragma_integrity_check_rows(&self, quick: bool) -> Vec<Row> {
-        let outcome = match self.validate_database_integrity(quick).await {
+        let result = self.validate_database_integrity(quick).await;
+        if !fsqlite_observability::metrics::metrics_disabled() {
+            let registry = fsqlite_observability::metrics::global();
+            if result.is_ok() {
+                registry.integrity_check_ok_total.inc();
+            } else {
+                registry.integrity_check_fail_total.inc();
+            }
+        }
+        let outcome = match result {
             Ok(()) => "ok".to_owned(),
             Err(err) => err.to_string(),
         };

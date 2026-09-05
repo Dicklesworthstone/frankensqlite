@@ -66,6 +66,90 @@ fn franken_rows(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<String>> {
         .collect()
 }
 
+async fn read_with_api(
+    stmt: &fsqlite_core::connection::PreparedStatement<'_>,
+    api: &str,
+) -> Vec<Vec<String>> {
+    match api {
+        "query" => franken_rows(&stmt.query().await.unwrap()),
+        "query_with_params" => franken_rows(&stmt.query_with_params(&[]).await.unwrap()),
+        "query_row" => franken_rows(&[stmt.query_row().await.unwrap()]),
+        "query_row_with_params" => franken_rows(&[stmt.query_row_with_params(&[]).await.unwrap()]),
+        "for_each" => {
+            let mut rows = Vec::new();
+            stmt.query_with_params_for_each(&[], |row| {
+                rows.push(row.values().iter().map(franken_cell).collect());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            rows
+        }
+        _ => panic!("unknown prepared-read API: {api}"),
+    }
+}
+
+#[test]
+fn schema_reprepare_releases_only_its_own_read_transaction() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for explicit in [false, true] {
+                for api in ["query", "query_with_params", "query_row", "query_row_with_params", "for_each"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("prepared-schema-retry.db");
+                    let conn = Connection::open(if file_backed { path.to_str().unwrap() } else { ":memory:" })
+                        .await
+                        .unwrap();
+                    assert!(conn.is_concurrent_mode_default());
+                    let ora = rusqlite::Connection::open_in_memory().unwrap();
+                    let setup = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t VALUES(1,'alpha');";
+                    conn.execute(setup).await.unwrap();
+                    ora.execute_batch(setup).unwrap();
+                    let sql = "SELECT * FROM t WHERE a=1";
+                    let stmt = conn.prepare(sql).await.unwrap();
+                    let mut ostmt = ora.prepare(sql).unwrap();
+                    assert_eq!(read_with_api(&stmt, api).await, oracle_rows(&mut ostmt));
+                    if explicit {
+                        conn.execute("BEGIN;").await.unwrap();
+                        ora.execute_batch("BEGIN;").unwrap();
+                    }
+                    let alter = "ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 7;";
+                    conn.execute(alter).await.unwrap();
+                    ora.execute_batch(alter).unwrap();
+                    assert_eq!(read_with_api(&stmt, api).await, oracle_rows(&mut ostmt));
+                    assert_eq!(conn.in_transaction(), explicit);
+
+                    // A leaked autocommit reader turns the following real
+                    // index allocation into ReadOnly. An explicit transaction
+                    // must instead retain ownership of both DDL and DML.
+                    let writes = "CREATE INDEX idx_t_c ON t(c); INSERT INTO t(a,b) VALUES(2,'beta');";
+                    conn.execute(writes).await.unwrap_or_else(|error| {
+                        panic!("{api}, file={file_backed}, explicit={explicit}: {error:?}")
+                    });
+                    ora.execute_batch(writes).unwrap();
+                    drop(stmt);
+                    drop(ostmt);
+                    if explicit {
+                        conn.execute("ROLLBACK;").await.unwrap();
+                        ora.execute_batch("ROLLBACK;").unwrap();
+                    }
+                    let final_sql = "SELECT * FROM t ORDER BY a";
+                    let expected = oracle_rows(&mut ora.prepare(final_sql).unwrap());
+                    assert_eq!(franken_rows(&conn.query(final_sql).await.unwrap()), expected);
+                    conn.close().await.unwrap();
+                    if file_backed {
+                        let reopened = rusqlite::Connection::open(&path).unwrap();
+                        assert_eq!(oracle_rows(&mut reopened.prepare(final_sql).unwrap()), expected);
+                        let integrity: String = reopened.query_row("PRAGMA integrity_check", [], |row| row.get(0)).unwrap();
+                        assert_eq!(integrity, "ok");
+                    }
+                    eprintln!("event=prepared_schema_retry_cleanup_verified api={api} file={file_backed} explicit={explicit}");
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn add_column_select_star_reprojects_matches_oracle() {
     asupersync::test_utils::run_test(|| async {
@@ -227,6 +311,12 @@ fn drop_table_surfaces_real_error_not_schemachanged() {
             msg.contains("nosuchtable") || msg.contains("no such table"),
             "Franken should report no-such-table like rusqlite, got: {err:?}"
         );
+        drop(stmt);
+        conn.execute("CREATE TABLE replacement(value INTEGER); INSERT INTO replacement VALUES(42);")
+            .await
+            .expect("failed re-prepare must not leave a read-only transaction active");
+        assert_eq!(conn.query("SELECT value FROM replacement;").await.unwrap()[0].values(), &[SqliteValue::Integer(42)]);
+        conn.close().await.unwrap();
     });
 }
 
