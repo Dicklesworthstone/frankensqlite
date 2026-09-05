@@ -18433,12 +18433,12 @@ struct SavepointEntry {
 
 #[derive(Clone)]
 struct SavepointSnapshot {
-    write_set_snapshot: PagePageMap<PageData>,
-    accounted_write_pages_snapshot: PagePageSet,
-    freed_pages_snapshot: Vec<PageNumber>,
-    freelist_snapshot: Vec<PageNumber>,
-    allocated_from_freelist_snapshot: Vec<PageNumber>,
-    allocated_from_eof_snapshot: Vec<PageNumber>,
+    write_set: PagePageMap<PageData>,
+    accounted_write_pages: PagePageSet,
+    freed_pages: Vec<PageNumber>,
+    freelist: Vec<PageNumber>,
+    allocated_from_freelist: Vec<PageNumber>,
+    allocated_from_eof: Vec<PageNumber>,
 }
 
 enum SavepointUndo {
@@ -19841,24 +19841,24 @@ where
             return Ok(snapshot.clone());
         }
         let mut snapshot = SavepointSnapshot {
-            write_set_snapshot: self
+            write_set: self
                 .write_set
                 .iter()
                 .map(|(&page, staged)| (page, staged.published_page()))
                 .collect(),
-            accounted_write_pages_snapshot: self.accounted_write_pages.clone(),
-            freed_pages_snapshot: self.freed_pages.clone(),
-            freelist_snapshot: if self.mode == TransactionMode::Concurrent {
+            accounted_write_pages: self.accounted_write_pages.clone(),
+            freed_pages: self.freed_pages.clone(),
+            freelist: if self.mode == TransactionMode::Concurrent {
                 Vec::new()
             } else {
                 freelist.to_vec()
             },
-            allocated_from_freelist_snapshot: self
+            allocated_from_freelist: self
                 .allocated_from_freelist
                 .get(..entry.allocated_from_freelist_len)
                 .ok_or_else(|| FrankenError::internal("savepoint freelist frontier lost"))?
                 .to_vec(),
-            allocated_from_eof_snapshot: self
+            allocated_from_eof: self
                 .allocated_from_eof
                 .get(..entry.allocated_from_eof_len)
                 .ok_or_else(|| FrankenError::internal("savepoint EOF frontier lost"))?
@@ -19872,21 +19872,21 @@ where
                     accounted,
                 } => {
                     if let Some(data) = before {
-                        snapshot.write_set_snapshot.insert(*page_no, data.clone());
+                        snapshot.write_set.insert(*page_no, data.clone());
                     } else {
-                        snapshot.write_set_snapshot.remove(page_no);
+                        snapshot.write_set.remove(page_no);
                     }
                     if *accounted {
-                        snapshot.accounted_write_pages_snapshot.insert(*page_no);
+                        snapshot.accounted_write_pages.insert(*page_no);
                     } else {
-                        snapshot.accounted_write_pages_snapshot.remove(page_no);
+                        snapshot.accounted_write_pages.remove(page_no);
                     }
                 }
                 SavepointUndo::FreedPages(pages) => {
-                    snapshot.freed_pages_snapshot.clone_from(pages);
+                    snapshot.freed_pages.clone_from(pages);
                 }
                 SavepointUndo::Freelist(pages) => {
-                    snapshot.freelist_snapshot.clone_from(pages);
+                    snapshot.freelist.clone_from(pages);
                 }
             }
         }
@@ -26267,7 +26267,7 @@ where
         // Restore write-set FIRST to ensure we don't leave the transaction in an
         // inconsistent state if PageBuf allocation fails (OOM).
         let new_write_set = snapshot
-            .write_set_snapshot
+            .write_set
             .iter()
             .map(|(&k, v)| -> Result<(PageNumber, StagedPage)> {
                 Ok((
@@ -26283,21 +26283,21 @@ where
             .collect::<Result<PagePageMap<_>>>()?;
         let mut restored_sorted: Vec<PageNumber> = new_write_set.keys().copied().collect();
         restored_sorted.sort_unstable();
-        let restored_freed_index = snapshot.freed_pages_snapshot.iter().copied().collect();
+        let restored_freed_index = snapshot.freed_pages.iter().copied().collect();
 
         // Track pages that were allocated after the savepoint so that get_page
         // can return zeros for them instead of BusySnapshot error.
         for page_no in self
             .allocated_from_eof
             .iter()
-            .skip(snapshot.allocated_from_eof_snapshot.len())
+            .skip(snapshot.allocated_from_eof.len())
         {
             self.rolled_back_pages.insert(*page_no);
         }
         for page_no in self
             .allocated_from_freelist
             .iter()
-            .skip(snapshot.allocated_from_freelist_snapshot.len())
+            .skip(snapshot.allocated_from_freelist.len())
         {
             self.rolled_back_pages.insert(*page_no);
         }
@@ -26305,7 +26305,7 @@ where
         {
             if self.mode != TransactionMode::Concurrent {
                 inner.next_page = entry.next_page_snapshot;
-                inner.freelist.clone_from(&snapshot.freelist_snapshot);
+                inner.freelist.clone_from(&snapshot.freelist);
                 // Lease pages reference the rolled-back next_page range
                 // and will be re-allocated by future EOF allocations, so
                 // just drop them.
@@ -26324,8 +26324,8 @@ where
                 // only at transaction end, when no live tree reference can
                 // persist.
                 let _ = &mut inner; // lock still held for sibling arms' symmetry
-                let eof_start = snapshot.allocated_from_eof_snapshot.len();
-                let freelist_start = snapshot.allocated_from_freelist_snapshot.len();
+                let eof_start = snapshot.allocated_from_eof.len();
+                let freelist_start = snapshot.allocated_from_freelist.len();
                 let lease: Vec<PageNumber> = std::mem::take(&mut self.page_lease);
                 for page in &lease {
                     alloc_ledger(
@@ -26367,9 +26367,9 @@ where
         let writes_observed = entry.writes_observed;
         let sealed = entry.commit_snapshot.is_some();
 
-        self.allocated_from_freelist = snapshot.allocated_from_freelist_snapshot;
-        self.allocated_from_eof = snapshot.allocated_from_eof_snapshot;
-        self.freed_pages = snapshot.freed_pages_snapshot;
+        self.allocated_from_freelist = snapshot.allocated_from_freelist;
+        self.allocated_from_eof = snapshot.allocated_from_eof;
+        self.freed_pages = snapshot.freed_pages;
         self.freed_pages_index = restored_freed_index;
         self.refresh_freed_page_bounds();
         // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
@@ -26379,7 +26379,7 @@ where
         // writes_observed should stay consistent with that.
         self.write_set = new_write_set;
         self.write_pages_sorted = restored_sorted;
-        self.accounted_write_pages = snapshot.accounted_write_pages_snapshot;
+        self.accounted_write_pages = snapshot.accounted_write_pages;
         self.write_set_current_pages
             .store(self.accounted_write_pages.len(), AtomicOrdering::Relaxed);
         self.writes_observed = writes_observed;
