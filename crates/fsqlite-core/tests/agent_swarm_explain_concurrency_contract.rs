@@ -51,6 +51,7 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
                     assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(name), SqliteValue::Integer(value)] if name.as_ref() == key && *value == expected)), "incorrect {key} stats: {stats:?}");
                 }
                 assert_eq!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.len(), 1, "shared conflict diagnostics are independent of connection-local SSI evidence capture");
+                first.execute("ROLLBACK;").await?;
                 second.execute("COMMIT;").await?;
                 assert_eq!(monitor.query("SELECT value FROM a WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(10)]);
                 assert_eq!(monitor.query("SELECT value FROM b WHERE id=1;").await?[0].values(), &[SqliteValue::Integer(21 + i64::try_from(round)?) ]);
@@ -60,6 +61,75 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
             assert!(first.execute("PRAGMA ssi_evidence_capture='invalid';").await.is_err());
             assert_eq!(first.ssi_evidence_retention_snapshot(), before, "invalid control does not mutate evidence");
             eprintln!("bead_id=bd-6hdwo.14 event=public_ssi_retention_capture_verified stats={before:?}");
+            first.close().await?;
+            second.close().await?;
+            monitor.close().await?;
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_ssi_early_abort_reports_unmeasured_edges() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("early-ssi.db");
+            let path = path.to_str().expect("temporary path is UTF-8");
+            let monitor = Connection::open(path).await?;
+            monitor.query("PRAGMA journal_mode=WAL;").await?;
+            for table in ["a", "c", "d", "e"] {
+                monitor.execute(&format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, value INTEGER);")).await?;
+                monitor.execute(&format!("INSERT INTO {table} VALUES(1,10);")).await?;
+            }
+            let pivot = Connection::open(path).await?;
+            let upstream = Connection::open(path).await?;
+            let downstream = Connection::open(path).await?;
+            let mut overlapping = Vec::new();
+            for _ in 0..32 {
+                let connection = Connection::open(path).await?;
+                connection.execute("BEGIN;").await?;
+                overlapping.push(connection);
+            }
+            monitor.query("PRAGMA fsqlite.conflict_reset;").await?;
+            for (connection, read, write) in [(&pivot, "a", "c"), (&upstream, "e", "a"), (&downstream, "c", "d")] {
+                assert!(connection.is_concurrent_mode_default());
+                connection.execute("BEGIN;").await?;
+                connection.query(&format!("SELECT value FROM {read} WHERE id=1;")).await?;
+                connection.execute(&format!("UPDATE {write} SET value=11 WHERE id=1;")).await?;
+            }
+            downstream.execute("COMMIT;").await?;
+            upstream.execute("COMMIT;").await?;
+            assert!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.is_empty());
+            let error = pivot.execute("COMMIT;").await.expect_err("propagated pivot abort is enforced");
+            assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }));
+            let cards = pivot.ssi_decisions_snapshot();
+            assert_eq!(cards.len(), 1);
+            let events = monitor.query("PRAGMA fsqlite.conflict_log;").await?;
+            assert_eq!(events.len(), 1);
+            let SqliteValue::Text(event) = &events[0].values()[2] else {
+                panic!("event text required");
+            };
+            assert!(event.contains("reason: MarkedForAbort"), "actual early path required: {event}");
+            assert!(event.contains("in_edge_count: None") && event.contains("out_edge_count: None"));
+            assert!(event.contains(&format!("txn: {:?}", cards[0].txn)));
+            for (table, expected) in [("a", 11), ("c", 10), ("d", 11), ("e", 10)] {
+                assert_eq!(monitor.query(&format!("SELECT value FROM {table} WHERE id=1;")).await?[0].values(), &[SqliteValue::Integer(expected)]);
+            }
+            pivot.execute("ROLLBACK;").await?;
+            for connection in overlapping {
+                connection.execute("ROLLBACK;").await?;
+                connection.close().await?;
+            }
+            assert_eq!(rows_to_values(&monitor.query("PRAGMA fsqlite.conflict_log;").await?), rows_to_values(&events));
+            eprintln!("bead_id=bd-6hdwo.14 event=public_early_ssi_abort_verified events={:?}", rows_to_values(&events));
+            pivot.close().await?;
+            upstream.close().await?;
+            downstream.close().await?;
+            monitor.close().await?;
             Ok(())
         }.await;
     });
@@ -111,7 +181,7 @@ fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
                 panic!("conflict log event must be text: {:?}", events[0].values());
             };
             assert!(event.contains("SsiAbort") && event.contains("reason: Pivot"));
-            assert!(event.contains("in_edge_count: 1,") && event.contains("out_edge_count: 1,"));
+            assert!(event.contains("in_edge_count: Some(1),") && event.contains("out_edge_count: Some(1),"));
             assert!(event.contains(&format!("txn: {:?}", cards[0].txn)), "event and actual decision must identify the same transaction");
             let stats = monitor.query("PRAGMA fsqlite.conflict_stats;").await?;
             for (name, expected) in [("conflicts_total", 1), ("ssi_aborts", 1), ("fcw_drifts", 0), ("page_contentions", 0), ("conflicts_resolved", 0)] {
@@ -125,6 +195,9 @@ fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
             eprintln!("bead_id=bd-6hdwo.14 event=public_ssi_conflict_observed txn={:?} events={:?} stats={:?}", cards[0].txn, rows_to_values(&events), rows_to_values(&stats));
             monitor.query("PRAGMA fsqlite.conflict_reset;").await?;
             assert!(first.query("PRAGMA fsqlite.conflict_log;").await?.is_empty(), "reset applies to the shared observer");
+            first.close().await?;
+            second.close().await?;
+            monitor.close().await?;
             Ok(())
         }
         .await;

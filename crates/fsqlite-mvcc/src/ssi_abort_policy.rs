@@ -1357,9 +1357,11 @@ pub struct SsiEvidenceRetentionSnapshot {
     pub retained_evicted: u64,
 }
 
-/// Bounded recent SSI decision evidence. Record counts are bounded; individual
-/// transaction witness payloads are not byte-limited. The chain covers appended
-/// cards, while pending overflow is reported separately as lost evidence.
+/// Bounded recent SSI decision evidence.
+///
+/// Record counts are bounded; individual transaction witness payloads are not
+/// byte-limited. The chain covers appended cards, while pending overflow is
+/// reported separately as lost evidence.
 #[derive(Debug)]
 pub struct SsiEvidenceLedger {
     state: Mutex<SsiEvidenceLedgerState>,
@@ -1391,7 +1393,8 @@ impl SsiEvidenceLedger {
         }
     }
 
-    /// Synchronous append used by callers that need visibility before return.
+    /// Flush the queued batch before returning. Concurrent overflow, eviction
+    /// or capture disabling may still discard this draft; retention is optional.
     pub fn record_sync(&self, draft: SsiDecisionCardDraft) {
         if self.enqueue_pending(draft) {
             self.flush_pending();
@@ -1446,6 +1449,9 @@ impl SsiEvidenceLedger {
     }
 
     #[must_use]
+    /// Number of queued drafts plus the batch currently being hashed, if any.
+    /// Each is separately bounded by capacity; use `retention_snapshot` for a
+    /// coherent count that waits for the current batch to finish.
     pub fn pending_count(&self) -> usize {
         self.pending.load(Ordering::Acquire)
     }

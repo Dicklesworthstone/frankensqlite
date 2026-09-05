@@ -817,10 +817,11 @@ pub enum ConflictEvent {
         txn: TxnToken,
         /// The reason for the abort.
         reason: SsiAbortCategory,
-        /// Number of incoming rw-antidependency edges.
-        in_edge_count: usize,
-        /// Number of outgoing rw-antidependency edges.
-        out_edge_count: usize,
+        /// Incoming edges discovered in this validation attempt. `None` means
+        /// validation exited before discovery, not that there were zero edges.
+        in_edge_count: Option<usize>,
+        /// Outgoing edges discovered in this validation attempt, if measured.
+        out_edge_count: Option<usize>,
         /// Monotonic event timestamp.
         timestamp_ns: u64,
     },
@@ -1389,8 +1390,8 @@ mod tests {
         m.record(&ConflictEvent::SsiAbort {
             txn: TxnToken::new(txn(10), fsqlite_types::TxnEpoch::new(1)),
             reason: SsiAbortCategory::Pivot,
-            in_edge_count: 1,
-            out_edge_count: 1,
+            in_edge_count: Some(1),
+            out_edge_count: Some(1),
             timestamp_ns: 3000,
         });
 
@@ -1551,8 +1552,8 @@ mod tests {
             m.record(&ConflictEvent::SsiAbort {
                 txn: TxnToken::new(txn(1), fsqlite_types::TxnEpoch::new(1)),
                 reason,
-                in_edge_count: 1,
-                out_edge_count: 1,
+                in_edge_count: Some(1),
+                out_edge_count: Some(1),
                 timestamp_ns: 0,
             });
         }
@@ -1785,8 +1786,8 @@ mod tests {
         m.record(&ConflictEvent::SsiAbort {
             txn: TxnToken::new(txn(4), fsqlite_types::TxnEpoch::new(1)),
             reason: SsiAbortCategory::Pivot,
-            in_edge_count: 2,
-            out_edge_count: 3,
+            in_edge_count: Some(2),
+            out_edge_count: Some(3),
             timestamp_ns: 0,
         });
         m.record(&ConflictEvent::ConflictResolved {
@@ -1852,8 +1853,8 @@ mod tests {
             ConflictEvent::SsiAbort {
                 txn: TxnToken::new(txn(6), fsqlite_types::TxnEpoch::new(2)),
                 reason: SsiAbortCategory::CommittedPivot,
-                in_edge_count: 3,
-                out_edge_count: 4,
+                in_edge_count: Some(3),
+                out_edge_count: Some(4),
                 timestamp_ns: 99,
             },
             ConflictEvent::ConflictResolved {
@@ -1890,8 +1891,8 @@ mod tests {
             ConflictEvent::SsiAbort {
                 txn: TxnToken::new(txn(1), fsqlite_types::TxnEpoch::new(1)),
                 reason: SsiAbortCategory::Pivot,
-                in_edge_count: 0,
-                out_edge_count: 0,
+                in_edge_count: Some(0),
+                out_edge_count: Some(0),
                 timestamp_ns: 0,
             }
             .is_conflict()

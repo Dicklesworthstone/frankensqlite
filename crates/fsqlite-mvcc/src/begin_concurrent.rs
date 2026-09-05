@@ -2960,6 +2960,15 @@ pub fn concurrent_commit(
 
             // Check if marked for abort by another committer.
             if handle.is_marked_for_abort() {
+                if lock_table.observer().is_some() {
+                    emit_ssi_abort(
+                        lock_table.observer(),
+                        handle.token(),
+                        fsqlite_observability::SsiAbortCategory::MarkedForAbort,
+                        None,
+                        None,
+                    );
+                }
                 tracing::warn!(
                     txn = %txn_id,
                     "concurrent_commit: SSI marked_for_abort"
@@ -3080,8 +3089,16 @@ pub fn prepare_concurrent_commit_with_ssi(
     };
 
     if marked_for_abort {
-        // This early exit has no discovered edge counts. Do not fabricate an
-        // SsiAbort observation from sticky flags alone.
+        // The rejection is real, but this early exit did not discover edges.
+        if lock_table.observer().is_some() {
+            emit_ssi_abort(
+                lock_table.observer(),
+                txn,
+                fsqlite_observability::SsiAbortCategory::MarkedForAbort,
+                None,
+                None,
+            );
+        }
         tracing::warn!(
             txn = %txn_id,
             "prepare_concurrent_commit_with_ssi: marked_for_abort"
@@ -3261,8 +3278,8 @@ pub fn prepare_concurrent_commit_with_ssi(
                     lock_table.observer(),
                     txn,
                     fsqlite_observability::SsiAbortCategory::CommittedPivot,
-                    incoming_edges.len(),
-                    0, // This write-only validation has no outgoing read edges.
+                    Some(incoming_edges.len()),
+                    Some(0), // This write-only validation has no outgoing read edges.
                 );
             }
             tracing::warn!(
@@ -3419,8 +3436,8 @@ pub fn prepare_concurrent_commit_with_ssi(
                 lock_table.observer(),
                 txn,
                 category,
-                incoming_edges.len(),
-                outgoing_edges.len(),
+                Some(incoming_edges.len()),
+                Some(outgoing_edges.len()),
             );
         }
         tracing::warn!(
@@ -3523,8 +3540,17 @@ pub fn prepare_concurrent_commit_fcw_only(
     };
 
     if marked_for_abort {
-        // No edge discovery ran in this path, so its sticky abort flag cannot
-        // supply the counts required by SsiAbort telemetry.
+        // FCW-only preparation still honors an existing abort mark. No SSI
+        // edge discovery ran here, so report the counts as unmeasured.
+        if lock_table.observer().is_some() {
+            emit_ssi_abort(
+                lock_table.observer(),
+                txn,
+                fsqlite_observability::SsiAbortCategory::MarkedForAbort,
+                None,
+                None,
+            );
+        }
         tracing::warn!(
             txn = %txn_id,
             "prepare_concurrent_commit_fcw_only: marked_for_abort"
@@ -5659,8 +5685,8 @@ mod tests {
                     matches!(events.as_slice(), [fsqlite_observability::ConflictEvent::SsiAbort {
                     txn,
                     reason: fsqlite_observability::SsiAbortCategory::Pivot,
-                    in_edge_count: 2,
-                    out_edge_count: 1,
+                    in_edge_count: Some(2),
+                    out_edge_count: Some(1),
                     ..
                 }] if *txn == token)
                 );
@@ -5683,6 +5709,130 @@ mod tests {
             eprintln!(
                 "bead_id=bd-6hdwo.13 event=ssi_pivot_observed enabled={enabled} events={events:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_prepare_conflict_observer_early_abort_has_unmeasured_edges() {
+        for enabled in [false, true] {
+            for path in ["ssi", "fcw", "legacy"] {
+                let observer = Arc::new(fsqlite_observability::MetricsObserver::new(8));
+                let mut lock_table = InProcessPageLockTable::with_observer(observer.clone());
+                if !enabled {
+                    lock_table.set_observer(None);
+                }
+                let commit_index = CommitIndex::new();
+                let mut registry = ConcurrentRegistry::new();
+                let pivot = registry.begin_concurrent(test_snapshot(10)).unwrap();
+                let upstream = registry.begin_concurrent(test_snapshot(10)).unwrap();
+                let downstream = registry.begin_concurrent(test_snapshot(10)).unwrap();
+                // Real overlapping sessions make the default DRO policy eagerly
+                // abort an active pivot. No abort or edge flags are set by hand.
+                for _ in 0..32 {
+                    registry.begin_concurrent(test_snapshot(10)).unwrap();
+                }
+                for (session, read, write) in
+                    [(pivot, 10, 30), (upstream, 50, 10), (downstream, 30, 40)]
+                {
+                    let mut handle = registry.get_mut(session).unwrap();
+                    handle.record_read(test_page(read));
+                    concurrent_write_page(
+                        &mut handle,
+                        &lock_table,
+                        session,
+                        test_page(write),
+                        test_data(),
+                    )
+                    .unwrap();
+                }
+                let token = registry.get(pivot).unwrap().token();
+                for (session, sequence) in [(downstream, 11), (upstream, 12)] {
+                    assert_eq!(
+                        concurrent_commit_with_ssi(
+                            &mut registry,
+                            &commit_index,
+                            &lock_table,
+                            session,
+                            CommitSeq::new(sequence)
+                        ),
+                        Ok(CommitSeq::new(sequence))
+                    );
+                }
+                assert!(registry.get(pivot).unwrap().is_marked_for_abort());
+                assert!(
+                    observer.log().is_empty(),
+                    "marking alone is not a rejected commit"
+                );
+                let rejected = match path {
+                    "ssi" => prepare_concurrent_commit_with_ssi(
+                        &mut registry,
+                        &commit_index,
+                        &lock_table,
+                        pivot,
+                        CommitSeq::new(13),
+                    )
+                    .map(|_| ()),
+                    "fcw" => super::prepare_concurrent_commit_fcw_only(
+                        &mut registry,
+                        &commit_index,
+                        &lock_table,
+                        pivot,
+                        CommitSeq::new(13),
+                    )
+                    .map(|_| ()),
+                    _ => concurrent_commit(
+                        &mut registry.get_mut(pivot).unwrap(),
+                        &commit_index,
+                        &lock_table,
+                        pivot,
+                        CommitSeq::new(13),
+                    )
+                    .map(|_| ()),
+                };
+                assert_eq!(rejected, Err((MvccError::BusySnapshot, FcwResult::Clean)));
+                assert_eq!(commit_index.latest(test_page(30)), None);
+                assert!(!registry.get(pivot).unwrap().is_active());
+                let events = observer.log().snapshot();
+                assert_eq!(events.len(), usize::from(enabled));
+                if enabled {
+                    assert!(
+                        matches!(events.as_slice(), [fsqlite_observability::ConflictEvent::SsiAbort {
+                        txn,
+                        reason: fsqlite_observability::SsiAbortCategory::MarkedForAbort,
+                        in_edge_count: None,
+                        out_edge_count: None,
+                        ..
+                    }] if *txn == token)
+                    );
+                }
+                let metrics = observer.metrics().snapshot();
+                assert_eq!(metrics.ssi_aborts, u64::from(enabled));
+                assert_eq!(metrics.conflicts_total, u64::from(enabled));
+                assert_eq!(metrics.conflicts_resolved, 0);
+                assert!(matches!(
+                    prepare_concurrent_commit_with_ssi(
+                        &mut registry,
+                        &commit_index,
+                        &lock_table,
+                        pivot,
+                        CommitSeq::new(13)
+                    ),
+                    Err((MvccError::InvalidState, FcwResult::Clean))
+                ));
+                assert_eq!(observer.log().snapshot(), events, "retry adds no rejection");
+                let replacement = registry.begin_concurrent(test_snapshot(12)).unwrap();
+                concurrent_write_page(
+                    &mut registry.get_mut(replacement).unwrap(),
+                    &lock_table,
+                    replacement,
+                    test_page(30),
+                    test_data(),
+                )
+                .expect("rejected writer releases its page");
+                eprintln!(
+                    "bead_id=bd-6hdwo.14 event=early_ssi_abort_verified path={path} enabled={enabled} events={events:?}"
+                );
+            }
         }
     }
 
@@ -5755,8 +5905,8 @@ mod tests {
                 matches!(events.as_slice(), [fsqlite_observability::ConflictEvent::SsiAbort {
                 txn,
                 reason: fsqlite_observability::SsiAbortCategory::CommittedPivot,
-                in_edge_count: 1,
-                out_edge_count: 0,
+                in_edge_count: Some(1),
+                out_edge_count: Some(0),
                 ..
             }] if *txn == token)
             );

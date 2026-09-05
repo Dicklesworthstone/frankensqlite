@@ -845,13 +845,14 @@ pub fn emit_fcw_base_drift(
 /// Called when SSI validation detects a dangerous structure (write skew)
 /// and the transaction must abort.
 /// Edge counts describe discovery in this validation attempt. A sticky
-/// `marked_for_abort` flag alone does not supply those counts.
+/// `marked_for_abort` flag alone does not supply those counts: use `None`
+/// when discovery did not run, and `Some(0)` for a measured empty edge set.
 pub fn emit_ssi_abort(
     observer: &SharedObserver,
     txn: TxnToken,
     reason: SsiAbortCategory,
-    in_edge_count: usize,
-    out_edge_count: usize,
+    in_edge_count: Option<usize>,
+    out_edge_count: Option<usize>,
 ) {
     let reason_str = match reason {
         SsiAbortCategory::Pivot => "pivot",
@@ -868,8 +869,8 @@ pub fn emit_ssi_abort(
     tracing::warn!(
         txn_id = txn.id.get(),
         reason = reason_str,
-        in_edges = in_edge_count,
-        out_edges = out_edge_count,
+        in_edges = ?in_edge_count,
+        out_edges = ?out_edge_count,
         "mvcc::ssi_abort"
     );
     emit(observer, &event);
@@ -951,7 +952,13 @@ mod tests {
         let obs = Arc::new(MetricsObserver::new(100));
         let shared: SharedObserver = Some(obs.clone() as Arc<dyn ConflictObserver>);
 
-        emit_ssi_abort(&shared, make_token(3), SsiAbortCategory::Pivot, 1, 1);
+        emit_ssi_abort(
+            &shared,
+            make_token(3),
+            SsiAbortCategory::Pivot,
+            Some(1),
+            Some(1),
+        );
 
         let snap = obs.metrics().snapshot();
         assert_eq!(snap.ssi_aborts, 1);
@@ -996,8 +1003,8 @@ mod tests {
             &shared,
             make_token(1),
             SsiAbortCategory::MarkedForAbort,
-            0,
-            0,
+            None,
+            None,
         );
         emit_page_lock_contention(&shared, make_page(1), make_txn(1), make_txn(2));
         emit_conflict_resolved(&shared, make_txn(1), 0, CommitSeq::new(1));
