@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main) | HEAD | 2026-09-03 | Development after v0.3.16 |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main) | HEAD | 2026-09-05 | SQL and shell correctness, real metrics and diagnostics, cache budgets, and native-storage component hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
 | [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) | Release | 2026-09-01 | FTS5 stock-compat writer fix (GH#404) + GH#402 checkpoint watermark (super-linear autocommit fix) + `PRAGMA wal_checkpoint` cumulative-nBackfill parity + legacy-automerge origin-poisoning fix |
@@ -46,7 +46,93 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main>
 
-Post-v0.3.16 development continues on `main` (see the compare link).
+These changes are on `main`; the next release has not been tagged or published.
+Full workspace and all-features release validation remain in progress.
+
+### SQL correctness and prepared statements
+
+- Prepared reads that recompile after a schema change now release the failed
+  attempt's automatic read transaction. Subsequent index creation and writes
+  succeed, while explicit transactions retain their caller-owned changes and
+  rollback behavior. The oracle guard covers buffered, single-row and streaming
+  reads on memory and file databases
+  ([19759440d](https://github.com/Dicklesworthstone/frankensqlite/commit/19759440d)).
+- Correct grouped `IN`-subquery aggregate results under an `AND` condition
+  (GH#407), preserve JSON subtypes in grouped JSON aggregates, and reject
+  no-op writes on read-only connections during preparation.
+- Resolve hidden `rowid`, `_rowid_` and `oid` update targets, re-key indexes,
+  and report stock-compatible rowid collision errors. A declared column still
+  shadows an alias. Updating hidden rowids on tables with UPDATE triggers
+  remains explicitly unsupported
+  ([7f2f076e1](https://github.com/Dicklesworthstone/frankensqlite/commit/7f2f076e1)).
+- Align parser error text for empty input, recursion limits and window frames.
+  Strengthen the deferred-foreign-key oracle: a rejected COMMIT leaves the
+  transaction open so the caller can repair the violation or roll back.
+
+### FTS5, page storage and transaction safety
+
+- Preserve a live FTS5 index only when its persisted content metadata still
+  matches. Queries observe foreign SQLite writes while unrelated commits avoid
+  rebuilding an unchanged corpus (GH#408). Keep contentless lazy reads
+  independent of MemDB hydration, and correct prefix BM25 scoring on the
+  Shadow snapshot path
+  ([af5ea90f9](https://github.com/Dicklesworthstone/frankensqlite/commit/af5ea90f9),
+  [02a967145](https://github.com/Dicklesworthstone/frankensqlite/commit/02a967145)).
+- Apply `PRAGMA cache_size` to real pager residency. Preserve independent TEMP
+  and attached-database settings; rollback restores persistent header defaults
+  without overwriting the connection's runtime cache suggestion. This is a
+  resident-page budget, not a hard process-memory limit.
+- Repair impossible freelist entries, keep the reserved lock-byte page out of
+  the freelist, and accept unqualified `PRAGMA repair_freelist` (GH#410).
+  Cancelled commit preparation preserves allocations still owned by savepoints.
+- Fold appended WAL frames into the existing tail index. Native trigger and FK
+  cascade admission uses measured remaining stack where available; unknown
+  stack size and wasm retain the existing depth caps (GH#414).
+
+### Metrics and execution diagnostics
+
+- Start the configured HTTP metrics listener through ordinary database open or
+  the metrics PRAGMA. Wire actual SQL commit counts and latency, page-lock wait
+  durations, successful WAL durability barriers, MVCC conflict outcomes,
+  completed version-store GC passes, local schema invalidations, integrity-check
+  outcomes, and active concurrent-writer counts to the existing exporters.
+- Verify metric counts through real public SQL, live HTTP scrapes, structurally
+  corrupted files, and an eight-writer workload with independently reopened
+  stock SQLite row/payload checks. Disabled recording is covered separately.
+  The metrics overhead target remains unmeasured; history and reader gauges
+  and accurate WAL checkpoint backlog accounting remain open.
+- Expose actual SSI conflicts and bounded fallback execution events with
+  connection, statement and transaction identities. Early SSI aborts report
+  unmeasured edge counts explicitly. Bound pending and retained evidence counts,
+  reject oversized diagnostic payloads before admission, and expose separate
+  loss counters. The payload budget does not limit transaction validation or
+  caller-side allocations
+  ([464ed1ca5](https://github.com/Dicklesworthstone/frankensqlite/commit/464ed1ca5),
+  [2ae21ab7e](https://github.com/Dicklesworthstone/frankensqlite/commit/2ae21ab7e)).
+
+### Shell and native-storage components
+
+- Shell list, column and line modes render bare text, empty NULL cells and
+  stock-style separators/alignment. Quote-mode REAL formatting follows SQLite
+  3.53's `%!.20g` expansion. CSV quotes empty text and blob values separately
+  from NULL, and handles spaces, control bytes, quotes and non-ASCII bytes.
+  Display writers preserve raw blob bytes up to the first NUL. Column mode
+  enables headers unless explicitly overridden; empty result sets emit nothing.
+  Stock-shell comparisons cover all 256 byte values in CSV.
+- Replace placeholder replication repair bytes with actual RaptorQ encoding
+  under caller `Cx` cancellation and admission checks. Harden root bootstrap
+  authentication, supported layout checks, systematic-record reconstruction and
+  bounded locator reads. Native-index admission preserves previously buffered
+  updates when a later update is invalid. Packed and aligned symbol append
+  reject malformed payload lengths and frame checksums before creating or
+  modifying a segment
+  ([4e0176378](https://github.com/Dicklesworthstone/frankensqlite/commit/4e0176378)).
+- These native-storage changes are component work. Public durable ECS
+  create/open, complete fault/restart proof, and compatibility-WAL repair-symbol
+  integration remain unfinished. They are not advertised as shipped native
+  storage or automatic erasure-coded recovery.
+- Pin the Rust toolchain to `nightly-2026-08-31`. Release builds continue through
+  DSR and crates.io; GitHub Actions remains disabled.
 
 ---
 

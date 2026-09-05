@@ -11,6 +11,7 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::large_futures)]
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -151,6 +152,7 @@ impl OutputMode {
 struct OutputOptions {
     mode: OutputMode,
     headers: bool,
+    headers_explicit: bool,
 }
 
 impl Default for OutputOptions {
@@ -158,6 +160,7 @@ impl Default for OutputOptions {
         Self {
             mode: OutputMode::List,
             headers: false,
+            headers_explicit: false,
         }
     }
 }
@@ -936,6 +939,10 @@ fn write_rows<W>(
 where
     W: Write,
 {
+    // The stock shell emits headers only when the query produces a row.
+    if rows.is_empty() {
+        return Ok(());
+    }
     let column_count = rows
         .first()
         .map(|row| row.values().len())
@@ -981,11 +988,13 @@ where
 
 #[cfg(test)]
 fn format_row(row: &Row) -> String {
-    row.values()
+    let bytes = row
+        .values()
         .iter()
         .map(render_display_value)
         .collect::<Vec<_>>()
-        .join(OutputMode::List.separator())
+        .join(OutputMode::List.separator().as_bytes());
+    String::from_utf8(bytes).expect("format_row fixtures contain UTF-8")
 }
 
 fn resolved_column_names(column_names: Option<&[String]>, column_count: usize) -> Vec<String> {
@@ -1018,22 +1027,23 @@ where
     };
 
     if output_options.headers && !column_names.is_empty() {
-        let header = column_names
-            .iter()
-            .map(|name| render_output_header(name, output_options.mode))
-            .collect::<Vec<_>>()
-            .join(separator);
-        write!(out, "{header}{line_ending}")?;
+        for (index, name) in column_names.iter().enumerate() {
+            if index > 0 {
+                out.write_all(separator.as_bytes())?;
+            }
+            out.write_all(&render_output_header(name, output_options.mode))?;
+        }
+        out.write_all(line_ending.as_bytes())?;
     }
 
     for row in rows {
-        let rendered = row
-            .values()
-            .iter()
-            .map(|value| render_output_value(value, output_options.mode))
-            .collect::<Vec<_>>()
-            .join(separator);
-        write!(out, "{rendered}{line_ending}")?;
+        for (index, value) in row.values().iter().enumerate() {
+            if index > 0 {
+                out.write_all(separator.as_bytes())?;
+            }
+            out.write_all(&render_output_value(value, output_options.mode))?;
+        }
+        out.write_all(line_ending.as_bytes())?;
     }
     Ok(())
 }
@@ -1054,7 +1064,7 @@ where
     let mut widths = vec![0usize; column_count];
 
     for (index, name) in column_names.iter().take(column_count).enumerate() {
-        widths[index] = widths[index].max(name.len());
+        widths[index] = widths[index].max(name.chars().count());
     }
 
     let rendered_rows = rows
@@ -1069,12 +1079,16 @@ where
 
     for row in &rendered_rows {
         for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(value.len());
+            widths[index] = widths[index].max(display_character_count(value));
         }
     }
 
     if show_headers && !column_names.is_empty() {
-        writeln!(out, "{}", format_column_line(column_names, &widths))?;
+        let names: Vec<_> = column_names
+            .iter()
+            .map(|name| Cow::Borrowed(name.as_bytes()))
+            .collect();
+        write_column_line(&names, &widths, out)?;
         let underline = widths
             .iter()
             .map(|width| "-".repeat(*width))
@@ -1084,7 +1098,7 @@ where
     }
 
     for row in rendered_rows {
-        writeln!(out, "{}", format_column_line(&row, &widths))?;
+        write_column_line(&row, &widths, out)?;
     }
 
     Ok(())
@@ -1112,7 +1126,9 @@ where
                 .get(column_index)
                 .map(String::as_str)
                 .unwrap_or("column");
-            writeln!(out, "{name:>name_width$} = {}", render_display_value(value))?;
+            write!(out, "{name:>name_width$} = ")?;
+            out.write_all(&render_display_value(value))?;
+            writeln!(out)?;
         }
         if row_index + 1 < rows.len() {
             writeln!(out)?;
@@ -1121,34 +1137,49 @@ where
     Ok(())
 }
 
-fn format_column_line(values: &[String], widths: &[usize]) -> String {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
-        .collect::<Vec<_>>()
-        .join(OutputMode::Column.separator())
+fn display_character_count(value: &[u8]) -> usize {
+    // Lossy decoding is used only for alignment; output retains the original
+    // bytes, including invalid UTF-8.
+    String::from_utf8_lossy(value).chars().count()
 }
 
-fn render_output_header(name: &str, mode: OutputMode) -> String {
+fn write_column_line<W: Write>(
+    values: &[Cow<'_, [u8]>],
+    widths: &[usize],
+    out: &mut W,
+) -> io::Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.write_all(OutputMode::Column.separator().as_bytes())?;
+        }
+        out.write_all(value)?;
+        let padding = widths[index].saturating_sub(display_character_count(value));
+        write!(out, "{:padding$}", "")?;
+    }
+    writeln!(out)
+}
+
+fn render_output_header(name: &str, mode: OutputMode) -> Cow<'_, [u8]> {
     match mode {
-        OutputMode::Csv => render_csv_field(name),
+        OutputMode::Csv => Cow::Owned(render_csv_field(name.as_bytes())),
         // sqlite3 `.mode quote` SQL-quotes header names too: `'x','y'`.
-        OutputMode::Quote => format!("'{}'", name.replace('\'', "''")),
+        OutputMode::Quote => Cow::Owned(format!("'{}'", name.replace('\'', "''")).into_bytes()),
         OutputMode::Tabs | OutputMode::List | OutputMode::Column | OutputMode::Line => {
-            name.to_owned()
+            Cow::Borrowed(name.as_bytes())
         }
     }
 }
 
-fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
+fn render_output_value(value: &SqliteValue, mode: OutputMode) -> Cow<'_, [u8]> {
     match mode {
-        OutputMode::List | OutputMode::Column | OutputMode::Line => render_display_value(value),
+        OutputMode::List | OutputMode::Column | OutputMode::Line | OutputMode::Tabs => {
+            render_display_value(value)
+        }
         // sqlite3 `.mode quote` lowercases blob hex (`X'0aff'`) unlike the other
         // SQL-literal display modes; oracle-diff tooling reads it byte-exact.
-        OutputMode::Quote => render_quote_value(value),
-        OutputMode::Csv => render_csv_field(&render_raw_value(value)),
-        OutputMode::Tabs => render_raw_value(value),
+        OutputMode::Quote => Cow::Owned(render_quote_value(value).into_bytes()),
+        OutputMode::Csv if matches!(value, SqliteValue::Null) => Cow::Borrowed(b""),
+        OutputMode::Csv => Cow::Owned(render_csv_field(&render_display_value(value))),
     }
 }
 
@@ -1156,21 +1187,20 @@ fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
 /// modes (bd-zy4es): they print `sqlite3_column_text()` verbatim — bare text
 /// (no SQL quoting), an empty string for NULL (the default `.nullvalue`), a
 /// blob's raw bytes, and the engine's REAL-to-TEXT form for numbers.
-fn render_display_value(value: &SqliteValue) -> String {
-    render_raw_value(value)
-}
-
-/// Bare text for `list`/`column`/`line`/`csv`/`tabs`: what sqlite3 gets from
-/// `sqlite3_column_text()`. A blob that is not valid UTF-8 has its invalid
-/// sequences replaced with U+FFFD; sqlite3 would write the raw bytes, which a
-/// `String`-based writer cannot carry.
-fn render_raw_value(value: &SqliteValue) -> String {
-    match value {
-        SqliteValue::Null => String::new(),
-        SqliteValue::Text(text) => text.to_string(),
-        SqliteValue::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        _ => value.to_string(),
-    }
+fn render_display_value(value: &SqliteValue) -> Cow<'_, [u8]> {
+    let bytes = match value {
+        SqliteValue::Null => return Cow::Borrowed(b""),
+        SqliteValue::Text(text) => text.as_bytes(),
+        SqliteValue::Blob(bytes) => bytes.as_ref(),
+        _ => return Cow::Owned(value.to_string().into_bytes()),
+    };
+    // The stock shell writes these values as C strings. Preserve raw bytes
+    // up to the first NUL, rather than replacing invalid UTF-8 sequences.
+    let len = bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len());
+    Cow::Borrowed(&bytes[..len])
 }
 
 /// `sqlite3 .mode quote` renders REAL columns with `sqlite3_snprintf("%!.20g")`
@@ -1202,11 +1232,24 @@ fn render_quote_value(value: &SqliteValue) -> String {
     }
 }
 
-fn render_csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
+fn render_csv_field(value: &[u8]) -> Vec<u8> {
+    if value.is_empty()
+        || value
+            .iter()
+            .any(|&byte| byte <= b' ' || byte >= 0x7f || matches!(byte, b',' | b'"' | b'\''))
+    {
+        let mut quoted = Vec::new();
+        quoted.push(b'"');
+        for &byte in value {
+            quoted.push(byte);
+            if byte == b'"' {
+                quoted.push(b'"');
+            }
+        }
+        quoted.push(b'"');
+        quoted
     } else {
-        value.to_owned()
+        value.to_vec()
     }
 }
 
@@ -1727,6 +1770,9 @@ where
             return DotCommandResult::Continue;
         };
         output_options.mode = mode;
+        if mode == OutputMode::Column && !output_options.headers_explicit {
+            output_options.headers = true;
+        }
         return DotCommandResult::Continue;
     }
 
@@ -1747,6 +1793,7 @@ where
             return DotCommandResult::Continue;
         };
         output_options.headers = headers;
+        output_options.headers_explicit = true;
         return DotCommandResult::Continue;
     }
 
@@ -3089,6 +3136,129 @@ SELECT 1 AS one, 'two,three' AS two;\n\
         });
     }
 
+    async fn assert_display_script_matches_stock(script: &str, expected: &[u8]) {
+        let mut input = Cursor::new(script.as_bytes());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let exit = run_with_shell_options(
+            vec![OsString::from("fsqlite")],
+            &mut input,
+            &mut out,
+            &mut err,
+            ShellOptions::batch(),
+        )
+        .await;
+        assert_eq!(exit, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty(), "unexpected stderr: {err:?}");
+        assert_eq!(out, expected, "script: {script}");
+        if let Some((_, _, version)) = system_sqlite3_version() {
+            assert_eq!(system_sqlite3_stdout(script.as_bytes()), expected);
+            eprintln!("event=display_bytes_stock_verified sqlite={version}");
+        }
+    }
+
+    #[test]
+    fn test_csv_empty_control_and_unicode_fields_lxtng() {
+        asupersync::test_utils::run_test(|| async {
+            assert_display_script_matches_stock(
+                ".mode csv\n.headers on\nSELECT NULL AS n, '' AS e, 'a b' AS space, \
+                 'it''s' AS apostrophe, char(9) AS tab, char(127) AS del, \
+                 'é' AS utf8, x'' AS empty_blob, x'ff410042' AS raw, \
+                 char(65,0,66) AS nul, 'a\"b' AS quote, 'a,b' AS comma;\n",
+                b"n,e,space,apostrophe,tab,del,utf8,empty_blob,raw,nul,quote,comma\r\n\
+                  ,\"\",\"a b\",\"it's\",\"\t\",\"\x7f\",\"\xc3\xa9\",\"\",\"\xffA\",A,\"a\"\"b\",\"a,b\"\r\n",
+            )
+            .await;
+            if system_sqlite3_version().is_some() {
+                let mut script = String::from(".mode csv\n");
+                for byte in 0_u16..=255 {
+                    use std::fmt::Write as _;
+                    writeln!(script, "SELECT char({byte}), x'{byte:02x}';").expect("write script");
+                }
+                let expected = system_sqlite3_stdout(script.as_bytes());
+                assert_display_script_matches_stock(&script, &expected).await;
+                eprintln!("event=csv_byte_corpus_verified values=256 columns=2");
+            }
+        });
+    }
+
+    #[test]
+    fn test_column_implicit_headers_and_explicit_override_lxtng() {
+        asupersync::test_utils::run_test(|| async {
+            assert_display_script_matches_stock(
+                ".mode column\nSELECT 1 AS a;\n.mode list\nSELECT 2 AS b;\n\
+                 .mode column\nSELECT 3 AS c;\n.headers off\n.mode list\n\
+                 .mode column\nSELECT 4 AS d;\n.header on\nSELECT 5 AS e;\n",
+                b"a\n-\n1\nb\n2\nc\n-\n3\n4\ne\n-\n5\n",
+            )
+            .await;
+            for mode in ["list", "column", "line", "csv", "tabs", "quote"] {
+                assert_display_script_matches_stock(
+                    &format!(".headers on\n.mode {mode}\nSELECT 1 AS a WHERE 0;\n"),
+                    b"",
+                )
+                .await;
+            }
+            assert_display_script_matches_stock(
+                ".headers off\n.mode column\nSELECT 1 AS a;\n",
+                b"1\n",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_display_modes_preserve_blob_bytes_lxtng() {
+        asupersync::test_utils::run_test(|| async {
+            for (mode, expected) in [
+                ("list", b"\xffA||\n".as_slice()),
+                ("tabs", b"\xffA\t\t\n".as_slice()),
+                ("line", b"    a = \xffA\n    b = \n    n = \n".as_slice()),
+                ("column", b"\xffA      \n".as_slice()),
+                ("csv", b"\"\xffA\",\"\",\r\n".as_slice()),
+            ] {
+                assert_display_script_matches_stock(
+                    &format!(
+                        ".headers off\n.mode {mode}\n\
+                         SELECT x'ff410042' AS a, x'00ff' AS b, NULL AS n;\n"
+                    ),
+                    expected,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[test]
+    fn test_display_modes_propagate_full_output_buffer_lxtng() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:").await.expect("open");
+            let rows = conn.query("SELECT x'ff', NULL, ''; ").await.expect("rows");
+            for mode in [
+                OutputMode::List,
+                OutputMode::Tabs,
+                OutputMode::Csv,
+                OutputMode::Column,
+                OutputMode::Line,
+                OutputMode::Quote,
+            ] {
+                let mut full_buffer = &mut [][..];
+                let error = super::write_rows(
+                    &rows,
+                    None,
+                    OutputOptions {
+                        mode,
+                        ..OutputOptions::default()
+                    },
+                    &mut full_buffer,
+                )
+                .expect_err("a full output buffer must report write failure");
+                assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+            }
+            conn.close().await.expect("close");
+        });
+    }
+
     #[test]
     fn test_mode_quote_renders_sql_literals_with_comma_separator() {
         // `.mode quote` matches sqlite3: SQL-quoted header names, text `'..'`
@@ -3370,9 +3540,8 @@ SELECT x'0aff' AS b;\n\
     /// sqlite3 — `list` (bare `|`, unquoted text, empty NULL, raw blob bytes),
     /// `column`, `line`, `tabs`, `csv`, with and without headers. The reals are
     /// short exact binary fractions so their text is identical on every SQLite
-    /// version, and the CSV section only carries fields both quoting rules
-    /// leave bare (stock also quotes empty strings, spaces, control bytes and
-    /// non-ASCII — a separate gap). `tabs` runs before `csv` because the stock
+    /// version. The CSV quoting and raw-byte boundary corpus is covered by
+    /// the separate bd-lxtng guards. `tabs` runs before `csv` because the stock
     /// shell keeps CSV's CRLF row separator for later modes.
     const DISPLAY_MODE_SCRIPT: &str = concat!(
         "CREATE TABLE t(id INTEGER, name TEXT, note TEXT, b BLOB, r REAL, n);\n",
@@ -3472,28 +3641,32 @@ SELECT x'0aff' AS b;\n\
         );
     }
 
-    /// bd-zy4es: a blob that is not valid UTF-8 cannot be carried by the
-    /// `String`-based writers byte for byte, so its invalid sequences become
-    /// U+FFFD; valid UTF-8 blobs and every other value come through verbatim.
+    /// Display output preserves blob bytes and stock's NUL termination.
     #[test]
     fn test_render_display_value_is_bare_text_bd_zy4es() {
         use fsqlite::SqliteValue;
 
-        assert_eq!(render_display_value(&SqliteValue::Null), "");
-        assert_eq!(render_display_value(&SqliteValue::from("it's")), "it's");
-        assert_eq!(render_display_value(&SqliteValue::from("")), "");
-        assert_eq!(render_display_value(&SqliteValue::Integer(-7)), "-7");
+        assert_eq!(render_display_value(&SqliteValue::Null).as_ref(), b"");
         assert_eq!(
-            render_display_value(&SqliteValue::Float(0.1 + 0.2)),
-            "0.30000000000000004"
+            render_display_value(&SqliteValue::from("it's")).as_ref(),
+            b"it's"
+        );
+        assert_eq!(render_display_value(&SqliteValue::from("")).as_ref(), b"");
+        assert_eq!(
+            render_display_value(&SqliteValue::Integer(-7)).as_ref(),
+            b"-7"
         );
         assert_eq!(
-            render_display_value(&SqliteValue::from(b"AB".to_vec())),
-            "AB"
+            render_display_value(&SqliteValue::Float(0.1 + 0.2)).as_ref(),
+            b"0.30000000000000004"
         );
         assert_eq!(
-            render_display_value(&SqliteValue::from(vec![0xff, b'A'])),
-            "\u{fffd}A"
+            render_display_value(&SqliteValue::from(b"AB".to_vec())).as_ref(),
+            b"AB"
+        );
+        assert_eq!(
+            render_display_value(&SqliteValue::from(vec![0xff, b'A', 0, b'B'])).as_ref(),
+            b"\xffA"
         );
     }
 
@@ -3808,6 +3981,7 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                 OutputOptions {
                     mode: OutputMode::Csv,
                     headers: false,
+                    ..OutputOptions::default()
                 },
                 OutputMode::Csv.separator(),
                 &mut csv_out,
@@ -3827,6 +4001,7 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                 OutputOptions {
                     mode: OutputMode::List,
                     headers: false,
+                    ..OutputOptions::default()
                 },
                 OutputMode::List.separator(),
                 &mut list_out,
