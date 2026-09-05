@@ -28,6 +28,7 @@ fsqlite-pager = { workspace = true, default-features = false }
 fsqlite-btree = { workspace = true, default-features = false }
 fsqlite-ast = { workspace = true }
 fsqlite-mvcc = { workspace = true, default-features = false }
+fsqlite-observability = { workspace = true }
 fsqlite-wal = { workspace = true, default-features = false }
 fsqlite-func = { workspace = true }
 fsqlite-parser = { workspace = true }

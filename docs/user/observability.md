@@ -37,7 +37,8 @@ FRANKENSQLITE_METRICS_DISABLE=1 ./your-app
 
 Three ways to read the metrics. The **callable API**, both **serializers**, the
 **StatsD UDP push** transport, and the **HTTP `/metrics` endpoint** all ship
-today. The SQL engine records `commits_total` at its commit success boundaries.
+today. The SQL engine records `commits_total` at its commit success boundaries
+and `page_lock_acquire_duration_seconds` when a contended wait finishes.
 Most other engine recording sites and endpoint auto-start from
 `Connection::open` / a `PRAGMA` still need wiring (see [Roadmap](#roadmap)).
 
@@ -188,7 +189,15 @@ Bucket bounds (`le`, seconds): `0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1,
 |--------|---------|--------------------|
 | `fsqlite_fsync_duration_seconds` (`fsqlite.fsync_duration_seconds`) | Time spent in `fsync`/durability barriers. | Track p99. On local SSD, p99 above ~10 ms usually means fsync contention or a slow device — the dominant cost in file-backed durability (see `bd-jyeus`). |
 | `fsqlite_commit_duration_seconds` (`fsqlite.commit_duration_seconds`) | End-to-end commit latency (validate → publish → durability). | Primary write-latency SLI. Compare p99 against your write-path budget; a gap vs. `fsync_duration_seconds` p99 isolates MVCC/publish cost from device cost. |
-| `fsqlite_page_lock_acquire_duration_seconds` (`fsqlite.page_lock_acquire_duration_seconds`) | Time to acquire a page lock at the MVCC layer. | Should stay sub-millisecond. Sustained tail growth indicates page-level hot-spotting — the signal to shard writes across pages. |
+| `fsqlite_page_lock_acquire_duration_seconds` (`fsqlite.page_lock_acquire_duration_seconds`) | Elapsed time per contended VDBE page-lock wait attempt, including holder change, timeout, cancellation, and deadlock-victim exits. | Compare tails with the workload's busy-timeout budget to locate page contention. |
+
+The page-lock histogram excludes uncontended acquisitions, zero-budget probes,
+and cancellation detected before entering the wait. It measures each completed
+wait attempt, not a whole statement or a successful lock acquisition. Recording
+uses the wait loop's existing start time. When metrics are disabled, the added
+recording path skips the elapsed-time read and registry access; the wait loop
+still reads the clock to enforce its timeout. The separate VDBE counters do not
+control this histogram.
 
 ### Gauges (point-in-time)
 
@@ -239,8 +248,11 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
   conflict / sweeper / integrity recording sites. The commit counter is wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
-  (bd-zywqc.11.1.3). Other series being present in an exposition is not proof
-  that their engine producers run.
+  (bd-zywqc.11.1.3). The page-lock wait histogram is wired at
+  `fsqlite-vdbe::engine::wait_for_page_lock_holder_change`; its isolated
+  `page_lock_wait_histogram_tracks_real_outcomes` keeper covers enabled and
+  disabled recording (bd-zywqc.11.1.1). Other series being present in an
+  exposition is not proof that their engine producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
 
 [`StatsdEncoder`]: ../../crates/fsqlite-observability/src/metrics.rs

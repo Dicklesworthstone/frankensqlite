@@ -2995,6 +2995,21 @@ impl Drop for PageWaitEdgeGuard<'_> {
     }
 }
 
+/// Observe every completed contention wait, including cancellation and early
+/// deadlock exits. Reuse the timeout clock; disabled recording adds no clock
+/// read or registry access. This does not time uncontended acquisitions.
+struct PageLockWaitMetric(Option<Instant>);
+
+impl Drop for PageLockWaitMetric {
+    fn drop(&mut self) {
+        if let Some(started) = self.0 {
+            fsqlite_observability::metrics::global()
+                .page_lock_acquire_duration_seconds
+                .observe(started.elapsed().as_secs_f64());
+        }
+    }
+}
+
 fn wait_for_page_lock_holder_change(
     cx: &Cx,
     ctx: &ConcurrentContext,
@@ -3030,6 +3045,9 @@ fn wait_for_page_lock_holder_change(
 
     let metrics_enabled = vdbe_metrics_enabled();
     let started = Instant::now();
+    let _wait_metric = PageLockWaitMetric(
+        (!fsqlite_observability::metrics::metrics_disabled()).then_some(started),
+    );
     let mut next_full_checkpoint = PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL;
     loop {
         if let Some(txn) = waiter_txn
@@ -30590,6 +30608,171 @@ mod tests {
                 .write_witness_keys()
                 .contains(&WitnessKey::Page(PageNumber::ONE)),
             "retained clone must record writes on the refilled concurrent session"
+        );
+    }
+
+    #[test]
+    fn page_lock_wait_histogram_tracks_real_outcomes() {
+        use fsqlite_observability::metrics::{global, metrics_disabled};
+        use fsqlite_types::SchemaEpoch;
+
+        const MODE: &str = "FSQLITE_PAGE_WAIT_METRICS_TEST_MODE";
+        let Ok(mode) = std::env::var(MODE) else {
+            for mode in ["enabled", "disabled"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "engine::tests::page_lock_wait_histogram_tracks_real_outcomes",
+                        "--nocapture",
+                    ])
+                    .env(MODE, mode)
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .env("FSQLITE_PAGE_LOCK_DEADLOCK_DETECT", "1")
+                    .output()
+                    .unwrap();
+                println!("{mode}: {}", String::from_utf8_lossy(&output.stdout));
+                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(output.status.success(), "{mode} subprocess failed");
+            }
+            return;
+        };
+        assert_eq!(metrics_disabled(), mode == "disabled");
+        // Prometheus recording must not depend on the separate VDBE counters.
+        set_vdbe_metrics_enabled(false);
+        let histogram = &global().page_lock_acquire_duration_seconds;
+        let count = |enabled_count| if mode == "disabled" { 0 } else { enabled_count };
+        assert_eq!(histogram.count(), 0);
+
+        let mut registry = ConcurrentRegistry::new();
+        let session = registry
+            .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
+            .unwrap();
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let ctx = ConcurrentContext::new(
+            session,
+            registry.handle(session).unwrap(),
+            Arc::clone(&lock_table),
+            Arc::new(CommitIndex::new()),
+            5000,
+        );
+        let victim_session = registry
+            .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
+            .unwrap();
+        let victim_ctx = ConcurrentContext::new(
+            victim_session,
+            registry.handle(victim_session).unwrap(),
+            Arc::clone(&lock_table),
+            Arc::new(CommitIndex::new()),
+            5000,
+        );
+        let cx = Cx::new();
+        cx.transition_to_running();
+        let page = PageNumber::new(42).unwrap();
+        let other_page = PageNumber::new(43).unwrap();
+        let waiter = TxnId::new(ctx.txn_id).unwrap();
+        let holder = TxnId::new(victim_ctx.txn_id).unwrap();
+
+        assert!(wait_for_page_lock_holder_change(&cx, &ctx, page, Duration::from_secs(1)).unwrap());
+        lock_table.try_acquire(page, holder).unwrap();
+        assert!(!wait_for_page_lock_holder_change(&cx, &ctx, page, Duration::ZERO).unwrap());
+        let cancelled = Cx::new();
+        cancelled.transition_to_running();
+        cancelled.cancel();
+        assert!(matches!(
+            wait_for_page_lock_holder_change(&cancelled, &ctx, page, Duration::from_secs(1)),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(histogram.count(), 0, "no completed wait on fast exits");
+
+        assert!(!wait_for_page_lock_holder_change(&cx, &ctx, page, Duration::from_millis(20)).unwrap());
+        assert_eq!(histogram.count(), count(1), "timeout records exactly once");
+        if !metrics_disabled() {
+            assert!(
+                histogram.sum() >= 0.020,
+                "record the full elapsed wait in seconds"
+            );
+        }
+        assert_eq!(lock_table.holder(page), Some(holder));
+
+        // The reverse wait edge lets the helper observe the real waiter's
+        // registration before acting. The older waiter is never the victim.
+        // No sleep guesses whether the tested function has started waiting.
+        lock_table.try_acquire(other_page, waiter).unwrap();
+        for cancel in [false, true] {
+            if cancel {
+                lock_table.try_acquire(page, holder).unwrap();
+            }
+            lock_table.begin_page_wait(holder, other_page);
+            let waiting_cx = Cx::new();
+            waiting_cx.transition_to_running();
+            let result = std::thread::scope(|scope| {
+                let helper = scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !lock_table.page_wait_deadlock_victim(holder, other_page) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "waiter must register its real edge"
+                        );
+                        std::thread::yield_now();
+                    }
+                    if cancel {
+                        waiting_cx.cancel();
+                    } else {
+                        lock_table.release(page, holder);
+                    }
+                });
+                let result = wait_for_page_lock_holder_change(
+                    &waiting_cx,
+                    &ctx,
+                    page,
+                    Duration::from_secs(10),
+                );
+                helper.join().unwrap();
+                result
+            });
+            if cancel {
+                assert!(matches!(result, Err(FrankenError::Abort)));
+                assert_eq!(lock_table.holder(page), Some(holder));
+            } else {
+                assert!(result.unwrap());
+                assert_eq!(lock_table.holder(page), None);
+            }
+            assert_eq!(histogram.count(), count(if cancel { 3 } else { 2 }));
+            assert!(
+                !lock_table.page_wait_deadlock_victim(holder, other_page),
+                "wait edge must be removed on every exit"
+            );
+            lock_table.end_page_wait(holder);
+        }
+
+        // Reverse the ages so this invocation is the actual deadlock victim.
+        lock_table.release(page, holder);
+        lock_table.release(other_page, waiter);
+        lock_table.try_acquire(page, waiter).unwrap();
+        lock_table.try_acquire(other_page, holder).unwrap();
+        lock_table.begin_page_wait(waiter, other_page);
+        assert!(
+            !wait_for_page_lock_holder_change(&cx, &victim_ctx, page, Duration::from_secs(1)).unwrap()
+        );
+        assert_eq!(histogram.count(), count(4), "deadlock exit records once");
+        lock_table.end_page_wait(waiter);
+        lock_table.release(page, waiter);
+        lock_table.release(other_page, holder);
+        assert_eq!(lock_table.lock_count(), 0);
+        if metrics_disabled() {
+            assert_eq!(histogram.sum(), 0.0);
+            assert!(global().render_prometheus().is_empty());
+        } else {
+            assert!(global().render_prometheus().lines().any(|line| {
+                line == "fsqlite_page_lock_acquire_duration_seconds_count 4"
+            }));
+        }
+        println!(
+            "real page waits: mode={mode}, observations={}",
+            histogram.count()
         );
     }
 
