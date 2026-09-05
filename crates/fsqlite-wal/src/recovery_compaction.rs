@@ -1139,6 +1139,58 @@ mod tests {
     }
 
     #[test]
+    fn test_subblock_fallback_does_not_count_source_symbols_as_repairs() {
+        let capsule_id = make_oid(0x94);
+        let oti = Oti {
+            f: 16,
+            al: 4,
+            t: 8,
+            z: 1,
+            n: 2,
+        };
+        let records: Vec<_> = [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                SymbolRecord::new(
+                    capsule_id,
+                    oti,
+                    u32::try_from(index).expect("two source symbols"),
+                    bytes.to_vec(),
+                    if index == 0 {
+                        SymbolRecordFlags::SYSTEMATIC_RUN_START
+                    } else {
+                        SymbolRecordFlags::empty()
+                    },
+                )
+            })
+            .collect();
+        assert!(records.iter().all(SymbolRecord::verify_integrity));
+        let mut fallback_invocations = 0;
+        let outcome = decode_capsule_symbol_records(capsule_id, &records, |received| {
+            fallback_invocations += 1;
+            assert_eq!(received, records);
+            // This fixture has two equal sub-blocks. Exercise the caller's
+            // deinterleaving path without claiming a general RaptorQ decoder.
+            let mut decoded = Vec::new();
+            for offset in [0, 4] {
+                for record in received {
+                    decoded.extend_from_slice(&record.symbol_data[offset..offset + 4]);
+                }
+            }
+            assert_eq!(decoded, (0..16).collect::<Vec<u8>>());
+            Ok(decoded)
+        });
+        assert_eq!(fallback_invocations, 1);
+        assert_eq!(
+            outcome,
+            CapsuleDecodeOutcome::Repaired {
+                repair_symbols_used: 0,
+            }
+        );
+    }
+
+    #[test]
     fn test_fallback_on_missing_symbol() {
         let capsule_id = make_oid(0x91);
         let (mut records, _) = make_capsule_symbol_records(capsule_id, 50, 64, 5);
