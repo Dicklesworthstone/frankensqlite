@@ -2450,7 +2450,9 @@ Collations affect not just WHERE comparisons but also ORDER BY sort order, GROUP
 
 ### Foreign Key Enforcement
 
-Foreign keys enforce referential integrity across tables. FrankenSQLite implements the SQLite foreign key protocol, including `DEFERRABLE INITIALLY DEFERRED` constraint deferral: violations by deferred constraints are queued during the transaction and re-checked at `COMMIT`, and a failing `COMMIT` reports the violation while leaving the transaction active, matching stock SQLite. `PRAGMA defer_foreign_keys` is **not** dispatched (unrecognised PRAGMAs are silently ignored), so per-transaction deferral of an otherwise-immediate constraint is not available; deferral must be declared on the constraint itself.
+Foreign keys enforce referential integrity across tables. FrankenSQLite supports `DEFERRABLE INITIALLY DEFERRED` constraints: violations are queued during the transaction and re-checked at `COMMIT`.
+
+With foreign-key enforcement enabled, `PRAGMA defer_foreign_keys = ON` also postpones otherwise-immediate `NO ACTION` checks until the end of an explicit transaction. An unresolved violation makes `COMMIT` fail while leaving the transaction active and deferral enabled. The application can repair the violation and retry, or issue a full `ROLLBACK`. A successful `COMMIT` or full `ROLLBACK` resets the pragma to `OFF`; enable it again for the next transaction. The stock-SQLite oracle tests in `crates/fsqlite-core/tests/defer_foreign_keys_pragma_gh161_oracle.rs` cover these transaction boundaries.
 
 ```
 Enforcement modes:
