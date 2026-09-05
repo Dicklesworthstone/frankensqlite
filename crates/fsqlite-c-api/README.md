@@ -67,45 +67,67 @@ workspace forbids it.
 
 ## Usage (from C)
 
+Use SQLite's `sqlite3.h` declarations and link against `libfsqlite_c_api.so`
+or `libfsqlite_c_api.a`. This program prints `42`. `SQLITE_ROW` is `100` and
+means a row is available; `SQLITE_DONE` is `101` and means execution finished.
+
 ```c
+#include <sqlite3.h>
 #include <stdio.h>
-
-// Link against libfsqlite_c_api.so / libfsqlite_c_api.a
-typedef struct Sqlite3 sqlite3;
-typedef struct Sqlite3Stmt sqlite3_stmt;
-
-extern int sqlite3_open(const char *filename, sqlite3 **ppDb);
-extern int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nByte,
-                              sqlite3_stmt **ppStmt, const char **pzTail);
-extern int sqlite3_step(sqlite3_stmt *stmt);
-extern const char *sqlite3_column_text(sqlite3_stmt *stmt, int iCol);
-extern int sqlite3_finalize(sqlite3_stmt *stmt);
-extern int sqlite3_close(sqlite3 *db);
+#include <stdlib.h>
 
 int main(void) {
-    sqlite3 *db;
-    sqlite3_open(":memory:", &db);
-
-    sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db, "SELECT 'hello, fsqlite!';", -1, &stmt, NULL);
-
-    if (sqlite3_step(stmt) == 101 /* SQLITE_ROW? -- use 100 for ROW */) {
-        printf("%s\n", sqlite3_column_text(stmt, 0));
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int status = EXIT_FAILURE;
+    int rc = sqlite3_open(":memory:", &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "open (%d): %s\n", rc,
+                db != NULL ? sqlite3_errmsg(db) : "no database handle");
+        goto cleanup;
     }
 
-    sqlite3_finalize(stmt);
-    sqlite3_close(db);
-    return 0;
+    rc = sqlite3_prepare_v2(db, "SELECT 42;", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "prepare (%d): %s\n", rc, sqlite3_errmsg(db));
+        goto cleanup;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        fprintf(stderr, "expected a row, got %d: %s\n", rc, sqlite3_errmsg(db));
+        goto cleanup;
+    }
+    printf("%d\n", sqlite3_column_int(stmt, 0));
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "expected completion, got %d: %s\n", rc, sqlite3_errmsg(db));
+        goto cleanup;
+    }
+    status = EXIT_SUCCESS;
+
+cleanup:
+    if (stmt != NULL && (rc = sqlite3_finalize(stmt)) != SQLITE_OK) {
+        fprintf(stderr, "finalize (%d): %s\n", rc, sqlite3_errmsg(db));
+        status = EXIT_FAILURE;
+    }
+    if (db != NULL && (rc = sqlite3_close(db)) != SQLITE_OK) {
+        fprintf(stderr, "close (%d): %s\n", rc, sqlite3_errmsg(db));
+        status = EXIT_FAILURE;
+    }
+    return status;
 }
 ```
 
 ## Usage (from Rust, for metrics)
 
 ```rust
-use fsqlite_c_api::{compat_metrics_snapshot, reset_compat_metrics};
+use fsqlite_c_api::compat_metrics_snapshot;
 
-let snapshot = compat_metrics_snapshot();
-println!("Total API calls: {}", snapshot.total());
+fn main() {
+    let snapshot = compat_metrics_snapshot();
+    println!("Total API calls: {}", snapshot.total());
+}
 ```
 
 ## License

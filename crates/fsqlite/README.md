@@ -37,14 +37,14 @@ fsqlite-error --> fsqlite-types --> fsqlite-ast --> fsqlite-parser
 | `rtree`   | yes     | R-Tree spatial index                 |
 | `fts3`    | no      | Full-text search v3/v4 (legacy)      |
 | `session` | no      | Session extension (changeset/patchset) |
-| `icu`     | no      | ICU Unicode collation/tokenization   |
-| `misc`    | no      | Miscellaneous extensions             |
-| `raptorq` | no      | RaptorQ erasure coding support       |
-| `mvcc`    | no      | Multi-version concurrency control    |
+| `icu`     | yes     | ICU Unicode collation/tokenization   |
+| `misc`    | yes     | Miscellaneous extensions             |
+| `raptorq` | no      | Currently an empty feature flag      |
+| `mvcc`    | no      | Currently an empty feature flag; MVCC concurrent writers are enabled by default |
 
 ## Key Types (re-exported)
 
-- `Connection` - A database connection. Open with `Connection::open(path)` or `Connection::open(":memory:")`.
+- `Connection` - A database connection. Open with `Connection::open(path).await?` or `Connection::open(":memory:").await?`.
 - `PreparedStatement` - A compiled SQL statement for repeated execution with different parameters.
 - `Row` - A single result row. Access columns by index with `row.get(i)` or get all values with `row.values()`.
 - `TraceEvent` / `TraceMask` - Tracing callback types for monitoring SQL execution.
@@ -52,35 +52,55 @@ fsqlite-error --> fsqlite-types --> fsqlite-ast --> fsqlite-parser
 
 ## Usage
 
+Add the database and the caller's runtime to your application's `Cargo.toml`:
+
+```toml
+[dependencies]
+fsqlite = "0.3.16"
+asupersync = { version = "0.4.10", default-features = false }
+```
+
+Connection and prepared-statement operations are asynchronous. This complete
+program creates the application's runtime, awaits each operation, and closes
+the connection before the runtime exits. `Connection` is `!Send` and `!Sync`;
+keep it on its owning thread.
+
 ```rust
-use fsqlite::Connection;
+#![recursion_limit = "512"]
 
-// Open an in-memory database
-let conn = Connection::open(":memory:").expect("failed to open database");
+use asupersync::runtime::RuntimeBuilder;
+use fsqlite::{Connection, SqliteValue};
 
-// Execute DDL
-conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
-    .expect("create table failed");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = RuntimeBuilder::current_thread().build()?;
+    runtime.block_on(async {
+        let conn = Connection::open(":memory:").await?;
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
+            .await?;
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');").await?;
 
-// Insert data
-conn.execute("INSERT INTO users VALUES (1, 'Alice');")
-    .expect("insert failed");
+        let rows = conn.query("SELECT id, name FROM users;").await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::from("Alice")));
+        for row in &rows {
+            println!("id={:?}, name={:?}", row.get(0), row.get(1));
+        }
 
-// Query with results
-let rows = conn.query("SELECT id, name FROM users;")
-    .expect("query failed");
-for row in &rows {
-    println!("id={:?}, name={:?}", row.get(0), row.get(1));
+        // Prepared statements borrow the connection; finish them before close.
+        {
+            let stmt = conn.prepare("SELECT name FROM users WHERE id = ?1;").await?;
+            let rows = stmt.query_with_params(&[SqliteValue::Integer(1)]).await?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::from("Alice")));
+        }
+
+        let row = conn.query_row("SELECT count(*) FROM users;").await?;
+        assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
+        conn.close().await
+    })?;
+    Ok(())
 }
-
-// Prepared statements with parameters
-use fsqlite_types::SqliteValue;
-let stmt = conn.prepare("SELECT * FROM users WHERE id = ?1;").unwrap();
-let rows = stmt.query_with_params(&[SqliteValue::Integer(1)]).unwrap();
-assert_eq!(rows.len(), 1);
-
-// Single-row convenience
-let row = conn.query_row("SELECT count(*) FROM users;").unwrap();
 ```
 
 ## License

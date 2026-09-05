@@ -54,11 +54,11 @@ re-exports `Connection`, `Row`, and `PreparedStatement`.
 
 ## Key Types
 
-- `Connection` -- Database connection. Open with `Connection::open(path)`.
+- `Connection` -- Database connection. Open with `Connection::open(path).await?`.
   Supports `:memory:` and file-backed databases. Holds the in-memory table
   store, pager backend, schema catalog, function registry, and transaction
   state.
-- `PreparedStatement` -- A compiled SQL statement bound to a connection. Call
+- `PreparedStatement` -- A compiled SQL statement bound to a connection. Await
   `query()`, `query_with_params()`, `execute()`, or `query_row()`.
 - `Row` -- A single result row. Access column values via `values()`.
 - `BulkheadConfig` -- Bounded parallelism configuration (max concurrency,
@@ -68,28 +68,52 @@ re-exports `Connection`, `Row`, and `PreparedStatement`.
 
 ## Usage
 
+Applications normally use the `fsqlite` facade. To use the core crate directly,
+add these dependencies to the application's `Cargo.toml`:
+
+```toml
+[dependencies]
+fsqlite-core = "0.3.16"
+fsqlite-types = "0.3.16"
+asupersync = { version = "0.4.10", default-features = false }
+```
+
+The caller owns the asupersync runtime that polls the engine's futures. This
+complete program keeps the `!Send`, `!Sync` connection on one thread and
+explicitly closes it before shutting down the runtime.
+
 ```rust
+#![recursion_limit = "512"]
+
+use asupersync::runtime::RuntimeBuilder;
 use fsqlite_core::connection::{Connection, Row};
+use fsqlite_types::SqliteValue;
 
-// Open an in-memory database
-let conn = Connection::open(":memory:").expect("open failed");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = RuntimeBuilder::current_thread().build()?;
+    runtime.block_on(async {
+        let conn = Connection::open(":memory:").await?;
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);").await?;
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');").await?;
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');").await?;
 
-// DDL
-conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")?;
+        let rows: Vec<Row> = conn.query("SELECT id, name FROM users ORDER BY id;").await?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values(), &[SqliteValue::Integer(1), SqliteValue::from("Alice")]);
+        assert_eq!(rows[1].values(), &[SqliteValue::Integer(2), SqliteValue::from("Bob")]);
+        for row in &rows {
+            println!("{:?}", row.values());
+        }
 
-// DML
-conn.execute("INSERT INTO users VALUES (1, 'Alice');")?;
-conn.execute("INSERT INTO users VALUES (2, 'Bob');")?;
-
-// Query
-let rows: Vec<Row> = conn.query("SELECT id, name FROM users ORDER BY id;")?;
-for row in &rows {
-    println!("{:?}", row.values());
+        {
+            let stmt = conn.prepare("SELECT name FROM users WHERE id = ?1;").await?;
+            let row = stmt.query_row_with_params(&[SqliteValue::Integer(1)]).await?;
+            assert_eq!(row.get(0), Some(&SqliteValue::from("Alice")));
+        }
+        conn.close().await
+    })?;
+    Ok(())
 }
-
-// Prepared statement with parameters
-let stmt = conn.prepare("SELECT name FROM users WHERE id = ?1;")?;
-let row = stmt.query_row_with_params(&[SqliteValue::Integer(1)])?;
 ```
 
 ## License
