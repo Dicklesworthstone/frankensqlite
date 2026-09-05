@@ -374,11 +374,18 @@ test of every supported-scenario invariant. What it asserts:
 The canonical validation surface is:
 
 ```bash
-cargo test -p fsqlite-e2e --test correctness_concurrent_writes
-cargo test -p fsqlite-e2e --test mvcc_concurrent_writers
-cargo run -p fsqlite-e2e --bin swarm-multiprocess -- \
+cargo test --locked -p fsqlite-e2e --test concurrent_writer_mvcc_oracle_e2e -- --show-output --test-threads=1
+cargo run --locked -p fsqlite-harness --bin e2e_full_suite_runner -- \
+    --script crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs \
+    --no-retry --execute
+cargo run --locked -p fsqlite-e2e --bin swarm-multiprocess -- \
     --workers 8 --seconds 60
 ```
+
+Run compilation through the repository's RCH policy. The selected canonical
+run records its full catalog denominator and omitted scripts; success sets
+`selected_scripts_pass`, never the full-suite `overall_pass`. Preserve the
+manifest, command output, source hashes and actual named test outcomes.
 
 When the swarm harness fails, it writes a forensic bundle
 under `crates/fsqlite-e2e/artifacts/swarm-multiprocess/run-<ts>-pid<pid>/`.

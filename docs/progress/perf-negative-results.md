@@ -12,6 +12,49 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-05 - STOP: bd-aoj0g journal savepoints fail allocation ownership after commit failure
+
+- Target: the same A-F indexed INSERT cost curve, especially case C at 100k
+  rows. Candidate changes `crates/fsqlite-pager/src/pager.rs` from full-map
+  statement snapshots to journal boundaries and per-page before-images;
+  the existing `aoj0g_insert_profile.rs` gains an optional row count.
+- Correctness rejection, not a measured speedup/regression: on trj, base
+  `731304ee47166e595d0ae5a63ddf7a3fbf9bc28c` plus the candidate pager,
+  release/locked/nightly-2026-08-31, the actual runtime test
+  `pager::tests::test_savepoint_journal_failed_commit_preserves_allocation_ownership`
+  reports 0 passed / 1 failed, exit 101. A real page-buffer-exhaustion commit
+  failure followed by ROLLBACK TO loses a post-savepoint allocation from
+  quarantine. The scoped lib-test build's initial wrong exact filter ran
+  zero tests; only the subsequent module-qualified invocation is evidence.
+- Pinpoint: `drain_unstaged_allocated_pages` removes entries from allocation
+  vectors during commit preparation, and non-WAL failure cleanup returns
+  those reservations to the shared freelist. Rollback using saved vector
+  lengths cannot recover the former allocation identities. Materializing
+  saved page images before commit does not establish allocator ownership.
+- Evidence: trj `/data/tmp/aoj0g-journal-inspect-KNHS40`, local
+  `/tmp/aoj0g-bluecedar-20260905/REPORT.md` and
+  `allocation-ownership-runtime.log`. Candidate pager SHA-256
+  `c63f52949012ecd7cc7064f243e90eecd67e2d9a8f3d490bd358dcc9b4cd042b`;
+  preserved test binary SHA-256
+  `0c6ea364214c109a4b07a6a8104f322bcb1100d8bdb76510412da58d9003b684`.
+- Baseline control on otherwise clean `731304ee4` also fails exactly one
+  test (exit 101): after rollback, page 3 is not quarantined and page 2 is
+  both restored to the transaction and still on the shared freelist. This
+  identifies a pre-existing prerequisite, not a newly introduced journal
+  defect. See `allocation-control.log` in both evidence directories.
+- No candidate A-F timings, stock differential/integrity, concurrency canon,
+  or workspace check/clippy/fmt acceptance is claimed. The original case-C
+  baseline remains 65,881 -> 214,122 ns/INSERT (3.250x).
+- Retry only after failed/cancelled commit preparation preserves exact
+  private reservation ownership and the rollback/quarantine proof passes,
+  including peer interleavings. Then rerun the complete acceptance matrix.
+- Publication incident: another actor swept the unfinished production
+  draft into `9f2222f9f514b8664122a2653e7160e9bf008177` despite BlueCedar's
+  reservation, under an inaccurate instrumentation message, and both remote
+  branches contained it before any gate ran. BlueCedar did not commit/push
+  or certify it. A pager-only inverse patch is preserved alongside REPORT.md,
+  prepared but not applied; presence on main is not acceptance evidence.
+
 ## 2026-09-05 - REJECT before implementation: bd-aoj0g lifecycle Arc lever is off the SQL path; live pager savepoint traversal measured
 
 - Target: existing `crates/fsqlite/tests/aoj0g_insert_profile.rs`, case C,

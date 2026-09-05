@@ -209,6 +209,12 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 Database engines live and die by cache behavior, memory layout, and I/O
 patterns. The following constraints are non-negotiable for hot-path code:
 
+**Implementation status (2026-09-05):** the alignment and zero-staging-copy
+requirements below are target architecture, not claims about every live path.
+Current `fsqlite-types::PageData` uses `Vec<u8>`/`Arc<[u8]>`; native VFS I/O can
+stage owned buffers for cancel-correct blocking-pool work. Preserve those
+safety properties while implementing and measuring the remaining buffer work.
+
 - **Page alignment.** All page buffers MUST be allocated at `page_size`
   alignment (4096 by default). This enables direct I/O (`O_DIRECT`) where
   physically compatible and avoids partial-page kernel copies.
@@ -302,11 +308,11 @@ cross-cutting checklist:
   update `aReadMark[i]`, then downgrade to SHARED for the snapshot lifetime),
   and writers MUST hold `WAL_WRITE_LOCK` for the coordinator lifetime (§5.6.7).
 
-- **Witnesses must be semantic and sub-page for point ops.**
-  The VDBE/B-tree MUST NOT register `WitnessKey::Page(pgno)` reads merely because
-  a cursor traversed a page during descent; point reads and negative reads MUST
-  use `WitnessKey::Cell(...)` (§5.6.4.3). Violating this collapses deterministic
-  rebase/safe merge back to abort-only behavior (§5.10.2).
+- **Witness coverage precedes refinement.** Conservative page witnesses are a
+  correct baseline. A future sub-page path must cover point and negative reads,
+  predicate gaps, and structural changes before omitting those coarse keys
+  (§5.6.4.3). Extra page witnesses can increase aborts; they are not a reason to
+  weaken the live conflict checks to activate dormant safe merging (§5.10.2).
 
 - **RaptorQ repair work must be off the commit critical path.**
   Commit durability is satisfied after appending and syncing systematic symbols.
@@ -382,23 +388,26 @@ cannot silently downgrade.
 
 ### 2.4 The Solution: Layered Isolation
 
-**Layer 1 (Default): SQLite behavioral compatibility mode (single-writer, WAL semantics).**
-- `BEGIN` / `BEGIN DEFERRED`: DEFERRED. No writer-exclusion lock is acquired at
-  `BEGIN`. Readers do not block readers. On the first write attempt, the
-  transaction MUST upgrade to a Serialized writer by acquiring the global write
-  mutex (§5.4) and then proceed as the single writer.
-- `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`: Acquire the global write mutex at
-  `BEGIN` (writer-intent). This provides the usual "single writer" behavior
-  while allowing concurrent readers (WAL semantics).
-- This is the default mode. **Within FrankenSQLite**, existing SQLite
-  applications observe SERIALIZABLE behavior for writer interactions (writers
-  are serialized) without sacrificing concurrent readers.
+**Default: page-level MVCC concurrent mode with SSI.**
+Plain `BEGIN` MUST promote to `BEGIN CONCURRENT` unless the caller explicitly
+opts out. `Connection` and the conformance/concurrency harnesses default their
+concurrent-mode setting to `true`. Compatibility storage (`.db` plus WAL) does
+not imply SQLite's single-writer transaction default. This rule supersedes the
+older serialized-default wording in this section and its companion document.
+
+**Explicit SQLite transaction modes (opt-out, not the default).**
+- `PRAGMA fsqlite.concurrent_mode = OFF` makes an unqualified `BEGIN` use
+  deferred semantics. Explicit `BEGIN DEFERRED`, `BEGIN IMMEDIATE` and
+  `BEGIN EXCLUSIVE` also select their named modes in the current
+  `Connection::execute_begin` dispatch; these are caller choices.
+- The serialized-mode machinery in §5.4 applies only to such explicit choices.
+  It MUST NOT be used to serialize ordinary default concurrent writers.
 - **Interop boundary:** When running Hybrid SHM (`foo.db.fsqlite-shm`), legacy
   SQLite processes are supported as readers only; legacy writers are excluded
   and will observe `SQLITE_BUSY` while the coordinator is alive (§5.6.6.1,
   §5.6.7).
 
-**Layer 2: MVCC concurrent mode with SSI (Serializable by Default).**
+**Concurrent-mode semantics (the default).**
 - `BEGIN CONCURRENT`: New non-standard syntax (matching SQLite's own
   experimental `BEGIN CONCURRENT` branch). Uses page-level MVCC with
   **Serializable Snapshot Isolation (SSI)** -- not merely Snapshot Isolation.
@@ -407,10 +416,10 @@ cannot silently downgrade.
 - SSI implements the conservative Cahill/Fekete rule at page granularity
   ("Page-SSI"): no committed transaction may have both an incoming AND
   outgoing rw-antidependency edge. This prevents serialization cycles.
-- Applications that opt in get **SERIALIZABLE** concurrent writes. The 3–7%
-  throughput overhead measured on OLTP benchmarks with PostgreSQL 9.1+ (Ports &
-  Grittner, VLDB 2012; up to 10–20% on synthetic microbenchmarks without
-  read-only optimizations) is acceptable for correctness.
+- SSI is the default isolation target for concurrent writes. PostgreSQL's SSI
+  measurements are prior art, not measurements of FrankenSQLite's overhead.
+  This implementation's correctness and cost require its own executed oracle
+  and benchmark evidence.
 - `PRAGMA fsqlite.serializable = OFF` provides an explicit opt-out to plain
   Snapshot Isolation for benchmarking or applications that tolerate write skew.
   This is NOT the default.
@@ -460,9 +469,9 @@ cannot silently downgrade.
 
 RaptorQ (RFC 6330) is a fountain code -- a class of erasure codes where the
 encoder can produce a practically unlimited stream of encoding symbols from K
-source symbols, and the decoder can recover the original K source symbols from
-ANY set of K' encoding symbols where K' is only slightly larger than K (in most
-cases, K' = K suffices).
+source symbols. Recovery requires a mathematically sufficient set of encoding
+equations; symbol count alone does not guarantee decoding. Additional repair
+symbols can resolve a rank-deficient received set.
 
 **Key properties:**
 - **Near-optimal (engineering sense)**: Approaches erasure-channel capacity with
@@ -471,25 +480,15 @@ cases, K' = K suffices).
 - **Systematic**: The first K encoding symbols ARE the source symbols (zero
   encoding overhead for the common no-loss case)
 - **Rateless**: Generate as many repair symbols as needed on-the-fly
-- **Universal**: Works for any symbol size (we use page-sized symbols)
+- **Self-describing**: Symbol sizes and block parameters must satisfy the
+  admitted format/codec bounds; FrankenSQLite's widened OTI is described in §3.5.2.
 
-RaptorQ improves upon the original Raptor code (RFC 5053) in several ways:
-it uses GF(256) arithmetic for the HDPC constraints instead of GF(2), which
-dramatically improves the failure probability at low overhead. Where Raptor
-codes over GF(2) have a ~5-10% failure rate when decoding with exactly K
-symbols (Shokrollahi, "Raptor Codes", IEEE Trans. Info. Theory, 2006;
-exact rate varies with K), RaptorQ achieves ~1% failure rate (RFC 6330 Annex B: for most K
-values, P_fail(K) < 0.01). With just one additional symbol (K+1 received),
-the failure rate drops to approximately 10^-4. With two additional symbols
-(K+2), it drops to approximately 10^-7. This near-perfect recovery rate is
-what makes RaptorQ suitable as a foundational building block for database
-durability rather than merely a network transport optimization.
-
-**Caution on failure probability claims:** The exact failure probability
-depends on K, the symbol size, and implementation quality. The figures above
-are from RFC 6330 Annex B simulation data. Do not cite "0.01%" (10^-4) for
-exactly-K decoding; that overstates the guarantee by ~100x. Our V1 policy
-(K+2 symbols) is specifically chosen to push well past this ambiguity.
+RaptorQ uses GF(256) HDPC constraints. The exact decoder succeeds when the
+decoding matrix has full rank; see [RFC 6330 §5.4.2](https://www.rfc-editor.org/rfc/rfc6330.html#section-5.4.2).
+The RFC's probability requirements use a specific encoder, decoder and ESI
+sampling model. They do not certify this project's implementation or an
+arbitrary fixed erasure pattern. There is no RFC 6330 "Annex B" supporting the
+older probability table in this document.
 
 The RFC 6330 specification defines behavior for source blocks containing up
 to 56,403 source symbols (K_max = 56403). Each symbol is a contiguous block
@@ -500,18 +499,18 @@ database content. Larger databases are partitioned into multiple source blocks
 
 ### 3.1.1 Operational Guidance: Overhead and Failure Probability
 
-RaptorQ is "any K symbols suffice" in the *engineering* sense, but the decode
-success probability at exactly `K` is not literally 1. The point of repair
-symbols is to drive decode failure probability into the floor.
+[RFC 6330 §5.8](https://www.rfc-editor.org/rfc/rfc6330.html#section-5.8)
+requires compliant recovery failure rates at most `10^-2`, `10^-4`, and
+`10^-6` for `K'`, `K'+1`, and `K'+2` received symbols respectively, with ESIs
+sampled independently and uniformly. Here `K'` is the RFC extended source-block
+size from its table, not arbitrary notation for the received count.
 
-**Rules of thumb (RFC 6330 Annex B simulation data):**
-- Decoding with **exactly K** received symbols: ~99% success (P_fail < 0.01).
-- Decoding with **K+1** symbols: P_fail < 10^-4.
-- Decoding with **K+2** symbols: P_fail < 10^-7.
-
-**V1 Default Policy:** Aim to persist/replicate enough symbols that a decoder
-can almost always collect **K+2** symbols without coordination. This eliminates
-the need for "just one more symbol" negotiation loops in the common case.
+**V1 policy target:** retain enough systematic and repair data to meet an
+explicit durability budget, and handle insufficient rank by collecting more
+valid symbols or returning a typed failure. A fixed `K+2` budget cannot promise
+success for every pattern or eliminate feedback/retry requirements. Current
+fixed-seed codec keepers prove their particular exact-byte erasure cases;
+probabilistic durability requires separate conformance and sampling evidence.
 
 ### 3.2 How RaptorQ Works (Essential Understanding)
 
@@ -6071,6 +6070,9 @@ begin(manager, begin_kind) -> Result<Transaction>:
             break
     snapshot_established = (begin_kind != Deferred)
     serialized_write_lock_held = false
+    // The caller has already resolved an unqualified BEGIN using its
+    // concurrent_mode_default (true). Only explicit modes/opt-out reach
+    // Deferred, Immediate, or Exclusive here; see §2.4.
     mode = if begin_kind == Concurrent { Concurrent } else { Serialized }
     if begin_kind == Immediate || begin_kind == Exclusive:
         // Writer-intent at BEGIN (SQLite IMMEDIATE/EXCLUSIVE semantics).
@@ -7739,7 +7741,7 @@ SSI tracks rw-antidependencies over a canonical key space:
 ```text
 WitnessKey =
   | Page(pgno: u32)
-  | Cell(btree_root_pgno: u32, cell_tag: u32)
+  | Cell(btree_root_pgno: u32, cell_tag: u32, leaf_page: u32)
   | ByteRange(page: u32, start: u16, len: u16)
   | KeyRange(btree_root_pgno: u32, lo: Key, hi: Key)   // optional, advanced
   | Custom(namespace: u32, bytes: [u8])
@@ -7750,15 +7752,15 @@ higher-resolution keys exist. Finer keys exist to reduce false positives and
 unlock safe merge/refinement (§5.10), never to preserve correctness.
 
 **Implementation directive (critical for deterministic rebase/merge):**
-The SSI witness plane is fed by *semantic* operations (VDBE/B-tree), not raw
-pager I/O. Implementations MUST NOT register `WitnessKey::Page(pgno)` reads just
-because a cursor traversed internal pages or performed point-lookup descent.
-Doing so makes almost all writers appear read-dependent on the pages they
-modify, collapsing safe merge and deterministic rebase (§5.10.2) back to
-abort/retry. Range scans/predicate reads are handled separately below for
-phantom protection.
+The baseline may conservatively witness pages read through the pager. Such
+keys can create false positives but preserve dependency discovery. The refined
+VDBE/B-tree machinery is partly implemented; durable witness publication and
+safe merge activation remain incomplete. It may omit an internal-page
+descent read only after semantic witnesses cover all effects that could change
+the result, including missing keys, predicate gaps and structural changes.
+Refinement must not discard a real dependency merely to permit a merge.
 
-Instead, the B-tree/VDBE MUST register witnesses at key granularity:
+When the refined path is enabled, the B-tree/VDBE MUST register:
 - **Point read / uniqueness check (including "negative point read"):**
   `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`.
 
@@ -7786,6 +7788,13 @@ Instead, the B-tree/VDBE MUST register witnesses at key granularity:
   inspected or structurally modified. It is not the `btree_root_pgno` namespace.
 - `btree_root_pgno` is the SQLite B-tree root page number for the table or
   index (stable namespace; see §11.11 `sqlite_master.rootpage`).
+
+The live `WitnessKey::Cell` carries both the logical root/tag and the physical
+leaf page. Cell-vs-Cell overlap compares root and tag; Page-vs-Cell overlap
+includes either the root page or the recorded leaf page
+(`fsqlite-mvcc::witness_plane::witness_keys_overlap`). Omitting the physical leaf
+from the model can lose mixed-granularity dependencies. Logical key identity
+must remain stable across physical relocation.
 
 `cell_tag(key_bytes)` MUST be deterministic and stable across processes. A
 recommended derivation is:
@@ -8338,7 +8347,8 @@ and enable merge (§5.10).
 **Witness plane integration contract (required hooks):**
 
 Every read path that participates in serializability MUST register a key, and
-every write path MUST register keys at the finest available granularity:
+every write path MUST register overlapping keys that preserve discovery.
+Finer keys may supplement or safely refine the conservative baseline:
 
 ```
 register_read(key: WitnessKey)
@@ -8896,9 +8906,10 @@ enabled:
 - Applications that previously tolerated write skew under SI will see
   occasional `SQLITE_BUSY_SNAPSHOT` aborts for transactions that would have
   produced non-serializable results.
-- `BEGIN` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` continue to use Serialized
-  mode (global write mutex), which is trivially serializable and does not
-need SSI.
+- Plain `BEGIN` promotes to Concurrent mode and uses SSI by default (§2.4).
+  Explicit `BEGIN DEFERRED` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`, or an
+  explicit concurrent-mode opt-out, select the serialized path. They do not
+  change the default for other callers.
 
 #### 5.7.4 Witness Refinement Policy (VOI-Driven, Bounded)
 
@@ -8946,8 +8957,11 @@ refinement budget (bytes + CPU) derived from the commit budget (`Cx::budget`).
 
 ##### 5.7.4.2 Practical Policy (V1 Defaults)
 
-1. **Always register Page keys:** Hot index is always updated at `Page(pgno)` so
-   candidate discoverability is never lost.
+1. **Preserve conservative discovery:** Page keys remain the baseline and a
+   permitted fallback. A refined path may omit a coarse read key only after
+   meeting §5.6.4.3's complete semantic coverage rules; write keys must still
+   intersect the corresponding read representation. Refinement is not a
+   switch that simply drops inconvenient dependencies.
 2. **Emit refined keys only for hotspots:** Maintain per-bucket statistics from:
    - `INV-SSI-FP` (false positive rate monitor; §5.7.3)
    - conflict heatmaps (`DependencyEdge` aggregation; bucket frequency)

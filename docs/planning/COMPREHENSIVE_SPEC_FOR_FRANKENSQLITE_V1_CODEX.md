@@ -609,11 +609,14 @@ User-visible contract:
 - **Readers never block writers** and **writers never block readers**.
 - **Writers do not wait while holding locks.** If a required lock is unavailable, the operation fails fast with a retryable error (`BUSY`-class).
 
-API / SQL surface (proposed, aligned to the canonical spec’s *Serialized vs Concurrent* modes):
+API / SQL surface (aligned to `AGENTS.md` and the live `execute_begin` dispatch):
 
-- `BEGIN` / `BEGIN DEFERRED` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`:
-  - start a **Serialized** transaction (single-writer semantics for parity and safety)
-  - this is the default in V1 conformance runs (SQLite is the oracle)
+- Plain `BEGIN` promotes to **Concurrent** by default, including in the
+  default harness configurations. SQLite is a result oracle, not authority to
+  disable FrankenSQLite's concurrent-writer default.
+- `PRAGMA fsqlite.concurrent_mode = OFF` explicitly opts out of this promotion.
+  Explicit `BEGIN DEFERRED`, `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` select
+  their named modes. Serialized-mode machinery applies to these choices only.
 - `BEGIN CONCURRENT`:
   - start a **Concurrent** transaction (page MVCC + first-committer-wins + SSI by default)
 - `PRAGMA fsqlite.serializable = ON|OFF` (applies to **Concurrent** mode only):
@@ -648,12 +651,20 @@ Each transaction has:
 Visibility predicate (page versions):
 
 ```
-visible(version_created_by, snapshot) :=
-  version_created_by == 0
-  OR (version_created_by <= snapshot.high
-      AND version_created_by ∉ snapshot.in_flight
-      AND version_created_by ∈ committed_set)
+visible(committed_version, snapshot) :=
+  0 < committed_version.commit_seq <= snapshot.high
 ```
+
+`snapshot.high` and `commit_seq` are both `CommitSeq` values. A transaction's
+`TxnId`/`created_by` is a begin-order identity, not a visibility timestamp:
+transactions may commit in a different order from their starts. Uncommitted
+versions stay private; the read rule below gives a transaction its own writes
+first. Sequence zero in a `PageVersion` is an uncommitted sentinel and is not
+visible. Resolution of a durable base image is a separate fallback from
+committed arena-version visibility.
+Publication must make a committed version available before advancing the
+visible commit watermark. Do not mix an in-flight set of TxnIds into a
+CommitSeq comparison.
 
 Read rule (self-visibility wins):
 
@@ -840,7 +851,7 @@ The math is only valuable if it is embodied in the right low-level structures.
 
 We need fast membership tests for:
 
-- snapshot visibility (`created_by ∈ in_flight?`)
+- active-transaction identity and liveness bookkeeping (not CommitSeq visibility)
 - SSI overlap checks / state pruning
 
 We therefore define `ActiveTxnSet` as an adaptive structure:
@@ -877,7 +888,14 @@ We therefore define reclamation epochs in terms of the commit clock:
 
 - `CommitSeq` acts as the global epoch.
 - `min_active_begin_seq` (or `min_snapshot_high`) defines the GC horizon.
-- any page history version whose `created_by_commit_seq < horizon` is reclaimable.
+- retain every page version above the horizon and the newest committed version
+  at or below it (the floor version). Only versions older than that floor are
+  reclaimable. `commit_seq < horizon` alone is insufficient: with versions at
+  3 and 8 and an active snapshot at 5, version 3 is the only visible version.
+- advance the horizon only from live snapshot/retention obligations; physical
+  slot reuse additionally waits for outstanding reader guards. See
+  `fsqlite-mvcc::gc::prune_page_chain_with_registry` and the detailed
+  reclamation proof work in `bd-db300.5.3.3.2`.
 
 Implementation:
 

@@ -125,7 +125,15 @@ version-chain operation currently uses RaptorQ.
 
 ### 9. Mechanical Sympathy
 
-Database engines live and die by cache behavior and I/O patterns. All page buffers are allocated at `page_size` alignment for direct I/O. VFS read/write paths operate directly on aligned buffers with no intermediate copies. The MVCC `PageLockTable` and `SireadTable` shards are padded to 64-byte cache-line boundaries to prevent false sharing. B-tree key comparisons and RaptorQ GF(256) arithmetic use SIMD-friendly contiguous layouts. B-tree descent issues prefetch hints for child pages.
+Database engines live and die by cache behavior and I/O patterns. Current
+`PageData` buffers use owned `Vec<u8>` storage and shared `Arc<[u8]>` snapshots;
+they do not promise `page_size` alignment. The VFS can stage owned buffers for
+blocking-pool I/O, so the live path is not universally free of intermediate
+copies. Page-aligned buffers and reducing those copies remain performance
+goals, subject to actual workload measurements. The MVCC `PageLockTable` and
+`SireadTable` use cache-padded shards, and B-tree/codec code uses contiguous
+layouts where appropriate. These mechanisms are not a measured throughput
+claim by themselves.
 
 ---
 
@@ -401,9 +409,9 @@ enum IntentOp {
 
 ### Three Invariants (Must Hold at All Times)
 
-1. **INV-1 (Monotonic TxnIds):** TxnIds are strictly monotonically increasing, allocated via `AtomicU64::fetch_add` with `SeqCst` ordering.
+1. **INV-1 (Monotonic TxnIds):** Transaction identities increase at admission and must not wrap or reuse an active identity. They identify transactions; they do not order commit visibility.
 2. **INV-2 (Page lock exclusivity):** At most one active transaction holds the exclusive lock on any given page.
-3. **INV-3 (Version chain ordering):** In every version chain, newer versions have strictly higher `created_by` TxnIds.
+3. **INV-3 (Version chain ordering):** Newer committed versions have strictly higher `commit_seq` values. `created_by` is a transaction identity and may be out of order because transactions can finish in a different order from their starts.
 
 ### Safe Write Merging and Intent Logs
 
@@ -978,7 +986,21 @@ async caller
   ← Result<Rows>
 ```
 
-Write transactions submit commit requests through an MPSC channel to a single write coordinator task, and each request carries a `oneshot::Sender<Result<()>>` so the caller can `.await` its result. The concurrent-commit critical section itself is deliberately **not** lock-free: `lock_registry_for_commit` takes a `TimedRegistryCommitGuard` over the shared concurrent registry and holds it across the entire publish sequence — FCW/SSI validation (`plan_concurrent_commit_with_registry`) → the physical pager write (`txn.commit`) → publication into the shared `CommitIndex` (`finalize_concurrent_commit_with_registry`). That single section is load-bearing for correctness (issue #115): an earlier design released the registry lock between validation and publication, letting a peer validate against a `CommitIndex` snapshot *after* this connection had physically written a freshly-allocated EOF page but *before* it published that page — the peer then claimed the same page number and left one physical page reachable from two b-trees, the "2nd reference to page" / "database disk image is malformed" TOCTOU (see `connection.rs::execute_commit_with_cx`). Only the commit-publish step is serialized: the page-version *work* (statement execution and page mutation) happens before `COMMIT` and overlaps freely between writers, so this is not a writer-blocks-writer bottleneck on the mutation path. The safe merge ladder is not invoked by this live path.
+The live compatibility commit runs in the owning `Connection`; it does not
+submit SQL commits to an MPSC coordinator. `execute_commit_with_cx` takes a
+`TimedRegistryCommitGuard` through `lock_registry_for_commit` and holds it
+across FCW/SSI validation (`plan_concurrent_commit_with_registry`), the physical
+pager write (`txn.commit`), and `CommitIndex` publication
+(`finalize_concurrent_commit_with_registry`). The guard closes the issue #115
+race in which a peer could claim an EOF page after its physical write but
+before its allocation became visible in the commit index. Statement execution
+and private page mutation can overlap before this coordinated commit section.
+The safe merge ladder is dormant.
+
+The region-owned `ensure_write_coordinator_service_started` task currently
+waits for a shutdown signal; its existence is lifecycle infrastructure, not a
+live commit queue. Cancel-correct MPSC submission, batching, and the native
+two-fsync sequencer remain planned integration work (`bd-3mgq5.7/.8`).
 
 ---
 
@@ -2242,35 +2264,43 @@ Proof:
 **Theorem 5: Memory Boundedness**
 
 ```
-Claim: Under steady-state load with max transaction duration D and commit
-rate R, the maximum retained versions per page is bounded by R × D + 1.
+Conditional claim: if every retention obligation lasts at most D, and at most
+A(D) commits can occur in ANY interval of length D, the logically required
+committed versions per page after pruning are bounded by A(D) + 1.
 
 Proof:
     The oldest active transaction started at most D seconds ago.
-    At most R × D commits occurred in those D seconds.
+    At most A(D) commits occurred in those D seconds.
     Each creates at most one version per page.
-    The version chain has at most R × D versions above gc_horizon,
+    The version chain needs at most A(D) versions above gc_horizon,
     plus one at/below the horizon. All versions below are reclaimable
     by Theorem 4.  QED ∎
 
-Practical: D = 5s, R = 1000 commits/s → at most 5,001 versions per page
-           → ~20 MB per hot page at 4 KB pages.
+    An average commit rate alone does not bound bursts and cannot replace A(D).
+    Pending GC work, private versions, reader guards, and time-travel retention
+    require separate physical-memory accounting.
 ```
+
+This is a conditional design bound, not a measured RSS limit. Public active and
+idle transaction lifetime enforcement (`bd-6hdwo.19/.20`) and complete byte and
+retention accounting (`bd-6hdwo.21/.22`) remain open requirements.
 
 **Theorem 6: Liveness (finite termination)**
 
 ```
 Claim: Every transaction either commits or aborts in finite time,
-assuming (a) the application calls COMMIT or ROLLBACK, (b) the write
-coordinator processes requests in finite time, and (c) WAL I/O completes.
+assuming (a) the application calls COMMIT or ROLLBACK, (b) runnable tasks and
+lock holders make progress, (c) every I/O/allocation wait completes or returns
+an error, and (d) retries and retained-history work have finite bounds.
 
 Proof sketch:
-    Begin:    fetch_add is O(1)
-    Read:     version chain bounded by R×D+1 (Theorem 5)
+    Begin:    bounded admission after required waits complete
+    Read:     version chain bounded under Theorem 5's stated assumptions
     Write:    try_acquire is non-blocking, COW is O(page_size)
-    Commit:   validation scan bounded by R×D entries, WAL append finite
+    Commit:   finite validation scan and WAL append under these assumptions
     Abort:    O(write_set_size + page_locks_size)
-    All operations bounded ⟹ total work bounded ⟹ terminates.  QED ∎
+    Finite work plus progress of every required wait implies termination.
+    Instruction counts do not bound scheduler time, I/O latency, or starvation.
 ```
 
 **Result:** These arguments define obligations for the implementation. Property
