@@ -18,16 +18,14 @@ issues whose common cause was never named.
 
 ## TL;DR
 
-- **Single-process, multi-Connection via MVCC WAL**: *shipped as the intended
-  default, with a tracked high-concurrency known-limitation*. v0.2.0
-  (2026-08-04), v0.2.1 (2026-08-11), and v0.3.0 (2026-08-13) all shipped;
-  `bd-9inpb` no longer hard-blocks the tag. Correctness is fixed and verified at
-  the tested writer counts — the 0.3.0 wave landed the ≤8-writer concurrent-INSERT
-  stack, same-file open+write (GH#333), and concurrent-commit aliasing
-  (`bd-o81ov`). The underlying defect is still open: `bd-9inpb` (P0, IN_PROGRESS)
-  reproduces corruption and wrong row counts with 10 or more ordinary
-  implicit-autocommit writers in both WAL and rollback-journal modes — treat ≥10
-  concurrent writers as unsupported until its four-scenario gate is green.
+- **Single-process, multi-Connection via MVCC WAL**: the intended default.
+  As checked on 2026-09-05, the double-allocation issue `bd-9inpb` is closed
+  after its September 4 acceptance; orphaned-page churn `bd-ioq6x` remains in
+  progress. The former blanket ten-writer warning described an older failure
+  and is not a current measured limit. Capability claims still require the
+  identified source, workload, writer count, duration and actual oracle results.
+  The two-writer receipt in `bd-6hdwo.7/.8` proves overlapping disjoint-page
+  transactions, not arbitrary high-concurrency churn.
 - **Single-process, single-Connection across threads**: *not supported by
   API*. `Connection` is `!Send + !Sync` by construction. Spawn one
   Connection per OS thread against the same file-backed database and
@@ -88,11 +86,10 @@ mechanism (MVCC, DPOR, page-conflict math), see the README's
 
 ### 1. Process count — how many caller processes can safely share one DB file?
 
-- **Single-process**: multiple `Connection` instances are the intended default,
-  shipped since v0.2.0. `bd-9inpb` (P0, IN_PROGRESS) no longer blocks releases
-  but remains open: do not claim an unconditional writer count — treat ≥10
-  concurrent implicit-autocommit writers as unsupported until its four-scenario
-  gate is green.
+- **Single-process**: multiple `Connection` instances are the intended default.
+  Do not infer an unconditional writer count from the now-closed `bd-9inpb` or
+  a small disjoint-page keeper. Use actual workload-specific acceptance and the
+  remaining churn work in `bd-ioq6x`.
 - **Multi-process**: target is N ≤ 32 short-lived writers per file
   (matching the swarm harness scale). Today the multi-process surface is
   *partial* — see the closed
@@ -124,21 +121,21 @@ must not produce process-global state leakage.
 - **Read-your-own-writes**: immediately, on the same `Connection`.
   `COMMIT` returning `Ok` means the next `query`/`query_with_params` on
   the same `Connection` sees the new row. This is unconditional.
-- **Cross-Connection (same process)**: visible at B's *next transaction
-  boundary*. fsqlite uses `schema_cookie` + per-connection prepared-plan
-  invalidation (see `crates/fsqlite-core/src/connection.rs` —
-  `schema_cookie` / `schema_generation` checks at prepared-statement
-  reuse). Within an active read transaction on B, B sees its own
+- **Cross-Connection (same process)**: visible at B's next transaction
+  boundary. Shared commit publication and
+  `refresh_memdb_if_stale_with_publication_and_mode` refresh data visibility;
+  `schema_cookie`/`schema_generation` additionally invalidate schema-dependent
+  plans. Schema checks alone cannot detect all committed data changes.
+  Within an active read transaction on B, B sees its own
   consistent snapshot; A's commits become visible when B begins a
   new transaction.
-- **Cross-process**: same as cross-Connection, mediated by the
-  shared-memory file (`*.fsqlite-shm`, see `crates/fsqlite-mvcc/src/shm.rs`)
-  for MVCC commit_seq propagation, plus standard SQLite WAL-index for
-  page-level visibility. The window between "process A's `COMMIT`
-  returns" and "process B's next `BEGIN` sees the new state" is bounded
-  by shared-memory atomic visibility (typically nanoseconds on the same
-  host) plus B's own read-snapshot acquisition. There is no indeterminate
-  staleness window once B has started a fresh transaction.
+- **Cross-process**: the required behavior is fresh committed data at a new
+  snapshot boundary. The current compatibility path uses pager/WAL refresh,
+  read marks and VFS coordination; `SharedMvccState` is process-local.
+  Native `*.fsqlite-shm` components exist, but do not establish a complete
+  public shared-version/commit/retention path. Cross-process acceptance must
+  execute on the actual platform/backend. No nanosecond propagation bound is
+  established by the presence of shared-memory types.
 
 ### 4. Plan-cache visibility — does the prepared-statement cache participate?
 
@@ -169,24 +166,17 @@ family. The contract:
 
 ### 5. Lock-timeout semantics — does `PRAGMA busy_timeout` apply across processes?
 
-- Same-process, multi-Connection: yes, unambiguously. `busy_timeout`
-  applies to MVCC abort/retry and to WAL-index locks alike.
-- Cross-process: yes for advisory `fcntl(F_SETLK)` byte-range locks on
-  the DB file (see the `F_SETLK` handling in
-  `crates/fsqlite-vfs/src/unix.rs` — `grep F_SETLK`). The
-  VFS retries `F_SETLK` with exponential backoff up to `busy_timeout`,
-  matching stock SQLite. Historical gap
-  ([#45](https://github.com/Dicklesworthstone/frankensqlite/issues/45))
-  was a non-blocking `F_SETLK` that returned immediately. That issue is closed;
-  the swarm harness's `busy_timeout` criterion is the
-  regression net.
-- On exhaustion, the failure mode is `FrankenError::Busy` (or
-  `BusyRecovery` / `BusySnapshot { .. }` for the snapshot-isolation
-  variants). It is **never** an indefinite hang and **never** a
-  silent zero-rows-committed exit. Callers retry on `Busy*`.
-- Granularity: timeout applies per *acquisition attempt*. A long
-  transaction holding many page locks does not consume the timeout once
-  acquired — only the wait phase does.
+- `busy_timeout` supplies a contention budget at participating Connection/VFS
+  boundaries. It is not permission to retry every error indefinitely, nor a
+  wall-clock bound on a complete transaction or syscall.
+- Unix locking currently distinguishes Linux `F_SETLK` from Darwin
+  `F_OFD_SETLK`; see `fcntl_setlk`/`UnixFile::lock` in
+  `crates/fsqlite-vfs/src/unix.rs`. Error and retry behavior must be checked at
+  the actual acquisition site rather than inferred from a generic fcntl label.
+- Busy, recovery and stale-snapshot errors remain observable. A stale snapshot
+  may require rolling back and restarting the transaction; caller retry policy
+  must preserve the error, attempt count and deadline. The swarm harness's
+  `busy_timeout` criterion provides platform-specific runtime evidence.
 
 ### 6. Where fsqlite is **weaker** than stock SQLite
 
@@ -194,8 +184,10 @@ These are intentional or known gaps documented so callers can plan:
 
 - **Multi-process WAL checkpoint coordination** is currently weaker.
   Stock SQLite's checkpoint protocol has been hardened over decades
-  against multi-process opener contention; fsqlite's Silo-style epoch
-  group commit is newer. Substantial #70 hardening work has landed, while the
+  against multi-process opener contention. FrankenSQLite's current public
+  commit path holds its shared registry guard across validation, pager commit
+  and publication; the planned coordinator/group-commit path is not connected
+  merely because its primitives exist. Substantial #70 hardening work has landed, while the
   remaining program is tracked by `bd-zywqc`; multi-process *checkpoint* (not
   normal commit) remains the weakest surface. Treat this as a measured
   limitation rather than evidence that the remaining program is complete. The
@@ -240,10 +232,11 @@ These are intentional or known gaps documented so callers can plan:
 - Single-writer + multi-reader WAL semantics: full parity, including
   `busy_timeout` honor, `SQLITE_BUSY` error codes, and `PRAGMA
   wal_autocheckpoint` thresholds.
-- `PRAGMA integrity_check` semantics: parity is the target. The current checker
-  can miss a referenced empty non-root leaf that stock SQLite reports as
-  malformed (`bd-y5urj`), so a green FrankenSQLite result is not by itself a
-  complete corruption proof; `bd-y5urj` remains open as of v0.3.0.
+- `PRAGMA integrity_check` semantics: parity is the target. `bd-y5urj` closed
+  on 2026-08-15 after its fixture was corrected to create a real non-root leaf
+  and expose its corruption instead of a WAL-shadowed image. It was not a
+  checker implementation defect. Retain stock SQLite as an independent oracle
+  for current churn/corruption investigations.
 - Connection lifecycle: `open` / `close` semantics match stock —
   including the hand-off via WAL checkpoint on the last connection
   closing.
@@ -267,21 +260,18 @@ boundary between parity-claimed and parity-aspired.
   boundary, committed rows from other Connections are visible.
 - `PRAGMA integrity_check = ok` after the workload terminates.
 
-The bullets above are the contract target. They hold at the tested writer
-counts (verified in the 0.3.0 wave), which is why v0.2.x/0.3.0 shipped — this is
-no longer a release blocker. But `bd-9inpb` (P0, IN_PROGRESS) still fails
-ordinary implicit-autocommit writer stress at 10+ writers in both WAL and
-rollback-journal modes while the two explicit `BEGIN CONCURRENT` barrier
-controls pass. All four scenarios must pass before ≥10-writer concurrency is
-**Supported** without qualification.
+The bullets above are the contract target. Acceptance is tied to the executed
+source and workload. The older ten-writer allocator failure `bd-9inpb` is
+closed; `bd-ioq6x` still tracks orphaned-page churn. A passing two-writer barrier
+scenario or an old release decision does not establish every stress shape.
 
 **`journal_mode = 'wal'` means MVCC here, not SQLite's single-writer WAL.**
 For file-format compatibility, `PRAGMA journal_mode` reports `wal` (and
 file-backed databases default to it), but FrankenSQLite intentionally
 replaces SQLite's single-writer `WAL_WRITE_LOCK` with page-level MVCC:
 while `concurrent_mode_default` is on (the default and a core invariant),
-every `BEGIN` auto-promotes to `BEGIN CONCURRENT`, so multiple writers
-commit in parallel as long as they touch disjoint pages. Do **not** assume
+plain `BEGIN` auto-promotes to `BEGIN CONCURRENT`, so disjoint-page write work
+can overlap before coordinated commit validation and publication. Do **not** assume
 the classic single-writer WAL contract from the `journal_mode` value alone.
 Query the live model with the read-only introspection PRAGMA:
 
@@ -403,8 +393,8 @@ that opens `fsqlite` as a dependency):
 
 Design around **single-process, multi-Connection via MVCC WAL**; that is the
 intended default and shipped since v0.2.0. It is safe at the tested writer
-counts; do not push ≥10 concurrent writers under load until `bd-9inpb` is fixed
-and its four-scenario writer gate is green.
+counts; qualify higher-load claims with current churn and stock-oracle evidence,
+including the remaining `bd-ioq6x` work.
 If you think you need multi-process access, re-check — most reports turn out to
 be multiple callers that could run in the same process.
 
@@ -417,17 +407,13 @@ be multiple callers that could run in the same process.
 - Cap N at whatever your `swarm-multiprocess --workers N --seconds
   3600` run is green on. Publish that number in your caller's own
   README so downstream is not guessing.
-- On startup, clean up 0–32-byte WAL sidecars before opening (see
-  `mcp_agent_mail_rust/crates/mcp-agent-mail-db/src/pool.rs::cleanup_empty_wal_sidecar`
-  for a tested implementation of that pattern).
-- On a checkpoint failure with `WAL file too small for header during
-  rebuild` or `freelist trunk page exceeds db_size`, do not fail
-  closed immediately — it is an fsqlite-known recoverable class. Log,
-  clean up the sidecar, and retry once before escalating.
-- A green FrankenSQLite `PRAGMA integrity_check` is not a complete corruption
-  proof while `bd-y5urj` remains open. Preserve the file, close FrankenSQLite,
-  run stock SQLite's checker, and retain the exact reproducer before deciding
-  whether the database or an in-process verdict is wrong.
+- Preserve database and sidecar bytes when startup or checkpoint reports a
+  short WAL, malformed freelist or another corruption condition. File length
+  alone does not authorize a caller to remove a live sidecar or discard recovery
+  evidence. Use the engine's typed recovery path with verified ownership.
+- Retain the original error and reproducer. After closing all relevant writers,
+  use stock SQLite's checker on the preserved state; do not turn a corruption
+  result into success through an unconditional cleanup/retry recipe.
 
 ### When you hit a new symptom
 

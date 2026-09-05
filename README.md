@@ -1962,33 +1962,24 @@ Phase 1 — Peeling (O(K) average):
 
 Phase 2 — Gaussian elimination on the "inactive" subsystem:
     Solve the remaining dense subsystem.
-    Algebraic work shape: O(I² × T) for I inactive symbols of size T.
+    Dense work: O(I³ + I² × T) for I inactive symbols of size T.
+    The second term accounts for elimination on the payload bytes.
 ```
 
 The peeling fraction, inactive-system size, and runtime cost depend on the
 code parameters and input. They are not current FrankenSQLite measurements;
 the release matrix must measure the shipped implementation.
 
-**Illustrative multicast bandwidth model:**
+**Multicast bandwidth goal:** One sender stream can serve several receivers,
+but each must collect enough independent equations. `K/(1-p)` is the expected
+transmission count for one receiver to receive K packets under independent
+loss probability p. It does not guarantee decoding or completion of all N
+receivers. If each receiver's deadline failure probability is at most q, the
+union bound is Nq; independent receiver failures give `1-(1-q)^N`.
 
-```
-Independent unicast replication:
-    Total sender bandwidth: O(N × K / (1-p))     where N = receivers, p = loss rate
-
-Fountain-coded multicast:
-    Sender emits: K × 1.02 / (1-p) symbols       (2% overhead, independent of N)
-    This assumes one multicast symbol reaches all receivers and independent
-    loss with the same rate at every receiver.
-
-Example: K=1000 pages, p=5% loss, N=10 replicas
-    Unicast: ~10,526 transmissions
-    Fountain: ~1,074 transmissions
-    Ratio:   ~9.8× under those assumptions
-```
-
-This arithmetic is not a measured FrankenSQLite replication result and does
-not account for correlated loss, feedback, headers, metadata, retransmission
-policy, or implementation overhead.
+The native replication benchmark must compare sender bytes, repair/feedback
+traffic and slowest-receiver completion under the same failure budget and loss
+model. No fixed repair percentage or achieved multicast speedup is claimed.
 
 **Result:** RaptorQ supplies a standards-defined erasure-code building block.
 The repository treats database-level durability as a property to prove and
@@ -2216,7 +2207,7 @@ commit_seq C_w and created versions {V_1, ..., V_k}:
 
     Exhaustive cases:
     • T_w committed after snapshot → sees NONE  (C_w > S_r.high)
-    • T_w not yet committed       → sees NONE  (commit_seq = 0, never <= S_r.high)
+    • T_w not yet committed       → sees NONE  (commit_seq = 0 fails the > 0 rule)
     • T_w committed before snapshot → sees ALL  (C_w <= S_r.high)
 
     In no case does T_r see a strict subset of T_w's writes.
@@ -2227,8 +2218,9 @@ commit_seq C_w and created versions {V_1, ..., V_k}:
 **Theorem 3: First-Committer-Wins**
 
 ```
-Claim: Under the live strict-FCW path, if two transactions both write page P,
-at most one commits successfully. The dormant SAFE-ladder design would permit
+Claim: Under the live strict-FCW path, writers with conflicting page P changes
+cannot both commit from snapshots excluding the other's publication.
+The dormant SAFE-ladder design would permit
 both only if a semantic resolution (intent replay / structured patch) produced
 a state equivalent to some serial ordering.
 
@@ -2239,24 +2231,25 @@ Proof (two cases):
 
     Case B — Sequential (T1 commits and releases before T2 acquires):
         T2 acquires lock on P and writes it.
-        At commit validation, T2 discovers T1 committed P after T2's snapshot.
-        The live path makes T2 abort/retry. A future activation of the SAFE
+        If T1 committed after T2's snapshot, validation makes T2 abort/retry.
+        If T2's snapshot already includes T1, both may commit in serial order.
+        A future activation of the SAFE
         ladder could instead commit rebased/merged deltas after validation.
 
-    In all cases, the final committed page version is well-defined: either one
-    writer's changes survive. The dormant design additionally requires any
+    In all cases, the final committed page version follows validated serial
+    order or conflict rejection. The dormant design additionally requires any
     future merged page to incorporate both writers in a serializable way. QED ∎
 ```
 
 **Theorem 4: GC Safety (no premature version reclamation)**
 
 ```
-Claim: Garbage collection never removes a version any active or future
-transaction could need.
+Claim: Logical pruning preserves versions needed by protected snapshots and
+ordinary future snapshots. Physical reuse also requires reader-guard safety.
 
 Setup:
-    gc_horizon = min(T.begin_seq : T ∈ active_transactions)
-        where begin_seq is the CommitSeq observed at T's BEGIN.
+    gc_horizon = min(protected snapshot.high), in CommitSeq order.
+        With no retention obligations: gc_horizon = latest committed sequence.
     Version V of page P is reclaimable iff:
         V.commit_seq < gc_horizon
         AND ∃ V' in version_chain(P):
@@ -2264,12 +2257,14 @@ Setup:
             AND V'.commit_seq ≤ gc_horizon
 
 Proof:
-    For any active T_a: T_a.snapshot.high = T_a.begin_seq ≥ gc_horizon
+    For any protected T_a: T_a.snapshot.high ≥ gc_horizon
     The superseding V' satisfies V'.commit_seq ≤ gc_horizon ≤ T_a.snapshot.high
     ∴ V' is visible to T_a's snapshot (V'.commit_seq ≤ S.high).
     Since V'.commit_seq > V.commit_seq, resolve(P, T_a.snapshot) returns V'
     or newer — never V.
-    Same argument holds for future transactions (their begin_seq ≥ gc_horizon).
+    Same argument holds for ordinary future snapshots with high ≥ gc_horizon.
+    Historical requests below it need separately retained history or an
+    explicit unavailable error; they are not covered by this argument.
     QED ∎
 ```
 

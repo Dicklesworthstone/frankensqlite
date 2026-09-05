@@ -59,7 +59,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
 | **CommitMarker** | The durable "this commit exists" record in Native mode: `(commit_seq, commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker, integrity_hash)`. |
 | **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
-| **RaptorQ** | RFC 6330 fountain code: K source symbols → unlimited encoding symbols, recoverable from any K' ≈ K. |
+| **RaptorQ** | RFC 6330 fountain code: K source symbols plus additional repair equations; recovery requires sufficient rank, not an arbitrary K-symbol subset. |
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
@@ -1673,44 +1673,28 @@ Receiver B: [  X  ] [sym_1] [  X  ] ... [  X    ] [sym_K] [sym_K+1] ...
 Receiver C: [sym_0] [sym_1] [sym_2] ... [sym_K-1] [  X  ] [  X    ] ...
 ```
 
-Each receiver experiences different packet losses (marked X). But since
-RaptorQ decoding works with ANY K' >= K symbols, each receiver independently
-collects until it has enough and then decodes. No retransmission is needed.
-No feedback channel from receiver to sender is needed.
-
-For N receivers with independent packet loss rate p, the sender needs to
-emit approximately K / (1 - p) symbols total. All N receivers decode
-simultaneously from this single stream. Compare with TCP unicast, which
-requires N separate streams, each requiring K / (1 - p) symbols plus
-retransmission overhead from ACK/NACK handshakes.
+Each receiver experiences different packet losses (marked X) and collects
+verified symbols until its decoding system has sufficient rank. Fresh repair
+symbols can replace retransmission of particular lost packets, but finite
+completion still needs either feedback or a provisioned loss/timeout budget.
+One receiver's completion does not prove that every receiver has decoded.
 
 **Bandwidth Analysis**
 
-Let K = number of source symbols (pages), p = packet loss rate, N = number
-of receivers.
+For one receiver with independent packet loss probability p, `K / (1-p)` is
+the expected number of transmissions to receive K packets. It is not a bound
+on decoding rank, tail latency or completion of all N receivers. If each
+receiver fails by a chosen deadline with probability at most q, the union
+bound gives at most Nq for any receiver failing. Under independent receiver
+failures, that probability is `1 - (1-q)^N`; correlated loss needs its own model.
 
-```
-Traditional TCP (per receiver):
-    Expected transmissions: K / (1 - p) + retransmission_overhead
-    For N receivers: N * K / (1 - p) * (1 + overhead)
-    Total sender bandwidth: O(N * K / (1 - p))
-
-Fountain-coded multicast:
-    Sender emits: K * (1 + epsilon) / (1 - p) symbols, where epsilon ~ 0.02
-    All N receivers decode from this single stream
-    Total sender bandwidth: O(K / (1 - p))
-    Bandwidth savings: factor of N
-
-Example:
-    K = 1000 pages, p = 5% loss, N = 10 receivers
-    TCP: ~10 * 1000 / 0.95 * 1.1 ~ 11,579 transmissions from sender
-    Fountain: ~1000 * 1.02 / 0.95 ~ 1,074 transmissions from sender
-    Savings: 10.8x
-```
-
-**This is the killer feature for edge/IoT deployments** where network
-reliability is poor. A sensor network can replicate its database to a
-central server over lossy radio links with optimal bandwidth usage.
+Multicast can share a sender stream across receivers, preserving the intended
+replication benefit. A numeric savings claim must measure total sender bytes,
+headers/metadata, repair and feedback traffic, receiver count, loss pattern and
+slowest-receiver completion at the same failure budget as the unicast baseline.
+Neither a fixed 2% repair allowance nor a single-receiver expectation proves
+simultaneous all-receiver completion. This remains an unmeasured native
+replication goal, not an achieved bandwidth ratio.
 
 #### 3.4.3 Fountain-Coded Snapshot Shipping
 
@@ -1863,10 +1847,11 @@ just like any other object.
 
 **Reconstruction cost bound:** Reconstructing the oldest version in a chain of
 depth `L` requires `L-1` sequential delta applications starting from the newest
-(full) version. Theorem 5 (§5.5) bounds chain length to `R * D + 1` where `R`
-is the write rate and `D` is the duration above the GC horizon; the GC
-scheduling policy (§5.6.5) targets a chain depth of ~8. This ensures delta
-reconstruction cost remains bounded and predictable.
+(full) version. Theorem 5 (§5.5) gives a conditional post-pruning bound
+`A(D) + 1`, requiring an enforced arrival envelope and bounded retention.
+A desired chain depth of eight is a scheduling target, not a guarantee when
+protected snapshots prevent pruning. Delta compression and its end-to-end
+reconstruction latency still require implementation and measured evidence.
 
 ```
 Version chain for page P:
@@ -2751,7 +2736,8 @@ OTI := {
 **RFC 6330 OTI divergence (normative):** The FrankenSQLite OTI is an internal
 encoding, not the RFC 6330 Common FEC OTI wire format. Field widths are widened
 for implementation convenience: `F` is `u64` (RFC: 40-bit), `T` is `u32`
-(RFC: 16-bit), `Z` is `u32` (RFC: 12-bit), `N` is `u32` (RFC: 8-bit). The
+(RFC: 16-bit), `Z` is `u32` (RFC: 8-bit), `N` is `u32` (RFC: 16-bit), and
+`Al` is `u16` (RFC: 8-bit). See RFC 6330 §§3.3.2–3.3.3. The
 critical widening is `T`: RFC 6330 limits symbol size to 65,535 bytes, but
 SQLite allows `page_size = 65,536` (encoded as `1` in the file header because
 65,536 overflows `u16`). Since `PageHistory` objects use `T = page_size`,
@@ -2761,7 +2747,11 @@ SQLite allows `page_size = 65,536` (encoded as `1` in the file header because
 `symbol_size == OTI.T`. On mismatch, the record MUST be treated as corrupt
 (reject for decode, count as a corruption observation for §3.5.12).
 
-**Self-describing property:** A symbol record contains everything needed to decode it: the ObjectId identifies which object this symbol belongs to, the OTI provides the RaptorQ parameters, and the ESI identifies which encoding symbol this is. A decoder collecting K' symbols with the same ObjectId can reconstruct the original object without any external metadata.
+**Self-describing property:** A symbol record identifies its object, encoding
+parameters and symbol identifier. Reconstruction additionally requires a
+consistent, supported OTI, valid integrity/authentication and enough independent
+equations for every source block. A count of matching ObjectIds alone is not
+proof that decoding can succeed.
 
 **Flags (normative):**
 
@@ -3325,7 +3315,7 @@ policy (K/R), and repair story.
 | Symbol streaming | `SymbolSink`/`SymbolStream` | Symbol-native, not file-native |
 | Anti-entropy | ObjectId set reconciliation (IBLT) | O(Δ) reconciliation of ObjectId sets; fallback to segment hash scan |
 | Bootstrap | `CheckpointChunk` symbol streaming | Late-join = collect K symbols |
-| Multipath | `MultipathAggregator` | Any K symbols from any path suffice |
+| Multipath | `MultipathAggregator` | Combine verified symbols across paths; decode only with sufficient rank for each source block |
 
 **Anti-entropy via IBLT (recommended):**
 
@@ -5623,9 +5613,9 @@ PageVersion := {
 -- MEMORY STABILITY (normative): The arena MUST be chunked so that appending new
 -- versions cannot reallocate/move previously published PageVersion storage.
 --
--- Theorem 5 (Section 5.5) bounds version chain length to R * D + 1 where
--- R is the write rate and D is the duration above the GC horizon. For
--- typical workloads (R=100 writes/sec, D=0.1s), chains are <= 11 entries.
+-- Theorem 5 (Section 5.5) conditionally bounds logically retained versions
+-- after pruning by A(D)+1. Mean throughput and transaction duration do not
+-- bound arena memory; reader pins, pruning lag and private writes also matter.
 -- The per-page version chain head table (mapping PageNumber -> VersionIdx)
 -- can use SmallVec<[VersionIdx; 8]> to inline the most recent chain heads
 -- without heap allocation; when a page has more than 8 retained versions,

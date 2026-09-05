@@ -189,7 +189,10 @@ DB file + WAL file + WAL index + checkpoints
 
 FrankenSQLite’s architecture is reorganized around a single universal abstraction:
 
-> **Erasure-Coded Stream (ECS):** an append-only stream of *objects*, where each object is encoded as RaptorQ symbols such that any `K` of the transmitted/stored symbols suffice to reconstruct the object. Objects can be stored locally, distributed across replicas, repaired after partial loss, and replayed to reconstruct state.
+> **Erasure-Coded Stream (ECS):** an append-only stream of objects encoded as
+> RaptorQ symbols. Enough independent verified equations reconstruct each source
+> block; an arbitrary K-symbol subset need not suffice. Local storage,
+> replication, repair and replay are the native design built on that condition.
 
 This is the database engine reframed as information theory:
 
@@ -228,18 +231,23 @@ Implementation note (practical API surface we will bind to):
 
 ### 3.1.1 Overhead, Failure Probability, and Defaults (Operational Guidance)
 
-RaptorQ is “any K symbols suffice” in the *engineering* sense, but the decode success probability at exactly `K` is not literally 1. The whole point of repair symbols is to drive decode failure probability into the floor.
+RaptorQ recovery requires sufficient rank. A deficient set needs more verified
+symbols or an explicit failure; describing arbitrary K-symbol subsets as
+sufficient obscures this requirement.
 
 Terminology we use consistently:
 
 - `K_block = ObjectParams.symbols_per_block` (source symbols per source block)
 - `B = ObjectParams.source_blocks` (number of source blocks)
-- `K_total = K_block * B` (total source symbols across the whole object)
+- `K_total = sum(K_b for each source block b)`; the final block may be shorter,
+  so multiplying a maximum block size by B can overcount actual source symbols
 
-Rules of thumb (backed by RFC 6330 guidance and typical RaptorQ behavior):
-
-- decoding with **exactly K** received symbols can very rarely fail (still extremely good compared to older fountain codes)
-- decoding with **K+1** or **K+2** received symbols makes failure probability effectively negligible for our purposes
+RFC 6330 §5.8 specifies maximum decoder failure probabilities of 10^-2,
+10^-4 and 10^-6 for K', K'+1 and K'+2 independently, uniformly sampled ESIs,
+respectively, under its compliant-decoder model. K' is the extended source
+block size. These conditions are not a guarantee for a fixed loss pattern or
+this implementation. Whether a residual risk is acceptable depends on the
+declared end-to-end failure budget and number of objects/receivers.
 
 Therefore, we define a default redundancy policy:
 
@@ -356,7 +364,9 @@ Each object has:
 RaptorQ encoding produces:
 
 - `K` **source symbols** (systematic)
-- optionally `R` **repair symbols** (overhead), such that receiving any `K` symbols from the union suffices (with high probability, but we treat RFC 6330 compliance as the operational contract)
+- optionally R repair symbols; decoding succeeds only when the verified
+  equations for each source block have sufficient rank. RFC probability bounds
+  require the sampling and decoder conditions above.
 
 #### 5.2.1 Canonical Encoding (Deterministic Bytes, Not “Serde Vibes”)
 
@@ -1688,7 +1698,8 @@ To bring up a new replica:
 Because chunks are fountain-coded:
 
 - loss does not require retransmission bookkeeping
-- multiple existing replicas can multicast symbols; the joiner just needs any K
+- multiple replicas may contribute verified symbols; the joiner needs
+  sufficient rank for every source block, plus authenticated metadata
 
 ### 12.8 Consistency Checking (Sheaf + TLA+ Export)
 
