@@ -11,6 +11,7 @@ use fsqlite_core::replication_receiver::{PacketResult, ReplicationReceiver};
 use fsqlite_core::replication_sender::{
     PageEntry, ReplicationPacket, ReplicationSender, SenderConfig,
 };
+use fsqlite_types::cx::Cx;
 use tracing::{debug, info};
 
 const BEAD_ID: &str = "bd-26qk";
@@ -113,7 +114,7 @@ fn test_bd_26qk_systematic_roundtrip() {
 
     let mut source_packets = Vec::new();
     while let Some(packet) = sender
-        .next_packet()
+        .next_packet(&Cx::new())
         .expect("packet generation should succeed")
     {
         if packet.is_source_symbol() {
@@ -129,7 +130,7 @@ fn test_bd_26qk_systematic_roundtrip() {
     let mut decoded_pages = Vec::new();
     for wire in &source_packets {
         let result = receiver
-            .process_packet(wire)
+            .process_packet(&Cx::new(), wire)
             .expect("packet processing should succeed");
         if result == PacketResult::DecodeReady {
             let mut applied = receiver
@@ -187,7 +188,7 @@ fn test_bd_26qk_sender_generates_packets() {
     let mut source_count = 0_usize;
     let mut repair_count = 0_usize;
     while let Some(packet) = sender
-        .next_packet()
+        .next_packet(&Cx::new())
         .expect("packet generation should succeed")
     {
         total_packets += 1;
@@ -234,7 +235,7 @@ fn test_bd_26qk_auth_tag_roundtrip() {
         .start_streaming()
         .expect("sender should transition to streaming");
 
-    if let Some(packet) = sender.next_packet().expect("should get a packet") {
+    if let Some(packet) = sender.next_packet(&Cx::new()).expect("should get a packet") {
         let mut tagged = packet;
         tagged.attach_auth_tag(&auth_key);
         let wire = tagged
@@ -259,6 +260,7 @@ fn test_bd_26qk_auth_tag_roundtrip() {
 
 #[test]
 fn test_bd_26qk_systematic_path_latency_bounded() {
+    let cx = Cx::new();
     let page_size = 1024_u32;
     let page_count = 32_usize;
     let symbol_size = 512_u16;
@@ -282,7 +284,7 @@ fn test_bd_26qk_systematic_path_latency_bounded() {
         sender.start_streaming().expect("start streaming");
 
         let mut source_packets = Vec::new();
-        while let Some(packet) = sender.next_packet().expect("packet gen") {
+        while let Some(packet) = sender.next_packet(&cx).expect("packet gen") {
             if packet.is_source_symbol() {
                 source_packets.push(packet.to_bytes().expect("encode"));
             }
@@ -291,7 +293,7 @@ fn test_bd_26qk_systematic_path_latency_bounded() {
         let start = Instant::now();
         let mut receiver = ReplicationReceiver::new();
         for wire in &source_packets {
-            let _ = receiver.process_packet(wire).expect("process");
+            let _ = receiver.process_packet(&cx, wire).expect("process");
         }
         let elapsed = start.elapsed().as_nanos();
         let elapsed_u64 = u64::try_from(elapsed).unwrap_or(u64::MAX);
@@ -354,7 +356,7 @@ fn test_e2e_bd_26qk_compliance() {
     sender.start_streaming().expect("start");
 
     let mut packets = Vec::new();
-    while let Some(packet) = sender.next_packet().expect("gen") {
+    while let Some(packet) = sender.next_packet(&Cx::new()).expect("gen") {
         if packet.is_source_symbol() {
             packets.push(packet.to_bytes().expect("encode"));
         }
@@ -363,7 +365,7 @@ fn test_e2e_bd_26qk_compliance() {
     let mut receiver = ReplicationReceiver::new();
     let mut completed = false;
     for wire in &packets {
-        if receiver.process_packet(wire).expect("process") == PacketResult::DecodeReady {
+        if receiver.process_packet(&Cx::new(), wire).expect("process") == PacketResult::DecodeReady {
             completed = true;
             break;
         }

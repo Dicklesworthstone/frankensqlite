@@ -8,6 +8,7 @@ use fsqlite_core::replication_sender::{
     PageEntry, ReplicationPacket, ReplicationSender, SenderConfig,
 };
 use fsqlite_core::{symbol_add_assign, symbol_addmul_assign, xor_patch_wide_chunks};
+use fsqlite_types::cx::Cx;
 
 fn fill_pattern(len: usize, a: u8, b: u8) -> Vec<u8> {
     (0..len)
@@ -42,11 +43,11 @@ fn make_replication_pages(page_size: u32, page_count: usize) -> Vec<PageEntry> {
         .collect()
 }
 
-fn run_replication_roundtrip(packet_bytes: &[Vec<u8>]) -> usize {
+fn run_replication_roundtrip(cx: &Cx, packet_bytes: &[Vec<u8>]) -> usize {
     let mut receiver = ReplicationReceiver::new();
     for wire in packet_bytes {
         let result = receiver
-            .process_packet(wire)
+            .process_packet(cx, wire)
             .expect("replication packet processing should succeed");
         match result {
             PacketResult::DecodeReady => {
@@ -77,6 +78,7 @@ fn build_replication_packet_path(
     symbol_size: u16,
     max_isi_multiplier: u32,
 ) -> (Vec<Vec<u8>>, usize) {
+    let cx = Cx::new();
     let mut sender = ReplicationSender::new();
     let mut pages = make_replication_pages(page_size, page_count);
     sender
@@ -95,7 +97,7 @@ fn build_replication_packet_path(
 
     let mut all_packets = Vec::new();
     while let Some(packet) = sender
-        .next_packet()
+        .next_packet(&cx)
         .expect("packet generation should succeed")
     {
         all_packets.push(
@@ -114,7 +116,7 @@ fn build_replication_packet_path(
     }
 
     let systematic_packets = source_packets.clone();
-    let _decoded_systematic = run_replication_roundtrip(&systematic_packets);
+    let _decoded_systematic = run_replication_roundtrip(&cx, &systematic_packets);
 
     let payload_bytes = usize::try_from(page_size)
         .expect("page_size must fit usize")
@@ -304,6 +306,7 @@ fn bench_raptorq_paths(c: &mut Criterion) {
 }
 
 fn bench_replication_paths(c: &mut Criterion) {
+    let cx = Cx::new();
     let page_size = 1024_u32;
     let page_count = 48_usize;
     let symbol_size = 512_u16;
@@ -330,7 +333,7 @@ fn bench_replication_paths(c: &mut Criterion) {
 
     group.bench_function("receiver_systematic_only", |b| {
         b.iter(|| {
-            let decoded_bytes = run_replication_roundtrip(black_box(&systematic_packets));
+            let decoded_bytes = run_replication_roundtrip(&cx, black_box(&systematic_packets));
             black_box(decoded_bytes);
         });
     });
@@ -365,7 +368,10 @@ fn bench_replication_paths(c: &mut Criterion) {
                 .expect("sender should transition to streaming");
 
             let mut generated_bytes = 0_usize;
-            while let Some(packet) = sender.next_packet().expect("packet generation should work") {
+            while let Some(packet) = sender
+                .next_packet(&cx)
+                .expect("packet generation should work")
+            {
                 generated_bytes = generated_bytes.saturating_add(packet.symbol_data.len());
             }
             black_box(generated_bytes);

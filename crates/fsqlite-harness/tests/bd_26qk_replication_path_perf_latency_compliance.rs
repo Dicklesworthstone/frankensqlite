@@ -6,6 +6,7 @@ use fsqlite_core::replication_receiver::{PacketResult, ReplicationReceiver};
 use fsqlite_core::replication_sender::{
     PageEntry, ReplicationPacket, ReplicationSender, SenderConfig,
 };
+use fsqlite_types::cx::Cx;
 use tracing::info;
 
 const BEAD_ID: &str = "bd-26qk";
@@ -39,7 +40,7 @@ fn make_pages(page_size: u32, page_count: usize) -> Vec<PageEntry> {
         .collect()
 }
 
-fn generate_all_packets() -> Vec<Vec<u8>> {
+fn generate_all_packets(cx: &Cx) -> Vec<Vec<u8>> {
     let mut sender = ReplicationSender::new();
     let mut pages = make_pages(PAGE_SIZE, PAGE_COUNT);
     sender
@@ -58,7 +59,7 @@ fn generate_all_packets() -> Vec<Vec<u8>> {
 
     let mut packets = Vec::new();
     while let Some(packet) = sender
-        .next_packet()
+        .next_packet(cx)
         .expect("packet generation should succeed")
     {
         packets.push(packet.to_bytes().expect("packet encoding should succeed"));
@@ -76,12 +77,12 @@ fn build_systematic_packets(all_packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn run_receiver_decode_latency_ns(packet_bytes: &[Vec<u8>]) -> (u128, usize) {
+fn run_receiver_decode_latency_ns(cx: &Cx, packet_bytes: &[Vec<u8>]) -> (u128, usize) {
     let mut receiver = ReplicationReceiver::new();
     let started = Instant::now();
     for wire in packet_bytes {
         let result = receiver
-            .process_packet(wire)
+            .process_packet(cx, wire)
             .expect("packet processing should succeed");
         match result {
             PacketResult::DecodeReady => {
@@ -197,7 +198,8 @@ fn throughput_mib_per_s(total_bytes: usize, total_elapsed_ns: u128) -> f64 {
 
 #[test]
 fn test_replication_tail_latency_and_throughput_paths() {
-    let all_packets = generate_all_packets();
+    let cx = Cx::new();
+    let all_packets = generate_all_packets(&cx);
     let systematic_packets = build_systematic_packets(&all_packets);
     assert!(
         !systematic_packets.is_empty(),
@@ -212,7 +214,7 @@ fn test_replication_tail_latency_and_throughput_paths() {
     let mut decode_payload_bytes = 0_usize;
 
     for _ in 0..TAIL_RUNS {
-        let (latency_ns, decoded_bytes) = run_receiver_decode_latency_ns(&systematic_packets);
+        let (latency_ns, decoded_bytes) = run_receiver_decode_latency_ns(&cx, &systematic_packets);
         systematic_latencies_ns.push(latency_ns);
         systematic_payload_bytes = decoded_bytes;
     }
@@ -278,7 +280,8 @@ fn test_replication_tail_latency_and_throughput_paths() {
 
 #[test]
 fn test_replication_component_cost_reporting() {
-    let all_packets = generate_all_packets();
+    let cx = Cx::new();
+    let all_packets = generate_all_packets(&cx);
     let systematic_packets = build_systematic_packets(&all_packets);
     assert!(
         !systematic_packets.is_empty(),
@@ -289,7 +292,7 @@ fn test_replication_component_cost_reporting() {
     let mut sender_generation_samples_ns = Vec::with_capacity(COMPONENT_RUNS);
     for _ in 0..COMPONENT_RUNS {
         let started = Instant::now();
-        let generated_packets = generate_all_packets();
+        let generated_packets = generate_all_packets(&cx);
         sender_generation_samples_ns.push(started.elapsed().as_nanos());
         assert!(
             !generated_packets.is_empty(),
