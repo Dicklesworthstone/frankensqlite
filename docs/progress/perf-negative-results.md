@@ -12,6 +12,60 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-05 - CERTIFICATION HOLD: swept bd-aoj0g journal improves C but fails the full main gate
+
+- Exact target: origin/main `08265d775a9a88df917b65e04c688c814fdde2bd`,
+  containing swept journal/completion 9f2222f9f and 29cbfaf20. No engine
+  edits in this certification. Owning files remain pager.rs and the existing
+  aoj0g_insert_profile.rs harness; concurrent mode stays on.
+- Direct trj release-perf comparison against 731304ee4, with the identical
+  HEAD harness overlaid on the baseline engine, five alternating rounds of
+  A-F at memory 1k/10k/50k and file 10k. All 40 measured runs and two warmups
+  execute all six cases and pass their integrity/read assertions. The old
+  1.55x/63,779 ns baseline citation was 10k rows while the partial's
+  1.12x/49,207 ns was 50k: the old baseline ignored AOJ0G_ROWS. Do not reuse
+  that mismatched-N comparison as a paired receipt.
+- Matched 50k C: median last batch 84,559 -> 47,338 ns; median per-run ramp
+  2.134x -> 1.245x; paired mean-INSERT ratio 0.632. This improves growth but
+  **misses the requested <=1.12x ramp bound**. The five HEAD ramps are
+  1.053/1.245/1.078/1.333/1.249. Columns are independently summarized medians.
+- No-regression gate also unmet: memory 1k B INSERT is slower in all five
+  pairs (median +8.9%); memory 50k C reads +9.1%; file 10k F INSERT +4.5%;
+  complete file-run wall time +2.2%, all paired medians. Host load exceeded
+  70 during round one; both arms have timing spikes. All results are retained.
+  These whole-HEAD comparisons do not isolate a journal-specific cause, and
+  noise is not assumed to explain away the observed regressions.
+- Runtime: pager savepoints 26/0 (including real failed/dropped commit
+  preparation + ROLLBACK TO), correctness_concurrent_writes 4/0,
+  mvcc_concurrent_writers 15/0, crash WAL replay 4/0, stock transaction oracle
+  6/0, core rewind/semantics 3/0 + 1/0. Stock sqlite3 physical integrity and
+  complete row/index checks pass for all 60 timing databases.
+- Remaining red oracle: after 512 indexed overflow rows and SAVEPOINT,
+  live integrity reports page 1671 unused before explicit rollback/commit.
+  Existing allocation ledger pins unissued private lease pages 1671-1674
+  below issued page 1677, omitted by the live integrity ownership view. The
+  actually rebuilt pre-journal control fails identically. Fix that private
+  ownership view without publishing those pages to the shared freelist or
+  weakening durable integrity. Large-oracle later branches remain unexecuted.
+- Workspace check/Clippy fail on six duplicate epoch.rs definitions;
+  Clippy also reports manual_is_multiple_of in the harness. Fmt passes with
+  existing core/pager/VDBE exclusions. Peer working-tree repairs are outside
+  this frozen proof. Neither commit_and_retain cancellation nor an injected
+  ROLLBACK TO restoration failure is separately runtime-certified here.
+- Evidence: trj `/data/tmp/aoj0g-main-cert-BPkJLm`; local
+  `/tmp/aoj0g-bluecedar-20260905/REPORT.md` and `certification-08265d775/`.
+  See timing-summary.md/json, timings.jsonl, stock-files.jsonl,
+  canon-crash-oracle.log, workspace-check/clippy logs, and provenance.txt.
+  Baseline binary SHA-256 7e7aa58f48575b873ad121a075a29dae2d1f3124ba06f0f8f0f1a6e9f92cc803;
+  HEAD bc8900e47b4e5e1267f5759bd513b227d6d9daca5c7157abaec07de4bd350027.
+- Decision/credit: BlueCedar refuses certification/closure and recommends
+  build-forward; the measured failures do not establish a structurally
+  unsalvageable rollback design. Fix the exact correctness/workspace blockers,
+  attribute residual/peripheral performance costs, then repeat the full gate.
+  No commit/push/revert by this certification lane; bd-2oh1t remains queued
+  behind accepted closure. Claude supplied the marching-order workload;
+  TanWren's separately reported epoch/lint repairs are peer work.
+
 ## 2026-09-05 - FOLLOW-UP STOP: bd-aoj0g allocation repair passes focused tests; overflow integrity oracle blocks acceptance
 
 - Target: journal-boundary savepoints for the same A-F indexed INSERT curve.
