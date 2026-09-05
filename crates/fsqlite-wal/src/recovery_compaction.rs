@@ -56,9 +56,11 @@ where
 {
     let k_required = records
         .first()
-        .and_then(|record| source_symbol_count(record.oti).ok())
-        .unwrap_or(0);
-    let k_required_u32 = u32::try_from(k_required).ok();
+        .and_then(|record| source_symbol_count(record.oti).ok());
+    // An unavailable flat-ESI count is not K=0: that would classify every
+    // source symbol as a repair when a block-aware fallback decoder succeeds.
+    let k_required_u32 = k_required.and_then(|count| u32::try_from(count).ok());
+    let k_required = k_required.unwrap_or(0);
 
     match reconstruct_systematic_happy_path(records) {
         Ok(_) => {

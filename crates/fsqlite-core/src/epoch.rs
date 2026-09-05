@@ -1058,8 +1058,14 @@ pub fn recover_root_pointer_from_scan(
 
     let mut best: Option<(ObjectId, RootManifest, bool)> = None;
     for (object_id, records) in grouped {
-        let Ok(payload) = reconstruct_payload_from_source_symbols(records) else {
-            continue;
+        let payload = match reconstruct_payload_from_source_symbols(records) {
+            Ok(payload) => payload,
+            // Unavailable decoding or memory cannot establish that a candidate
+            // is invalid. Skipping it could silently publish an older root.
+            Err(error @ (FrankenError::NotImplemented(_) | FrankenError::OutOfMemory)) => {
+                return Err(error);
+            }
+            Err(_) => continue,
         };
         let Ok(manifest) = RootManifest::decode(&payload) else {
             continue;
@@ -1361,6 +1367,20 @@ fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Re
         return Err(FrankenError::DatabaseCorrupt {
             detail: "symbol_size=0 in OTI".to_owned(),
         });
+    }
+    if first_oti.z == 0 || first_oti.n == 0 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "source_blocks=0 or sub_blocks=0 in OTI".to_owned(),
+        });
+    }
+    // Concatenation preserves object order only for one source block with one
+    // sub-block. RFC 6330 sub-blocks need deinterleaving; multiple source blocks
+    // additionally need a block identity that this bootstrap path does not carry.
+    if first_oti.z != 1 || first_oti.n != 1 {
+        return Err(FrankenError::NotImplemented(format!(
+            "native bootstrap OTI layout Z={} N={}; only Z=1 N=1 is supported",
+            first_oti.z, first_oti.n
+        )));
     }
 
     let source_symbols = first_oti.f.div_ceil(symbol_size_u64);
@@ -2560,6 +2580,102 @@ mod tests {
         assert_eq!(bootstrap_disk_snapshot(&layout), before);
     }
 
+    #[test]
+    fn test_native_bootstrap_rejects_unsupported_symbol_layouts_without_writes() {
+        let original: Vec<u8> = (0..16).collect();
+        // RFC 6330 N=2 source symbols interleave two contiguous sub-blocks.
+        let subblock_symbols = [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]];
+        assert_ne!(subblock_symbols.concat(), original);
+        for (z, n) in [(1, 2), (2, 1)] {
+            for target in ["schema", "candidate"] {
+                for root_state in ["signed", "missing", "torn"] {
+                    // A direct open need not inspect an unreferenced object.
+                    if target == "candidate" && root_state == "signed" {
+                        continue;
+                    }
+                    let (_tmp, layout) = create_layout();
+                    let key = test_master_key();
+                    let epoch = EpochId::new(7);
+                    let expected =
+                        write_authenticated_bootstrap_fixture(&layout, epoch, epoch, &key);
+                    let object_id = if target == "schema" {
+                        expected.manifest.schema_snapshot
+                    } else {
+                        // Keep a fully readable older manifest, schema and
+                        // checkpoint. Recovery must not skip this candidate and
+                        // publish that older root just because decoding is absent.
+                        make_object_id(0x74)
+                    };
+                    let path = layout.symbols_dir().join("segment-000001.log");
+                    let scan = scan_symbol_segment(&path).expect("fixture segment");
+                    let mut bytes = scan.header.encode().to_vec();
+                    for row in scan.records {
+                        if row.record.object_id != object_id {
+                            bytes.extend_from_slice(&row.record.to_bytes());
+                        }
+                    }
+                    let payloads = if n == 2 {
+                        subblock_symbols
+                    } else {
+                        [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]]
+                    };
+                    let epoch_key = derive_epoch_auth_key(&key, epoch);
+                    for (index, payload) in payloads.into_iter().enumerate() {
+                        let oti = Oti {
+                            f: 16,
+                            al: 4,
+                            t: 8,
+                            z,
+                            n,
+                        };
+                        // ESI is local to each source block. The current FSEC
+                        // envelope carries no separate block identity for Z=2.
+                        let esi = if z == 1 {
+                            u32::try_from(index).expect("two source symbols")
+                        } else {
+                            0
+                        };
+                        let record = SymbolRecord::new(
+                            object_id,
+                            oti,
+                            esi,
+                            payload.to_vec(),
+                            SymbolRecordFlags::empty(),
+                        )
+                        .with_auth_tag(epoch_key.as_bytes());
+                        assert!(record.verify_integrity());
+                        assert!(record.verify_auth(epoch_key.as_bytes()));
+                        bytes.extend_from_slice(&record.to_bytes());
+                    }
+                    fs::write(path, bytes).expect("write authenticated layout fixture");
+                    let root_bytes = expected.root_pointer.encode();
+                    match root_state {
+                        "signed" => fs::write(layout.root_path(), root_bytes).expect("root"),
+                        "missing" => {}
+                        "torn" => {
+                            fs::write(layout.root_path(), &root_bytes[..17]).expect("torn root")
+                        }
+                        _ => unreachable!(),
+                    }
+                    let before = bootstrap_disk_snapshot(&layout);
+                    let result = bootstrap_native_mode_with_recovery(&layout, true, Some(&key));
+                    let error =
+                        result.expect_err("unsupported layout must not produce object bytes");
+                    assert!(
+                        matches!(&error, FrankenError::NotImplemented(detail)
+                            if detail.contains(&format!("Z={z} N={n}"))),
+                        "target={target} root_state={root_state} error={error}"
+                    );
+                    assert_eq!(bootstrap_disk_snapshot(&layout), before);
+                    eprintln!(
+                        "bead_id=bd-3mgq5.4 case=unsupported_layout z={z} n={n} target={target} root_state={root_state} authenticated_symbols=2 naive_misordered={} result=unsupported disk_unchanged=true",
+                        n == 2
+                    );
+                }
+            }
+        }
+    }
+
     fn reconstruction_symbol(f: u64, t: u32, esi: u32, payload: &[u8]) -> SymbolRecord {
         SymbolRecord::new(
             make_object_id(0xA5),
@@ -2649,9 +2765,9 @@ mod tests {
         for esi in [0, 9] {
             for damage in ["oti", "payload_length", "object_id"] {
                 let source = reconstruction_symbol(2, 2, 0, &[1, 2]);
-                let bad = match damage {
+                let mut bad = match damage {
                     "oti" => reconstruction_symbol(3, 2, esi, &[1, 2]),
-                    "payload_length" => reconstruction_symbol(2, 2, esi, &[1]),
+                    "payload_length" => reconstruction_symbol(2, 2, esi, &[1, 2]),
                     "object_id" => SymbolRecord::new(
                         make_object_id(0xA6),
                         source.oti,
@@ -2665,6 +2781,14 @@ mod tests {
                     bad.verify_integrity(),
                     "fixture has a valid unkeyed checksum"
                 );
+                if damage == "payload_length" {
+                    // The public constructor and checksum verifier require an
+                    // exact payload length. Damage the valid in-memory record
+                    // afterwards to exercise reconstruction's own length guard.
+                    bad.symbol_data.truncate(1);
+                    assert_eq!(bad.symbol_data.len(), 1);
+                    assert_eq!(bad.oti.t, 2);
+                }
                 let error = reconstruct_payload_from_source_symbols(vec![source, bad])
                     .expect_err("all records must have consistent metadata before allocation");
                 let expected = match damage {
@@ -2703,11 +2827,22 @@ mod tests {
                 .expect("zero transfer length with valid metadata"),
             Vec::<u8>::new()
         );
-        let short =
-            reconstruct_payload_from_source_symbols(vec![reconstruction_symbol(0, 2, 0, &[1])])
-                .expect_err("zero transfer length does not bypass record validation");
+        let mut short_record = reconstruction_symbol(0, 2, 0, &[1, 2]);
+        assert!(short_record.verify_integrity());
+        short_record.symbol_data.truncate(1);
+        let short = reconstruct_payload_from_source_symbols(vec![short_record])
+            .expect_err("zero transfer length does not bypass record validation");
         assert!(matches!(&short, FrankenError::DatabaseCorrupt { detail }
             if detail.contains("symbol size does not match")));
+        for (z, n) in [(0, 1), (1, 0), (0, 0)] {
+            let mut zero_layout = reconstruction_symbol(0, 2, 0, &[1, 2]);
+            zero_layout.oti.z = z;
+            zero_layout.oti.n = n;
+            let error = reconstruct_payload_from_source_symbols(vec![zero_layout])
+                .expect_err("zero layout dimensions are malformed");
+            assert!(matches!(&error, FrankenError::DatabaseCorrupt { detail }
+                if detail.contains("source_blocks=0 or sub_blocks=0")));
+        }
     }
 
     #[test]

@@ -506,6 +506,10 @@ pub enum SystematicLayoutError {
     EmptySymbolSet,
     /// OTI uses `t = 0`, which is invalid.
     ZeroSymbolSize,
+    /// OTI source-block or sub-block count is zero.
+    InvalidBlockLayout { source_blocks: u32, sub_blocks: u32 },
+    /// Concatenation cannot decode multiple source blocks or sub-blocks.
+    UnsupportedBlockLayout { source_blocks: u32, sub_blocks: u32 },
     /// Source-symbol count cannot be represented on this platform.
     SourceSymbolCountTooLarge { source_symbols: u64 },
     /// Source-symbol count exceeds the `u32` ESI namespace.
@@ -550,6 +554,20 @@ impl fmt::Display for SystematicLayoutError {
         match self {
             Self::EmptySymbolSet => f.write_str("no symbol records provided"),
             Self::ZeroSymbolSize => f.write_str("OTI.t is zero"),
+            Self::InvalidBlockLayout {
+                source_blocks,
+                sub_blocks,
+            } => write!(
+                f,
+                "invalid OTI layout: source_blocks={source_blocks}, sub_blocks={sub_blocks}"
+            ),
+            Self::UnsupportedBlockLayout {
+                source_blocks,
+                sub_blocks,
+            } => write!(
+                f,
+                "systematic concatenation requires one source block and one sub-block: source_blocks={source_blocks}, sub_blocks={sub_blocks}"
+            ),
             Self::SourceSymbolCountTooLarge { source_symbols } => {
                 write!(
                     f,
@@ -638,6 +656,22 @@ impl fmt::Display for SystematicLayoutError {
 
 impl std::error::Error for SystematicLayoutError {}
 
+fn validate_systematic_block_layout(oti: Oti) -> Result<(), SystematicLayoutError> {
+    if oti.z == 0 || oti.n == 0 {
+        return Err(SystematicLayoutError::InvalidBlockLayout {
+            source_blocks: oti.z,
+            sub_blocks: oti.n,
+        });
+    }
+    if oti.z != 1 || oti.n != 1 {
+        return Err(SystematicLayoutError::UnsupportedBlockLayout {
+            source_blocks: oti.z,
+            sub_blocks: oti.n,
+        });
+    }
+    Ok(())
+}
+
 fn source_symbol_count_u64(oti: Oti) -> Result<u64, SystematicLayoutError> {
     if oti.t == 0 {
         return Err(SystematicLayoutError::ZeroSymbolSize);
@@ -681,8 +715,12 @@ fn validate_record_shape(
     Ok(())
 }
 
-/// Compute source-symbol count `K = ceil(F / T)` for the given [`Oti`].
+/// Compute `K = ceil(F / T)` for the single-block, single-sub-block layout.
+///
+/// Native systematic locators and concatenation use one flat ESI namespace.
+/// Other layouts require a block-aware decoder and must not enter these paths.
 pub fn source_symbol_count(oti: Oti) -> Result<usize, SystematicLayoutError> {
+    validate_systematic_block_layout(oti)?;
     let source_symbols = source_symbol_count_u64(oti)?;
     usize::try_from(source_symbols)
         .map_err(|_| SystematicLayoutError::SourceSymbolCountTooLarge { source_symbols })
@@ -691,6 +729,8 @@ pub fn source_symbol_count(oti: Oti) -> Result<usize, SystematicLayoutError> {
 /// Writer helper: normalize records into `ESI 0..K-1` contiguous layout.
 ///
 /// Guarantees:
+/// - Only one source block with one sub-block is admitted; more general layouts
+///   need block identities and sub-symbol deinterleaving, not concatenation.
 /// - Source symbols are first, in ascending ESI order (`0..K-1`).
 /// - Repair symbols (`ESI >= K`) follow the systematic run.
 /// - Only ESI 0 has [`SymbolRecordFlags::SYSTEMATIC_RUN_START`].
@@ -813,7 +853,8 @@ pub fn validate_systematic_run(records: &[SymbolRecord]) -> Result<usize, System
 
 /// Reconstruct payload bytes directly from contiguous systematic symbols.
 ///
-/// This is the GF(256)-free happy path.
+/// This is the GF(256)-free happy path for `OTI.z = OTI.n = 1`. Other layouts
+/// must use a decoder that supports their block and sub-block organization.
 pub fn reconstruct_systematic_happy_path(
     records: &[SymbolRecord],
 ) -> Result<Vec<u8>, SystematicLayoutError> {
@@ -1618,6 +1659,97 @@ mod tests {
             "fallback decode must not run on systematic happy path"
         );
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_systematic_path_rejects_subblock_reordering() {
+        let original: Vec<u8> = (0..16).collect();
+        let payloads = [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13, 14, 15]];
+        assert_ne!(payloads.concat(), original);
+        let oti = Oti {
+            f: 16,
+            al: 4,
+            t: 8,
+            z: 1,
+            n: 2,
+        };
+        let records: Vec<_> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                SymbolRecord::new(
+                    ObjectId::from_bytes([0x78; 16]),
+                    oti,
+                    u32::try_from(index).expect("two source symbols"),
+                    bytes.to_vec(),
+                    if index == 0 {
+                        SymbolRecordFlags::SYSTEMATIC_RUN_START
+                    } else {
+                        SymbolRecordFlags::empty()
+                    },
+                )
+            })
+            .collect();
+        assert!(records.iter().all(SymbolRecord::verify_integrity));
+        let result = reconstruct_systematic_happy_path(&records);
+        eprintln!(
+            "bead_id=bd-3mgq5.4 case=shared_systematic_subblocks n=2 result={result:?} expected={original:?}"
+        );
+        assert!(
+            result.is_err(),
+            "concatenation must not return reordered bytes as a successful object"
+        );
+        assert!(validate_systematic_run(&records).is_err());
+        assert!(layout_systematic_run(records.clone()).is_err());
+        let mut fallback_invocations = 0;
+        let result = recover_object_with_fallback(&records, |received| {
+            fallback_invocations += 1;
+            assert_eq!(received, records);
+            Err(SystematicLayoutError::EmptySymbolSet)
+        });
+        assert_eq!(fallback_invocations, 1);
+        assert_eq!(result, Err(SystematicLayoutError::EmptySymbolSet));
+    }
+
+    #[test]
+    fn test_systematic_layout_rejects_invalid_and_unsupported_dimensions() {
+        for transfer_length in [0, 16] {
+            for (source_blocks, sub_blocks) in [(0, 1), (1, 0), (0, 0), (2, 1), (1, 2)] {
+                let oti = Oti {
+                    f: transfer_length,
+                    al: 4,
+                    t: 8,
+                    z: source_blocks,
+                    n: sub_blocks,
+                };
+                let records = vec![SymbolRecord::new(
+                    ObjectId::from_bytes([0x79; 16]),
+                    oti,
+                    0,
+                    vec![0; 8],
+                    SymbolRecordFlags::SYSTEMATIC_RUN_START,
+                )];
+                assert!(records[0].verify_integrity());
+                let expected = if source_blocks == 0 || sub_blocks == 0 {
+                    SystematicLayoutError::InvalidBlockLayout {
+                        source_blocks,
+                        sub_blocks,
+                    }
+                } else {
+                    SystematicLayoutError::UnsupportedBlockLayout {
+                        source_blocks,
+                        sub_blocks,
+                    }
+                };
+                assert_eq!(source_symbol_count(oti), Err(expected.clone()));
+                assert_eq!(validate_systematic_run(&records), Err(expected.clone()));
+                assert_eq!(
+                    reconstruct_systematic_happy_path(&records),
+                    Err(expected.clone())
+                );
+                assert_eq!(layout_systematic_run(records), Err(expected));
+            }
+        }
     }
 
     #[test]
