@@ -48,6 +48,11 @@ asupersync = { workspace = true }
 # entry points through `asupersync::test_utils::run_test`, which lives behind
 # `test-internals`. The runtime the binary itself builds in `main` is unchanged.
 asupersync = { workspace = true, features = ["test-internals"] }
+# Stock oracle for the `.mode quote` REAL differential (bd-7p5z3): the shell's
+# quote mode is `sqlite3_snprintf("%!.20g")`, so the bundled library's
+# `printf('%!.20g', x)` is byte-for-byte what a `sqlite3` shell of the same
+# version prints.
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

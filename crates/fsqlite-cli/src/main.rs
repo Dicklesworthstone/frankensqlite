@@ -23,6 +23,7 @@ use fsqlite_core::decode_proofs::{
     DECODE_PROOF_SCHEMA_VERSION_V1, DEFAULT_DECODE_PROOF_POLICY_ID, DEFAULT_DECODE_PROOF_SLACK,
     DecodeProofVerificationConfig, EcsDecodeProof, RejectedSymbol, SymbolDigest,
 };
+use fsqlite_types::value::format_sqlite_float_g;
 use serde::Deserialize;
 
 const DEFAULT_DB_PATH: &str = ":memory:";
@@ -1153,12 +1154,18 @@ fn render_display_value(value: &SqliteValue) -> String {
     }
 }
 
+/// `sqlite3 .mode quote` renders REAL columns with `sqlite3_snprintf("%!.20g")`
+/// (shell.c, `MODE_Quote`): the full 18-19 significant digits of the exact
+/// double, decimal point kept, so an INSERT built from the output reproduces
+/// the stored value bit for bit.
+const QUOTE_MODE_REAL_PRECISION: usize = 20;
+
 /// `.mode quote` value rendering. Matches sqlite3's SQL-literal output, which
-/// differs from [`render_display_value`] only in blob hex casing: sqlite3
-/// lowercases (`X'0aff'`) so oracle byte-diff tooling compares cleanly. Reals
-/// are left shortest-round-trip for now; sqlite3's `%!.20g` 20-significant-digit
-/// expansion (e.g. `0.1` -> `0.100000000000000005`) needs a dedicated float
-/// decoder and is tracked separately on bd-7p5z3.
+/// differs from [`render_display_value`] in two ways: blob hex is lowercase
+/// (`X'0aff'`) and reals carry sqlite3's `%!.20g` expansion (`0.1` ->
+/// `0.1000000000000000056`, `1e300` -> `1.000000000000000052e+300`) instead of
+/// the 17-digit REAL-to-TEXT form, so oracle byte-diff tooling compares
+/// cleanly (bd-7p5z3).
 fn render_quote_value(value: &SqliteValue) -> String {
     match value {
         SqliteValue::Blob(bytes) => {
@@ -1169,6 +1176,7 @@ fn render_quote_value(value: &SqliteValue) -> String {
             rendered.push('\'');
             rendered
         }
+        SqliteValue::Float(real) => format_sqlite_float_g(*real, QUOTE_MODE_REAL_PRECISION),
         _ => render_display_value(value),
     }
 }
@@ -3122,6 +3130,204 @@ SELECT x'0aff' AS b;\n\
                 !stdout.contains("X'0AFF'"),
                 "quote mode must not emit uppercase blob hex, got: {stdout}",
             );
+        });
+    }
+
+    /// bd-7p5z3(b): SQL expressions the `.mode quote` REAL keepers render, one
+    /// `SELECT` (one output line) each. The flag marks values whose `%!.20g`
+    /// text is identical across SQLite's float-to-text rewrites (3.45 Dekker
+    /// double-double, 3.51 widened landing zone, 3.53 exact `Fp2Convert10`):
+    /// short exact binary fractions, integer-valued reals, exponent-form
+    /// powers of ten, infinities. Everything else is byte-exact only against
+    /// a 3.53+ shell.
+    const QUOTE_MODE_REAL_CORPUS: &[(&str, bool)] = &[
+        ("0.1", false),
+        ("-0.1", false),
+        ("3.14159", false),
+        ("0.1 + 0.2", false),
+        ("2.0 / 3.0", false),
+        ("0.9999999999999999", false),
+        ("1.0", true),
+        ("100.0", true),
+        ("-2.5", true),
+        ("0.5", true),
+        ("1.25", true),
+        ("0.0", true),
+        ("-0.0", true),
+        ("1.5e10", true),
+        ("123456789012345678.0", true),
+        ("1e15", true),
+        ("1e19", true),
+        ("1e20", true),
+        ("1e21", true),
+        ("0.0001", false),
+        ("0.00001", false),
+        ("1e-7", false),
+        ("1e300", false),
+        ("-1e-300", false),
+        ("5e-324", false),
+        ("2.2250738585072014e-308", false),
+        ("1.7976931348623157e308", false),
+        ("49.47", false),
+        ("1e999", true),
+        ("-1e999", true),
+        ("1.5, 'x', NULL, x'0aff', 7", true),
+    ];
+
+    fn quote_mode_script() -> Vec<u8> {
+        let mut script = String::from(".mode quote\n");
+        for (expr, _) in QUOTE_MODE_REAL_CORPUS {
+            script.push_str("SELECT ");
+            script.push_str(expr);
+            script.push_str(";\n");
+        }
+        script.into_bytes()
+    }
+
+    /// Runs the quote-mode corpus through the fsqlite shell (batch mode, so
+    /// stdout carries only result rows) and returns one line per `SELECT`.
+    async fn fsqlite_quote_mode_lines() -> Vec<String> {
+        let mut input = Cursor::new(quote_mode_script());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+        let exit_code =
+            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                .await;
+        assert_eq!(exit_code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        let lines: Vec<String> = stdout.lines().map(str::to_owned).collect();
+        assert_eq!(
+            lines.len(),
+            QUOTE_MODE_REAL_CORPUS.len(),
+            "one quote-mode line per SELECT, got: {stdout}"
+        );
+        lines
+    }
+
+    /// bd-7p5z3(b): `.mode quote` REAL rendering is sqlite3's `%!.20g`
+    /// (shell.c `MODE_Quote`), differential against the bundled stock library
+    /// (rusqlite, the workspace conformance oracle) evaluating the same
+    /// `printf('%!.20g', <expr>)` the shell calls — byte for byte, every entry.
+    #[test]
+    fn test_mode_quote_reals_match_stock_printf_20g_bd_7p5z3() {
+        asupersync::test_utils::run_test(|| async {
+            let lines = fsqlite_quote_mode_lines().await;
+
+            let oracle = rusqlite::Connection::open_in_memory().expect("stock in-memory oracle");
+            for ((expr, _), line) in QUOTE_MODE_REAL_CORPUS.iter().zip(&lines) {
+                // The mixed row exercises the non-REAL branches; stock renders
+                // it as one quote-mode line too, so compare the shell shape.
+                let expected: String = if expr.contains(',') {
+                    "1.5,'x',NULL,X'0aff',7".to_owned()
+                } else {
+                    oracle
+                        .query_row(&format!("SELECT printf('%!.20g', {expr})"), [], |row| {
+                            row.get(0)
+                        })
+                        .expect("stock printf('%!.20g')")
+                };
+                assert_eq!(line, &expected, "`.mode quote` rendering of SELECT {expr}");
+            }
+
+            // Discriminator: the pre-fix renderer reused the 17-digit
+            // REAL-to-TEXT form (`0.1`); stock's quote mode spells out the
+            // stored double (`0.1000000000000000056`) so the text round-trips.
+            assert_ne!(
+                lines[0], "0.1",
+                "quote mode must not reuse the 17-digit display form"
+            );
+            assert!(
+                lines[0].starts_with("0.100000000000000005"),
+                "expected stock's full-precision 0.1, got {}",
+                lines[0]
+            );
+        });
+    }
+
+    /// bd-7p5z3(b): the same corpus through the system `sqlite3` shell itself.
+    /// Byte-exact for every entry when that shell is 3.53+ (the exact
+    /// `Fp2Convert10` decode fsqlite ports); older shells differ in the last
+    /// digits of long expansions, so only the version-stable entries are
+    /// compared there and the skipped ones are named on stderr. Skips with a
+    /// message when no `sqlite3` binary is on PATH.
+    #[test]
+    fn test_mode_quote_matches_system_sqlite3_shell_bd_7p5z3() {
+        let Ok(version_output) = std::process::Command::new("sqlite3")
+            .arg("--version")
+            .output()
+        else {
+            eprintln!("SKIP: no `sqlite3` binary on PATH; stock shell differential not run");
+            return;
+        };
+        if !version_output.status.success() {
+            eprintln!("SKIP: `sqlite3 --version` failed; stock shell differential not run");
+            return;
+        }
+        let version_text = String::from_utf8_lossy(&version_output.stdout)
+            .trim()
+            .to_owned();
+        let mut version_parts = version_text
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        let major = version_parts.next().unwrap_or(0);
+        let minor = version_parts.next().unwrap_or(0);
+        let exact_float_decode = (major, minor) >= (3, 53);
+
+        let mut child = std::process::Command::new("sqlite3")
+            .arg(":memory:")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sqlite3");
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("sqlite3 stdin");
+            stdin
+                .write_all(&quote_mode_script())
+                .expect("write script to sqlite3");
+        }
+        let stock = child.wait_with_output().expect("sqlite3 output");
+        assert!(
+            stock.status.success(),
+            "sqlite3 failed: {}",
+            String::from_utf8_lossy(&stock.stderr)
+        );
+        let stock_lines: Vec<String> = String::from_utf8_lossy(&stock.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            stock_lines.len(),
+            QUOTE_MODE_REAL_CORPUS.len(),
+            "sqlite3 {version_text} printed an unexpected number of quote-mode lines"
+        );
+
+        asupersync::test_utils::run_test(|| async {
+            let fsqlite_lines = fsqlite_quote_mode_lines().await;
+            for (((expr, stable), stock_line), fsqlite_line) in QUOTE_MODE_REAL_CORPUS
+                .iter()
+                .zip(&stock_lines)
+                .zip(&fsqlite_lines)
+            {
+                if exact_float_decode || *stable {
+                    assert_eq!(
+                        fsqlite_line, stock_line,
+                        "`.mode quote` SELECT {expr}: fsqlite vs sqlite3 {version_text}"
+                    );
+                } else {
+                    eprintln!(
+                        "NOTE: sqlite3 {version_text} predates the 3.53 float decode; \
+                         SELECT {expr} is compared against the bundled oracle only \
+                         (shell printed {stock_line}, fsqlite {fsqlite_line})"
+                    );
+                }
+            }
         });
     }
 

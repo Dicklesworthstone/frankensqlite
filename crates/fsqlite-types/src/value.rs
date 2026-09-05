@@ -2147,14 +2147,32 @@ pub fn int_float_cmp(i: i64, r: f64) -> Ordering {
     }
 }
 
-/// Format a floating-point value as text matching SQLite's `%!.*g` behavior.
+/// Format a floating-point value as text matching SQLite's `%!.17g` behavior.
 ///
-/// SQLite 3.52 and newer default REAL-to-TEXT conversion to 17 significant
+/// SQLite 3.53 and newer default REAL-to-TEXT conversion to 17 significant
 /// digits through `sqlite3VdbeMemStringify()`. The `!` flag keeps a decimal
 /// point so REAL text stays distinct from INTEGER text, for example `120.0`
 /// rather than `120`.
 #[must_use]
 pub fn format_sqlite_float(f: f64) -> String {
+    format_sqlite_float_g(f, SQLITE_FLOAT_SIGNIFICANT_DIGITS)
+}
+
+/// Format a floating-point value exactly as SQLite's `%!.<precision>g` does.
+///
+/// This is a port of `sqlite3FpDecode()` (util.c) feeding the `etGENERIC`
+/// branch of `sqlite3_str_vappendf()` (printf.c) for SQLite 3.53+: the exact
+/// base-2 to base-10 decode yields 18-19 significant digits, which are rounded
+/// to `precision` only when `precision` is smaller than that; trailing zeros are
+/// stripped and the `!` flag keeps a decimal point (`1.0`, `1.0e+21`). The
+/// `precision == 17` path additionally applies stock's round-trip shortening
+/// (`49.47`, not `49.469999999999999`). `precision == 20` is what the `sqlite3`
+/// shell's `.mode quote` emits for REAL columns: `0.1` renders as
+/// `0.1000000000000000056`, `1e300` as `1.000000000000000052e+300`.
+///
+/// `precision` is clamped to at least 1 like stock's `%g`.
+#[must_use]
+pub fn format_sqlite_float_g(f: f64, precision: usize) -> String {
     if f.is_nan() {
         return "NaN".to_owned();
     }
@@ -2165,12 +2183,17 @@ pub fn format_sqlite_float(f: f64) -> String {
             "-Inf".to_owned()
         };
     }
-    render_sqlite_float_decode(&sqlite_float_decode(f))
+    let precision = precision.max(1);
+    let generic_precision = i32::try_from(precision - 1).unwrap_or(i32::MAX);
+    render_sqlite_float_decode(&sqlite_float_decode(f, precision), generic_precision)
 }
 
 const SQLITE_FLOAT_SIGNIFICANT_DIGITS: usize = 17;
-const SQLITE_FLOAT_MAX_ROUND_DIGITS: usize = 20;
-const SQLITE_FLOAT_GENERIC_PRECISION: i32 = 16;
+const SQLITE_FLOAT_MAX_ROUND_DIGITS: usize = 26;
+/// `sqlite3Fp2Convert10()` produces at most this many significant digits;
+/// `sqlite3FpDecode()` asks for `iRound + 1` below it and the full 18 at or
+/// above it.
+const SQLITE_FP2_CONVERT_MAX_DIGITS: usize = 18;
 const SQLITE_POWERS_OF_TEN_FIRST: i32 = -348;
 const SQLITE_POWERS_OF_TEN_LAST: i32 = 347;
 
@@ -2181,21 +2204,28 @@ struct SqliteFloatDecode {
     negative: bool,
 }
 
-fn render_sqlite_float_decode(decoded: &SqliteFloatDecode) -> String {
+/// Render a decoded float with `%g` shaping: `generic_precision` is the
+/// requested precision minus one (the number of digits `%g` keeps after the
+/// leading one), which also bounds the exponent range rendered in fixed form.
+fn render_sqlite_float_decode(decoded: &SqliteFloatDecode, generic_precision: i32) -> String {
     let exponent = decoded.decimal_point - 1;
-    if !(-4..=SQLITE_FLOAT_GENERIC_PRECISION).contains(&exponent) {
-        return render_sqlite_float_exponential(decoded, exponent);
+    if !(-4..=generic_precision).contains(&exponent) {
+        return render_sqlite_float_exponential(decoded, exponent, generic_precision);
     }
-    render_sqlite_float_fixed(decoded, exponent)
+    render_sqlite_float_fixed(decoded, exponent, generic_precision)
 }
 
-fn render_sqlite_float_fixed(decoded: &SqliteFloatDecode, exponent: i32) -> String {
+fn render_sqlite_float_fixed(
+    decoded: &SqliteFloatDecode,
+    exponent: i32,
+    generic_precision: i32,
+) -> String {
     let mut out = String::with_capacity(decoded.digits.len() + 8);
     if decoded.negative {
         out.push('-');
     }
 
-    let mut precision = SQLITE_FLOAT_GENERIC_PRECISION - exponent;
+    let mut precision = generic_precision - exponent;
     let mut digit_idx = 0usize;
     let mut e2 = decoded.decimal_point - 1;
 
@@ -2235,7 +2265,11 @@ fn render_sqlite_float_fixed(decoded: &SqliteFloatDecode, exponent: i32) -> Stri
     out
 }
 
-fn render_sqlite_float_exponential(decoded: &SqliteFloatDecode, exponent: i32) -> String {
+fn render_sqlite_float_exponential(
+    decoded: &SqliteFloatDecode,
+    exponent: i32,
+    generic_precision: i32,
+) -> String {
     let mut out = String::with_capacity(decoded.digits.len() + 8);
     if decoded.negative {
         out.push('-');
@@ -2244,8 +2278,8 @@ fn render_sqlite_float_exponential(decoded: &SqliteFloatDecode, exponent: i32) -
     let first = decoded.digits.first().copied().unwrap_or(b'0');
     out.push(char::from(first));
     out.push('.');
-    let digits_after_decimal =
-        (decoded.digits.len().saturating_sub(1)).min(SQLITE_FLOAT_GENERIC_PRECISION as usize);
+    let digits_after_decimal = (decoded.digits.len().saturating_sub(1))
+        .min(usize::try_from(generic_precision).unwrap_or(0));
     for &digit in decoded.digits.iter().skip(1).take(digits_after_decimal) {
         out.push(char::from(digit));
     }
@@ -2319,7 +2353,10 @@ pub fn sqlite_float_altform2_digits(f: f64) -> (Vec<u8>, i32) {
     (digits, exponent)
 }
 
-fn sqlite_float_decode(f: f64) -> SqliteFloatDecode {
+/// `sqlite3FpDecode(p, f, iRound = significant_digits, mxRound = 26)`: the
+/// exact decimal expansion of `f`, rounded to `significant_digits` significant
+/// digits when the decode carries more than that, trailing zeros stripped.
+fn sqlite_float_decode(f: f64, significant_digits: usize) -> SqliteFloatDecode {
     let negative = f < 0.0;
     let r = if negative { -f } else { f };
     if r == 0.0 {
@@ -2342,13 +2379,25 @@ fn sqlite_float_decode(f: f64) -> SqliteFloatDecode {
         raw_exponent - 1086
     };
 
-    let (decimal, decimal_exponent) = sqlite_fp2_convert10(mantissa, binary_exponent, 18);
+    // Stock asks the converter for one digit past the rounding point, capped
+    // at the 18 it can produce; the cap is where 18-19 digits come from.
+    let convert_digits = if significant_digits >= SQLITE_FP2_CONVERT_MAX_DIGITS {
+        SQLITE_FP2_CONVERT_MAX_DIGITS
+    } else {
+        significant_digits + 1
+    };
+    let (decimal, decimal_exponent) = sqlite_fp2_convert10(
+        mantissa,
+        binary_exponent,
+        i32::try_from(convert_digits).expect("convert_digits is at most 18"),
+    );
     let mut digits = decimal.to_string().into_bytes();
     let mut digit_count = digits.len();
     let mut decimal_point = digit_count as i32 + decimal_exponent;
-    let mut round_at = SQLITE_FLOAT_SIGNIFICANT_DIGITS;
+    let mut round_at = significant_digits;
 
     if round_at < digit_count || digit_count > SQLITE_FLOAT_MAX_ROUND_DIGITS {
+        round_at = round_at.min(SQLITE_FLOAT_MAX_ROUND_DIGITS);
         if round_at == SQLITE_FLOAT_SIGNIFICANT_DIGITS {
             round_at = sqlite_adjust_17_digit_rounding(
                 r,
@@ -4329,6 +4378,118 @@ mod tests {
             format_sqlite_float(9.223_372_036_854_776e18),
             "9.2233720368547758e+18"
         );
+    }
+
+    /// bd-7p5z3(b): `%!.20g` is what the sqlite3 shell's `.mode quote` emits
+    /// for REAL columns. Every expected string below was produced by
+    /// `SELECT printf('%!.20g', ?)` on the bundled SQLite 3.53.2 (the
+    /// workspace rusqlite oracle) — NOT by a C-library `%.20g`, which would
+    /// print `0.10000000000000000555`.
+    #[test]
+    fn test_format_sqlite_float_g_20_matches_stock_quote_mode_bd_7p5z3() {
+        let oracle: [(f64, &str); 26] = [
+            (0.1, "0.1000000000000000056"),
+            (-0.1, "-0.1000000000000000056"),
+            (3.14159, "3.14158999999999988"),
+            (0.1 + 0.2, "0.300000000000000044"),
+            (2.0 / 3.0, "0.66666666666666663"),
+            (0.999_999_999_999_999_9, "0.999999999999999889"),
+            (1.0, "1.0"),
+            (100.0, "100.0"),
+            (-2.5, "-2.5"),
+            (0.5, "0.5"),
+            (1.25, "1.25"),
+            (0.0, "0.0"),
+            (-0.0, "0.0"),
+            (1.5e10, "15000000000.0"),
+            (123_456_789_012_345_678.0, "123456789012345680.0"),
+            (12_345_678_901_234_567_890.0, "12345678901234567170.0"),
+            (1e15, "1000000000000000.0"),
+            (1e19, "10000000000000000000.0"),
+            (1e20, "1.0e+20"),
+            (1e21, "1.0e+21"),
+            (0.0001, "0.0001000000000000000048"),
+            (0.000_01, "1.000000000000000082e-05"),
+            (1e-7, "9.99999999999999955e-08"),
+            (1e300, "1.000000000000000052e+300"),
+            (-1e-300, "-1.000000000000000025e-300"),
+            (5e-324, "4.94065645841246544e-324"),
+        ];
+        for (value, expected) in oracle {
+            assert_eq!(
+                format_sqlite_float_g(value, 20),
+                expected,
+                "format_sqlite_float_g({value:e}, 20)"
+            );
+        }
+        assert_eq!(
+            format_sqlite_float_g(2.225_073_858_507_201_4e-308, 20),
+            "2.22507385850720138e-308"
+        );
+        assert_eq!(
+            format_sqlite_float_g(1.797_693_134_862_315_7e308, 20),
+            "1.797693134862315708e+308"
+        );
+        assert_eq!(format_sqlite_float_g(f64::INFINITY, 20), "Inf");
+        assert_eq!(format_sqlite_float_g(f64::NEG_INFINITY, 20), "-Inf");
+        assert_eq!(format_sqlite_float_g(f64::NAN, 20), "NaN");
+    }
+
+    /// `format_sqlite_float_g` rounds when the requested precision is below
+    /// the 18-19 digits the exact decode carries, and carries into a new
+    /// leading digit like stock (`%!.5g` of `99999.5` is `1.0e+05`). Oracle:
+    /// bundled SQLite 3.53.2 `printf`.
+    #[test]
+    fn test_format_sqlite_float_g_lower_precisions_round_like_stock() {
+        assert_eq!(format_sqlite_float_g(0.1, 15), "0.1");
+        assert_eq!(format_sqlite_float_g(0.1 + 0.2, 15), "0.3");
+        assert_eq!(format_sqlite_float_g(1e300, 15), "1.0e+300");
+        assert_eq!(format_sqlite_float_g(0.999_999_999_999_999_9, 15), "1.0");
+        assert_eq!(
+            format_sqlite_float_g(123_456_789.123_456_79, 15),
+            "123456789.123457"
+        );
+        assert_eq!(format_sqlite_float_g(0.1, 5), "0.1");
+        assert_eq!(format_sqlite_float_g(99_999.5, 5), "1.0e+05");
+        assert_eq!(format_sqlite_float_g(0.000_012_345_678, 5), "1.2346e-05");
+        assert_eq!(format_sqlite_float_g(123_456.0, 5), "1.2346e+05");
+        assert_eq!(format_sqlite_float_g(1e20, 5), "1.0e+20");
+        assert_eq!(format_sqlite_float_g(9.6, 1), "1.0e+01");
+        assert_eq!(format_sqlite_float_g(0.96, 1), "1.0");
+        assert_eq!(format_sqlite_float_g(2.5, 1), "3.0");
+        assert_eq!(format_sqlite_float_g(3.5, 1), "4.0");
+        // `%!.0g` is `%!.1g` in stock.
+        assert_eq!(format_sqlite_float_g(2.5, 0), "3.0");
+    }
+
+    /// The default REAL-to-TEXT path is the `precision == 17` instance of the
+    /// generalized formatter, byte for byte.
+    #[test]
+    fn test_format_sqlite_float_is_the_17_digit_instance() {
+        for value in [
+            0.1,
+            0.1 + 0.2,
+            1.0 / 3.0,
+            49.47,
+            1.5e16,
+            1e17,
+            123_456_789_012_345.6,
+            1.0e308,
+            1.0e-308,
+            5e-324,
+            9.223_372_036_854_776e18,
+            -0.0,
+            0.0,
+            -2.5,
+        ] {
+            assert_eq!(
+                format_sqlite_float(value),
+                format_sqlite_float_g(value, 17),
+                "value {value:e}"
+            );
+        }
+        assert_eq!(format_sqlite_float_g(49.47, 17), "49.47");
+        assert_eq!(format_sqlite_float_g(1e17, 17), "1.0e+17");
     }
 
     #[test]

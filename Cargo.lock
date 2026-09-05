@@ -1125,6 +1125,7 @@ dependencies = [
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
