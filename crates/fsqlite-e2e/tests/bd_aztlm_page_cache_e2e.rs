@@ -1398,6 +1398,7 @@ fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn q16_cache_budget_rollback_restores_header_not_runtime() {
     asupersync::test_utils::run_test(|| async {
         let run = CacheBudgetRun::new("q16_cache_budget_rollback_restores_header_not_runtime");
@@ -1433,6 +1434,7 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
             let default_query = format!("PRAGMA {schema}.default_cache_size");
             let original_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
             conn.execute("PRAGMA main.cache_size=8").await.unwrap();
+            oracle.execute_batch("PRAGMA main.cache_size=8").unwrap();
             let setup = format!("PRAGMA {schema}.cache_size=8");
             conn.execute(&setup).await.unwrap();
             oracle.execute_batch(&setup).unwrap();
@@ -1475,6 +1477,45 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
                 &conn,
                 if schema == "main" { 32 } else { 8 },
             );
+            if schema == "aux" {
+                conn.execute("PRAGMA query_only=ON").await.unwrap();
+                oracle.execute_batch("PRAGMA query_only=ON").unwrap();
+                let denied_setter = "PRAGMA aux.default_cache_size=16";
+                let stock_error = oracle.execute_batch(denied_setter).unwrap_err();
+                let actual_error = conn.execute(denied_setter).await.unwrap_err();
+                run.record(
+                    "attached_default_readonly_after_rollback",
+                    &conn,
+                    json!({
+                        "stock_error": stock_error.to_string(),
+                        "actual_error": actual_error.to_string(),
+                    }),
+                );
+                assert_eq!(
+                    stock_error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ReadOnly)
+                );
+                assert!(matches!(
+                    actual_error,
+                    fsqlite_error::FrankenError::ReadOnly
+                ));
+                for (query, expected_value) in [
+                    ("PRAGMA aux.cache_size", 16),
+                    ("PRAGMA aux.default_cache_size", original_default),
+                    ("PRAGMA main.cache_size", 8),
+                ] {
+                    let stock_value: i64 = oracle.query_row(query, [], |r| r.get(0)).unwrap();
+                    assert_eq!(stock_value, expected_value, "{query}");
+                    assert_eq!(cache_budget_integer(&conn, query).await, stock_value);
+                }
+                cache_budget_assert_rows(
+                    &conn,
+                    "SELECT id, payload FROM aux.cache_budget ORDER BY id",
+                    &expected,
+                )
+                .await;
+                run.assert_quiescent_budget("attached_readonly_main_budget_unchanged", &conn, 8);
+            }
             conn.close().await.unwrap();
             oracle.close().unwrap();
             let reopened = rusqlite::Connection::open(&affected_path).unwrap();
