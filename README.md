@@ -306,13 +306,13 @@ commit path is lock-free or always parallel.
 ### The Snapshot Read Path
 
 ```
-read(page 47, snapshot TxnId=41)
+read(page 47, snapshot.high = CommitSeq(41))
   │
   ├──▶ Buffer pool hit? → Return cached version visible to snapshot
   │
   ├──▶ WAL index lookup? → Read frame, cache it, return
   │
-  └──▶ Database file → Read page (implicit TxnId::ZERO), return
+  └──▶ Database file → Read eligible durable base page, return
 ```
 
 Readers do not acquire writer page locks for ordinary snapshot reads. Their
@@ -449,8 +449,8 @@ structured pages.
 
 Old page versions are reclaimed when no active transaction can see them:
 
-- **GC horizon** = `min(active_snapshot_ids)` across all open transactions. The live horizon is derived from the process-local `ConcurrentRegistry`; a cross-process shared-memory horizon is Native/partial design, not current behavior
-- A version is reclaimable if a newer committed version of the same page also falls below the horizon
+- **GC horizon** = `min(protected snapshot.high)` in `CommitSeq` order. The live horizon is derived from the process-local `ConcurrentRegistry`; a cross-process shared-memory horizon is Native/partial design, not current behavior
+- Retain all committed versions above the horizon and the newest version of each page at or below it. Older versions may be logically pruned; physical reuse additionally waits for reader-guard safety
 - **Epoch-based reclamation (EBR)** batches retired version slots behind a global epoch counter and active reader pins
 - Commit-time version maintenance prunes unreachable versions, and retired slots are batch-freed once all pinned readers have advanced past the retire epoch
 - During WAL checkpointing, reclaimable frames are copied back to the main database file
@@ -741,11 +741,16 @@ Types 8 and 9 are an optimization: booleans and small constants consume zero byt
 
 | Mode | Behavior |
 |------|----------|
-| DEFERRED (default) | No locks acquired until the first read or write |
-| IMMEDIATE | Acquires RESERVED lock at BEGIN; other writers get SQLITE_BUSY |
-| EXCLUSIVE | Acquires EXCLUSIVE lock at BEGIN; other readers and writers get SQLITE_BUSY |
+| Plain `BEGIN` (default) | Promotes to `BEGIN CONCURRENT`; writers may overlap on disjoint pages |
+| `BEGIN CONCURRENT` | Explicit concurrent mode, with snapshot and commit-time conflict validation |
+| Explicit `BEGIN DEFERRED` | Opts into deferred serialized-writer admission; may fail when upgrading to a writer |
+| Explicit `BEGIN IMMEDIATE` | Requests serialized-writer admission at BEGIN; conflicting admission can return `SQLITE_BUSY` |
+| Explicit `BEGIN EXCLUSIVE` | Requests exclusive transaction mode; reader exclusion depends on the journal/VFS path |
 
-In MVCC mode, DEFERRED and IMMEDIATE behave identically from a correctness perspective because snapshot isolation provides consistency. EXCLUSIVE is still useful for bulk operations that want to guarantee no concurrent access.
+`PRAGMA fsqlite.concurrent_mode = OFF` explicitly changes the policy for plain
+`BEGIN`. It is ON by default. Explicit modes have different admission and
+snapshot behavior; EXCLUSIVE is not a universal guarantee of reader exclusion
+in WAL mode.
 
 ### Savepoints
 
@@ -1699,7 +1704,7 @@ The design below extends MVCC coordination across OS processes via a shared-memo
 │   version: u32 (1)                  │
 │   next_txn_id: AtomicU64            │  ← global TxnId counter
 │   commit_seq: AtomicU64             │  ← global commit sequence
-│   gc_horizon: AtomicU64             │  ← min active TxnId across processes
+│   gc_horizon: AtomicU64             │  ← min protected snapshot.high (CommitSeq)
 │   checksum: u64 (xxhash3)           │
 ├─────────────────────────────────────┤
 │ TxnSlot Array (256 slots default)   │  ← one slot per active transaction
@@ -1902,9 +1907,10 @@ Encoding:
     Repair symbols:  generated on demand, unlimited quantity
     Each repair symbol = GF(256) linear combination of intermediate symbols
 
-Decoding probability from RFC 6330, stated in terms of the extended source
-block size K':
-    With K' received symbols:            failure is about 1%
+Decoder failure bounds from RFC 6330 §5.8, for its compliant decoder and
+independently, uniformly sampled encoding-symbol identifiers (ESIs), stated
+in terms of extended source block size K':
+    With K' received symbols:            failure is at most 10⁻²
     With K'+1 received symbols:          failure is at most 10⁻⁴
     With K'+2 received symbols:          failure is at most 10⁻⁶
 
@@ -1913,7 +1919,12 @@ durability claim. Storage-loss correlation, metadata, implementation defects,
 and the symbol-selection policy require separate analysis.
 ```
 
-**Intuition:** Think of it as a mathematical hologram. Every repair symbol encodes information about *all* source symbols. Lose any subset of symbols and the remaining ones contain enough information to reconstruct the whole. This is fundamentally different from replication, where losing the one copy of page 47 means page 47 is gone.
+Repair symbols supply additional equations over intermediate symbols. Recovery
+requires enough independent equations: neither every repair symbol nor every
+subset of K received symbols guarantees recovery. A deficient system needs more
+verified symbols or an explicit decode failure. The sampling-dependent bounds
+above are specified by [RFC 6330 §5.8](https://www.rfc-editor.org/rfc/rfc6330.html#section-5.8);
+they are not measured loss probabilities for FrankenSQLite's fixed test schedules.
 
 An end-to-end durability bound would additionally need a validated failure
 model, correlation assumptions, object-size policy, symbol placement and
@@ -1935,9 +1946,10 @@ Step 1 — Constraint matrix A (L × L, where L = K' + S + H):
 
 Step 2 — Solve A × C = D for intermediate symbols C (Gaussian elimination)
 
-Step 3 — Generate any encoding symbol X:
-    if X < K': return source symbol C'[X]        (systematic: original data)
-    else:      return LTEnc(K', C, X)            (repair symbol: GF(256) linear combo)
+Step 3 — Generate an encoding symbol with ESI e:
+    if e < K: return source symbol C'[e]        (systematic: original data)
+    else:     return LTEnc(K', C, e + K' - K)   (map repair ESI to internal ISI)
+    ISIs K..K'-1 are local padding, not additional transmitted source data.
 ```
 
 **Decoding is a two-phase process:**
@@ -2112,7 +2124,7 @@ Betting martingale update rule:
 |-----------|-----------|----------------------|
 | E₁ | INV-1: Monotonic TxnIds | `AtomicU64` counter went backward (hardware fault?) |
 | E₂ | INV-2: Lock exclusivity | Two transactions hold the same page lock (concurrency bug) |
-| E₃ | INV-3: Version chain order | Newer version has lower TxnId (corruption or logic error) |
+| E₃ | INV-3: Version chain order | Committed versions violate descending CommitSeq order |
 | E₄ | INV-4: Write set consistency | Transaction wrote a page it doesn't hold a lock on |
 | E₅ | INV-5: Snapshot stability | Snapshot mutated after creation (memory corruption) |
 | E₆ | INV-6: Commit atomicity | Partial commit visible (the worst possible bug) |
@@ -2699,7 +2711,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 |------|----------|-----------|
 | **R1: SSI abort rate too high** (Page-SSI is conservative, may false-positive) | High | Measure the current page-granular rate on the release matrix; refine SIREAD keys to page ranges if needed; evaluate the dormant intent-replay ladder only with repository benchmark evidence. PostgreSQL's row-granular results are prior art, not an estimate for this engine. |
 | **R2: RaptorQ overhead dominates CPU** | Medium | Symbol sizing policy per object type; cache decoded objects aggressively via ARC; profile/tune encoder/decoder hot paths |
-| **R3: Append-only storage grows without bound** | Medium | Checkpoint and compaction are first-class operations; enforce budgets for MVCC history, SIREAD table, symbol caches; GC horizon = min(active txn ids) bounds version chain length |
+| **R3: Append-only storage grows without bound** | Medium | Checkpoint/compaction and enforced admission/retention budgets are required. Prune using protected snapshot.high in CommitSeq order; the horizon alone does not bound memory or storage growth. |
 | **R4: Bootstrap chicken-and-egg** (need index to find symbols, need symbols to build index) | Low | Symbol records are self-describing (header + OTI); one tiny mutable root pointer per database; rebuild-from-scan always possible as fallback |
 | **R5: Multi-process MVCC coordination is complex** | High | Shared-memory coordination protocol fully specified; lease-based TxnSlot cleanup handles process crashes; validate in-process first (Phase 6), cross-process follows (Phase 7) |
 | **R6: File format compatibility vs innovation** | Medium | Compatibility runtime stays on standard SQLite files; Native/ECS work is an innovation layer pursued alongside parity harnesses and explicit status tracking |

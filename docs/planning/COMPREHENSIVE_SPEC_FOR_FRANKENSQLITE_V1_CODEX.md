@@ -643,7 +643,7 @@ Let:
 Each transaction has:
 
 - `begin_seq(T)` (logical begin time; derived from current commit stream tip)
-- `snapshot(T)` = `(high, in_flight)` as of begin
+- `snapshot(T)` = `{ high: CommitSeq, schema_epoch }` captured consistently at begin
 - `read_set(T)` and `write_set(T)` at page granularity:
   - `read_set(T) ⊆ Pgno`
   - `write_set(T) ⊆ Pgno`
@@ -884,10 +884,11 @@ This preserves our “no waiting while holding locks” rule: the only blocking 
 
 We want the *effect* of EBR (quick reclamation without global pauses) without unsafe pointer tricks.
 
-We therefore define reclamation epochs in terms of the commit clock:
+Logical visibility and physical reclamation use different clocks:
 
-- `CommitSeq` acts as the global epoch.
-- `min_active_begin_seq` (or `min_snapshot_high`) defines the GC horizon.
+- `CommitSeq` orders committed versions and protected snapshot horizons.
+- `min(protected snapshot.high)` defines the logical GC horizon; when no
+  retention obligation remains, it may advance to the latest committed sequence.
 - retain every page version above the horizon and the newest committed version
   at or below it (the floor version). Only versions older than that floor are
   reclaimable. `commit_seq < horizon` alone is insufficient: with versions at
@@ -897,13 +898,12 @@ We therefore define reclamation epochs in terms of the commit clock:
   `fsqlite-mvcc::gc::prune_page_chain_with_registry` and the detailed
   reclamation proof work in `bd-db300.5.3.3.2`.
 
-Implementation:
-
-- store versions as `Arc`-owned objects
-- remove reclaimable versions from maps/lists when horizon advances
-- memory is freed by `Arc` drops (safe Rust)
-
-This gives us “epoch reclamation semantics” while preserving `#[forbid(unsafe_code)]`.
+The live `VersionStore` prunes chains with `VersionGuardRegistry` and an
+`EbrRetireQueue`; arena-slot recycling is deferred until physical reader pins
+permit it. `ebr::EpochGuard::pinned_epoch` is explicitly not a `CommitSeq`.
+Dropping an `Arc` payload alone does not establish that an arena slot or linked
+version is safe to reuse. The detailed reclamation proof and retention-policy
+integration remain tracked by `bd-db300.5.3.3.2`.
 
 ### 7.13 Upgrade Path: Full SSI (Cahill/Fekete) To Reduce Abort Rate
 

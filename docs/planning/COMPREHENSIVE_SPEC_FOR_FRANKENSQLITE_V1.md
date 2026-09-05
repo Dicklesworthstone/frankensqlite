@@ -4424,49 +4424,51 @@ This means a cancelled transaction never leaves ghost entries in the commit
 pipeline, never consumes a slot without producing a message, and never
 causes the coordinator to hang waiting for a message that will never arrive.
 
-**Backpressure: bounded channel capacity limits in-flight commits:**
+**Backpressure: bounded channel capacity limits queued reservations:**
 
-The channel capacity (default: 16) limits the number of transactions that can
-be simultaneously in the commit pipeline.
+This is the planned coordinator channel, not the current public commit path.
+`Connection::execute_commit_with_cx` currently performs validation, pager commit
+and publication under the commit guard; the coordinator service remains an
+integration task (bd-3mgq5.7/.8).
 
-**Derivation (Little's Law):** The channel capacity C must satisfy
-`C >= lambda * t_commit` where `lambda` is the peak commit arrival rate and
-`t_commit` is the mean commit processing time (validate + WAL append + fsync
-amortization). For the throughput model in Section 17.2:
-- Group commit with batch size N=50, fsync cost 2ms:
-  `t_commit ≈ 2ms / 50 = 40us` per transaction (amortized).
-- At peak 37,000 commits/sec: `C >= 37000 * 40e-6 ≈ 1.5`.
-- At burst 4x peak (148K/sec): `C >= 148000 * 40e-6 ≈ 6`.
-- With safety margin 2.5x for jitter: `C = 6 * 2.5 = 15 ≈ 16`.
+A capacity C bounds occupied and reserved channel slots. It does not by itself
+bound producer-owned write sets, a batch removed for service, payload bytes or
+all transactions in the commit pipeline. Those require separate admission and
+byte budgets, including ownership during cancellation.
 
-The default of 16 is therefore well-calibrated: it absorbs bursts at 4x
-sustained peak without stalling senders, while bounding memory to 16 write
-sets. Adjustable via `PRAGMA fsqlite.commit_channel_capacity`.
+Little's Law, `L = lambda * W`, relates stable long-run averages over the same
+system boundary. W is a request's residence time, including queuing; fsync time
+divided by batch size is amortized work, not that residence time. Consequently
+the law alone cannot establish a burst-safe capacity. With a hypothetical
+2ms fsync and batches of 50, even the fsync-only capacity is at most 25,000
+commits/s; batches capped at 16 give at most 8,000 commits/s before other work.
+These are model calculations, not measured engine throughput.
 
-This provides:
-- **Memory boundedness**: At most C write sets are buffered, bounding the
-  coordinator's memory usage regardless of the number of concurrent writers.
-- **Latency signal**: When the channel is full, new committers block on
-  `reserve()`, signaling commit pipeline saturation. This naturally
-  throttles new write transactions.
-- **Fair queuing**: FIFO ordering of reserve waiters ensures long-waiting
-  transactions are served first, preventing starvation.
-- **Optimal batch size:** The group commit batch size N interacts with C:
-  the coordinator drains `min(C, available)` commits per fsync. The optimal
-  N minimizes `t_fsync / N + t_validate * N` (fsync amortization vs.
-  validation latency). For `t_fsync = 2ms, t_validate = 5us`:
-  `N_opt = sqrt(t_fsync / t_validate) = sqrt(400) = 20`. The capacity of 16
-  is below this optimum, so the system naturally batches up to 16 per fsync
-  under saturation, which is near-optimal.
+Capacity 16 is a proposed tuning candidate. A burst guarantee needs an arrival
+envelope and a service bound, including stalls: bound backlog by arrivals minus
+service over every relevant interval. The planned
+`PRAGMA fsqlite.commit_channel_capacity` must be wired and measured before it
+is described as an effective control.
+
+- **Backpressure:** a full channel delays reservation, but existing producer
+  memory remains owned until admitted or cancelled.
+- **Fairness:** FIFO reservation can prevent overtaking. Eventual service also
+  requires finitely many predecessors, scheduler progress, finite service and
+  correct cancellation/drain behavior; FIFO alone proves no wall-clock bound.
+- **Batch tuning:** `sqrt(a/b)` minimizes the stated heuristic `a/N + b*N`
+  for positive constants and continuous N. Real batch latency, arrival rate,
+  validation cost, capacity and durability constraints must determine whether
+  that heuristic is useful; it does not establish an optimal database policy.
 
 **Alien-artifact upgrade (recommended): Conformal control for batch size**
 
-The derivation above uses point estimates. In reality, `t_fsync` and
+The heuristic above uses point estimates. In reality, `t_fsync` and
 `t_validate` are random variables with heavy tails and regime shifts
 (queue depth, background compaction, device health).
 
-The coordinator SHOULD therefore choose `N` using conservative, distribution-free
-upper quantiles *within the current BOCPD regime* (§4.8):
+The planned coordinator MAY evaluate quantile-based tuning within a measured
+regime (§4.8). Conformal coverage requires its sampling assumptions; detecting
+a regime change does not itself establish exchangeability or a performance bound:
 
 1. Maintain bounded calibration windows (ring buffers) of recent measurements:
    - `fsync_samples = {t_fsync_i}` from completed batches
@@ -4833,30 +4835,21 @@ The blocking pool uses a min/max thread model:
 
 - **Minimum threads: 1** -- always at least one blocking thread available for
   immediate dispatch, avoiding cold-start latency on the first I/O operation.
-- **Maximum threads: derived from storage class** -- not a fixed constant.
-  The optimal thread count follows from Little's Law (`L = lambda * W`):
+- **Maximum threads: measured for the workload and device.** Little's Law
+  estimates average in-flight demand under stable operation, not an optimal
+  thread count. For example, 10,000 requests/s times 8ms gives 80 in-flight
+  requests. A hypothetical device serializing each request for 8ms has capacity
+  only 125 requests/s; adding 80 threads cannot make that offered load stable.
+  Device queue depth, internal parallelism, CPU overlap and tail latency need
+  measurement. Storage-class guesses and `statfs()` do not prove capacity.
+  A future `PRAGMA fsqlite.blocking_pool_threads` needs actual runtime wiring
+  and workload evidence before being presented as an effective tuning control.
 
-  | Storage class | Mean service time W | Optimal threads at 10K IOPS |
-  |---------------|--------------------|-----------------------------|
-  | HDD (7200rpm) | ~8ms (seek+rotate) | 80 (but serialized by arm)  |
-  | SATA SSD      | ~100us             | 1-2                         |
-  | NVMe SSD      | ~15us              | 1-2 (kernel parallelism)    |
-
-  For single-file database workloads, HDD and SATA SSD serialize requests
-  internally (single command queue). The benefit of >1 thread is overlap
-  with CPU work (CRC computation while another read is in-flight), not
-  increased I/O bandwidth. NVMe devices support multiple hardware queues
-  and internal parallelism, so additional threads yield actual I/O
-  concurrency. Defaults: **HDD: 2**, **SATA SSD: 2**, **NVMe: 4**.
-  Auto-detected via `statfs()` heuristic; overridable with
-  `PRAGMA fsqlite.blocking_pool_threads`.
-
-- **Idle timeout: 10 seconds (derived from survival analysis)** -- minimizes
-  `L_spawn * P(arrival < t) + L_idle * t * P(no_arrival < t)` where
-  `L_spawn ≈ 50us` (thread creation cost) and `L_idle ≈ 8MB` (stack memory
-  per idle thread). For bursty I/O with exponential inter-arrival times,
-  the optimal timeout ranges 5-30s. The BOCPD workload monitor (Section 4.8)
-  adjusts this adaptively when it detects a regime shift in I/O arrival rate.
+- **Idle timeout: a measured policy choice.** A ten-second timeout is a
+  candidate, not a derived optimum. An optimization model must express thread
+  creation latency and idle stack memory in a common weighted cost, state its
+  arrival assumptions and validate them. Adding microseconds directly to
+  megabytes cannot justify a timeout. Adaptive control remains planned.
 
 **How this interacts with async callers:**
 
@@ -5692,15 +5685,12 @@ InProcessPageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write 
     -- The system SHOULD estimate M2_shard online by feeding `shard_id(pgno)` into
     -- the same bounded F2 sketch used for write-set collision mass (§18.4.1.3).
     --
-    -- The expected lock hold time per shard access is ~50ns (HashMap lookup
-    -- under parking_lot::Mutex). Expected wait time when contended:
-    --   E[wait] ≈ (W/S) * t_hold ≈ (16/64) * 50ns = 12.5ns (uniform)
-    --   E[wait] ≈ (W/S_eff) * t_hold ≈ (16/16) * 50ns = 50ns (skewed)
-    --
-    -- S=64 is adequate for W <= 32 under uniform access, W <= 16 under common
-    -- skew patterns. For higher concurrency, increase S to 256 (via PRAGMA).
-    -- Monitored at runtime via the BOCPD contention stream (Section 4.8) and
-    -- the shard collision mass estimate (M2_shard_hat).
+    -- The birthday approximation assumes independent uniform shard choices;
+    -- it describes occupancy collisions, not blocking duration. Neither it
+    -- nor M2 determines wait time without arrivals, service and scheduling.
+    -- Measure shard hold/wait distributions, skew and scheduler effects before
+    -- choosing a shard count. Short instruction paths do not establish a
+    -- nanosecond hold bound or starvation freedom. Adaptive tuning is planned.
 
 SSIWitnessPlane := (see §5.6.4)
     -- The RaptorQ-native witness plane replaces any ephemeral SIREAD lock table:
@@ -6529,14 +6519,14 @@ QED.
 
 ---
 
-**Theorem 4 (GC Safety):** Garbage collection never removes a version that
-any active or future transaction could need.
+**Theorem 4 (Logical GC Safety):** Pruning preserves the version selected by
+every protected snapshot and ordinary future snapshot.
 
 **Proof:** Define the safe GC horizon in commit-seq space:
 
 ```
-safe_gc_seq := min(T.snapshot.high for all active transactions T)
-if no active transactions: safe_gc_seq := latest_commit_seq
+safe_gc_seq := min(snapshot.high for all protected retention obligations)
+if no protected obligations: safe_gc_seq := latest_commit_seq
 ```
 
 Because `CommitSeq` is monotonic and snapshots are immutable (INV-5),
@@ -6551,51 +6541,47 @@ Because `CommitSeq` is monotonic and snapshots are immutable (INV-5),
 c < V'.commit_seq <= safe_gc_seq
 ```
 
-That is: `V'` is at least as new as the newest version that the oldest active
-snapshot could ever see.
+That is: `V'` is a newer eligible version for every protected snapshot. It need
+not itself be the newest eligible version; resolution may select a newer one.
 
 For any active transaction `T_a`, since `V'.commit_seq <= safe_gc_seq <= T_a.snapshot.high`,
 `visible(V', T_a.snapshot)` is true (§5.3). Because the version chain is ordered
 by descending `commit_seq` (INV-3), `resolve(P, T_a.snapshot)` returns `V'` or a
 newer version, never `V`. Thus no active transaction can need `V`.
 
-For any future transaction `T_f`, `T_f.snapshot.high >= latest_commit_seq >= safe_gc_seq`,
+For an ordinary future transaction `T_f`, `T_f.snapshot.high >= latest_commit_seq >= safe_gc_seq`,
 so the same argument applies: `V'` is visible and dominates `V` in the chain.
 
-Therefore, reclaiming `V` cannot affect the result of `resolve(P, S)` for any
-active or future snapshot.
+Therefore, unlinking `V` cannot affect resolution for these snapshots.
+Historical requests below this horizon require separately retained history or
+an explicit unavailable error. Physical reclamation also requires outstanding
+reader guards and EBR retirement to permit reuse; the logical predicate alone
+does not authorize recycling a version slot.
 
 QED.
 
 ---
 
-**Theorem 5 (Memory Boundedness):** Under steady-state load with maximum
-transaction duration `D` and commit rate `R` (commits per second), the
-maximum number of retained versions per page is bounded by `R * D + 1`.
+**Theorem 5 (Conditional Logical Version Bound):** Suppose every retention
+obligation is at most D old, and A(t) is a hard upper bound on commits in any
+interval of length t. After complete logical pruning, a page retains at most
+`A(D) + 1` committed versions.
 
-**Proof:** Define `safe_gc_seq = min(active snapshot.high)` (Theorem 4).
-Under steady state, the oldest active transaction began at most `D` seconds
-ago, so `safe_gc_seq` lags the head of the commit clock by at most `R * D`
-commits (in `D` seconds, at most `R * D` commits can occur).
+**Proof:** Each commit creates at most one version of a page. At most A(D)
+commits are newer than the oldest protected horizon. Pruning retains those
+versions and at most one floor version at or below that horizon. QED.
 
-Each committed transaction can create at most one version per page. Therefore
-the version chain for any page contains at most `R * D` versions with
-`commit_seq > safe_gc_seq`, plus one version at or below the horizon (the
-newest version visible to the oldest active snapshot). All older versions are
-reclaimable by GC Safety (Theorem 4). Total retained versions per page:
-`R * D + 1`. QED.
+The special form `R * D + 1` needs a hard arrival bound `A(D) <= R * D`;
+average throughput or steady-state load is insufficient. Bounded pruning lag
+G instead requires an envelope covering D+G. Pinned retired versions, private
+write sets, caches, indexes and allocator overhead require separate accounting;
+this is not an RSS or physical-memory bound.
 
-**Practical implication (example numbers):** With `D = 5s` (configured maximum
-active snapshot duration; `PRAGMA fsqlite.txn_max_duration_ms`) and
-`R = 1000 commits/s`, at most 5001 versions per page. At 4KB per full-page
-version, this is ~20MB per extremely hot page. In practice:
-- most transactions touch a small subset of pages,
-- older history is stored as patches/intent logs (§5.10.6), not full images,
-- GC prunes aggressively once the horizon advances.
-
-**Alien-artifact correction (required):** `D` is not a "nice-to-have estimate".
-It is a contractual bound on how long the oldest active snapshot can hold the
-GC horizon back. If `D` is unbounded, memory boundedness is unprovable.
+D must bound all retention obligations, including historical readers and other
+consumers, not merely transactions that happen to finish in a measured sample.
+Admission control, enforced expiration and bounded reclamation remain product
+requirements tracked by bd-6hdwo.19/.20 and bd-6hdwo.21/.22. The existing
+duration pragma is not evidence that this full policy is operational.
 
 Therefore:
 - The engine MUST define a configured `txn_max_duration` for Concurrent mode
@@ -6605,12 +6591,11 @@ Therefore:
   transaction durations (Kaplan-Meier with right censoring) and updated only on
   BOCPD regime shifts, with evidence-ledger justification (§4.17).
 
-**Caveat (non-steady-state):** Theorem 5 assumes constant `R` and bounded `D`.
-Under burst workloads (high `R`) or under a policy that permits larger `D`, the
-bound grows proportionally. If version chain length exceeds the configured
-threshold, the GC scheduling policy (§5.6.5) increases GC frequency and the
-PolicyController MAY tighten `txn_max_duration` (never loosen under active
-memory pressure).
+**Policy requirement:** Bursts must fit an enforced arrival envelope, or
+admission must delay/reject work. Increasing GC frequency cannot free a version
+still needed by a protected reader. The planned controller may tighten future
+admission and expiry policies within its correctness contract; a statistical
+duration quantile alone supplies no hard bound.
 
 **Deriving `txn_max_duration` (survival analysis, recommended):**
 
@@ -6630,12 +6615,17 @@ global constant.
 
 ---
 
-**Theorem 6 (Liveness):** Every transaction either commits or aborts in
-finite time, assuming:
+**Theorem 6 (Conditional Liveness):** A transaction reaches commit or abort
+under the following progress assumptions:
 (a) The application eventually calls COMMIT or ROLLBACK for every transaction.
 (b) The write coordinator processes requests in finite time.
 (c) Durable commit I/O completes in finite time (WAL I/O in Compatibility mode;
     symbol-log + marker I/O in Native mode).
+(d) Runnable tasks and lock waiters make progress, allocation completes or
+    errors, and retries and the transaction's remaining work are finite.
+
+The following operation counts describe finite work under these assumptions.
+They do not establish wall-clock bounds or starvation freedom on their own.
 
 **Proof:** We show that every transaction makes progress through its lifecycle
 without unbounded blocking.
@@ -6643,8 +6633,9 @@ without unbounded blocking.
 **Begin:** TxnId allocation is a CAS loop on an `AtomicU64` (lock-free; each
 iteration O(1)). Snapshot capture is O(1): it reads the current `commit_seq` and
 `schema_epoch` and stores them in the immutable `Snapshot` (INV-5). The capture
-MUST be self-consistent (see `load_consistent_snapshot()` in §5.4; it is still
-O(1), bounded by a small constant number of atomic loads under a seqlock). For `BeginKind::Immediate` / `Exclusive`,
+MUST be self-consistent (see `load_consistent_snapshot()` in §5.4). A seqlock
+attempt has bounded work, but repeated interference can require retries; its
+eventual success needs the progress assumption above. For `BeginKind::Immediate` / `Exclusive`,
 acquiring Serialized writer exclusion may:
 - fail immediately with `SQLITE_BUSY` (or wait under busy-timeout) if Concurrent
   writers are active (§5.8), and otherwise
@@ -6686,11 +6677,12 @@ subsystem cooperate. QED.
 
 ### 5.6 Multi-Process Semantics
 
-FrankenSQLite provides MVCC concurrency both within a single process (via
-in-memory lock tables and version chains) and across processes (via a
-shared-memory coordination region). The in-process path is the fast path;
-the cross-process path adds ~100ns per lock operation due to mmap-based
-atomics.
+The native design extends in-process MVCC with a shared-memory coordination
+region. The public compatibility path currently combines process-local MVCC
+state with its pager/WAL and VFS coordination; the complete native shared
+version/witness/retention plane remains partial. No fixed nanosecond overhead
+is established for cross-process locking; benchmark the actual backend and
+contention pattern before making a performance claim.
 
 **Architecture:** Each database file `foo.db` (or `foo.db.fsqlite/` in Native
 mode) has an associated shared-memory file `foo.db.fsqlite-shm` that
@@ -7741,8 +7733,8 @@ SSI tracks rw-antidependencies over a canonical key space:
 ```text
 WitnessKey =
   | Page(pgno: u32)
-  | Cell(btree_root_pgno: u32, cell_tag: u32, leaf_page: u32)
-  | ByteRange(page: u32, start: u16, len: u16)
+  | Cell(btree_root_pgno: u32, cell_tag: u64, leaf_page: u32)
+  | ByteRange(page: u32, start: u32, len: u32)
   | KeyRange(btree_root_pgno: u32, lo: Key, hi: Key)   // optional, advanced
   | Custom(namespace: u32, bytes: [u8])
 ```
@@ -7762,10 +7754,10 @@ Refinement must not discard a real dependency merely to permit a merge.
 
 When the refined path is enabled, the B-tree/VDBE MUST register:
 - **Point read / uniqueness check (including "negative point read"):**
-  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`.
+  `WitnessKey::Cell { btree_root, leaf_page, tag: cell_tag(key_bytes) }`.
 
 - **Point write (insert/delete/update by key):**
-  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))` AND
+  `WitnessKey::Cell { btree_root, leaf_page, tag: cell_tag(key_bytes) }` AND
   `WitnessKey::Page(leaf_pgno)` as a write witness.
 
 - **Range scan / predicate read (phantom protection; SERIALIZABLE requirement):**
@@ -7796,9 +7788,11 @@ includes either the root page or the recorded leaf page
 from the model can lose mixed-granularity dependencies. Logical key identity
 must remain stable across physical relocation.
 
-`cell_tag(key_bytes)` MUST be deterministic and stable across processes. A
-recommended derivation is:
-`cell_tag = low32(xxh3_64("fsqlite:witness:cell:v1" || le_u32(btree_root_pgno) || canonical_key_bytes))`.
+`cell_tag(key_bytes)` MUST be deterministic and agreed by every producer and
+consumer of a witness namespace. The live tag is 64 bits: the glossary helper
+uses XXH3-64, while B-tree paths currently use rowid-bit identity or FNV-1a index
+key tags. A future uniform encoding must reconcile these paths and preserve
+mixed-granularity overlap; a universal low-32-bit XXH3 format is not implemented.
 
 ##### 5.6.4.4 RangeKey: Hierarchical Buckets Over WitnessKey Hash Space
 
