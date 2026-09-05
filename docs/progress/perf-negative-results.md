@@ -12,6 +12,44 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-05 - FOLLOW-UP STOP: bd-aoj0g allocation repair passes focused tests; overflow integrity oracle blocks acceptance
+
+- Target: journal-boundary savepoints for the same A-F indexed INSERT curve.
+  Completion touches `crates/fsqlite-pager/src/pager.rs` and the existing
+  `crates/fsqlite/tests/aoj0g_insert_profile.rs`. Concurrent mode remains on.
+- The authorized completion keeps savepoint-restorable allocation lists and
+  leases private through commit preparation. Its six journal tests pass on
+  trj, including real failed/cancelled preparation followed by ROLLBACK TO;
+  the broader pager savepoint filter passes 26 tests. These do not certify
+  the full integration or performance gate.
+- Acceptance STOP: the new stock-oracle workload inserts 512 indexed rows
+  with 9000-byte payloads in one transaction. After SAVEPOINT outer_sp, row
+  contents match rusqlite but in-transaction integrity_check reports
+  `page 1671 is never used`. No explicit rollback or COMMIT has occurred.
+  This is not evidence of durable file corruption.
+- An otherwise identical tree with the pre-journal pager from `9f2222f9f~1`
+  was actually rebuilt and fails the same one test at the same step/page.
+  Thus this blocker predates the journal. No orphan-page or planning-frontier
+  code was changed. Both runs exit 101; acceptance stops under the user's gate.
+- Candidate base `21ebd0149`, pager SHA-256
+  `baf57bf0433be2a091c25497bab29770cae54f01bed5a022054cef51ec1c0f96`;
+  control pager SHA-256
+  `8a88a09ad706999f286d405ae30f276fd0c6cb3f569248a3a8d305053608f16d`.
+  Both use release/locked/nightly-2026-08-31, default features, four jobs,
+  no target-cpu override. Evidence: trj `/data/tmp/aoj0g-completion-xceVJQ`,
+  local `/tmp/aoj0g-bluecedar-20260905/REPORT.md`,
+  `facade-oracle-labelled.log`, `facade-oracle-control-rebuilt.log`, and
+  `source-control-diff.txt`. The initial cached control invocation is excluded.
+- No candidate A-F timing, read/file regression result, external sqlite3
+  file check, either concurrency canon, or workspace check/Clippy/fmt is
+  claimed. The original 3.250x case-C baseline is unchanged. Retry only after
+  resolving the pre-existing integrity gate and running all acceptance lanes.
+- Another actor swept the unaccepted completion into `29cbfaf20`, then pushed
+  it inside `be29814e8` despite reservations and STOP messages. BlueCedar
+  issued no commit/push/revert and did not close the bead. The commit's claims
+  about both retain variants and a completed statement-failure oracle are
+  inaccurate; the report records the exact narrower runtime evidence.
+
 ## 2026-09-05 - STOP: bd-aoj0g journal savepoints fail allocation ownership after commit failure
 
 - Target: the same A-F indexed INSERT cost curve, especially case C at 100k
