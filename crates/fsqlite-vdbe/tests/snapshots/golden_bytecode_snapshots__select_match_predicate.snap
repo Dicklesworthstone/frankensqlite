@@ -1,6 +1,6 @@
 ---
 source: crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
-expression: "render_bytecode_case(\"match_predicate\",\n\"SELECT id, title FROM docs WHERE title MATCH ?1\")"
+expression: match_predicate
 ---
 case: match_predicate
 sql: SELECT id, title FROM docs WHERE title MATCH ?1

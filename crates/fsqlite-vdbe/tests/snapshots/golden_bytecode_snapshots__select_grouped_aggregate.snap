@@ -1,6 +1,6 @@
 ---
 source: crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
-expression: "render_bytecode_case(\"grouped_aggregate\",\n\"SELECT category_id, count(*), sum(score) \\\n             FROM docs GROUP BY category_id HAVING sum(score) > 10\")"
+expression: grouped_aggregate
 ---
 case: grouped_aggregate
 sql: SELECT category_id, count(*), sum(score) FROM docs GROUP BY category_id HAVING sum(score) > 10

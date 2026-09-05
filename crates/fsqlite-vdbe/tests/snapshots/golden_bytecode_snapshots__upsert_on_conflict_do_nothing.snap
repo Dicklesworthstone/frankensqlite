@@ -12,7 +12,7 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     34    0                        0 
+0     Init             0     37    0                        0 
 1     Transaction      0     1     0                        0 
 2     OpenWrite        0     2     0     (tbl)docs          0 
 3     OpenWrite        1     10    0     (tbl)idx_docs_category  0 
@@ -33,16 +33,19 @@ addr  opcode           p1    p2    p3    p4                 p5
 18    NewRowid         0     1     1                        0 
 19    Copy             1     7     0                        0 
 20    Affinity         7     5     0     (aff)XDBBD         0 
-21    Insert           0     12    1     (blob)[17B]        4 
-22    Copy             8     13    0                        0 
-23    Copy             1     14    0                        0 
-24    MakeRecord       13    2     15                       0 
-25    IdxInsert        1     15    0     (tbl)idx_docs_category  0 
-26    Copy             9     16    0                        0 
-27    Copy             1     17    0                        0 
-28    MakeRecord       16    2     18                       0 
-29    IdxInsert        2     18    0     (tbl)idx_docs_title  0 
-30    Close            0     0     0                        0 
-31    Close            1     0     0                        0 
-32    Close            2     0     0                        0 
-33    Halt             0     0     0                        0
+21    Affinity         7     5     0     (aff)XDBBD         0 
+22    NotExists        0     24    1                        0 
+23    Goto             0     33    0                        0 
+24    Insert           0     12    1     (blob)[17B]        2 
+25    Copy             8     13    0                        0 
+26    Copy             1     14    0                        0 
+27    MakeRecord       13    2     15                       0 
+28    IdxInsert        1     15    0     (tbl)idx_docs_category  0 
+29    Copy             9     16    0                        0 
+30    Copy             1     17    0                        0 
+31    MakeRecord       16    2     18                       0 
+32    IdxInsert        2     18    0     (tbl)idx_docs_title  0 
+33    Close            0     0     0                        0 
+34    Close            1     0     0                        0 
+35    Close            2     0     0                        0 
+36    Halt             0     0     0                        0

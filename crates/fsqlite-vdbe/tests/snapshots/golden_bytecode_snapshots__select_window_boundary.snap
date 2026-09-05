@@ -1,30 +1,36 @@
 ---
 source: crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
-expression: "render_bytecode_case(\"window_boundary\",\n\"SELECT category_id, \\\n                    sum(score) OVER (PARTITION BY category_id ORDER BY score) \\\n             FROM events\")"
+expression: window_boundary
 ---
 case: window_boundary
 sql: SELECT category_id, sum(score) OVER (PARTITION BY category_id ORDER BY score) FROM events
 status: ok
-registers: 5
+registers: 9
 bind_parameters: 0
 requires_attached_memdb: false
 requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     16    0                        0 
+0     Init             0     22    0                        0 
 1     Transaction      0     0     0                        0 
 2     Null             0     3     0                        0 
 3     Null             0     4     0                        0 
-4     OpenRead         0     4     0     (tbl)events        0 
-5     Rewind           0     10    0                        0 
-6     Column           0     1     3                        0 
-7     Column           0     2     5                        0 
-8     AggStep          0     5     4     (func)SUM          1 
-9     Next             0     6     0                        0 
-10    AggFinal         4     1     0     (func)SUM          0 
-11    Copy             3     1     0                        0 
-12    Copy             4     2     0                        0 
-13    ResultRow        1     2     0                        0 
-14    Close            0     0     0                        0 
-15    Halt             0     0     0                        0
+4     Integer          0     5     0                        0 
+5     OpenRead         0     4     0     (tbl)events        0 
+6     Rewind           0     13    0                        0 
+7     If               5     9     0                        0 
+8     Column           0     1     3                        0 
+9     Column           0     2     6                        0 
+10    AggStep          0     6     4     (func)SUM          1 
+11    Integer          1     5     0                        0 
+12    Next             0     7     0                        0 
+13    If               5     16    0                        0 
+14    Null             0     7     9                        0 
+15    Copy             8     3     0                        0 
+16    AggFinal         4     1     0     (func)SUM          0 
+17    Copy             3     1     0                        0 
+18    Copy             4     2     0                        0 
+19    ResultRow        1     2     0                        0 
+20    Close            0     0     0                        0 
+21    Halt             0     0     0                        0

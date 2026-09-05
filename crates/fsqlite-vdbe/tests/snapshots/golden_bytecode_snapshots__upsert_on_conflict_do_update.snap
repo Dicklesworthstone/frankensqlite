@@ -12,7 +12,7 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     77    0                        0 
+0     Init             0     79    0                        0 
 1     Transaction      0     1     0                        0 
 2     OpenWrite        0     2     0     (tbl)docs          0 
 3     OpenWrite        1     10    0     (tbl)idx_docs_category  0 
@@ -33,59 +33,61 @@ addr  opcode           p1    p2    p3    p4                 p5
 18    NewRowid         0     1     1                        0 
 19    Copy             1     7     0                        0 
 20    Affinity         7     5     0     (aff)XDBBD         0 
-21    NotExists        0     63    1                        0 
-22    Rowid            0     13    0                        0 
-23    Column           0     1     14                       0 
-24    Column           0     2     15                       0 
-25    Column           0     3     16                       0 
-26    Column           0     4     17                       0 
-27    Copy             11    19    0                        0 
-28    Copy             17    20    0                        0 
-29    IsNull           19    36    0                        0 
-30    IsNull           20    36    0                        0 
-31    Gt               20    34    19    (coll)BINARY       67
-32    Integer          0     18    0                        0 
-33    Goto             0     37    0                        0 
-34    Integer          1     18    0                        0 
-35    Goto             0     37    0                        0 
-36    Null             0     18    0                        0 
-37    IfNot            18    62    1                        0 
-38    Copy             9     15    0                        0 
-39    Copy             11    17    0                        0 
-40    Column           0     1     21                       0 
-41    Rowid            0     22    0                        0 
-42    IdxDelete        1     21    2     (tbl)idx_docs_category  0 
-43    Column           0     2     23                       0 
-44    Rowid            0     24    0                        0 
-45    IdxDelete        2     23    2     (tbl)idx_docs_title  0 
-46    Delete           0     0     0                        16
-47    IsNull           13    50    0                        0 
-48    Copy             13    25    0                        0 
-49    Goto             0     52    0                        0 
-50    NewRowid         0     25    1                        0 
-51    Copy             25    13    0                        0 
-52    MakeRecord       13    5     26    (aff)XDBBD         0 
-53    Insert           0     26    25    (tbl)docs          21
-54    Copy             14    27    0                        0 
-55    Copy             25    28    0                        0 
-56    MakeRecord       27    2     29                       0 
-57    IdxInsert        1     29    0     (tbl)idx_docs_category  0 
-58    Copy             15    30    0                        0 
-59    Copy             25    31    0                        0 
-60    MakeRecord       30    2     32                       0 
-61    IdxInsert        2     32    0     (tbl)idx_docs_title  0 
-62    Goto             0     73    0                        0 
-63    MakeRecord       7     5     12    (aff)XDBBD         0 
-64    Insert           0     12    1     (tbl)docs          2 
-65    Copy             8     33    0                        0 
-66    Copy             1     34    0                        0 
-67    MakeRecord       33    2     35                       0 
-68    IdxInsert        1     35    0     (tbl)idx_docs_category  0 
-69    Copy             9     36    0                        0 
-70    Copy             1     37    0                        0 
-71    MakeRecord       36    2     38                       0 
-72    IdxInsert        2     38    0     (tbl)idx_docs_title  0 
-73    Close            0     0     0                        0 
-74    Close            1     0     0                        0 
-75    Close            2     0     0                        0 
-76    Halt             0     0     0                        0
+21    Affinity         7     5     0     (aff)XDBBD         0 
+22    NotExists        0     65    1                        0 
+23    Rowid            0     13    0                        0 
+24    Column           0     1     14                       0 
+25    Column           0     2     15                       0 
+26    Column           0     3     16                       0 
+27    Column           0     4     17                       0 
+28    Copy             11    19    0                        0 
+29    Copy             17    20    0                        0 
+30    IsNull           19    37    0                        0 
+31    IsNull           20    37    0                        0 
+32    Gt               20    35    19    (coll)BINARY       67
+33    Integer          0     18    0                        0 
+34    Goto             0     38    0                        0 
+35    Integer          1     18    0                        0 
+36    Goto             0     38    0                        0 
+37    Null             0     18    0                        0 
+38    IfNot            18    64    1                        0 
+39    Copy             9     15    0                        0 
+40    Copy             11    17    0                        0 
+41    Affinity         13    5     0     (aff)XDBBD         0 
+42    Column           0     1     21                       0 
+43    Rowid            0     22    0                        0 
+44    IdxDelete        1     21    2     (tbl)idx_docs_category  0 
+45    Column           0     2     23                       0 
+46    Rowid            0     24    0                        0 
+47    IdxDelete        2     23    2     (tbl)idx_docs_title  0 
+48    Delete           0     0     0                        16
+49    IsNull           13    52    0                        0 
+50    Copy             13    25    0                        0 
+51    Goto             0     54    0                        0 
+52    NewRowid         0     25    1                        0 
+53    Copy             25    13    0                        0 
+54    MakeRecord       13    5     26    (aff)XDBBD         0 
+55    Insert           0     26    25    (tbl)docs          18
+56    Copy             14    27    0                        0 
+57    Copy             25    28    0                        0 
+58    MakeRecord       27    2     29                       0 
+59    IdxInsert        1     29    0     (tbl)idx_docs_category  0 
+60    Copy             15    30    0                        0 
+61    Copy             25    31    0                        0 
+62    MakeRecord       30    2     32                       0 
+63    IdxInsert        2     32    0     (tbl)idx_docs_title  0 
+64    Goto             0     75    0                        0 
+65    MakeRecord       7     5     12    (aff)XDBBD         0 
+66    Insert           0     12    1     (tbl)docs          2 
+67    Copy             8     33    0                        0 
+68    Copy             1     34    0                        0 
+69    MakeRecord       33    2     35                       0 
+70    IdxInsert        1     35    0     (tbl)idx_docs_category  0 
+71    Copy             9     36    0                        0 
+72    Copy             1     37    0                        0 
+73    MakeRecord       36    2     38                       0 
+74    IdxInsert        2     38    0     (tbl)idx_docs_title  0 
+75    Close            0     0     0                        0 
+76    Close            1     0     0                        0 
+77    Close            2     0     0                        0 
+78    Halt             0     0     0                        0

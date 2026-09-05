@@ -12,7 +12,7 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     59    0                        0 
+0     Init             0     60    0                        0 
 1     Transaction      0     1     0                        0 
 2     OpenWrite        0     2     0     (tbl)docs          0 
 3     OpenWrite        1     10    0     (tbl)idx_docs_category  0 
@@ -39,8 +39,8 @@ addr  opcode           p1    p2    p3    p4                 p5
 24    RowSetAdd        1     2     0                        0 
 25    Next             3     11    0                        0 
 26    Close            3     0     0                        0 
-27    RowSetRead       1     55    2                        0 
-28    SeekRowid        0     54    2                        0 
+27    RowSetRead       1     56    2                        0 
+28    SeekRowid        0     55    2                        0 
 29    Rowid            0     9     0                        0 
 30    Column           0     1     10                       0 
 31    Column           0     2     11                       0 
@@ -50,24 +50,25 @@ addr  opcode           p1    p2    p3    p4                 p5
 35    Integer          1     7     0                        0 
 36    Add              7     13    13                       0 
 37    String8          0     11    0     (str)updated       0 
-38    Column           0     2     14                       0 
-39    Rowid            0     15    0                        0 
-40    IdxDelete        2     14    2     (tbl)idx_docs_title  0 
-41    Delete           0     0     0                        16
-42    IsNull           9     45    0                        0 
-43    Copy             9     16    0                        0 
-44    Goto             0     47    0                        0 
-45    NewRowid         0     16    1                        0 
-46    Copy             16    9     0                        0 
-47    Affinity         9     5     0     (aff)XDBBD         0 
-48    MakeRecord       9     5     17    (aff)XDBBD         0 
-49    Insert           0     17    16    (tbl)docs          18
-50    Copy             11    18    0                        0 
-51    Copy             16    19    0                        0 
-52    MakeRecord       18    2     20                       0 
-53    IdxInsert        2     20    0     (tbl)idx_docs_title  0 
-54    Goto             0     27    0                        0 
-55    Close            1     0     0                        0 
-56    Close            2     0     0                        0 
-57    Close            0     0     0                        0 
-58    Halt             0     0     0                        0
+38    Affinity         9     5     0     (aff)XDBBD         0 
+39    Column           0     2     14                       0 
+40    Rowid            0     15    0                        0 
+41    IdxDelete        2     14    2     (tbl)idx_docs_title  0 
+42    Delete           0     0     0                        16
+43    IsNull           9     46    0                        0 
+44    Copy             9     16    0                        0 
+45    Goto             0     48    0                        0 
+46    NewRowid         0     16    1                        0 
+47    Copy             16    9     0                        0 
+48    Affinity         9     5     0     (aff)XDBBD         0 
+49    MakeRecord       9     5     17    (aff)XDBBD         0 
+50    Insert           0     17    16    (tbl)docs          18
+51    Copy             11    18    0                        0 
+52    Copy             16    19    0                        0 
+53    MakeRecord       18    2     20                       0 
+54    IdxInsert        2     20    0     (tbl)idx_docs_title  0 
+55    Goto             0     27    0                        0 
+56    Close            1     0     0                        0 
+57    Close            2     0     0                        0 
+58    Close            0     0     0                        0 
+59    Halt             0     0     0                        0
