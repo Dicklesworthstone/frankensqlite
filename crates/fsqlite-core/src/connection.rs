@@ -56121,6 +56121,8 @@ impl Connection {
         let Some(txn) = self.retained_autocommit_txn.borrow_mut().take() else {
             return Ok(());
         };
+        let commit_metrics_started =
+            (!fsqlite_observability::metrics::metrics_disabled()).then(Instant::now);
         if hot_path_profile_enabled() {
             FSQLITE_RETAINED_AUTOCOMMIT_FLUSHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
@@ -56210,8 +56212,10 @@ impl Connection {
             // A retained batch contributes one physical write commit, regardless
             // of how many statements were parked. Count before fallible
             // post-commit checkpointing; the committed writes already exist.
-            if txn_had_pending_writes && !fsqlite_observability::metrics::metrics_disabled() {
-                fsqlite_observability::metrics::global().commits_total.inc();
+            if txn_had_pending_writes && let Some(started) = commit_metrics_started {
+                let metrics = fsqlite_observability::metrics::global();
+                metrics.commits_total.inc();
+                metrics.commit_duration_seconds.observe(started.elapsed().as_secs_f64());
             }
             if !self.pager.is_memory() && self.pager.journal_mode() == JournalMode::Wal {
                 match self.pager.checkpoint(cx, CheckpointMode::Passive).await {
@@ -57958,6 +57962,10 @@ impl Connection {
             return Ok(());
         }
 
+        // Virtual-table synchronization below may add writes to an initially
+        // clean pager transaction, so do not gate timing on its current dirtiness.
+        let commit_metrics_started =
+            (ok && !fsqlite_observability::metrics::metrics_disabled()).then(Instant::now);
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
         if ok
             && !self.live_vtab_transactions.borrow().is_empty()
@@ -58146,8 +58154,10 @@ impl Connection {
                         // This branch committed writes and returns before the
                         // normal autocommit tail. Parking an uncommitted batch
                         // above never reaches this counter.
-                        if !fsqlite_observability::metrics::metrics_disabled() {
-                            fsqlite_observability::metrics::global().commits_total.inc();
+                        if let Some(started) = commit_metrics_started {
+                            let metrics = fsqlite_observability::metrics::global();
+                            metrics.commits_total.inc();
+                            metrics.commit_duration_seconds.observe(started.elapsed().as_secs_f64());
                         }
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
@@ -58461,8 +58471,10 @@ impl Connection {
         }
 
         txn_result?;
-        if committed_write && !fsqlite_observability::metrics::metrics_disabled() {
-            fsqlite_observability::metrics::global().commits_total.inc();
+        if committed_write && let Some(started) = commit_metrics_started {
+            let metrics = fsqlite_observability::metrics::global();
+            metrics.commits_total.inc();
+            metrics.commit_duration_seconds.observe(started.elapsed().as_secs_f64());
         }
         if committed_write && schema_change_boundary {
             self.publish_committed_schema_cookie(self.schema_cookie());
@@ -69975,6 +69987,8 @@ impl Connection {
                 "cannot commit - no transaction is active".to_owned(),
             ));
         }
+        let commit_metrics_started =
+            (!fsqlite_observability::metrics::metrics_disabled()).then(Instant::now);
         // AAC-P6: txn boundary — the micro-batch epoch ends at COMMIT.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
@@ -70418,8 +70432,10 @@ impl Connection {
         // Count once after retry/in-doubt resolution, including a physically
         // committed transaction whose later cleanup reports an error. Explicit
         // read-only COMMIT also completes a transaction; implicit reads do not.
-        if !fsqlite_observability::metrics::metrics_disabled() {
-            fsqlite_observability::metrics::global().commits_total.inc();
+        if let Some(started) = commit_metrics_started {
+            let metrics = fsqlite_observability::metrics::global();
+            metrics.commits_total.inc();
+            metrics.commit_duration_seconds.observe(started.elapsed().as_secs_f64());
         }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);

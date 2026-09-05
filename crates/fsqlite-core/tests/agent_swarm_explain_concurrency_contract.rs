@@ -219,11 +219,13 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
     let enabled = mode == "enabled";
     assert_eq!(fsqlite_observability::metrics::metrics_disabled(), !enabled);
     let counter = &fsqlite_observability::metrics::global().commits_total;
+    let duration = &fsqlite_observability::metrics::global().commit_duration_seconds;
     let fsync = &fsqlite_observability::metrics::global().fsync_duration_seconds;
     let busy = &fsqlite_observability::metrics::global().conflicts_busy_snapshot_total;
     fsqlite_core::connection::set_hot_path_profile_enabled(false);
     let delta = |before, expected| {
         assert_eq!(counter.get() - before, if enabled { expected } else { 0 });
+        assert_eq!(duration.count(), counter.get(), "each completed transaction contributes one latency sample");
     };
     let mut outcome: TestResult = Ok(());
     asupersync::test_utils::run_test(|| async {
@@ -310,6 +312,20 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
             conn.close().await?;
             delta(before, 2);
 
+            #[cfg(feature = "ext-fts5")]
+            {
+                let conn = Connection::open(":memory:").await?;
+                conn.execute("PRAGMA fsqlite.autocommit_retain=OFF;").await?;
+                let before = counter.get();
+                conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body);").await?;
+                delta(before, 1);
+                conn.execute("INSERT INTO docs VALUES('commit latency');").await?;
+                delta(before, 2);
+                assert_eq!(conn.query("SELECT count(*) FROM docs WHERE docs MATCH 'latency';").await?[0].values(), &[SqliteValue::Integer(1)]);
+                conn.close().await?;
+                delta(before, 2);
+            }
+
             // Genuine SSI write skew: the rejected COMMIT is not counted,
             // while the independent survivor publishes exactly once.
             let path = dir.path().join("commit-metrics-ssi.db");
@@ -344,11 +360,14 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
             let text = fsqlite_observability::metrics::render_prometheus();
             if enabled {
                 assert!(text.lines().any(|line| line == format!("fsqlite_commits_total {}", counter.get())));
+                assert!(duration.sum().is_finite() && duration.sum() > 0.0);
                 assert!(text.lines().any(|line| line == format!("fsqlite_conflicts_total{{response=\"busy_snapshot\"}} {}", busy.get())));
                 assert!(!text.contains("commit-metrics") && !text.contains("INSERT INTO"));
             } else {
                 assert!(text.is_empty());
                 assert_eq!(counter.get(), 0);
+                assert_eq!(duration.count(), 0);
+                assert_eq!(duration.sum(), 0.0);
                 assert_eq!(fsync.count(), 0);
                 assert_eq!(fsync.sum(), 0.0);
                 assert_eq!(busy.get(), 0);

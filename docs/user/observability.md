@@ -218,7 +218,7 @@ Bucket bounds (`le`, seconds): `0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1,
 | Metric | Meaning | SLO recommendation |
 |--------|---------|--------------------|
 | `fsqlite_fsync_duration_seconds` (`fsqlite.fsync_duration_seconds`) | Elapsed time for successful WAL VFS sync calls, including header creation/reset and frame durability. Failed or cancelled calls are excluded; an in-memory VFS has no physical disk flush. | Track the successful durability latency distribution; failures require separate error diagnostics. |
-| `fsqlite_commit_duration_seconds` (`fsqlite.commit_duration_seconds`) | End-to-end commit latency (validate → publish → durability). | Primary write-latency SLI. Compare p99 against your write-path budget; a gap vs. `fsync_duration_seconds` p99 isolates MVCC/publish cost from device cost. |
+| `fsqlite_commit_duration_seconds` (`fsqlite.commit_duration_seconds`) | Successful SQL commit-resolution latency, including validation and durability waits. One sample per counted commit, including explicit read-only commits. | Compare its distribution with your transaction budget and WAL sync latency. These measure different populations, so subtracting their percentiles does not isolate a component's cost. |
 | `fsqlite_page_lock_acquire_duration_seconds` (`fsqlite.page_lock_acquire_duration_seconds`) | Elapsed time per contended VDBE page-lock wait attempt, including holder change, timeout, cancellation, and deadlock-victim exits. | Compare tails with the workload's busy-timeout budget to locate page contention. |
 
 The page-lock histogram excludes uncontended acquisitions, zero-budget probes,
@@ -228,6 +228,14 @@ uses the wait loop's existing start time. When metrics are disabled, the added
 recording path skips the elapsed-time read and registry access; the wait loop
 still reads the clock to enforce its timeout. The separate VDBE counters do not
 control this histogram.
+
+Commit timing starts when an explicit COMMIT, retained-batch flush, or writable
+autocommit resolution enters its commit work. It ends at the successful outcome
+counted by `commits_total`, before later checkpointing and connection cleanup.
+Time spent executing earlier SQL or accumulating a retained batch is excluded.
+Internal durability retries are included in the successful attempt; rejected
+transactions and rollbacks have no latency sample. When metrics are disabled,
+this timing path skips clock reads and registry access.
 
 ### Gauges (point-in-time)
 
@@ -271,8 +279,8 @@ The recording registry, both serializers, the StatsD UDP push transport, and the
 HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
-- **Engine hot-path wiring** — restoring the remaining commit-latency /
-  sweeper / schema / integrity recording sites. The commit counter is wired;
+- **Engine hot-path wiring** — restoring the remaining sweeper / schema /
+  integrity recording sites. Commit counts and successful commit latency are wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
   (bd-zywqc.11.1.3). The page-lock wait histogram is wired at
