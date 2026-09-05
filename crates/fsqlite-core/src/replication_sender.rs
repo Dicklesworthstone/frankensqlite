@@ -11,6 +11,7 @@
 use std::fmt;
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::cx::Cx;
 use tracing::{debug, error, info, warn};
 
 use crate::source_block_partition::K_MAX;
@@ -551,20 +552,105 @@ pub fn derive_seed_from_changeset_id(id: &ChangesetId) -> u64 {
     xxhash_rust::xxh3::xxh3_64(id.as_bytes())
 }
 
-/// Generate a deterministic placeholder repair symbol (fallback when the
-/// RaptorQ encoder cannot be constructed). NOT a real RFC 6330 repair symbol;
-/// data encoded with these placeholders cannot be recovered.
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn generate_deterministic_placeholder(seed: u64, isi: u32, t: usize) -> Vec<u8> {
-    let repair_seed = seed.wrapping_add(u64::from(isi));
-    let mut data = vec![0_u8; t];
-    for (i, byte) in data.iter_mut().enumerate() {
-        let mixed = repair_seed
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(i as u64);
-        *byte = (mixed >> 32) as u8;
+/// Conservative per-operation admission bound for the codec's dense work.
+pub(crate) const MAX_REPAIR_WORK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validate dimensions before constructing the codec's constraint matrix.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn repair_parameters(
+    k: usize,
+    t: usize,
+    received: usize,
+    max_bytes: usize,
+) -> Result<asupersync::raptorq::systematic::SystematicParams> {
+    use asupersync::raptorq::systematic::SystematicParams;
+
+    if t == 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "symbol_size".to_owned(),
+            value: t.to_string(),
+        });
     }
-    data
+    let params = SystematicParams::try_for_source_block(k, t).map_err(|error| {
+        FrankenError::OutOfRange {
+            what: "RaptorQ source block".to_owned(),
+            value: format!("{error:?}"),
+        }
+    })?;
+    // Allow for matrix copies, equations, RHS and reconstructed symbols. This
+    // admission estimate is deliberately conservative, not allocator telemetry.
+    let rows = received.max(k).checked_add(params.l).ok_or(FrankenError::TooBig)?;
+    let width = params.l.checked_add(t).and_then(|v| v.checked_add(64)).ok_or(FrankenError::TooBig)?;
+    let work = rows.checked_mul(width).and_then(|v| v.checked_mul(8)).ok_or(FrankenError::TooBig)?;
+    if work > max_bytes {
+        return Err(FrankenError::TooBig);
+    }
+    Ok(params)
+}
+
+/// A real encoder retained for the current source block.
+#[derive(Debug, Default)]
+pub(crate) struct RepairEncoder {
+    #[cfg(not(target_arch = "wasm32"))]
+    encoder: Option<asupersync::raptorq::systematic::SystematicEncoder>,
+}
+
+impl RepairEncoder {
+    pub(crate) fn symbol(
+        &mut self,
+        cx: &Cx,
+        bytes: &[u8],
+        k: u32,
+        t: u16,
+        esi: u32,
+    ) -> Result<Vec<u8>> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use asupersync::raptorq::systematic::SystematicEncoder;
+
+            let k = usize::try_from(k).map_err(|_| FrankenError::TooBig)?;
+            let t = usize::from(t);
+            let params = repair_parameters(k, t, k, MAX_REPAIR_WORK_BYTES)?;
+            // Validate ESI before allocation and use its canonical wire value.
+            params.rfc_repair_equation(esi).map_err(|error| FrankenError::OutOfRange {
+                what: "repair ESI".to_owned(),
+                value: format!("{error:?}"),
+            })?;
+            if bytes.len().div_ceil(t) != k {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "repair source length does not match K".to_owned(),
+                });
+            }
+            if self.encoder.is_none() {
+                let mut sources = Vec::with_capacity(k);
+                for chunk in bytes.chunks(t) {
+                    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                    let mut symbol = vec![0; t];
+                    symbol[..chunk.len()].copy_from_slice(chunk);
+                    sources.push(symbol);
+                }
+                let seed = derive_seed_from_changeset_id(&compute_changeset_id(bytes));
+                let encoder = SystematicEncoder::new(&sources, t, seed).ok_or_else(|| {
+                    FrankenError::Internal("RaptorQ encoder construction failed".to_owned())
+                })?;
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                self.encoder = Some(encoder);
+            }
+            let symbol = self.encoder.as_ref().expect("initialized encoder")
+                .try_repair_symbol(esi).map_err(|error| FrankenError::OutOfRange {
+                    what: "repair ESI".to_owned(),
+                    value: format!("{error:?}"),
+                })?;
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            Ok(symbol)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (bytes, k, t, esi);
+            Err(FrankenError::NotImplemented("RaptorQ repair encoding on wasm32".to_owned()))
+        }
+    }
 }
 
 /// Compute `K_source = ceil(F / T_replication)` for a payload length `F`.
@@ -1213,6 +1299,7 @@ pub struct EncodingSession {
     pub current_isi: u32,
     /// Configuration.
     pub config: SenderConfig,
+    repair_encoder: RepairEncoder,
 }
 
 /// Replication sender state machine.
@@ -1273,6 +1360,7 @@ impl ReplicationSender {
             current_shard: 0,
             current_isi: 0,
             config,
+            repair_encoder: RepairEncoder::default(),
         });
         self.state = SenderState::Encoding;
         Ok(())
@@ -1303,7 +1391,8 @@ impl ReplicationSender {
     ///
     /// Returns error if not in STREAMING state.
     #[allow(clippy::too_many_lines)]
-    pub fn next_packet(&mut self) -> Result<Option<ReplicationPacket>> {
+    pub fn next_packet(&mut self, cx: &Cx) -> Result<Option<ReplicationPacket>> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if self.state != SenderState::Streaming {
             return Err(FrankenError::Internal(format!(
                 "sender must be STREAMING to generate packets, current state: {:?}",
@@ -1330,6 +1419,7 @@ impl ReplicationSender {
             // Move to next shard.
             session.current_shard += 1;
             session.current_isi = 0;
+            session.repair_encoder = RepairEncoder::default();
 
             if session.current_shard >= session.shards.len() {
                 return Ok(None);
@@ -1350,8 +1440,7 @@ impl ReplicationSender {
 
         // Generate symbol data for current ISI.
         // For source symbols (ISI < K_source): extract from changeset bytes.
-        // For repair symbols (ISI >= K_source): would use RaptorQ encoder in production.
-        // Here we provide the framework; actual FEC encoding is delegated to asupersync.
+        // Repair symbols use the same canonical ESI and codec as the receiver.
         let symbol_data = if u64::from(isi) < u64::from(shard.k_source) {
             // Source symbol: extract T bytes starting at ISI * T.
             let start = isi as usize * t;
@@ -1364,57 +1453,10 @@ impl ReplicationSender {
             // Remaining bytes are zero-padded (per RFC 6330 symbol alignment).
             data
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                // Repair symbol: use asupersync's RaptorQ SystematicEncoder.
-                //
-                // IMPORTANT: The encoder is rebuilt for each repair symbol call.
-                // SystematicEncoder::new() solves a constraint matrix, which is
-                // O(K^2) or worse. For production use with many repair symbols per
-                // shard, the encoder should be cached in EncodingSession (requires
-                // making EncodingSession non-Debug or wrapping the encoder).
-                // This is correct but slow for large K_source values.
-                use asupersync::raptorq::systematic::SystematicEncoder;
-
-                let source_symbols: Vec<Vec<u8>> = (0..shard.k_source as usize)
-                    .map(|i| {
-                        let start = i * t;
-                        let end = (start + t).min(shard.changeset_bytes.len());
-                        let mut sym = vec![0_u8; t];
-                        let available = end.saturating_sub(start);
-                        if available > 0 {
-                            sym[..available].copy_from_slice(&shard.changeset_bytes[start..end]);
-                        }
-                        sym
-                    })
-                    .collect();
-
-                match SystematicEncoder::new(&source_symbols, t, shard.seed) {
-                    Some(encoder) => encoder.repair_symbol(isi),
-                    None => {
-                        warn!(
-                            bead_id = BEAD_ID,
-                            isi,
-                            shard_index = session.current_shard,
-                            "RaptorQ encoder construction failed; using placeholder repair symbol"
-                        );
-                        generate_deterministic_placeholder(shard.seed, isi, t)
-                    }
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                warn!(
-                    bead_id = BEAD_ID,
-                    isi,
-                    shard_index = session.current_shard,
-                    "RaptorQ encoder is native-only; using placeholder repair symbol"
-                );
-                generate_deterministic_placeholder(shard.seed, isi, t)
-            }
+            session.repair_encoder.symbol(cx, &shard.changeset_bytes, shard.k_source, session.config.symbol_size, isi)?
         };
 
-        let r_repair = max_isi.saturating_sub(shard.k_source);
+        let r_repair = shard.k_source.saturating_mul(session.config.max_isi_multiplier).saturating_sub(shard.k_source);
         let packet = ReplicationPacket::new_v2(
             ReplicationPacketV2Header {
                 changeset_id: shard.changeset_id,
@@ -1475,6 +1517,8 @@ impl Default for ReplicationSender {
 
 #[cfg(test)]
 mod tests {
+    use fsqlite_types::cx::Cx;
+
     use super::*;
 
     const TEST_BEAD_ID: &str = "bd-1hi.13";
@@ -1939,7 +1983,7 @@ mod tests {
         let mut repair_count = 0_u32;
         let mut last_isi = 0_u32;
 
-        while let Some(packet) = sender.next_packet().expect("next") {
+        while let Some(packet) = sender.next_packet(&Cx::new()).expect("next") {
             if packet.is_source_symbol() {
                 source_count += 1;
             } else {
@@ -1983,7 +2027,7 @@ mod tests {
         let k_source_usize = usize::try_from(k_source).expect("K_source fits usize");
 
         let mut observed_esis = Vec::new();
-        while let Some(packet) = sender.next_packet().expect("next") {
+        while let Some(packet) = sender.next_packet(&Cx::new()).expect("next") {
             observed_esis.push(packet.esi);
         }
 
@@ -2022,7 +2066,7 @@ mod tests {
             sender.start_streaming().expect("start");
 
             let mut packets = Vec::new();
-            while let Some(packet) = sender.next_packet().expect("next") {
+            while let Some(packet) = sender.next_packet(&Cx::new()).expect("next") {
                 packets.push(packet);
             }
             packets
@@ -2056,7 +2100,7 @@ mod tests {
         sender.start_streaming().expect("start");
 
         // Generate a few packets.
-        let _p1 = sender.next_packet().expect("next").expect("packet");
+        let _p1 = sender.next_packet(&Cx::new()).expect("next").expect("packet");
 
         // Receiver ACKs completion.
         sender.acknowledge_complete().expect("ack");
@@ -2066,7 +2110,7 @@ mod tests {
             "bead_id={TEST_BEAD_ID} case=stop_on_ack"
         );
         assert!(
-            sender.next_packet().is_err(),
+            sender.next_packet(&Cx::new()).is_err(),
             "bead_id={TEST_BEAD_ID} case=no_packets_after_ack_complete"
         );
     }
@@ -2083,7 +2127,7 @@ mod tests {
         sender.start_streaming().expect("start");
 
         let mut count = 0_u32;
-        while sender.next_packet().expect("next").is_some() {
+        while sender.next_packet(&Cx::new()).expect("next").is_some() {
             count += 1;
         }
 

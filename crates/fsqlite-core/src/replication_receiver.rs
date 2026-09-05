@@ -1090,6 +1090,7 @@ mod tests {
         SimNetwork, SimTransportConfig, SymbolSinkExt as _, SymbolStreamExt as _,
     };
     use asupersync::types::{Symbol, SymbolId, SymbolKind};
+    use fsqlite_types::cx::Cx;
     use std::collections::HashSet;
 
     use super::*;
@@ -1142,7 +1143,7 @@ mod tests {
         sender.start_streaming().expect("start");
 
         let mut packets = Vec::new();
-        while let Some(packet) = sender.next_packet().expect("next") {
+        while let Some(packet) = sender.next_packet(&Cx::new()).expect("next") {
             packets.push(packet.to_bytes().expect("encode"));
         }
         packets
@@ -1221,7 +1222,7 @@ mod tests {
         let mut parse_errors = 0_usize;
 
         for (_, wire) in delivered {
-            match receiver.process_packet(wire) {
+            match receiver.process_packet(&Cx::new(), wire) {
                 Ok(PacketResult::DecodeReady) => {
                     let mut applied = receiver.apply_pending().expect("apply decoded changeset");
                     let pages = applied.pop().expect("decode result pages").pages;
@@ -1299,7 +1300,9 @@ mod tests {
         let packets = generate_sender_packets(512, &[1], 512);
         assert!(!packets.is_empty());
 
-        receiver.process_packet(&packets[0]).expect("first packet");
+        receiver
+            .process_packet(&Cx::new(), &packets[0])
+            .expect("first packet");
         assert_ne!(
             receiver.state(),
             ReceiverState::Listening,
@@ -1313,7 +1316,9 @@ mod tests {
         let packets = generate_sender_packets(512, &[1, 2], 512);
         assert_eq!(receiver.active_decoders(), 0);
 
-        receiver.process_packet(&packets[0]).expect("first packet");
+        receiver
+            .process_packet(&Cx::new(), &packets[0])
+            .expect("first packet");
         // Should have created exactly one decoder.
         // Note: if decode triggers, the decoder may be cleaned up,
         // so just check that processing succeeded.
@@ -1339,7 +1344,7 @@ mod tests {
             vec![0x11; 256],
         );
         receiver
-            .process_parsed_packet(&first)
+            .process_parsed_packet(&Cx::new(), &first)
             .expect("first decoder");
         assert_eq!(receiver.active_decoders(), 1);
 
@@ -1350,7 +1355,9 @@ mod tests {
             100,
             vec![0x22; 256],
         );
-        let err = receiver.process_parsed_packet(&second).unwrap_err();
+        let err = receiver
+            .process_parsed_packet(&Cx::new(), &second)
+            .unwrap_err();
         assert!(matches!(err, FrankenError::Busy));
         assert_eq!(receiver.active_decoders(), 1);
     }
@@ -1370,7 +1377,7 @@ mod tests {
             vec![0x55; 400],
         );
         receiver
-            .process_parsed_packet(&first)
+            .process_parsed_packet(&Cx::new(), &first)
             .expect("first packet");
         assert_eq!(receiver.active_decoders(), 1);
 
@@ -1382,7 +1389,9 @@ mod tests {
             100,
             vec![0x77; 200],
         );
-        let err = receiver.process_parsed_packet(&second).unwrap_err();
+        let err = receiver
+            .process_parsed_packet(&Cx::new(), &second)
+            .unwrap_err();
         assert!(matches!(err, FrankenError::TooBig));
         assert_eq!(receiver.active_decoders(), 1);
     }
@@ -1411,7 +1420,7 @@ mod tests {
             vec![0x55; 512],
         );
         let wire = packet.to_bytes().expect("encode");
-        let result = receiver.process_packet(&wire);
+        let result = receiver.process_packet(&Cx::new(), &wire);
         assert!(
             result.is_err(),
             "bead_id={TEST_BEAD_ID} case=v1_sbn_rejected"
@@ -1432,7 +1441,7 @@ mod tests {
         );
         let wire_zero = packet_zero.to_bytes().expect("encode");
         assert!(
-            receiver.process_packet(&wire_zero).is_err(),
+            receiver.process_packet(&Cx::new(), &wire_zero).is_err(),
             "bead_id={TEST_BEAD_ID} case=k_source_zero_rejected"
         );
 
@@ -1446,7 +1455,7 @@ mod tests {
         );
         // ESI only has 24 bits, K_source > K_MAX might not fit in packet format
         // but we test the validation path directly.
-        let result = receiver.process_parsed_packet(&packet_over);
+        let result = receiver.process_parsed_packet(&Cx::new(), &packet_over);
         assert!(
             result.is_err(),
             "bead_id={TEST_BEAD_ID} case=k_source_over_max_rejected"
@@ -1460,7 +1469,7 @@ mod tests {
             K_MAX,
             vec![0x55; 512],
         );
-        let result = receiver.process_parsed_packet(&packet_max);
+        let result = receiver.process_parsed_packet(&Cx::new(), &packet_max);
         assert!(
             result.is_ok(),
             "bead_id={TEST_BEAD_ID} case=k_source_at_max_accepted"
@@ -1478,7 +1487,7 @@ mod tests {
             vec![0x42; 1024],
         );
         receiver
-            .process_parsed_packet(&packet)
+            .process_parsed_packet(&Cx::new(), &packet)
             .expect("accept packet");
 
         // Symbol size should be inferred as 1024.
@@ -1495,7 +1504,9 @@ mod tests {
         let mut receiver2 = ReplicationReceiver::new();
         let empty_packet = make_packet(ChangesetId::from_bytes([0xFF; 16]), 0, 0, 10, vec![]);
         assert!(
-            receiver2.process_parsed_packet(&empty_packet).is_err(),
+            receiver2
+                .process_parsed_packet(&Cx::new(), &empty_packet)
+                .is_err(),
             "bead_id={TEST_BEAD_ID} case=zero_symbol_size_rejected"
         );
     }
@@ -1507,13 +1518,13 @@ mod tests {
 
         let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
         receiver
-            .process_parsed_packet(&p1)
+            .process_parsed_packet(&Cx::new(), &p1)
             .expect("first packet ok");
 
         // Same changeset_id, different K_source.
         let p2 = make_packet(id, 0, 1, 200, vec![0x42; 512]); // mismatch
         assert!(
-            receiver.process_parsed_packet(&p2).is_err(),
+            receiver.process_parsed_packet(&Cx::new(), &p2).is_err(),
             "bead_id={TEST_BEAD_ID} case=k_source_mismatch_rejected"
         );
     }
@@ -1525,13 +1536,13 @@ mod tests {
 
         let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
         receiver
-            .process_parsed_packet(&p1)
+            .process_parsed_packet(&Cx::new(), &p1)
             .expect("first packet ok");
 
         // Same changeset_id, different symbol_size.
         let p2 = make_packet(id, 0, 1, 100, vec![0x42; 1024]); // different size
         assert!(
-            receiver.process_parsed_packet(&p2).is_err(),
+            receiver.process_parsed_packet(&Cx::new(), &p2).is_err(),
             "bead_id={TEST_BEAD_ID} case=symbol_size_mismatch_rejected"
         );
     }
@@ -1543,7 +1554,9 @@ mod tests {
 
         let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]);
 
-        let r1 = receiver.process_parsed_packet(&p1).expect("first");
+        let r1 = receiver
+            .process_parsed_packet(&Cx::new(), &p1)
+            .expect("first");
         assert_eq!(
             r1,
             PacketResult::Accepted,
@@ -1551,7 +1564,9 @@ mod tests {
         );
 
         // Same ISI again → duplicate.
-        let r2 = receiver.process_parsed_packet(&p1).expect("duplicate");
+        let r2 = receiver
+            .process_parsed_packet(&Cx::new(), &p1)
+            .expect("duplicate");
         assert_eq!(
             r2,
             PacketResult::Duplicate,
@@ -1578,7 +1593,9 @@ mod tests {
         );
         let mut wire = packet.to_bytes().expect("encode packet");
         wire[48] ^= 0xFF;
-        let result = receiver.process_packet(&wire).expect("process packet");
+        let result = receiver
+            .process_packet(&Cx::new(), &wire)
+            .expect("process packet");
         assert_eq!(result, PacketResult::Erasure);
     }
 
@@ -1597,7 +1614,9 @@ mod tests {
         );
         packet.attach_auth_tag(&sender_key);
         let wire = packet.to_bytes().expect("encode auth packet");
-        let result = receiver.process_packet(&wire).expect("process packet");
+        let result = receiver
+            .process_packet(&Cx::new(), &wire)
+            .expect("process packet");
         assert_eq!(result, PacketResult::Erasure);
     }
 
@@ -1623,7 +1642,7 @@ mod tests {
         let parsed = ReplicationPacket::from_bytes(&wire).expect("decode legacy packet");
         assert_eq!(parsed.wire_version, ReplicationWireVersion::LegacyV1);
         let result = receiver
-            .process_packet(&wire)
+            .process_packet(&Cx::new(), &wire)
             .expect("process legacy packet");
         assert_eq!(result, PacketResult::Accepted);
     }
@@ -1638,7 +1657,7 @@ mod tests {
         let mut last_result = PacketResult::Accepted;
         for pkt in &packets {
             let result = receiver
-                .process_packet(pkt)
+                .process_packet(&Cx::new(), pkt)
                 .expect("bead_id={TEST_BEAD_ID} case=decode_at_k unexpected error");
             last_result = result;
         }
@@ -1664,9 +1683,13 @@ mod tests {
         let p1 = make_packet(changeset_id, 0, 2, 2, vec![0xA1; 64]);
         let p2 = make_packet(changeset_id, 0, 3, 2, vec![0xA2; 64]);
 
-        let r1 = receiver.process_parsed_packet(&p1).expect("first packet");
+        let r1 = receiver
+            .process_parsed_packet(&Cx::new(), &p1)
+            .expect("first packet");
         assert_eq!(r1, PacketResult::Accepted);
-        let r2 = receiver.process_parsed_packet(&p2).expect("second packet");
+        let r2 = receiver
+            .process_parsed_packet(&Cx::new(), &p2)
+            .expect("second packet");
         assert_eq!(r2, PacketResult::NeedMore);
 
         let audit = receiver.take_decode_audit_entries();
@@ -1715,15 +1738,17 @@ mod tests {
         let p1 = make_packet(changeset_id, 0, 1, 2, s1);
 
         assert_eq!(
-            receiver.process_parsed_packet(&p0).expect("p0"),
+            receiver.process_parsed_packet(&Cx::new(), &p0).expect("p0"),
             PacketResult::Accepted
         );
         assert_eq!(
-            receiver.process_parsed_packet(&p_repair).expect("repair"),
+            receiver
+                .process_parsed_packet(&Cx::new(), &p_repair)
+                .expect("repair"),
             PacketResult::NeedMore
         );
         assert_eq!(
-            receiver.process_parsed_packet(&p1).expect("p1"),
+            receiver.process_parsed_packet(&Cx::new(), &p1).expect("p1"),
             PacketResult::DecodeReady
         );
         assert_eq!(receiver.state(), ReceiverState::Applying);
@@ -1752,7 +1777,7 @@ mod tests {
         let packets = generate_sender_packets(page_size, &[1], 128);
 
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         // Apply and check that pages are correctly truncated.
@@ -1885,7 +1910,7 @@ mod tests {
         let packets = generate_sender_packets(page_size, &[5, 1, 3, 2, 4], 256);
 
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         if receiver.state() == ReceiverState::Applying {
@@ -1918,7 +1943,10 @@ mod tests {
 
             let mut decode_ready = false;
             for pkt in &packets {
-                if matches!(receiver.process_packet(pkt), Ok(PacketResult::DecodeReady)) {
+                if matches!(
+                    receiver.process_packet(&Cx::new(), pkt),
+                    Ok(PacketResult::DecodeReady)
+                ) {
                     decode_ready = true;
                     break;
                 }
@@ -1939,7 +1967,9 @@ mod tests {
         // Feed the same ISI multiple times within a single decoder session.
         let p1 = make_packet(id, 0, 0, 100, vec![0x42; 512]); // large enough that one symbol won't trigger decode
 
-        let r1 = receiver.process_parsed_packet(&p1).expect("first");
+        let r1 = receiver
+            .process_parsed_packet(&Cx::new(), &p1)
+            .expect("first");
         assert_eq!(
             r1,
             PacketResult::Accepted,
@@ -1947,7 +1977,9 @@ mod tests {
         );
 
         for _ in 0..5 {
-            let r = receiver.process_parsed_packet(&p1).expect("duplicate");
+            let r = receiver
+                .process_parsed_packet(&Cx::new(), &p1)
+                .expect("duplicate");
             assert_eq!(
                 r,
                 PacketResult::Duplicate,
@@ -1968,7 +2000,7 @@ mod tests {
     fn test_packet_reject_over_message_cap() {
         let mut receiver = ReplicationReceiver::new();
         let oversized = vec![0_u8; DEFAULT_RPC_MESSAGE_CAP_BYTES + 1];
-        let err = receiver.process_packet(&oversized).unwrap_err();
+        let err = receiver.process_packet(&Cx::new(), &oversized).unwrap_err();
         assert!(matches!(err, FrankenError::TooBig));
     }
 
@@ -1983,7 +2015,7 @@ mod tests {
         let packets = generate_sender_packets(page_size, &page_numbers, 512);
 
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         assert_eq!(
@@ -2049,7 +2081,10 @@ mod tests {
 
         let mut decode_count = 0_u32;
         for pkt in &all_packets {
-            if matches!(receiver.process_packet(pkt), Ok(PacketResult::DecodeReady)) {
+            if matches!(
+                receiver.process_packet(&Cx::new(), pkt),
+                Ok(PacketResult::DecodeReady)
+            ) {
                 decode_count += 1;
                 // Apply immediately and reset if needed.
                 if receiver.state() == ReceiverState::Applying {
@@ -2085,7 +2120,7 @@ mod tests {
 
         // Collect all packets.
         let mut wire_packets = Vec::new();
-        while let Some(packet) = sender.next_packet().expect("next") {
+        while let Some(packet) = sender.next_packet(&Cx::new()).expect("next") {
             wire_packets.push(packet.to_bytes().expect("encode"));
         }
 
@@ -2096,7 +2131,7 @@ mod tests {
         let mut last_result = PacketResult::Accepted;
         for pkt in &wire_packets {
             let result = receiver
-                .process_packet(pkt)
+                .process_packet(&Cx::new(), pkt)
                 .expect("bead_id={TEST_BEAD_ID} case=e2e_compliance unexpected error");
             last_result = result;
             if result == PacketResult::DecodeReady {
@@ -2289,7 +2324,9 @@ mod tests {
                     .expect("stream item");
                 let wire = delivered.symbol().data().to_vec();
                 if matches!(
-                    receiver.process_packet(&wire).expect("receiver process"),
+                    receiver
+                        .process_packet(&Cx::new(), &wire)
+                        .expect("receiver process"),
                     PacketResult::DecodeReady
                 ) {
                     decoded = true;
@@ -2346,7 +2383,7 @@ mod tests {
 
         let packets = generate_sender_packets(page_size, &[1, 2], 256);
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         // Should have transitioned through the state machine.

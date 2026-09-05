@@ -916,6 +916,8 @@ fn parse_decoded_snapshot_block(
 
 #[cfg(test)]
 mod tests {
+    use fsqlite_types::cx::Cx;
+
     use super::*;
     use crate::replication_sender::PageEntry;
 
@@ -1012,7 +1014,7 @@ mod tests {
 
         // Collect all packets.
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
         assert!(
@@ -1023,7 +1025,7 @@ mod tests {
         // Feed to receiver.
         let mut receiver = SnapshotReceiver::new(1, page_size);
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         assert_eq!(
@@ -1061,13 +1063,13 @@ mod tests {
         );
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
         let mut receiver = SnapshotReceiver::new(sender.num_blocks(), page_size);
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         assert_eq!(
@@ -1095,20 +1097,24 @@ mod tests {
         let mut sender = SnapshotSender::prepare(page_size, &mut pages, config).expect("prepare");
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
         let mut receiver = SnapshotReceiver::new(1, page_size);
 
         // Feed first packet twice.
-        let r1 = receiver.process_packet(&packets[0]).expect("first");
+        let r1 = receiver
+            .process_packet(&Cx::new(), &packets[0])
+            .expect("first");
         assert_ne!(
             r1,
             SnapshotPacketResult::Duplicate,
             "bead_id={TEST_BEAD_ID} case=first_not_dup"
         );
-        let r2 = receiver.process_packet(&packets[0]).expect("duplicate");
+        let r2 = receiver
+            .process_packet(&Cx::new(), &packets[0])
+            .expect("duplicate");
         assert_eq!(
             r2,
             SnapshotPacketResult::Duplicate,
@@ -1130,7 +1136,7 @@ mod tests {
         let mut sender = SnapshotSender::prepare(page_size, &mut pages, config).expect("prepare");
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
@@ -1138,7 +1144,9 @@ mod tests {
         let mut block_decoded_at = None;
 
         for (i, pkt) in packets.iter().enumerate() {
-            if let Ok(SnapshotPacketResult::BlockDecoded(_)) = receiver.process_packet(pkt) {
+            if let Ok(SnapshotPacketResult::BlockDecoded(_)) =
+                receiver.process_packet(&Cx::new(), pkt)
+            {
                 block_decoded_at = Some(i);
                 break;
             }
@@ -1176,13 +1184,13 @@ mod tests {
         let mut sender = SnapshotSender::prepare(page_size, &mut pages, config).expect("prepare");
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
         let mut receiver = SnapshotReceiver::new(sender.num_blocks(), page_size);
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
 
         assert_eq!(
@@ -1228,7 +1236,7 @@ mod tests {
         let mut sender = SnapshotSender::prepare(page_size, &mut pages, config).expect("prepare");
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
@@ -1236,7 +1244,7 @@ mod tests {
         let half = packets.len() / 2;
         let mut receiver1 = SnapshotReceiver::new(sender.num_blocks(), page_size);
         for pkt in &packets[..half] {
-            let _ = receiver1.process_packet(pkt);
+            let _ = receiver1.process_packet(&Cx::new(), pkt);
         }
 
         // Persist resume state.
@@ -1248,7 +1256,7 @@ mod tests {
 
         // Continue with remaining packets (and possibly some overlap).
         for pkt in &packets {
-            let _ = receiver2.process_packet(pkt);
+            let _ = receiver2.process_packet(&Cx::new(), pkt);
         }
 
         // Should be complete now.
@@ -1284,7 +1292,7 @@ mod tests {
         );
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
@@ -1292,7 +1300,7 @@ mod tests {
         assert_eq!(receiver.state(), SnapshotReceiverState::Waiting);
 
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
         assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
 
@@ -1382,13 +1390,13 @@ mod tests {
         assert!(sender.num_blocks() >= 1);
 
         let mut packets = Vec::new();
-        while let Some(pkt) = sender.next_packet() {
+        while let Some(pkt) = sender.next_packet(&Cx::new()).expect("next packet") {
             packets.push(pkt);
         }
 
         let mut receiver = SnapshotReceiver::new(sender.num_blocks(), page_size);
         for pkt in &packets {
-            let _ = receiver.process_packet(pkt);
+            let _ = receiver.process_packet(&Cx::new(), pkt);
         }
         assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
     }
