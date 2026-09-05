@@ -226,7 +226,7 @@ impl SegmentBuilder {
     /// # Errors
     ///
     /// Returns [`FrankenError::TypeMismatch`] if a pointer commit sequence does
-    /// not match `commit_seq`.
+    /// not match `commit_seq`. Invalid updates leave the builder unchanged.
     pub fn ingest_commit(
         &mut self,
         commit_seq: u64,
@@ -239,6 +239,10 @@ impl SegmentBuilder {
             "segment builder ingesting commit updates"
         );
 
+        // Validate the entire commit before changing pending entries or their
+        // sequence bounds. In particular, a valid prefix may replace keys
+        // already buffered by an earlier admission of the same commit.
+        let mut admitted = Vec::new();
         for (page, pointer) in updates {
             if pointer.commit_seq != commit_seq {
                 return Err(FrankenError::TypeMismatch {
@@ -246,8 +250,10 @@ impl SegmentBuilder {
                     actual: pointer.commit_seq.to_string(),
                 });
             }
-            self.pending
-                .insert((page.get(), pointer.commit_seq), pointer);
+            admitted.push((page, pointer));
+        }
+        for (page, pointer) in admitted {
+            self.pending.insert((page.get(), commit_seq), pointer);
         }
 
         self.start_seq = Some(match self.start_seq {
@@ -1413,6 +1419,45 @@ mod tests {
         let built_b = builder_b.flush().expect("flush").expect("segment");
         assert_eq!(built_a.segment.entries, built_b.segment.entries);
         assert_eq!(built_a.object_id, built_b.object_id);
+    }
+
+    #[test]
+    fn invalid_commit_admission_preserves_builder_and_next_segment() {
+        for seeded in [false, true] {
+            let mut builder = SegmentBuilder::new(2).expect("builder");
+            if seeded {
+                builder
+                    .ingest_commit(
+                        10,
+                        [(page(1), pointer(10, 0x10, PatchKind::FullImage, None))],
+                    )
+                    .expect("seed");
+            }
+            let mut control = builder.clone();
+            // The valid prefix overwrites an existing key in the seeded case;
+            // a new key then reaches the auto-flush threshold before a bad
+            // final pointer rejects the entire commit.
+            let rejected = [
+                (page(1), pointer(10, 0x20, PatchKind::FullImage, None)),
+                (page(2), pointer(10, 0x21, PatchKind::FullImage, None)),
+                (page(3), pointer(11, 0x22, PatchKind::FullImage, None)),
+            ];
+            assert!(matches!(
+                builder.ingest_commit(10, rejected),
+                Err(FrankenError::TypeMismatch { .. })
+            ));
+            assert_eq!(builder, control, "failed admission must preserve all state");
+            let retry = [
+                (page(1), pointer(20, 0x30, PatchKind::FullImage, None)),
+                (page(2), pointer(20, 0x31, PatchKind::FullImage, None)),
+            ];
+            let actual = builder.ingest_commit(20, retry).expect("retry");
+            let expected = control.ingest_commit(20, retry).expect("control");
+            assert!(actual.is_some(), "valid retry must still auto-flush");
+            assert_eq!(actual, expected, "rejected bytes must not enter the segment");
+            assert_eq!(builder, control);
+            assert!(builder.flush().expect("already flushed").is_none());
+        }
     }
 
     fn run_e2e_path_case() {
