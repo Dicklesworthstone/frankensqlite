@@ -7500,6 +7500,11 @@ struct PendingReturnedAllocations {
     from_freelist: Vec<PageNumber>,
     from_eof: Vec<PageNumber>,
     page_lease: Vec<PageNumber>,
+    /// A surviving savepoint still owns these reservations in the transaction
+    /// lists. The attempt describes their prospective return on publication;
+    /// failure or cancellation must neither return them globally nor append
+    /// duplicate reservations to the transaction.
+    retained_by_transaction: bool,
 }
 
 impl PendingReturnedAllocations {
@@ -8217,10 +8222,6 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                             &mut inner.freelist,
                             self.allocated_from_freelist.drain(..),
                         );
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            not_committed.returned_allocations.from_freelist,
-                        );
                         // Deferred cleanup may run after later transactions
                         // reserved higher EOF pages. Never rewind next_page;
                         // quarantine every abandoned EOF reservation in the
@@ -8230,14 +8231,20 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                             self.allocated_from_eof.drain(..),
                         );
                         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            not_committed.returned_allocations.from_eof,
-                        );
-                        return_pages_to_freelist(
-                            &mut inner.freelist,
-                            not_committed.returned_allocations.page_lease,
-                        );
+                        if !not_committed.returned_allocations.retained_by_transaction {
+                            return_pages_to_freelist(
+                                &mut inner.freelist,
+                                not_committed.returned_allocations.from_freelist,
+                            );
+                            return_pages_to_freelist(
+                                &mut inner.freelist,
+                                not_committed.returned_allocations.from_eof,
+                            );
+                            return_pages_to_freelist(
+                                &mut inner.freelist,
+                                not_committed.returned_allocations.page_lease,
+                            );
+                        }
                         DisownedPageReclaimAttempt::<F>::restore_pages(
                             &mut inner,
                             not_committed.reclaimed_abandoned_reservations,
@@ -20433,7 +20440,23 @@ where
         pending
     }
 
-    fn drain_unstaged_allocated_pages(&mut self) -> PendingReturnedAllocations {
+    fn prepare_unstaged_allocations(&mut self) -> PendingReturnedAllocations {
+        if !self.savepoint_stack.is_empty() {
+            // Savepoint allocation frontiers are prefixes of these lists.
+            // Keep the complete lists, including their order, until a durable
+            // commit ends the savepoints. A dropped preparation future then
+            // leaves every reservation privately owned and rollback can still
+            // identify the exact post-savepoint suffix.
+            let unstaged = |page: &&PageNumber| {
+                !self.write_set.contains_key(page) && !self.contains_freed_page(**page)
+            };
+            return PendingReturnedAllocations {
+                from_freelist: self.allocated_from_freelist.iter().filter(unstaged).copied().collect(),
+                from_eof: self.allocated_from_eof.iter().filter(unstaged).copied().collect(),
+                page_lease: self.page_lease.clone(),
+                retained_by_transaction: true,
+            };
+        }
         let mut unstaged = PendingReturnedAllocations::default();
         let write_set = &self.write_set;
         let freed_pages = &self.freed_pages;
@@ -20458,6 +20481,7 @@ where
             keep
         });
 
+        unstaged.page_lease = std::mem::take(&mut self.page_lease);
         unstaged
     }
 
@@ -23184,12 +23208,14 @@ where
         })?;
         attempt.complete_not_committed_global()?;
         let not_committed = attempt.take_not_committed_state()?;
-        self.allocated_from_freelist
-            .extend(not_committed.returned_allocations.from_freelist);
-        self.allocated_from_eof
-            .extend(not_committed.returned_allocations.from_eof);
-        self.page_lease
-            .extend(not_committed.returned_allocations.page_lease);
+        if !not_committed.returned_allocations.retained_by_transaction {
+            self.allocated_from_freelist
+                .extend(not_committed.returned_allocations.from_freelist);
+            self.allocated_from_eof
+                .extend(not_committed.returned_allocations.from_eof);
+            self.page_lease
+                .extend(not_committed.returned_allocations.page_lease);
+        }
         self.restore_pending_freed_pages(not_committed.pending_freed_pages);
         self.reclaimed_abandoned_reservations
             .extend(not_committed.reclaimed_abandoned_reservations);
@@ -24286,9 +24312,6 @@ where
                     }
                     return Err(FrankenError::BusyRecovery);
                 }
-                // Return any unused lease pages to the freelist so they can
-                // be reused by other transactions.
-                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 let notify_writer_idle = coordinated_transaction_exit(
                     &self.group_commit_queue,
                     cx,
@@ -24298,11 +24321,14 @@ where
                 )
                 .await?;
                 debug_assert!(!notify_writer_idle);
+                // Keep reservations private until the fallible exit completes.
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
                 drop(inner);
                 self.committed = true;
                 self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
+                self.clear_savepoints();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
                 self.scratch_arena.reset();
@@ -24358,7 +24384,6 @@ where
                     }
                     return Err(FrankenError::BusyRecovery);
                 }
-                self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
                 let notify_writer_idle = coordinated_transaction_exit(
                     &self.group_commit_queue,
                     cx,
@@ -24367,6 +24392,7 @@ where
                     &logical_exit_claim,
                 )
                 .await?;
+                self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
                 drop(inner);
                 if notify_writer_idle {
                     self.writer_idle.notify_one();
@@ -24375,6 +24401,7 @@ where
                 self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
+                self.clear_savepoints();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
                 self.scratch_arena.reset();
@@ -24450,8 +24477,8 @@ where
                 return Err(FrankenError::BusyRecovery);
             }
             let committed_db_size = self.committed_db_size_with_inner(&inner);
-            let mut returned_allocations = self.drain_unstaged_allocated_pages();
-            returned_allocations.page_lease.append(&mut self.page_lease);
+            let mut returned_allocations = self.prepare_unstaged_allocations();
+            let retained_allocations = returned_allocations.retained_by_transaction;
             let pending_returned_pages = returned_allocations.all_pages();
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
@@ -24707,10 +24734,12 @@ where
                                 self.restore_not_committed_wal_attempt()?;
                             } else {
                                 self.restore_pending_freed_pages(pending_freed);
-                                return_pages_to_freelist(
-                                    &mut inner.freelist,
-                                    pending_returned_pages,
-                                );
+                                if !retained_allocations {
+                                    return_pages_to_freelist(
+                                        &mut inner.freelist,
+                                        pending_returned_pages,
+                                    );
+                                }
                             }
                             return Err(e);
                         }
@@ -24751,10 +24780,12 @@ where
                                 self.restore_not_committed_wal_attempt()?;
                             } else {
                                 self.restore_pending_freed_pages(pending_freed);
-                                return_pages_to_freelist(
-                                    &mut inner.freelist,
-                                    pending_returned_pages,
-                                );
+                                if !retained_allocations {
+                                    return_pages_to_freelist(
+                                        &mut inner.freelist,
+                                        pending_returned_pages,
+                                    );
+                                }
                             }
                             return Err(e);
                         }
@@ -24883,10 +24914,9 @@ where
                 let t_journal_commit_start =
                     pager_commit_profile_start(pager_commit_profile_active);
                 // The freelist-alias check needs the transaction's FULL set of
-                // freelist pops. `drain_unstaged_allocated_pages` (Phase A) has
-                // already moved never-written allocations out of
-                // `allocated_from_freelist` into `pending_returned_pages`, so
-                // restore both when reconstructing the begin-time freelist view
+                // freelist pops. Phase A may have moved never-written
+                // allocations into `pending_returned_pages` (unless savepoints
+                // retain ownership), so include both when reconstructing the view
                 // (EOF-origin entries are filtered out by the db-size bound).
                 let mut alias_check_restored = self.allocated_from_freelist.clone();
                 alias_check_restored.extend_from_slice(&pending_returned_pages);
@@ -25194,6 +25224,7 @@ where
                 self.reclaimed_abandoned_reservations.clear();
                 self.maintenance_lease.take();
                 self.reset_current_write_set_accounting();
+                self.clear_savepoints();
                 self.finished = true;
                 // IMPL-3 / AG-4B: reset scratch arena after successful commit so
                 // transient per-transaction allocations do not linger. The arena
@@ -25213,7 +25244,9 @@ where
                 // they leaked into inner.freelist regardless of commit outcome;
                 // now we only promote on success and restore on failure.
                 self.restore_pending_freed_pages(pending_freed);
-                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                if !retained_allocations {
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                }
                 drop(inner);
             }
             match commit_result {
@@ -25385,8 +25418,8 @@ where
             // inner.freelist. The serializer receives pending_free_pages so
             // inner.freelist remains untouched until Phase C (after successful
             // commit).
-            let mut returned_allocations = self.drain_unstaged_allocated_pages();
-            returned_allocations.page_lease.append(&mut self.page_lease);
+            let mut returned_allocations = self.prepare_unstaged_allocations();
+            let retained_allocations = returned_allocations.retained_by_transaction;
             let pending_returned_pages = returned_allocations.all_pages();
             let mut pending_free_pages = pending_returned_pages.clone();
             pending_free_pages.extend(self.freed_pages.iter().copied());
@@ -25525,10 +25558,12 @@ where
                                 self.restore_not_committed_wal_attempt()?;
                             } else {
                                 self.restore_pending_freed_pages(pending_freed);
-                                return_pages_to_freelist(
-                                    &mut inner.freelist,
-                                    pending_returned_pages,
-                                );
+                                if !retained_allocations {
+                                    return_pages_to_freelist(
+                                        &mut inner.freelist,
+                                        pending_returned_pages,
+                                    );
+                                }
                             }
                             return Err(e);
                         }
@@ -25574,10 +25609,12 @@ where
                                 self.restore_not_committed_wal_attempt()?;
                             } else {
                                 self.restore_pending_freed_pages(pending_freed);
-                                return_pages_to_freelist(
-                                    &mut inner.freelist,
-                                    pending_returned_pages,
-                                );
+                                if !retained_allocations {
+                                    return_pages_to_freelist(
+                                        &mut inner.freelist,
+                                        pending_returned_pages,
+                                    );
+                                }
                             }
                             return Err(e);
                         }
@@ -25681,7 +25718,9 @@ where
                         .await
                         {
                             self.restore_pending_freed_pages(pending_freed);
-                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            if !retained_allocations {
+                                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            }
                             return Err(e);
                         }
                     }
@@ -25834,6 +25873,7 @@ where
                 self.allocated_from_freelist.clear();
                 self.allocated_from_durable_freelist.clear();
                 self.allocated_from_eof.clear();
+                self.page_lease.clear();
                 self.clear_savepoints();
                 self.rolled_back_pages.clear();
                 self.writes_observed = false;
@@ -25865,7 +25905,9 @@ where
                 // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
                 // commit failure so rollback can still see them.
                 self.restore_pending_freed_pages(pending_freed);
-                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                if !retained_allocations {
+                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                }
                 drop(inner);
                 commit_result?;
                 unreachable!()
@@ -27849,6 +27891,7 @@ mod tests {
             from_freelist: vec![page_four, page_five],
             from_eof: vec![page_six],
             page_lease: vec![page_five],
+            retained_by_transaction: false,
         };
         let delta = PendingGroupCommitAllocatorDelta::new(
             vec![page_five, page_five],
@@ -35062,6 +35105,70 @@ mod tests {
     }
 
     #[test]
+    fn test_savepoint_journal_cancelled_commit_preparation_preserves_ownership() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let mut seed = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let header = seed.get_page(&cx, PageNumber::ONE).await.unwrap();
+            seed.write_page_data(&cx, PageNumber::ONE, header).await.unwrap();
+            seed.commit(&cx).await.unwrap();
+            pager.set_write_set_page_limit(4).unwrap();
+
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let reserved_before = txn.allocate_page(&cx).await.unwrap();
+            txn.savepoint(&cx, "outer").unwrap();
+            let written_after = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page_data(&cx, written_after, PageData::from_vec(sample_page(0x22)))
+                .await.unwrap();
+            let owned_before_commit = txn.allocated_from_eof.clone();
+            let lease_before_commit = txn.page_lease.clone();
+            let shared_before_commit = txn.inner.lock().unwrap().freelist.clone();
+            assert!(txn.inner.lock().unwrap().db_size >= 1);
+
+            // Force page-one preparation to await the real database-file lock.
+            // Polling and dropping the future then cancels after allocation
+            // classification, before journal recovery or durable publication.
+            txn.cache = Arc::new(ShardedPageCache::with_pool(txn.pool.clone(), PageSize::DEFAULT));
+            let db_file = Arc::clone(&txn.db_file);
+            let held_file = shared_db_file_write(&db_file, &cx).await.unwrap();
+            let mut commit = Box::pin(txn.commit(&cx));
+            std::future::poll_fn(|poll_cx| match commit.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("commit must suspend at the held file lock: {result:?}")
+                }
+            }).await;
+            drop(commit);
+            drop(held_file);
+            assert!(txn.savepoint_stack[0].commit_snapshot.is_some());
+            assert!(!txn.has_pending_recovery_barrier());
+            assert_eq!(txn.allocated_from_eof, owned_before_commit);
+            assert_eq!(txn.page_lease, lease_before_commit);
+            assert_eq!(txn.inner.lock().unwrap().freelist, shared_before_commit);
+
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            assert_eq!(txn.allocated_from_eof, vec![reserved_before]);
+            assert!(txn.savepoint_quarantined_allocations.contains(&written_after));
+            assert!(txn.write_set.is_empty());
+            assert!(txn.write_pages_sorted.is_empty());
+            assert!(txn.accounted_write_pages.is_empty());
+            assert!(txn.freed_pages.is_empty());
+            assert_eq!(pager.write_set_stats().unwrap().current_dirty_pages, 0);
+            assert!(!txn.inner.lock().unwrap().freelist.contains(&reserved_before));
+
+            // A live peer cannot receive either the preserved prefix or suffix.
+            let mut peer = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let peer_page = peer.allocate_page(&cx).await.unwrap();
+            assert_ne!(peer_page, reserved_before);
+            assert_ne!(peer_page, written_after);
+            peer.rollback(&cx).await.unwrap();
+            txn.rollback_to_savepoint(&cx, "outer").unwrap();
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_savepoint_journal_tracks_mutations_not_resident_pages() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
@@ -35106,6 +35213,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
             let cx = Cx::new();
+            pager.set_write_set_page_limit(1).unwrap();
             let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
             let page = txn.allocate_page(&cx).await.unwrap();
             txn.write_page_data(&cx, page, PageData::from_vec(sample_page(0x11)))
