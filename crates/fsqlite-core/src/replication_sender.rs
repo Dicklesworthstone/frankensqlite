@@ -12,7 +12,7 @@ use std::fmt;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::source_block_partition::K_MAX;
 
@@ -66,6 +66,24 @@ pub const MTU_SAFE_SYMBOL_SIZE: u16 = 1400;
 
 /// Default maximum ISI multiplier for streaming stop.
 pub const DEFAULT_MAX_ISI_MULTIPLIER: u32 = 2;
+
+/// Decoder admission limit in the locked asupersync 0.4.10 codec.
+/// Keep send schedules within this limit even though the wire has 24 ESI bits.
+pub(crate) const MAX_REPLICATION_ESI: u32 = 1_000_000;
+
+pub(crate) fn validate_codec_esi(esi: u32) -> Result<()> {
+    if esi > MAX_REPLICATION_ESI {
+        return Err(FrankenError::OutOfRange {
+            what: "replication ESI".to_owned(),
+            value: esi.to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn symbol_schedule_end(k: u32, multiplier: u32) -> u32 {
+    k.saturating_mul(multiplier).min(MAX_REPLICATION_ESI + 1)
+}
 
 /// Default hard cap for a single remote message (4 MiB, §4.19.6).
 pub const DEFAULT_RPC_MESSAGE_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -556,7 +574,6 @@ pub fn derive_seed_from_changeset_id(id: &ChangesetId) -> u64 {
 pub(crate) const MAX_REPAIR_WORK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Validate dimensions before constructing the codec's constraint matrix.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn repair_parameters(
     k: usize,
     t: usize,
@@ -571,17 +588,26 @@ pub(crate) fn repair_parameters(
             value: t.to_string(),
         });
     }
-    let params = SystematicParams::try_for_source_block(k, t).map_err(|error| {
-        FrankenError::OutOfRange {
+    let params =
+        SystematicParams::try_for_source_block(k, t).map_err(|error| FrankenError::OutOfRange {
             what: "RaptorQ source block".to_owned(),
             value: format!("{error:?}"),
-        }
-    })?;
+        })?;
     // Allow for matrix copies, equations, RHS and reconstructed symbols. This
     // admission estimate is deliberately conservative, not allocator telemetry.
-    let rows = received.max(k).checked_add(params.l).ok_or(FrankenError::TooBig)?;
-    let width = params.l.checked_add(t).and_then(|v| v.checked_add(64)).ok_or(FrankenError::TooBig)?;
-    let work = rows.checked_mul(width).and_then(|v| v.checked_mul(8)).ok_or(FrankenError::TooBig)?;
+    let rows = received
+        .max(k)
+        .checked_add(params.l)
+        .ok_or(FrankenError::TooBig)?;
+    let width = params
+        .l
+        .checked_add(t)
+        .and_then(|v| v.checked_add(64))
+        .ok_or(FrankenError::TooBig)?;
+    let work = rows
+        .checked_mul(width)
+        .and_then(|v| v.checked_mul(8))
+        .ok_or(FrankenError::TooBig)?;
     if work > max_bytes {
         return Err(FrankenError::TooBig);
     }
@@ -605,6 +631,7 @@ impl RepairEncoder {
         esi: u32,
     ) -> Result<Vec<u8>> {
         cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        validate_codec_esi(esi)?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             use asupersync::raptorq::systematic::SystematicEncoder;
@@ -613,10 +640,12 @@ impl RepairEncoder {
             let t = usize::from(t);
             let params = repair_parameters(k, t, k, MAX_REPAIR_WORK_BYTES)?;
             // Validate ESI before allocation and use its canonical wire value.
-            params.rfc_repair_equation(esi).map_err(|error| FrankenError::OutOfRange {
-                what: "repair ESI".to_owned(),
-                value: format!("{error:?}"),
-            })?;
+            params
+                .rfc_repair_equation(esi)
+                .map_err(|error| FrankenError::OutOfRange {
+                    what: "repair ESI".to_owned(),
+                    value: format!("{error:?}"),
+                })?;
             if bytes.len().div_ceil(t) != k {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "repair source length does not match K".to_owned(),
@@ -637,8 +666,12 @@ impl RepairEncoder {
                 cx.checkpoint().map_err(|_| FrankenError::Abort)?;
                 self.encoder = Some(encoder);
             }
-            let symbol = self.encoder.as_ref().expect("initialized encoder")
-                .try_repair_symbol(esi).map_err(|error| FrankenError::OutOfRange {
+            let symbol = self
+                .encoder
+                .as_ref()
+                .expect("initialized encoder")
+                .try_repair_symbol(esi)
+                .map_err(|error| FrankenError::OutOfRange {
                     what: "repair ESI".to_owned(),
                     value: format!("{error:?}"),
                 })?;
@@ -648,7 +681,9 @@ impl RepairEncoder {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = (bytes, k, t, esi);
-            Err(FrankenError::NotImplemented("RaptorQ repair encoding on wasm32".to_owned()))
+            Err(FrankenError::NotImplemented(
+                "RaptorQ repair encoding on wasm32".to_owned(),
+            ))
         }
     }
 }
@@ -702,6 +737,11 @@ fn canonicalize_changeset_pages(pages: &mut [PageEntry]) {
 ///
 /// Returns error if `page_size` is 0 or pages are empty.
 pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u8>> {
+    validate_changeset_pages(page_size, pages)?;
+    encode_validated_changeset(page_size, pages)
+}
+
+pub(crate) fn validate_changeset_pages(page_size: u32, pages: &[PageEntry]) -> Result<()> {
     if pages.is_empty() {
         return Err(FrankenError::OutOfRange {
             what: "pages".to_owned(),
@@ -736,8 +776,10 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
         }
     }
 
-    canonicalize_changeset_pages(pages);
+    Ok(())
+}
 
+fn encode_validated_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u8>> {
     let n_pages = u32::try_from(pages.len()).map_err(|_| FrankenError::OutOfRange {
         what: "n_pages".to_owned(),
         value: pages.len().to_string(),
@@ -777,6 +819,7 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
         what: "changeset total_len".to_owned(),
         value: total_len.to_string(),
     })?;
+    canonicalize_changeset_pages(pages);
     let mut buf = Vec::with_capacity(buf_cap);
     buf.extend_from_slice(&header.to_bytes());
 
@@ -812,93 +855,82 @@ pub struct ChangesetShard {
     pub k_source: u32,
 }
 
-/// Shard a changeset into pieces that each fit within K_MAX source symbols.
-///
-/// If the changeset fits in one block, returns a single shard.
-///
-/// Large changesets use deterministic contiguous byte-range sharding:
-/// - max shard payload = `K_MAX * T_replication`
-/// - shard `i` = bytes `[i * max_payload .. min((i+1) * max_payload, F))`
-/// - each shard gets its own `changeset_id` and seed derived from shard bytes
-///
-/// # Errors
-///
-/// Returns error if `symbol_size` is 0.
-pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec<ChangesetShard>> {
-    let t = u64::from(symbol_size);
-    let f = u64::try_from(changeset_bytes.len()).map_err(|_| FrankenError::OutOfRange {
-        what: "changeset_bytes".to_owned(),
-        value: changeset_bytes.len().to_string(),
-    })?;
-    let k_source_total = compute_k_source(changeset_bytes.len(), symbol_size)?;
-
-    if k_source_total <= u64::from(K_MAX) {
-        let id = compute_changeset_id(&changeset_bytes);
-        let seed = derive_seed_from_changeset_id(&id);
-        let k_source = u32::try_from(k_source_total).expect("checked <= K_MAX");
-        info!(
-            bead_id = BEAD_ID,
-            k_source,
-            symbol_size,
-            changeset_len = changeset_bytes.len(),
-            "single-shard changeset"
-        );
-        return Ok(vec![ChangesetShard {
-            changeset_bytes,
-            changeset_id: id,
-            seed,
-            k_source,
-        }]);
+/// Largest whole-page block admitted by both the wire and dense codec budget.
+/// Reserve room for 2K received equations, so repair decoding has useful slack.
+pub(crate) fn max_pages_per_repair_block(page_size: u32, symbol_size: u16) -> Result<usize> {
+    ReplicationPacket::validate_symbol_size(usize::from(symbol_size))?;
+    if page_size == 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "page_size".to_owned(),
+            value: "0".to_owned(),
+        });
     }
+    let t = usize::from(symbol_size);
+    let (mut lower, mut upper) = (0_usize, K_MAX as usize);
+    while lower < upper {
+        let k = lower + (upper - lower).div_ceil(2);
+        if repair_parameters(k, t, 2 * k, MAX_REPAIR_WORK_BYTES).is_ok() {
+            lower = k;
+        } else {
+            upper = k - 1;
+        }
+    }
+    let max_bytes = lower.checked_mul(t).ok_or(FrankenError::TooBig)?;
+    let entry_size = usize::try_from(page_size)
+        .ok()
+        .and_then(|size| size.checked_add(12))
+        .ok_or(FrankenError::TooBig)?;
+    let pages = max_bytes.saturating_sub(CHANGESET_HEADER_SIZE) / entry_size;
+    if pages == 0 {
+        return Err(FrankenError::TooBig);
+    }
+    Ok(pages)
+}
 
-    // Need to shard: split the changeset bytes into chunks
-    // Each chunk gets its own changeset_id and seed.
-    let max_chunk = u64::from(K_MAX) * t;
-    let n_shards = f.div_ceil(max_chunk);
-
-    info!(
-        bead_id = BEAD_ID,
-        n_shards,
-        k_source_total,
-        symbol_size,
-        changeset_len = changeset_bytes.len(),
-        "sharding large changeset"
-    );
-
-    let n_shards_usize = usize::try_from(n_shards).map_err(|_| FrankenError::OutOfRange {
-        what: "n_shards".to_owned(),
-        value: n_shards.to_string(),
-    })?;
-    let mut shards = Vec::with_capacity(n_shards_usize);
-    let max_chunk_usize = usize::try_from(max_chunk).map_err(|_| FrankenError::OutOfRange {
-        what: "max_chunk".to_owned(),
-        value: max_chunk.to_string(),
-    })?;
-
-    for (i, chunk) in changeset_bytes.chunks(max_chunk_usize).enumerate() {
-        let shard_bytes = chunk.to_vec();
-        let id = compute_changeset_id(&shard_bytes);
-        let seed = derive_seed_from_changeset_id(&id);
-        let k = compute_k_source(chunk.len(), symbol_size)?;
-        let k_source = u32::try_from(k).expect("each shard <= K_MAX symbols");
-
-        debug!(
-            bead_id = BEAD_ID,
-            shard_index = i,
-            k_source,
-            shard_len = chunk.len(),
-            "created changeset shard"
-        );
-
+pub(crate) fn encode_replication_blocks(
+    page_size: u32,
+    pages: &mut [PageEntry],
+    symbol_size: u16,
+    max_blocks: usize,
+) -> Result<Vec<ChangesetShard>> {
+    validate_changeset_pages(page_size, pages)?;
+    let max_pages = max_pages_per_repair_block(page_size, symbol_size)?;
+    let block_count = pages.len().div_ceil(max_pages);
+    if block_count > max_blocks || u32::try_from(pages.len()).is_err() {
+        return Err(FrankenError::TooBig);
+    }
+    // Every fallible dimension/input check precedes mutation of caller pages.
+    canonicalize_changeset_pages(pages);
+    let mut shards = Vec::with_capacity(block_count);
+    for block_pages in pages.chunks_mut(max_pages) {
+        let changeset_bytes = encode_validated_changeset(page_size, block_pages)?;
+        let changeset_id = compute_changeset_id(&changeset_bytes);
+        let seed = derive_seed_from_changeset_id(&changeset_id);
+        let k_source = u32::try_from(changeset_bytes.len().div_ceil(usize::from(symbol_size)))
+            .map_err(|_| FrankenError::TooBig)?;
         shards.push(ChangesetShard {
-            changeset_bytes: shard_bytes,
-            changeset_id: id,
+            changeset_bytes,
+            changeset_id,
             seed,
             k_source,
         });
     }
-
     Ok(shards)
+}
+
+/// Split a valid changeset at whole-page boundaries into independently decodable
+/// objects, each with its own complete header, identity and codec work budget.
+///
+/// # Errors
+/// Returns malformed-input, unsupported dimensions or codec-budget errors.
+pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec<ChangesetShard>> {
+    let (header, mut pages) = crate::replication_receiver::parse_changeset_pages(&changeset_bytes)?;
+    if usize::try_from(header.total_len).ok() != Some(changeset_bytes.len()) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "trailing bytes after changeset".to_owned(),
+        });
+    }
+    encode_replication_blocks(header.page_size, &mut pages, symbol_size, usize::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,14 +1060,14 @@ impl ReplicationPacket {
     ///
     /// # Errors
     ///
-    /// Returns error if symbol size exceeds `MAX_REPLICATION_SYMBOL_SIZE`.
+    /// Returns error if symbol size is zero or exceeds `MAX_REPLICATION_SYMBOL_SIZE`.
     pub fn validate_symbol_size(symbol_size: usize) -> Result<()> {
-        if symbol_size > MAX_REPLICATION_SYMBOL_SIZE {
+        if symbol_size == 0 || symbol_size > MAX_REPLICATION_SYMBOL_SIZE {
             error!(
                 bead_id = BEAD_ID,
                 symbol_size,
                 max = MAX_REPLICATION_SYMBOL_SIZE,
-                "symbol size exceeds UDP hard wire limit"
+                "symbol size is outside the nonzero UDP wire range"
             );
             return Err(FrankenError::OutOfRange {
                 what: "symbol_size".to_owned(),
@@ -1275,8 +1307,21 @@ pub enum SenderState {
 pub struct SenderConfig {
     /// Symbol size for replication transport.
     pub symbol_size: u16,
-    /// Maximum ISI = `max_isi_multiplier * k_source`.
+    /// Nonzero symbol-count multiplier, capped at the codec's ESI admission limit.
     pub max_isi_multiplier: u32,
+}
+
+impl SenderConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ReplicationPacket::validate_symbol_size(usize::from(self.symbol_size))?;
+        if self.max_isi_multiplier == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "max_isi_multiplier".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for SenderConfig {
@@ -1343,10 +1388,9 @@ impl ReplicationSender {
             )));
         }
 
-        ReplicationPacket::validate_symbol_size(usize::from(config.symbol_size))?;
+        config.validate()?;
 
-        let changeset_bytes = encode_changeset(page_size, pages)?;
-        let shards = shard_changeset(changeset_bytes, config.symbol_size)?;
+        let shards = encode_replication_blocks(page_size, pages, config.symbol_size, usize::MAX)?;
 
         info!(
             bead_id = BEAD_ID,
@@ -1411,9 +1455,7 @@ impl ReplicationSender {
         }
 
         let shard = &session.shards[session.current_shard];
-        let max_isi = shard
-            .k_source
-            .saturating_mul(session.config.max_isi_multiplier);
+        let max_isi = symbol_schedule_end(shard.k_source, session.config.max_isi_multiplier);
 
         if session.current_isi >= max_isi {
             // Move to next shard.
@@ -1453,10 +1495,17 @@ impl ReplicationSender {
             // Remaining bytes are zero-padded (per RFC 6330 symbol alignment).
             data
         } else {
-            session.repair_encoder.symbol(cx, &shard.changeset_bytes, shard.k_source, session.config.symbol_size, isi)?
+            session.repair_encoder.symbol(
+                cx,
+                &shard.changeset_bytes,
+                shard.k_source,
+                session.config.symbol_size,
+                isi,
+            )?
         };
 
-        let r_repair = shard.k_source.saturating_mul(session.config.max_isi_multiplier).saturating_sub(shard.k_source);
+        let r_repair = symbol_schedule_end(shard.k_source, session.config.max_isi_multiplier)
+            .saturating_sub(shard.k_source);
         let packet = ReplicationPacket::new_v2(
             ReplicationPacketV2Header {
                 changeset_id: shard.changeset_id,
@@ -1523,6 +1572,151 @@ mod tests {
 
     const TEST_BEAD_ID: &str = "bd-1hi.13";
     const TEST_BEAD_BD_1SQU: &str = "bd-1squ";
+
+    #[test]
+    fn test_sender_cancel_preserves_next_symbol() {
+        let cx = Cx::new();
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        let mut pages = make_pages(128, &[1]);
+        let mut sender = ReplicationSender::new();
+        sender
+            .prepare(
+                128,
+                &mut pages,
+                SenderConfig {
+                    symbol_size: 128,
+                    max_isi_multiplier: 2,
+                },
+            )
+            .expect("prepare");
+        sender.start_streaming().expect("stream");
+        assert!(matches!(
+            sender.next_packet(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(sender.session.as_ref().expect("session").current_isi, 0);
+        let first = sender.next_packet(&cx).expect("packet").expect("source");
+        for _ in 1..first.k_source {
+            sender.next_packet(&cx).expect("source");
+        }
+        assert!(matches!(
+            sender.next_packet(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(
+            sender.session.as_ref().expect("session").current_isi,
+            first.k_source
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(
+            sender
+                .next_packet(&cx)
+                .expect("repair")
+                .expect("packet")
+                .esi,
+            first.k_source
+        );
+        #[cfg(target_arch = "wasm32")]
+        assert!(matches!(
+            sender.next_packet(&cx),
+            Err(FrankenError::NotImplemented(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_sender_repair_budget_failure_emits_no_packet_or_advancement() {
+        let cx = Cx::new();
+        let mut pages = make_pages(2048, &[1]);
+        let original = pages.clone();
+        let mut sender = ReplicationSender::new();
+        assert!(matches!(
+            sender.prepare(
+                2048,
+                &mut pages,
+                SenderConfig {
+                    symbol_size: 1,
+                    max_isi_multiplier: 2,
+                }
+            ),
+            Err(FrankenError::TooBig)
+        ));
+        assert_eq!(pages, original);
+        assert_eq!(sender.state(), SenderState::Idle);
+        assert!(sender.session.is_none());
+
+        // The codec also fails closed if called directly with a too-large
+        // block; no repair payload or cached encoder survives either attempt.
+        let bytes = encode_changeset(2048, &mut pages).expect("changeset");
+        let k = u32::try_from(bytes.len()).expect("K with one-byte symbols");
+        let mut encoder = RepairEncoder::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                encoder.symbol(&cx, &bytes, k, 1, k),
+                Err(FrankenError::TooBig)
+            ));
+            assert!(encoder.encoder.is_none());
+        }
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=encoder_budget_refusal k={k} source_packets=0 repair_packets=0"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_repair_invalid_dimensions_and_esi_fail_before_allocation() {
+        let cx = Cx::new();
+        let mut encoder = RepairEncoder::default();
+        for (k, t, esi) in [
+            (0, 1, 0),
+            (1, 0, 1),
+            (1, 1, 0),
+            (1, 1, u32::MAX),
+            (K_MAX + 1, 1, K_MAX + 1),
+        ] {
+            assert!(encoder.symbol(&cx, &[7], k, t, esi).is_err());
+            assert!(encoder.encoder.is_none());
+        }
+        assert!(matches!(
+            repair_parameters(1, 1, usize::MAX, usize::MAX),
+            Err(FrankenError::TooBig)
+        ));
+        assert!(matches!(
+            repair_parameters(1, usize::MAX, 1, usize::MAX),
+            Err(FrankenError::TooBig)
+        ));
+        let valid = encoder
+            .symbol(&cx, &[7], 1, 1, 1)
+            .expect("valid encoder after errors");
+        assert_eq!(valid.len(), 1);
+        assert!(encoder.encoder.is_some());
+    }
+
+    #[test]
+    fn test_sender_zero_schedule_rejected_without_mutating_pages() {
+        let mut pages = make_pages(128, &[3, 1, 2]);
+        let before = pages.clone();
+        let mut sender = ReplicationSender::new();
+        assert!(matches!(
+            sender.prepare(
+                128,
+                &mut pages,
+                SenderConfig {
+                    symbol_size: 128,
+                    max_isi_multiplier: 0,
+                }
+            ),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert_eq!(pages, before);
+        assert_eq!(sender.state(), SenderState::Idle);
+        assert!(sender.session.is_none());
+        assert_eq!(
+            symbol_schedule_end(K_MAX, u32::MAX),
+            MAX_REPLICATION_ESI + 1
+        );
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_pages(page_size: u32, page_numbers: &[u32]) -> Vec<PageEntry> {
@@ -1707,34 +1901,43 @@ mod tests {
     #[test]
     fn test_bd_1squ_sharding_threshold_rule() {
         let symbol_size = 64_u16;
-        let max_payload = usize::try_from(u64::from(K_MAX) * u64::from(symbol_size)).unwrap();
-
-        let exact = vec![0xA5_u8; max_payload];
-        let exact_shards = shard_changeset(exact, symbol_size).expect("exact shard");
-        assert_eq!(
-            exact_shards.len(),
-            1,
-            "bead_id={TEST_BEAD_BD_1SQU} case=exact_threshold_single_shard"
-        );
-        assert_eq!(
-            exact_shards[0].k_source, K_MAX,
-            "bead_id={TEST_BEAD_BD_1SQU} case=exact_threshold_kmax"
-        );
-
-        let over = vec![0x5A_u8; max_payload + 1];
-        let over_shards = shard_changeset(over, symbol_size).expect("over shard");
-        assert_eq!(
-            over_shards.len(),
-            2,
-            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_two_shards"
-        );
-        assert_eq!(
-            over_shards[0].k_source, K_MAX,
-            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_first_kmax"
-        );
-        assert_eq!(
-            over_shards[1].k_source, 1,
-            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_second_one_symbol"
+        let max_pages = max_pages_per_repair_block(128, symbol_size).expect("admitted block");
+        for (count, expected_blocks) in [(max_pages, 1), (max_pages + 1, 2)] {
+            let page_numbers: Vec<_> = (1..=u32::try_from(count).expect("count")).collect();
+            let mut pages = make_pages(128, &page_numbers);
+            let bytes = encode_changeset(128, &mut pages).expect("whole changeset");
+            let shards = shard_changeset(bytes, symbol_size).expect("page-aligned shards");
+            assert_eq!(shards.len(), expected_blocks);
+            let mut recovered = Vec::new();
+            for shard in &shards {
+                let (header, block_pages) =
+                    crate::replication_receiver::parse_changeset_pages(&shard.changeset_bytes)
+                        .expect("complete local header");
+                assert_eq!(header.total_len as usize, shard.changeset_bytes.len());
+                assert_eq!(header.n_pages as usize, block_pages.len());
+                assert_eq!(
+                    compute_changeset_id(&shard.changeset_bytes),
+                    shard.changeset_id
+                );
+                assert_eq!(
+                    derive_seed_from_changeset_id(&shard.changeset_id),
+                    shard.seed
+                );
+                assert!(shard.k_source <= K_MAX);
+                repair_parameters(
+                    shard.k_source as usize,
+                    usize::from(symbol_size),
+                    2 * shard.k_source as usize,
+                    MAX_REPAIR_WORK_BYTES,
+                )
+                .expect("reserved repair slack");
+                recovered.extend(block_pages);
+            }
+            assert_eq!(recovered, pages);
+        }
+        assert!(
+            shard_changeset(vec![0xA5; 100], symbol_size).is_err(),
+            "headerless bytes are not a changeset"
         );
     }
 
@@ -2100,7 +2303,10 @@ mod tests {
         sender.start_streaming().expect("start");
 
         // Generate a few packets.
-        let _p1 = sender.next_packet(&Cx::new()).expect("next").expect("packet");
+        let _p1 = sender
+            .next_packet(&Cx::new())
+            .expect("next")
+            .expect("packet");
 
         // Receiver ACKs completion.
         sender.acknowledge_complete().expect("ack");
@@ -2142,12 +2348,12 @@ mod tests {
 
     #[test]
     fn test_block_size_limit_sharding() {
-        // Create a changeset that exceeds K_MAX source symbols.
         let symbol_size = 64_u16;
-        let bytes_per_max_block = u64::from(K_MAX) * u64::from(symbol_size);
-        // Make changeset bytes just over the limit.
-        let changeset_bytes = vec![0xAB_u8; usize::try_from(bytes_per_max_block).unwrap() + 1];
-        let shards = shard_changeset(changeset_bytes.clone(), symbol_size).expect("shard");
+        let max_pages = max_pages_per_repair_block(128, symbol_size).expect("limit");
+        let count = u32::try_from(max_pages + 3).expect("page count");
+        let mut pages = make_pages(128, &(1..=count).collect::<Vec<_>>());
+        let changeset_bytes = encode_changeset(128, &mut pages).expect("changeset");
+        let shards = shard_changeset(changeset_bytes, symbol_size).expect("shard");
 
         assert!(
             shards.len() > 1,
@@ -2164,13 +2370,16 @@ mod tests {
             );
         }
 
-        // All bytes covered.
-        let total_bytes: usize = shards.iter().map(|s| s.changeset_bytes.len()).sum();
-        assert_eq!(
-            total_bytes,
-            changeset_bytes.len(),
-            "bead_id={TEST_BEAD_ID} case=sharding_coverage"
-        );
+        let recovered: Vec<_> = shards
+            .iter()
+            .flat_map(|shard| {
+                crate::replication_receiver::parse_changeset_pages(&shard.changeset_bytes)
+                    .expect("complete shard")
+                    .1
+            })
+            .collect();
+        assert_eq!(recovered, pages, "every complete page appears once");
+        assert_ne!(shards[0].changeset_id, shards[1].changeset_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2204,18 +2413,24 @@ mod tests {
     #[test]
     fn prop_sharding_covers_all_pages() {
         let symbol_size = 64_u16;
-        for size_multiplier in [1_u64, 2, 5] {
-            let total = u64::from(K_MAX) * u64::from(symbol_size) * size_multiplier + 7;
-            let changeset = vec![0xCC_u8; usize::try_from(total).unwrap()];
-            let shards = shard_changeset(changeset.clone(), symbol_size).expect("shard");
-
-            let reassembled: Vec<u8> = shards
+        let max_pages = max_pages_per_repair_block(128, symbol_size).expect("block limit");
+        for size_multiplier in [1_usize, 2, 5] {
+            let total = u32::try_from(max_pages * size_multiplier + 7).expect("page count");
+            let mut pages = make_pages(128, &(1..=total).collect::<Vec<_>>());
+            let changeset = encode_changeset(128, &mut pages).expect("changeset");
+            let shards = shard_changeset(changeset, symbol_size).expect("shard");
+            assert_eq!(shards.len(), size_multiplier + 1);
+            let reassembled: Vec<PageEntry> = shards
                 .iter()
-                .flat_map(|s| s.changeset_bytes.iter().copied())
+                .flat_map(|s| {
+                    crate::replication_receiver::parse_changeset_pages(&s.changeset_bytes)
+                        .expect("complete shard")
+                        .1
+                })
                 .collect();
 
             assert_eq!(
-                reassembled, changeset,
+                reassembled, pages,
                 "bead_id={TEST_BEAD_ID} case=prop_sharding_coverage multiplier={size_multiplier}"
             );
         }

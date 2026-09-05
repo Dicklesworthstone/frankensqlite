@@ -14,13 +14,15 @@
 use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::cx::Cx;
 use tracing::{debug, error, info, warn};
 
 use crate::replication_sender::{
-    CHANGESET_HEADER_SIZE, ChangesetId, PageEntry, ReplicationPacket, ReplicationPacketV2Header,
-    SenderConfig, compute_changeset_id, derive_seed_from_changeset_id, encode_changeset,
+    CHANGESET_HEADER_SIZE, ChangesetId, PageEntry, RepairEncoder, ReplicationPacket,
+    ReplicationPacketV2Header, SenderConfig, compute_changeset_id, derive_seed_from_changeset_id,
+    encode_replication_blocks, symbol_schedule_end, validate_codec_esi,
 };
-use crate::source_block_partition::{K_MAX, SourceBlock, partition_source_blocks};
+use crate::source_block_partition::{K_MAX, SourceBlock};
 
 const BEAD_ID: &str = "bd-1hi.15";
 
@@ -222,6 +224,7 @@ pub struct SnapshotSender {
     config: SenderConfig,
     /// Whether we're done.
     done: bool,
+    repair_encoder: RepairEncoder,
 }
 
 impl SnapshotSender {
@@ -238,70 +241,28 @@ impl SnapshotSender {
         all_pages: &mut [PageEntry],
         config: SenderConfig,
     ) -> Result<Self> {
-        if all_pages.is_empty() {
-            return Err(FrankenError::OutOfRange {
-                what: "pages".to_owned(),
-                value: "0".to_owned(),
-            });
-        }
-
-        let total_pages = u32::try_from(all_pages.len()).map_err(|_| FrankenError::OutOfRange {
-            what: "total_pages".to_owned(),
-            value: all_pages.len().to_string(),
-        })?;
-
-        let source_blocks = partition_source_blocks(total_pages)?;
-        info!(
-            bead_id = BEAD_ID,
-            total_pages,
-            n_blocks = source_blocks.len(),
-            page_size,
-            "snapshot partitioned into source blocks"
-        );
-
-        // Sort all pages by page_number.
-        all_pages.sort_by_key(|p| p.page_number);
-
-        // Build per-block changesets.
-        let mut block_changeset_ids = Vec::with_capacity(source_blocks.len());
-        let mut block_k_sources = Vec::with_capacity(source_blocks.len());
-        let mut block_changesets = Vec::with_capacity(source_blocks.len());
-
-        let mut page_idx = 0_usize;
-        for block in &source_blocks {
-            let end = page_idx + block.num_pages as usize;
-            if end > all_pages.len() {
-                return Err(FrankenError::Internal(format!(
-                    "block {} requires pages up to index {end}, but only {} available",
-                    block.index,
-                    all_pages.len()
-                )));
-            }
-            let block_pages = &mut all_pages[page_idx..end];
-            let changeset_bytes = encode_changeset(page_size, block_pages)?;
-            let changeset_id = compute_changeset_id(&changeset_bytes);
-
-            // Compute K_source from changeset + symbol_size.
-            let t = u64::from(config.symbol_size);
-            let f = changeset_bytes.len() as u64;
-            let k_source = u32::try_from(f.div_ceil(t)).map_err(|_| FrankenError::OutOfRange {
-                what: "k_source".to_owned(),
-                value: f.div_ceil(t).to_string(),
-            })?;
-
-            debug!(
-                bead_id = BEAD_ID,
-                block_index = block.index,
-                num_pages = block.num_pages,
-                changeset_len = changeset_bytes.len(),
-                k_source,
-                "prepared block changeset"
+        config.validate()?;
+        let shards = encode_replication_blocks(page_size, all_pages, config.symbol_size, 256)?;
+        let mut source_blocks = Vec::with_capacity(shards.len());
+        let mut block_changeset_ids = Vec::with_capacity(shards.len());
+        let mut block_k_sources = Vec::with_capacity(shards.len());
+        let mut block_changesets = Vec::with_capacity(shards.len());
+        let mut page_idx = 0;
+        for (index, shard) in shards.into_iter().enumerate() {
+            let num_pages = u32::from_le_bytes(
+                shard.changeset_bytes[10..14]
+                    .try_into()
+                    .expect("encoded page count"),
             );
-
-            block_changeset_ids.push(changeset_id);
-            block_k_sources.push(k_source);
-            block_changesets.push(changeset_bytes);
-            page_idx = end;
+            source_blocks.push(SourceBlock {
+                index: u8::try_from(index).expect("block count admitted before encoding"),
+                start_page: all_pages[page_idx].page_number,
+                num_pages,
+            });
+            page_idx += num_pages as usize;
+            block_changeset_ids.push(shard.changeset_id);
+            block_k_sources.push(shard.k_source);
+            block_changesets.push(shard.changeset_bytes);
         }
 
         Ok(Self {
@@ -314,6 +275,7 @@ impl SnapshotSender {
             block_changesets,
             config,
             done: false,
+            repair_encoder: RepairEncoder::default(),
         })
     }
 
@@ -321,21 +283,26 @@ impl SnapshotSender {
     ///
     /// Returns `None` when the current streaming pass is complete.
     /// Caller can restart from block 0 for continuous streaming.
-    pub fn next_packet(&mut self) -> Option<ReplicationPacket> {
+    ///
+    /// # Errors
+    /// Returns cancellation, invalid codec dimensions or repair encoding errors.
+    pub fn next_packet(&mut self, cx: &Cx) -> Result<Option<ReplicationPacket>> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if self.done || self.current_block >= self.source_blocks.len() {
             self.done = true;
-            return None;
+            return Ok(None);
         }
 
         let k_source = self.block_k_sources[self.current_block];
-        let max_isi = k_source.saturating_mul(self.config.max_isi_multiplier);
+        let max_isi = symbol_schedule_end(k_source, self.config.max_isi_multiplier);
 
         if self.current_isi >= max_isi {
             self.current_block += 1;
             self.current_isi = 0;
+            self.repair_encoder = RepairEncoder::default();
             if self.current_block >= self.source_blocks.len() {
                 self.done = true;
-                return None;
+                return Ok(None);
             }
         }
 
@@ -356,46 +323,13 @@ impl SnapshotSender {
             }
             data
         } else {
-            let seed = derive_seed_from_changeset_id(&changeset_id);
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                // Repair symbol: use RaptorQ SystematicEncoder from asupersync.
-                // NOTE: Encoder is rebuilt per-symbol (expensive for large K).
-                // See replication_sender.rs for the same pattern and caching note.
-                use asupersync::raptorq::systematic::SystematicEncoder;
-
-                let source_symbols: Vec<Vec<u8>> = (0..k_source as usize)
-                    .map(|i| {
-                        let start = i * t;
-                        let end = (start + t).min(changeset.len());
-                        let mut sym = vec![0_u8; t];
-                        let available = end.saturating_sub(start);
-                        if available > 0 {
-                            sym[..available].copy_from_slice(&changeset[start..end]);
-                        }
-                        sym
-                    })
-                    .collect();
-
-                match SystematicEncoder::new(&source_symbols, t, seed) {
-                    Some(encoder) => {
-                        let repair_esi = isi - k_source;
-                        encoder.repair_symbol(repair_esi)
-                    }
-                    None => {
-                        // Fallback for degenerate parameters.
-                        crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
-                    }
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                crate::replication_sender::generate_deterministic_placeholder(seed, isi, t)
-            }
+            self.repair_encoder
+                .symbol(cx, changeset, k_source, self.config.symbol_size, isi)?
         };
 
         let seed = derive_seed_from_changeset_id(&changeset_id);
-        let r_repair = max_isi.saturating_sub(k_source);
+        let r_repair =
+            symbol_schedule_end(k_source, self.config.max_isi_multiplier).saturating_sub(k_source);
         let packet = ReplicationPacket::new_v2(
             ReplicationPacketV2Header {
                 changeset_id,
@@ -410,7 +344,7 @@ impl SnapshotSender {
         );
 
         self.current_isi += 1;
-        Some(packet)
+        Ok(Some(packet))
     }
 
     /// Number of source blocks.
@@ -430,6 +364,7 @@ impl SnapshotSender {
         self.current_block = 0;
         self.current_isi = 0;
         self.done = false;
+        self.repair_encoder = RepairEncoder::default();
         debug!(bead_id = BEAD_ID, "snapshot sender restarted for next pass");
     }
 }
@@ -523,37 +458,17 @@ impl BlockDecoder {
         self.received_count() >= self.k_source && self.k_source > 0
     }
 
-    fn try_decode(&self) -> Option<Vec<u8>> {
-        if !self.ready_to_decode() {
-            return None;
-        }
-        let source_count = self
-            .symbols
-            .keys()
-            .filter(|&&isi| isi < self.k_source)
-            .count();
-        let k = self.k_source as usize;
-        let t = self.symbol_size as usize;
-        if source_count >= k {
-            let padded_len = k * t;
-            let mut padded = vec![0_u8; padded_len];
-            for isi in 0..self.k_source {
-                if let Some(data) = self.symbols.get(&isi) {
-                    let start = isi as usize * t;
-                    let copy_len = data.len().min(t);
-                    padded[start..start + copy_len].copy_from_slice(&data[..copy_len]);
-                }
-            }
-            Some(padded)
-        } else {
-            warn!(
-                bead_id = BEAD_ID,
-                source_count,
-                k_source = self.k_source,
-                "snapshot block decode needs repair symbols (production RaptorQ)"
-            );
-            None
-        }
+    fn try_decode(&self, cx: &Cx) -> Result<Option<Vec<u8>>> {
+        crate::replication_receiver::decode_symbols(
+            cx,
+            &self.symbols,
+            self.k_source,
+            self.symbol_size,
+            self.seed,
+            crate::replication_sender::MAX_REPAIR_WORK_BYTES,
+            false,
+        )
+        .map(|decoded| decoded.data)
     }
 }
 
@@ -573,6 +488,8 @@ pub struct SnapshotReceiver {
     resume: ResumeState,
     /// Page size.
     page_size: u32,
+    buffered_symbol_bytes: usize,
+    auth_key: Option<[u8; 32]>,
 }
 
 impl SnapshotReceiver {
@@ -591,6 +508,8 @@ impl SnapshotReceiver {
             decoded_blocks: Vec::new(),
             resume: ResumeState::new(u32::try_from(num_blocks).unwrap_or(u32::MAX)),
             page_size,
+            buffered_symbol_bytes: 0,
+            auth_key: None,
         }
     }
 
@@ -611,6 +530,8 @@ impl SnapshotReceiver {
             decoded_blocks: Vec::new(),
             resume,
             page_size,
+            buffered_symbol_bytes: 0,
+            auth_key: None,
         }
     }
 
@@ -618,6 +539,18 @@ impl SnapshotReceiver {
     #[must_use]
     pub const fn state(&self) -> SnapshotReceiverState {
         self.state
+    }
+
+    /// Require authenticated packets before starting this receive session.
+    ///
+    /// # Errors
+    /// Returns `Busy` if packets have already been accepted.
+    pub fn set_auth_key(&mut self, auth_key: [u8; 32]) -> Result<()> {
+        if self.state != SnapshotReceiverState::Waiting {
+            return Err(FrankenError::Busy);
+        }
+        self.auth_key = Some(auth_key);
+        Ok(())
     }
 
     /// Number of blocks decoded so far.
@@ -646,7 +579,23 @@ impl SnapshotReceiver {
     ///
     /// Returns error if the packet is malformed or validation fails.
     #[allow(clippy::too_many_lines)]
-    pub fn process_packet(&mut self, packet: &ReplicationPacket) -> Result<SnapshotPacketResult> {
+    pub fn process_packet(
+        &mut self,
+        cx: &Cx,
+        packet: &ReplicationPacket,
+    ) -> Result<SnapshotPacketResult> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        if !packet.verify_integrity(self.auth_key.as_ref()) {
+            return Ok(SnapshotPacketResult::Rejected);
+        }
+        validate_codec_esi(packet.esi)?;
+        if usize::from(packet.symbol_size_t) != packet.symbol_data.len()
+            || packet.seed != derive_seed_from_changeset_id(&packet.changeset_id)
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "snapshot packet size or seed mismatch".to_owned(),
+            });
+        }
         if self.state == SnapshotReceiverState::Complete {
             return Ok(SnapshotPacketResult::AlreadyComplete);
         }
@@ -675,13 +624,37 @@ impl SnapshotReceiver {
                 value: "0".to_owned(),
             });
         }
-
-        if self.state == SnapshotReceiverState::Waiting {
-            self.state = SnapshotReceiverState::Receiving;
-            info!(bead_id = BEAD_ID, "snapshot receiving started");
+        let padded_len = usize::try_from(packet.k_source)
+            .ok()
+            .and_then(|k| k.checked_mul(packet.symbol_data.len()))
+            .ok_or(FrankenError::TooBig)?;
+        if padded_len > crate::replication_sender::MAX_REPAIR_WORK_BYTES {
+            return Err(FrankenError::TooBig);
         }
 
         let changeset_id = packet.changeset_id;
+
+        if self
+            .changeset_to_block
+            .get(&changeset_id)
+            .is_some_and(|&idx| self.block_decoders[idx].decoded)
+        {
+            return Ok(SnapshotPacketResult::BlockAlreadyDecoded);
+        }
+
+        let new_mapping = !self.changeset_to_block.contains_key(&changeset_id);
+        let duplicate = self
+            .changeset_to_block
+            .get(&changeset_id)
+            .is_some_and(|&idx| self.block_decoders[idx].received_isis.contains(&packet.esi));
+        if !duplicate
+            && self
+                .buffered_symbol_bytes
+                .checked_add(packet.symbol_data.len())
+                .is_none_or(|bytes| bytes > crate::replication_sender::MAX_REPAIR_WORK_BYTES)
+        {
+            return Err(FrankenError::TooBig);
+        }
 
         // Map changeset_id to block index.
         let block_idx = if let Some(&idx) = self.changeset_to_block.get(&changeset_id) {
@@ -743,6 +716,30 @@ impl SnapshotReceiver {
         if !accepted {
             return Ok(SnapshotPacketResult::Duplicate);
         }
+        self.buffered_symbol_bytes += packet.symbol_data.len();
+
+        let padded = if decoder.ready_to_decode() {
+            match decoder.try_decode(cx) {
+                Ok(padded) => padded,
+                Err(error) => {
+                    decoder.symbols.remove(&packet.esi);
+                    decoder.received_isis.remove(&packet.esi);
+                    self.buffered_symbol_bytes -= packet.symbol_data.len();
+                    if new_mapping {
+                        self.changeset_to_block.remove(&changeset_id);
+                        self.block_decoders[block_idx] = BlockDecoder::new();
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        if self.state == SnapshotReceiverState::Waiting {
+            self.state = SnapshotReceiverState::Receiving;
+            info!(bead_id = BEAD_ID, "snapshot receiving started");
+        }
 
         // Update resume state.
         if block_idx < self.resume.blocks.len() {
@@ -750,14 +747,15 @@ impl SnapshotReceiver {
         }
 
         // Check if ready to decode this block.
-        if decoder.ready_to_decode()
-            && !decoder.decoded
-            && let Some(padded) = decoder.try_decode()
-        {
-            match parse_decoded_snapshot_block(&padded, self.page_size) {
+        if let Some(padded) = padded {
+            match parse_decoded_snapshot_block(&padded, self.page_size, changeset_id) {
                 Ok(pages) => {
                     let block_id = u32::try_from(block_idx).unwrap_or(u32::MAX);
                     decoder.decoded = true;
+                    self.buffered_symbol_bytes -=
+                        decoder.symbols.values().map(Vec::len).sum::<usize>();
+                    decoder.symbols.clear();
+                    decoder.received_isis.clear();
                     if block_idx < self.resume.blocks.len() {
                         self.resume.blocks[block_idx].decoded = true;
                     }
@@ -793,6 +791,15 @@ impl SnapshotReceiver {
                         error = %e,
                         "snapshot block validation failed"
                     );
+                    self.buffered_symbol_bytes -=
+                        decoder.symbols.values().map(Vec::len).sum::<usize>();
+                    self.block_decoders[block_idx] = BlockDecoder::new();
+                    self.changeset_to_block.remove(&changeset_id);
+                    self.resume.blocks[block_idx] =
+                        BlockResumeState::new(u32::try_from(block_idx).unwrap_or(u32::MAX));
+                    if self.changeset_to_block.is_empty() {
+                        self.state = SnapshotReceiverState::Waiting;
+                    }
                     return Err(e);
                 }
             }
@@ -826,7 +833,8 @@ pub enum SnapshotPacketResult {
 /// Parse decoded snapshot block bytes into pages with xxh3 validation.
 fn parse_decoded_snapshot_block(
     padded_bytes: &[u8],
-    _page_size: u32,
+    page_size: u32,
+    changeset_id: ChangesetId,
 ) -> Result<Vec<DecodedBlockPage>> {
     use crate::replication_sender::ChangesetHeader;
 
@@ -848,7 +856,7 @@ fn parse_decoded_snapshot_block(
         what: "total_len".to_owned(),
         value: header.total_len.to_string(),
     })?;
-    if total_len > padded_bytes.len() {
+    if total_len < CHANGESET_HEADER_SIZE || total_len > padded_bytes.len() {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "total_len ({total_len}) exceeds decoded bytes ({})",
@@ -857,6 +865,11 @@ fn parse_decoded_snapshot_block(
         });
     }
     let changeset_bytes = &padded_bytes[..total_len];
+    if header.page_size != page_size || compute_changeset_id(changeset_bytes) != changeset_id {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "snapshot page size or changeset identity mismatch".to_owned(),
+        });
+    }
 
     let entry_size = 4_usize + 8 + header.page_size as usize;
     let data_bytes = &changeset_bytes[CHANGESET_HEADER_SIZE..];
@@ -867,7 +880,7 @@ fn parse_decoded_snapshot_block(
             detail: "n_pages causes size overflow".to_owned(),
         })?;
 
-    if data_bytes.len() < required_data_len {
+    if data_bytes.len() != required_data_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "changeset truncated: expected {} data bytes, got {}",
@@ -911,17 +924,462 @@ fn parse_decoded_snapshot_block(
         });
     }
 
+    if pages
+        .windows(2)
+        .any(|pair| pair[0].page_number > pair[1].page_number)
+    {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "snapshot pages are not ordered by page number".to_owned(),
+        });
+    }
+
     Ok(pages)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::source_block_partition::partition_source_blocks;
     use fsqlite_types::cx::Cx;
 
     use super::*;
     use crate::replication_sender::PageEntry;
 
     const TEST_BEAD_ID: &str = "bd-1hi.15";
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_snapshot_repairs_permanent_source_erasure() {
+        let cx = Cx::new();
+        let key = [0x91; 32];
+        let mut pages = make_pages(256, &[1, 2, 3]);
+        let original = pages.clone();
+        let mut sender = SnapshotSender::prepare(
+            256,
+            &mut pages,
+            SenderConfig {
+                symbol_size: 256,
+                max_isi_multiplier: 4,
+            },
+        )
+        .expect("prepare");
+        let mut receiver = SnapshotReceiver::new(sender.num_blocks(), 256);
+        receiver
+            .set_auth_key(key)
+            .expect("set key before receiving");
+        let mut repairs = 0;
+        let mut dropped_source = false;
+        while let Some(mut packet) = sender.next_packet(&cx).expect("real packet") {
+            if packet.esi == 0 {
+                dropped_source = true;
+                continue;
+            }
+            if !packet.is_source_symbol() {
+                if repairs == 0 {
+                    assert_eq!(packet.esi, packet.k_source);
+                }
+                repairs += 1;
+            }
+            packet.attach_auth_tag(&key);
+            let mut forged = packet.clone();
+            forged.symbol_data[0] ^= 1;
+            assert_eq!(
+                receiver.process_packet(&cx, &forged).expect("erasure"),
+                SnapshotPacketResult::Rejected
+            );
+            let result = receiver.process_packet(&cx, &packet).expect("receive");
+            if matches!(result, SnapshotPacketResult::BlockDecoded(_)) {
+                break;
+            }
+        }
+        assert!(dropped_source && repairs > 0);
+        assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
+        assert!(receiver.resume_state().all_decoded());
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        let blocks = receiver.take_decoded_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].pages.len(), original.len());
+        for (decoded, expected) in blocks[0].pages.iter().zip(&original) {
+            assert_eq!(decoded.page_number, expected.page_number);
+            assert_eq!(decoded.page_data, expected.page_bytes);
+        }
+        eprintln!(
+            "bead_id=bd-3mgq5.2 phase=snapshot_decode erased_source_esi=0 repair_packets={repairs} exact_pages={}",
+            original.len()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_rejects_wrong_object_identity() {
+        let cx = Cx::new();
+        let mut pages = make_pages(128, &[1]);
+        let mut sender = SnapshotSender::prepare(
+            128,
+            &mut pages,
+            SenderConfig {
+                symbol_size: 128,
+                max_isi_multiplier: 1,
+            },
+        )
+        .expect("prepare");
+        let mut receiver = SnapshotReceiver::new(1, 128);
+        let mut rejected = false;
+        while let Some(mut packet) = sender.next_packet(&cx).expect("packet") {
+            packet.changeset_id = ChangesetId::from_bytes([0xAB; 16]);
+            packet.seed = derive_seed_from_changeset_id(&packet.changeset_id);
+            match receiver.process_packet(&cx, &packet) {
+                Err(FrankenError::DatabaseCorrupt { .. }) => {
+                    rejected = true;
+                    break;
+                }
+                Ok(SnapshotPacketResult::Accepted) => {}
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert!(rejected);
+        assert!(!receiver.resume_state().all_decoded());
+        assert!(receiver.take_decoded_blocks().is_empty());
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert!(receiver.changeset_to_block.is_empty());
+        assert_eq!(
+            receiver.resume_state().to_bytes(),
+            ResumeState::new(1).to_bytes()
+        );
+        sender.restart();
+        while let Some(packet) = sender.next_packet(&cx).expect("valid packet") {
+            receiver
+                .process_packet(&cx, &packet)
+                .expect("valid retry after rejection");
+        }
+        assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
+        assert_eq!(
+            receiver.take_decoded_blocks()[0].pages[0].page_data,
+            pages[0].page_bytes
+        );
+    }
+
+    #[test]
+    fn test_snapshot_rejected_admission_and_cancel_preserve_receiver() {
+        let cx = Cx::new();
+        let mut pages = make_pages(128, &[1]);
+        let mut sender = SnapshotSender::prepare(
+            128,
+            &mut pages,
+            SenderConfig {
+                symbol_size: 128,
+                max_isi_multiplier: 1,
+            },
+        )
+        .expect("prepare");
+        let first = sender.next_packet(&cx).expect("packet").expect("first");
+        let mut receiver = SnapshotReceiver::new(1, 128);
+        let empty_resume = receiver.resume_state().to_bytes();
+        for esi in [crate::replication_sender::MAX_REPLICATION_ESI + 1, u32::MAX] {
+            let mut invalid = first.clone();
+            invalid.esi = esi;
+            assert!(matches!(
+                receiver.process_packet(&cx, &invalid),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+        }
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(matches!(
+            receiver.process_packet(&cancelled, &first),
+            Err(FrankenError::Abort)
+        ));
+        let mut oversized = first.clone();
+        oversized.k_source = K_MAX;
+        oversized.symbol_data = vec![0; 2048];
+        oversized.symbol_size_t = 2048;
+        oversized.payload_xxh3 = ReplicationPacket::compute_payload_xxh3(&oversized.symbol_data);
+        assert!(matches!(
+            receiver.process_packet(&cx, &oversized),
+            Err(FrankenError::TooBig)
+        ));
+        assert_eq!(receiver.state(), SnapshotReceiverState::Waiting);
+        assert!(receiver.changeset_to_block.is_empty());
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.resume_state().to_bytes(), empty_resume);
+        receiver
+            .process_packet(&cx, &first)
+            .expect("first admitted");
+        while let Some(packet) = sender.next_packet(&cx).expect("next packet") {
+            receiver
+                .process_packet(&cx, &packet)
+                .expect("valid receive");
+        }
+        assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
+        assert_eq!(
+            receiver.take_decoded_blocks()[0].pages[0].page_data,
+            pages[0].page_bytes
+        );
+    }
+
+    #[test]
+    fn test_snapshot_failed_prepare_preserves_unsorted_input() {
+        for invalid_checksum in [false, true] {
+            let mut pages = make_pages(128, &[3, 1, 2]);
+            if invalid_checksum {
+                pages[1].page_xxh3 ^= 1;
+            } else {
+                pages[1].page_bytes.push(9);
+            }
+            let original = pages.clone();
+            assert!(SnapshotSender::prepare(128, &mut pages, SenderConfig::default()).is_err());
+            assert_eq!(pages, original);
+        }
+        let mut pages = make_pages(128, &[3, 1, 2]);
+        let original = pages.clone();
+        assert!(matches!(
+            SnapshotSender::prepare(
+                128,
+                &mut pages,
+                SenderConfig {
+                    symbol_size: 128,
+                    max_isi_multiplier: 0,
+                }
+            ),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert_eq!(pages, original);
+    }
+
+    #[test]
+    fn test_snapshot_zero_symbol_size_is_error() {
+        let mut pages = make_pages(128, &[1]);
+        assert!(matches!(
+            SnapshotSender::prepare(
+                128,
+                &mut pages,
+                SenderConfig {
+                    symbol_size: 0,
+                    max_isi_multiplier: 1,
+                }
+            ),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_snapshot_interleaved_objects_repair_independently() {
+        let cx = Cx::new();
+        let mut pages_a = make_pages(128, &[1, 2]);
+        let mut pages_b = make_pages(128, &[11, 12]);
+        let config = SenderConfig {
+            symbol_size: 128,
+            max_isi_multiplier: 8,
+        };
+        let mut senders = [
+            SnapshotSender::prepare(128, &mut pages_a, config.clone()).expect("A"),
+            SnapshotSender::prepare(128, &mut pages_b, config).expect("B"),
+        ];
+        let mut receiver = SnapshotReceiver::new(2, 128);
+        let mut completed = [false; 2];
+        let mut object_ids = [None; 2];
+        while !completed.iter().all(|done| *done) {
+            for (index, sender) in senders.iter_mut().enumerate() {
+                if completed[index] {
+                    continue;
+                }
+                let packet = sender
+                    .next_packet(&cx)
+                    .expect("encoding")
+                    .expect("fixed repair schedule must suffice");
+                object_ids[index] = Some(packet.changeset_id);
+                if packet.esi == 0 {
+                    continue;
+                }
+                if matches!(
+                    receiver.process_packet(&cx, &packet).expect("receive"),
+                    SnapshotPacketResult::BlockDecoded(_)
+                ) {
+                    completed[index] = true;
+                }
+            }
+        }
+        assert_ne!(object_ids[0], object_ids[1]);
+        assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
+        assert_eq!(receiver.changeset_to_block.len(), 2);
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        let mut blocks = receiver.take_decoded_blocks();
+        assert_eq!(blocks.len(), 2);
+        blocks.sort_by_key(|block| block.block_index);
+        for (block, expected) in blocks.iter().zip([pages_a, pages_b]) {
+            assert_eq!(block.pages.len(), expected.len());
+            for (page, original) in block.pages.iter().zip(expected) {
+                assert_eq!(page.page_number, original.page_number);
+                assert_eq!(page.page_data, original.page_bytes);
+            }
+        }
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=interleaved_snapshot_objects blocks=2 erased_source_esi=0 exact_pages=4"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_snapshot_sender_repairs_every_block_of_one_large_input() {
+        use std::collections::{BTreeMap, HashSet};
+
+        use crate::replication_sender::{
+            MAX_REPLICATION_SYMBOL_SIZE, compute_changeset_id, encode_changeset,
+            max_pages_per_repair_block,
+        };
+
+        let cx = Cx::new();
+        let page_size = 4096;
+        let symbol_size = u16::try_from(MAX_REPLICATION_SYMBOL_SIZE).expect("wire symbol size");
+        let block_pages = max_pages_per_repair_block(page_size, symbol_size).expect("block budget");
+        assert!(block_pages > 1);
+        let page_count = block_pages
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .expect("page count");
+        let page_numbers: Vec<_> =
+            (1..=u32::try_from(page_count).expect("page count fits")).collect();
+        let mut pages = make_pages(page_size, &page_numbers);
+        let expected: BTreeMap<_, _> = pages
+            .iter()
+            .map(|page| (page.page_number, page.page_bytes.clone()))
+            .collect();
+        let mut expected_objects = BTreeMap::new();
+        for chunk in pages.chunks(block_pages) {
+            let mut originals = chunk.to_vec();
+            let bytes =
+                encode_changeset(page_size, &mut originals).expect("complete block changeset");
+            assert!(
+                expected_objects
+                    .insert(*compute_changeset_id(&bytes).as_bytes(), originals)
+                    .is_none()
+            );
+        }
+        let mut sender = SnapshotSender::prepare(
+            page_size,
+            &mut pages,
+            SenderConfig {
+                symbol_size,
+                max_isi_multiplier: 8,
+            },
+        )
+        .expect("one large snapshot input");
+        assert_eq!(sender.num_blocks(), 3);
+        let mut receiver = SnapshotReceiver::new(sender.num_blocks(), page_size);
+        let mut packets_by_object: BTreeMap<[u8; 16], Vec<ReplicationPacket>> = BTreeMap::new();
+        while let Some(packet) = sender.next_packet(&cx).expect("bounded block encoding") {
+            packets_by_object
+                .entry(*packet.changeset_id.as_bytes())
+                .or_default()
+                .push(packet);
+        }
+        assert_eq!(
+            packets_by_object.keys().collect::<Vec<_>>(),
+            expected_objects.keys().collect::<Vec<_>>()
+        );
+        for packets in packets_by_object.values_mut() {
+            let k = packets[0].k_source;
+            assert_eq!(packets.len(), usize::try_from(k).expect("K fits") * 8);
+            assert_eq!(packets.iter().filter(|packet| packet.esi == 0).count(), 1);
+            assert!(
+                packets
+                    .iter()
+                    .all(|packet| packet.k_source == k && packet.sbn == 0)
+            );
+            packets.retain(|packet| packet.esi != 0);
+            for pair in packets.chunks_mut(2) {
+                if pair.len() == 2 {
+                    pair.swap(0, 1);
+                }
+            }
+        }
+
+        let mut completed = HashSet::new();
+        let mut completed_slots = HashSet::new();
+        let mut recovered = BTreeMap::new();
+        let mut block_sizes = Vec::new();
+        let rounds = packets_by_object
+            .values()
+            .map(Vec::len)
+            .max()
+            .expect("three streams");
+        for round in 0..rounds {
+            for (id, packets) in packets_by_object.iter().rev() {
+                if completed.contains(id) {
+                    continue;
+                }
+                let Some(packet) = packets.get(round) else {
+                    continue;
+                };
+                assert_ne!(packet.esi, 0);
+                if let SnapshotPacketResult::BlockDecoded(slot) = receiver
+                    .process_packet(&cx, packet)
+                    .expect("snapshot receive")
+                {
+                    assert!(completed.insert(*id), "each object is decoded once");
+                    assert!(completed_slots.insert(slot), "one object per receiver slot");
+                    let blocks = receiver.take_decoded_blocks();
+                    assert_eq!(blocks.len(), 1);
+                    let block = &blocks[0];
+                    assert_eq!(block.block_index, slot);
+                    let originals = &expected_objects[id];
+                    assert_eq!(block.pages.len(), originals.len());
+                    let original_by_page: BTreeMap<_, _> = originals
+                        .iter()
+                        .map(|page| (page.page_number, &page.page_bytes))
+                        .collect();
+                    for page in &block.pages {
+                        assert_eq!(&page.page_data, original_by_page[&page.page_number]);
+                        assert!(
+                            recovered
+                                .insert(page.page_number, page.page_data.clone())
+                                .is_none(),
+                            "page repeated across objects"
+                        );
+                    }
+                    let resume =
+                        &receiver.resume_state().blocks[usize::try_from(slot).expect("slot fits")];
+                    assert!(resume.decoded);
+                    assert!(!resume.received_isis.contains(&0));
+                    assert!(
+                        resume
+                            .received_isis
+                            .iter()
+                            .any(|esi| *esi >= packet.k_source)
+                    );
+                    block_sizes.push(block.pages.len());
+                    eprintln!(
+                        "bead_id=bd-3mgq5.2 event=single_input_snapshot_block object={id:?} receiver_slot={slot} round={round} k={} erased_source_esi=0 recovered_pages={}",
+                        packet.k_source,
+                        block.pages.len()
+                    );
+                }
+            }
+            if round == 0 {
+                assert!(
+                    receiver
+                        .block_decoders
+                        .iter()
+                        .filter(|decoder| !decoder.decoded && !decoder.received_isis.is_empty())
+                        .count()
+                        >= 2,
+                    "the full objects must overlap in collection"
+                );
+            }
+        }
+        assert_eq!(
+            completed.len(),
+            3,
+            "both full blocks and short tail must recover"
+        );
+        block_sizes.sort_unstable();
+        assert_eq!(block_sizes, [1, block_pages, block_pages]);
+        assert_eq!(recovered, expected);
+        assert_eq!(receiver.state(), SnapshotReceiverState::Complete);
+        assert!(receiver.resume_state().all_decoded());
+        assert_eq!(receiver.changeset_to_block.len(), 3);
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert!(receiver.take_decoded_blocks().is_empty());
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_pages(page_size: u32, page_numbers: &[u32]) -> Vec<PageEntry> {

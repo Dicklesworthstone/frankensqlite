@@ -365,7 +365,8 @@ fn test_e2e_bd_26qk_compliance() {
     let mut receiver = ReplicationReceiver::new();
     let mut completed = false;
     for wire in &packets {
-        if receiver.process_packet(&Cx::new(), wire).expect("process") == PacketResult::DecodeReady {
+        if receiver.process_packet(&Cx::new(), wire).expect("process") == PacketResult::DecodeReady
+        {
             completed = true;
             break;
         }

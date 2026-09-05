@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::ObjectId;
+use fsqlite_types::cx::Cx;
 use tracing::{debug, error, info, warn};
 
 use crate::decode_proofs::{DecodeAuditEntry, EcsDecodeProof};
@@ -22,6 +23,143 @@ use crate::source_block_partition::K_MAX;
 const BEAD_ID: &str = "bd-1hi.14";
 const DEFAULT_MAX_INFLIGHT_DECODERS: usize = 128;
 const DEFAULT_MAX_BUFFERED_SYMBOL_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct SymbolDecode {
+    pub data: Option<Vec<u8>>,
+    pub rank: Option<u32>,
+    pub repairs_used: bool,
+}
+
+/// Decode one admitted source block, preserving canonical wire ESIs.
+pub(crate) fn decode_symbols(
+    cx: &Cx,
+    symbols: &HashMap<u32, Vec<u8>>,
+    k_source: u32,
+    symbol_size: u32,
+    seed: u64,
+    max_bytes: usize,
+    capture_rank: bool,
+) -> Result<SymbolDecode> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+    let k = usize::try_from(k_source).map_err(|_| FrankenError::TooBig)?;
+    let t = usize::try_from(symbol_size).map_err(|_| FrankenError::TooBig)?;
+    let padded_len = k.checked_mul(t).ok_or(FrankenError::TooBig)?;
+    if k == 0 || t == 0 || padded_len > max_bytes {
+        return Err(FrankenError::TooBig);
+    }
+    if symbols.len() < k {
+        return Ok(SymbolDecode {
+            data: None,
+            rank: None,
+            repairs_used: false,
+        });
+    }
+    if (0..k_source).all(|esi| symbols.contains_key(&esi)) {
+        let mut padded = Vec::with_capacity(padded_len);
+        for esi in 0..k_source {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let data = &symbols[&esi];
+            if data.len() != t {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "source symbol size mismatch".to_owned(),
+                });
+            }
+            padded.extend_from_slice(data);
+        }
+        // Repairs may have arrived, but none contributed to direct assembly.
+        return Ok(SymbolDecode {
+            data: Some(padded),
+            rank: None,
+            repairs_used: false,
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::replication_sender::{MAX_REPAIR_WORK_BYTES, repair_parameters};
+        use asupersync::raptorq::decoder::{DecodeError, InactivationDecoder, ReceivedSymbol};
+
+        repair_parameters(k, t, symbols.len(), max_bytes.min(MAX_REPAIR_WORK_BYTES))?;
+        let decoder =
+            InactivationDecoder::try_new(k, t, seed).map_err(|error| FrankenError::OutOfRange {
+                what: "RaptorQ source block".to_owned(),
+                value: format!("{error:?}"),
+            })?;
+        let mut received = decoder.constraint_symbols();
+        let mut ordered: Vec<_> = symbols.iter().collect();
+        ordered.sort_unstable_by_key(|(esi, _)| **esi);
+        for (&esi, data) in ordered {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            if data.len() != t {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "repair symbol size mismatch".to_owned(),
+                });
+            }
+            if esi < k_source {
+                received.push(ReceivedSymbol::source(esi, data.clone()));
+            } else {
+                let (columns, coefficients) =
+                    decoder
+                        .repair_equation(esi)
+                        .map_err(|error| FrankenError::OutOfRange {
+                            what: "repair ESI".to_owned(),
+                            value: format!("{error:?}"),
+                        })?;
+                received.push(ReceivedSymbol::repair(
+                    esi,
+                    columns,
+                    coefficients,
+                    data.clone(),
+                ));
+            }
+        }
+        let decoded = decoder.decode(&received);
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        match decoded {
+            Ok(decoded) => {
+                let rank =
+                    u32::try_from(decoded.intermediate.len()).map_err(|_| FrankenError::TooBig)?;
+                Ok(SymbolDecode {
+                    data: Some(decoded.source.concat()),
+                    rank: Some(rank),
+                    repairs_used: true,
+                })
+            }
+            Err(error) if error.is_recoverable() => {
+                let rank = if capture_rank {
+                    let status = decoder.rank_status(&received).map_err(|error| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!("RaptorQ rank validation failed: {error:?}"),
+                        }
+                    })?;
+                    Some(u32::try_from(status.rank).map_err(|_| FrankenError::TooBig)?)
+                } else {
+                    None
+                };
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                Ok(SymbolDecode {
+                    data: None,
+                    rank,
+                    repairs_used: false,
+                })
+            }
+            Err(
+                DecodeError::ComputeBudgetExhausted { .. }
+                | DecodeError::EsiRateLimitExceeded { .. },
+            ) => Err(FrankenError::TooBig),
+            Err(error) => Err(FrankenError::DatabaseCorrupt {
+                detail: format!("RaptorQ decode failed: {error:?}"),
+            }),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (seed, capture_rank);
+        Err(FrankenError::NotImplemented(
+            "RaptorQ repair decoding on wasm32".to_owned(),
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Receiver State Machine
@@ -64,8 +202,10 @@ impl DecoderState {
             k_source,
             symbol_size,
             seed,
-            symbols: HashMap::with_capacity(k_source as usize),
-            received_isis: HashSet::with_capacity(k_source as usize),
+            // A claimed K is not permission to allocate K slots before any
+            // payload has passed admission. Grow with accepted symbols.
+            symbols: HashMap::new(),
+            received_isis: HashSet::new(),
         }
     }
 
@@ -129,47 +269,16 @@ impl DecoderState {
 
     /// Attempt to decode the collected symbols into changeset bytes.
     ///
-    /// For source symbols (ISI < k_source), this reconstructs the padded
-    /// changeset by placing each symbol at offset `ISI * symbol_size`.
-    /// Repair symbols would require RaptorQ decoding in production;
-    /// this implementation handles the source-symbol-only case.
-    ///
-    /// Returns `None` if insufficient symbols or decode fails.
-    fn try_decode(&self) -> Option<Vec<u8>> {
-        if !self.ready_to_decode() {
-            return None;
-        }
-
-        // Count source symbols available.
-        let source_count = usize::try_from(self.source_symbol_count()).unwrap_or(usize::MAX);
-
-        let k = self.k_source as usize;
-        let t = self.symbol_size as usize;
-
-        if source_count >= k {
-            // All source symbols available — reconstruct directly.
-            let padded_len = k * t;
-            let mut padded = vec![0_u8; padded_len];
-            for isi in 0..self.k_source {
-                if let Some(data) = self.symbols.get(&isi) {
-                    let start = isi as usize * t;
-                    let copy_len = data.len().min(t);
-                    padded[start..start + copy_len].copy_from_slice(&data[..copy_len]);
-                }
-            }
-            Some(padded)
-        } else {
-            // Need repair symbols + RaptorQ decoder (production path via asupersync).
-            // For now, return None to stay in COLLECTING.
-            warn!(
-                bead_id = BEAD_ID,
-                source_count,
-                k_source = self.k_source,
-                total_received = self.received_count(),
-                "decode requires repair symbols (production uses RaptorQ decoder)"
-            );
-            None
-        }
+    fn try_decode(&self, cx: &Cx, max_bytes: usize, capture_rank: bool) -> Result<SymbolDecode> {
+        decode_symbols(
+            cx,
+            &self.symbols,
+            self.k_source,
+            self.symbol_size,
+            self.seed,
+            max_bytes,
+            capture_rank,
+        )
     }
 }
 
@@ -199,12 +308,11 @@ pub struct DecodeResult {
 struct DecodeProofBuildInput<'a> {
     changeset_id: ChangesetId,
     k_source: u32,
-    symbol_size: u32,
     seed: u64,
     received_isis: &'a [u32],
     decode_success: bool,
     intermediate_rank: Option<u32>,
-    symbols_used: u32,
+    timing_ns: u64,
 }
 
 /// Replication receiver state machine.
@@ -370,7 +478,8 @@ impl ReplicationReceiver {
     /// - V1 rule violated (SBN != 0)
     /// - K_source out of range
     /// - K_source or symbol_size mismatch for existing decoder
-    pub fn process_packet(&mut self, packet_bytes: &[u8]) -> Result<PacketResult> {
+    pub fn process_packet(&mut self, cx: &Cx, packet_bytes: &[u8]) -> Result<PacketResult> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if packet_bytes.len() > DEFAULT_RPC_MESSAGE_CAP_BYTES {
             return Err(FrankenError::TooBig);
         }
@@ -384,7 +493,7 @@ impl ReplicationReceiver {
             );
             return Ok(PacketResult::Erasure);
         }
-        self.process_parsed_packet(&packet)
+        self.process_parsed_packet(cx, &packet)
     }
 
     /// Process a parsed packet.
@@ -393,7 +502,16 @@ impl ReplicationReceiver {
     ///
     /// See `process_packet`.
     #[allow(clippy::too_many_lines)]
-    pub fn process_parsed_packet(&mut self, packet: &ReplicationPacket) -> Result<PacketResult> {
+    pub fn process_parsed_packet(
+        &mut self,
+        cx: &Cx,
+        packet: &ReplicationPacket,
+    ) -> Result<PacketResult> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        if !packet.verify_integrity(self.config.auth_key.as_ref()) {
+            return Ok(PacketResult::Erasure);
+        }
+        crate::replication_sender::validate_codec_esi(packet.esi)?;
         // V1 rule: reject multi-block packets.
         if packet.sbn != 0 {
             error!(
@@ -559,12 +677,11 @@ impl ReplicationReceiver {
         let (
             ready_to_decode,
             k_source_ctx,
-            symbol_size_ctx,
+            decode_timing_ns,
             seed_ctx,
             received_isis_ctx,
             received_count_ctx,
             source_count_ctx,
-            has_repair_ctx,
             decoded_padded,
         ) = {
             let decoder = self.decoders.get_mut(&changeset_id).expect("just inserted");
@@ -593,18 +710,63 @@ impl ReplicationReceiver {
             );
 
             let ready = decoder.ready_to_decode();
-            let padded = if ready { decoder.try_decode() } else { None };
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+            let padded = if ready {
+                decoder.try_decode(
+                    cx,
+                    self.config.max_buffered_symbol_bytes,
+                    self.config.decode_proof_policy.emit_on_decode_failure,
+                )
+            } else {
+                Ok(SymbolDecode {
+                    data: None,
+                    rank: None,
+                    repairs_used: false,
+                })
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let timing_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // The browser path cannot emit a repair decode proof until it has
+            // a supported codec. Zero here denotes unavailable timing.
+            #[cfg(target_arch = "wasm32")]
+            let timing_ns = 0;
             (
                 ready,
                 decoder.k_source,
-                decoder.symbol_size,
+                timing_ns,
                 decoder.seed,
                 decoder.sorted_isis(),
                 decoder.received_count(),
                 decoder.source_symbol_count(),
-                decoder.has_repair_symbols(),
                 padded,
             )
+        };
+
+        let decoded = match decoded_padded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let decoder = self
+                    .decoders
+                    .get_mut(&changeset_id)
+                    .expect("active decoder");
+                decoder.symbols.remove(&packet.esi);
+                decoder.received_isis.remove(&packet.esi);
+                self.buffered_symbol_bytes -= packet.symbol_data.len();
+                *self
+                    .received_counts
+                    .get_mut(&changeset_id)
+                    .expect("active count") -= 1;
+                if created_decoder {
+                    self.remove_decoder(changeset_id);
+                }
+                self.state = if self.decoders.is_empty() {
+                    ReceiverState::Listening
+                } else {
+                    ReceiverState::Collecting
+                };
+                return Err(error);
+            }
         };
 
         if ready_to_decode {
@@ -616,26 +778,31 @@ impl ReplicationReceiver {
             );
             self.state = ReceiverState::Decoding;
 
-            if let Some(padded_bytes) = decoded_padded {
-                let success_proof =
-                    if self.config.decode_proof_policy.emit_on_repair_success && has_repair_ctx {
-                        Some(Self::build_decode_proof(DecodeProofBuildInput {
-                            changeset_id,
-                            k_source: k_source_ctx,
-                            symbol_size: symbol_size_ctx,
-                            seed: seed_ctx,
-                            received_isis: &received_isis_ctx,
-                            decode_success: true,
-                            intermediate_rank: Some(k_source_ctx),
-                            symbols_used: received_count_ctx,
-                        }))
-                    } else {
-                        None
-                    };
+            if let Some(padded_bytes) = decoded.data {
+                let success_proof = if self.config.decode_proof_policy.emit_on_repair_success
+                    && decoded.repairs_used
+                {
+                    Some(Self::build_decode_proof(DecodeProofBuildInput {
+                        changeset_id,
+                        k_source: k_source_ctx,
+                        seed: seed_ctx,
+                        received_isis: &received_isis_ctx,
+                        decode_success: true,
+                        intermediate_rank: decoded.rank,
+                        timing_ns: decode_timing_ns,
+                    }))
+                } else {
+                    None
+                };
 
                 // Decode succeeded: truncate to total_len and parse pages.
                 match self.parse_and_validate_changeset(changeset_id, &padded_bytes) {
                     Ok(mut result) => {
+                        result.symbols_used = if decoded.repairs_used {
+                            received_count_ctx
+                        } else {
+                            k_source_ctx
+                        };
                         let n_pages = result.pages.len();
                         if let Some(proof) = success_proof {
                             self.record_decode_proof(proof.clone());
@@ -673,12 +840,11 @@ impl ReplicationReceiver {
                 let failure_proof = Self::build_decode_proof(DecodeProofBuildInput {
                     changeset_id,
                     k_source: k_source_ctx,
-                    symbol_size: symbol_size_ctx,
                     seed: seed_ctx,
                     received_isis: &received_isis_ctx,
                     decode_success: false,
-                    intermediate_rank: Some(source_count_ctx),
-                    symbols_used: received_count_ctx,
+                    intermediate_rank: decoded.rank,
+                    timing_ns: decode_timing_ns,
                 });
                 self.record_decode_proof(failure_proof);
             }
@@ -839,12 +1005,14 @@ impl ReplicationReceiver {
             });
         }
 
-        // Pages should already be sorted (sender sorts them).
-        debug_assert!(
-            pages
-                .windows(2)
-                .all(|w| w[0].page_number <= w[1].page_number)
-        );
+        if pages
+            .windows(2)
+            .any(|pair| pair[0].page_number > pair[1].page_number)
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "changeset pages are not ordered by page number".to_owned(),
+            });
+        }
 
         Ok(DecodeResult {
             changeset_id,
@@ -856,15 +1024,13 @@ impl ReplicationReceiver {
 
     fn build_decode_proof(input: DecodeProofBuildInput<'_>) -> EcsDecodeProof {
         let object_id = ObjectId::from_bytes(*input.changeset_id.as_bytes());
-        let timing_ns =
-            deterministic_timing_ns(input.k_source, input.symbol_size, input.symbols_used);
         EcsDecodeProof::from_esis(
             object_id,
             input.k_source,
             input.received_isis,
             input.decode_success,
             input.intermediate_rank,
-            timing_ns,
+            input.timing_ns,
             input.seed,
         )
         .with_changeset_id(*input.changeset_id.as_bytes())
@@ -879,18 +1045,15 @@ impl ReplicationReceiver {
         });
     }
 
-    /// Apply pending decoded results. Returns applied page counts.
-    ///
-    /// In production, this writes pages to the local database. Here we
-    /// validate and return the results for the caller to apply.
+    /// Drain validated changesets for the caller to apply to its database.
     ///
     /// # Errors
     ///
-    /// Returns error if not in APPLYING state.
+    /// Returns error if there are no pending results.
     pub fn apply_pending(&mut self) -> Result<Vec<DecodeResult>> {
-        if self.state != ReceiverState::Applying {
+        if self.pending_results.is_empty() {
             return Err(FrankenError::Internal(format!(
-                "receiver must be APPLYING to apply, current state: {:?}",
+                "receiver has no pending changesets, current state: {:?}",
                 self.state
             )));
         }
@@ -906,8 +1069,11 @@ impl ReplicationReceiver {
             "applied pending changesets"
         );
 
-        // Transition to COMPLETE.
-        self.state = ReceiverState::Complete;
+        self.state = if self.decoders.is_empty() {
+            ReceiverState::Complete
+        } else {
+            ReceiverState::Collecting
+        };
         Ok(results)
     }
 
@@ -943,14 +1109,6 @@ impl Default for ReplicationReceiver {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn deterministic_timing_ns(k_source: u32, symbol_size: u32, symbols_used: u32) -> u64 {
-    let mut material = [0_u8; 12];
-    material[..4].copy_from_slice(&k_source.to_le_bytes());
-    material[4..8].copy_from_slice(&symbol_size.to_le_bytes());
-    material[8..12].copy_from_slice(&symbols_used.to_le_bytes());
-    xxhash_rust::xxh3::xxh3_64(&material)
 }
 
 /// Result of processing a single packet.
@@ -1083,6 +1241,8 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
 
 #[cfg(test)]
 mod tests {
+    use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
+    use asupersync::raptorq::systematic::SystematicEncoder;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::security::authenticated::AuthenticatedSymbol;
     use asupersync::security::tag::AuthenticationTag;
@@ -1216,25 +1376,72 @@ mod tests {
 
     fn decode_from_wire_packets(
         delivered: &[(u32, Vec<u8>)],
-    ) -> (Option<Vec<DecodedPage>>, usize, usize) {
-        let mut receiver = ReplicationReceiver::new();
+        auth_key: Option<[u8; 32]>,
+    ) -> (Option<DecodeResult>, usize, usize) {
+        let mut receiver = receiver_with_decode_proofs();
+        receiver.config.auth_key = auth_key;
+        let cx = Cx::new();
         let mut erasures = 0_usize;
         let mut parse_errors = 0_usize;
 
         for (_, wire) in delivered {
-            match receiver.process_packet(&Cx::new(), wire) {
+            match receiver.process_packet(&cx, wire) {
                 Ok(PacketResult::DecodeReady) => {
                     let mut applied = receiver.apply_pending().expect("apply decoded changeset");
-                    let pages = applied.pop().expect("decode result pages").pages;
-                    return (Some(pages), erasures, parse_errors);
+                    assert_eq!(applied.len(), 1);
+                    assert_eq!(receiver.buffered_symbol_bytes, 0);
+                    assert_eq!(receiver.active_decoders(), 0);
+                    let decoded = applied.pop().expect("decode result pages");
+                    assert_eq!(
+                        receiver
+                            .decode_audit_entries()
+                            .iter()
+                            .filter(|entry| entry.proof.decode_success)
+                            .count(),
+                        usize::from(decoded.decode_proof.is_some())
+                    );
+                    return (Some(decoded), erasures, parse_errors);
                 }
                 Ok(PacketResult::Erasure) => erasures += 1,
                 Ok(PacketResult::Accepted | PacketResult::Duplicate | PacketResult::NeedMore) => {}
-                Err(_) => parse_errors += 1,
+                Err(error) => {
+                    eprintln!("bead_id=bd-3mgq5.2 event=packet_error error={error}");
+                    parse_errors += 1;
+                }
             }
         }
 
         (None, erasures, parse_errors)
+    }
+
+    fn assert_genuine_repair(result: &DecodeResult, original: &[PageEntry]) {
+        assert!(decoded_matches_original(&result.pages, original));
+        let proof = result.decode_proof.as_ref().expect("repair proof");
+        assert!(proof.decode_success && proof.is_repair() && proof.is_consistent());
+        assert!(
+            !proof.source_esis.contains(&0),
+            "source ESI 0 was permanently erased"
+        );
+        assert!(!proof.symbols_received.contains(&0));
+        assert!(!proof.repair_esis.is_empty());
+        let decoder = InactivationDecoder::new(
+            usize::try_from(proof.k_source).expect("K fits usize"),
+            128,
+            proof.seed,
+        );
+        assert_eq!(
+            proof.intermediate_rank,
+            Some(u32::try_from(decoder.params().l).expect("rank fits u32"))
+        );
+        assert_eq!(proof.changeset_id, Some(*result.changeset_id.as_bytes()));
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=repair_decoded k={} rank={:?} source_esis={:?} repair_esis={:?} pages={}",
+            proof.k_source,
+            proof.intermediate_rank,
+            proof.source_esis,
+            proof.repair_esis,
+            result.pages.len()
+        );
     }
 
     fn decoded_matches_original(decoded: &[DecodedPage], original: &[PageEntry]) -> bool {
@@ -1621,6 +1828,470 @@ mod tests {
     }
 
     #[test]
+    fn test_receiver_rejects_corrupt_and_unauthenticated_repairs_on_both_entrypoints() {
+        let cx = Cx::new();
+        let key = [0x11_u8; 32];
+        let packets = generate_sender_packets_with_multiplier(128, &[1, 2], 128, 2);
+        let repair = packets
+            .iter()
+            .map(|wire| ReplicationPacket::from_bytes(wire).expect("packet"))
+            .find(|packet| !packet.is_source_symbol())
+            .expect("real repair");
+        let mut valid = repair.clone();
+        valid.attach_auth_tag(&key);
+        let mut corrupted_wire = valid.to_bytes().expect("valid authenticated wire");
+        let payload_start = corrupted_wire.len() - valid.symbol_data.len();
+        corrupted_wire[payload_start] ^= 0x80;
+        let mut corrupted = valid.clone();
+        corrupted.symbol_data[0] ^= 0x80;
+        let mut wrong_key = repair.clone();
+        wrong_key.attach_auth_tag(&[0x22; 32]);
+        let wrong_key_wire = wrong_key.to_bytes().expect("wrong-key wire");
+        let missing_tag_wire = repair.to_bytes().expect("missing-tag wire");
+        for (case, packet, wire) in [
+            ("payload", corrupted, corrupted_wire),
+            ("wrong_key", wrong_key, wrong_key_wire),
+            ("missing_tag", repair, missing_tag_wire),
+        ] {
+            for parsed in [false, true] {
+                let mut receiver =
+                    ReplicationReceiver::with_config(ReceiverConfig::with_auth_key(key));
+                let outcome = if parsed {
+                    receiver.process_parsed_packet(&cx, &packet)
+                } else {
+                    receiver.process_packet(&cx, &wire)
+                };
+                assert_eq!(
+                    outcome.expect("invalid integrity is an erasure"),
+                    PacketResult::Erasure,
+                    "case={case} parsed={parsed}"
+                );
+                assert_eq!(receiver.state(), ReceiverState::Listening);
+                assert_eq!(receiver.active_decoders(), 0);
+                assert_eq!(receiver.buffered_symbol_bytes, 0);
+                assert!(receiver.pending_results.is_empty());
+                assert!(receiver.decode_audit_entries().is_empty());
+                assert_eq!(
+                    receiver
+                        .process_parsed_packet(&cx, &valid)
+                        .expect("valid authenticated repair"),
+                    PacketResult::Accepted
+                );
+                assert_eq!(receiver.buffered_symbol_bytes, 128);
+                receiver.force_reset();
+                assert_eq!(receiver.buffered_symbol_bytes, 0);
+                eprintln!(
+                    "bead_id=bd-3mgq5.2 event=repair_integrity case={case} parsed={parsed} rejected=true valid_retry=accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_receiver_cancelled_packet_preserves_admitted_symbols() {
+        let cx = Cx::new();
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        let packets = generate_sender_packets(128, &[1, 2], 128);
+        let first = ReplicationPacket::from_bytes(&packets[0]).expect("first");
+        let second = ReplicationPacket::from_bytes(&packets[1]).expect("second");
+        let mut receiver = receiver_with_decode_proofs();
+        assert!(matches!(
+            receiver.process_packet(&cancelled, &packets[0]),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(receiver.state(), ReceiverState::Listening);
+        assert_eq!(receiver.active_decoders(), 0);
+        receiver
+            .process_packet(&cx, &packets[0])
+            .expect("first admitted");
+        let original = receiver.decoders[&first.changeset_id].symbols.clone();
+        let counts = receiver.received_counts.clone();
+        for parsed in [false, true] {
+            let outcome = if parsed {
+                receiver.process_parsed_packet(&cancelled, &second)
+            } else {
+                receiver.process_packet(&cancelled, &packets[1])
+            };
+            assert!(matches!(outcome, Err(FrankenError::Abort)));
+            assert_eq!(receiver.decoders[&first.changeset_id].symbols, original);
+            assert_eq!(receiver.received_counts, counts);
+            assert_eq!(receiver.buffered_symbol_bytes, 128);
+            assert_eq!(receiver.state(), ReceiverState::Collecting);
+            assert!(receiver.pending_results.is_empty());
+            assert!(receiver.decode_audit_entries().is_empty());
+        }
+        for wire in &packets[1..] {
+            receiver
+                .process_packet(&cx, wire)
+                .expect("fresh caller continues");
+        }
+        let results = receiver
+            .apply_pending()
+            .expect("exact source-only recovery");
+        assert_eq!(results.len(), 1);
+        assert!(decoded_matches_original(
+            &results[0].pages,
+            &make_pages(128, &[1, 2])
+        ));
+        assert!(results[0].decode_proof.is_none());
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=cancel_retry preserved_bytes=128 final_buffered_bytes=0 decoded_pages=2"
+        );
+    }
+
+    #[test]
+    fn test_receiver_repair_work_budget_rolls_back_only_new_symbol() {
+        let cx = Cx::new();
+        let packets = generate_sender_packets_with_multiplier(128, &[1, 2], 128, 2);
+        let first = ReplicationPacket::from_bytes(&packets[0]).expect("source 0");
+        assert_eq!(first.k_source, 3);
+        let mut receiver = ReplicationReceiver::with_config(ReceiverConfig {
+            max_buffered_symbol_bytes: 384,
+            ..ReceiverConfig::default()
+        });
+        for wire in &packets[1..3] {
+            receiver
+                .process_packet(&cx, wire)
+                .expect("admit surviving sources");
+        }
+        let original = receiver.decoders[&first.changeset_id].symbols.clone();
+        assert!(matches!(
+            receiver.process_packet(&cx, &packets[3]),
+            Err(FrankenError::TooBig)
+        ));
+        assert_eq!(receiver.decoders[&first.changeset_id].symbols, original);
+        assert_eq!(receiver.buffered_symbol_bytes, 256);
+        assert_eq!(receiver.received_counts[&first.changeset_id], 2);
+        assert!(receiver.pending_results.is_empty());
+        assert_eq!(receiver.state(), ReceiverState::Collecting);
+        assert_eq!(
+            receiver
+                .process_packet(&cx, &packets[0])
+                .expect("bounded direct source assembly"),
+            PacketResult::DecodeReady
+        );
+        let results = receiver.apply_pending().expect("source assembly");
+        assert_eq!(results.len(), 1);
+        assert!(decoded_matches_original(
+            &results[0].pages,
+            &make_pages(128, &[1, 2])
+        ));
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=repair_budget rejected_symbol=3 preserved_bytes=256 source_retry=decoded"
+        );
+    }
+
+    #[test]
+    fn test_receiver_oversized_esi_cannot_poison_valid_transfer() {
+        let cx = Cx::new();
+        let packets = generate_sender_packets(128, &[1, 2], 128);
+        let first = ReplicationPacket::from_bytes(&packets[0]).expect("source packet");
+        for (esi, parsed) in [(1_000_001, false), (u32::MAX, true)] {
+            let mut receiver = receiver_with_decode_proofs();
+            let mut invalid = first.clone();
+            invalid.esi = esi;
+            let result = if parsed {
+                receiver.process_parsed_packet(&cx, &invalid)
+            } else {
+                receiver.process_packet(&cx, &invalid.to_bytes().expect("ESI fits wire encoding"))
+            };
+            assert!(
+                matches!(result, Err(FrankenError::OutOfRange { .. })),
+                "esi={esi} parsed={parsed}"
+            );
+            assert_eq!(receiver.state(), ReceiverState::Listening);
+            assert_eq!(receiver.active_decoders(), 0);
+            assert_eq!(receiver.buffered_symbol_bytes, 0);
+            assert!(receiver.received_counts.is_empty());
+            assert!(receiver.pending_results.is_empty());
+            assert!(receiver.decode_audit_entries().is_empty());
+            for wire in &packets {
+                receiver
+                    .process_packet(&cx, wire)
+                    .expect("same receiver accepts valid transfer");
+            }
+            let results = receiver
+                .apply_pending()
+                .expect("valid pages after invalid ESI");
+            assert_eq!(results.len(), 1);
+            assert!(decoded_matches_original(
+                &results[0].pages,
+                &make_pages(128, &[1, 2])
+            ));
+            assert_eq!(receiver.buffered_symbol_bytes, 0);
+            assert_eq!(receiver.active_decoders(), 0);
+            eprintln!(
+                "bead_id=bd-3mgq5.2 event=esi_admission esi={esi} parsed={parsed} invalid_admitted=false valid_retry=decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_receiver_unordered_changeset_is_rejected_before_valid_retry() {
+        let cx = Cx::new();
+        let mut pages = make_pages(64, &[1, 2]);
+        let mut changeset = encode_changeset(64, &mut pages).expect("changeset");
+        let entry_size = 12 + 64;
+        let split = CHANGESET_HEADER_SIZE + entry_size;
+        assert_eq!(changeset.len(), CHANGESET_HEADER_SIZE + 2 * entry_size);
+        let first_entry = changeset[CHANGESET_HEADER_SIZE..split].to_vec();
+        changeset.copy_within(split..split + entry_size, CHANGESET_HEADER_SIZE);
+        changeset[split..].copy_from_slice(&first_entry);
+        // Hash the malformed order itself: this is not a transport/hash rejection.
+        let id = compute_changeset_id(&changeset);
+        let k = u32::try_from(changeset.len().div_ceil(64)).expect("K fits");
+        let mut receiver = receiver_with_decode_proofs();
+        for (index, chunk) in changeset.chunks(64).enumerate() {
+            let mut payload = vec![0; 64];
+            payload[..chunk.len()].copy_from_slice(chunk);
+            let esi = u32::try_from(index).expect("ESI fits");
+            let packet = make_packet(id, 0, esi, k, payload);
+            let result = receiver.process_packet(&cx, &packet.to_bytes().expect("wire"));
+            if esi + 1 == k {
+                assert!(
+                    matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+                    "unordered self-consistent changeset must fail"
+                );
+            } else {
+                assert_eq!(result.expect("partial source"), PacketResult::Accepted);
+            }
+        }
+        assert_eq!(receiver.state(), ReceiverState::Listening);
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
+        assert!(receiver.pending_results.is_empty());
+        assert!(receiver.decode_audit_entries().is_empty());
+        for wire in generate_sender_packets(64, &[1, 2], 64) {
+            receiver
+                .process_packet(&cx, &wire)
+                .expect("valid transfer after unordered data");
+        }
+        let results = receiver.apply_pending().expect("valid ordered transfer");
+        assert_eq!(results.len(), 1);
+        assert!(decoded_matches_original(&results[0].pages, &pages));
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=unordered_changeset invalid_applied=false valid_retry=decoded"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_replication_sender_repairs_every_shard_of_one_large_input() {
+        use std::collections::BTreeMap;
+
+        use crate::replication_sender::{MAX_REPLICATION_SYMBOL_SIZE, max_pages_per_repair_block};
+
+        let cx = Cx::new();
+        let page_size = 4096;
+        let symbol_size = u16::try_from(MAX_REPLICATION_SYMBOL_SIZE).expect("wire symbol size");
+        let block_pages = max_pages_per_repair_block(page_size, symbol_size).expect("block budget");
+        assert!(block_pages > 1);
+        let page_count = block_pages
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .expect("page count");
+        let page_numbers: Vec<_> =
+            (1..=u32::try_from(page_count).expect("page count fits")).collect();
+        let mut pages = make_pages(page_size, &page_numbers);
+        let expected: BTreeMap<_, _> = pages
+            .iter()
+            .map(|page| (page.page_number, page.page_bytes.clone()))
+            .collect();
+        let mut expected_objects = BTreeMap::new();
+        for chunk in pages.chunks(block_pages) {
+            let mut originals = chunk.to_vec();
+            let bytes =
+                encode_changeset(page_size, &mut originals).expect("complete shard changeset");
+            assert!(
+                expected_objects
+                    .insert(*compute_changeset_id(&bytes).as_bytes(), originals)
+                    .is_none()
+            );
+        }
+        assert_eq!(expected_objects.len(), 3);
+
+        let mut sender = ReplicationSender::new();
+        sender
+            .prepare(
+                page_size,
+                &mut pages,
+                SenderConfig {
+                    symbol_size,
+                    max_isi_multiplier: 8,
+                },
+            )
+            .expect("one large sender input");
+        sender.start_streaming().expect("stream shards");
+        let mut packets_by_object: BTreeMap<[u8; 16], Vec<ReplicationPacket>> = BTreeMap::new();
+        while let Some(packet) = sender.next_packet(&cx).expect("bounded shard encoding") {
+            packets_by_object
+                .entry(*packet.changeset_id.as_bytes())
+                .or_default()
+                .push(packet);
+        }
+        assert_eq!(
+            packets_by_object.keys().collect::<Vec<_>>(),
+            expected_objects.keys().collect::<Vec<_>>()
+        );
+        for packets in packets_by_object.values_mut() {
+            let k = packets[0].k_source;
+            assert_eq!(packets.len(), usize::try_from(k).expect("K fits") * 8);
+            assert_eq!(packets.iter().filter(|packet| packet.esi == 0).count(), 1);
+            assert!(
+                packets
+                    .iter()
+                    .all(|packet| packet.k_source == k && packet.sbn == 0)
+            );
+            packets.retain(|packet| packet.esi != 0);
+            // Fixed adjacent reversal, followed by round-robin object delivery.
+            for pair in packets.chunks_mut(2) {
+                if pair.len() == 2 {
+                    pair.swap(0, 1);
+                }
+            }
+        }
+
+        let mut receiver = receiver_with_decode_proofs();
+        let mut completed = HashSet::new();
+        let mut recovered = BTreeMap::new();
+        let rounds = packets_by_object
+            .values()
+            .map(Vec::len)
+            .max()
+            .expect("three streams");
+        for round in 0..rounds {
+            for (id, packets) in packets_by_object.iter().rev() {
+                // DecodeReady is the object's ACK boundary; stop forwarding its surplus repairs.
+                if completed.contains(id) {
+                    continue;
+                }
+                let Some(packet) = packets.get(round) else {
+                    continue;
+                };
+                assert_ne!(packet.esi, 0);
+                let outcome = receiver
+                    .process_packet(&cx, &packet.to_bytes().expect("wire packet"))
+                    .expect("shard receive");
+                if outcome == PacketResult::DecodeReady {
+                    let results = receiver.apply_pending().expect("drain one repaired object");
+                    assert_eq!(results.len(), 1);
+                    let result = &results[0];
+                    assert_eq!(result.changeset_id.as_bytes(), id);
+                    assert!(completed.insert(*id), "each object is drained once");
+                    assert_genuine_repair(result, &expected_objects[id]);
+                    for page in &result.pages {
+                        assert!(
+                            recovered
+                                .insert(page.page_number, page.page_data.clone())
+                                .is_none(),
+                            "page repeated across shards"
+                        );
+                    }
+                    eprintln!(
+                        "bead_id=bd-3mgq5.2 event=single_input_replication_shard object={id:?} round={round} k={} erased_source_esi=0 recovered_pages={}",
+                        packet.k_source,
+                        result.pages.len()
+                    );
+                }
+            }
+            if round == 0 {
+                assert!(
+                    receiver.active_decoders() >= 2,
+                    "the full objects must overlap in collection"
+                );
+            }
+        }
+        assert_eq!(
+            completed.len(),
+            3,
+            "both full blocks and short tail must recover"
+        );
+        assert_eq!(recovered, expected);
+        let mut block_sizes: Vec<_> = expected_objects.values().map(Vec::len).collect();
+        block_sizes.sort_unstable();
+        assert_eq!(block_sizes, [1, block_pages, block_pages]);
+        assert_eq!(receiver.applied_count(), 3);
+        assert_eq!(receiver.active_decoders(), 0);
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert!(receiver.pending_results.is_empty());
+    }
+
+    #[test]
+    fn test_receiver_pending_repaired_changeset_survives_incomplete_peer() {
+        let cx = Cx::new();
+        let mut receiver = receiver_with_decode_proofs();
+        let expected_a = make_pages(128, &[7, 11]);
+        for wire in generate_sender_packets_with_multiplier(128, &[7, 11], 128, 32) {
+            let packet = ReplicationPacket::from_bytes(&wire).expect("A packet");
+            if packet.esi == 0 {
+                continue;
+            }
+            if receiver.process_packet(&cx, &wire).expect("repair A") == PacketResult::DecodeReady {
+                break;
+            }
+        }
+        assert_eq!(receiver.pending_results.len(), 1);
+        assert_genuine_repair(&receiver.pending_results[0], &expected_a);
+        let proof_a = receiver.pending_results[0].decode_proof.clone();
+        let id_a = receiver.pending_results[0].changeset_id;
+        let packets_b = generate_sender_packets(128, &[21, 34], 128);
+        let id_b = ReplicationPacket::from_bytes(&packets_b[0])
+            .expect("B packet")
+            .changeset_id;
+        assert_ne!(id_a, id_b);
+        assert_eq!(
+            receiver
+                .process_packet(&cx, &packets_b[0])
+                .expect("incomplete B"),
+            PacketResult::Accepted
+        );
+        assert_eq!(receiver.active_decoders(), 1);
+        assert_eq!(receiver.buffered_symbol_bytes, 128);
+        let results_a = receiver
+            .apply_pending()
+            .expect("A remains drainable while B collects");
+        assert_eq!(results_a.len(), 1);
+        assert_eq!(results_a[0].changeset_id, id_a);
+        assert_eq!(results_a[0].decode_proof, proof_a);
+        assert!(decoded_matches_original(&results_a[0].pages, &expected_a));
+        assert_eq!(receiver.applied_count(), 1);
+        assert_eq!(receiver.state(), ReceiverState::Collecting);
+        assert_eq!(receiver.buffered_symbol_bytes, 128);
+        assert!(
+            receiver.apply_pending().is_err(),
+            "A must drain exactly once"
+        );
+        assert_eq!(receiver.applied_count(), 1);
+        for wire in &packets_b[1..] {
+            receiver
+                .process_packet(&cx, wire)
+                .expect("continue B after draining A");
+        }
+        let results_b = receiver.apply_pending().expect("drain B");
+        assert_eq!(results_b.len(), 1);
+        assert_eq!(results_b[0].changeset_id, id_b);
+        assert!(decoded_matches_original(
+            &results_b[0].pages,
+            &make_pages(128, &[21, 34])
+        ));
+        assert!(results_b[0].decode_proof.is_none());
+        assert_eq!(receiver.applied_count(), 2);
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
+        assert!(receiver.pending_results.is_empty());
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=interleaved_drain a_repaired=true a_drains=1 b_drains=1 final_buffered_bytes=0"
+        );
+    }
+
+    #[test]
     fn test_receiver_accepts_legacy_v1_packets() {
         let mut receiver = ReplicationReceiver::new();
         let id = ChangesetId::from_bytes([0x46; 16]);
@@ -1677,11 +2348,31 @@ mod tests {
     #[test]
     fn test_receiver_decode_failure_emits_proof_when_enabled() {
         let mut receiver = receiver_with_decode_proofs();
-        let changeset_id = ChangesetId::from_bytes([0x5A; 16]);
-
-        // Two repair-only symbols at K=2: ready_to_decode => true, but decode fails.
-        let p1 = make_packet(changeset_id, 0, 2, 2, vec![0xA1; 64]);
-        let p2 = make_packet(changeset_id, 0, 3, 2, vec![0xA2; 64]);
+        let packets = generate_sender_packets_with_multiplier(64, &[7], 64, 161);
+        let p1 = ReplicationPacket::from_bytes(&packets[311]).expect("repair 311");
+        let p2 = ReplicationPacket::from_bytes(&packets[320]).expect("repair 320");
+        let changeset_id = p1.changeset_id;
+        assert_eq!(p1.k_source, 2);
+        assert_eq!((p1.esi, p2.esi), (311, 320));
+        let decoder = InactivationDecoder::new(2, 64, p1.seed);
+        let mut equations = decoder.constraint_symbols();
+        // Frozen dependent RFC equations, not arbitrary bytes or a successful seed search.
+        for packet in [&p1, &p2] {
+            let (mut columns, coefficients) =
+                decoder.repair_equation(packet.esi).expect("equation");
+            assert!(coefficients.iter().all(|coefficient| coefficient.0 == 1));
+            columns.sort_unstable();
+            assert_eq!(columns, [9, 13, 19, 20, 25]);
+            equations.push(ReceivedSymbol::repair(
+                packet.esi,
+                columns,
+                coefficients,
+                packet.symbol_data.clone(),
+            ));
+        }
+        assert_eq!(p1.symbol_data, p2.symbol_data);
+        let rank = decoder.rank_status(&equations).expect("rank status");
+        assert!(rank.rank < rank.columns && rank.deficit > 0);
 
         let r1 = receiver
             .process_parsed_packet(&Cx::new(), &p1)
@@ -1700,74 +2391,127 @@ mod tests {
             "bead_id=bd-faz4 case=failure_proof_decode_success_false"
         );
         assert_eq!(proof.changeset_id, Some(*changeset_id.as_bytes()));
+        assert_eq!(
+            proof.intermediate_rank,
+            Some(u32::try_from(rank.rank).expect("rank fits"))
+        );
+        assert_eq!(proof.symbols_received, [311, 320]);
+        assert!(proof.source_esis.is_empty());
+        assert!(receiver.pending_results.is_empty());
+        assert_eq!(receiver.buffered_symbol_bytes, 128);
+        assert_eq!(receiver.active_decoders(), 1);
+        assert_eq!(receiver.state(), ReceiverState::Collecting);
         assert!(
             proof.is_consistent(),
             "bead_id=bd-faz4 case=failure_proof_consistent"
         );
+        eprintln!(
+            "bead_id=bd-3mgq5.2 event=rank_deficient esis=311,320 rank={} columns={} deficit={}",
+            rank.rank, rank.columns, rank.deficit
+        );
+        receiver.force_reset();
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
     }
 
     #[test]
     fn test_receiver_decode_success_with_repair_emits_proof_when_enabled() {
-        let mut receiver = ReplicationReceiver::with_config(ReceiverConfig {
-            auth_key: None,
-            decode_proof_policy: DecodeProofEmissionPolicy {
-                emit_on_decode_failure: false,
-                emit_on_repair_success: true,
-            },
-            ..ReceiverConfig::default()
-        });
-        let page_size = 64_u32;
-        let mut pages = make_pages(page_size, &[7]);
-        let changeset_bytes = encode_changeset(page_size, &mut pages).expect("encode changeset");
-        let changeset_id = compute_changeset_id(&changeset_bytes);
+        let original = make_pages(128, &[7, 11]);
+        let packets = generate_sender_packets_with_multiplier(128, &[7, 11], 128, 32);
+        let surviving: Vec<_> = packets
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, wire)| {
+                let packet = ReplicationPacket::from_bytes(&wire).expect("sender packet");
+                (packet.esi != 0).then_some((u32::try_from(index).expect("index fits"), wire))
+            })
+            .collect();
+        let source_only: Vec<_> = surviving
+            .iter()
+            .filter(|(_, wire)| {
+                ReplicationPacket::from_bytes(wire)
+                    .expect("sender packet")
+                    .is_source_symbol()
+            })
+            .cloned()
+            .collect();
+        let (without_repair, erasures, errors) = decode_from_wire_packets(&source_only, None);
+        assert!(
+            without_repair.is_none(),
+            "permanent erasure cannot decode without repairs"
+        );
+        assert_eq!((erasures, errors), (0, 0));
+        let (decoded, erasures, errors) = decode_from_wire_packets(&surviving, None);
+        assert_eq!((erasures, errors), (0, 0));
+        assert_genuine_repair(
+            &decoded.expect("repair must recover absent source ESI 0"),
+            &original,
+        );
+    }
 
-        // Build K=2 source symbols from encoded bytes.
-        let symbol_size = 64_usize;
-        let mut s0 = vec![0_u8; symbol_size];
-        let mut s1 = vec![0_u8; symbol_size];
-        let split = changeset_bytes.len().min(symbol_size);
-        s0[..split].copy_from_slice(&changeset_bytes[..split]);
-        if changeset_bytes.len() > symbol_size {
-            let rem = changeset_bytes.len() - symbol_size;
-            s1[..rem].copy_from_slice(&changeset_bytes[symbol_size..]);
-        }
-
-        // Interleave source+repair so K is reached with at least one repair symbol present.
-        let p0 = make_packet(changeset_id, 0, 0, 2, s0);
-        let p_repair = make_packet(changeset_id, 0, 2, 2, vec![0xCC; symbol_size]);
-        let p1 = make_packet(changeset_id, 0, 1, 2, s1);
-
+    #[test]
+    fn test_receiver_source_assembly_does_not_claim_unused_repair() {
+        let cx = Cx::new();
+        let packets = generate_sender_packets(64, &[7], 64);
+        let source: Vec<_> = packets
+            .iter()
+            .map(|wire| ReplicationPacket::from_bytes(wire).expect("source"))
+            .collect();
+        assert_eq!(source.len(), 2);
+        let payloads: Vec<_> = source
+            .iter()
+            .map(|packet| packet.symbol_data.clone())
+            .collect();
+        let encoder = SystematicEncoder::new(&payloads, 64, source[0].seed).expect("real encoder");
+        let decoder = InactivationDecoder::new(2, 64, source[0].seed);
+        // This fixed repair equation equals source ESI 0. It cannot recover source ESI 1.
+        let mut source_columns = decoder.source_equation(0).0;
+        let mut repair_columns = decoder.repair_equation(26_345).expect("repair equation").0;
+        source_columns.sort_unstable();
+        repair_columns.sort_unstable();
+        assert_eq!(source_columns, [9, 13, 18, 23]);
+        assert_eq!(source_columns, repair_columns);
+        let redundant = make_packet(
+            source[0].changeset_id,
+            0,
+            26_345,
+            2,
+            encoder.repair_symbol(26_345),
+        );
+        assert_eq!(redundant.symbol_data, source[0].symbol_data);
+        let mut receiver = receiver_with_decode_proofs();
         assert_eq!(
-            receiver.process_parsed_packet(&Cx::new(), &p0).expect("p0"),
+            receiver.process_packet(&cx, &packets[0]).expect("source 0"),
             PacketResult::Accepted
         );
         assert_eq!(
             receiver
-                .process_parsed_packet(&Cx::new(), &p_repair)
-                .expect("repair"),
+                .process_parsed_packet(&cx, &redundant)
+                .expect("dependent repair"),
             PacketResult::NeedMore
         );
         assert_eq!(
-            receiver.process_parsed_packet(&Cx::new(), &p1).expect("p1"),
+            receiver.process_packet(&cx, &packets[1]).expect("source 1"),
             PacketResult::DecodeReady
         );
-        assert_eq!(receiver.state(), ReceiverState::Applying);
-
-        let results = receiver.apply_pending().expect("apply");
-        assert_eq!(results.len(), 1);
-        let decode_proof = results[0]
-            .decode_proof
-            .as_ref()
-            .expect("bead_id=bd-faz4 case=success_proof_attached_to_result");
-        assert!(decode_proof.decode_success);
-        assert!(decode_proof.is_repair());
+        let result = receiver.apply_pending().expect("source assembly");
+        assert_eq!(result.len(), 1);
+        assert!(decoded_matches_original(
+            &result[0].pages,
+            &make_pages(64, &[7])
+        ));
         assert!(
-            decode_proof.is_consistent(),
-            "bead_id=bd-faz4 case=success_proof_consistent"
+            result[0].decode_proof.is_none(),
+            "unused repair is not repair success"
         );
-
-        let audit = receiver.take_decode_audit_entries();
-        assert_eq!(audit.len(), 1, "bead_id=bd-faz4 case=success_proof_emitted");
+        assert!(
+            receiver
+                .decode_audit_entries()
+                .iter()
+                .all(|entry| !entry.proof.decode_success)
+        );
+        assert_eq!(receiver.buffered_symbol_bytes, 0);
+        assert_eq!(receiver.active_decoders(), 0);
     }
 
     #[test]
@@ -2175,47 +2919,37 @@ mod tests {
         let page_size = 128_u32;
         let page_numbers = [1_u32, 2];
         let original_pages = make_pages(page_size, &page_numbers);
-        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 32);
         let loss_packets: Vec<Vec<u8>> = packets
             .iter()
-            .flat_map(|packet| [packet.clone(), packet.clone()])
+            .filter(|wire| ReplicationPacket::from_bytes(wire).expect("packet").esi != 0)
+            .cloned()
             .collect();
 
-        for (loss_rate, require_observed_drop) in [(0.05_f64, false), (0.30_f64, true)] {
-            let mut found_seed = None;
-            for seed in 1_u64..=20_000 {
+        for loss_rate in [0.05_f64, 0.30_f64] {
+            for seed in [1_u64, 7, 42] {
                 let mut config = SimTransportConfig::deterministic(seed);
                 config.loss_rate = loss_rate;
                 config.preserve_order = true;
 
                 let delivery = transmit_packets_simnetwork(config, &loss_packets);
-                let observed_drop = delivery.delivered.len() < delivery.sent_count;
-                if require_observed_drop && !observed_drop {
-                    continue;
-                }
-                let saw_repair_symbol = delivery.delivered.iter().any(|(_, wire)| {
-                    ReplicationPacket::from_bytes(wire)
-                        .is_ok_and(|packet| !packet.is_source_symbol())
-                });
-                if !saw_repair_symbol {
-                    continue;
-                }
-
-                let (decoded, _erasures, _parse_errors) =
-                    decode_from_wire_packets(&delivery.delivered);
-                if decoded
-                    .as_ref()
-                    .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
-                {
-                    found_seed = Some(seed);
-                    break;
-                }
+                assert!(
+                    delivery.delivered.len() < delivery.sent_count,
+                    "seed={seed} loss_rate={loss_rate} must exercise transport loss"
+                );
+                let (decoded, erasures, parse_errors) =
+                    decode_from_wire_packets(&delivery.delivered, None);
+                assert_eq!((erasures, parse_errors), (0, 0));
+                eprintln!(
+                    "bead_id=bd-xgoe event=fixed_loss seed={seed} loss_rate={loss_rate} sent={} delivered={} source_0=permanently_erased",
+                    delivery.sent_count,
+                    delivery.delivered.len()
+                );
+                assert_genuine_repair(
+                    &decoded.expect("fixed loss schedule must recover"),
+                    &original_pages,
+                );
             }
-
-            assert!(
-                found_seed.is_some(),
-                "bead_id=bd-xgoe case=loss_profile_convergence loss_rate={loss_rate} require_drop={require_observed_drop} did not find deterministic convergent seed"
-            );
         }
     }
 
@@ -2224,33 +2958,39 @@ mod tests {
         let page_size = 128_u32;
         let page_numbers = [7_u32, 11];
         let original_pages = make_pages(page_size, &page_numbers);
-        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+        let packets: Vec<_> =
+            generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 32)
+                .into_iter()
+                .filter(|wire| ReplicationPacket::from_bytes(wire).expect("packet").esi != 0)
+                .collect();
 
-        let mut found_seed = None;
-        for seed in 1_u64..=2_000 {
+        for seed in [1_u64, 7, 42] {
             let mut config = SimTransportConfig::deterministic(seed);
             config.preserve_order = false;
-            config.duplication_rate = 0.35;
+            config.duplication_rate = 1.0;
 
             let delivery = transmit_packets_simnetwork(config, &packets);
-            if !has_duplicate_esies(&delivery) || !has_reordered_esies(&delivery) {
-                continue;
-            }
-
-            let (decoded, _erasures, _parse_errors) = decode_from_wire_packets(&delivery.delivered);
-            if decoded
-                .as_ref()
-                .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
-            {
-                found_seed = Some(seed);
-                break;
-            }
+            assert!(
+                has_duplicate_esies(&delivery),
+                "seed={seed}: no duplication exercised"
+            );
+            assert!(
+                has_reordered_esies(&delivery),
+                "seed={seed}: no reordering exercised"
+            );
+            let (decoded, erasures, parse_errors) =
+                decode_from_wire_packets(&delivery.delivered, None);
+            assert_eq!((erasures, parse_errors), (0, 0));
+            eprintln!(
+                "bead_id=bd-xgoe event=fixed_reorder_dup seed={seed} sent={} delivered={} source_0=permanently_erased",
+                delivery.sent_count,
+                delivery.delivered.len()
+            );
+            assert_genuine_repair(
+                &decoded.expect("fixed reorder/dup schedule must recover"),
+                &original_pages,
+            );
         }
-
-        assert!(
-            found_seed.is_some(),
-            "bead_id=bd-xgoe case=reorder_dup_convergence no deterministic seed achieved reorder+dup convergence"
-        );
     }
 
     #[test]
@@ -2258,36 +2998,60 @@ mod tests {
         let page_size = 128_u32;
         let page_numbers = [21_u32, 34];
         let original_pages = make_pages(page_size, &page_numbers);
-        let packets = generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 2);
+        let auth_key = [0xA5; 32];
+        let packets: Vec<_> =
+            generate_sender_packets_with_multiplier(page_size, &page_numbers, 128, 32)
+                .into_iter()
+                .filter_map(|wire| {
+                    let mut packet = ReplicationPacket::from_bytes(&wire).expect("packet");
+                    if packet.esi == 0 {
+                        return None;
+                    }
+                    packet.attach_auth_tag(&auth_key);
+                    Some(packet.to_bytes().expect("authenticated packet"))
+                })
+                .collect();
+        let mut corrupt_repair = packets
+            .iter()
+            .find(|wire| {
+                !ReplicationPacket::from_bytes(wire)
+                    .expect("packet")
+                    .is_source_symbol()
+            })
+            .expect("repair packet")
+            .clone();
+        *corrupt_repair.last_mut().expect("payload byte") ^= 0x80;
 
-        let mut found_seed = None;
-        for seed in 1_u64..=20_000 {
+        for seed in [1_u64, 7, 42] {
             let mut config = SimTransportConfig::deterministic(seed);
             config.corruption_rate = 0.20;
             config.preserve_order = false;
 
-            let delivery = transmit_packets_simnetwork(config, &packets);
-            if !has_corrupted_wire_bytes(&delivery, &packets) {
-                continue;
-            }
-
-            let (decoded, erasures, parse_errors) = decode_from_wire_packets(&delivery.delivered);
-            if erasures + parse_errors == 0 {
-                continue;
-            }
-            if decoded
-                .as_ref()
-                .is_some_and(|pages| decoded_matches_original(pages, &original_pages))
-            {
-                found_seed = Some(seed);
-                break;
-            }
+            let mut delivery = transmit_packets_simnetwork(config, &packets);
+            assert!(
+                has_corrupted_wire_bytes(&delivery, &packets),
+                "seed={seed}: no simulated corruption"
+            );
+            // Deterministic first rejection, even if decode finishes before later corrupt packets.
+            delivery
+                .delivered
+                .insert(0, (u32::MAX, corrupt_repair.clone()));
+            let (decoded, erasures, parse_errors) =
+                decode_from_wire_packets(&delivery.delivered, Some(auth_key));
+            assert!(
+                erasures > 0,
+                "corrupt repair must be rejected before decode"
+            );
+            eprintln!(
+                "bead_id=bd-xgoe event=fixed_corruption seed={seed} sent={} delivered={} erasures={erasures} parse_errors={parse_errors} source_0=permanently_erased",
+                delivery.sent_count,
+                delivery.delivered.len()
+            );
+            assert_genuine_repair(
+                &decoded.expect("fixed corruption schedule must recover"),
+                &original_pages,
+            );
         }
-
-        assert!(
-            found_seed.is_some(),
-            "bead_id=bd-xgoe case=corruption_recovery no deterministic seed achieved corruption rejection + convergence"
-        );
     }
 
     #[test]
