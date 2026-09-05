@@ -187,7 +187,7 @@ as per-flush deltas.
 | Metric | Labels | Meaning | SLO recommendation |
 |--------|--------|---------|--------------------|
 | `fsqlite_commits_total` (`fsqlite.commits_total`) | — | Completed explicit transactions, including read-only COMMIT, plus committed autocommit write transactions. | Base rate for transaction completion; a sudden drop with steady request load signals stalls. |
-| `fsqlite_conflicts_total` (`fsqlite.conflicts_total`) | `response=busy_snapshot` \| `rebased` | Write-write conflicts, split by how MVCC resolved them. | Alert when `rate(conflicts_total{response="busy_snapshot"}) / rate(commits_total) > 0.05` — busy-snapshot means a writer was turned away and must retry. A healthy `rebased` share is normal (the engine merged the writer forward). |
+| `fsqlite_conflicts_total` (`fsqlite.conflicts_total`) | `response=busy_snapshot` \| `rebased` | Rejected MVCC commit attempts, or successfully committed rebased transactions. | Compare rejected attempts with committed transactions to measure retry pressure. The `rebased` series reports successful merges in the MVCC transaction-manager API. |
 | `fsqlite_sweeper_clears_total` (`fsqlite.sweeper_clears_total`) | — | Version-sweeper reclamation passes. | Should track roughly with commit volume; a flatline while `history_bytes` climbs indicates the sweeper is starved. |
 | `fsqlite_historical_snapshots_opened_total` (`fsqlite.historical_snapshots_opened_total`) | — | Time-travel / historical snapshots opened. | Informational; correlate with `historical_pins_active`. |
 | `fsqlite_schema_epoch_bumps_total` (`fsqlite.schema_epoch_bumps_total`) | — | Schema-epoch increments (DDL that invalidated cached plans). | A spike outside a deploy window suggests unexpected DDL churn. |
@@ -199,6 +199,16 @@ implicit reads, and uncommitted retained batches. A retained batch counts once
 when flushed, regardless of its statement count. Post-commit cleanup errors do
 not undo an already counted commit. These are SQL engine commit counts; they do
 not count individual rows or internal pager maintenance transactions.
+
+The conflict counter records each commit attempt rejected with `BusySnapshot`,
+including SSI, stale-schema and first-committer-wins validation failures.
+Autocommit retries start new transactions: a rejected attempt still counts even
+if a later attempt succeeds. SQL validation and the separate MVCC
+`TransactionManager` API each record their own terminal outcome; neither
+requires hot-path profiling. The MVCC API counts a successful rebase once per
+committed transaction, regardless of page count. Partial rebases followed by an
+abort, invalid-state calls, and ordinary successful commits do not increment
+that series. This does not establish a public SQL rebase path.
 
 ### Histograms (latency, seconds)
 
@@ -262,7 +272,7 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
 `bd-zywqc.11`):
 
 - **Engine hot-path wiring** — restoring the remaining commit-latency /
-  conflict / sweeper / integrity recording sites. The commit counter is wired;
+  sweeper / schema / integrity recording sites. The commit counter is wired;
   its public SQL keeper is
   `crates/fsqlite-core/tests/agent_swarm_explain_concurrency_contract.rs::real_commit_metrics_count_public_durable_outcomes`
   (bd-zywqc.11.1.3). The page-lock wait histogram is wired at
@@ -272,7 +282,9 @@ HTTP `/metrics` endpoint all ship today. Remaining increments (tracked on
   reset, `sync`, and `durable_sync`; the real-file
   `real_wal_barriers_record_successful_fsync_latency` keeper checks successful
   counts, cancellation, reopen, and disabled mode. Clock reads are skipped when
-  metrics are disabled. Other series being present in an
+  metrics are disabled. Conflict outcomes are checked by the public SQL keeper
+  and `fsqlite-mvcc::lifecycle::tests::real_conflict_metrics_count_terminal_transaction_outcomes`,
+  including a multi-page merge followed by an abort. Other series being present in an
   exposition is not proof that their engine producers run.
 - **Overhead gate** — verify opt-in metrics add < 2% on the 8-writer soak.
 

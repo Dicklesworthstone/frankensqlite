@@ -16,6 +16,7 @@ use std::sync::{
 use std::time::Duration;
 
 use fsqlite_error::FrankenError;
+use fsqlite_observability::metrics;
 use fsqlite_types::sync_primitives::{Instant, Mutex};
 use fsqlite_types::{
     CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
@@ -1378,11 +1379,15 @@ impl TransactionManager {
             return Ok(CommitSeq::ZERO);
         }
 
-        if txn.mode == TransactionMode::Serialized {
+        let result = if txn.mode == TransactionMode::Serialized {
             self.commit_serialized(txn)
         } else {
             self.commit_concurrent(txn)
+        };
+        if matches!(result, Err(MvccError::BusySnapshot)) && !metrics::metrics_disabled() {
+            metrics::global().conflicts_busy_snapshot_total.inc();
         }
+        result
     }
 
     /// Abort a transaction, releasing all held resources.
@@ -2264,6 +2269,9 @@ impl TransactionManager {
             "concurrent commit succeeded"
         );
 
+        if rebased && !metrics::metrics_disabled() {
+            metrics::global().conflicts_rebased_total.inc();
+        }
         Ok(commit_seq)
     }
 
@@ -6083,6 +6091,122 @@ mod tests {
     }
 
     // -- bd-zppf test 5: CommitIndex tracks latest commit per page --
+
+    #[test]
+    fn real_conflict_metrics_count_terminal_transaction_outcomes() {
+        const CHILD: &str = "FSQLITE_CONFLICT_METRICS_KEEPER_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["enabled", "disabled"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "lifecycle::tests::real_conflict_metrics_count_terminal_transaction_outcomes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .env(
+                        "FRANKENSQLITE_METRICS_DISABLE",
+                        if mode == "disabled" { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("conflict_metrics mode={mode}\n{stdout}\n{stderr}");
+                assert!(output.status.success(), "isolated {mode} keeper failed");
+                assert!(stderr.contains("event=real_conflict_metrics_verified"));
+            }
+            return;
+        };
+        assert!(matches!(mode.as_str(), "enabled" | "disabled"));
+        let enabled = mode == "enabled";
+        let metrics = fsqlite_observability::metrics::global();
+        let busy = &metrics.conflicts_busy_snapshot_total;
+        let rebased = &metrics.conflicts_rebased_total;
+        let assert_counts = |rejected, merged| {
+            assert_eq!(busy.get(), if enabled { rejected } else { 0 });
+            assert_eq!(rebased.get(), if enabled { merged } else { 0 });
+        };
+        assert_counts(0, 0);
+        test_no_conflict_different_pages();
+        assert_counts(0, 0);
+        test_first_committer_wins();
+        assert_counts(1, 0);
+        test_conflict_response_sqlite_busy();
+        assert_counts(2, 0);
+
+        // Two conflicting pages: either both merge and publish once, or the
+        // second rejects after the first rebases. A partial rebase is not a
+        // successful transaction outcome and must never count as one.
+        for succeeds in [true, false] {
+            let m = mgr();
+            let pages = [PageNumber::new(501).unwrap(), PageNumber::new(502).unwrap()];
+            let mut base = m.begin(BeginKind::Concurrent).unwrap();
+            for page in pages {
+                m.write_page(&mut base, page, PageData::zeroed(PageSize::DEFAULT))
+                    .unwrap();
+            }
+            m.commit(&mut base).unwrap();
+            let mut winner = m.begin(BeginKind::Concurrent).unwrap();
+            let mut stale = m.begin(BeginKind::Concurrent).unwrap();
+            for page in pages {
+                m.write_page(&mut winner, page, test_data_at(0, 0xAA))
+                    .unwrap();
+            }
+            m.commit(&mut winner).unwrap();
+            m.write_page(&mut stale, pages[0], test_data_at(1, 0xBB))
+                .unwrap();
+            m.write_page(
+                &mut stale,
+                pages[1],
+                test_data_at(usize::from(succeeds), 0xBB),
+            )
+            .unwrap();
+            let result = m.commit(&mut stale);
+            if succeeds {
+                assert!(
+                    result.is_ok(),
+                    "both disjoint page changes must merge: {result:?}"
+                );
+                assert_counts(2, 1);
+            } else {
+                assert_eq!(result, Err(MvccError::BusySnapshot));
+                assert_counts(3, 1);
+            }
+            for page in pages {
+                let head = m.version_store().chain_head(page).unwrap();
+                let version = m.version_store().get_version(head).unwrap();
+                assert_eq!(version.data.as_bytes()[0], 0xAA);
+                assert_eq!(version.data.as_bytes()[1], if succeeds { 0xBB } else { 0 });
+            }
+            assert_eq!(m.commit(&mut stale), Err(MvccError::InvalidState));
+        }
+        let m = mgr();
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(m.commit(&mut reader), Ok(CommitSeq::ZERO));
+        assert_eq!(m.commit(&mut reader), Err(MvccError::InvalidState));
+        assert_counts(3, 1);
+        let exposition = fsqlite_observability::metrics::render_prometheus();
+        if enabled {
+            assert!(
+                exposition.lines().any(|line| {
+                    line == "fsqlite_conflicts_total{response=\"busy_snapshot\"} 3"
+                })
+            );
+            assert!(
+                exposition
+                    .lines()
+                    .any(|line| line == "fsqlite_conflicts_total{response=\"rebased\"} 1")
+            );
+        } else {
+            assert!(exposition.is_empty());
+        }
+        eprintln!(
+            "event=real_conflict_metrics_verified mode={mode} busy={} rebased={}",
+            busy.get(),
+            rebased.get()
+        );
+    }
 
     #[test]
     fn test_commit_index_lookup_correctness() {

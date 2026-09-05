@@ -2017,6 +2017,13 @@ fn record_concurrent_commit_plan_success(plan: &PreparedConcurrentCommit) {
 }
 
 fn record_concurrent_commit_plan_error(error: &FrankenError) {
+    // A rejected transaction attempt counts even when hot-path profiling is
+    // off. Autocommit may retry it as a new transaction on a fresh snapshot.
+    if matches!(error, FrankenError::BusySnapshot { .. })
+        && !fsqlite_observability::metrics::metrics_disabled()
+    {
+        fsqlite_observability::metrics::global().conflicts_busy_snapshot_total.inc();
+    }
     if !hot_path_profile_enabled() {
         return;
     }
