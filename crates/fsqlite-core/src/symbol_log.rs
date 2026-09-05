@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
@@ -511,22 +511,88 @@ pub fn scan_symbol_segment(segment_path: &Path) -> Result<SymbolSegmentScan> {
 }
 
 /// Read one packed SymbolRecord at a locator offset.
+///
+/// `max_symbol_bytes` is the caller's allocation budget for the symbol payload.
+/// The segment header and selected record are read from one opened file; other
+/// records are neither read nor allocated. The budget does not change the wire
+/// format's representable symbol sizes.
 pub fn read_symbol_record_at_offset(
     segment_path: &Path,
     offset: SymbolLogOffset,
+    max_symbol_bytes: u32,
 ) -> Result<SymbolRecord> {
-    let bytes = fs::read(segment_path)?;
-    if bytes.len() < SYMBOL_SEGMENT_HEADER_BYTES {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "segment {} shorter than header: {} bytes",
-                segment_path.display(),
-                bytes.len()
-            ),
-        });
-    }
+    let mut file = fs::File::open(segment_path)?;
+    let file_len = file.metadata()?.len();
+    read_located_symbol(&mut file, file_len, offset, max_symbol_bytes, None).inspect_err(|error| {
+        error!(
+            bead_id = BEAD_ID,
+            logging_standard = LOGGING_STANDARD_BEAD,
+            path = %segment_path.display(),
+            segment_id = offset.segment_id,
+            offset_bytes = offset.offset_bytes,
+            max_symbol_bytes,
+            error = %error,
+            "failed reading packed symbol record"
+        );
+    })
+}
 
-    let header = SymbolSegmentHeader::decode(&bytes[..SYMBOL_SEGMENT_HEADER_BYTES])?;
+/// Read one aligned-layout SymbolRecord using an explicit index entry.
+///
+/// Reads only the selected record, with the caller's `max_symbol_bytes` payload
+/// budget checked before allocation. Padding is range-checked but not loaded.
+pub fn read_aligned_symbol_record(
+    segment_path: &Path,
+    entry: AlignedSymbolIndexEntry,
+    max_symbol_bytes: u32,
+) -> Result<SymbolRecord> {
+    let mut file = fs::File::open(segment_path)?;
+    let file_len = file.metadata()?.len();
+    read_located_symbol(
+        &mut file,
+        file_len,
+        entry.offset,
+        max_symbol_bytes,
+        Some((entry.logical_len, entry.padded_len)),
+    )
+    .inspect_err(|error| {
+        error!(
+            bead_id = BEAD_ID,
+            logging_standard = LOGGING_STANDARD_BEAD,
+            path = %segment_path.display(),
+            segment_id = entry.offset.segment_id,
+            offset_bytes = entry.offset.offset_bytes,
+            logical_len = entry.logical_len,
+            padded_len = entry.padded_len,
+            max_symbol_bytes,
+            error = %error,
+            "failed reading aligned symbol record"
+        );
+    })
+}
+
+fn read_symbol_bytes(reader: &mut impl Read, bytes: &mut [u8]) -> Result<()> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            FrankenError::DatabaseCorrupt {
+                detail: "incomplete symbol record or segment header".to_owned(),
+            }
+        } else {
+            FrankenError::Io(error)
+        }
+    })
+}
+
+fn read_located_symbol(
+    reader: &mut (impl Read + Seek),
+    file_len: u64,
+    offset: SymbolLogOffset,
+    max_symbol_bytes: u32,
+    aligned_slot: Option<(u32, u32)>,
+) -> Result<SymbolRecord> {
+    let mut segment_bytes = [0_u8; SYMBOL_SEGMENT_HEADER_BYTES];
+    read_symbol_bytes(reader, &mut segment_bytes)?;
+    let header = SymbolSegmentHeader::decode(&segment_bytes)?;
     if header.segment_id != offset.segment_id {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -535,116 +601,93 @@ pub fn read_symbol_record_at_offset(
             ),
         });
     }
-
-    let offset_usize = u64_to_usize(offset.offset_bytes, "offset_bytes")?;
-    let absolute_offset = SYMBOL_SEGMENT_HEADER_BYTES
-        .checked_add(offset_usize)
+    let absolute_offset = offset
+        .offset_bytes
+        .checked_add(usize_to_u64(SYMBOL_SEGMENT_HEADER_BYTES, "segment header")?)
         .ok_or_else(|| FrankenError::DatabaseCorrupt {
             detail: "absolute offset overflow while reading symbol record".to_owned(),
         })?;
-
-    let Some((record, _)) = parse_symbol_record_at(&bytes, header.segment_id, absolute_offset)?
-    else {
+    if file_len.saturating_sub(absolute_offset)
+        < usize_to_u64(SYMBOL_RECORD_HEADER_BYTES, "record header")?
+    {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "no complete symbol record at offset {} in {}",
-                offset.offset_bytes,
-                segment_path.display()
-            ),
+            detail: "no complete symbol record header at locator offset".to_owned(),
         });
-    };
-
-    Ok(record.record)
+    }
+    reader.seek(SeekFrom::Start(absolute_offset))?;
+    let mut record_header = [0_u8; SYMBOL_RECORD_HEADER_BYTES];
+    read_symbol_bytes(reader, &mut record_header)?;
+    let symbol_size = read_u32_at(&record_header, SYMBOL_SIZE_FIELD_OFFSET, "symbol_size")?;
+    if symbol_size > max_symbol_bytes {
+        return Err(FrankenError::OutOfRange {
+            what: format!("symbol payload size (read budget {max_symbol_bytes})"),
+            value: symbol_size.to_string(),
+        });
+    }
+    let wire_len = SYMBOL_RECORD_HEADER_BYTES
+        .checked_add(u32_to_usize(symbol_size, "symbol_size")?)
+        .and_then(|len| len.checked_add(SYMBOL_RECORD_TRAILER_BYTES))
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "symbol record size overflow".to_owned(),
+        })?;
+    validate_located_symbol_range(file_len, absolute_offset, wire_len, aligned_slot)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(wire_len)
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    bytes.resize(wire_len, 0);
+    bytes[..SYMBOL_RECORD_HEADER_BYTES].copy_from_slice(&record_header);
+    read_symbol_bytes(reader, &mut bytes[SYMBOL_RECORD_HEADER_BYTES..])?;
+    SymbolRecord::from_bytes(&bytes).map_err(|error| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "invalid SymbolRecord at offset {}: {error}",
+            offset.offset_bytes
+        ),
+    })
 }
 
-/// Read one aligned-layout SymbolRecord using an explicit index entry.
-pub fn read_aligned_symbol_record(
-    segment_path: &Path,
-    entry: AlignedSymbolIndexEntry,
-) -> Result<SymbolRecord> {
-    let bytes = fs::read(segment_path)?;
-    if bytes.len() < SYMBOL_SEGMENT_HEADER_BYTES {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "segment {} shorter than header: {} bytes",
-                segment_path.display(),
-                bytes.len()
-            ),
-        });
-    }
-
-    let header = SymbolSegmentHeader::decode(&bytes[..SYMBOL_SEGMENT_HEADER_BYTES])?;
-    if header.segment_id != entry.offset.segment_id {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "segment id mismatch: locator={}, header={}",
-                entry.offset.segment_id, header.segment_id
-            ),
-        });
-    }
-
-    let offset_usize = u64_to_usize(entry.offset.offset_bytes, "offset_bytes")?;
-    let absolute_offset = SYMBOL_SEGMENT_HEADER_BYTES
-        .checked_add(offset_usize)
-        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "absolute offset overflow while reading aligned symbol".to_owned(),
-        })?;
-    let logical_len = u32_to_usize(entry.logical_len, "logical_len")?;
-    let padded_len = u32_to_usize(entry.padded_len, "padded_len")?;
+fn validate_located_symbol_range(
+    file_len: u64,
+    absolute_offset: u64,
+    wire_len: usize,
+    aligned_slot: Option<(u32, u32)>,
+) -> Result<()> {
+    let record_len = usize_to_u64(wire_len, "record length")?;
+    let Some((logical_len, padded_len)) = aligned_slot else {
+        if record_len > file_len.saturating_sub(absolute_offset) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "no complete symbol record at locator offset".to_owned(),
+            });
+        }
+        return Ok(());
+    };
     if logical_len > padded_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
-                "invalid aligned index entry: logical_len {} exceeds padded_len {}",
-                entry.logical_len, entry.padded_len
+                "invalid aligned index entry: logical_len {logical_len} exceeds padded_len {padded_len}"
             ),
         });
     }
-    let padded_end =
-        absolute_offset
-            .checked_add(padded_len)
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "aligned padded read overflow".to_owned(),
-            })?;
-    if padded_end > bytes.len() {
+    let padded_end = absolute_offset
+        .checked_add(u64::from(padded_len))
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "aligned padded read overflow".to_owned(),
+        })?;
+    if padded_end > file_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
-                "aligned symbol padded range out of bounds: end={}, file_len={}",
-                padded_end,
-                bytes.len()
+                "aligned symbol padded range out of bounds: end={padded_end}, file_len={file_len}"
             ),
         });
     }
-    let end =
-        absolute_offset
-            .checked_add(logical_len)
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "aligned logical read overflow".to_owned(),
-            })?;
-    if end > padded_end {
+    if u64::from(logical_len) != record_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
-                "aligned logical range exceeds padded slot: logical_end={}, padded_end={}",
-                end, padded_end
+                "aligned logical_len {logical_len} differs from encoded record length {record_len}"
             ),
         });
     }
-
-    SymbolRecord::from_bytes(&bytes[absolute_offset..end]).map_err(|err| {
-        error!(
-            bead_id = BEAD_ID,
-            logging_standard = LOGGING_STANDARD_BEAD,
-            path = %segment_path.display(),
-            offset_bytes = entry.offset.offset_bytes,
-            error = %err,
-            "failed to decode aligned symbol record"
-        );
-        FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "invalid aligned SymbolRecord at offset {}: {err}",
-                entry.offset.offset_bytes
-            ),
-        }
-    })
+    Ok(())
 }
 
 /// Rebuild `ObjectId -> Vec<SymbolLogOffset>` by scanning all segment files.
@@ -1499,11 +1542,205 @@ mod tests {
         let record = test_record(7, 11, 2048, 0x44);
         let offset = manager.append(&record).expect("append record");
 
-        let loaded = read_symbol_record_at_offset(&manager.active_segment_path(), offset)
+        let loaded = read_symbol_record_at_offset(&manager.active_segment_path(), offset, 2048)
             .expect("read by offset");
         assert_eq!(loaded.object_id, record.object_id);
         assert_eq!(loaded.esi, record.esi);
         assert_eq!(loaded.symbol_data, record.symbol_data);
+    }
+
+    struct CountedSymbolFile {
+        file: fs::File,
+        bytes_read: usize,
+    }
+
+    impl Read for CountedSymbolFile {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            // Real file I/O with short reads also exercises read_exact's loop.
+            let limit = buffer.len().min(17);
+            let count = self.file.read(&mut buffer[..limit])?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountedSymbolFile {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(position)
+        }
+    }
+
+    #[test]
+    fn test_locator_reads_only_selected_record_with_explicit_budget() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        manager
+            .append(&test_record(2, 0, 1024, 0x22))
+            .expect("first");
+        let record = test_record(3, 1, 65_536, 0x33);
+        let offset = manager.append(&record).expect("selected record");
+        let path = manager.active_segment_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("file");
+        file.set_len(64 * 1024 * 1024)
+            .expect("sparse unrelated tail");
+        let file_len = file.metadata().expect("length").len();
+        let mut counted = CountedSymbolFile {
+            file,
+            bytes_read: 0,
+        };
+        let loaded = read_located_symbol(&mut counted, file_len, offset, 65_536, None)
+            .expect("selected record");
+        assert_eq!(loaded, record);
+        assert_eq!(
+            counted.bytes_read,
+            SYMBOL_SEGMENT_HEADER_BYTES + record.to_bytes().len()
+        );
+        assert_eq!(
+            read_symbol_record_at_offset(&path, offset, 65_536).expect("public reader"),
+            record
+        );
+        let error = read_symbol_record_at_offset(&path, offset, 65_535)
+            .expect_err("caller budget is enforced");
+        assert!(matches!(&error, FrankenError::OutOfRange { what, value }
+            if what.contains("read budget 65535") && value == "65536"));
+        assert_eq!(
+            fs::metadata(&path).expect("unchanged sparse file").len(),
+            file_len
+        );
+    }
+
+    #[test]
+    fn test_locator_refuses_bad_offsets_lengths_and_truncation() {
+        let dir = tempdir().expect("tempdir");
+        let header = SymbolSegmentHeader::new(1, 42, 100);
+        let record = test_record(4, 0, 1024, 0x44);
+        let wire = record.to_bytes();
+        let good = SymbolLogOffset {
+            segment_id: 1,
+            offset_bytes: 0,
+        };
+        for case in [
+            "overflow",
+            "past_end",
+            "segment_id",
+            "budget",
+            "truncated",
+            "short_header",
+            "checksum",
+        ] {
+            let path = dir.path().join(case);
+            let mut bytes = header.encode().to_vec();
+            bytes.extend_from_slice(&wire);
+            let mut offset = good;
+            match case {
+                "overflow" => offset.offset_bytes = u64::MAX,
+                "past_end" => offset.offset_bytes = 1_000_000,
+                "segment_id" => offset.segment_id = 2,
+                "budget" => bytes[SYMBOL_SEGMENT_HEADER_BYTES + SYMBOL_SIZE_FIELD_OFFSET
+                    ..SYMBOL_SEGMENT_HEADER_BYTES + SYMBOL_SIZE_FIELD_OFFSET + 4]
+                    .copy_from_slice(&u32::MAX.to_le_bytes()),
+                "truncated" => {
+                    bytes.pop();
+                }
+                "short_header" => bytes.truncate(20),
+                "checksum" => bytes[SYMBOL_SEGMENT_HEADER_BYTES + SYMBOL_RECORD_HEADER_BYTES] ^= 1,
+                _ => unreachable!("case"),
+            }
+            fs::write(&path, &bytes).expect("fault fixture");
+            let mut counted = CountedSymbolFile {
+                file: fs::File::open(&path).expect("file"),
+                bytes_read: 0,
+            };
+            let error = read_located_symbol(
+                &mut counted,
+                usize_to_u64(bytes.len(), "fixture length").expect("length"),
+                offset,
+                65_536,
+                None,
+            )
+            .expect_err(case);
+            if case == "budget" {
+                assert!(matches!(error, FrankenError::OutOfRange { .. }), "{error}");
+            } else {
+                assert!(
+                    matches!(error, FrankenError::DatabaseCorrupt { .. }),
+                    "case={case} error={error}"
+                );
+            }
+            if case != "checksum" {
+                assert!(
+                    counted.bytes_read <= SYMBOL_SEGMENT_HEADER_BYTES + SYMBOL_RECORD_HEADER_BYTES,
+                    "case={case}"
+                );
+            }
+            assert_eq!(
+                fs::read(&path).expect("retained fixture"),
+                bytes,
+                "case={case}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aligned_locator_budget_and_padding_are_independent() {
+        let dir = tempdir().expect("tempdir");
+        let header = SymbolSegmentHeader::new(1, 42, 100);
+        let record = test_record(5, 0, 1024, 0x55);
+        let entry = append_symbol_record_aligned(dir.path(), header, &record, 4096)
+            .expect("aligned record");
+        let path = symbol_segment_path(dir.path(), 1);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("file");
+        file.set_len(64 * 1024 * 1024)
+            .expect("sparse unrelated tail");
+        let file_len = file.metadata().expect("length").len();
+        let mut counted = CountedSymbolFile {
+            file,
+            bytes_read: 0,
+        };
+        assert_eq!(
+            read_located_symbol(
+                &mut counted,
+                file_len,
+                entry.offset,
+                1024,
+                Some((entry.logical_len, entry.padded_len))
+            )
+            .expect("aligned reader"),
+            record
+        );
+        assert_eq!(
+            counted.bytes_read,
+            SYMBOL_SEGMENT_HEADER_BYTES + record.to_bytes().len()
+        );
+        assert_eq!(
+            read_aligned_symbol_record(&path, entry, 1024).expect("public aligned reader"),
+            record
+        );
+        assert!(read_aligned_symbol_record(&path, entry, 1023).is_err());
+        for (logical_len, padded_len) in [
+            (entry.logical_len + 1, entry.padded_len),
+            (entry.logical_len - 1, entry.padded_len),
+            (entry.logical_len, u32::MAX),
+        ] {
+            let bad = AlignedSymbolIndexEntry {
+                logical_len,
+                padded_len,
+                ..entry
+            };
+            assert!(
+                read_aligned_symbol_record(&path, bad, 1024).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(fs::metadata(&path).expect("unchanged file").len(), file_len);
     }
 
     #[test]
@@ -1919,7 +2156,7 @@ mod tests {
         assert!(entry.padded_len >= entry.logical_len);
 
         let segment_path = symbol_segment_path(dir.path(), 1);
-        let loaded = read_aligned_symbol_record(&segment_path, entry).expect("read aligned");
+        let loaded = read_aligned_symbol_record(&segment_path, entry, 1024).expect("read aligned");
         assert_eq!(loaded.object_id, record.object_id);
         assert_eq!(loaded.esi, record.esi);
         assert_eq!(loaded.frame_xxh3, record.frame_xxh3);
@@ -1938,8 +2175,8 @@ mod tests {
         let mut bad = entry;
         bad.padded_len = bad.logical_len.saturating_sub(1);
 
-        let err =
-            read_aligned_symbol_record(&segment_path, bad).expect_err("must reject bad index");
+        let err = read_aligned_symbol_record(&segment_path, bad, 1024)
+            .expect_err("must reject bad index");
         let FrankenError::DatabaseCorrupt { detail } = err else {
             panic!("expected DatabaseCorrupt for inconsistent aligned index");
         };
@@ -2032,7 +2269,12 @@ mod tests {
 
         for (object_id, offset) in &written {
             let path = symbol_segment_path(dir.path(), offset.segment_id);
-            let loaded = read_symbol_record_at_offset(&path, *offset).expect("direct offset read");
+            let loaded = read_symbol_record_at_offset(
+                &path,
+                *offset,
+                crate::symbol_size_policy::MAX_SYMBOL_SIZE,
+            )
+            .expect("direct offset read");
             assert_eq!(&loaded.object_id, object_id);
         }
 

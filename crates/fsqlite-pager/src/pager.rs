@@ -13511,6 +13511,7 @@ where
                     finished: false,
                     original_db_size,
                     savepoint_stack: Vec::new(),
+                    savepoint_journal: SavepointJournal::default(),
                     journal_mode,
                     pool,
                     cleanup_cx,
@@ -13748,6 +13749,7 @@ where
                 finished: false,
                 original_db_size,
                 savepoint_stack: Vec::new(),
+                savepoint_journal: SavepointJournal::default(),
                 journal_mode,
                 pool,
                 cleanup_cx,
@@ -18414,33 +18416,62 @@ where
     }
 }
 
-/// A snapshot of the transaction state at a savepoint boundary.
+/// An O(1) boundary in the transaction's statement undo journal.
 struct SavepointEntry {
-    /// The user-supplied savepoint name.
     name: String,
-    /// Snapshot of the write-set at the time the savepoint was created.
-    /// Stores published page data so savepoint capture can reuse the staged
-    /// page's shared `Arc<Vec<u8>>` when available instead of cloning bytes.
-    /// Keyed with the same fast page-number hasher as the live write-set:
-    /// this map is rebuilt on EVERY statement savepoint, so SipHash here was
-    /// a top-of-profile cost for bulk DML transactions (bd-aoj0g).
-    write_set_snapshot: PagePageMap<PageData>,
-    /// Sorted unique page ids in the write-set snapshot.
-    write_pages_sorted_snapshot: Vec<PageNumber>,
-    /// Caller-staged pages charged to the builder write-set ceiling.
-    accounted_write_pages_snapshot: PagePageSet,
-    /// Snapshot of freed pages at the time the savepoint was created.
-    freed_pages_snapshot: Vec<PageNumber>,
-    /// Snapshot of the pager's next_page counter.
-    /// Used to restore allocation state on rollback.
+    undo_offset: usize,
     next_page_snapshot: u32,
-    /// Snapshot of the pager's freelist.
-    /// Used to restore allocation state on rollback.
+    allocated_from_freelist_len: usize,
+    allocated_from_eof_len: usize,
+    writes_observed: bool,
+    /// Commit preparation can drain/reorder allocations and rewrite pages in
+    /// bulk. Seal surviving boundaries before that operation, so failed or
+    /// cancelled commits retain the same recovery images as statement writes.
+    /// Ordinary SAVEPOINT/RELEASE never constructs this full-map image.
+    commit_snapshot: Option<SavepointSnapshot>,
+}
+
+#[derive(Clone)]
+struct SavepointSnapshot {
+    write_set_snapshot: PagePageMap<PageData>,
+    accounted_write_pages_snapshot: PagePageSet,
+    freed_pages_snapshot: Vec<PageNumber>,
     freelist_snapshot: Vec<PageNumber>,
-    /// Snapshot of pages allocated from freelist by this transaction.
     allocated_from_freelist_snapshot: Vec<PageNumber>,
-    /// Snapshot of pages allocated from EOF by this transaction.
     allocated_from_eof_snapshot: Vec<PageNumber>,
+}
+
+enum SavepointUndo {
+    Page {
+        page_no: PageNumber,
+        before: Option<PageData>,
+        accounted: bool,
+    },
+    FreedPages(Vec<PageNumber>),
+    Freelist(Vec<PageNumber>),
+}
+
+#[derive(Default)]
+struct SavepointJournal {
+    undo: Vec<SavepointUndo>,
+    /// Deduplication is local to the interval between boundary operations.
+    /// RELEASE starts another interval but retains the outer undo suffix.
+    pages: PagePageSet,
+    freed_pages_captured: bool,
+    freelist_captured: bool,
+}
+
+impl SavepointJournal {
+    fn new_interval(&mut self) {
+        self.pages.clear();
+        self.freed_pages_captured = false;
+        self.freelist_captured = false;
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.new_interval();
+    }
 }
 
 #[derive(Debug)]
@@ -18863,6 +18894,7 @@ where
     original_db_size: u32,
     /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
     savepoint_stack: Vec<SavepointEntry>,
+    savepoint_journal: SavepointJournal,
     /// Journal mode captured at transaction start.
     journal_mode: JournalMode,
     /// Buffer pool for allocating write-set pages.
@@ -19205,7 +19237,7 @@ where
         self.write_pages_sorted.clear();
         self.reset_current_write_set_accounting();
         self.clear_freed_pages();
-        self.savepoint_stack.clear();
+        self.clear_savepoints();
         self.rolled_back_pages.clear();
         self.allocated_from_freelist.clear();
         self.allocated_from_durable_freelist.clear();
@@ -19361,7 +19393,7 @@ where
         }
 
         self.clear_freed_pages();
-        self.savepoint_stack.clear();
+        self.clear_savepoints();
         self.rolled_back_pages.clear();
         self.allocated_from_freelist.clear();
         self.allocated_from_durable_freelist.clear();
@@ -19744,6 +19776,157 @@ where
         }
     }
 
+    fn journals_savepoint_mutations(&self) -> bool {
+        self.savepoint_stack
+            .last()
+            .is_some_and(|entry| entry.commit_snapshot.is_none())
+    }
+
+    fn journal_page_before_mutation(&mut self, page_no: PageNumber) {
+        if !self.journals_savepoint_mutations()
+            || !self.savepoint_journal.pages.insert(page_no)
+        {
+            return;
+        }
+        // Do not publish the staged entry: take/mutate/restore may still use
+        // its owned backing. The immutable before-image uses PageData's COW,
+        // or an independent copy of the unique pool buffer.
+        let before = self.write_set.get(&page_no).map(|staged| {
+            staged.published.get().map_or_else(
+                || match &staged.backing {
+                    StagedPageBacking::Buffered(buf) => {
+                        PageData::from_shared(Arc::<[u8]>::from(buf.as_slice()))
+                    }
+                    StagedPageBacking::Owned(data) => data.clone(),
+                },
+                Clone::clone,
+            )
+        });
+        self.savepoint_journal.undo.push(SavepointUndo::Page {
+            page_no,
+            before,
+            accounted: self.accounted_write_pages.contains(&page_no),
+        });
+    }
+
+    fn journal_freed_pages_before_mutation(&mut self) {
+        if self.journals_savepoint_mutations()
+            && !self.savepoint_journal.freed_pages_captured
+        {
+            self.savepoint_journal
+                .undo
+                .push(SavepointUndo::FreedPages(self.freed_pages.clone()));
+            self.savepoint_journal.freed_pages_captured = true;
+        }
+    }
+
+    fn journal_freelist_before_allocation(&mut self, freelist: &[PageNumber]) {
+        if self.mode != TransactionMode::Concurrent
+            && self.journals_savepoint_mutations()
+            && !self.savepoint_journal.freelist_captured
+        {
+            self.savepoint_journal
+                .undo
+                .push(SavepointUndo::Freelist(freelist.to_vec()));
+            self.savepoint_journal.freelist_captured = true;
+        }
+    }
+
+    fn savepoint_snapshot(
+        &self,
+        entry: &SavepointEntry,
+        freelist: &[PageNumber],
+    ) -> Result<SavepointSnapshot> {
+        if let Some(snapshot) = &entry.commit_snapshot {
+            return Ok(snapshot.clone());
+        }
+        let mut snapshot = SavepointSnapshot {
+            write_set_snapshot: self
+                .write_set
+                .iter()
+                .map(|(&page, staged)| (page, staged.published_page()))
+                .collect(),
+            accounted_write_pages_snapshot: self.accounted_write_pages.clone(),
+            freed_pages_snapshot: self.freed_pages.clone(),
+            freelist_snapshot: if self.mode == TransactionMode::Concurrent {
+                Vec::new()
+            } else {
+                freelist.to_vec()
+            },
+            allocated_from_freelist_snapshot: self
+                .allocated_from_freelist
+                .get(..entry.allocated_from_freelist_len)
+                .ok_or_else(|| FrankenError::internal("savepoint freelist frontier lost"))?
+                .to_vec(),
+            allocated_from_eof_snapshot: self
+                .allocated_from_eof
+                .get(..entry.allocated_from_eof_len)
+                .ok_or_else(|| FrankenError::internal("savepoint EOF frontier lost"))?
+                .to_vec(),
+        };
+        for undo in self.savepoint_journal.undo[entry.undo_offset..].iter().rev() {
+            match undo {
+                SavepointUndo::Page {
+                    page_no,
+                    before,
+                    accounted,
+                } => {
+                    if let Some(data) = before {
+                        snapshot.write_set_snapshot.insert(*page_no, data.clone());
+                    } else {
+                        snapshot.write_set_snapshot.remove(page_no);
+                    }
+                    if *accounted {
+                        snapshot.accounted_write_pages_snapshot.insert(*page_no);
+                    } else {
+                        snapshot.accounted_write_pages_snapshot.remove(page_no);
+                    }
+                }
+                SavepointUndo::FreedPages(pages) => {
+                    snapshot.freed_pages_snapshot.clone_from(pages);
+                }
+                SavepointUndo::Freelist(pages) => {
+                    snapshot.freelist_snapshot.clone_from(pages);
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Commit preparation has bulk mutation paths outside the statement API.
+    /// Materialize active boundaries once before entering that machinery;
+    /// retries and cancellation then retain independent recovery images.
+    fn seal_savepoints_for_commit(&mut self) -> Result<()> {
+        if !self.journals_savepoint_mutations() {
+            return Ok(());
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        let snapshots = self
+            .savepoint_stack
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.commit_snapshot.is_none())
+            .map(|(index, entry)| {
+                self.savepoint_snapshot(entry, &inner.freelist)
+                    .map(|snapshot| (index, snapshot))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(inner);
+        for (index, snapshot) in snapshots {
+            self.savepoint_stack[index].commit_snapshot = Some(snapshot);
+        }
+        self.savepoint_journal.clear();
+        Ok(())
+    }
+
+    fn clear_savepoints(&mut self) {
+        self.savepoint_stack.clear();
+        self.savepoint_journal.clear();
+    }
+
     fn refresh_freed_page_bounds(&mut self) {
         let mut pages = self.freed_pages.iter().copied();
         let Some(first) = pages.next() else {
@@ -19787,6 +19970,7 @@ where
             return;
         }
         if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
+            self.journal_freed_pages_before_mutation();
             self.freed_pages.swap_remove(pos);
             self.freed_pages_index.remove(&page_no);
             if self.freed_pages.is_empty() {
@@ -23101,7 +23285,7 @@ where
         self.allocated_from_durable_freelist.clear();
         self.allocated_from_eof.clear();
         self.page_lease.clear();
-        self.savepoint_stack.clear();
+        self.clear_savepoints();
         self.rolled_back_pages.clear();
         self.writes_observed = false;
         self.scratch_arena.reset();
@@ -23579,6 +23763,7 @@ where
             // the old one. This is a frequent pattern for cursor-driven
             // workloads that repeatedly restamp the same B-tree leaf as rows
             // accumulate.
+            self.journal_page_before_mutation(page_no);
             if let Some(existing) = self.write_set.get_mut(&page_no)
                 && existing.try_overwrite_bytes_in_place(data)
             {
@@ -23621,6 +23806,7 @@ where
             // longer single-owner, replace that map entry directly. Routing through
             // `insert_staged_page` would hash and insert the same key again even
             // though `write_pages_sorted` is already correct.
+            self.journal_page_before_mutation(page_no);
             if let Some(existing) = self.write_set.get_mut(&page_no)
                 && existing.try_overwrite_page_data_in_place(&data)
             {
@@ -23667,6 +23853,7 @@ where
         if self.has_pending_recovery_barrier() {
             return None;
         }
+        self.journal_page_before_mutation(page_no);
         let staged = self.write_set.remove(&page_no)?;
         match staged.try_into_unpublished_owned_page_data() {
             Ok(data) => {
@@ -23688,6 +23875,7 @@ where
         if self.has_pending_recovery_barrier() {
             return false;
         }
+        self.journal_page_before_mutation(page_no);
         let Some(staged) = self.write_set.get_mut(&page_no) else {
             return false;
         };
@@ -23717,6 +23905,7 @@ where
             )?;
             let account_page = self.admit_new_write_set_page(page_no)?;
             // #70 ghost-commit guard: mark only after fallible staging succeeds.
+            self.journal_page_before_mutation(page_no);
             self.writes_observed = true;
             insert_staged_page(
                 &mut self.write_set,
@@ -23771,12 +23960,13 @@ where
             // page to another tree before the old ownership is durably retired,
             // which can surface as cross-tree page aliasing on disk.
 
-            let mut inner = self
-                .inner
+            let inner_arc = Arc::clone(&self.inner);
+            let mut inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
             if !self.memory_db_bump_alloc {
+                self.journal_freelist_before_allocation(&inner.freelist);
                 let committed_freelist_is_snapshot_pinned =
                     self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
 
@@ -23990,7 +24180,9 @@ where
                 );
                 return Ok(());
             }
+            self.journal_page_before_mutation(page_no);
             if !self.contains_freed_page(page_no) {
+                self.journal_freed_pages_before_mutation();
                 self.freed_pages.push(page_no);
                 self.freed_pages_index.insert(page_no);
                 self.note_freed_page_bound(page_no);
@@ -24027,6 +24219,7 @@ where
             if self.finished {
                 return Ok(());
             }
+            self.seal_savepoints_for_commit()?;
             if self.rollback_commit_finalization_pending {
                 return self.finish_durable_rollback_commit(cx).await;
             }
@@ -25077,6 +25270,7 @@ where
     #[allow(clippy::await_holding_lock)]
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move {
+            self.seal_savepoints_for_commit()?;
             if self.rollback_commit_finalization_pending {
                 self.finish_durable_rollback_commit(cx).await?;
                 return Ok(false);
@@ -25640,7 +25834,7 @@ where
                 self.allocated_from_freelist.clear();
                 self.allocated_from_durable_freelist.clear();
                 self.allocated_from_eof.clear();
-                self.savepoint_stack.clear();
+                self.clear_savepoints();
                 self.rolled_back_pages.clear();
                 self.writes_observed = false;
                 if !metadata_only_single_connection_fast_path {
@@ -25903,7 +26097,7 @@ where
             self.write_pages_sorted.clear();
             self.reset_current_write_set_accounting();
             self.clear_freed_pages();
-            self.savepoint_stack.clear();
+            self.clear_savepoints();
             self.rolled_back_pages.clear();
             // #70 ghost-commit guard: after rollback, staged writes were
             // explicitly discarded, so a subsequent commit entry with an empty
@@ -26023,19 +26217,14 @@ where
 
         self.savepoint_stack.push(SavepointEntry {
             name: name.to_owned(),
-            write_set_snapshot: self
-                .write_set
-                .iter()
-                .map(|(&k, v)| (k, v.published_page()))
-                .collect(),
-            write_pages_sorted_snapshot: self.write_pages_sorted.clone(),
-            accounted_write_pages_snapshot: self.accounted_write_pages.clone(),
-            freed_pages_snapshot: self.freed_pages.clone(),
+            undo_offset: self.savepoint_journal.undo.len(),
             next_page_snapshot: inner.next_page,
-            freelist_snapshot: inner.freelist.clone(),
-            allocated_from_freelist_snapshot: self.allocated_from_freelist.clone(),
-            allocated_from_eof_snapshot: self.allocated_from_eof.clone(),
+            allocated_from_freelist_len: self.allocated_from_freelist.len(),
+            allocated_from_eof_len: self.allocated_from_eof.len(),
+            writes_observed: self.writes_observed,
+            commit_snapshot: None,
         });
+        self.savepoint_journal.new_interval();
         drop(inner);
         Ok(())
     }
@@ -26050,6 +26239,11 @@ where
         // RELEASE removes the named savepoint and all savepoints above it.
         // Changes since the savepoint are kept (merged into the parent).
         self.savepoint_stack.truncate(pos);
+        if self.journals_savepoint_mutations() {
+            self.savepoint_journal.new_interval();
+        } else {
+            self.savepoint_journal.clear();
+        }
         Ok(())
     }
 
@@ -26062,10 +26256,17 @@ where
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
 
         let entry = &self.savepoint_stack[pos];
+        // Lock and build every fallible restoration object before changing
+        // allocator ownership, live staging, accounting, or rollback markers.
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        let snapshot = self.savepoint_snapshot(entry, &inner.freelist)?;
 
         // Restore write-set FIRST to ensure we don't leave the transaction in an
         // inconsistent state if PageBuf allocation fails (OOM).
-        let new_write_set = entry
+        let new_write_set = snapshot
             .write_set_snapshot
             .iter()
             .map(|(&k, v)| -> Result<(PageNumber, StagedPage)> {
@@ -26080,32 +26281,31 @@ where
                 ))
             })
             .collect::<Result<PagePageMap<_>>>()?;
+        let mut restored_sorted: Vec<PageNumber> = new_write_set.keys().copied().collect();
+        restored_sorted.sort_unstable();
+        let restored_freed_index = snapshot.freed_pages_snapshot.iter().copied().collect();
 
         // Track pages that were allocated after the savepoint so that get_page
         // can return zeros for them instead of BusySnapshot error.
         for page_no in self
             .allocated_from_eof
             .iter()
-            .skip(entry.allocated_from_eof_snapshot.len())
+            .skip(snapshot.allocated_from_eof_snapshot.len())
         {
             self.rolled_back_pages.insert(*page_no);
         }
         for page_no in self
             .allocated_from_freelist
             .iter()
-            .skip(entry.allocated_from_freelist_snapshot.len())
+            .skip(snapshot.allocated_from_freelist_snapshot.len())
         {
             self.rolled_back_pages.insert(*page_no);
         }
 
         {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             if self.mode != TransactionMode::Concurrent {
                 inner.next_page = entry.next_page_snapshot;
-                inner.freelist.clone_from(&entry.freelist_snapshot);
+                inner.freelist.clone_from(&snapshot.freelist_snapshot);
                 // Lease pages reference the rolled-back next_page range
                 // and will be re-allocated by future EOF allocations, so
                 // just drop them.
@@ -26124,8 +26324,8 @@ where
                 // only at transaction end, when no live tree reference can
                 // persist.
                 let _ = &mut inner; // lock still held for sibling arms' symmetry
-                let eof_start = entry.allocated_from_eof_snapshot.len();
-                let freelist_start = entry.allocated_from_freelist_snapshot.len();
+                let eof_start = snapshot.allocated_from_eof_snapshot.len();
+                let freelist_start = snapshot.allocated_from_freelist_snapshot.len();
                 let lease: Vec<PageNumber> = std::mem::take(&mut self.page_lease);
                 for page in &lease {
                     alloc_ledger(
@@ -26161,18 +26361,16 @@ where
                 self.savepoint_quarantined_allocations.dedup();
             }
         }
+        drop(inner);
 
-        let allocated_from_freelist_snapshot = entry.allocated_from_freelist_snapshot.clone();
-        let allocated_from_eof_snapshot = entry.allocated_from_eof_snapshot.clone();
-        let freed_pages_snapshot = entry.freed_pages_snapshot.clone();
-        let write_pages_sorted_snapshot = entry.write_pages_sorted_snapshot.clone();
-        let accounted_write_pages_snapshot = entry.accounted_write_pages_snapshot.clone();
-        let snapshot_was_empty = entry.write_set_snapshot.is_empty();
+        let undo_offset = entry.undo_offset;
+        let writes_observed = entry.writes_observed;
+        let sealed = entry.commit_snapshot.is_some();
 
-        self.allocated_from_freelist = allocated_from_freelist_snapshot;
-        self.allocated_from_eof = allocated_from_eof_snapshot;
-        self.freed_pages = freed_pages_snapshot;
-        self.freed_pages_index = self.freed_pages.iter().copied().collect();
+        self.allocated_from_freelist = snapshot.allocated_from_freelist_snapshot;
+        self.allocated_from_eof = snapshot.allocated_from_eof_snapshot;
+        self.freed_pages = snapshot.freed_pages_snapshot;
+        self.freed_pages_index = restored_freed_index;
         self.refresh_freed_page_bounds();
         // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
         // with the snapshot. If the snapshot is empty, no writes are pending
@@ -26180,17 +26378,21 @@ where
         // it. If the snapshot is non-empty, writes are still pending and
         // writes_observed should stay consistent with that.
         self.write_set = new_write_set;
-        self.write_pages_sorted = write_pages_sorted_snapshot;
-        self.accounted_write_pages = accounted_write_pages_snapshot;
+        self.write_pages_sorted = restored_sorted;
+        self.accounted_write_pages = snapshot.accounted_write_pages_snapshot;
         self.write_set_current_pages
             .store(self.accounted_write_pages.len(), AtomicOrdering::Relaxed);
-        if snapshot_was_empty {
-            self.writes_observed = false;
-        }
+        self.writes_observed = writes_observed;
 
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
         self.savepoint_stack.truncate(pos + 1);
+        if sealed {
+            self.savepoint_journal.clear();
+        } else {
+            self.savepoint_journal.undo.truncate(undo_offset);
+            self.savepoint_journal.new_interval();
+        }
         Ok(())
     }
 }

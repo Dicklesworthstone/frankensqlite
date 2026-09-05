@@ -12,6 +12,68 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-05 - REJECT before implementation: bd-aoj0g lifecycle Arc lever is off the SQL path; live pager savepoint traversal measured
+
+- Target: existing `crates/fsqlite/tests/aoj0g_insert_profile.rs`, case C,
+  `:memory:`, secondary index `idx_t_k`, `k=i%100`, one transaction, 100,000
+  inserts timed directly in 1,000-row batches. Concurrent-writer mode remains
+  enabled. This supersedes the September 5 bead comment's attribution to
+  `lifecycle.rs::TransactionManager::read_page`; it does not revive the
+  measured-dead cell-delta hypothesis.
+- Baseline: trj (`threadripperje`, Linux x86_64), source
+  `15d8ac30978140a3357089d62a1204642a8e80ec`, nightly-2026-08-31,
+  `cargo test --release --locked -p fsqlite --test aoj0g_insert_profile
+  --no-run --message-format=json -j 4`, repository size profile with LTO and
+  no target-cpu override. The only baseline source change was ROWS=100,000.
+  A-F executed in the existing harness: 1 passed / 0 failed. Case C rises
+  **65,881 -> 214,122 ns/insert (3.250x)**. Binary SHA-256
+  `af621c080d04357aae4a4dbd004ac5d00782af5721a653fd10c314617bc45685`.
+- Isolated diagnostics touch only `fsqlite-mvcc/src/lifecycle.rs`,
+  `fsqlite-pager/src/pager.rs`, and that harness in a scratch clone. A
+  fail-if-called trap at lifecycle `read_page` is armed by
+  `AOJ0G_LIFECYCLE_READ_TRAP=1`; case C still executes all 100,000 inserts
+  and COMMIT successfully, with a **67,235 -> 214,350 ns/insert (3.188x)**
+  ramp. Diagnostic binary SHA-256
+  `f393cc5d1d71b86eddde985bbe68443013fb7d5138ed5fb8263be336d6e17808`.
+  This is an instrumentation comparison, not an Arc optimization A/B or an
+  improvement claim.
+  Positive control `lifecycle::tests::test_read_checks_write_set_first`
+  passes without the variable (1 test, exit 0) and fails at the exact armed
+  trap (1 test, exit 101) using the same preserved control binary and
+  instrumented source. That deliberate failure validates the trap; it is not
+  a product regression (`trap-control.log`).
+- The live `SimpleTransaction::savepoint` executes **100,000 times** and
+  traverses **227,612,024 staged-page entries** to build its snapshots;
+  staged reads total only **639,284**. Snapshot entries per 1,000-row batch
+  grow from 5,962 to 3,981,251. Savepoint creation alone rises from
+  **1,043 to 96,455 ns/insert**, accounting for 45.0% of final-batch wall
+  time and about 64.9% of the first-to-last cost increase. Snapshot release
+  and other remaining costs were not separately timed.
+- Precise distinction: `Connection::with_internal_statement_savepoint_and_cx`
+  calls the **pager** transaction's `savepoint`, whose
+  `self.write_set.iter().map(...published_page()).collect()` plus bookkeeping
+  clones are O(staged pages). The unused **lifecycle** manager's savepoint
+  does not establish the complexity of this separate live API. The live
+  `get_page -> StagedPage::published_page` path and `PageData::clone` already
+  share immutable snapshots through Arcs; wrapping the off-path lifecycle
+  return in another Arc cannot remove the measured traversal.
+- Evidence: trj `/data/tmp/aoj0g-bluecedar-20260905-DrBRrC/` contains preserved
+  baseline/diagnostic binaries, build JSONL, run logs, exact patches and
+  `provenance.json`. Local `/tmp/aoj0g-bluecedar-20260905/REPORT.md`,
+  `baseline-summary.json`, and `diagnostic-summary.json` retain the result
+  and design. Attribution by BlueCedar using the Claude marching-order
+  workload; no production optimization landed and bd-aoj0g stays open.
+- Retry condition/design: implement O(1)-creation **pager** savepoints via
+  an undo-journal boundary and before-images captured before first mutation
+  in each savepoint interval. Cover write/take/mutate/restore/free/allocate
+  paths, nested RELEASE/ROLLBACK TO, dirty-page accounting, admission failure,
+  immutable readers, and the existing concurrent allocation quarantine.
+  Do not disable savepoints or move a full-map clone to first mutation.
+  A future candidate must flatten C without small-N/read/file regressions
+  and pass stock sqlite3 differential/integrity, both concurrency canon
+  targets, and workspace check/clippy/fmt. This diagnostic run supplies
+  neither correctness acceptance nor an A/A-calibrated performance win.
+
 ## T6.2 candidate preflight gate
 
 Before mutating SQL-pipeline/VDBE source for a T6.2 optimization candidate,
