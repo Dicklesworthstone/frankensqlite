@@ -22112,9 +22112,10 @@ pub fn codegen_update(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // Resolve assignment targets to column indices.
-    let assignment_cols = collect_update_assignment_columns(table, &stmt.assignments)?;
-    let update_index_mask = update_index_maintenance_mask(table, &assignment_cols);
+    // Resolve assignment targets to column indices (and note a hidden-rowid
+    // rewrite, which re-keys every index).
+    let assignment_targets = collect_update_assignment_columns(table, &stmt.assignments)?;
+    let update_index_mask = update_index_maintenance_mask(table, &assignment_targets);
 
     // OpenWrite for table.
     let table_cursor = cursor;
@@ -22471,7 +22472,26 @@ pub fn codegen_update(
     };
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
-    emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
+    // bd-p1h2r: `SET rowid = <expr>` on a rowid table without an INTEGER
+    // PRIMARY KEY alias lands in its own register; the row is re-inserted
+    // under that key below.
+    let hidden_rowid_reg = assignment_targets
+        .assigns_hidden_rowid
+        .then(|| b.alloc_reg());
+    emit_update_assignments(
+        b,
+        &stmt.assignments,
+        table,
+        col_regs,
+        hidden_rowid_reg,
+        &update_ctx,
+    )?;
+    if let Some(reg) = hidden_rowid_reg {
+        // Stock coerces the new rowid with OP_MustBeInt before any constraint
+        // check or mutation: NULL, text that is not an integer, and a
+        // non-integral REAL all fail with "datatype mismatch".
+        b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
+    }
 
     // Recompute STORED generated columns and validate constraints on the NEW
     // row image BEFORE any destructive mutation, so OR IGNORE can bail out
@@ -22531,7 +22551,13 @@ pub fn codegen_update(
     let rowid_alias_col_idx = ctx
         .rowid_alias_col_idx
         .or_else(|| table.columns.iter().position(|col| col.is_ipk));
-    if let Some(ipk_idx) = rowid_alias_col_idx {
+    if let Some(new_rowid_reg) = hidden_rowid_reg {
+        // bd-p1h2r: the statement assigned the hidden rowid; the (already
+        // MustBeInt-coerced) value is the new key. A table that reaches here
+        // has no INTEGER PRIMARY KEY alias (`resolve_update_target` routes the
+        // alias spelling to that column instead), so no payload sync is needed.
+        rowid_reg = new_rowid_reg;
+    } else if let Some(ipk_idx) = rowid_alias_col_idx {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ipk_reg = col_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
@@ -22659,21 +22685,63 @@ pub fn codegen_update(
     Ok(())
 }
 
+/// Where an UPDATE `SET` target lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateTarget {
+    /// A declared column (including an INTEGER PRIMARY KEY alias, which a
+    /// bare `rowid` / `_rowid_` / `oid` target resolves to when one exists).
+    Column(usize),
+    /// The implicit rowid of a rowid table that has no INTEGER PRIMARY KEY
+    /// alias: `UPDATE t SET rowid = <expr>` on `CREATE TABLE t(a, b)`.
+    HiddenRowid,
+}
+
+/// Resolve one UPDATE `SET` target name the way stock SQLite does: a declared
+/// column wins (so a user column literally named `rowid` shadows the alias);
+/// otherwise `rowid` / `_rowid_` / `oid` on a rowid table is the row key —
+/// the INTEGER PRIMARY KEY column when the table declares one, else the
+/// hidden rowid itself. WITHOUT ROWID tables have no rowid, so the alias is
+/// simply an unknown column there ("no such column: rowid"). bd-p1h2r.
+fn resolve_update_target(table: &TableSchema, name: &str) -> Result<UpdateTarget, CodegenError> {
+    if let Some(idx) = table.column_index(name) {
+        return Ok(UpdateTarget::Column(idx));
+    }
+    if table.resolves_to_hidden_rowid(name) {
+        return Ok(table
+            .columns
+            .iter()
+            .position(|col| col.is_ipk)
+            .map_or(UpdateTarget::HiddenRowid, UpdateTarget::Column));
+    }
+    Err(CodegenError::ColumnNotFound {
+        table: table.name.clone(),
+        column: name.to_owned(),
+    })
+}
+
+/// Resolved UPDATE `SET` targets: the declared-column indices that are
+/// rewritten, plus whether the statement rewrites the hidden rowid.
+struct UpdateAssignmentTargets {
+    columns: Vec<usize>,
+    assigns_hidden_rowid: bool,
+}
+
 fn collect_update_assignment_columns(
     table: &TableSchema,
     assignments: &[fsqlite_ast::Assignment],
-) -> Result<Vec<usize>, CodegenError> {
+) -> Result<UpdateAssignmentTargets, CodegenError> {
     let mut columns = Vec::with_capacity(assignments.len());
+    let mut assigns_hidden_rowid = false;
+    let mut push_target = |name: &str| -> Result<(), CodegenError> {
+        match resolve_update_target(table, name)? {
+            UpdateTarget::Column(idx) => columns.push(idx),
+            UpdateTarget::HiddenRowid => assigns_hidden_rowid = true,
+        }
+        Ok(())
+    };
     for assignment in assignments {
         match &assignment.target {
-            AssignmentTarget::Column(name) => {
-                columns.push(table.column_index(name).ok_or_else(|| {
-                    CodegenError::ColumnNotFound {
-                        table: table.name.clone(),
-                        column: name.to_owned(),
-                    }
-                })?);
-            }
+            AssignmentTarget::Column(name) => push_target(name)?,
             AssignmentTarget::ColumnList(names) => {
                 if names.is_empty() {
                     return Err(CodegenError::Unsupported(
@@ -22681,17 +22749,15 @@ fn collect_update_assignment_columns(
                     ));
                 }
                 for name in names {
-                    columns.push(table.column_index(name).ok_or_else(|| {
-                        CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: name.to_owned(),
-                        }
-                    })?);
+                    push_target(name)?;
                 }
             }
         }
     }
-    Ok(columns)
+    Ok(UpdateAssignmentTargets {
+        columns,
+        assigns_hidden_rowid,
+    })
 }
 
 /// Number of statically-known result columns in a subquery used as the RHS of a
@@ -22742,25 +22808,43 @@ fn project_row_value_subquery_column(
     Some(projected)
 }
 
+/// Register an UPDATE `SET` target's new value lands in: the column's slot in
+/// `col_regs`, or `hidden_rowid_reg` for a hidden-rowid target. The caller
+/// allocates `hidden_rowid_reg` exactly when `collect_update_assignment_columns`
+/// reported `assigns_hidden_rowid`, so a `None` here is unreachable for a
+/// resolvable hidden-rowid target; it is surfaced as a codegen error rather
+/// than a panic for the lanes (WITHOUT ROWID) that never pass one.
+fn update_target_reg(
+    table: &TableSchema,
+    name: &str,
+    col_regs: i32,
+    hidden_rowid_reg: Option<i32>,
+) -> Result<i32, CodegenError> {
+    match resolve_update_target(table, name)? {
+        UpdateTarget::Column(col_idx) => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            Ok(col_regs + col_idx as i32)
+        }
+        UpdateTarget::HiddenRowid => hidden_rowid_reg.ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "UPDATE of the implicit rowid ({name}) is not supported on this lane"
+            ))
+        }),
+    }
+}
+
 fn emit_update_assignments(
     b: &mut ProgramBuilder,
     assignments: &[fsqlite_ast::Assignment],
     table: &TableSchema,
     col_regs: i32,
+    hidden_rowid_reg: Option<i32>,
     scan: &ScanCtx<'_>,
 ) -> Result<(), CodegenError> {
     for assignment in assignments {
         match &assignment.target {
             AssignmentTarget::Column(name) => {
-                let col_idx =
-                    table
-                        .column_index(name)
-                        .ok_or_else(|| CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: name.to_owned(),
-                        })?;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let target_reg = col_regs + col_idx as i32;
+                let target_reg = update_target_reg(table, name, col_regs, hidden_rowid_reg)?;
                 emit_expr(b, &assignment.value, target_reg, Some(scan));
             }
             AssignmentTarget::ColumnList(names) => match &assignment.value {
@@ -22774,14 +22858,8 @@ fn emit_update_assignments(
                         )));
                     }
                     for (name, value) in names.iter().zip(values) {
-                        let col_idx = table.column_index(name).ok_or_else(|| {
-                            CodegenError::ColumnNotFound {
-                                table: table.name.clone(),
-                                column: name.to_owned(),
-                            }
-                        })?;
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                        let target_reg = col_regs + col_idx as i32;
+                        let target_reg =
+                            update_target_reg(table, name, col_regs, hidden_rowid_reg)?;
                         emit_expr(b, value, target_reg, Some(scan));
                     }
                 }
@@ -22807,14 +22885,8 @@ fn emit_update_assignments(
                         )));
                     }
                     for (col_pos, name) in names.iter().enumerate() {
-                        let col_idx = table.column_index(name).ok_or_else(|| {
-                            CodegenError::ColumnNotFound {
-                                table: table.name.clone(),
-                                column: name.to_owned(),
-                            }
-                        })?;
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                        let target_reg = col_regs + col_idx as i32;
+                        let target_reg =
+                            update_target_reg(table, name, col_regs, hidden_rowid_reg)?;
                         let projected = project_row_value_subquery_column(select, col_pos)
                             .expect("subquery shape validated by row_value_subquery_arity");
                         if let Some(schema) = scan.schema {
@@ -22829,16 +22901,8 @@ fn emit_update_assignments(
                 // uncorrelated scalar subquery the DML rewrite pass already folded
                 // to a literal before codegen (so it arrives as a plain expr).
                 scalar if names.len() == 1 => {
-                    let name = &names[0];
-                    let col_idx =
-                        table
-                            .column_index(name)
-                            .ok_or_else(|| CodegenError::ColumnNotFound {
-                                table: table.name.clone(),
-                                column: name.to_owned(),
-                            })?;
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    let target_reg = col_regs + col_idx as i32;
+                    let target_reg =
+                        update_target_reg(table, &names[0], col_regs, hidden_rowid_reg)?;
                     emit_expr(b, scalar, target_reg, Some(scan));
                 }
                 _ => {
@@ -22852,11 +22916,20 @@ fn emit_update_assignments(
     Ok(())
 }
 
-fn update_index_maintenance_mask(table: &TableSchema, assignment_cols: &[usize]) -> Vec<bool> {
+fn update_index_maintenance_mask(
+    table: &TableSchema,
+    targets: &UpdateAssignmentTargets,
+) -> Vec<bool> {
     table
         .indexes
         .iter()
-        .map(|index| update_must_maintain_index(table, index, assignment_cols))
+        .map(|index| {
+            // Every index entry carries the row's rowid, so rewriting the hidden
+            // rowid re-keys all of them (same rule as an INTEGER PRIMARY KEY
+            // assignment inside `update_must_maintain_index`). bd-p1h2r.
+            targets.assigns_hidden_rowid
+                || update_must_maintain_index(table, index, &targets.columns)
+        })
         .collect()
 }
 
@@ -23040,8 +23113,9 @@ fn codegen_update_from(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // Validate assignment targets before emitting loops.
-    collect_update_assignment_columns(target, &stmt.assignments)?;
+    // Validate assignment targets before emitting loops (and note a
+    // hidden-rowid rewrite, bd-p1h2r).
+    let assignment_targets = collect_update_assignment_columns(target, &stmt.assignments)?;
 
     // Scan context with all FROM sources for multi-table column resolution.
     let scan = ScanCtx {
@@ -23199,7 +23273,22 @@ fn codegen_update_from(
     // text). The scan cursor still points at the OLD row here, so `SET x = x + 1`
     // observes the pre-update value.
     b.set_next_anon_placeholder(1);
-    emit_update_assignments(b, &stmt.assignments, target, col_regs, &scan)?;
+    let hidden_rowid_reg = assignment_targets
+        .assigns_hidden_rowid
+        .then(|| b.alloc_reg());
+    emit_update_assignments(
+        b,
+        &stmt.assignments,
+        target,
+        col_regs,
+        hidden_rowid_reg,
+        &scan,
+    )?;
+    if let Some(reg) = hidden_rowid_reg {
+        // Same MustBeInt gate as the plain UPDATE lane: "datatype mismatch"
+        // before any constraint check or mutation. bd-p1h2r.
+        b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
+    }
 
     // Capture the old rowid before any destructive mutation (re-insertion base).
     let old_rowid_reg = b.alloc_reg();
@@ -23259,7 +23348,10 @@ fn codegen_update_from(
     let rowid_alias_col_idx = ctx
         .rowid_alias_col_idx
         .or_else(|| target.columns.iter().position(|col| col.is_ipk));
-    if let Some(ipk_idx) = rowid_alias_col_idx {
+    if let Some(new_rowid_reg) = hidden_rowid_reg {
+        // bd-p1h2r: hidden-rowid assignment supplies the new key directly.
+        rowid_reg = new_rowid_reg;
+    } else if let Some(ipk_idx) = rowid_alias_col_idx {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ipk_reg = col_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
@@ -26408,7 +26500,8 @@ fn codegen_update_without_rowid(
     // appear first in the SQL text, so their anon placeholders are slots 1..N
     // (bd-q3hu3).
     b.set_next_anon_placeholder(1);
-    emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
+    // WITHOUT ROWID: no hidden rowid exists, so no rowid register is passed.
+    emit_update_assignments(b, &stmt.assignments, table, col_regs, None, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
     emit_strict_type_check(b, table, col_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
@@ -26731,7 +26824,7 @@ fn codegen_update_from_without_rowid(
         );
     }
     b.set_next_anon_placeholder(1);
-    emit_update_assignments(b, &stmt.assignments, table, new_regs, &scan)?;
+    emit_update_assignments(b, &stmt.assignments, table, new_regs, None, &scan)?;
     emit_stored_generated_columns(b, table, new_regs);
     emit_strict_type_check(b, table, new_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the

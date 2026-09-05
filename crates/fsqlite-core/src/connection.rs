@@ -38272,6 +38272,23 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &update_event,
                 );
+                // bd-p1h2r: the compiled lane rewrites the hidden rowid
+                // (`SET rowid = <expr>` on a rowid table without an INTEGER
+                // PRIMARY KEY alias), but the trigger OLD/NEW snapshot carries
+                // one rowid per row, so a trigger body would read a stale
+                // NEW.rowid. Refuse that shape cleanly before any row is
+                // touched rather than fire triggers against wrong values.
+                if (has_before_update || has_after_update)
+                    && let Some(alias) = self.hidden_rowid_update_target(
+                        table_name,
+                        targets_shadowed_main,
+                        &effective_update.assignments,
+                    )
+                {
+                    return Err(FrankenError::NotImplemented(format!(
+                        "UPDATE of the implicit rowid ({alias}) on a table with UPDATE triggers"
+                    )));
+                }
                 let needs_row_by_row_replay = effective_update.from.is_none()
                     && (has_before_update
                         || has_after_update
@@ -42922,6 +42939,43 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    /// bd-p1h2r: the first `SET` target that addresses the hidden rowid of
+    /// `table_name` — a `rowid`/`_rowid_`/`oid` spelling on a rowid table that
+    /// declares neither a column of that name nor an INTEGER PRIMARY KEY
+    /// alias. `None` when the table is unknown, WITHOUT ROWID, aliased, or the
+    /// statement only assigns declared columns.
+    fn hidden_rowid_update_target<'a>(
+        &self,
+        table_name: &str,
+        targets_shadowed_main: bool,
+        assignments: &'a [fsqlite_ast::Assignment],
+    ) -> Option<&'a str> {
+        let visible_schema = self.schema.borrow();
+        let shadowed_schema = self.shadowed_main_tables.borrow();
+        let table = if targets_shadowed_main {
+            shadowed_schema.get(&table_name.to_ascii_lowercase())
+        } else {
+            visible_schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        }?;
+        let shape = UpdateSetTargetShape {
+            ipk_idx: table.columns.iter().position(|col| col.is_ipk),
+            without_rowid: table.without_rowid,
+        };
+        let column_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        assignments.iter().find_map(|assignment| {
+            let targets: &[String] = match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            };
+            targets
+                .iter()
+                .find(|name| shape.is_hidden_rowid(&column_names, name))
+                .map(String::as_str)
+        })
     }
 
     /// Reject an UPDATE that assigns to a generated (VIRTUAL/STORED) column.
@@ -53466,6 +53520,17 @@ impl Connection {
             name: table_name.clone(),
         })?;
         let column_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        // bd-p1h2r: SET targets resolve like stock — a declared column, the
+        // INTEGER PRIMARY KEY column for a `rowid`/`_rowid_`/`oid` spelling on
+        // an alias table, or the hidden rowid of a plain rowid table. The
+        // hidden rowid is not a column of this image (FK checks compare column
+        // values only), so that target is skipped and the tuple's rowid stays
+        // the OLD one; the trigger dispatch refuses that shape up front because
+        // a trigger body's NEW.rowid would otherwise be stale.
+        let set_target_shape = UpdateSetTargetShape {
+            ipk_idx: table.columns.iter().position(|col| col.is_ipk),
+            without_rowid: table.without_rowid,
+        };
         let table_label = update
             .table
             .alias
@@ -53521,13 +53586,11 @@ impl Connection {
             for assignment in &bound_assignments {
                 match &assignment.target {
                     fsqlite_ast::AssignmentTarget::Column(column_name) => {
-                        let target_index =
-                            find_column_index_case_insensitive(&column_names, column_name)
-                                .ok_or_else(|| {
-                                    FrankenError::Internal(format!(
-                                        "UPDATE trigger snapshot: unknown column `{column_name}`"
-                                    ))
-                                })?;
+                        let Some(target_index) =
+                            set_target_shape.snapshot_index(&column_names, column_name)?
+                        else {
+                            continue;
+                        };
                         new_values[target_index] = self.eval_join_expr_with_registry(
                             &assignment.value,
                             &old_values,
@@ -53536,14 +53599,11 @@ impl Connection {
                     }
                     fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
                         if columns.len() == 1 {
-                            let target_index =
-                                find_column_index_case_insensitive(&column_names, &columns[0])
-                                    .ok_or_else(|| {
-                                        FrankenError::Internal(format!(
-                                            "UPDATE trigger snapshot: unknown column `{}`",
-                                            columns[0]
-                                        ))
-                                    })?;
+                            let Some(target_index) =
+                                set_target_shape.snapshot_index(&column_names, &columns[0])?
+                            else {
+                                continue;
+                            };
                             let value_expr = match &assignment.value {
                                 Expr::RowValue(values, _) if values.len() == 1 => &values[0],
                                 other => other,
@@ -53559,15 +53619,11 @@ impl Connection {
                         match &assignment.value {
                             Expr::RowValue(values, _) if values.len() == columns.len() => {
                                 for (column_name, value_expr) in columns.iter().zip(values) {
-                                    let target_index = find_column_index_case_insensitive(
-                                        &column_names,
-                                        column_name,
-                                    )
-                                    .ok_or_else(|| {
-                                        FrankenError::Internal(format!(
-                                            "UPDATE trigger snapshot: unknown column `{column_name}`"
-                                        ))
-                                    })?;
+                                    let Some(target_index) = set_target_shape
+                                        .snapshot_index(&column_names, column_name)?
+                                    else {
+                                        continue;
+                                    };
                                     new_values[target_index] = self.eval_join_expr_with_registry(
                                         value_expr,
                                         &old_values,
@@ -60104,8 +60160,9 @@ impl Connection {
         let mut rowid_alias_col_by_root_page = HbHashMap::new();
         let mut table_column_count_by_root_page = HbHashMap::with_capacity(schema.len());
         let mut first_not_null_non_ipk_col_by_root_page = HbHashMap::with_capacity(schema.len());
-        // bd-977wx: "table.ipkcol" per root page, populated only for tables that
-        // have an INTEGER PRIMARY KEY alias column.
+        // bd-977wx / bd-p1h2r: the rowid-key label per root page — "table.ipkcol"
+        // for tables with an INTEGER PRIMARY KEY alias, "table.rowid" for other
+        // rowid tables; WITHOUT ROWID tables have no entry.
         let mut ipk_label_by_root_page: HbHashMap<i32, String> = HbHashMap::new();
         let mut column_default_sql_by_root_page = HbHashMap::new();
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
@@ -60133,9 +60190,17 @@ impl Connection {
             }
             // bd-977wx: record the qualified IPK label so a rowid/IPK collision
             // is reported as `UNIQUE constraint failed: <table>.<ipk>`.
+            // bd-p1h2r: a rowid table WITHOUT a named INTEGER PRIMARY KEY alias
+            // still collides on its hidden rowid when a statement supplies one
+            // (`INSERT INTO t(rowid, ...)`, `UPDATE t SET rowid = ...`); stock
+            // reports that as `UNIQUE constraint failed: <table>.rowid`.
+            // WITHOUT ROWID tables never reach the rowid Insert-opcode conflict
+            // site — their PK collision is labelled by the index path.
             if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
                 ipk_label_by_root_page
                     .insert(table.root_page, format!("{}.{}", table.name, ipk_column.name));
+            } else if !table.without_rowid {
+                ipk_label_by_root_page.insert(table.root_page, format!("{}.rowid", table.name));
             }
             let column_default_sqls: Vec<Option<String>> = table
                 .columns
@@ -145489,6 +145554,45 @@ fn find_column_index_case_insensitive(column_names: &[String], target: &str) -> 
 fn is_rowid_alias(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "rowid" || lower == "_rowid_" || lower == "oid"
+}
+
+/// How a table resolves UPDATE `SET` target names that are not declared
+/// columns (bd-p1h2r). Mirrors the VDBE codegen's `resolve_update_target`: a
+/// declared column always wins; on a rowid table a `rowid`/`_rowid_`/`oid`
+/// spelling is the INTEGER PRIMARY KEY column when one exists, else the hidden
+/// rowid itself; WITHOUT ROWID tables have no rowid to alias.
+#[derive(Debug, Clone, Copy)]
+struct UpdateSetTargetShape {
+    ipk_idx: Option<usize>,
+    without_rowid: bool,
+}
+
+impl UpdateSetTargetShape {
+    /// True when `name` addresses the hidden rowid of a plain rowid table (no
+    /// declared column of that name, no INTEGER PRIMARY KEY alias).
+    fn is_hidden_rowid(self, column_names: &[String], name: &str) -> bool {
+        !self.without_rowid
+            && self.ipk_idx.is_none()
+            && find_column_index_case_insensitive(column_names, name).is_none()
+            && is_rowid_alias(name)
+    }
+
+    /// Column slot a `SET` target writes in a row image: `Some(idx)` for a
+    /// declared column or the alias-resolved INTEGER PRIMARY KEY column,
+    /// `None` for the hidden rowid (not part of the image), and an internal
+    /// error for a name that resolves to nothing (the compiled lane rejects
+    /// those first, so reaching here is a resolver mismatch).
+    fn snapshot_index(self, column_names: &[String], name: &str) -> Result<Option<usize>> {
+        if let Some(idx) = find_column_index_case_insensitive(column_names, name) {
+            return Ok(Some(idx));
+        }
+        if !self.without_rowid && is_rowid_alias(name) {
+            return Ok(self.ipk_idx);
+        }
+        Err(FrankenError::Internal(format!(
+            "UPDATE trigger snapshot: unknown column `{name}`"
+        )))
+    }
 }
 
 /// Rewrite rowid alias references in an expression tree so that `rowid`,
