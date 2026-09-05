@@ -1179,7 +1179,7 @@ impl PageCache {
             evictions: self.evictions.get(),
             cached_pages,
             pool_capacity: self.pool.capacity(),
-            cache_page_budget: self.pool.capacity(),
+            cache_page_budget: usize::MAX,
             // The legacy non-sharded cache still stores raw `PageBuf`s, so it
             // does not expose per-page dirty state yet.
             dirty_ratio_pct: 0,
@@ -2586,8 +2586,9 @@ pub struct ShardedPageCache {
     pool: PageBufPool,
     /// Configured page size.
     page_size: PageSize,
-    /// Live residency target. Transaction staging and idle pool allocations
-    /// retain their independent hard allocation ceiling.
+    /// Live residency target, initially unbounded until explicitly configured.
+    /// Transaction staging and idle pool allocations retain their independent
+    /// hard allocation ceiling.
     cache_page_budget: AtomicUsize,
     /// Fast-path flat array for single-connection mode (bd-fzr07).
     /// When `Some`, page lookups bypass sharded mutexes and use direct indexing.
@@ -2758,7 +2759,7 @@ impl ShardedPageCache {
             shard_mask,
             shard_shift,
             overflow_clean_probe_cursor: AtomicUsize::new(0),
-            cache_page_budget: AtomicUsize::new(pool.capacity()),
+            cache_page_budget: AtomicUsize::new(usize::MAX),
             pool,
             page_size,
             fast_array: None,
@@ -2845,17 +2846,19 @@ impl ShardedPageCache {
 
     /// Set the live resident-page target without restricting transaction
     /// staging allocations. The caller has already converted KiB to pages.
+    /// Low-level constructors leave this target unbounded; SQL connection
+    /// bootstrap explicitly applies its default after opening the pager.
     ///
     /// Clean pages are reclaimed immediately when no miss flight is active.
     /// Dirty pages are preserved, and trimming is retried after publication,
     /// successful writeback, and read-flight completion or cancellation.
     /// A zero target allows transient reads and retains no eligible pages.
     pub fn set_cache_page_budget(&self, page_budget: usize) {
-        self.cache_page_budget.store(page_budget, Ordering::Release);
         // Rebuild only the existing policy's bounded history. This is a cold
         // resize operation, not a resident-page reconstruction on admission.
         let capacity = page_budget.min(self.pool.capacity()).max(1);
-        let policy = match self.eviction_policy() {
+        let mut tracker = self.eviction_policy.lock();
+        let policy = match tracker.policy() {
             PageCacheEvictionPolicy::Arbitrary => PageCacheEvictionPolicy::Arbitrary,
             PageCacheEvictionPolicy::S3Fifo(_) => {
                 PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(capacity))
@@ -2867,7 +2870,16 @@ impl ShardedPageCache {
                 PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(capacity))
             }
         };
-        self.set_eviction_policy(policy);
+        *tracker = PageCacheEvictionTracker::from_policy(policy);
+        self.eviction_policy_enabled.store(
+            !matches!(policy, PageCacheEvictionPolicy::Arbitrary),
+            Ordering::Release,
+        );
+        // Concurrent setters publish the policy and target under this same
+        // existing lock; an older setter cannot install its policy after a
+        // newer setter has published a different target.
+        self.cache_page_budget.store(page_budget, Ordering::Release);
+        drop(tracker);
         self.trim_to_page_budget();
     }
 
@@ -6577,7 +6589,7 @@ mod tests {
     fn cache_page_budget_shrink_and_admission_cover_every_tier() {
         for fast_path in [false, true] {
             let mut cache = ShardedPageCache::with_pool_and_shards_and_flat_capacity(
-                PageBufPool::new(PageSize::DEFAULT, 32),
+                PageBufPool::new(PageSize::DEFAULT, 64),
                 PageSize::DEFAULT,
                 4,
                 2,
@@ -6585,23 +6597,38 @@ mod tests {
             if fast_path {
                 cache.enable_fast_path();
             }
-            cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(32)));
-            for raw_page in 1..=8 {
+            assert_eq!(cache.cache_page_budget(), usize::MAX);
+            cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(64)));
+            let resident_count = MAX_PROBE_LENGTH + 1;
+            let pages = if fast_path {
+                (1..=u32::try_from(resident_count).unwrap())
+                    .map(|page| PageNumber::new(page).unwrap())
+                    .collect::<Vec<_>>()
+            } else {
+                let bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+                track_q_collision_pages(&cache.flat_slots, bucket, resident_count)
+            };
+            for (index, &page) in pages.iter().enumerate() {
                 let mut buffer = cache.pool.acquire().unwrap();
-                buffer.as_mut_slice().fill(u8::try_from(raw_page).unwrap());
-                cache.insert_buffer(PageNumber::new(raw_page).unwrap(), buffer);
+                buffer.as_mut_slice().fill(u8::try_from(index + 1).unwrap());
+                cache.insert_buffer(page, buffer);
             }
             if !fast_path {
                 assert!(cache.shards.iter().any(|shard| !shard.lock().pages.is_empty()));
             }
-            let retained = cache.get_shared(PageNumber::ONE).unwrap();
+            let retained = cache.get_shared(pages[0]).unwrap();
             let before = cache.metrics_lightweight_snapshot();
+            assert_eq!(before.cached_pages, resident_count);
+            assert_eq!(before.cache_page_budget, usize::MAX);
             cache.set_cache_page_budget(2);
             let after = cache.metrics_lightweight_snapshot();
             assert_eq!(after.cache_page_budget, 2);
             assert_eq!(after.cached_pages, 2);
-            assert_eq!(after.evictions - before.evictions, 6);
-            assert_eq!(after.pool_capacity, 32);
+            assert_eq!(
+                after.evictions - before.evictions,
+                u64::try_from(resident_count - 2).unwrap()
+            );
+            assert_eq!(after.pool_capacity, 64);
             assert!(retained.as_bytes().iter().all(|&byte| byte == 1));
 
             for raw_page in 9..=24 {
@@ -6617,13 +6644,42 @@ mod tests {
             assert_eq!(cache.budget_resident_pages(), 0);
             cache.set_cache_page_budget(usize::MAX);
             assert_eq!(cache.cache_page_budget(), usize::MAX);
-            assert_eq!(cache.pool.capacity(), 32);
+            assert_eq!(cache.pool.capacity(), 64);
             assert_eq!(cache.diagnostic_snapshot_calls.load(Ordering::Relaxed), 0);
             assert_eq!(
                 cache.reconstructed_victim_scan_calls.load(Ordering::Relaxed),
                 0
             );
         }
+    }
+
+    #[test]
+    fn cache_page_budget_concurrent_setters_publish_matching_policy() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 64);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(64)));
+        cache.set_cache_page_budget(64);
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for budget in [0, 1, 17, 64] {
+                let cache = &cache;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..256 {
+                        cache.set_cache_page_budget(budget);
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..4_096 {
+                let tracker = cache.eviction_policy.lock();
+                let PageCacheEvictionPolicy::S3Fifo(config) = tracker.policy() else {
+                    panic!("resizing must retain the configured eviction policy kind");
+                };
+                assert_eq!(config.capacity(), cache.cache_page_budget().max(1));
+            }
+        });
+        assert_eq!(cache.pool.capacity(), 64);
     }
 
     #[test]

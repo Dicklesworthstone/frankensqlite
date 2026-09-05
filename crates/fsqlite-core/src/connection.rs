@@ -10640,6 +10640,9 @@ struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
+    // TEMP has no pager header: retain its transactional default here.
+    // The independent runtime cache suggestion deliberately survives rollback.
+    temp_default_cache_size: i64,
     shadowed_main_tables: HashMap<String, TableSchema>,
     views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
@@ -19491,7 +19494,10 @@ impl Connection {
                     if pragma_attached_scope_is_global(&pragma.name.name) {
                         return Ok(None);
                     }
-                    let writes_cache_header = pragma.name.name.eq_ignore_ascii_case("default_cache_size")
+                    let writes_cache_header = pragma
+                        .name
+                        .name
+                        .eq_ignore_ascii_case("default_cache_size")
                         && pragma.value.is_some();
                     let cache_header_write_forbidden = writes_cache_header
                         && self.pragma_state.borrow().query_only;
@@ -19522,7 +19528,10 @@ impl Connection {
                                 // Like stock, accept the child cache suggestion
                                 // even though its persistent write is refused.
                                 let mut next_state = conn.pragma_state.borrow().clone();
-                                fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, &rewritten)?;
+                                fsqlite_vdbe::pragma::apply_connection_pragma(
+                                    &mut next_state,
+                                    &rewritten,
+                                )?;
                                 conn.apply_cache_size_to_pager(next_state.cache_size)?;
                                 conn.pragma_state.borrow_mut().cache_size = next_state.cache_size;
                                 return Err(FrankenError::ReadOnly);
@@ -24160,10 +24169,8 @@ impl Connection {
     /// size. Later PRAGMA page_size requests must not reinterpret a previously
     /// assigned KiB budget, nor change the transaction buffer-pool ceiling.
     fn apply_cache_size_to_pager(&self, cache_size: i64) -> Result<()> {
-        let pages = fsqlite_vdbe::pragma::cache_pages_from_size(
-            cache_size,
-            self.pager.page_size().get(),
-        );
+        let pages =
+            fsqlite_vdbe::pragma::cache_pages_from_size(cache_size, self.pager.page_size().get());
         let pages = usize::try_from(pages).map_err(|_| FrankenError::OutOfRange {
             what: "cache_size page budget".to_owned(),
             value: pages.to_string(),
@@ -68657,6 +68664,7 @@ impl Connection {
             db_version,
             schema: self.schema.borrow().clone(),
             temp_table_names: self.temp_table_names.borrow().clone(),
+            temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
             shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
@@ -68728,6 +68736,7 @@ impl Connection {
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
         (*self.temp_table_names.borrow_mut()).clone_from(&snap.temp_table_names);
+        self.pragma_state.borrow_mut().temp_default_cache_size = snap.temp_default_cache_size;
         (*self.shadowed_main_tables.borrow_mut()).clone_from(&snap.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&snap.views);
         *self.views_by_name.borrow_mut() = new_views_by_name;
@@ -73305,6 +73314,15 @@ impl Connection {
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
             let is_temp = pragma_schema_scope(pragma) == PragmaSchemaScope::Temp;
             let is_default = pragma_name == "default_cache_size";
+            if pragma.value.is_some() && is_temp {
+                // TEMP accepts the runtime suggestion before a default-setting
+                // write is refused, just like a file-backed schema does.
+                let mut state = self.pragma_state.borrow_mut();
+                state.temp_cache_size = next_state.temp_cache_size;
+                if is_default && state.query_only {
+                    return Err(FrankenError::ReadOnly);
+                }
+            }
             if pragma.value.is_some() && !is_temp {
                 // Resize before publishing the accepted runtime suggestion.
                 // SQLite keeps this connection-local setting even if a
@@ -73346,7 +73364,9 @@ impl Connection {
                     values: vec![SqliteValue::Integer(value)],
                 }])
             } else {
-                Err(FrankenError::internal("cache-size pragma returned a non-integer"))
+                Err(FrankenError::internal(
+                    "cache-size pragma returned a non-integer",
+                ))
             };
         }
         let maybe_prior_journal_mode = if pragma_name == "journal_mode" && pragma.value.is_some() {

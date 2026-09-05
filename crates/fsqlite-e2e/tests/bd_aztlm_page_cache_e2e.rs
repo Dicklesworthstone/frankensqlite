@@ -854,6 +854,34 @@ fn cache_budget_pages(setting: i64, actual_page_size: usize) -> usize {
     }
 }
 
+async fn cache_budget_schema_stats(
+    conn: &fsqlite::Connection,
+    schema: &str,
+) -> std::collections::BTreeMap<String, i64> {
+    use fsqlite_types::value::SqliteValue;
+    let sql = format!("PRAGMA {schema}.fsqlite_cache_stats");
+    let rows = conn.query(&sql).await.unwrap();
+    let mut stats = std::collections::BTreeMap::new();
+    for row in rows {
+        match row.values() {
+            [SqliteValue::Text(name), SqliteValue::Integer(value)] => {
+                assert!(
+                    stats.insert(name.to_string(), *value).is_none(),
+                    "{sql}: duplicate metric {name}"
+                );
+            }
+            other => panic!("{sql}: unexpected diagnostic row {other:?}"),
+        }
+    }
+    for required in ["cached_pages", "eviction_count", "capacity_pages"] {
+        assert!(
+            stats.contains_key(required),
+            "{sql}: missing {required}; got {stats:?}"
+        );
+    }
+    stats
+}
+
 #[test]
 fn q9_cache_budget_live_effect() {
     asupersync::test_utils::run_test(|| async {
@@ -1120,6 +1148,7 @@ fn q12_cache_budget_independent_connections_and_close_orders() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn q13_cache_budget_attach_and_temp_isolation() {
     asupersync::test_utils::run_test(|| async {
         let run = CacheBudgetRun::new("q13_cache_budget_attach_and_temp_isolation");
@@ -1139,7 +1168,30 @@ fn q13_cache_budget_attach_and_temp_isolation() {
         .unwrap();
         conn.execute("PRAGMA main.cache_size=16").await.unwrap();
         cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &main_rows).await;
+        let aux_select = "SELECT id, payload FROM aux.cache_budget ORDER BY id";
+        conn.execute("PRAGMA aux.cache_size=128").await.unwrap();
+        cache_budget_assert_rows(&conn, aux_select, &aux_rows).await;
+        let warm_aux = cache_budget_schema_stats(&conn, "aux").await;
+        run.record(
+            "attached_warmed",
+            &conn,
+            json!({"schema": "aux", "child_cache": warm_aux}),
+        );
+        assert!(
+            warm_aux["cached_pages"] > 8,
+            "attached warm-up must create eviction work"
+        );
+        assert!(warm_aux["cached_pages"] <= 128);
         conn.execute("PRAGMA aux.cache_size=-32").await.unwrap();
+        let shrunk_aux = cache_budget_schema_stats(&conn, "aux").await;
+        run.record(
+            "attached_shrunk",
+            &conn,
+            json!({"schema": "aux", "expected_pages": 4, "child_cache": shrunk_aux}),
+        );
+        assert!(shrunk_aux["cached_pages"] <= 4);
+        assert!(shrunk_aux["eviction_count"] > warm_aux["eviction_count"]);
+        assert_eq!(shrunk_aux["capacity_pages"], warm_aux["capacity_pages"]);
         assert_eq!(
             cache_budget_integer(&conn, "PRAGMA aux.page_size").await,
             8192
@@ -1153,12 +1205,27 @@ fn q13_cache_budget_attach_and_temp_isolation() {
             16
         );
         run.assert_quiescent_budget("attached_setter_main_unchanged", &conn, 16);
-        cache_budget_assert_rows(
+        cache_budget_assert_rows(&conn, aux_select, &aux_rows).await;
+        let scanned_aux = cache_budget_schema_stats(&conn, "aux").await;
+        run.record(
+            "attached_small_scan",
             &conn,
-            "SELECT id, payload FROM aux.cache_budget ORDER BY id",
-            &aux_rows,
-        )
-        .await;
+            json!({"schema": "aux", "expected_pages": 4, "child_cache": scanned_aux}),
+        );
+        assert!(scanned_aux["cached_pages"] <= 4);
+        conn.execute("PRAGMA aux.cache_size=128").await.unwrap();
+        cache_budget_assert_rows(&conn, aux_select, &aux_rows).await;
+        let grown_aux = cache_budget_schema_stats(&conn, "aux").await;
+        run.record(
+            "attached_grown",
+            &conn,
+            json!({"schema": "aux", "expected_pages": 128, "child_cache": grown_aux}),
+        );
+        assert!(grown_aux["cached_pages"] > 8);
+        assert!(grown_aux["cached_pages"] <= 128);
+        run.assert_quiescent_budget("attached_resize_main_budget_unchanged", &conn, 16);
+        conn.execute("PRAGMA aux.cache_size=-32").await.unwrap();
+        assert!(cache_budget_schema_stats(&conn, "aux").await["cached_pages"] <= 4);
 
         assert_eq!(
             cache_budget_integer(&conn, "PRAGMA temp.cache_size").await,
@@ -1306,16 +1373,26 @@ fn q14_cache_budget_default_survives_reopen() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
     asupersync::test_utils::run_test(|| async {
         let run =
             CacheBudgetRun::new("q15_cache_budget_readonly_header_failure_keeps_runtime_change");
         let dir = tempfile::tempdir().unwrap();
-        for readonly_file in [false, true] {
-            let path = dir.path().join(format!("readonly-{readonly_file}.db"));
-            let oracle_path = dir
-                .path()
-                .join(format!("oracle-readonly-{readonly_file}.db"));
+        for (readonly_file, temp_created) in [
+            (false, None),
+            (true, None),
+            (false, Some(false)),
+            (false, Some(true)),
+        ] {
+            let schema = if temp_created.is_some() {
+                "temp"
+            } else {
+                "main"
+            };
+            let case = format!("{readonly_file}-{temp_created:?}");
+            let path = dir.path().join(format!("readonly-{case}.db"));
+            let oracle_path = dir.path().join(format!("oracle-readonly-{case}.db"));
             let expected = seed_cache_budget_database(&path, 4096);
             assert_eq!(seed_cache_budget_database(&oracle_path, 4096), expected);
             let conn = if readonly_file {
@@ -1338,29 +1415,38 @@ fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
             };
             conn.execute("PRAGMA cache_size=8").await.unwrap();
             oracle.execute_batch("PRAGMA cache_size=8").unwrap();
+            if temp_created == Some(true) {
+                let create = "CREATE TEMP TABLE kept_temp(id INTEGER, payload TEXT)";
+                let insert = "INSERT INTO kept_temp VALUES (1, 'unchanged')";
+                conn.execute(create).await.unwrap();
+                conn.execute(insert).await.unwrap();
+                oracle.execute_batch(create).unwrap();
+                oracle.execute_batch(insert).unwrap();
+            }
+            if temp_created.is_some() {
+                conn.execute("PRAGMA temp.cache_size=8").await.unwrap();
+                oracle.execute_batch("PRAGMA temp.cache_size=8").unwrap();
+            }
             if !readonly_file {
                 conn.execute("PRAGMA query_only=ON").await.unwrap();
                 oracle.execute_batch("PRAGMA query_only=ON").unwrap();
             }
-            let original_default: i64 = oracle
-                .query_row("PRAGMA default_cache_size", [], |r| r.get(0))
-                .unwrap();
-            let stock_error = oracle
-                .execute_batch("PRAGMA default_cache_size=32")
-                .unwrap_err();
+            let default_query = format!("PRAGMA {schema}.default_cache_size");
+            let runtime_query = format!("PRAGMA {schema}.cache_size");
+            let setter = format!("PRAGMA {schema}.default_cache_size=32");
+            let original_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
+            let stock_error = oracle.execute_batch(&setter).unwrap_err();
             assert_eq!(
                 stock_error.sqlite_error_code(),
                 Some(rusqlite::ErrorCode::ReadOnly)
             );
-            let actual_error = conn
-                .execute("PRAGMA default_cache_size=32")
-                .await
-                .unwrap_err();
+            let actual_error = conn.execute(&setter).await.unwrap_err();
             run.record(
                 "readonly_header_error",
                 &conn,
                 json!({
                     "readonly_file": readonly_file,
+                    "temp_created": temp_created,
                     "stock_error": stock_error.to_string(),
                     "actual_error": actual_error.to_string(),
                 }),
@@ -1369,27 +1455,41 @@ fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
                 actual_error,
                 fsqlite_error::FrankenError::ReadOnly
             ));
-            let stock_runtime: i64 = oracle
-                .query_row("PRAGMA cache_size", [], |r| r.get(0))
-                .unwrap();
+            let stock_runtime: i64 = oracle.query_row(&runtime_query, [], |r| r.get(0)).unwrap();
             assert_eq!(stock_runtime, 32);
             assert_eq!(
-                cache_budget_integer(&conn, "PRAGMA cache_size").await,
+                cache_budget_integer(&conn, &runtime_query).await,
                 stock_runtime
             );
             assert_eq!(
-                cache_budget_integer(&conn, "PRAGMA default_cache_size").await,
+                cache_budget_integer(&conn, &default_query).await,
                 original_default
             );
             assert_eq!(
                 oracle
-                    .query_row("PRAGMA default_cache_size", [], |r| r.get::<_, i64>(0))
+                    .query_row(&default_query, [], |r| r.get::<_, i64>(0))
                     .unwrap(),
                 original_default
             );
             cache_budget_assert_rows(&conn, CACHE_BUDGET_SELECT, &expected).await;
-            run.assert_quiescent_budget("readonly_runtime_budget_really_grew", &conn, 32);
-            assert!(conn.memory_stats().unwrap().page_cache.cached_pages > 8);
+            if temp_created.is_some() {
+                assert_eq!(
+                    cache_budget_integer(&conn, "PRAGMA main.cache_size").await,
+                    8
+                );
+                run.assert_quiescent_budget("temp_readonly_main_budget_unchanged", &conn, 8);
+                if temp_created == Some(true) {
+                    cache_budget_assert_rows(
+                        &conn,
+                        "SELECT id, payload FROM kept_temp ORDER BY id",
+                        &[(1, "unchanged".to_owned())],
+                    )
+                    .await;
+                }
+            } else {
+                run.assert_quiescent_budget("readonly_runtime_budget_really_grew", &conn, 32);
+                assert!(conn.memory_stats().unwrap().page_cache.cached_pages > 8);
+            }
             conn.close().await.unwrap();
             oracle.close().unwrap();
             assert_eq!(cache_budget_oracle_rows(&path), expected);
@@ -1398,11 +1498,12 @@ fn q15_cache_budget_readonly_header_failure_keeps_runtime_change() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn q16_cache_budget_rollback_restores_header_not_runtime() {
     asupersync::test_utils::run_test(|| async {
         let run = CacheBudgetRun::new("q16_cache_budget_rollback_restores_header_not_runtime");
         let dir = tempfile::tempdir().unwrap();
-        for schema in ["main", "aux"] {
+        for schema in ["main", "aux", "temp"] {
             let main_path = dir.path().join(format!("rollback-{schema}.db"));
             let oracle_main = dir.path().join(format!("oracle-rollback-{schema}.db"));
             let expected = seed_cache_budget_database(&main_path, 4096);
@@ -1429,10 +1530,20 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
             } else {
                 main_path.clone()
             };
+            if schema == "temp" {
+                for sql in [
+                    "CREATE TEMP TABLE cache_budget(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+                    "INSERT INTO temp.cache_budget SELECT id, payload FROM main.cache_budget",
+                ] {
+                    conn.execute(sql).await.unwrap();
+                    oracle.execute_batch(sql).unwrap();
+                }
+            }
             let runtime_query = format!("PRAGMA {schema}.cache_size");
             let default_query = format!("PRAGMA {schema}.default_cache_size");
             let original_default: i64 = oracle.query_row(&default_query, [], |r| r.get(0)).unwrap();
             conn.execute("PRAGMA main.cache_size=8").await.unwrap();
+            oracle.execute_batch("PRAGMA main.cache_size=8").unwrap();
             let setup = format!("PRAGMA {schema}.cache_size=8");
             conn.execute(&setup).await.unwrap();
             oracle.execute_batch(&setup).unwrap();
@@ -1475,6 +1586,90 @@ fn q16_cache_budget_rollback_restores_header_not_runtime() {
                 &conn,
                 if schema == "main" { 32 } else { 8 },
             );
+            if schema == "temp" {
+                for sql in [
+                    "PRAGMA temp.default_cache_size=16",
+                    "BEGIN",
+                    "PRAGMA temp.default_cache_size=32",
+                    "SAVEPOINT cache_default",
+                    "PRAGMA temp.default_cache_size=64",
+                    "ROLLBACK TO cache_default",
+                ] {
+                    conn.execute(sql).await.unwrap();
+                    oracle.execute_batch(sql).unwrap();
+                }
+                for (phase, restored_default) in [
+                    ("temp_default_savepoint_rollback", 32),
+                    ("temp_default_outer_rollback", 16),
+                ] {
+                    if restored_default == 16 {
+                        for sql in ["RELEASE cache_default", "ROLLBACK"] {
+                            conn.execute(sql).await.unwrap();
+                            oracle.execute_batch(sql).unwrap();
+                        }
+                    }
+                    for (query, expected_value) in [
+                        ("PRAGMA temp.cache_size", 64),
+                        ("PRAGMA temp.default_cache_size", restored_default),
+                        ("PRAGMA main.cache_size", 8),
+                    ] {
+                        let stock_value: i64 = oracle.query_row(query, [], |r| r.get(0)).unwrap();
+                        assert_eq!(stock_value, expected_value, "{phase}: {query}");
+                        assert_eq!(cache_budget_integer(&conn, query).await, stock_value);
+                    }
+                    cache_budget_assert_rows(
+                        &conn,
+                        "SELECT id, payload FROM temp.cache_budget ORDER BY id",
+                        &expected,
+                    )
+                    .await;
+                    run.record(
+                        phase,
+                        &conn,
+                        json!({"temp_runtime": 64, "temp_default": restored_default}),
+                    );
+                    run.assert_quiescent_budget(phase, &conn, 8);
+                }
+            }
+            if schema == "aux" {
+                conn.execute("PRAGMA query_only=ON").await.unwrap();
+                oracle.execute_batch("PRAGMA query_only=ON").unwrap();
+                let denied_setter = "PRAGMA aux.default_cache_size=16";
+                let stock_error = oracle.execute_batch(denied_setter).unwrap_err();
+                let actual_error = conn.execute(denied_setter).await.unwrap_err();
+                run.record(
+                    "attached_default_readonly_after_rollback",
+                    &conn,
+                    json!({
+                        "stock_error": stock_error.to_string(),
+                        "actual_error": actual_error.to_string(),
+                    }),
+                );
+                assert_eq!(
+                    stock_error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ReadOnly)
+                );
+                assert!(matches!(
+                    actual_error,
+                    fsqlite_error::FrankenError::ReadOnly
+                ));
+                for (query, expected_value) in [
+                    ("PRAGMA aux.cache_size", 16),
+                    ("PRAGMA aux.default_cache_size", original_default),
+                    ("PRAGMA main.cache_size", 8),
+                ] {
+                    let stock_value: i64 = oracle.query_row(query, [], |r| r.get(0)).unwrap();
+                    assert_eq!(stock_value, expected_value, "{query}");
+                    assert_eq!(cache_budget_integer(&conn, query).await, stock_value);
+                }
+                cache_budget_assert_rows(
+                    &conn,
+                    "SELECT id, payload FROM aux.cache_budget ORDER BY id",
+                    &expected,
+                )
+                .await;
+                run.assert_quiescent_budget("attached_readonly_main_budget_unchanged", &conn, 8);
+            }
             conn.close().await.unwrap();
             oracle.close().unwrap();
             let reopened = rusqlite::Connection::open(&affected_path).unwrap();
