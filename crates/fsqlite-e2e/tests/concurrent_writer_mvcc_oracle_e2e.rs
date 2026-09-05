@@ -180,8 +180,8 @@ fn compiled_overlap_source_hashes() -> BTreeMap<String, String> {
             include_bytes!("../../fsqlite-pager/src/page_cache.rs"),
         ),
         (
-            "crates/fsqlite-mvcc/src/concurrent.rs",
-            include_bytes!("../../fsqlite-mvcc/src/concurrent.rs"),
+            "crates/fsqlite-mvcc/src/begin_concurrent.rs",
+            include_bytes!("../../fsqlite-mvcc/src/begin_concurrent.rs"),
         ),
         (
             "crates/fsqlite-vdbe/src/lib.rs",
@@ -301,6 +301,7 @@ fn overlap_identity(name: &str, fallback: &str) -> String {
 fn build_overlap_observation(
     run_id: &str,
     recorder: &Arc<Mutex<OverlapRecorder>>,
+    final_state: BTreeMap<String, HistoryValue>,
 ) -> ConcurrentWriteObservation {
     let recorder = recorder.lock().expect("complete overlap observations");
     let trace_id = overlap_identity("FSQLITE_PROOF_TRACE_ID", run_id);
@@ -362,10 +363,7 @@ fn build_overlap_observation(
             ("overlap_a".to_owned(), HistoryValue::Integer(0)),
             ("overlap_b".to_owned(), HistoryValue::Integer(0)),
         ]),
-        final_state: BTreeMap::from([
-            ("overlap_a".to_owned(), HistoryValue::Integer(1)),
-            ("overlap_b".to_owned(), HistoryValue::Integer(1)),
-        ]),
+        final_state,
         final_state_sha256: String::new(),
         events: recorder.events.clone(),
     };
@@ -400,6 +398,7 @@ fn verify_overlap_stock_child(path: &std::path::Path) {
     let stock =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("independent stock reopen");
+    let mut final_state = BTreeMap::new();
     for table in ["overlap_a", "overlap_b"] {
         assert_eq!(
             rusqlite_query_sorted(
@@ -409,6 +408,14 @@ fn verify_overlap_stock_child(path: &std::path::Path) {
             .expect("stock exact rows"),
             vec![vec!["1".to_owned(), "1".to_owned()]],
         );
+        let value: i64 = stock
+            .query_row(
+                &format!("SELECT value FROM {table} WHERE id=1"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("actual retained value");
+        final_state.insert(table.to_owned(), HistoryValue::Integer(value));
     }
     let integrity: String = stock
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -419,11 +426,12 @@ fn verify_overlap_stock_child(path: &std::path::Path) {
         serde_json::json!({
             "process_id": std::process::id(), "parent_process_id": parent,
             "sqlite_version": rusqlite::version(), "retained_rows": 2, "integrity": integrity,
+            "final_state": final_state,
         })
     );
 }
 
-fn run_overlap_stock_child(path: &std::path::Path) {
+fn run_overlap_stock_child(path: &std::path::Path) -> BTreeMap<String, HistoryValue> {
     let child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
         .args([
             "--exact",
@@ -461,6 +469,7 @@ fn run_overlap_stock_child(path: &std::path::Path) {
     assert_eq!(receipt["integrity"], "ok");
     // Keep the actual child observation, without duplicating its libtest completion records.
     println!("{STOCK_REOPEN_PREFIX}{}", receipts[0]);
+    serde_json::from_value(receipt["final_state"].clone()).expect("actual reopened final state")
 }
 
 fn seed_overlap_database(path: &str) -> [u32; 2] {
@@ -563,8 +572,8 @@ fn observed_disjoint_writer_overlap_for_certificate() {
             worker.join().expect("observed writer panicked");
         }
     });
-    run_overlap_stock_child(database.path());
-    let observation = build_overlap_observation(&run_id, &recorder);
+    let final_state = run_overlap_stock_child(database.path());
+    let observation = build_overlap_observation(&run_id, &recorder, final_state);
     observation
         .validate()
         .expect("actual history must prove committed disjoint writer overlap");
@@ -572,6 +581,93 @@ fn observed_disjoint_writer_overlap_for_certificate() {
         "{CONCURRENT_WRITE_OBSERVATION_PREFIX}{}",
         serde_json::to_string(&observation).expect("compact observed concurrency JSON")
     );
+}
+
+#[test]
+fn overlapping_same_page_writer_conflict_preserves_winner() {
+    asupersync::test_utils::run_test(|| async {
+        let database = tempfile::NamedTempFile::new().expect("same-page database");
+        let path = database.path().to_str().expect("fixture path");
+        let roots = seed_overlap_database(path);
+        let first = fsqlite::Connection::open(path).await.expect("first writer");
+        let second = fsqlite::Connection::open(path)
+            .await
+            .expect("second writer");
+        first
+            .execute("BEGIN")
+            .await
+            .expect("first concurrent BEGIN");
+        second
+            .execute("BEGIN")
+            .await
+            .expect("second concurrent BEGIN");
+        let first_snapshot = first
+            .current_concurrent_snapshot_seq()
+            .expect("first active snapshot");
+        let second_snapshot = second
+            .current_concurrent_snapshot_seq()
+            .expect("second active snapshot");
+        assert_eq!(first_snapshot, second_snapshot);
+        assert_eq!(
+            first
+                .execute("UPDATE overlap_a SET value=1 WHERE id=1")
+                .await
+                .expect("first held write"),
+            1
+        );
+        let second_write = second
+            .execute("UPDATE overlap_a SET value=2 WHERE id=1")
+            .await;
+        first
+            .execute("COMMIT")
+            .await
+            .expect("first writer must commit");
+        let (phase, error) = match second_write {
+            Ok(changed) => {
+                assert_eq!(changed, 1);
+                (
+                    "commit",
+                    second
+                        .execute("COMMIT")
+                        .await
+                        .expect_err("FCW must reject stale same-page write"),
+                )
+            }
+            Err(error) => ("write", error),
+        };
+        match &error {
+            fsqlite::FrankenError::WriteConflict { page, .. }
+            | fsqlite::FrankenError::SerializationFailure { page } => assert_eq!(*page, roots[0]),
+            fsqlite::FrankenError::Busy | fsqlite::FrankenError::BusySnapshot { .. } => {}
+            unexpected => {
+                panic!("same-page rejection must be a typed MVCC conflict: {unexpected:?}")
+            }
+        }
+        println!(
+            "FSQLITE_SAME_PAGE_CONFLICT={}",
+            serde_json::json!({
+                "process_id": std::process::id(), "connections": ["first", "second"],
+                "snapshot_high": first_snapshot, "page_id": roots[0], "rejected_phase": phase,
+                "error": error.to_string(), "extended_code": error.extended_error_code(),
+                "winner_commit_seq": first.last_local_commit_seq().expect("winner publication"),
+                "attempts": 1, "retries": 0,
+            })
+        );
+        if second.in_transaction() {
+            second
+                .execute("ROLLBACK")
+                .await
+                .expect("rollback conflicting transaction");
+        }
+        first.close().await.expect("close winning writer");
+        second.close().await.expect("close rejected writer");
+        let stock = rusqlite::Connection::open(database.path()).expect("stock reopen");
+        assert_eq!(
+            rusqlite_query_sorted(&stock, "SELECT id,value FROM overlap_a ORDER BY id")
+                .expect("retained winner"),
+            vec![vec!["1".to_owned(), "1".to_owned()]],
+        );
+    });
 }
 
 #[test]

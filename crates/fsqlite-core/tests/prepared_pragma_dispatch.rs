@@ -537,13 +537,22 @@ fn prepared_pragma_getters_and_setters_match_rusqlite() -> TestResult {
                     .await
                     .expect_err("unknown schema unexpectedly fell back");
                 assert_eq!(error.error_code(), ErrorCode::Error, "{sql}");
-                assert!(
-                    error.to_string().contains("no such database"),
-                    "unexpected unknown-schema error for {sql}: {error}"
+                let oracle_error = rusqlite_rows(&rconn, sql)
+                    .expect_err("SQLite unexpectedly accepted an unknown schema");
+                let Some(rusqlite::Error::SqliteFailure(code, Some(message))) =
+                    oracle_error.downcast_ref::<rusqlite::Error>()
+                else {
+                    panic!("unexpected SQLite error for {sql}: {oracle_error}");
+                };
+                assert_eq!(
+                    error.extended_error_code(),
+                    code.extended_code,
+                    "unknown-schema error code mismatch for {sql}"
                 );
-                assert!(
-                    rusqlite_rows(&rconn, sql).is_err(),
-                    "SQLite unexpectedly accepted unknown schema for {sql}"
+                assert_eq!(
+                    error.to_string(),
+                    message.as_str(),
+                    "unknown-schema error message mismatch for {sql}"
                 );
             }
 
