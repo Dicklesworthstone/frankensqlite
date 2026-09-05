@@ -1420,17 +1420,19 @@ fn reconstruct_payload_from_source_symbols(mut records: Vec<SymbolRecord>) -> Re
         if esi >= source_symbols {
             break;
         }
-        if esi == next_source_esi {
-            next_source_esi += 1;
-            previous = Some(record);
-        } else if esi < next_source_esi {
-            if previous.is_none_or(|prior| prior.symbol_data != record.symbol_data) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("conflicting source symbols at ESI {esi}"),
-                });
+        match esi.cmp(&next_source_esi) {
+            std::cmp::Ordering::Equal => {
+                next_source_esi += 1;
+                previous = Some(record);
             }
-        } else {
-            break;
+            std::cmp::Ordering::Less => {
+                if previous.is_none_or(|prior| prior.symbol_data != record.symbol_data) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!("conflicting source symbols at ESI {esi}"),
+                    });
+                }
+            }
+            std::cmp::Ordering::Greater => break,
         }
     }
     if next_source_esi != source_symbols {
