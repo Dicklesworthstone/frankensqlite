@@ -6051,12 +6051,18 @@ mod tests {
 
     #[test]
     fn strict_output_path_accepts_an_absent_canonical_child_without_creating_it() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("workspace root");
+        let fixture = tempfile::tempdir().expect("temporary workspace");
+        let workspace = fixture.path().canonicalize().expect("workspace root");
         let relative = Path::new("artifacts/strict-certificate-path-validation-only");
         let expected = workspace.join(relative);
+        let parent = expected.parent().expect("output parent");
+        assert!(
+            prepare_strict_output_directory(&workspace, relative)
+                .expect_err("missing output parent must fail")
+                .starts_with("certificate_output_parent_missing")
+        );
+        assert!(!parent.exists(), "validation must not create the parent");
+        fs::create_dir(parent).expect("create fixture output parent");
         assert!(
             !expected.exists(),
             "validation-only output must stay absent"

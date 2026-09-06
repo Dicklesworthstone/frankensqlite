@@ -2415,18 +2415,12 @@ mod tests {
 
         let seed = 0xC0FF_EE11_AAA5_5501_u64;
         let rounds = 96_u32;
-        let mut socket_path = std::env::temp_dir();
-        let unique = format!(
-            "coord-ipc-seeded-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0_u128, |duration| duration.as_nanos())
-        );
-        socket_path.push(unique);
-        if socket_path.exists() {
-            let _ = std::fs::remove_file(&socket_path);
-        }
+        // RCH and other runners can set TMPDIR to a deep workspace path.
+        // Linux pathname sockets have a fixed sun_path limit, so reserve a
+        // private short directory instead of inheriting that path or deleting
+        // a potentially unrelated socket before binding.
+        let socket_directory = tempfile::tempdir_in("/tmp").expect("short socket directory");
+        let socket_path = socket_directory.path().join("ipc.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
 
         let pm = Arc::new(PermitManager::new(MAX_OUTSTANDING_PERMITS));
@@ -2610,7 +2604,6 @@ mod tests {
             cache_len, server_ok,
             "cache cardinality must match committed txns"
         );
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     // ===================================================================
