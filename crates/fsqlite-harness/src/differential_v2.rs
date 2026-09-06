@@ -800,6 +800,12 @@ pub trait SqlExecutor {
         EngineIdentity::Unknown
     }
 
+    /// Actual connection-local fallback events, when this backend exposes them.
+    /// Reading this snapshot must not execute SQL, reset capture, or alter routing.
+    fn fallback_execution_snapshot(&self) -> Option<fsqlite::FallbackExecutionSnapshot> {
+        None
+    }
+
     /// Best-effort classification of whether a statement produces result rows.
     ///
     /// Real executors should prefer prepared-statement metadata over keyword
@@ -991,6 +997,10 @@ impl SqlExecutor for FsqliteExecutor {
 
     fn engine_identity(&self) -> EngineIdentity {
         EngineIdentity::FrankenSqlite
+    }
+
+    fn fallback_execution_snapshot(&self) -> Option<fsqlite::FallbackExecutionSnapshot> {
+        Some(self.conn.fallback_execution_snapshot())
     }
 }
 

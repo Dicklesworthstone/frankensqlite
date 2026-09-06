@@ -877,6 +877,39 @@ pub struct AgentSwarmSchemaFailure {
     pub error: String,
 }
 
+/// An actual engine routing event, with no SQL, parameters or database paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmFallbackEvent {
+    /// Monotone event identity on the executing connection.
+    pub event_id: u64,
+    /// Actual engine connection identity, distinct from the trace actor label.
+    pub connection_id: Option<u64>,
+    /// Actual engine statement identity.
+    pub statement_id: u64,
+    /// Actual concurrent transaction identity, when present.
+    pub transaction_id: Option<u64>,
+    /// Engine statement kind.
+    pub statement_kind: String,
+    /// Stable reason emitted at the routing boundary.
+    pub decision_reason: String,
+    /// Admission outcome; this does not certify statement success.
+    pub decision_outcome: String,
+    /// Engine source boundary that emitted the event.
+    pub source_context: String,
+    /// Actual pager backend.
+    pub storage_backend: String,
+}
+
+/// Bounded engine evidence emitted during this statement's synchronous replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmFallbackEvidence {
+    /// Newly emitted events still retained after execution.
+    pub events: Vec<AgentSwarmFallbackEvent>,
+    /// Increase in the engine's dropped-event counter during execution.
+    /// This can include older events evicted from the shared bounded ring.
+    pub dropped_events: u64,
+}
+
 /// Replay record for one trace statement on one backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmStatementReplay {
@@ -906,6 +939,8 @@ pub struct AgentSwarmStatementReplay {
     pub expected_result_class: ExpectedResultClass,
     /// Actual statement outcome.
     pub outcome: StmtOutcome,
+    /// Actual fallback evidence; `None` means the executor does not expose it.
+    pub fallback_evidence: Option<AgentSwarmFallbackEvidence>,
     /// Normalized outcome class.
     pub outcome_class: AgentSwarmReplayOutcomeClass,
     /// Statement latency in nanoseconds.
@@ -1256,12 +1291,12 @@ pub struct AgentSwarmCoordinationMetrics {
     pub lease_expiration_count: u64,
     /// Worker-range allocation/split/merge operations observed by replay.
     pub range_allocation_count: u64,
-    /// EXPLAIN CONCURRENCY diagnostic rows observed by replay.
-    pub explain_concurrency_row_count: u64,
-    /// Compatibility fallback reason rows observed by replay.
+    /// Actual EXPLAIN CONCURRENCY rows, unavailable without an engine producer.
+    pub explain_concurrency_row_count: Option<u64>,
+    /// Actual newly emitted fallback events retained by the replay executor.
     pub fallback_reason_count: u64,
-    /// Resource-governor decision rows observed by replay.
-    pub resource_governor_decision_count: u64,
+    /// Actual governor decisions, unavailable without an engine producer.
+    pub resource_governor_decision_count: Option<u64>,
     /// Score of expected-vs-actual coordination outcomes, per mille.
     pub coordination_correctness_per_mille: u16,
     /// Score of conflict/fallback diagnostic visibility, per mille.
@@ -2402,9 +2437,34 @@ where
     E: SqlExecutor,
 {
     let materialized_sql = materialize_replay_sql_for_backend(backend, &statement.scrubbed_sql);
+    let fallback_before = executor.fallback_execution_snapshot();
     let started_at = Instant::now();
     let outcome = executor.run_stmt(&materialized_sql);
     let latency_ns = elapsed_nanos_u64(started_at.elapsed());
+    let fallback_evidence = fallback_before
+        .zip(executor.fallback_execution_snapshot())
+        .map(|(before, after)| {
+            let previous_id = before.events.last().map_or(0, |event| event.event_id);
+            AgentSwarmFallbackEvidence {
+                events: after
+                    .events
+                    .into_iter()
+                    .filter(|event| event.event_id > previous_id)
+                    .map(|event| AgentSwarmFallbackEvent {
+                        event_id: event.event_id,
+                        connection_id: event.connection_id,
+                        statement_id: event.statement_id,
+                        transaction_id: event.transaction_id,
+                        statement_kind: event.statement_kind.to_owned(),
+                        decision_reason: event.decision_reason.to_owned(),
+                        decision_outcome: event.decision_outcome.to_owned(),
+                        source_context: event.source_context.to_owned(),
+                        storage_backend: event.storage_backend.to_owned(),
+                    })
+                    .collect(),
+                dropped_events: after.dropped_events.saturating_sub(before.dropped_events),
+            }
+        });
     let outcome_class = classify_stmt_outcome(&outcome);
     let expected_matched = expected_result_matches(statement.expected_result_class, outcome_class);
     let first_failure_diag = if expected_matched {
@@ -2431,6 +2491,7 @@ where
         materialized_sql,
         expected_result_class: statement.expected_result_class,
         outcome,
+        fallback_evidence,
         outcome_class,
         latency_ns,
         retry_count: 0,
@@ -2664,9 +2725,7 @@ fn coordination_metrics_for_backend(
     let mut lease_renew_count = 0_u64;
     let mut lease_expiration_count = 0_u64;
     let mut range_allocation_count = 0_u64;
-    let mut explain_concurrency_row_count = 0_u64;
     let mut fallback_reason_count = 0_u64;
-    let mut resource_governor_decision_count = 0_u64;
     let mut scenarios = BTreeSet::new();
 
     if backend.summary.success_count > 0 {
@@ -2713,18 +2772,12 @@ fn coordination_metrics_for_backend(
                 scenarios.insert(AgentSwarmCoordinationScenario::RangeImbalance);
             }
         }
-        if statement_has_signal(statement, &["explain concurrency", "explain_concurrency"]) {
-            explain_concurrency_row_count = explain_concurrency_row_count.saturating_add(1);
-        }
-        if statement_has_signal(statement, &["fallback", "compatibility"]) {
-            fallback_reason_count = fallback_reason_count.saturating_add(1);
+        if let Some(evidence) = &statement.fallback_evidence
+            && !evidence.events.is_empty()
+        {
+            fallback_reason_count =
+                fallback_reason_count.saturating_add(usize_to_u64(evidence.events.len()));
             scenarios.insert(AgentSwarmCoordinationScenario::FallbackHeavy);
-        }
-        if statement_has_signal(
-            statement,
-            &["slo_governor", "resource_governor", "governor"],
-        ) {
-            resource_governor_decision_count = resource_governor_decision_count.saturating_add(1);
         }
     }
 
@@ -2737,13 +2790,14 @@ fn coordination_metrics_for_backend(
         lease_renew_count,
         lease_expiration_count,
         range_allocation_count,
-        explain_concurrency_row_count,
+        // SQL text and labels cannot provide these engine observations.
+        explain_concurrency_row_count: None,
         fallback_reason_count,
-        resource_governor_decision_count,
+        resource_governor_decision_count: None,
         coordination_correctness_per_mille: coordination_correctness_per_mille(&backend.summary),
         conflict_transparency_per_mille: conflict_transparency_per_mille(
             &backend.summary,
-            explain_concurrency_row_count,
+            0,
             fallback_reason_count,
         ),
         fairness_resource_pressure_per_mille: 1_000_u16.saturating_sub(fairness_index_per_mille),
@@ -4261,6 +4315,106 @@ mod tests {
     }
 
     #[test]
+    fn agent_swarm_replay_captures_only_new_fallback_events_across_eviction_and_disable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut statements = Vec::new();
+        for logical_order in 0..71 {
+            statements.push(TraceStatement::from_raw(RawTraceStatement {
+                logical_order,
+                logical_timestamp: None,
+                actor_id: "actor",
+                connection_id: "trace-connection",
+                transaction_id: None,
+                transaction_boundary: TransactionBoundary::None,
+                concurrency_group: "ordinary-queries",
+                workload_phase: "ordinary-query",
+                sql: if logical_order < 70 {
+                    "WITH source(value) AS (SELECT 7) SELECT value FROM source"
+                } else {
+                    "SELECT 7"
+                },
+                expected_result_class: ExpectedResultClass::Success,
+                row_count_class: RowCountClass::Unknown,
+                error_class: None,
+                source: StatementSource::new("inline-harness", "bd-6hdwo.14")?,
+            })?);
+        }
+        let trace = AgentSwarmTrace::new(
+            "trace-actual-fallback",
+            "run-actual-fallback",
+            "actual-fallback",
+            TraceMetadata::new("inline-harness", "bd-6hdwo.14")?,
+            statements,
+        )?;
+        for enabled in [true, false] {
+            let subject = FsqliteExecutor::open_in_memory()?;
+            let oracle = CsqliteExecutor::open_in_memory()?;
+            subject.query("WITH source(value) AS (SELECT 9) SELECT value FROM source")?;
+            let previous = subject.fallback_execution_snapshot().unwrap();
+            assert_eq!(previous.events.len(), 1);
+            let previous_id = previous.events[0].event_id;
+            if !enabled {
+                subject.execute("PRAGMA fsqlite.fallback_capture = OFF")?;
+                assert_eq!(
+                    subject.query("PRAGMA fsqlite.fallback_capture")?,
+                    vec![vec![crate::differential_v2::NormalizedValue::Integer(0)]]
+                );
+            }
+            let report = replay_agent_swarm_trace_with_executors(
+                &trace,
+                &AgentSwarmReplayConfig::smoke(0xFA11_BACC),
+                &subject,
+                &oracle,
+            )?;
+            assert!(report.first_failure.is_none(), "{report:?}");
+            let replay = &report.backends[0];
+            let mut event_ids = BTreeSet::new();
+            let mut statement_ids = BTreeSet::new();
+            let mut drops = 0;
+            for statement in &replay.statements {
+                let evidence = statement.fallback_evidence.as_ref().unwrap();
+                drops += evidence.dropped_events;
+                assert_eq!(
+                    evidence.events.len(),
+                    usize::from(enabled && statement.logical_order < 70)
+                );
+                for event in &evidence.events {
+                    assert!(event.event_id > previous_id);
+                    assert!(event_ids.insert(event.event_id));
+                    assert!(statement_ids.insert(event.statement_id));
+                    assert_eq!(event.decision_reason, "with_clause_materialization");
+                    assert_eq!(event.storage_backend, "memory");
+                }
+            }
+            assert_eq!(event_ids.len(), if enabled { 70 } else { 0 });
+            assert_eq!(drops, if enabled { 7 } else { 0 });
+            let scorecard = score_agent_swarm_resource_envelope(
+                &report,
+                &AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::local_smoke()),
+            );
+            assert_eq!(
+                scorecard.backends[0]
+                    .coordination_metrics
+                    .fallback_reason_count,
+                if enabled { 70 } else { 0 }
+            );
+            assert_eq!(
+                scorecard.backends[1]
+                    .coordination_metrics
+                    .fallback_reason_count,
+                0
+            );
+            assert!(
+                report.backends[1]
+                    .statements
+                    .iter()
+                    .all(|statement| statement.fallback_evidence.is_none())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_swarm_scorecard_exposes_coordination_bridge_metrics() {
         let mut queue_claim = resource_replay_record(
             "agent-a",
@@ -4378,11 +4532,11 @@ mod tests {
         assert_eq!(metrics.lease_acquire_count, 1);
         assert_eq!(metrics.lease_expiration_count, 1);
         assert_eq!(metrics.range_allocation_count, 1);
-        assert_eq!(metrics.explain_concurrency_row_count, 1);
-        assert_eq!(metrics.fallback_reason_count, 1);
-        assert_eq!(metrics.resource_governor_decision_count, 1);
+        assert_eq!(metrics.explain_concurrency_row_count, None);
+        assert_eq!(metrics.fallback_reason_count, 0);
+        assert_eq!(metrics.resource_governor_decision_count, None);
         assert!(metrics.coordination_correctness_per_mille < 1_000);
-        assert_eq!(metrics.conflict_transparency_per_mille, 500);
+        assert_eq!(metrics.conflict_transparency_per_mille, 0);
         assert!(metrics.fairness_resource_pressure_per_mille > 0);
         assert!(metrics.privacy_scrubber_preserved);
         assert!(
@@ -4391,7 +4545,7 @@ mod tests {
                 .contains(&AgentSwarmCoordinationScenario::ConflictHeavy)
         );
         assert!(
-            metrics
+            !metrics
                 .scenarios
                 .contains(&AgentSwarmCoordinationScenario::FallbackHeavy)
         );
@@ -4926,6 +5080,7 @@ mod tests {
             materialized_sql: "SELECT 1".to_owned(),
             expected_result_class: ExpectedResultClass::Success,
             outcome,
+            fallback_evidence: None,
             outcome_class,
             latency_ns,
             retry_count,

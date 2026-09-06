@@ -30,8 +30,9 @@ pub use fsqlite_core::connection::{
     BoundedDatabaseStructuralStats, PageCachePeakSnapshot, WriteSetStats,
 };
 pub use fsqlite_core::connection::{
-    Connection, ConnectionEnv, DatabaseImageReceipt, IoPollStrategy, PreparedStatement, Row,
-    RuntimeConfig, RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
+    Connection, ConnectionEnv, DatabaseImageReceipt, FallbackExecutionRecord,
+    FallbackExecutionSnapshot, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,
+    RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
 };
 pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;

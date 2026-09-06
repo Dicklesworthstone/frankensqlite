@@ -249,9 +249,10 @@ pub struct SwarmSloProofPackRunbookCheck {
     pub surface: String,
     /// Proof-pack field or metric that backs the check.
     pub evidence_field: String,
-    /// Count observed in the FrankenSQLite concurrent-default replay row.
-    pub observed_count: u64,
-    /// SQL shape an operator can run against the trace tables.
+    /// Count observed in the FrankenSQLite concurrent-default replay row,
+    /// or `None` when the observation is unavailable.
+    pub observed_count: Option<u64>,
+    /// SQL inspection an operator can run on the database or trace tables.
     pub operator_query: String,
 }
 
@@ -811,12 +812,13 @@ fn proof_pack_operator_runbook(
         ],
         hot_range_detection: "SELECT worker_range_start, worker_range_end, range_imbalance_reason, COUNT(*) AS statement_count FROM fsqlite_worker_ranges GROUP BY worker_range_start, worker_range_end, range_imbalance_reason ORDER BY statement_count DESC".to_owned(),
         stuck_lease_detection: "SELECT lease_owner, lease_generation, lease_expires_ms FROM fsqlite_lease WHERE lease_expires_ms <= :now_ms ORDER BY lease_expires_ms".to_owned(),
-        fallback_detection: "SELECT fallback_reason, COUNT(*) AS statement_count FROM fsqlite_coordination_events WHERE fallback_reason IS NOT NULL GROUP BY fallback_reason ORDER BY statement_count DESC".to_owned(),
+        fallback_detection: "PRAGMA fsqlite.fallback_events".to_owned(),
         resource_pressure_detection: "SELECT resource_governor_decision, COUNT(*) AS statement_count FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL GROUP BY resource_governor_decision ORDER BY statement_count DESC".to_owned(),
         known_limitations: vec![
             "The deterministic replay proves artifact wiring and scoring semantics; it does not make a README performance claim.".to_owned(),
             "p999 latency and publish-window pressure remain live-harness measurements, not deterministic replay measurements.".to_owned(),
             "The coordination SQL catalog is still a contract surface until parser/planner/VDBE implementation beads ship it natively.".to_owned(),
+            "Fallback counts come from new engine events around each replayed statement. The ring can evict events; per-statement evidence reports drops. Unavailable EXPLAIN CONCURRENCY and governor observations are serialized as null.".to_owned(),
         ],
     }
 }
@@ -824,8 +826,7 @@ fn proof_pack_operator_runbook(
 fn proof_pack_runbook_checks(
     metrics: Option<&AgentSwarmCoordinationMetrics>,
 ) -> Vec<SwarmSloProofPackRunbookCheck> {
-    let count =
-        |field: fn(&AgentSwarmCoordinationMetrics) -> u64| -> u64 { metrics.map_or(0, field) };
+    let count = |field: fn(&AgentSwarmCoordinationMetrics) -> u64| metrics.map(field);
     vec![
         SwarmSloProofPackRunbookCheck {
             surface: "queue_claim".to_owned(),
@@ -854,19 +855,19 @@ fn proof_pack_runbook_checks(
         SwarmSloProofPackRunbookCheck {
             surface: "contention_diagnostics".to_owned(),
             evidence_field: "coordination_metrics.explain_concurrency_row_count".to_owned(),
-            observed_count: count(|metrics| metrics.explain_concurrency_row_count),
+            observed_count: metrics.and_then(|metrics| metrics.explain_concurrency_row_count),
             operator_query: "SELECT explain_concurrency_reason FROM fsqlite_coordination_events WHERE explain_concurrency_reason IS NOT NULL".to_owned(),
         },
         SwarmSloProofPackRunbookCheck {
             surface: "fallback_reporting".to_owned(),
             evidence_field: "coordination_metrics.fallback_reason_count".to_owned(),
             observed_count: count(|metrics| metrics.fallback_reason_count),
-            operator_query: "SELECT fallback_reason, COUNT(*) FROM fsqlite_coordination_events WHERE fallback_reason IS NOT NULL GROUP BY fallback_reason".to_owned(),
+            operator_query: "PRAGMA fsqlite.fallback_events".to_owned(),
         },
         SwarmSloProofPackRunbookCheck {
             surface: "resource_governor_scoring".to_owned(),
             evidence_field: "coordination_metrics.resource_governor_decision_count".to_owned(),
-            observed_count: count(|metrics| metrics.resource_governor_decision_count),
+            observed_count: metrics.and_then(|metrics| metrics.resource_governor_decision_count),
             operator_query: "SELECT resource_governor_decision, COUNT(*) FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL GROUP BY resource_governor_decision".to_owned(),
         },
     ]
@@ -1265,9 +1266,48 @@ mod tests {
         assert!(metrics.queue_release_count > 0);
         assert!(metrics.lease_expiration_count > 0);
         assert!(metrics.range_allocation_count > 0);
-        assert!(metrics.explain_concurrency_row_count > 0);
-        assert!(metrics.fallback_reason_count > 0);
-        assert!(metrics.resource_governor_decision_count > 0);
+        assert_eq!(metrics.explain_concurrency_row_count, None);
+        assert_eq!(metrics.fallback_reason_count, 1);
+        assert_eq!(metrics.resource_governor_decision_count, None);
+        let subject = report
+            .backends
+            .iter()
+            .find(|backend| {
+                backend.identity.backend == AgentSwarmReplayBackend::FrankenSqliteConcurrent
+            })
+            .ok_or_else(|| std::io::Error::other("missing subject replay"))?;
+        for statement in &subject.statements {
+            let evidence = statement
+                .fallback_evidence
+                .as_ref()
+                .expect("real executor evidence");
+            assert_eq!(evidence.dropped_events, 0);
+            if statement.logical_order == 7 {
+                assert_eq!(evidence.events.len(), 1);
+                let event = &evidence.events[0];
+                assert_eq!(event.decision_reason, "with_clause_materialization");
+                assert_eq!(event.decision_outcome, "allowed_compatibility_fallback");
+                assert_eq!(event.storage_backend, "memory");
+                assert!(event.event_id > 0);
+                assert!(event.statement_id > 0);
+            } else {
+                assert!(
+                    evidence.events.is_empty(),
+                    "synthetic rows, labels and later reads are not fallback events: {statement:?}"
+                );
+            }
+        }
+        let oracle = report
+            .backends
+            .iter()
+            .find(|backend| backend.identity.backend == AgentSwarmReplayBackend::CSqliteOracle)
+            .ok_or_else(|| std::io::Error::other("missing oracle replay"))?;
+        assert!(
+            oracle
+                .statements
+                .iter()
+                .all(|statement| statement.fallback_evidence.is_none())
+        );
         assert!(subject_proof.governor_shadow.is_some());
 
         assert_eq!(
@@ -1279,7 +1319,11 @@ mod tests {
                 .operator_runbook
                 .scenario_coverage
                 .iter()
-                .all(|check| check.observed_count > 0),
+                .all(|check| match check.surface.as_str() {
+                    "contention_diagnostics" | "resource_governor_scoring" =>
+                        check.observed_count.is_none(),
+                    _ => check.observed_count.is_some_and(|count| count > 0),
+                }),
             "runbook coverage missing observed counts: {:?}",
             proof_pack.operator_runbook.scenario_coverage
         );
@@ -1332,7 +1376,7 @@ mod tests {
             proof_pack
                 .operator_runbook
                 .fallback_detection
-                .contains("fallback_reason")
+                .contains("PRAGMA fsqlite.fallback_events")
         );
         assert!(
             proof_pack
@@ -1584,6 +1628,18 @@ mod tests {
                 "worker-e",
                 "resource-governor-shadow",
                 "SELECT resource_governor_decision FROM fsqlite_coordination_events WHERE resource_governor_decision IS NOT NULL",
+            )?,
+            coordination_e2e_statement(
+                7,
+                "worker-e",
+                "ordinary-query",
+                "WITH source(value) AS (SELECT 7) SELECT value FROM source",
+            )?,
+            coordination_e2e_statement(
+                8,
+                "worker-e",
+                "compatibility-fallback",
+                "SELECT fallback_reason FROM fsqlite_coordination_events WHERE event_id = 0",
             )?,
         ];
 
