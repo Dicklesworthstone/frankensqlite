@@ -13880,12 +13880,16 @@ where
             // Without this, standard SQLite tools cannot detect WAL mode from the
             // on-disk header and will fail to look for the WAL file.
             let version_byte: u8 = if mode == JournalMode::Wal { 2 } else { 1 };
+            let mut main_file_change_counter = None;
             if inner.db_size > 0 && !inner.access_mode.is_readonly() {
                 let page_size = inner.page_size.as_usize();
                 let mut page1 = vec![0u8; page_size];
                 let db_file = shared_db_file_read(&inner.db_file, cx).await?;
                 let bytes_read = db_file.read(cx, &mut page1, 0).await?;
                 if bytes_read >= DATABASE_HEADER_SIZE {
+                    main_file_change_counter = Some(u64::from(u32::from_be_bytes([
+                        page1[24], page1[25], page1[26], page1[27],
+                    ])));
                     page1[18] = version_byte;
                     page1[19] = version_byte;
                     db_file.write(cx, &page1, 0).await?;
@@ -13894,6 +13898,18 @@ where
             }
 
             inner.journal_mode = mode;
+            if mode == JournalMode::Delete {
+                // Leaving WAL moves its committed horizon into the main file.
+                // Preserve the logical sequence, but rebase its components:
+                // the next non-WAL probe must not subtract the old WAL count
+                // from it. Otherwise the transaction clock regresses while
+                // the publication plane correctly rejects that stale value.
+                inner.committed_wal_visible_commit_count = 0;
+                inner.committed_wal_generation = None;
+                if let Some(counter) = main_file_change_counter {
+                    inner.committed_db_change_counter = counter;
+                }
+            }
             // D1-CRITICAL Change 3: Use sharded publish_remove_page.
             self.published.publish_remove_page(
                 cx,

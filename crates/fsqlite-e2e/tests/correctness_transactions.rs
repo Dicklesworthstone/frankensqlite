@@ -40,6 +40,8 @@ const SCENARIO_COMPLETENESS_REPLAY: &str =
 const RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV: &str =
     "FSQLITE_RETAINED_AUTOCOMMIT_CRASH_DB_PATH";
 const RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST: &str = "retained_autocommit_crash_helper_entrypoint";
+const AUTOCOMMIT_CRASH_READY: &str =
+    "event=autocommit_crash_ready acknowledged_rows=3 uncommitted_rows=1";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -188,7 +190,7 @@ impl Drop for HotPathProfileGuard {
 }
 
 fn spawn_retained_autocommit_crash_helper(db_path: &Path) {
-    let helper_status = Command::new(env::current_exe().expect("current_exe"))
+    let helper_output = Command::new(env::current_exe().expect("current_exe"))
         .arg("--exact")
         .arg(RETAINED_AUTOCOMMIT_CRASH_HELPER_TEST)
         .arg("--ignored")
@@ -197,12 +199,25 @@ fn spawn_retained_autocommit_crash_helper(db_path: &Path) {
             RETAINED_AUTOCOMMIT_CRASH_HELPER_DB_PATH_ENV,
             db_path.as_os_str(),
         )
-        .status()
+        .output()
         .expect("spawn retained-autocommit crash helper");
 
+    let stdout = String::from_utf8_lossy(&helper_output.stdout);
+    let stderr = String::from_utf8_lossy(&helper_output.stderr);
+    eprintln!("{stdout}{stderr}");
     assert!(
-        !helper_status.success(),
+        stderr.lines().any(|line| line == AUTOCOMMIT_CRASH_READY),
+        "crash helper failed before staging the uncommitted tail: {}",
+        helper_output.status
+    );
+    assert!(
+        !helper_output.status.success(),
         "retained-autocommit crash helper should abort"
+    );
+    #[cfg(unix)]
+    assert!(
+        helper_output.status.code().is_none(),
+        "crash helper must terminate by signal, not normal exit or test panic"
     );
 }
 
@@ -975,6 +990,36 @@ fn txn_wal_checkpoint_journal_mode_transitions_file_backed() {
             c_count, f_count,
             "row visibility mismatch after non-WAL checkpoint"
         );
+        // Continue writing on both sides of the mode boundary. A stale WAL
+        // component can leave reads apparently coherent until the next commit
+        // or until the connection re-enters WAL mode.
+        for sql in [
+            "INSERT INTO t VALUES (3, 'rollback');",
+            "PRAGMA journal_mode=WAL;",
+            "INSERT INTO t VALUES (4, 'wal-again');",
+        ] {
+            c_conn
+                .execute_batch(sql)
+                .expect("stock mode-boundary write");
+            f_conn
+                .execute(sql)
+                .await
+                .expect("Franken mode-boundary write");
+        }
+        let dump_sql = "SELECT id, v FROM t ORDER BY id;";
+        let expected = csqlite_query_values(&c_conn, dump_sql);
+        assert_eq!(fsqlite_query_values(&f_conn, dump_sql).await, expected);
+        f_conn.close().await.expect("close after mode transitions");
+        let stock_peer = rusqlite::Connection::open(&f_path).expect("stock opens candidate file");
+        assert_eq!(
+            csqlite_query_values(&stock_peer, dump_sql),
+            expected,
+            "stock must recover the complete candidate file after mode transitions"
+        );
+        assert_eq!(
+            csqlite_query_values(&stock_peer, "PRAGMA integrity_check;"),
+            vec![vec![SqlValue::Text("ok".to_owned())]]
+        );
     });
 }
 
@@ -1367,7 +1412,7 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_reopen() {
+fn txn_file_backed_autocommit_10k_is_committed_before_close_and_matches_rusqlite() {
     asupersync::test_utils::run_test(|| async {
         const ROW_COUNT: i64 = 10_000;
 
@@ -1384,7 +1429,7 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
         f_conn
             .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
             .await
-            .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+            .expect("exercise serialized-mode file-backed acknowledgement contract");
 
         let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
         c_conn.execute(schema_sql, []).expect("csqlite schema");
@@ -1401,27 +1446,32 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
         let profile = hot_path_profile_snapshot();
 
         eprintln!(
-            "bd-iuvw4 retained-autocommit-10k elapsed_ms={} reuses={} parks={} flushes={}",
+            "bd-iuvw4 file-backed-autocommit-10k elapsed_ms={} reuses={} parks={} flushes={}",
             elapsed.as_millis(),
             profile.retained_autocommit_reuses,
             profile.retained_autocommit_parks,
             profile.retained_autocommit_flushes
         );
 
-        assert!(
-            profile.retained_autocommit_reuses >= 9_000,
-            "10k pure-write autocommit should heavily reuse the retained txn path: {profile:?}"
-        );
-        assert!(
-            profile.retained_autocommit_parks >= profile.retained_autocommit_reuses,
-            "10k pure-write autocommit should keep re-parking the retained txn across the reused fast path: {profile:?}"
-        );
-        assert!(
-            profile.retained_autocommit_flushes <= 64,
-            "10k pure-write autocommit should batch flushes rather than flushing every statement: {profile:?}"
+        // bd-792q5: retention is memory-only. Every acknowledged file-backed
+        // autocommit must already be committed, including serialized mode.
+        assert_eq!(profile.retained_autocommit_reuses, 0);
+        assert_eq!(profile.retained_autocommit_parks, 0);
+        assert_eq!(profile.retained_autocommit_flushes, 0);
+        assert_eq!(
+            profile.single_writer_filebacked_commits,
+            u64::try_from(ROW_COUNT).expect("positive row count")
         );
 
         let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
+        let future_peer =
+            rusqlite::Connection::open(&f_path).expect("open stock peer after writes");
+        assert_eq!(
+            csqlite_query_values(&c_conn, full_dump_sql),
+            csqlite_query_values(&future_peer, full_dump_sql),
+            "all acknowledged rows must be visible before any further writer operation"
+        );
+        drop(future_peer);
         assert_eq!(
             csqlite_query_values(&c_conn, full_dump_sql),
             fsqlite_query_values(&f_conn, full_dump_sql).await,
@@ -1444,7 +1494,7 @@ fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_
 }
 
 #[test]
-fn txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch() {
+fn txn_file_backed_autocommit_crash_preserves_acknowledged_rows_only() {
     asupersync::test_utils::run_test(|| async {
         let tmp = tempdir().expect("tempdir");
         let db_path = tmp.path().join("retained_autocommit_crash_recovery.db");
@@ -1452,26 +1502,34 @@ fn txn_file_backed_retained_autocommit_crash_recovery_discards_unflushed_batch()
 
         spawn_retained_autocommit_crash_helper(&db_path);
 
-        let reopened_f = fsqlite::Connection::open(&f_path_string)
-            .await
-            .expect("reopen fsqlite db");
         let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
         let dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
-        let expected = vec![vec![
-            SqlValue::Integer(1),
-            SqlValue::Text("committed".to_owned()),
-        ]];
+        let expected = vec![
+            vec![SqlValue::Integer(1), SqlValue::Text("committed".to_owned())],
+            vec![
+                SqlValue::Integer(2),
+                SqlValue::Text("acknowledged_2".to_owned()),
+            ],
+            vec![
+                SqlValue::Integer(3),
+                SqlValue::Text("acknowledged_3".to_owned()),
+            ],
+        ];
 
         assert_eq!(
             csqlite_query_values(&reopened_c, dump_sql),
             expected,
-            "stock SQLite should recover only the flushed retained-autocommit prefix"
+            "stock SQLite must independently recover every acknowledged autocommit and discard the open transaction"
         );
+        let reopened_f = fsqlite::Connection::open(&f_path_string)
+            .await
+            .expect("reopen fsqlite db");
         assert_eq!(
             fsqlite_query_values(&reopened_f, dump_sql).await,
             expected,
-            "FrankenSQLite should recover only the flushed retained-autocommit prefix"
+            "FrankenSQLite must recover the same committed rows after abrupt process termination"
         );
+        reopened_f.close().await.expect("close recovered database");
     });
 }
 
@@ -1510,21 +1568,28 @@ fn retained_autocommit_crash_helper_entrypoint() {
 
         conn.execute("INSERT INTO msgs VALUES (1, 'committed');")
             .await
-            .expect("insert flushed retained prefix");
+            .expect("acknowledge first durable row");
         conn.execute("BEGIN;")
             .await
-            .expect("explicit begin should flush retained prefix");
+            .expect("begin explicit boundary");
         conn.execute("COMMIT;")
             .await
             .expect("finish explicit boundary");
 
-        conn.execute("INSERT INTO msgs VALUES (2, 'pending_2');")
+        conn.execute("INSERT INTO msgs VALUES (2, 'acknowledged_2');")
             .await
-            .expect("insert first unflushed retained row");
-        conn.execute("INSERT INTO msgs VALUES (3, 'pending_3');")
+            .expect("acknowledge second durable row");
+        conn.execute("INSERT INTO msgs VALUES (3, 'acknowledged_3');")
             .await
-            .expect("insert second unflushed retained row");
+            .expect("acknowledge third durable row");
+        conn.execute("BEGIN;")
+            .await
+            .expect("begin uncommitted tail");
+        conn.execute("INSERT INTO msgs VALUES (4, 'uncommitted');")
+            .await
+            .expect("stage a row that must not survive the crash");
 
+        eprintln!("{AUTOCOMMIT_CRASH_READY}");
         std::process::abort();
     });
 }
