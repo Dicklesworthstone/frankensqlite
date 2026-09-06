@@ -1,6 +1,7 @@
 tmp_golden/
 .rch-correctness-target/
 .rch-retained-dml-target/
-.beads/
+# .beads/issues.jsonl is a test fixture. Runtime and recovery exclusions live
+# in .rch/config.toml; a blanket .beads/ rule would hide the fixture again.
 .beads.recovery_*/
 .git/
