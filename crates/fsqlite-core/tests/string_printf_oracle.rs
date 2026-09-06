@@ -12,6 +12,67 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
+#[test]
+fn printf_altform2_float_rounding_matches_bundled_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let version: String = r.query_row("SELECT sqlite_version()", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, "3.53.2", "review version-sensitive float conversion when the oracle changes");
+        let mut values = vec![
+            0.0, -0.0, 0.1, -0.1, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 7.0,
+            0.5_f64.next_down(), 0.5, 0.5_f64.next_up(), -0.5,
+            2.5, -2.5, 9.995, 49.47, 999.95, 1e-4, 1e-5, 1e18,
+            1e300, -1e300, f64::MIN_POSITIVE, f64::from_bits(1),
+            f64::MAX, -f64::MAX,
+        ];
+        // Fixed bit-pattern sweep, independent of either decimal converter.
+        let mut seed = 0x1998_5eed_d00d_f00d_u64;
+        for _ in 0..64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let value = f64::from_bits(seed);
+            if value.is_finite() {
+                values.push(value);
+            }
+        }
+        let precisions = [0, 1, 2, 6, 15, 16, 17, 18, 20, 26, 40, 340];
+        let mut checked = 0;
+        let mut mismatches = 0;
+        let mut first = Vec::new();
+        for value in &values {
+            for conversion in ['e', 'E', 'f', 'g', 'G'] {
+                for precision in precisions {
+                    let spec = format!("%!.{precision}{conversion}");
+                    let expected: String = r.query_row(
+                        "SELECT printf(?1, ?2)", rusqlite::params![&spec, value], |row| row.get(0),
+                    ).unwrap();
+                    let rows = f.query_with_params(
+                        "SELECT printf(?1, ?2), format(?1, ?2)",
+                        &[SqliteValue::Text(spec.clone().into()), SqliteValue::Float(*value)],
+                    ).await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].values().len(), 2);
+                    for actual in rows[0].values() {
+                        checked += 1;
+                        if actual != &SqliteValue::Text(expected.clone().into()) {
+                            mismatches += 1;
+                            if first.len() < 8 {
+                                first.push(format!("bits={:016x} spec={spec} expected={expected:?} actual={actual:?}", value.to_bits()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        f.close().await.unwrap();
+        eprintln!("event=public_printf_float_oracle version={version} seed=19985eedd00df00d values={} conversions=5 precisions=12 aliases=2 checked={checked} mismatches={mismatches}", values.len());
+        assert_eq!(checked, values.len() * 5 * precisions.len() * 2);
+        assert_eq!(mismatches, 0, "{}", first.join("\n"));
+    });
+}
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),

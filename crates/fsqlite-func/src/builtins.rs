@@ -28,7 +28,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::value::{format_sqlite_float, sql_like_cased, sqlite_float_altform2_digits};
+use fsqlite_types::value::{
+    SqliteFloatRounding, format_sqlite_float, sql_like_cased, sqlite_float_altform2_digits,
+};
 use fsqlite_types::{SmallText, SqliteValue, TextEncoding};
 
 use crate::agg_builtins::register_aggregate_builtins;
@@ -2736,24 +2738,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     // has its own shortest-round-trip rendering (which keeps the
                     // exact integer of a large whole number), so it is not capped.
                     let mut mag = if alt_form2 {
-                        // bd-ixizz: alt-form-2 caps significant digits at the
-                        // exact double's value-dependent cap (18, or 19 for
-                        // |val| >= 1e18), TRUNCATING there. Below the cap, Rust's
-                        // exact fixed rounding already reproduces stock's digits.
-                        if val == 0.0 {
-                            altform2_trim_float("0")
-                        } else {
-                            let (cap_digits, sci_exp) = sqlite_float_altform2_digits(val);
-                            // Significant digits a `prec`-fractional render shows.
-                            let want =
-                                i64::from(sci_exp) + i64::try_from(prec).unwrap_or(i64::MAX) + 1;
-                            let cap = i64::try_from(cap_digits.len()).unwrap_or(i64::MAX);
-                            if want >= cap {
-                                altform2_render_fixed(&cap_digits, sci_exp, prec)
-                            } else {
-                                altform2_trim_float(&format_fixed_round_half_away(val.abs(), prec))
-                            }
-                        }
+                        let (digits, exp) = sqlite_float_altform2_digits(
+                            val,
+                            SqliteFloatRounding::Fractional(prec),
+                        );
+                        altform2_render_fixed(&digits, exp, prec)
                     } else {
                         round_positional_to_sig(
                             &format_fixed_round_half_away(val.abs(), prec),
@@ -2787,13 +2776,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 {
                     result.push_str(&s);
                 } else if alt_form2 {
-                    // bd-ixizz: alt-form-2 emits min(prec+1, cap) significant
-                    // digits — ROUNDED below the exact double's value-dependent
-                    // cap (18, or 19 for |val| >= 1e18), exact-TRUNCATED at it —
-                    // then strips trailing zeros. e.g. '%!.40e' 2.0/3.0 ->
-                    // "6.66666666666666629e-01", '%!e' 5.0 -> "5.0e+00". The
-                    // mantissa always carries a decimal point, so `#` is a no-op.
-                    let (digits, exp) = altform2_sig_digits(val, prec + 1);
+                    // Share the shell's binary-to-decimal conversion; %e
+                    // precision excludes its one leading significant digit.
+                    let (digits, exp) = sqlite_float_altform2_digits(
+                        val,
+                        SqliteFloatRounding::Significant(prec.saturating_add(1)),
+                    );
                     let mut formatted = altform2_render_exp(&digits, exp, spec == 'E');
                     if val.is_sign_negative() {
                         formatted = format!("-{formatted}");
@@ -2847,15 +2835,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 {
                     result.push_str(&s);
                 } else if alt_form2 {
-                    // bd-ixizz: alt-form-2 (`!`) on %g emits min(sig, cap)
-                    // significant digits — ROUNDED below the exact double's
-                    // value-dependent cap (18, or 19 for |val| >= 1e18), exact-
-                    // TRUNCATED at it — then applies %g's fixed-vs-exponential
-                    // choice (honoring precision — 0 means 1 sig fig) and forces a
-                    // decimal point with >= 1 fractional digit: '%!.0g' 12345 ->
-                    // "1.0e+04", '%!.3g' 12345 -> "1.23e+04", '%!g' 100 -> "100.0",
-                    // '%!.18g' 2.0/3.0 -> "0.666666666666666629".
-                    let (digits, exp) = altform2_sig_digits(val, sig);
+                    let (digits, exp) =
+                        sqlite_float_altform2_digits(val, SqliteFloatRounding::Significant(sig));
                     let use_exp_form =
                         exp < -4 || i64::from(exp) >= i64::try_from(sig).unwrap_or(i64::MAX);
                     let mut alt = if use_exp_form {
@@ -3257,46 +3238,6 @@ fn apply_int_precision(digits: &str, precision: Option<usize>) -> String {
         }
         _ => digits.to_owned(),
     }
-}
-
-/// The significant digits SQLite's `%!` (alt-form-2) float rendering emits for a
-/// requested count of `want` significant digits (bd-ixizz).
-///
-/// Draws from the exact double's value-dependent cap
-/// ([`sqlite_float_altform2_digits`], 18 sig digits, or 19 when `|val| >= 1e18`):
-/// ROUNDS half-away when `want` is below the cap, and returns the exact TRUNCATED
-/// digits at/above it. Returns `(digit_bytes, exponent)` with `exponent` the
-/// power-of-ten of the first digit (adjusted for any rounding carry). `want` must
-/// be >= 1.
-fn altform2_sig_digits(val: f64, want: usize) -> (Vec<u8>, i32) {
-    let (cap_digits, sci_exp) = sqlite_float_altform2_digits(val);
-    if want >= cap_digits.len() {
-        return (cap_digits, sci_exp);
-    }
-    let mut digits = cap_digits[..want].to_vec();
-    let mut exp = sci_exp;
-    // Round half away from zero when the first dropped digit is >= 5. (The digits
-    // up to the cap are exact, so this matches rounding the true value.)
-    if cap_digits[want] >= b'5' {
-        let mut idx = want;
-        loop {
-            if idx == 0 {
-                // Carried out of the leading digit: "99..9" -> "10..0", exp + 1.
-                digits.fill(b'0');
-                digits[0] = b'1';
-                exp += 1;
-                break;
-            }
-            idx -= 1;
-            if digits[idx] == b'9' {
-                digits[idx] = b'0';
-            } else {
-                digits[idx] += 1;
-                break;
-            }
-        }
-    }
-    (digits, exp)
 }
 
 /// Render alt-form-2 significant `digits` as a `%e`/`%E` mantissa+exponent.
@@ -6529,12 +6470,8 @@ mod tests {
     #[test]
     #[allow(clippy::excessive_precision, clippy::unreadable_literal)]
     fn test_format_altform2_high_precision_bd_ixizz() {
-        // bd-ixizz: at HIGH precision the '!' (alt-form-2) float paths must emit
-        // the exact double's value-dependent significant-digit cap — 18 figs, or
-        // 19 when |val| >= 1e18 — TRUNCATED (not rounded to the 16-fig dtoa cap
-        // the plain conversions use), then strip trailing zeros. Below the cap
-        // they round as before. Oracle: sqlite3 3.46.1 (float->text is
-        // oracle-version-sensitive, but these are all sqlite3-3.46.1 %! outputs).
+        // bd-199z8: bundled SQLite 3.53.2 conversion, shared with shell quote
+        // mode. string_printf_oracle independently checks the bound f64 inputs.
         let f = FormatFunc;
         let fmt = |spec: &str, v: f64| -> String {
             match f
@@ -6552,29 +6489,27 @@ mod tests {
         let two_thirds = 2.0 / 3.0;
         let seventh = 1.0 / 7.0;
         let cases: &[(&str, f64, &str)] = &[
-            // %!e: 18-fig cap (19 for 1e300), truncated then trailing-stripped.
-            ("%!.40e", two_thirds, "6.66666666666666629e-01"),
-            ("%!.40e", third, "3.33333333333333314e-01"),
-            ("%!.40e", 0.1, "1.00000000000000005e-01"),
+            ("%!.40e", two_thirds, "6.6666666666666663e-01"),
+            ("%!.40e", third, "3.33333333333333315e-01"),
+            ("%!.40e", 0.1, "1.000000000000000056e-01"),
             ("%!.40e", seventh, "1.42857142857142849e-01"),
             ("%!.40e", 1e300, "1.000000000000000052e+300"),
-            ("%!.40E", two_thirds, "6.66666666666666629E-01"),
-            ("%!.40e", -two_thirds, "-6.66666666666666629e-01"),
-            // Transition: below the cap rounds, at the cap truncates.
+            ("%!.40E", two_thirds, "6.6666666666666663E-01"),
+            ("%!.40e", -two_thirds, "-6.6666666666666663e-01"),
             ("%!.16e", two_thirds, "6.6666666666666663e-01"),
-            ("%!.17e", two_thirds, "6.66666666666666629e-01"),
+            ("%!.17e", two_thirds, "6.6666666666666663e-01"),
             // %!f: same cap in fixed form.
-            ("%!.40f", third, "0.333333333333333314"),
-            ("%!.40f", 0.1, "0.100000000000000005"),
-            ("%!.18f", third, "0.333333333333333314"),
-            ("%!.40f", -two_thirds, "-0.666666666666666629"),
+            ("%!.40f", third, "0.333333333333333315"),
+            ("%!.40f", 0.1, "0.1000000000000000056"),
+            ("%!.18f", third, "0.333333333333333315"),
+            ("%!.40f", -two_thirds, "-0.66666666666666663"),
             // 19-fig cap for a >= 1e18 whole number (extra integer zero-fill).
-            ("%!.40f", 12345678901234567890.0, "12345678901234567160.0"),
+            ("%!.40f", 12345678901234567890.0, "12345678901234567170.0"),
             // %!g: honors the fixed/exponential choice at the wider cap.
             ("%!.17g", two_thirds, "0.66666666666666663"),
-            ("%!.18g", two_thirds, "0.666666666666666629"),
-            ("%!.40g", two_thirds, "0.666666666666666629"),
-            ("%!.40g", -two_thirds, "-0.666666666666666629"),
+            ("%!.18g", two_thirds, "0.66666666666666663"),
+            ("%!.40g", two_thirds, "0.66666666666666663"),
+            ("%!.40g", -two_thirds, "-0.66666666666666663"),
         ];
         for (spec, v, want) in cases {
             assert_eq!(fmt(spec, *v), *want, "spec={spec} v={v}");
