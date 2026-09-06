@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) (2026-09-03). v0.3.2–v0.3.4 and v0.3.6–v0.3.16 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) (2026-09-06). v0.3.2–v0.3.4 and v0.3.6–v0.3.17 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main) | HEAD | 2026-09-05 | SQL and shell correctness, real metrics and diagnostics, cache budgets, and native-storage component hardening |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | — |
+| [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) | Release | 2026-09-06 | SQL/shell correctness, real metrics & diagnostics (reader gauge, WAL durability, MVCC conflict/commit counters, /metrics HTTP), PRAGMA cache_size as a real page budget, aoj0g journal-boundary savepoint (O(n^2)->flat insert ramp) + private-allocation ownership through rollback, printf/FTS5 3.53.2 parity, epoch/RaptorQ native-storage hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
 | [v0.3.14](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.14) | Release | 2026-09-01 | FTS5 stock-compat writer fix (GH#404) + GH#402 checkpoint watermark (super-linear autocommit fix) + `PRAGMA wal_checkpoint` cumulative-nBackfill parity + legacy-automerge origin-poisoning fix |
@@ -42,12 +43,17 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.16
+## [Unreleased] -- development on `main` since v0.3.17
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main>
 
-These changes are on `main`; the next release has not been tagged or published.
-Full workspace and all-features release validation remain in progress.
+No changes yet.
+
+---
+
+## [0.3.17] -- 2026-09-06 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.16...v0.3.17>
 
 ### SQL correctness and prepared statements
 
