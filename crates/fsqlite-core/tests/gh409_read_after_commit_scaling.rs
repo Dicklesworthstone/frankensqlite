@@ -137,9 +137,14 @@ fn gh409_first_read_after_a_commit_does_not_scale_with_the_database() {
              (ratio {ratio:.2}, data is 4x)"
         );
 
-        // The read is still correct after all that.
-        let rows = small.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
-        assert!(rows.is_empty() || matches!(rows[0].values()[0], SqliteValue::Integer(_)));
+        // Both fixtures must still return the exact row inserted by build().
+        for conn in [&small, &large] {
+            let rows = conn.query("SELECT n FROM t WHERE k = 'k1';").await.unwrap();
+            assert_eq!(rows.len(), 1, "the populated key must remain visible");
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(1)]);
+        }
+        small.close().await.unwrap();
+        large.close().await.unwrap();
     });
 }
 

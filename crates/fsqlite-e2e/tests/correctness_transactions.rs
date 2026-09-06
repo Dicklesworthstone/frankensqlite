@@ -1436,6 +1436,130 @@ fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite()
 }
 
 #[test]
+fn txn_memory_retained_autocommit_10k_matches_rusqlite() {
+    const CHILD: &str = "FSQLITE_MEMORY_AUTOCOMMIT_10K_CHILD";
+    const VERIFIED: &str = "event=memory_autocommit_10k_verified rows=10000";
+    if env::var(CHILD).as_deref() != Ok("1") {
+        // Hot-path counters are process-global. Isolate this keeper from other
+        // tests, including the file-backed acknowledgement counter keeper.
+        let output = Command::new(env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "txn_memory_retained_autocommit_10k_matches_rusqlite",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated memory retention keeper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{stdout}\n{stderr}");
+        assert!(output.status.success(), "memory retention child failed");
+        assert!(
+            stderr.contains(VERIFIED),
+            "child did not finish the oracle checks"
+        );
+        return;
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        let _profile_guard = HotPathProfileGuard::new();
+        let oracle = rusqlite::Connection::open_in_memory().expect("open stock memory db");
+        let candidate = fsqlite::Connection::open(":memory:")
+            .await
+            .expect("open Franken memory db");
+        assert!(candidate.is_concurrent_mode_default());
+        for sql in [
+            "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+            "CREATE INDEX msgs_val ON msgs(val);",
+            "CREATE TABLE clean_rows(id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO clean_rows VALUES (1, 'unchanged');",
+        ] {
+            oracle.execute(sql, []).expect("stock setup");
+            candidate.execute(sql).await.expect("Franken setup");
+        }
+        candidate
+            .query("SELECT * FROM clean_rows")
+            .await
+            .expect("flush setup");
+        reset_hot_path_profile();
+        for rowid in 1..=10_000 {
+            let sql = format!("INSERT INTO msgs VALUES ({rowid}, 'v{rowid}');");
+            oracle.execute(&sql, []).expect("stock insert");
+            candidate.execute(&sql).await.expect("Franken insert");
+        }
+        let profile = hot_path_profile_snapshot();
+        assert!(profile.retained_autocommit_reuses >= 9_000, "{profile:?}");
+        // A threshold-reaching write commits instead of parking. Those
+        // boundaries use the normal pager commit path, not the explicit
+        // flush_retained_autocommit_txn path counted by retained flushes.
+        assert_eq!(
+            profile.retained_autocommit_parks + profile.pager_commit.commit_calls,
+            10_000,
+            "every write must either park or finish a batch: {profile:?}"
+        );
+        assert!(
+            (1..=1_000).contains(&profile.pager_commit.commit_calls),
+            "10k writes must cross batch boundaries without committing every write: {profile:?}"
+        );
+        assert_eq!(profile.single_writer_filebacked_commits, 0);
+        for query in [
+            "SELECT id, val FROM clean_rows ORDER BY id;",
+            "SELECT id, val FROM msgs ORDER BY id;",
+            "SELECT id, val FROM msgs WHERE val = 'v5000';",
+        ] {
+            assert_eq!(
+                csqlite_query_values(&oracle, query),
+                fsqlite_query_values(&candidate, query).await,
+                "10k memory batching diverged for {query}"
+            );
+        }
+        let after_reads = hot_path_profile_snapshot();
+        assert!(
+            after_reads.retained_autocommit_flushes > profile.retained_autocommit_flushes,
+            "the full-table read must flush the final partial batch: {after_reads:?}"
+        );
+        for sql in [
+            "INSERT INTO msgs VALUES (10001, 'new');",
+            "UPDATE msgs SET val = 'changed' WHERE id = 10001;",
+            "DELETE FROM msgs WHERE id = 10001;",
+        ] {
+            oracle
+                .execute(sql, [])
+                .expect("stock read-after-write mutation");
+            candidate
+                .execute(sql)
+                .await
+                .expect("Franken read-after-write mutation");
+            for query in [
+                "SELECT id, val FROM msgs WHERE id = 10001;",
+                "SELECT id, val FROM msgs WHERE val IN ('new', 'changed');",
+            ] {
+                assert_eq!(
+                    csqlite_query_values(&oracle, query),
+                    fsqlite_query_values(&candidate, query).await,
+                    "read-after-write mismatch after {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            csqlite_query_values(&oracle, "SELECT id, val FROM msgs ORDER BY id;"),
+            fsqlite_query_values(&candidate, "SELECT id, val FROM msgs ORDER BY id;").await
+        );
+        candidate.close().await.expect("close memory connection");
+        eprintln!(
+            "{VERIFIED} sqlite={} reuses={} parks={} periodic_commits={} read_flushes={}",
+            rusqlite::version(),
+            profile.retained_autocommit_reuses,
+            profile.retained_autocommit_parks,
+            profile.pager_commit.commit_calls,
+            after_reads.retained_autocommit_flushes - profile.retained_autocommit_flushes
+        );
+    });
+}
+
+#[test]
 fn txn_file_backed_autocommit_10k_is_committed_before_close_and_matches_rusqlite() {
     asupersync::test_utils::run_test(|| async {
         const ROW_COUNT: i64 = 10_000;
