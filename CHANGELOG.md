@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | Lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | CLI statement batches, lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions |
 | [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) | Release | 2026-09-06 | SQL/shell correctness, real metrics & diagnostics (reader gauge, WAL durability, MVCC conflict/commit counters, /metrics HTTP), PRAGMA cache_size as a real page budget, aoj0g journal-boundary savepoint (O(n^2)->flat insert ramp) + private-allocation ownership through rollback, printf/FTS5 3.53.2 parity, epoch/RaptorQ native-storage hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
@@ -49,6 +49,13 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
 
 ### SQL and transaction correctness
 
+- The shell prints each result in a same-line SQL batch, including `-c`
+  commands: `SELECT 1; SELECT 2;` now prints both values. It respects trigger
+  bodies, quoted semicolons and comments, renders headers per statement, and
+  preserves earlier output and committed changes when a later statement fails.
+  Parsing errors retain the engine's SQLite-compatible diagnostics
+  ([5eaecc593](https://github.com/Dicklesworthstone/frankensqlite/commit/5eaecc593),
+  [a653ed1f2](https://github.com/Dicklesworthstone/frankensqlite/commit/a653ed1f2)).
 - Aggregate queries with `AND`/`OR` predicates preserve lazy `IN`-subquery
   evaluation. A condition that already determines the result skips the other
   operand, including an erroring grouped subquery. Uncorrelated scalar `IN`
