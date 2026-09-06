@@ -35814,12 +35814,11 @@ fn test_conformance_upsert_partial_unique_index_conflict_target_gh145() {
     });
 }
 
-/// GH #147 (FSQL-BUG-006): default concurrent mode leaves a forward-only
-/// AUTOINCREMENT gap after savepoint rollback. This keeper pins the observed
-/// divergence from stock SQLite while requiring allocated rowids to remain
-/// unique and strictly increasing.
+/// GH #147 (FSQL-BUG-006): CAS-safe savepoint rewind restores an uncontended
+/// AUTOINCREMENT reservation on rollback, matching stock SQLite. Keep both
+/// the rows and sqlite_sequence in agreement after the replacement insert.
 #[test]
-fn test_conformance_autoincrement_savepoint_rollback_gap_is_intentional_gh147() {
+fn test_conformance_autoincrement_savepoint_rollback_matches_sqlite_gh147() {
     asupersync::test_utils::run_test(|| async {
         let fconn = Connection::open(":memory:").await.unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -35845,27 +35844,24 @@ fn test_conformance_autoincrement_savepoint_rollback_gap_is_intentional_gh147() 
         let sqlite_rows = query_rusqlite_strings(&rconn, "SELECT id, val FROM t ORDER BY id")
             .expect("query stock SQLite AUTOINCREMENT rows");
         assert_eq!(
-            frank_rows,
-            vec![
-                vec!["1".to_owned(), "'a'".to_owned()],
-                vec!["3".to_owned(), "'c'".to_owned()],
-            ],
-            "concurrent reservations must leave a forward-only gap after rollback"
-        );
-        assert_eq!(
             sqlite_rows,
             vec![
                 vec!["1".to_owned(), "'a'".to_owned()],
                 vec!["2".to_owned(), "'c'".to_owned()],
             ],
-            "the reference engine must continue to pin the documented divergence"
+            "stock SQLite reuses the rolled-back reservation"
         );
+        assert_eq!(frank_rows, sqlite_rows, "GH #147 rollback row parity");
 
         let frank_sequence =
             query_fsqlite_strings(&fconn, "SELECT seq FROM sqlite_sequence WHERE name = 't'")
                 .await
                 .expect("query FrankenSQLite sqlite_sequence");
-        assert_eq!(frank_sequence, vec![vec!["3".to_owned()]]);
+        let sqlite_sequence =
+            query_rusqlite_strings(&rconn, "SELECT seq FROM sqlite_sequence WHERE name = 't'")
+                .expect("query stock SQLite sqlite_sequence");
+        assert_eq!(sqlite_sequence, vec![vec!["2".to_owned()]]);
+        assert_eq!(frank_sequence, sqlite_sequence, "GH #147 sequence parity");
         fconn.close().await.expect("close FrankenSQLite connection");
     });
 }

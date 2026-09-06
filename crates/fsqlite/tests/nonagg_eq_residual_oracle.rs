@@ -1,9 +1,10 @@
 //! bd-nonagg-eq-residual: `SELECT <cols> FROM t WHERE <indexed col> = <lit> AND <residual>`
 //! seeks the exact `col = lit` block on its index and filters the residual per row (heuristic-chain
 //! fallback, after rowid/range/index_eq) via codegen_select_index_equality_scan with residual_filter=true,
-//! instead of full-scanning. The eq block is emitted in rowid order (= the full scan's order within it),
-//! so byte-identical. The residual-aware emitter opens the table even when the projection itself is
-//! index-covering, because the residual may read any table column.
+//! instead of full-scanning. Composite indexes can emit the equality block in trailing-key order,
+//! so unordered pagination checks cardinality and membership against stock SQLite. Ordered
+//! comparisons also check row identity and order. The residual-aware emitter opens the table
+//! even when the projection is index-covering, because the residual may read any table column.
 use fsqlite::Connection;
 use fsqlite_func::ScalarFunction;
 use fsqlite_types::SqliteValue;
@@ -202,6 +203,30 @@ async fn cmp_params(
         "[{label}] parameterized query diverged: `{sql}`"
     );
 }
+
+fn assert_unordered_page(
+    actual: &[Vec<String>],
+    eligible: &[Vec<String>],
+    limit: usize,
+    offset: usize,
+    label: &str,
+) {
+    assert_eq!(
+        actual.len(),
+        eligible.len().saturating_sub(offset).min(limit),
+        "[{label}] OFFSET must count qualifying rows before LIMIT"
+    );
+    assert!(
+        actual.iter().all(|row| eligible.contains(row)),
+        "[{label}] paginated rows must satisfy the stock-oracle predicate: {actual:?}"
+    );
+    // Each fixture projects the unique primary key, and these rows are sorted.
+    assert!(
+        actual.windows(2).all(|pair| pair[0] != pair[1]),
+        "[{label}] pagination must not duplicate a row"
+    );
+}
+
 async fn both_reject_params(
     f: &Connection,
     r: &rusqlite::Connection,
@@ -380,10 +405,6 @@ async fn check(label: &str, ddl: &[&str]) {
         "SELECT * FROM t WHERE a = 999 AND c = 5",
         "SELECT c FROM t WHERE a = 0 AND c = 0",
         "SELECT c, s FROM t WHERE a = 3 AND c BETWEEN 2 AND 8",
-        // OFFSET counts rows after WHERE filtering, not every candidate in the
-        // `a = 5` index run.
-        "SELECT id, c FROM t WHERE a = 5 AND c = 5 LIMIT 3 OFFSET 2",
-        "SELECT id FROM t WHERE a = 5 AND c = 5 LIMIT 3 OFFSET 2",
     ];
     for sql in seeks {
         cmp(&f, &r, sql, label).await;
@@ -394,7 +415,32 @@ async fn check(label: &str, ddl: &[&str]) {
     }
     cmp(&f, &r, "SELECT id FROM t WHERE a = 5", label).await;
 
-    let ordered_params_sql = "SELECT id, c FROM t WHERE a = 5 AND c > ? LIMIT ? OFFSET ?";
+    for projection in ["id, c", "id"] {
+        let unpaged_sql = format!("SELECT {projection} FROM t WHERE a = 5 AND c = 5");
+        let eligible = sqlite_rows(&r, &unpaged_sql);
+        assert!(eligible.len() > 3, "fixture needs several qualifying rows");
+        // The final offset leaves exactly one qualifying row. Counting index
+        // candidates before filtering would incorrectly leave a full page.
+        for offset in [2, eligible.len() - 1] {
+            let sql = format!("{unpaged_sql} LIMIT 3 OFFSET {offset}");
+            let actual = frank_rows(&f, &sql).await;
+            assert_unordered_page(&actual, &eligible, 3, offset, label);
+            assert!(
+                has_seek(&f, &sql).await,
+                "[{label}] pagination must seek: {sql}"
+            );
+            cmp_ordered(
+                &f,
+                &r,
+                &format!("{unpaged_sql} ORDER BY id LIMIT 3 OFFSET {offset}"),
+                label,
+            )
+            .await;
+        }
+    }
+
+    let ordered_params_sql =
+        "SELECT id, c FROM t WHERE a = 5 AND c > ? ORDER BY id LIMIT ? OFFSET ?";
     cmp_params(
         &f,
         &r,
@@ -412,17 +458,24 @@ async fn check(label: &str, ddl: &[&str]) {
         label,
     )
     .await;
+    let seek_params_sql = "SELECT id, c FROM t WHERE a = 5 AND c > ? LIMIT ? OFFSET ?";
+    let eligible = sqlite_rows(&r, "SELECT id, c FROM t WHERE a = 5 AND c > 4");
     assert!(
-        has_seek_params(
-            &f,
-            ordered_params_sql,
-            &[
-                SqliteValue::Integer(4),
-                SqliteValue::Integer(3),
-                SqliteValue::Integer(2),
-            ],
-        )
-        .await,
+        eligible.len() > 3,
+        "parameter fixture needs several qualifying rows"
+    );
+    let offset = eligible.len() - 1;
+    let seek_params = [
+        SqliteValue::Integer(4),
+        SqliteValue::Integer(3),
+        SqliteValue::Integer(i64::try_from(offset).unwrap()),
+    ];
+    let actual = frank_rows_params(&f, seek_params_sql, &seek_params)
+        .await
+        .unwrap();
+    assert_unordered_page(&actual, &eligible, 3, offset, label);
+    assert!(
+        has_seek_params(&f, seek_params_sql, &seek_params).await,
         "[{label}] residual/LIMIT/OFFSET parameter-order fixture must retain the equality seek"
     );
 
