@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | — |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | Lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions |
 | [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) | Release | 2026-09-06 | SQL/shell correctness, real metrics & diagnostics (reader gauge, WAL durability, MVCC conflict/commit counters, /metrics HTTP), PRAGMA cache_size as a real page budget, aoj0g journal-boundary savepoint (O(n^2)->flat insert ramp) + private-allocation ownership through rollback, printf/FTS5 3.53.2 parity, epoch/RaptorQ native-storage hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
@@ -46,6 +46,68 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 ## [Unreleased] -- development on `main` since v0.3.17
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main>
+
+### SQL and transaction correctness
+
+- Aggregate queries with `AND`/`OR` predicates preserve lazy `IN`-subquery
+  evaluation. A condition that already determines the result skips the other
+  operand, including an erroring grouped subquery. Uncorrelated scalar `IN`
+  operands in the WHERE clause's `AND`/`OR`/`NOT` branches reuse their results
+  within its fallback loop; new executions use their current parameters and
+  data. Scalar `IN` comparisons
+  distinguish absent expression affinity from declared BLOB affinity, and
+  fallback NUMERIC casts preserve SQLite's integer/real conversion behavior
+  ([cec7dd37c](https://github.com/Dicklesworthstone/frankensqlite/commit/cec7dd37c)).
+- Lazy membership memo state belongs to its executing future and is installed
+  only while that future is being polled. Suspending or cancelling overlapping
+  executions in a different order preserves each execution's parameter-bound
+  results ([c2bc489d6](https://github.com/Dicklesworthstone/frankensqlite/commit/c2bc489d6)).
+- Leaving WAL mode after a checkpoint preserves the pager's logical commit
+  sequence while rebasing its main-file and WAL counters. This fixes stale
+  snapshot errors on subsequent reads or writes in DELETE mode. The stock
+  SQLite oracle also covers further writes after returning to WAL and reopening
+  the final file with stock SQLite
+  ([9bcba3129](https://github.com/Dicklesworthstone/frankensqlite/commit/9bcba3129)).
+- Journal-mode guards now write in WAL, DELETE, TRUNCATE, PERSIST, MEMORY and
+  OFF modes, then return to WAL. An independent stock SQLite reader checks
+  acknowledged rows and database integrity after each mode's write, before
+  the writer performs another operation
+  ([c2bc489d6](https://github.com/Dicklesworthstone/frankensqlite/commit/c2bc489d6)).
+
+### Regression coverage
+
+- The in-memory autocommit guard now runs 10,000 indexed writes and compares
+  the complete contents with stock SQLite, then checks subsequent insert,
+  update and delete visibility. Its counters distinguish parked writes from
+  periodic commits. The GH409 indexed-read scaling guard now requires the
+  exact inserted row in both fixtures; missing rows can no longer pass
+  ([d65ada8ea](https://github.com/Dicklesworthstone/frankensqlite/commit/d65ada8ea)).
+- File-backed autocommit guards now enforce the existing memory-only retention
+  policy: every acknowledged write is visible before another writer operation.
+  The crash guard requires the child to reach its intended transaction boundary
+  and terminate abruptly; stock SQLite opens first and recovers acknowledged
+  rows while discarding the open transaction's uncommitted row
+  ([9bcba3129](https://github.com/Dicklesworthstone/frankensqlite/commit/9bcba3129)).
+- DQS guards check default-on stock parity, explicit opt-out, valid quoted
+  identifiers and restoring the setting on the same connection. Component
+  repair guards tie successful repair witnesses to the expected content and
+  distinguish failed decode from early bailout without fabricating a recovered
+  payload. This does not establish automatic repair through the public database
+  API ([f697ed38d](https://github.com/Dicklesworthstone/frankensqlite/commit/f697ed38d)).
+- Focused Linux SQL/storage tests and workspace check/Clippy/formatting passed
+  for these committed fixes. Full workspace and all-features test execution,
+  historical benchmark comparison and release acceptance remain pending.
+
+### Replay diagnostics
+
+- Agent-swarm replay captures actual connection-local fallback events around
+  each statement, retaining engine identities and reporting bounded-ring
+  losses. Scoring no longer treats SQL keywords, workload labels or seeded
+  contract rows as fallback evidence. The operator runbook uses
+  `PRAGMA fsqlite.fallback_events`; unavailable EXPLAIN CONCURRENCY and
+  governor observations serialize as `null`. This connects the existing
+  fallback producer and does not complete the broader coordination diagnostic
+  surface ([300528044](https://github.com/Dicklesworthstone/frankensqlite/commit/300528044)).
 
 ### Native storage
 
