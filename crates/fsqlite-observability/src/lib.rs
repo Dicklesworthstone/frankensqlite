@@ -1650,6 +1650,109 @@ mod tests {
     }
 
     #[test]
+    fn io_uring_latency_window_matches_sorted_reference() {
+        // Keep a full-sort oracle independent of the production quantile
+        // algorithm. The 99/100/101 capacities straddle nearest-rank changes;
+        // three windows exercise eviction, duplicates, and saturated bounds.
+        fn reference_quantile(values: &VecDeque<u64>, conformal: bool) -> Option<u64> {
+            if values.is_empty() {
+                return None;
+            }
+            let mut sorted: Vec<_> = values.iter().copied().collect();
+            sorted.sort_unstable();
+            let population = sorted.len() + usize::from(conformal);
+            let rank = (99 * population).div_ceil(100).min(sorted.len());
+            Some(sorted[rank - 1])
+        }
+
+        for capacity in [0, 1, 2, 7, 99, 100, 101, 1024] {
+            for read in [true, false] {
+                let metrics = IoUringLatencyMetrics::new(capacity);
+                let mut latencies = VecDeque::new();
+                let mut scores = VecDeque::new();
+                let mut violations = 0;
+                let samples = 3 * capacity + 32;
+                for index in 0..samples {
+                    let sample = match index {
+                        i if i < capacity => i as u64 * 12_345,
+                        i if i < 2 * capacity => (2 * capacity - i) as u64 * 12_345,
+                        i => match i % 8 {
+                            0 => 0,
+                            1 => u64::MAX,
+                            2 | 3 => 12_345,
+                            4 => i as u64,
+                            5 => u64::MAX - i as u64,
+                            _ => (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        },
+                    };
+                    let baseline = reference_quantile(&latencies, false);
+                    let prior_bound = baseline
+                        .zip(reference_quantile(&scores, true))
+                        .map(|(value, score)| value.saturating_add(score));
+                    let expected_violation = prior_bound.is_some_and(|bound| sample > bound);
+                    let actual_violation = if read {
+                        metrics.record_read_latency(Duration::from_nanos(sample))
+                    } else {
+                        metrics.record_write_latency(Duration::from_nanos(sample))
+                    };
+                    assert_eq!(
+                        actual_violation, expected_violation,
+                        "capacity={capacity} read={read} index={index}"
+                    );
+                    violations += u64::from(expected_violation);
+                    if capacity != 0 {
+                        latencies.push_back(sample);
+                        scores.push_back(sample.saturating_sub(baseline.unwrap_or(sample)));
+                        if latencies.len() > capacity {
+                            let _ = latencies.pop_front();
+                            let _ = scores.pop_front();
+                        }
+                    }
+                    let expected_p99 = reference_quantile(&latencies, false).unwrap_or(0);
+                    let expected_bound =
+                        expected_p99.saturating_add(reference_quantile(&scores, true).unwrap_or(0));
+                    let snapshot = metrics.snapshot();
+                    let actual = if read {
+                        (
+                            snapshot.read_samples_total,
+                            snapshot.read_window_len,
+                            snapshot.read_p99_latency_us,
+                            snapshot.read_conformal_upper_bound_us,
+                            snapshot.read_tail_violations_total,
+                        )
+                    } else {
+                        (
+                            snapshot.write_samples_total,
+                            snapshot.write_window_len,
+                            snapshot.write_p99_latency_us,
+                            snapshot.write_conformal_upper_bound_us,
+                            snapshot.write_tail_violations_total,
+                        )
+                    };
+                    assert_eq!(
+                        actual,
+                        (
+                            index as u64 + 1,
+                            latencies.len(),
+                            expected_p99 / 1_000,
+                            expected_bound / 1_000,
+                            violations
+                        ),
+                        "capacity={capacity} read={read} index={index}"
+                    );
+                }
+                metrics.reset();
+                let reset = metrics.snapshot();
+                assert_eq!(reset.read_samples_total + reset.write_samples_total, 0);
+                assert_eq!(reset.read_window_len + reset.write_window_len, 0);
+                assert_eq!(reset.read_p99_latency_us + reset.write_p99_latency_us, 0);
+                assert!(!metrics.record_read_latency(Duration::from_nanos(u64::MAX)));
+                assert!(!metrics.record_write_latency(Duration::from_nanos(u64::MAX)));
+            }
+        }
+    }
+
+    #[test]
     fn trace_and_decision_ids_are_monotonic() {
         let first_trace = next_trace_id();
         let second_trace = next_trace_id();
