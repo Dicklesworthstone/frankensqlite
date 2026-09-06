@@ -2912,6 +2912,12 @@ impl ShardedPageCache {
 
     fn trim_to_page_budget(&self) {
         let budget = self.cache_page_budget();
+        // bd-cea9i: an unbounded budget can never be exceeded; skip the
+        // (possibly locking) residency count entirely so connections that
+        // never set PRAGMA cache_size pay no per-admission trim overhead.
+        if budget == usize::MAX {
+            return;
+        }
         if self.budget_resident_pages() <= budget {
             return;
         }
@@ -3672,7 +3678,13 @@ impl ShardedPageCache {
             } else {
                 self.record_eviction_access(page_no);
             }
-            self.trim_to_page_budget();
+            // bd-cea9i: `resident` is already known from the insert above;
+            // only trim when actually over budget, avoiding a redundant
+            // fast-array lock in the common under-budget case (trim would
+            // early-return anyway when resident <= budget).
+            if resident > self.cache_page_budget() {
+                self.trim_to_page_budget();
+            }
             return;
         }
         // Flat slots first; overflow to shard.
