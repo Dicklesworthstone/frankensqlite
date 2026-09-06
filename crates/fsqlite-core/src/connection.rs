@@ -139069,6 +139069,7 @@ fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<
 #[allow(dead_code)] // wired into scan_live_fts5_rows in child bead .4
 struct Fts5LiveShadowReader<'a> {
     cx: &'a Cx,
+    timing_epoch: Option<Instant>,
     txn: &'a mut TransactionKind,
     page_size: PageSize,
     reserved_per_page: u8,
@@ -139141,6 +139142,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
     ) -> Self {
         Self {
             cx,
+            timing_epoch: std::env::var("FSQLITE_FTS5_TIMING").is_ok().then(Instant::now),
             txn,
             page_size,
             reserved_per_page,
@@ -139204,6 +139206,10 @@ impl<'a> Fts5LiveShadowReader<'a> {
 
 #[cfg(feature = "ext-fts5")]
 impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
+    fn diagnostic_time(&self) -> Option<Duration> {
+        self.timing_epoch.as_ref().map(Instant::elapsed)
+    }
+
     async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
         // `_data(id INTEGER PRIMARY KEY, block BLOB)`: the block is the lone
         // stored BLOB (the rowid-alias `id` is not in the record payload).

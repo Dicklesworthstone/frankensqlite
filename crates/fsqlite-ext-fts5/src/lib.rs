@@ -3412,6 +3412,13 @@ impl Fts5ShadowRows {
 /// owning query so results are MVCC-consistent.
 #[allow(async_fn_in_trait)]
 pub trait Fts5OnDiskReader {
+    /// Sample the host's monotonic query clock, relative to a fixed origin.
+    ///
+    /// Return `None` when timing is disabled, without reading a clock. The
+    /// setting and origin must remain fixed for the reader's lifetime. This
+    /// keeps clock authority with the host that owns the query's I/O context.
+    fn diagnostic_time(&self) -> Option<std::time::Duration>;
+
     /// Raw `_data.block` bytes for an encoded id, or `None` if the row is absent.
     async fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>>;
 
@@ -8897,24 +8904,23 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
-        let t0 = std::time::Instant::now();
+        let t0 = self.reader.diagnostic_time();
         self.prefetch_query_doclists(queries).await?;
-        let t1 = std::time::Instant::now();
+        let t1 = self.reader.diagnostic_time();
         let (matching_docs, query_terms) = self.evaluate_queries(queries)?;
-        let t2 = std::time::Instant::now();
+        let t2 = self.reader.diagnostic_time();
         let n_docs = matching_docs.len();
         self.prefetch_doc_lengths(&matching_docs).await?;
-        let t3 = std::time::Instant::now();
+        let t3 = self.reader.diagnostic_time();
         let ranked = self.rank_matching_docs(matching_docs, &query_terms, weights);
-        let t4 = std::time::Instant::now();
-        if timing {
+        let t4 = self.reader.diagnostic_time();
+        if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
             eprintln!(
                 "FTS5_TIMING search: prefetch_doclists={:?} evaluate={:?} ({n_docs} docs) prefetch_doclengths={:?} rank={:?}",
-                t1 - t0,
-                t2 - t1,
-                t3 - t2,
-                t4 - t3,
+                t1.saturating_sub(t0),
+                t2.saturating_sub(t1),
+                t3.saturating_sub(t2),
+                t4.saturating_sub(t3),
             );
         }
         ranked
@@ -8935,24 +8941,23 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
         &mut self,
         queries: &[&str],
     ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
         if std::env::var("FSQLITE_FTS5_SCANDBG").is_ok() {
             eprintln!("FTS5_SCANDBG matched_rowids start -> prefetch_query_doclists");
         }
-        let t0 = std::time::Instant::now();
+        let t0 = self.reader.diagnostic_time();
         self.prefetch_query_doclists(queries).await?;
         if std::env::var("FSQLITE_FTS5_SCANDBG").is_ok() {
             eprintln!("FTS5_SCANDBG matched_rowids: prefetch DONE -> evaluate");
         }
-        let t1 = std::time::Instant::now();
+        let t1 = self.reader.diagnostic_time();
         let (mut matching_docs, _query_terms) = self.evaluate_queries(queries)?;
         matching_docs.sort_unstable();
         matching_docs.dedup();
-        if timing {
+        if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, self.reader.diagnostic_time()) {
             eprintln!(
                 "FTS5_TIMING matched_rowids (unranked): prefetch_doclists={:?} evaluate+sort={:?} ({} docs)",
-                t1 - t0,
-                t1.elapsed(),
+                t1.saturating_sub(t0),
+                t2.saturating_sub(t1),
                 matching_docs.len(),
             );
         }
@@ -10162,18 +10167,17 @@ impl Fts5Table {
         )
         .await?;
         let ranked = query.search_queries_with_weights(queries, weights).await?;
-        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
-        let t_content = std::time::Instant::now();
+        let t_content = query.reader.diagnostic_time();
         let n_ranked = ranked.len();
         let mut out = Vec::with_capacity(ranked.len());
         for (rowid, score) in ranked {
             let columns = query.content_for_rowid(rowid).await?.unwrap_or_default();
             out.push((rowid, score, columns));
         }
-        if timing {
+        if let (Some(start), Some(end)) = (t_content, query.reader.diagnostic_time()) {
             eprintln!(
                 "FTS5_TIMING content_loop: {n_ranked} rows in {:?}",
-                t_content.elapsed()
+                end.saturating_sub(start)
             );
         }
         Ok(out)
@@ -10198,18 +10202,17 @@ impl Fts5Table {
         )
         .await?;
         let rowids = query.matched_rowids(queries).await?;
-        let timing = std::env::var("FSQLITE_FTS5_TIMING").is_ok();
-        let t_content = std::time::Instant::now();
+        let t_content = query.reader.diagnostic_time();
         let n = rowids.len();
         let mut out = Vec::with_capacity(rowids.len());
         for rowid in rowids {
             let columns = query.content_for_rowid(rowid).await?.unwrap_or_default();
             out.push((rowid, columns));
         }
-        if timing {
+        if let (Some(start), Some(end)) = (t_content, query.reader.diagnostic_time()) {
             eprintln!(
                 "FTS5_TIMING content_loop (unranked): {n} rows in {:?}",
-                t_content.elapsed()
+                end.saturating_sub(start)
             );
         }
         Ok(out)
@@ -13784,6 +13787,10 @@ mod tests {
     // desugared RPITIT form with eagerly computed `ready` futures instead
     // of `async fn`.
     impl Fts5OnDiskReader for SliceOnDiskReader {
+        fn diagnostic_time(&self) -> Option<std::time::Duration> {
+            None
+        }
+
         fn read_data_block(
             &mut self,
             id: i64,
