@@ -66,6 +66,10 @@ rusqlite = { workspace = true, features = ["functions"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 
+[[test]]
+name = "async_drop_skips_detached_checkpoint"
+required-features = ["async-api"]
+
 [[bench]]
 name = "minmax_prefix_contract_bench"
 path = "benches/minmax_prefix_contract_bench.rs"
