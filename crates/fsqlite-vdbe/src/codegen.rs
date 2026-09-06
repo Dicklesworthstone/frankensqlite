@@ -3270,12 +3270,23 @@ pub fn codegen_select(
     } else {
         None
     };
+    // GH #415: `WHERE <rowid> IN (?1, ?2, ...)` / `<rowid> = ?1 OR <rowid> = ?2` — members known
+    // only at bind time (or literals the integer-literal detector declines, e.g. `-5`, `'7'`) are
+    // materialized once into a sorted, de-duplicated probe set and seeked in a loop, instead of
+    // full-scanning with the IN evaluated per row. Same gate as the literal path (the probe set is
+    // ascending rowid, so `ORDER BY <rowid>` is served); time travel is declined because the seek
+    // emitter does not pin a snapshot.
+    let rowid_in_const = if rowid_in_seek_allowed && rowid_in.is_none() && time_travel.is_none() {
+        extract_rowid_in_const_list_residual_target(where_clause.as_deref(), table, table_alias)
+    } else {
+        None
+    };
     // bd-nonagg-in-list-residual: also admit `col IN (ints) AND <residual>` — the residual variant
     // returns `has_residual = true`, and the IN scan re-applies the whole WHERE per row (the seek
     // visits the IN runs, a superset; the residual narrows to exact). The IN emitter always opens the
     // table, so the residual reads any column and no covering gate is needed; IN is not a single-eq
     // prefix, so it does not collide with the composite-prefix-range path.
-    let index_in = if in_list_seek_allowed && rowid_in.is_none() {
+    let index_in = if in_list_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none() {
         index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
         None
@@ -3287,7 +3298,8 @@ pub fn codegen_select(
     // the directive. The bare `rowid = <const>` (single conjunct) is declined by the detector and keeps
     // its existing directive path. Same narrow gate as the IN seeks. `codegen_select_rowid_lookup`
     // always opens the table, so the residual reads any column and all outputs work.
-    let rowid_eq_residual = if in_list_seek_allowed && rowid_in.is_none() {
+    let rowid_eq_residual = if in_list_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none()
+    {
         extract_rowid_eq_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
         None
@@ -3315,6 +3327,24 @@ pub fn codegen_select(
             &values,
             where_clause.as_deref(),
             has_residual,
+            matches!(rowid_order, Some(SortDirection::Desc)),
+        );
+    }
+    // GH #415: bind-time-constant rowid membership, same pre-directive routing as the literal list.
+    if let Some(target) = &rowid_in_const {
+        return codegen_select_rowid_in_const_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            target,
+            where_clause.as_deref(),
             matches!(rowid_order, Some(SortDirection::Desc)),
         );
     }
@@ -5744,6 +5774,119 @@ fn codegen_select_rowid_in_scan(
     Ok(())
 }
 
+/// Codegen for `SELECT <cols> FROM t WHERE <rowid> IN (<bind-time constants>)` (GH #415) —
+/// the parameterized sibling of [`codegen_select_rowid_in_scan`].
+///
+/// The members are unknown at compile time, so instead of unrolling one `SeekRowid` per
+/// literal the program materializes them once into an ascending, de-duplicated ephemeral
+/// index ([`emit_rowid_const_list_probe_set`]) and loops over it: `Column` the candidate,
+/// `SeekRowid` the table (a miss skips the candidate), apply the residual WHERE when the
+/// membership test is only one conjunct, read the columns, `ResultRow`. This is the same
+/// build-then-loop shape stock SQLite emits, so the output order is ascending rowid — which
+/// serves `ORDER BY <rowid>` for free (`descending` walks the probe set with `Last`/`Prev`).
+/// The table cursor is never `Rewind`/`Next`ed: cost is O(members), not O(rows).
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_rowid_in_const_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target: &RowidConstInList<'_>,
+    where_clause: Option<&Expr>,
+    descending: bool,
+) -> Result<(), CodegenError> {
+    // The whole WHERE (when re-applied as a residual) numbers its anonymous `?`s from here; the
+    // probe-set build numbers the list members from `base + anon_offset` so `v <> ? AND id IN
+    // (?, ?)` binds the list to `?2`/`?3` exactly as the residual will.
+    let where_placeholder_base = b.current_anon_placeholder();
+    let probe_cursor = cursor + 1;
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    emit_rowid_const_list_probe_set(
+        b,
+        probe_cursor,
+        &target.values,
+        where_placeholder_base + target.anon_offset,
+    );
+    // Whatever follows the WHERE (result columns with their own `?`s) must see the counter as
+    // if the whole WHERE had been emitted once, residual or not.
+    b.set_next_anon_placeholder(
+        where_placeholder_base + where_clause.map_or(0, count_anon_placeholders),
+    );
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_jump_to_label(
+        if descending {
+            Opcode::Last
+        } else {
+            Opcode::Rewind
+        },
+        probe_cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_top = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, probe_cursor, 0, rowid_reg, P4::None, 0);
+    let next_value = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        next_value,
+        P4::None,
+        0,
+    );
+    if target.has_residual && let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            next_value,
+        );
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(next_value);
+    b.emit_op(
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        probe_cursor,
+        loop_top,
+        0,
+        P4::None,
+        0,
+    );
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
 /// Codegen for a full table scan SELECT with optional WHERE filtering and LIMIT/OFFSET.
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_full_scan(
@@ -7550,6 +7693,28 @@ fn codegen_select_count_star(
         );
         return Ok(());
     }
+    // GH #415: `COUNT(*) WHERE <rowid> IN (?1, ?2, ...) [AND <residual>]` — bind-time-constant
+    // members are materialized once into a de-duplicated probe set and counted with one
+    // `SeekRowid` each (plus the residual per hit), instead of a full scan. After every
+    // integer-literal arm above so those keep their unrolled programs.
+    if !table.without_rowid
+        && let Some(target) =
+            extract_rowid_in_const_list_residual_target(where_clause, table, table_alias)
+    {
+        codegen_select_count_star_rowid_in_const(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &target,
+            where_clause,
+        );
+        return Ok(());
+    }
 
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
@@ -7757,6 +7922,83 @@ fn codegen_select_count_star_rowid_in(
     }
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+}
+
+/// `SELECT COUNT(*) FROM t WHERE <rowid> IN (<bind-time constants>) [AND <residual>]` (GH #415):
+/// build the de-duplicated probe set once ([`emit_rowid_const_list_probe_set`]), then loop
+/// `Column` → `SeekRowid` → (residual) → `AddImm`. The parameterized sibling of
+/// [`codegen_select_count_star_rowid_in`]; each existing row is counted at most once because
+/// the probe set holds each rowid once.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_count_star_rowid_in_const(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target: &RowidConstInList<'_>,
+    where_clause: Option<&Expr>,
+) {
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+    let where_placeholder_base = b.current_anon_placeholder();
+    let probe_cursor = cursor + 1;
+    emit_rowid_const_list_probe_set(
+        b,
+        probe_cursor,
+        &target.values,
+        where_placeholder_base + target.anon_offset,
+    );
+    b.set_next_anon_placeholder(
+        where_placeholder_base + where_clause.map_or(0, count_anon_placeholders),
+    );
+    let rowid_reg = b.alloc_reg();
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_top = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, probe_cursor, 0, rowid_reg, P4::None, 0);
+    let skip_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        skip_label,
+        P4::None,
+        0,
+    );
+    if target.has_residual && let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
+    }
+    b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+    b.resolve_label(skip_label);
+    b.emit_op(Opcode::Next, probe_cursor, loop_top, 0, P4::None, 0);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
@@ -22158,10 +22400,25 @@ pub fn codegen_update(
     } else {
         None
     };
+    // GH #415: `UPDATE ... WHERE <rowid> IN (?1, ?2, ...) [AND <residual>]` — bind-time-constant members
+    // are materialized once into a de-duplicated probe set and seeked in a loop (Pass 1), instead of
+    // full-scanning with the IN evaluated per row.
+    let rowid_in_const_list = if rowid_target.is_none() && rowid_in_list.is_none() {
+        extract_rowid_in_const_list_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
+    } else {
+        None
+    };
     // bd-update-rowid-range: `UPDATE ... WHERE <rowid> <range>` collects the [lower, upper] slice with a
     // bounded seek+walk instead of full-scanning. Bare range, integer-literal bounds only (so Pass 1 emits
     // no anon placeholders — the SET placeholders are numbered in Pass 2 as before).
-    let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
+    let rowid_range = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+    {
         extract_rowid_range_target(
             stmt.where_clause.as_ref(),
             Some(table),
@@ -22178,21 +22435,25 @@ pub fn codegen_update(
     // bd-update-rowid-eq-residual: `UPDATE ... WHERE <rowid> = <const> AND <residual>` seeks the single
     // target row and applies the residual — the common optimistic-lock shape (`WHERE id = ? AND version =
     // ?`), routed through the two-pass collect so the RowSet path (and its Halloween safety) is reused.
-    let rowid_eq_residual =
-        if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
-            extract_rowid_eq_residual_target(
-                stmt.where_clause.as_ref(),
-                table,
-                stmt.table.alias.as_deref(),
-            )
-        } else {
-            None
-        };
+    let rowid_eq_residual = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+        && rowid_range.is_none()
+    {
+        extract_rowid_eq_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
+    } else {
+        None
+    };
     // bd-update-index-eq(-residual): `UPDATE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
     // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
     // instead of full-scanning. After all rowid cases decline.
     let index_eq = if rowid_target.is_none()
         && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
@@ -22289,6 +22550,63 @@ pub fn codegen_update(
                 );
                 b.resolve_label(next_value);
             }
+        } else if let Some(target) = &rowid_in_const_list {
+            // GH #415: probe set built once (members numbered after the SET placeholders, offset by any
+            // `?` in conjuncts before the membership test), then one `SeekRowid` per distinct member with
+            // the residual re-applied per hit. The probe cursor sits beyond the table + index cursors and
+            // is closed before Pass 2.
+            let probe_cursor = table_cursor + 1 + table.indexes.len() as i32;
+            emit_rowid_const_list_probe_set(
+                b,
+                probe_cursor,
+                &target.values,
+                set_placeholder_count + 1 + target.anon_offset,
+            );
+            let collect_loop_done = b.emit_label();
+            b.emit_jump_to_label(
+                Opcode::Rewind,
+                probe_cursor,
+                0,
+                collect_loop_done,
+                P4::None,
+                0,
+            );
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let loop_top = b.current_addr() as i32;
+            b.emit_op(Opcode::Column, probe_cursor, 0, matched_rowid_reg, P4::None, 0);
+            let next_value = b.emit_label();
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                table_cursor,
+                matched_rowid_reg,
+                next_value,
+                P4::None,
+                0,
+            );
+            if target.has_residual && let Some(where_expr) = &stmt.where_clause {
+                b.set_next_anon_placeholder(set_placeholder_count + 1);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    table_cursor,
+                    table,
+                    stmt.table.alias.as_deref(),
+                    schema,
+                    next_value,
+                );
+            }
+            b.emit_op(
+                Opcode::RowSetAdd,
+                rowset_reg,
+                matched_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
+            b.resolve_label(next_value);
+            b.emit_op(Opcode::Next, probe_cursor, loop_top, 0, P4::None, 0);
+            b.resolve_label(collect_loop_done);
+            b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
         } else if let Some(range) = rowid_range {
             emit_rowid_range_rowset_collect(
                 b,
@@ -23855,11 +24173,26 @@ pub fn codegen_delete(
     } else {
         None
     };
+    // GH #415: `DELETE ... WHERE <rowid> IN (?1, ?2, ...) [AND <residual>]` — bind-time-constant members
+    // are materialized once into a de-duplicated probe set and seeked in a loop, instead of full-scanning
+    // with the IN evaluated per row.
+    let rowid_in_const_list = if rowid_target.is_none() && rowid_in_list.is_none() {
+        extract_rowid_in_const_list_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
+    } else {
+        None
+    };
     // bd-delete-rowid-range: `DELETE ... WHERE <rowid> <range>` collects the [lower, upper] slice with a
     // bounded seek+walk (SeekGE/SeekGT to the lower bound, stop past the upper) instead of full-scanning.
     // Bare range only (no residual), integer-literal bounds only (so the walk emits no anon placeholders),
     // and only after the eq / IN cases decline.
-    let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
+    let rowid_range = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+    {
         extract_rowid_range_target(
             stmt.where_clause.as_ref(),
             Some(table),
@@ -23875,21 +24208,25 @@ pub fn codegen_delete(
     };
     // bd-delete-rowid-eq-residual: `DELETE ... WHERE <rowid> = <const> AND <residual>` seeks the single
     // target row and applies the residual, instead of full-scanning — the common compare-and-delete shape.
-    let rowid_eq_residual =
-        if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
-            extract_rowid_eq_residual_target(
-                stmt.where_clause.as_ref(),
-                table,
-                stmt.table.alias.as_deref(),
-            )
-        } else {
-            None
-        };
+    let rowid_eq_residual = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
+        && rowid_range.is_none()
+    {
+        extract_rowid_eq_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
+    } else {
+        None
+    };
     // bd-delete-index-eq(-residual): `DELETE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
     // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
     // instead of full-scanning. After all rowid cases decline.
     let index_eq = if rowid_target.is_none()
         && rowid_in_list.is_none()
+        && rowid_in_const_list.is_none()
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
@@ -23960,6 +24297,65 @@ pub fn codegen_delete(
             b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
             b.resolve_label(next_value);
         }
+    } else if let Some(target) = &rowid_in_const_list {
+        // GH #415: probe set built once (members numbered from the current base, offset by any `?` in
+        // conjuncts before the membership test), then one `SeekRowid` per distinct member with the
+        // residual re-applied per hit. The probe cursor sits beyond the table + index cursors and is
+        // closed before Pass 2.
+        let where_base = b.current_anon_placeholder();
+        let probe_cursor = table_cursor + 1 + table.indexes.len() as i32;
+        emit_rowid_const_list_probe_set(
+            b,
+            probe_cursor,
+            &target.values,
+            where_base + target.anon_offset,
+        );
+        let collect_loop_done = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            probe_cursor,
+            0,
+            collect_loop_done,
+            P4::None,
+            0,
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_top = b.current_addr() as i32;
+        b.emit_op(Opcode::Column, probe_cursor, 0, rowid_reg, P4::None, 0);
+        let next_value = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            table_cursor,
+            rowid_reg,
+            next_value,
+            P4::None,
+            0,
+        );
+        if target.has_residual && let Some(where_expr) = &stmt.where_clause {
+            b.set_next_anon_placeholder(where_base);
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                next_value,
+            );
+        }
+        b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+        b.resolve_label(next_value);
+        b.emit_op(Opcode::Next, probe_cursor, loop_top, 0, P4::None, 0);
+        b.resolve_label(collect_loop_done);
+        b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
+        // RETURNING numbers its `?`s after the WHERE's, whether or not a residual re-emitted it.
+        b.set_next_anon_placeholder(
+            where_base
+                + stmt
+                    .where_clause
+                    .as_ref()
+                    .map_or(0, count_anon_placeholders),
+        );
     } else if let Some(range) = rowid_range {
         emit_rowid_range_rowset_collect(
             b,
@@ -30224,6 +30620,191 @@ fn extract_rowid_in_list_residual_target(
         }
     }
     None
+}
+
+/// Whether an IN-list member (or an OR-chain equality operand) is fixed for the
+/// whole statement execution and can therefore be evaluated ONCE, before the
+/// row loop, into the rowid probe set — a literal, a bind parameter, or a
+/// deterministic/query-constant expression over those (GH #415).
+///
+/// Bound parameters are the whole point: `id IN (?1, ?2, ?3)` is what every
+/// driver emits for a batch lookup, and it used to full-scan because the
+/// integer-literal detector ([`column_int_list_from_predicate`]) declined it.
+/// Column references, correlated outer values, and subqueries are NOT admitted;
+/// a row value is not a scalar rowid candidate (SQLite rejects
+/// `id IN ((1, 2))` as a misused row value) so it declines too, leaving the
+/// generic IN evaluation to report it.
+fn rowid_in_probe_value_is_constant(expr: &Expr) -> bool {
+    !matches!(expr, Expr::RowValue(..)) && singleton_in_rhs_is_constant(expr)
+}
+
+/// Collect the leaves of a pure `OR` chain of `<expr> = <bind-time constant>` into `out` as
+/// `(column expr, value expr)` pairs. The constant-operand sibling of
+/// [`collect_or_int_eq_leaves`]: an equality whose two sides are both constant (`5 = ?`) or
+/// both non-constant (`id = k`) has no probe orientation and fails the chain.
+fn collect_or_const_eq_leaves<'a>(expr: &'a Expr, out: &mut Vec<(&'a Expr, &'a Expr)>) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => collect_or_const_eq_leaves(left, out) && collect_or_const_eq_leaves(right, out),
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            let left_const = rowid_in_probe_value_is_constant(left);
+            let right_const = rowid_in_probe_value_is_constant(right);
+            match (left_const, right_const) {
+                (false, true) => {
+                    out.push((left, right));
+                    true
+                }
+                (true, false) => {
+                    out.push((right, left));
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The rowid membership list of a `WHERE <rowid> IN (<bind-time constants>)` or
+/// `WHERE <rowid> = <c1> OR <rowid> = <c2> OR ...` predicate whose members are known only
+/// at bind time (GH #415). Members are returned in source order (anonymous `?` placeholders
+/// number by emission order, so the emitter must evaluate them in this order); the probe set
+/// they build is sorted and de-duplicated at runtime, and NULL / non-integer members are
+/// dropped there (they can never equal a rowid), so `IN (NULL, ?)` and `IN (?, ?)` bound to
+/// the same rowid twice behave exactly like SQLite's ephemeral-index IN loop.
+///
+/// Callers try [`extract_rowid_in_list_target`] (integer literals, unrolled at compile time)
+/// first; this detector also admits all-literal lists whose members are not plain integers
+/// (`-5`, `2.0`, `'7'`), which previously fell back to a scan.
+fn extract_rowid_in_const_list_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<Vec<&'a Expr>> {
+    let expr = where_clause?;
+    if let Expr::In {
+        expr: column,
+        set: fsqlite_ast::InSet::List(values),
+        not: false,
+        ..
+    } = expr
+    {
+        if values.is_empty() || !values.iter().all(rowid_in_probe_value_is_constant) {
+            return None;
+        }
+        return is_rowid_expr(column, Some(table), table_alias).then(|| values.iter().collect());
+    }
+    if !matches!(
+        expr,
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Or,
+            ..
+        }
+    ) {
+        // A bare `<rowid> = <const>` keeps its existing single-seek path (and EQP shape).
+        return None;
+    }
+    let mut leaves: Vec<(&Expr, &Expr)> = Vec::new();
+    if !collect_or_const_eq_leaves(expr, &mut leaves) || leaves.is_empty() {
+        return None;
+    }
+    // Every disjunct must equate the SAME rowid alias (`id = ? OR rowid = ?` is fine — both name
+    // the rowid — but `id = ? OR k = ?` is not).
+    if !leaves
+        .iter()
+        .all(|(column, _)| is_rowid_expr(column, Some(table), table_alias))
+    {
+        return None;
+    }
+    Some(leaves.into_iter().map(|(_, value)| value).collect())
+}
+
+/// A bind-time-constant rowid membership list found in a WHERE clause (GH #415).
+struct RowidConstInList<'a> {
+    /// The list members, in source order.
+    values: Vec<&'a Expr>,
+    /// `false` = the whole WHERE is the membership test. `true` = it is one conjunct alongside
+    /// OTHER predicates the rowid seeks cannot enforce; the caller re-applies the whole WHERE per
+    /// seeked row (the probe set is a SUPERSET, the residual narrows to exact).
+    has_residual: bool,
+    /// How many anonymous `?` placeholders occur in the conjuncts BEFORE the membership test.
+    /// The whole WHERE numbers its `?`s in emission order (`v <> ? AND id IN (?, ?)` binds the
+    /// list to `?2`/`?3`), so the probe-set build must start numbering at `base + anon_offset`.
+    anon_offset: u32,
+}
+
+/// The constant-list sibling of [`extract_rowid_in_list_residual_target`]. Bare membership
+/// first, then a conjunct of a longer AND chain.
+fn extract_rowid_in_const_list_residual_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<RowidConstInList<'a>> {
+    if let Some(values) = extract_rowid_in_const_list_target(where_clause, table, table_alias) {
+        return Some(RowidConstInList {
+            values,
+            has_residual: false,
+            anon_offset: 0,
+        });
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    let mut anon_offset = 0_u32;
+    for term in &conjuncts {
+        if let Some(values) = extract_rowid_in_const_list_target(Some(term), table, table_alias) {
+            return Some(RowidConstInList {
+                values,
+                has_residual: true,
+                anon_offset,
+            });
+        }
+        anon_offset += count_anon_placeholders(term);
+    }
+    None
+}
+
+/// Materialize the bind-time-constant rowid candidates `values` into a de-duplicated,
+/// ascending ephemeral index on `probe_cursor` (GH #415) — the build phase SQLite emits for
+/// `rowid IN (?, ?, ...)` (`OpenEphemeral` + `IdxInsert` per member, then a `Rewind`/`Next`
+/// loop of `SeekRowid`s). Each member is evaluated once, coerced to INTEGER affinity by
+/// `MustBeInt` (so `'3'` / `3.0` become `3` while NULL, `2.5`, `'3abc'`, and blobs — which can
+/// never equal a rowid — are dropped instead of being truncated to a wrong rowid), and inserted
+/// under a `Found` guard so duplicates collapse to one seek. Anonymous `?` placeholders number
+/// from `anon_placeholder_base` in source order.
+fn emit_rowid_const_list_probe_set(
+    b: &mut ProgramBuilder,
+    probe_cursor: i32,
+    values: &[&Expr],
+    anon_placeholder_base: u32,
+) {
+    b.set_next_anon_placeholder(anon_placeholder_base);
+    b.emit_op(Opcode::OpenAutoindex, probe_cursor, 1, 0, P4::None, 0);
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    for value in values {
+        let skip_value = b.emit_label();
+        emit_expr(b, value, r_value, None);
+        b.emit_jump_to_label(Opcode::MustBeInt, r_value, 0, skip_value, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_value, P4::None, 0);
+        b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+        b.resolve_label(skip_value);
+    }
+    b.free_temp(r_key);
+    b.free_temp(r_value);
 }
 
 fn extract_rowid_range_target<'a>(
@@ -40093,19 +40674,157 @@ mod tests {
             );
         }
 
+        // GH #415: `2.0` / `-5` are not integer literals, so the unrolled path declines them —
+        // but they are bind-time constants, so the probe-set path now seeks them (coercing
+        // 2.0 -> 2 and evaluating the negation) instead of scanning.
         for sql in [
             "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1",
             "SELECT DISTINCT id FROM t WHERE id IN (5, 10)",
-            "SELECT id FROM t WHERE id IN (2.0, 5)",
-            "SELECT id FROM t WHERE id IN (-5, 2)",
             "SELECT id FROM t WHERE id NOT IN (5, 10)",
             "SELECT id FROM t NOT INDEXED WHERE id IN (5, 10)",
         ] {
             assert!(
                 bd_2dgf5_program(sql)
                     .iter()
-                    .any(|op| op.opcode == Opcode::Rewind),
-                "`{sql}` must decline the rowid IN-list seek (Rewind present)"
+                    .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+                "`{sql}` must decline the rowid IN-list seek (table Rewind present)"
+            );
+        }
+    }
+
+    /// GH #415: a rowid membership test whose members are bind parameters (or any
+    /// bind-time-constant expression) must seek, not scan. Asserts on the emitted
+    /// program: the table cursor (0) is never walked, a `SeekRowid` targets it, the
+    /// members are materialized once (`OpenAutoindex` + `MustBeInt`-guarded
+    /// `IdxInsert`), and anonymous `?`s keep their SQL-order indices even when the
+    /// membership test is not the first conjunct. Results are covered by
+    /// `gh415_rowid_in_params_oracle_e2e`.
+    #[test]
+    fn gh415_rowid_in_bind_time_constants_seek_instead_of_scan() {
+        let program = |sql: &str| -> Vec<VdbeOp> {
+            let Some((statement, tail)) =
+                parse_first_statement_with_tail(sql).expect("test SQL should parse")
+            else {
+                unreachable!("expected parsed statement");
+            };
+            assert_eq!(tail, sql.len(), "parser left trailing SQL");
+            let schema = vec![bd_2dgf5_table()];
+            let mut b = ProgramBuilder::new();
+            let ctx = CodegenContext::default();
+            match statement {
+                Statement::Select(stmt) => codegen_select(&mut b, &stmt, &schema, &ctx),
+                Statement::Update(stmt) => codegen_update(&mut b, &stmt, &schema, &ctx),
+                Statement::Delete(stmt) => codegen_delete(&mut b, &stmt, &schema, &ctx),
+                other => panic!("unexpected statement {other:?}"),
+            }
+            .unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+            b.finish().expect("program should finish").ops().to_vec()
+        };
+        let table_walks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| {
+                    op.p1 == 0
+                        && matches!(
+                            op.opcode,
+                            Opcode::Rewind | Opcode::Next | Opcode::Last | Opcode::Prev
+                        )
+                })
+                .count()
+        };
+        let table_seeks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid && op.p1 == 0)
+                .count()
+        };
+        let variables = |ops: &[VdbeOp]| -> Vec<i32> {
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::Variable)
+                .map(|op| op.p1)
+                .collect()
+        };
+
+        for (sql, expected_variables) in [
+            ("SELECT id, v FROM t WHERE id IN (?1, ?2, ?3)", vec![1, 2, 3]),
+            ("SELECT id, v FROM t WHERE id IN (?, ?, ?)", vec![1, 2, 3]),
+            ("SELECT v FROM t WHERE id IN (?1)", vec![1]),
+            ("SELECT v FROM t WHERE rowid IN (?1, ?2)", vec![1, 2]),
+            ("SELECT v FROM t WHERE t.id IN (?2, ?1)", vec![2, 1]),
+            // Mixed literals / negation / real / text: all bind-time constants.
+            ("SELECT v FROM t WHERE id IN (?1, 5, -3, '7', 2.0)", vec![1]),
+            ("SELECT v FROM t WHERE id IN (2.0, 5)", vec![]),
+            ("SELECT v FROM t WHERE id IN (-5, 2)", vec![]),
+            // OR chain of rowid equalities, either operand order, rowid alias mixed in.
+            ("SELECT v FROM t WHERE id = ?1 OR id = ?2", vec![1, 2]),
+            ("SELECT v FROM t WHERE id = ? OR ? = id OR rowid = 5", vec![1, 2]),
+            // Residual conjuncts: the whole WHERE is re-applied per seeked row, so the
+            // list's `?`s are emitted once for the build and once inside the loop.
+            ("SELECT v FROM t WHERE id IN (?, ?) AND v <> ?", vec![1, 2, 1, 2, 3]),
+            ("SELECT v FROM t WHERE v <> ? AND id IN (?, ?)", vec![2, 3, 1, 2, 3]),
+            ("SELECT v FROM t WHERE id IN (?1, ?2) ORDER BY id", vec![1, 2]),
+            ("SELECT v FROM t WHERE id IN (?1, ?2) ORDER BY id DESC", vec![1, 2]),
+            ("SELECT COUNT(*) FROM t WHERE id IN (?1, ?2)", vec![1, 2]),
+            ("SELECT COUNT(*) FROM t WHERE v <> ? AND id IN (?, ?)", vec![2, 3, 1, 2, 3]),
+            // DML: SET placeholders come first in SQL order; the list numbers after them.
+            ("UPDATE t SET v = ? WHERE id IN (?, ?)", vec![2, 3, 1]),
+            ("UPDATE t SET v = ? WHERE k > ? AND id IN (?, ?)", vec![3, 4, 2, 3, 4, 1]),
+            ("DELETE FROM t WHERE id IN (?1, ?2)", vec![1, 2]),
+            ("DELETE FROM t WHERE id = ? OR id = ?", vec![1, 2]),
+            ("DELETE FROM t WHERE v = ? AND id IN (?, ?)", vec![2, 3, 1, 2, 3]),
+        ] {
+            let ops = program(sql);
+            assert_eq!(table_walks(&ops), 0, "`{sql}` walks the table cursor:\n{ops:#?}");
+            // SELECT/COUNT: exactly one `SeekRowid` (the loop body). UPDATE/DELETE add the
+            // Pass-2 re-seek of each collected rowid.
+            let expected_seeks = if sql.starts_with("SELECT") { 1 } else { 2 };
+            assert_eq!(
+                table_seeks(&ops),
+                expected_seeks,
+                "`{sql}` must seek the table from a single probe-set loop body"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex),
+                "`{sql}` must materialize the members into an ephemeral probe set"
+            );
+            assert_eq!(
+                ops.iter().filter(|op| op.opcode == Opcode::MustBeInt).count(),
+                ops.iter().filter(|op| op.opcode == Opcode::IdxInsert).count(),
+                "`{sql}` must INTEGER-coerce every member before it enters the probe set"
+            );
+            assert_eq!(
+                variables(&ops),
+                expected_variables,
+                "`{sql}` anonymous placeholder numbering"
+            );
+        }
+
+        // `ORDER BY <rowid> DESC` walks the probe set backwards instead of sorting.
+        let desc = program("SELECT v FROM t WHERE id IN (?1, ?2) ORDER BY id DESC");
+        assert!(desc.iter().any(|op| op.opcode == Opcode::Last && op.p1 == 1));
+        assert!(desc.iter().any(|op| op.opcode == Opcode::Prev && op.p1 == 1));
+        assert!(!desc.iter().any(|op| op.opcode == Opcode::SorterOpen));
+
+        // Declines: NOT IN, a non-constant member, a non-rowid column, a
+        // constant-only equality, LIMIT / DISTINCT (unchanged gates).
+        for sql in [
+            "SELECT v FROM t WHERE id NOT IN (?1, ?2)",
+            "SELECT v FROM t WHERE id IN (?1, k)",
+            "SELECT v FROM t WHERE id IN (?1, (SELECT 1))",
+            "SELECT v FROM t WHERE v IN (?1, ?2)",
+            "SELECT v FROM t WHERE id = ?1 OR k = ?2",
+            "SELECT v FROM t WHERE id = ?1 OR 5 = ?2",
+            "SELECT v FROM t WHERE id IN (?1, ?2) LIMIT 1",
+            "SELECT DISTINCT v FROM t WHERE id IN (?1, ?2)",
+            "SELECT v FROM t WHERE id IN (?1, ?2) ORDER BY v",
+        ] {
+            let ops = program(sql);
+            assert!(
+                table_walks(&ops) > 0,
+                "`{sql}` must decline the probe-set seek and scan the table"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex
+                    && ops.iter().any(|o| o.opcode == Opcode::SeekRowid && o.p1 == 0)),
+                "`{sql}` must not build a rowid probe set"
             );
         }
     }
