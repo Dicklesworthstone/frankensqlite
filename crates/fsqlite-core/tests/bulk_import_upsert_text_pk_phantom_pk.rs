@@ -2320,6 +2320,8 @@ const GH399_READER_DB_ENV: &str = "FSQLITE_GH399_READER_DB";
 #[cfg(unix)]
 const GH399_READER_SIGNAL_DIR_ENV: &str = "FSQLITE_GH399_READER_SIGNAL_DIR";
 #[cfg(unix)]
+const GH399_READER_READ_ONLY_ENV: &str = "FSQLITE_GH399_READER_READ_ONLY";
+#[cfg(unix)]
 const GH399_ROWS: usize = 400;
 
 /// Everything a reader can observe about `gh399_rows` in one snapshot: the
@@ -2386,8 +2388,19 @@ fn gh399_reset_gate_reader_helper() {
     let db = std::env::var(GH399_READER_DB_ENV).expect("helper needs the database path");
     let signals =
         std::path::PathBuf::from(std::env::var(GH399_READER_SIGNAL_DIR_ENV).expect("signal dir"));
+    let read_only = std::env::var(GH399_READER_READ_ONLY_ENV).is_ok_and(|value| value == "1");
     asupersync::test_utils::run_test(|| async move {
-        let conn = Connection::open(&db).await.expect("reader open");
+        let conn = if read_only {
+            Connection::open_schema_only(&db).await.expect("read-only reader open")
+        } else {
+            Connection::open(&db).await.expect("reader open")
+        };
+        if read_only {
+            assert!(matches!(
+                conn.execute("UPDATE gh399_rows SET payload = payload").await,
+                Err(fsqlite_error::FrankenError::ReadOnly)
+            ));
+        }
         execute_with_transient_retry(&conn, "PRAGMA busy_timeout=5000").await;
         execute_with_transient_retry(&conn, "BEGIN").await;
         let pinned = gh399_snapshot_fingerprint(&conn).await;
@@ -2462,6 +2475,17 @@ fn gh399_wal_len(wal_path: &std::path::Path) -> u64 {
 #[cfg(unix)]
 #[test]
 fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
+    gh399_checkpoint_peer_reader_case(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn gh294_readonly_peer_preserves_snapshot_across_writer_and_checkpoints() {
+    gh399_checkpoint_peer_reader_case(true);
+}
+
+#[cfg(unix)]
+fn gh399_checkpoint_peer_reader_case(read_only: bool) {
     use fsqlite_types::cx::Cx;
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::shm::{SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, wal_read_lock_slot};
@@ -2469,7 +2493,7 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
 
     const WAL_FRAME_BYTES: u64 = 24 + 4096;
 
-    asupersync::test_utils::run_test(|| async {
+    asupersync::test_utils::run_test(move || async move {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("gh399-reset-gate.db");
         let wal_path = dir.path().join("gh399-reset-gate.db-wal");
@@ -2633,6 +2657,7 @@ fn gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends() {
             .arg("--nocapture")
             .env(GH399_READER_DB_ENV, &db)
             .env(GH399_READER_SIGNAL_DIR_ENV, &signals)
+            .env(GH399_READER_READ_ONLY_ENV, if read_only { "1" } else { "0" })
             .spawn()
             .expect("spawn reader helper");
         gh399_wait_for_signal(&signals.join("pinned"), "pinned");

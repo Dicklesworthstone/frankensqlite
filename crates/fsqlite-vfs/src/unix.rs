@@ -1259,6 +1259,7 @@ impl Vfs for UnixVfs {
         let unix_file = UnixFile {
             file: Some(file),
             path: resolved,
+            open_flags: out_flags,
             lock_level: LockLevel::None,
             transient_shared_pending_gate: false,
             external_shared_snapshot_attempt: None,
@@ -1414,6 +1415,9 @@ impl UnixExternalMaintenanceAttempt {
 pub struct UnixFile {
     file: Option<Arc<File>>,
     path: PathBuf,
+    /// The caller's access mode, independent of the shared canonical fd's
+    /// writable capability. Read-only readers may share WAL marks, not publish them.
+    open_flags: VfsOpenFlags,
     lock_level: LockLevel,
     /// A transient SHARED-acquisition read lock on SQLite's PENDING byte.
     ///
@@ -2371,6 +2375,7 @@ impl UnixFile {
         let deferred = Self {
             file: self.file.take(),
             path: std::mem::take(&mut self.path),
+            open_flags: self.open_flags,
             lock_level: self.lock_level,
             transient_shared_pending_gate: self.transient_shared_pending_gate,
             external_shared_snapshot_attempt: self.external_shared_snapshot_attempt.take(),
@@ -3480,7 +3485,9 @@ fn write_wal_read_mark(region_0: &ShmRegion, index: u32, mark: u32) -> Result<()
 impl UnixFile {
     /// One `walTryBeginRead` attempt: share the slot already published at the
     /// best mark `<= mx_frame`, publishing `mx_frame` into a free slot first
-    /// when no slot carries it. `Ok(None)` asks the caller to retry after a
+    /// when no slot carries it and this handle permits writes. A read-only
+    /// handle shares an existing conservative mark without mutating SHM.
+    /// `Ok(None)` asks the caller to retry after a
     /// transient conflict (every slot pinned, or the shared slot's mark moved
     /// between publish and share).
     fn try_acquire_wal_reader_slot(
@@ -3489,6 +3496,18 @@ impl UnixFile {
         region_0: &ShmRegion,
         mx_frame: u32,
     ) -> Result<Option<u32>> {
+        // An empty WAL snapshot reads only the main database. Slot 0 protects
+        // it from backfill without requiring a published mark or pinning a
+        // WAL generation it does not use. This also admits a read-only opener
+        // immediately after a checkpoint has retired the older WAL marks.
+        if !self.open_flags.contains(VfsOpenFlags::READWRITE) && mx_frame == 0 {
+            let slot = wal_reader_lock_slot(0)?;
+            return match self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED) {
+                Ok(()) => Ok(Some(0)),
+                Err(FrankenError::Busy) => Ok(None),
+                Err(error) => Err(error),
+            };
+        }
         let mut mx_read_mark = 0_u32;
         let mut mx_index = 0_u32;
         for index in 1..WAL_NREADER {
@@ -3499,7 +3518,9 @@ impl UnixFile {
             }
         }
 
-        if mx_read_mark < mx_frame || mx_index == 0 {
+        if self.open_flags.contains(VfsOpenFlags::READWRITE)
+            && (mx_read_mark < mx_frame || mx_index == 0)
+        {
             for index in 1..WAL_NREADER {
                 let lock_slot = wal_reader_lock_slot(index)?;
                 match self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE) {
@@ -4861,6 +4882,112 @@ mod tests {
             .expect("registered");
         assert_eq!(tip_slot, 1, "slot 1 was re-armed at the WAL tip");
         reader.wal_reader_slot_release(&cx, tip_slot).unwrap();
+    }
+
+    #[test]
+    fn test_readonly_wal_reader_shares_older_mark_without_mutating_shm() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("readonly_reader_horizon.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let original_slot = writer.wal_reader_slot_acquire(&cx, 41).unwrap().unwrap();
+        writer.wal_reader_slot_release(&cx, original_slot).unwrap();
+        let before = fs::read(sqlite_shm_path(&path)).unwrap();
+
+        // The canonical descriptor is writable because the writer opened it
+        // first. The new handle must still honor its requested READONLY mode.
+        let (mut reader, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        let slot = reader.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        assert_eq!(slot, original_slot, "reuse the conservative older horizon");
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before);
+
+        // Publishing a newer writer horizon remains possible while the
+        // read-only handle pins the older slot: no writer serialization.
+        let newer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        assert_ne!(newer_slot, slot);
+        writer.wal_reader_slot_release(&cx, newer_slot).unwrap();
+        assert_eq!(writer.wal_checkpoint_reader_horizon(&cx, 42).unwrap(), 41);
+        assert!(!writer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
+
+        let before_release = fs::read(sqlite_shm_path(&path)).unwrap();
+        reader.wal_reader_slot_release(&cx, slot).unwrap();
+        reader.close(&cx).unwrap();
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before_release);
+        assert_eq!(writer.wal_checkpoint_reader_horizon(&cx, 42).unwrap(), 42);
+        assert!(writer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
+        writer.wal_checkpoint_reset_gate_release(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_readonly_wal_reader_rejects_missing_safe_mark_without_publication() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("readonly_reader_no_safe_mark.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let region = writer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        for index in 1..WAL_NREADER {
+            write_wal_read_mark(&region, index, WAL_READ_MARK_NOT_USED).unwrap();
+        }
+        let before = fs::read(sqlite_shm_path(&path)).unwrap();
+        let (mut reader, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        reader.set_busy_timeout_ms(1);
+        assert!(matches!(
+            reader.wal_reader_slot_acquire(&cx, 42),
+            Err(FrankenError::Busy)
+        ));
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before);
+
+        // Once a writable peer publishes a safe mark, the same read-only
+        // handle can acquire it. The failed attempt left no stale lock.
+        let writer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        let reader_slot = reader.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        assert_eq!(reader_slot, writer_slot);
+        reader.wal_reader_slot_release(&cx, reader_slot).unwrap();
+        writer.wal_reader_slot_release(&cx, writer_slot).unwrap();
+    }
+
+    #[test]
+    fn test_readonly_empty_wal_reader_uses_byte_neutral_backfill_fence() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("readonly_empty_wal_reader.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let region = writer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        for index in 1..WAL_NREADER {
+            write_wal_read_mark(&region, index, WAL_READ_MARK_NOT_USED).unwrap();
+        }
+        let before = fs::read(sqlite_shm_path(&path)).unwrap();
+        let (mut reader, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        let slot = reader.wal_reader_slot_acquire(&cx, 0).unwrap().unwrap();
+        assert_eq!(slot, 0, "an empty WAL uses the database-only reader slot");
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before);
+        assert!(!writer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap());
+        assert!(writer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
+        writer.wal_checkpoint_reset_gate_release(&cx).unwrap();
+
+        let newer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        writer.wal_reader_slot_release(&cx, newer_slot).unwrap();
+        reader.wal_reader_slot_release(&cx, slot).unwrap();
+        assert!(writer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap());
+        writer.wal_checkpoint_backfill_gate_release(&cx).unwrap();
     }
 
     /// GH#399: readers at one mark share a slot; a reader whose mark has no

@@ -1311,8 +1311,9 @@ pub trait VfsFile: Send + Sync {
     /// `mxFrame`), holding the chosen `WAL_READ_LOCK(i)` slot SHARED until
     /// [`Self::wal_reader_slot_release`].
     ///
-    /// Returns the held reader slot index (`1..WAL_NREADER`) or `None` when
-    /// the backend has no cross-process reader table. Returns `Busy` when
+    /// Returns the held reader slot index (`0..WAL_NREADER`) or `None` when
+    /// the backend has no cross-process reader table. Slot 0 protects a
+    /// database-only snapshot that reads no WAL frames. Returns `Busy` when
     /// every slot is pinned by other readers at incompatible marks for the
     /// whole busy budget.
     fn wal_reader_slot_acquire(&mut self, _cx: &Cx, _mx_frame: u32) -> Result<Option<u32>> {
