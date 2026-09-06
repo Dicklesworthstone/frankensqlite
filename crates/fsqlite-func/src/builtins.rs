@@ -2735,8 +2735,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     // value, then pads zeros (bd-o8m86). Round the naive
                     // fixed-point rendering to that cap; a no-op when prec stays
                     // within the value's meaningful precision. Alt-form-2 (`!`)
-                    // has its own shortest-round-trip rendering (which keeps the
-                    // exact integer of a large whole number), so it is not capped.
+                    // uses the shared SQLite 3.53 decoder's wider significant-
+                    // digit limit before placing the decimal point.
                     let mut mag = if alt_form2 {
                         let (digits, exp) = sqlite_float_altform2_digits(
                             val,

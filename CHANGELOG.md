@@ -51,6 +51,11 @@ Full workspace and all-features release validation remain in progress.
 
 ### SQL correctness and prepared statements
 
+- SQL `printf` and `format` now share the shell's SQLite 3.53 float decoder
+  for `%!e`, `%!f` and `%!g`, including uppercase variants, fractional rounding
+  carries and high precision. The bound-value differential guard compares
+  10,680 results with bundled SQLite 3.53.2
+  ([6455fbb29](https://github.com/Dicklesworthstone/frankensqlite/commit/6455fbb29)).
 - Prepared reads that recompile after a schema change now release the failed
   attempt's automatic read transaction. Subsequent index creation and writes
   succeed, while explicit transactions retain their caller-owned changes and
