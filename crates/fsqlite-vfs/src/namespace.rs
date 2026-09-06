@@ -23,8 +23,9 @@
 //! an exposure: the file was created `0600` on this call and the filesystem
 //! reported them anyway (a mount that does not persist POSIX permission bits,
 //! such as a WSL2 Windows drive without `metadata`), or the sidecar grants no
-//! group/other bit that the database file itself does not already grant. See
-//! `sidecar_exposure_is_acceptable`.
+//! principal class a bit that the database file does not already grant it
+//! (group bits count as the same principals only when the two files share a
+//! group). See `sidecar_exposure_is_acceptable`.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -1976,7 +1977,7 @@ fn validate_secure_lock_file(
         if metadata.uid() != effective_uid || metadata.nlink() != 1 {
             return Err(cannot_open(path));
         }
-        if !sidecar_exposure_is_acceptable(metadata.mode(), provenance) {
+        if !sidecar_exposure_is_acceptable(metadata.mode(), metadata.gid(), provenance) {
             return Err(cannot_open(path));
         }
     }
@@ -2023,8 +2024,23 @@ fn validate_secure_lock_file(
 ///    accepting a sidecar that was loosened beyond its database on a real
 ///    POSIX filesystem. A missing or non-regular database file offers no
 ///    baseline and the sidecar fails closed as before.
+///
+///    "Grants no bit the database does not" is evaluated per principal class,
+///    not on the raw bit pattern, because POSIX resolves exactly one class per
+///    process (owner, else group, else other) and the group class names a
+///    specific set of accounts — the file's group. When the two files share a
+///    group, the sidecar's group bits are bounded by the database's group bits
+///    and its other bits by the database's other bits. When the groups differ,
+///    a sidecar-group member may fall into either class of the database, so a
+///    sidecar bit is covered only by the database bit in *both* classes;
+///    permission-less mounts report one owner and group for every file, so
+///    they always take the same-group branch.
 #[cfg(unix)]
-fn sidecar_exposure_is_acceptable(sidecar_mode: u32, provenance: SidecarProvenance<'_>) -> bool {
+fn sidecar_exposure_is_acceptable(
+    sidecar_mode: u32,
+    sidecar_gid: u32,
+    provenance: SidecarProvenance<'_>,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
     let exposure = sidecar_mode & 0o077;
@@ -2040,7 +2056,15 @@ fn sidecar_exposure_is_acceptable(sidecar_mode: u32, provenance: SidecarProvenan
             if !database.file_type().is_file() {
                 return false;
             }
-            exposure & !(database.mode() & 0o077) == 0
+            let database_group = database.mode() & 0o070;
+            let database_other = database.mode() & 0o007;
+            let (group_cover, other_cover) = if database.gid() == sidecar_gid {
+                (database_group, database_other)
+            } else {
+                let both = (database_group >> 3) & database_other;
+                (both << 3, both)
+            };
+            exposure & !(group_cover | other_cover) == 0
         }
     }
 }
@@ -4370,11 +4394,13 @@ mod tests {
     /// The permission policy in `sidecar_exposure_is_acceptable`: owner-only
     /// always passes; a just-created file passes regardless (its bits came
     /// from the mount, not from anyone loosening it); an existing sidecar
-    /// passes only when it grants nothing beyond its database.
+    /// passes only when every principal class it grants is granted at least
+    /// as much by its database — which for group bits depends on the two
+    /// files sharing a group.
     #[cfg(unix)]
     #[test]
     fn sidecar_exposure_policy_is_bounded_by_the_database_file() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let dir = tempdir().expect("tempdir");
         let database = dir.path().join("policy.db");
@@ -4382,24 +4408,36 @@ mod tests {
         let existing = SidecarProvenance::Existing {
             database_path: &database,
         };
+        // The gid a sidecar created beside the database carries, and one it
+        // only carries once the owner regroups it. The policy compares gids,
+        // never memberships, so the second need not name a real group.
+        create_database(&database, b"policy");
+        let same_gid = fs::metadata(&database).expect("database gid").gid();
+        let other_gid = same_gid.wrapping_add(1);
 
-        assert!(sidecar_exposure_is_acceptable(0o100_600, existing));
-        assert!(sidecar_exposure_is_acceptable(0o100_700, existing));
+        assert!(sidecar_exposure_is_acceptable(
+            0o100_600, same_gid, existing
+        ));
+        assert!(sidecar_exposure_is_acceptable(
+            0o100_700, other_gid, existing
+        ));
         // A fresh `O_EXCL` create that reads back as 0777 is the mount
         // reporting a fixed mask (WSL drvfs without `metadata`, FAT/exFAT).
         assert!(sidecar_exposure_is_acceptable(
             0o100_777,
+            other_gid,
             SidecarProvenance::CreatedNow
         ));
         // No database to bound the exposure: fail closed.
         assert!(!sidecar_exposure_is_acceptable(
             0o100_644,
+            same_gid,
             SidecarProvenance::Existing {
                 database_path: &missing,
             },
         ));
 
-        create_database(&database, b"policy");
+        // Same group: group bits bound group bits, other bits bound other bits.
         for (database_mode, sidecar_mode, accepted) in [
             (0o644, 0o644, true),
             (0o644, 0o640, true),
@@ -4409,13 +4447,45 @@ mod tests {
             (0o600, 0o640, false),
             (0o777, 0o777, true),
             (0o777, 0o666, true),
+            // POSIX resolves one class per process: a group member of a 0604
+            // database is refused by its group class, so a 0640 sidecar would
+            // grant that member something the database does not.
+            (0o604, 0o640, false),
+            (0o604, 0o604, true),
+            (0o640, 0o604, false),
         ] {
             fs::set_permissions(&database, fs::Permissions::from_mode(database_mode))
                 .expect("set database mode");
             assert_eq!(
-                sidecar_exposure_is_acceptable(0o100_000 | sidecar_mode, existing),
+                sidecar_exposure_is_acceptable(0o100_000 | sidecar_mode, same_gid, existing),
                 accepted,
-                "database {database_mode:04o} sidecar {sidecar_mode:04o}"
+                "same group: database {database_mode:04o} sidecar {sidecar_mode:04o}"
+            );
+        }
+
+        // Different group: a sidecar-group member may be in the database's
+        // group or not, so a sidecar bit needs the database bit in both
+        // classes. (A sidecar in a group other than its database's arises only
+        // from the owner regrouping it, e.g. `chgrp` or a setgid directory
+        // plus a database moved in from elsewhere.)
+        for (database_mode, sidecar_mode, accepted) in [
+            (0o640, 0o640, false),
+            (0o604, 0o604, false),
+            (0o604, 0o640, false),
+            (0o644, 0o640, true),
+            (0o644, 0o604, true),
+            (0o644, 0o644, true),
+            (0o664, 0o640, true),
+            (0o664, 0o620, false),
+            (0o666, 0o666, true),
+            (0o777, 0o777, true),
+        ] {
+            fs::set_permissions(&database, fs::Permissions::from_mode(database_mode))
+                .expect("set database mode");
+            assert_eq!(
+                sidecar_exposure_is_acceptable(0o100_000 | sidecar_mode, other_gid, existing),
+                accepted,
+                "different group: database {database_mode:04o} sidecar {sidecar_mode:04o}"
             );
         }
 
@@ -4425,6 +4495,7 @@ mod tests {
         fs::set_permissions(&database, fs::Permissions::from_mode(0o777)).expect("loosen");
         assert!(!sidecar_exposure_is_acceptable(
             0o100_777,
+            same_gid,
             SidecarProvenance::Existing {
                 database_path: &link,
             },

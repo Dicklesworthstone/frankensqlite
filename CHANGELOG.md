@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | CLI statement batches, lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | CLI statement batches, lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions, parameterized rowid IN-list seeks (GH#415) |
 | [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) | Release | 2026-09-06 | SQL/shell correctness, real metrics & diagnostics (reader gauge, WAL durability, MVCC conflict/commit counters, /metrics HTTP), PRAGMA cache_size as a real page budget, aoj0g journal-boundary savepoint (O(n^2)->flat insert ramp) + private-allocation ownership through rollback, printf/FTS5 3.53.2 parity, epoch/RaptorQ native-storage hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
@@ -81,6 +81,30 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   the writer performs another operation
   ([c2bc489d6](https://github.com/Dicklesworthstone/frankensqlite/commit/c2bc489d6)).
 
+### Query planning
+
+- `WHERE <rowid> IN (?1, ?2, …)` on an INTEGER PRIMARY KEY table now plans as
+  rowid seeks instead of a full table scan (GH#415). The IN-list seek only
+  admitted integer literals, so the parameterized list every driver emits —
+  and `rowid IN (?, …)`, `id = ?1 OR id = ?2`, and literal lists such as
+  `IN (-5, '7', 2.0)` — walked the whole table with the membership test
+  evaluated per row (cass GH#382 spent minutes scanning 12.9M rows for 5 ids).
+  Bind-time-constant members are now materialized once into a sorted,
+  de-duplicated ephemeral probe set and `SeekRowid`-looped, the same build-then-
+  loop shape stock SQLite emits: NULL, non-integer, and duplicate members are
+  dropped or collapsed at bind time, text/real members coerce under INTEGER
+  affinity (`'3'`/`3.0` match rowid 3, `2.5`/`'3abc'` match nothing), and
+  `ORDER BY <rowid>` (ASC/DESC) is served by the probe set without a sorter.
+  The same path serves `COUNT(*)`, `UPDATE`, and `DELETE` by parameterized
+  rowid list, including residual conjuncts (`… AND v = ?`) with correct
+  anonymous-placeholder numbering. `EXPLAIN QUERY PLAN` reports
+  `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)` for these shapes, including
+  the ORDER BY and aggregate forms that carry no planner directive. The
+  secondary-index IN-list seek (`<indexed col> IN (?, ?)`) still requires
+  integer literals and remains a follow-up
+  ([0061b4ea7](https://github.com/Dicklesworthstone/frankensqlite/commit/0061b4ea7),
+  [1e770535d](https://github.com/Dicklesworthstone/frankensqlite/commit/1e770535d)).
+
 ### Regression coverage
 
 - The in-memory autocommit guard now runs 10,000 indexed writes and compares
@@ -125,9 +149,11 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   mount mask. A sidecar this process just created with `O_CREAT|O_EXCL` is
   accepted whatever mode the mount reports back, and an existing sidecar is
   accepted when it grants no group/other bit that the database file itself
-  does not already grant; the owner, single-hard-link and regular-file checks
-  are unchanged, and a sidecar loosened beyond its database on a real POSIX
-  filesystem still fails closed (beads_rust GH#491).
+  does not already grant to the same principals — group bits count only when
+  the sidecar and the database share a group, since POSIX resolves one
+  permission class per process; the owner, single-hard-link and regular-file
+  checks are unchanged, and a sidecar loosened beyond its database on a real
+  POSIX filesystem still fails closed (beads_rust GH#491).
 
 ---
 
