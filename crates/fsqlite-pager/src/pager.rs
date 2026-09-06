@@ -23457,9 +23457,9 @@ fn wal_reader_mark_for_snapshot(snapshot: Option<&traits::WalPublicationSnapshot
 ///
 /// Runs under the main-file SHARED fence and after the WAL backend pinned the
 /// snapshot, so the published mark is exactly the horizon this window reads
-/// through. A read-only pager that cannot open a writable `*-shm` (the table
-/// lives there) proceeds unregistered with a warning rather than failing the
-/// read; a read-write pager propagates the error so the caller retries.
+/// through. Registration errors propagate for both access modes: a read-only
+/// snapshot also needs checkpoint protection, and silently proceeding without
+/// a reader slot would let a peer backfill or reset underneath that snapshot.
 async fn register_wal_reader_slot<F: VfsFile>(
     inner: &mut PagerInner<F>,
     cx: &Cx,
@@ -23491,16 +23491,6 @@ async fn register_wal_reader_slot<F: VfsFile>(
                 mx_frame,
                 reader_slot = ?slot,
                 "registered WAL read snapshot with the cross-process reader table"
-            );
-            Ok(())
-        }
-        Err(error) if inner.access_mode.is_readonly() && !matches!(error, FrankenError::Busy) => {
-            tracing::warn!(
-                target: "fsqlite::wal::checkpoint_coordination",
-                trace_id = cx.trace_id(),
-                mx_frame,
-                %error,
-                "read-only pager could not register its WAL read snapshot; peers cannot see this reader"
             );
             Ok(())
         }
