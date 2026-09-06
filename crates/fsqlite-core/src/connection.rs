@@ -12026,7 +12026,8 @@ pub struct Connection {
     /// Lazy uncorrelated IN results, scoped to each fallback WHERE loop.
     /// Only expression addresses admitted from that loop's live AST may enter
     /// its map; nested SELECTs cannot reuse transient or outer-scope addresses.
-    in_subquery_memo: RefCell<Vec<HashMap<usize, Option<MaterializedInSubquery>>>>,
+    /// Frames are installed only during polling, never across `Pending`.
+    in_subquery_memo: RefCell<Vec<InSubqueryMemo>>,
     /// Deferred MemDatabase upserts for prepared direct-simple INSERTs when the
     /// connection cannot keep the MemDatabase image exact inline.
     ///
@@ -81009,7 +81010,11 @@ impl Connection {
         ExistsProbeMemoGuard { conn: self }
     }
 
-    fn arm_in_subquery_memo<'a>(&'a self, expr: &'a Expr) -> InSubqueryMemoGuard<'a> {
+    fn with_in_subquery_memo<'a, T>(
+        &'a self,
+        expr: &'a Expr,
+        inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+    ) -> InSubqueryMemoFuture<'a, T> {
         let mut scope = HashMap::new();
         // Restrict admission to the boolean skeleton of this exact WHERE AST.
         // In particular, never descend into a nested SELECT: its expression
@@ -81040,10 +81045,11 @@ impl Connection {
                 _ => {}
             }
         }
-        self.in_subquery_memo.borrow_mut().push(scope);
-        InSubqueryMemoGuard {
+        InSubqueryMemoFuture {
             conn: self,
             _expr: expr,
+            scope: Some(scope),
+            inner,
         }
     }
 
@@ -82236,8 +82242,8 @@ impl Connection {
                                 let _cache_guard =
                                     BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                                 let rows = Arc::new(execute_nested_select(subquery.clone()).await?);
-                                // Nested WHERE guards have already popped their
-                                // frames. Insert only into a pre-admitted slot;
+                                // Nested WHERE polls have restored this frame.
+                                // Insert only into a pre-admitted slot;
                                 // never memoize transient nested AST addresses.
                                 if let Some(slot) = self
                                     .in_subquery_memo
@@ -90312,31 +90318,37 @@ impl Connection {
             // table for every outer row. The guard disarms+clears on exit so the
             // memo is never consulted across statements.
             let _exists_memo_guard = self.arm_exists_probe_memo();
-            let _in_subquery_memo_guard = self.arm_in_subquery_memo(where_expr);
-            let mut filtered = Vec::with_capacity(combined.len());
-            for row in combined {
-                // WHERE is a truthiness context: stock compiles it through
-                // ExprIfTrue, so AND/OR short-circuit left-to-right and a
-                // would-be-skipped operand is never evaluated once the chain's
-                // outcome is already decided. Evaluating the whole predicate
-                // eagerly (`eval_expr_with_subqueries` + `is_sqlite_truthy`)
-                // would materialize an OR right arm even when the left disjunct
-                // is TRUE, so an erroring correlated subquery there (e.g.
-                // `EXISTS(SELECT 1 FROM json_each(x))` over a non-JSON row)
-                // would wrongly fail the whole query. `eval_expr_truthiness`
-                // mirrors stock's short-circuit while yielding the identical
-                // keep/filter decision on non-erroring rows (both map operand
-                // truth through `is_sqlite_truthy` under the same three-valued
-                // logic). bd-and-or-short-circuit-value-jump-gaps-dkswh.
-                let keep = self
-                    .eval_expr_truthiness(where_expr, true, &row, &col_map, params)
-                    .await?
-                    .unwrap_or(false);
-                if keep {
-                    filtered.push(row);
-                }
-            }
-            combined = filtered;
+            combined = self
+                .with_in_subquery_memo(
+                    where_expr,
+                    Box::pin(async {
+                        let mut filtered = Vec::with_capacity(combined.len());
+                        for row in combined {
+                            // WHERE is a truthiness context: stock compiles it through
+                            // ExprIfTrue, so AND/OR short-circuit left-to-right and a
+                            // would-be-skipped operand is never evaluated once the chain's
+                            // outcome is already decided. Evaluating the whole predicate
+                            // eagerly (`eval_expr_with_subqueries` + `is_sqlite_truthy`)
+                            // would materialize an OR right arm even when the left disjunct
+                            // is TRUE, so an erroring correlated subquery there (e.g.
+                            // `EXISTS(SELECT 1 FROM json_each(x))` over a non-JSON row)
+                            // would wrongly fail the whole query. `eval_expr_truthiness`
+                            // mirrors stock's short-circuit while yielding the identical
+                            // keep/filter decision on non-erroring rows (both map operand
+                            // truth through `is_sqlite_truthy` under the same three-valued
+                            // logic). bd-and-or-short-circuit-value-jump-gaps-dkswh.
+                            let keep = self
+                                .eval_expr_truthiness(where_expr, true, &row, &col_map, params)
+                                .await?
+                                .unwrap_or(false);
+                            if keep {
+                                filtered.push(row);
+                            }
+                        }
+                        Ok::<_, FrankenError>(filtered)
+                    }),
+                )
+                .await?;
         }
 
         // ── 5b. Build set of col_map indices to skip for SELECT * ──
@@ -124803,17 +124815,48 @@ impl MaterializedInSubquery {
     }
 }
 
-/// Each nested WHERE owns a separate frame, even if it admits no probes.
-/// Holding the original AST alive prevents pointer reuse for admitted keys.
-/// Drop releases all rows/indexes on success, error, cancellation or unwind.
+type InSubqueryMemo = HashMap<usize, Option<MaterializedInSubquery>>;
+
+/// Restores this future's frame before another future can be polled. Nested
+/// WHERE polls unwind in stack order; suspended futures never occupy the stack.
 struct InSubqueryMemoGuard<'a> {
     conn: &'a Connection,
-    _expr: &'a Expr,
+    scope: &'a mut Option<InSubqueryMemo>,
 }
 
 impl Drop for InSubqueryMemoGuard<'_> {
     fn drop(&mut self) {
-        self.conn.in_subquery_memo.borrow_mut().pop();
+        *self.scope = self.conn.in_subquery_memo.borrow_mut().pop();
+    }
+}
+
+/// Each WHERE future owns its rows/indexes, even while suspended. Holding the
+/// original AST alive prevents pointer reuse for admitted keys. Cancellation
+/// in any order drops only that future's frame, without exposing it to peers.
+struct InSubqueryMemoFuture<'a, T> {
+    conn: &'a Connection,
+    _expr: &'a Expr,
+    scope: Option<InSubqueryMemo>,
+    inner: Pin<Box<dyn Future<Output = T> + 'a>>,
+}
+
+impl<T> Future for InSubqueryMemoFuture<'_, T> {
+    type Output = T;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        this.conn
+            .in_subquery_memo
+            .borrow_mut()
+            .push(this.scope.take().expect("memo frame restored after each poll"));
+        let _scope = InSubqueryMemoGuard {
+            conn: this.conn,
+            scope: &mut this.scope,
+        };
+        this.inner.as_mut().poll(cx)
     }
 }
 
@@ -125041,11 +125084,108 @@ impl Drop for ExistsProbeMemoGuard<'_> {
 #[cfg(test)]
 mod exists_value_set_tests {
     use super::{
-        ExistsProbeCollation, ExistsProbeMode, ExistsValueSet, MaterializedInSubquery, Row,
+        Connection, ExistsProbeCollation, ExistsProbeMode, ExistsValueSet, MaterializedInSubquery, Row,
         cmp_values_with_comparison_affinity, exists_probe_mode, exists_probe_values_equal,
     };
+    use fsqlite_ast::{Expr, SelectCore, Statement};
     use fsqlite_types::{SqliteValue, TypeAffinity};
+    use std::cell::Cell;
+    use std::future::{Future, poll_fn};
     use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn lazy_in_memo_isolates_non_lifo_pending_executions() {
+        async fn probe_until_released(
+            conn: &Connection,
+            expr: &Expr,
+            parameter: i64,
+            finish: &Cell<bool>,
+        ) -> SqliteValue {
+            let params = [SqliteValue::Integer(parameter)];
+            let first = conn
+                .eval_expr_with_subqueries(expr, &[], &[], Some(&params))
+                .await
+                .unwrap();
+            assert_eq!(first, SqliteValue::Integer(i64::from(parameter == 1)));
+            poll_fn(|_| {
+                if finish.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let resumed = conn
+                .eval_expr_with_subqueries(expr, &[], &[], Some(&params))
+                .await
+                .unwrap();
+            assert_eq!(resumed, first, "another execution replaced the cached RHS");
+            resumed
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE labels(id INTEGER); INSERT INTO labels VALUES(1),(2)")
+                .await
+                .unwrap();
+            let (statement, _) = fsqlite_parser::parse_first_statement_with_tail(
+                "SELECT 1 WHERE 1 IN (SELECT id FROM labels WHERE id=?1 GROUP BY id)",
+            )
+            .unwrap()
+            .unwrap();
+            let Statement::Select(select) = statement else {
+                panic!("expected SELECT");
+            };
+            let SelectCore::Select { where_clause, .. } = &select.body.select else {
+                panic!("expected SELECT core");
+            };
+            let expr = where_clause.as_deref().unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            for cancel_first in [true, false] {
+                let finish_a = Cell::new(false);
+                let finish_b = Cell::new(false);
+                // Exactly the same live AST address, with different bindings.
+                let mut a = Box::pin(conn.with_in_subquery_memo(
+                    expr,
+                    Box::pin(probe_until_released(&conn, expr, 1, &finish_a)),
+                ));
+                let mut b = Box::pin(conn.with_in_subquery_memo(
+                    expr,
+                    Box::pin(probe_until_released(&conn, expr, 2, &finish_b)),
+                ));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(a.as_mut().poll(&mut context).is_pending());
+                assert!(conn.in_subquery_memo.borrow().is_empty());
+                assert!(b.as_mut().poll(&mut context).is_pending());
+                assert!(conn.in_subquery_memo.borrow().is_empty());
+                assert!(a.as_mut().poll(&mut context).is_pending());
+                if cancel_first {
+                    drop(a);
+                    finish_b.set(true);
+                    assert_eq!(
+                        b.as_mut().poll(&mut context),
+                        Poll::Ready(SqliteValue::Integer(0))
+                    );
+                    drop(b);
+                } else {
+                    finish_a.set(true);
+                    assert_eq!(
+                        a.as_mut().poll(&mut context),
+                        Poll::Ready(SqliteValue::Integer(1))
+                    );
+                    drop(a);
+                    drop(b);
+                }
+                assert!(conn.in_subquery_memo.borrow().is_empty());
+            }
+            conn.execute("ROLLBACK").await.unwrap();
+            let rows = conn.query("SELECT COUNT(*) FROM labels WHERE id IN (SELECT id FROM labels GROUP BY id)").await.unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(2)]);
+            assert!(conn.in_subquery_memo.borrow().is_empty());
+            conn.close().await.unwrap();
+        });
+    }
 
     /// A spread of values covering every storage class plus the tricky numeric
     /// boundaries (cross-type INTEGER/REAL, large ints beyond f64 precision,

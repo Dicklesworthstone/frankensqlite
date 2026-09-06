@@ -1047,13 +1047,21 @@ fn txn_journal_mode_all_modes_response_parity() {
 
         eprintln!("bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=start");
 
+        for sql in [
+            "CREATE TABLE t_L(id INTEGER PRIMARY KEY, v TEXT);",
+            "INSERT INTO t_L VALUES (0, 'before-transitions');",
+        ] {
+            c_conn.execute(sql, []).expect("stock initial data");
+            f_conn.execute(sql).await.expect("Franken initial data");
+        }
+
         // Test each journal_mode transition. SQLite echoes back the mode that was
         // actually set (which may differ from the requested mode on some backends).
         let modes = [
             "wal", "delete", "truncate", "persist", "memory", "off", "wal",
         ];
 
-        for mode in modes {
+        for (index, mode) in modes.into_iter().enumerate() {
             let sql = format!("PRAGMA journal_mode='{mode}';");
             let c_resp = csqlite_query_values(&c_conn, &sql);
             let f_resp = fsqlite_query_values(&f_conn, &sql).await;
@@ -1072,23 +1080,34 @@ fn txn_journal_mode_all_modes_response_parity() {
                 c_query, f_query,
                 "journal_mode query mismatch after setting mode='{mode}'"
             );
-        }
 
-        // Verify data integrity is maintained through mode transitions.
-        c_conn
-            .execute("CREATE TABLE t_L(id INTEGER PRIMARY KEY, v TEXT)", [])
-            .expect("csqlite create");
-        f_conn
-            .execute("CREATE TABLE t_L(id INTEGER PRIMARY KEY, v TEXT)")
-            .await
-            .expect("fsqlite create");
-        c_conn
-            .execute("INSERT INTO t_L VALUES (1, 'mode_test')", [])
-            .expect("csqlite insert");
-        f_conn
-            .execute("INSERT INTO t_L VALUES (1, 'mode_test')")
-            .await
-            .expect("fsqlite insert");
+            // Echoing a mode on an empty database does not prove its write or
+            // visibility path. Carry existing rows across every transition,
+            // acknowledge a new write in that mode, then read the whole file
+            // independently before the writer does anything else.
+            let insert = format!("INSERT INTO t_L VALUES ({}, '{mode}');", index + 1);
+            c_conn.execute(&insert, []).expect("stock mode write");
+            f_conn.execute(&insert).await.expect("Franken mode write");
+            let dump = "SELECT id, v FROM t_L ORDER BY id;";
+            let expected = csqlite_query_values(&c_conn, dump);
+            let peer = rusqlite::Connection::open(&f_path).expect("stock opens candidate");
+            assert_eq!(
+                csqlite_query_values(&peer, dump),
+                expected,
+                "acknowledged rows must be independently visible in mode='{mode}'"
+            );
+            assert_eq!(
+                csqlite_query_values(&peer, "PRAGMA integrity_check;"),
+                vec![vec![SqlValue::Text("ok".to_owned())]],
+                "candidate integrity in mode='{mode}'"
+            );
+            drop(peer);
+            assert_eq!(
+                fsqlite_query_values(&f_conn, dump).await,
+                expected,
+                "writer visibility in mode='{mode}'"
+            );
+        }
 
         let c_count = csqlite_query_values(&c_conn, "SELECT COUNT(*) FROM t_L;");
         let f_count = fsqlite_query_values(&f_conn, "SELECT COUNT(*) FROM t_L;").await;
@@ -1099,6 +1118,11 @@ fn txn_journal_mode_all_modes_response_parity() {
             c_count, f_count,
             "data integrity mismatch after mode transitions"
         );
+        assert_eq!(f_count, vec![vec![SqlValue::Integer(8)]]);
+        f_conn
+            .close()
+            .await
+            .expect("close after every journal mode");
     });
 }
 
