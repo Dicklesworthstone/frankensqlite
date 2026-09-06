@@ -215,7 +215,8 @@ use fsqlite_types::value::{
     format_sqlite_float, sql_like_cased,
 };
 use fsqlite_types::{
-    BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize, Region,
+    BTreePageHeader, ComparisonAffinity, DatabaseHeader, EProcessConfig, EProcessOracle,
+    ExprAffinity, PageNumber, PageSize, Region,
     StrictColumnType, TextEncoding, TypeAffinity, without_rowid_declared_to_physical,
     without_rowid_pk_is_leading, without_rowid_storage_order,
 };
@@ -12022,6 +12023,10 @@ pub struct Connection {
     /// column promoted to an O(child) value-set build followed by O(1)
     /// membership checks. This avoids penalizing small early-hit outer inputs.
     exists_probe_memo: RefCell<ExistsProbeMemo>,
+    /// Lazy uncorrelated IN results, scoped to each fallback WHERE loop.
+    /// Only expression addresses admitted from that loop's live AST may enter
+    /// its map; nested SELECTs cannot reuse transient or outer-scope addresses.
+    in_subquery_memo: RefCell<Vec<HashMap<usize, Option<MaterializedInSubquery>>>>,
     /// Deferred MemDatabase upserts for prepared direct-simple INSERTs when the
     /// connection cannot keep the MemDatabase image exact inline.
     ///
@@ -13990,6 +13995,7 @@ impl Connection {
             quotient_filter_short_circuits: Cell::new(0),
             precomputed_in_sets: RefCell::new(std::collections::HashMap::new()),
             exists_probe_memo: RefCell::new(ExistsProbeMemo::default()),
+            in_subquery_memo: RefCell::new(Vec::new()),
             pending_memdb_direct_upserts: RefCell::new(Vec::new()),
             pending_direct_insert_page_run: RefCell::new(None),
             pending_direct_insert_page_run_active: Cell::new(false),
@@ -14510,6 +14516,7 @@ impl Connection {
             quotient_filter_short_circuits: Cell::new(0),
             precomputed_in_sets: RefCell::new(std::collections::HashMap::new()),
             exists_probe_memo: RefCell::new(ExistsProbeMemo::default()),
+            in_subquery_memo: RefCell::new(Vec::new()),
             pending_memdb_direct_upserts: RefCell::new(Vec::new()),
             pending_direct_insert_page_run: RefCell::new(None),
             pending_direct_insert_page_run_active: Cell::new(false),
@@ -49289,8 +49296,9 @@ impl Connection {
         expr: &Expr,
         row: &[SqliteValue],
         col_map: &[(String, String, bool)],
-    ) -> TypeAffinity {
+    ) -> Option<TypeAffinity> {
         match expr {
+            Expr::BoundOuterValue { affinity, .. } => return *affinity,
             Expr::Collate { expr, .. } => {
                 return self.operand_affinity_for_current_row(expr, row, col_map);
             }
@@ -49306,19 +49314,19 @@ impl Connection {
                     .resolve_in_rhs_donor_metadata(&bound_select)
                     .columns
                     .first()
-                    .and_then(|column| column.affinity)
-                    .unwrap_or(TypeAffinity::Blob);
+                    .and_then(|column| column.affinity);
             }
-            _ => {}
+            Expr::Column(_, _) | Expr::Cast { .. } => {}
+            _ => return None,
         }
 
-        current_join_eval_collation_context_snapshot().map_or_else(
+        Some(current_join_eval_collation_context_snapshot().map_or_else(
             || {
                 let schemas = self.schema.borrow();
                 resolve_operand_affinity(expr, &schemas)
             },
             |context| join_expr_affinity(expr, col_map, &context),
-        )
+        ))
     }
 
     /// Compare one field of a vector `IN` probe using metadata from the
@@ -49338,8 +49346,12 @@ impl Connection {
         col_map: &[(String, String, bool)],
     ) -> std::cmp::Ordering {
         let collation = join_comparison_collation(left_expr, right_expr, col_map);
-        let left_affinity = self.operand_affinity_for_current_row(left_expr, row, col_map);
-        let right_affinity = self.operand_affinity_for_current_row(right_expr, row, col_map);
+        let left_affinity = self
+            .operand_affinity_for_current_row(left_expr, row, col_map)
+            .unwrap_or(TypeAffinity::Blob);
+        let right_affinity = self
+            .operand_affinity_for_current_row(right_expr, row, col_map)
+            .unwrap_or(TypeAffinity::Blob);
         let registry = current_join_eval_collation_context_snapshot().map_or_else(
             || lock_unpoisoned(&self.collation_registry).clone(),
             |context| context.registry.clone(),
@@ -80997,6 +81009,44 @@ impl Connection {
         ExistsProbeMemoGuard { conn: self }
     }
 
+    fn arm_in_subquery_memo<'a>(&'a self, expr: &'a Expr) -> InSubqueryMemoGuard<'a> {
+        let mut scope = HashMap::new();
+        // Restrict admission to the boolean skeleton of this exact WHERE AST.
+        // In particular, never descend into a nested SELECT: its expression
+        // addresses can be reused after it returns for the next outer row.
+        let mut pending = vec![expr];
+        while let Some(expr) = pending.pop() {
+            match expr {
+                Expr::BinaryOp {
+                    op: BinaryOp::And | BinaryOp::Or,
+                    left,
+                    right,
+                    ..
+                } => pending.extend([left.as_ref(), right.as_ref()]),
+                Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr,
+                    ..
+                } => pending.push(expr),
+                Expr::In {
+                    expr: left,
+                    set: InSet::Subquery(subquery),
+                    ..
+                } if !matches!(left.as_ref(), Expr::RowValue(..))
+                    && !rewrite_probe_is_correlated(self, subquery) =>
+                {
+                    scope.insert(std::ptr::from_ref(expr) as usize, None);
+                }
+                _ => {}
+            }
+        }
+        self.in_subquery_memo.borrow_mut().push(scope);
+        InSubqueryMemoGuard {
+            conn: self,
+            _expr: expr,
+        }
+    }
+
     /// bd-kwaam (frankensqlite#377): maximum child-table size for the
     /// unamortized linear `EXISTS` direct probe at memo depth 0. Above this,
     /// evaluation falls through to the nested-statement path, which scales
@@ -82165,24 +82215,47 @@ impl Connection {
                     // A subquery RHS is fully materialized before SQLite
                     // evaluates the scalar LHS. Explicit expression lists use
                     // the opposite, LHS-first order and remain lazy below.
+                    let memo_key = std::ptr::from_ref(expr) as usize;
                     let materialized_subquery_rows = match set {
                         InSet::Subquery(_) => {
                             let subquery = bound_in_subquery
                                 .as_ref()
                                 .expect("subquery binding prepared above");
-                            self.validate_select_column_references(subquery)?;
-                            self.validate_in_subquery_column_count(e, subquery)?;
-                            let _cache_guard =
-                                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
-                            let rows = execute_nested_select(subquery.clone()).await?;
-                            Some(rows)
+                            let cached = self
+                                .in_subquery_memo
+                                .borrow()
+                                .last()
+                                .and_then(|scope| scope.get(&memo_key))
+                                .and_then(Option::as_ref)
+                                .map(|cached| Arc::clone(&cached.rows));
+                            if let Some(rows) = cached {
+                                Some(rows)
+                            } else {
+                                self.validate_select_column_references(subquery)?;
+                                self.validate_in_subquery_column_count(e, subquery)?;
+                                let _cache_guard =
+                                    BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                                let rows = Arc::new(execute_nested_select(subquery.clone()).await?);
+                                // Nested WHERE guards have already popped their
+                                // frames. Insert only into a pre-admitted slot;
+                                // never memoize transient nested AST addresses.
+                                if let Some(slot) = self
+                                    .in_subquery_memo
+                                    .borrow_mut()
+                                    .last_mut()
+                                    .and_then(|scope| scope.get_mut(&memo_key))
+                                {
+                                    *slot = Some(MaterializedInSubquery::new(Arc::clone(&rows)));
+                                }
+                                Some(rows)
+                            }
                         }
                         InSet::Table(name) => {
                             let subquery = in_table_name_to_select_statement(name);
                             self.validate_select_column_references(&subquery)?;
                             self.validate_in_subquery_column_count(e, &subquery)?;
                             let rows = execute_nested_select(subquery.clone()).await?;
-                            Some(rows)
+                            Some(Arc::new(rows))
                         }
                         InSet::List(_) => None,
                     };
@@ -82241,7 +82314,7 @@ impl Connection {
                     let coll_ref = subquery_collation.as_deref();
                     let has_non_binary_collation =
                         coll_ref.is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"));
-                    let (left_affinity, subquery_affinity) = {
+                    let (left_affinity, in_comparison_affinity) = {
                         let left_affinity = self.operand_affinity_for_current_row(e, row, col_map);
                         let subquery_affinity = match set {
                             InSet::Subquery(_) | InSet::Table(_) => in_set_donor_metadata
@@ -82249,13 +82322,44 @@ impl Connection {
                                 .expect("IN donor metadata prepared above")
                                 .columns
                                 .first()
-                                .and_then(|column| column.affinity)
-                                .unwrap_or(TypeAffinity::Blob),
-                            InSet::List(_) => TypeAffinity::Blob,
+                                .and_then(|column| column.affinity),
+                            InSet::List(_) => None,
                         };
-                        (left_affinity, subquery_affinity)
+                        let comparison = ComparisonAffinity::from_operands(
+                            left_affinity.map_or(ExprAffinity::None, ExprAffinity::Affinity),
+                            subquery_affinity.map_or(ExprAffinity::None, ExprAffinity::Affinity),
+                        );
+                        let affinity = match comparison {
+                            ComparisonAffinity::None | ComparisonAffinity::Blob => None,
+                            ComparisonAffinity::Text => Some(TypeAffinity::Text),
+                            ComparisonAffinity::Numeric
+                            | ComparisonAffinity::Integer
+                            | ComparisonAffinity::Real => Some(TypeAffinity::Numeric),
+                        };
+                        (left_affinity.unwrap_or(TypeAffinity::Blob), affinity)
                     };
                     let collation_snapshot = lock_unpoisoned(&self.collation_registry).clone();
+
+                    if matches!(set, InSet::Subquery(_))
+                        && !has_non_binary_collation
+                        && collation_snapshot.uses_builtin_implementation("BINARY")
+                        && let Some(cached) = self
+                            .in_subquery_memo
+                            .borrow_mut()
+                            .last_mut()
+                            .and_then(|scope| scope.get_mut(&memo_key))
+                            .and_then(Option::as_mut)
+                    {
+                        return Ok(cached.probe(
+                            &val,
+                            match in_comparison_affinity {
+                                Some(TypeAffinity::Text) => ExistsProbeMode::Text,
+                                Some(_) => ExistsProbeMode::Numeric,
+                                None => ExistsProbeMode::Raw,
+                            },
+                            *not,
+                        ));
+                    }
 
                     match set {
                         InSet::List(list) => {
@@ -82376,9 +82480,10 @@ impl Connection {
                         InSet::Subquery(_) => {
                             for row in materialized_subquery_rows
                                 .expect("subquery rows materialized before LHS evaluation")
+                                .iter()
                             {
                                 let candidate =
-                                    row.values.into_iter().next().unwrap_or(SqliteValue::Null);
+                                    row.values.first().unwrap_or(&SqliteValue::Null);
                                 if candidate.is_null() {
                                     saw_null = true;
                                     continue;
@@ -82387,11 +82492,10 @@ impl Connection {
                                     saw_null = true;
                                     continue;
                                 }
-                                let eq = cmp_values_with_comparison_affinity(
+                                let eq = cmp_values_with_affinity(
                                     &val,
-                                    &candidate,
-                                    left_affinity,
-                                    subquery_affinity,
+                                    candidate,
+                                    in_comparison_affinity,
                                     coll_ref,
                                     &collation_snapshot,
                                 ) == std::cmp::Ordering::Equal;
@@ -82404,9 +82508,10 @@ impl Connection {
                         InSet::Table(_) => {
                             for row in materialized_subquery_rows
                                 .expect("table RHS rows materialized before LHS evaluation")
+                                .iter()
                             {
                                 let candidate =
-                                    row.values.into_iter().next().unwrap_or(SqliteValue::Null);
+                                    row.values.first().unwrap_or(&SqliteValue::Null);
                                 if candidate.is_null() {
                                     saw_null = true;
                                     continue;
@@ -82415,11 +82520,10 @@ impl Connection {
                                     saw_null = true;
                                     continue;
                                 }
-                                let eq = cmp_values_with_comparison_affinity(
+                                let eq = cmp_values_with_affinity(
                                     &val,
-                                    &candidate,
-                                    left_affinity,
-                                    subquery_affinity,
+                                    candidate,
+                                    in_comparison_affinity,
                                     coll_ref,
                                     &collation_snapshot,
                                 ) == std::cmp::Ordering::Equal;
@@ -90208,6 +90312,7 @@ impl Connection {
             // table for every outer row. The guard disarms+clears on exit so the
             // memo is never consulted across statements.
             let _exists_memo_guard = self.arm_exists_probe_memo();
+            let _in_subquery_memo_guard = self.arm_in_subquery_memo(where_expr);
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
                 // WHERE is a truthiness context: stock compiles it through
@@ -108486,14 +108591,14 @@ fn subquery_is_noncorrelated_nonlowerable(
 // a `subquery_is_noncorrelated_nonlowerable` subquery in a short-circuitable
 // position (reachable through an AND/OR/NOT connective). Such a query errors on
 // the VDBE path (rewrite_in_expr eagerly executes the subquery) though stock
-// short-circuits it (`NULL AND E`, `0 AND E`), so route it to execute_join_select
-// whose per-row `eval_expr_truthiness` short-circuits with correct polarity.
+// short-circuits it (`NULL AND E`, `0 AND E`), so preserve the WHERE for the
+// fallback executor's per-row `eval_expr_truthiness`. The caller folds aggregate
+// projections through execute_group_by_join_select after that same row filter.
 fn where_should_route_to_fallback_for_shortcircuit(
     conn: &Connection,
     select: &SelectStatement,
 ) -> bool {
     let SelectCore::Select {
-        columns,
         from: Some(from),
         where_clause: Some(where_expr),
         group_by,
@@ -108504,28 +108609,12 @@ fn where_should_route_to_fallback_for_shortcircuit(
         return false;
     };
     // Defensive: earlier cascade branches already peel joins / subquery sources /
-    // table-function sources / aggregates / windows; keep this to the plain
-    // single-table shape execute_join_select handles cleanly.
+    // table-function sources / grouped aggregates / windows; keep this to the
+    // plain single-table source the short-circuit fallback handles cleanly.
     if !from.joins.is_empty()
         || !matches!(from.source, TableOrSubquery::Table { .. })
         || !group_by.is_empty()
         || having.is_some()
-    {
-        return false;
-    }
-    // GH#407: an UNGROUPED aggregate projection (`SELECT COUNT(*) ... WHERE
-    // 1=1 AND id IN (<grouped subquery>) AND ...`) has no `GROUP BY` and no
-    // `HAVING`, so the shape test above admitted it — but `execute_join_select`
-    // returns the FILTERED ROWS, not an aggregate over them. The caller then
-    // saw `COUNT(*)` evaluated per row (NULL) or, when nothing matched, no row
-    // at all, where stock returns exactly one row with the count. Aggregates
-    // belong on the VDBE path, which computes them; the short-circuit
-    // absorption this branch exists to preserve is a WHERE-evaluation
-    // property, and losing it for an aggregate query is strictly better than
-    // answering the wrong value.
-    if columns
-        .iter()
-        .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)))
     {
         return false;
     }
@@ -124667,6 +124756,67 @@ struct PrecomputedInSetCache {
     has_null: bool,
 }
 
+/// One lazily executed scalar IN RHS. Keep the rows for custom collations,
+/// whose equality cannot be replaced by binary hash keys. Built-in BINARY
+/// probes reuse the existing precision-preserving membership implementation.
+struct MaterializedInSubquery {
+    rows: Arc<Vec<Row>>,
+    has_null: bool,
+    sets: HashMap<ExistsProbeMode, ExistsValueSet>,
+}
+
+impl MaterializedInSubquery {
+    fn new(rows: Arc<Vec<Row>>) -> Self {
+        let has_null = rows
+            .iter()
+            .any(|row| row.values.first().is_none_or(SqliteValue::is_null));
+        Self {
+            rows,
+            has_null,
+            sets: HashMap::new(),
+        }
+    }
+
+    fn probe(&mut self, value: &SqliteValue, mode: ExistsProbeMode, not: bool) -> SqliteValue {
+        if self.rows.is_empty() {
+            return SqliteValue::Integer(i64::from(not));
+        }
+        if value.is_null() {
+            return SqliteValue::Null;
+        }
+        let set = self.sets.entry(mode).or_insert_with(|| {
+            let mut set = ExistsValueSet::new(mode, ExistsProbeCollation::Binary);
+            for row in self.rows.iter() {
+                if let Some(value) = row.values.first() {
+                    set.add(value);
+                }
+            }
+            set
+        });
+        if set.contains(value) {
+            SqliteValue::Integer(i64::from(!not))
+        } else if self.has_null {
+            SqliteValue::Null
+        } else {
+            SqliteValue::Integer(i64::from(not))
+        }
+    }
+}
+
+/// Each nested WHERE owns a separate frame, even if it admits no probes.
+/// Holding the original AST alive prevents pointer reuse for admitted keys.
+/// Drop releases all rows/indexes on success, error, cancellation or unwind.
+struct InSubqueryMemoGuard<'a> {
+    conn: &'a Connection,
+    _expr: &'a Expr,
+}
+
+impl Drop for InSubqueryMemoGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.in_subquery_memo.borrow_mut().pop();
+    }
+}
+
 /// GH#117: query-scoped memo for the correlated `EXISTS`/`NOT EXISTS` direct
 /// probe (`try_direct_exists_probe`). `depth` counts the nesting of armed
 /// `execute_join_select` WHERE loops; the memo is consulted only when
@@ -124891,8 +125041,8 @@ impl Drop for ExistsProbeMemoGuard<'_> {
 #[cfg(test)]
 mod exists_value_set_tests {
     use super::{
-        ExistsProbeCollation, ExistsProbeMode, ExistsValueSet, exists_probe_mode,
-        exists_probe_values_equal,
+        ExistsProbeCollation, ExistsProbeMode, ExistsValueSet, MaterializedInSubquery, Row,
+        cmp_values_with_comparison_affinity, exists_probe_mode, exists_probe_values_equal,
     };
     use fsqlite_types::{SqliteValue, TypeAffinity};
     use std::sync::Arc;
@@ -125008,6 +125158,62 @@ mod exists_value_set_tests {
                 continue;
             }
             assert!(!set.contains(&outer), "NULL cell wrongly matched {outer:?}");
+        }
+    }
+
+    #[test]
+    fn lazy_in_membership_matches_authoritative_comparison() {
+        let mut values = sample_values();
+        values.push(SqliteValue::Text("a\0b".into()));
+        let registry = fsqlite_func::CollationRegistry::new();
+        let affinities = [
+            TypeAffinity::Blob,
+            TypeAffinity::Text,
+            TypeAffinity::Numeric,
+            TypeAffinity::Integer,
+            TypeAffinity::Real,
+        ];
+        for left_affinity in affinities {
+            for right_affinity in affinities {
+                for cell in &values {
+                    let mut cached = MaterializedInSubquery::new(Arc::new(vec![Row {
+                        values: vec![cell.clone()],
+                    }]));
+                    for value in &values {
+                        for not in [false, true] {
+                            let expected = if cell.is_null() || value.is_null() {
+                                SqliteValue::Null
+                            } else {
+                                let equal = cmp_values_with_comparison_affinity(
+                                    value,
+                                    cell,
+                                    left_affinity,
+                                    right_affinity,
+                                    None,
+                                    &registry,
+                                ) == std::cmp::Ordering::Equal;
+                                SqliteValue::Integer(i64::from(equal != not))
+                            };
+                            assert_eq!(
+                                cached.probe(
+                                    value,
+                                    exists_probe_mode(left_affinity, right_affinity),
+                                    not,
+                                ),
+                                expected,
+                                "left={value:?}/{left_affinity:?} right={cell:?}/{right_affinity:?} not={not}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut empty = MaterializedInSubquery::new(Arc::new(Vec::new()));
+        for not in [false, true] {
+            assert_eq!(
+                empty.probe(&SqliteValue::Null, ExistsProbeMode::Raw, not),
+                SqliteValue::Integer(i64::from(not))
+            );
         }
     }
 
@@ -144945,11 +145151,23 @@ fn cmp_values_with_comparison_affinity(
     collation: Option<&str>,
     registry: &CollationRegistry,
 ) -> std::cmp::Ordering {
-    let (left, right) = coerce_values_for_comparison_affinity(
+    cmp_values_with_affinity(
         left,
         right,
         TypeAffinity::comparison_affinity(left_affinity, right_affinity),
-    );
+        collation,
+        registry,
+    )
+}
+
+fn cmp_values_with_affinity(
+    left: &SqliteValue,
+    right: &SqliteValue,
+    affinity: Option<TypeAffinity>,
+    collation: Option<&str>,
+    registry: &CollationRegistry,
+) -> std::cmp::Ordering {
+    let (left, right) = coerce_values_for_comparison_affinity(left, right, affinity);
     // `None` is the compact representation of default BINARY in the common
     // built-in case. If an application has replaced BINARY, it is no longer
     // valid to bypass the registry comparator under that representation.
@@ -147013,22 +147231,14 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Null => SqliteValue::Null,
         }
     } else {
-        // NUMERIC affinity: try integer first, then float
+        // CAST requires a numeric result even when affinity would preserve
+        // text. Reuse the same prefix conversion as the VDBE/types layer.
         match val {
-            SqliteValue::Text(ref s) => {
-                if let Ok(n) = s.trim().parse::<i64>() {
-                    SqliteValue::Integer(n)
-                } else if let Ok(f) = s.trim().parse::<f64>() {
-                    if f.is_finite() {
-                        SqliteValue::Float(f)
-                    } else {
-                        val
-                    }
-                } else {
-                    val
-                }
+            SqliteValue::Blob(ref bytes) => {
+                SqliteValue::Text(blob_cast_text_string(bytes, db_encoding).into())
+                    .cast_to_numeric()
             }
-            _ => val,
+            _ => val.cast_to_numeric(),
         }
     }
 }

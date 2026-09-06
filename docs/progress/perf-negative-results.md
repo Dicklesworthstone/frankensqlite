@@ -12,6 +12,29 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-06 - REJECTED: grouped IN short-circuit routing without RHS reuse (bd-0pkki)
+
+- Removing the obsolete aggregate exclusion in `connection.rs` connects the
+  aggregate-aware fallback and fixes three real integer-overflow divergences
+  against bundled SQLite 3.53.2. That routing-only candidate passes 27 tests
+  across four integration targets, but must not land alone: the interpreter
+  executes a demanded uncorrelated grouped RHS for every outer row.
+- The public `gh407_grouped_rhs_is_lazy_and_reused_within_each_execution`
+  keeper uses an identity scalar callback to count actual RHS projection work.
+  With 30 outer rows and 30 qualifying RHS groups, the candidate makes 900
+  calls instead of 30. The required result itself matches stock; this is an
+  execution-work failure, not a wall-clock speed estimate.
+- Linux x86_64, strict RCH on vmi1152480, locked test profile with line tables,
+  debug assertions and overflow checks; base `9171f445f` plus the routing
+  candidate and test. Actual exit 101, 0 passed/1 failed at 05:42 UTC.
+  Log: `/tmp/frankensqlite-gh407-lazy-work-red-20260906.log`; unchanged-source
+  and retained executable receipt:
+  `/tmp/frankensqlite-gh407-lazy-work-red-source-final-20260906.json`.
+- Retry with lazy reuse confined to eligible uncorrelated probes in the live
+  WHERE scope, plus membership lookup that preserves NULL, affinity and custom
+  collation behavior. Require fresh-parameter/write/error/nested-scope guards
+  and keep the existing simple-IN compiled execution and scaling checks.
+
 ## 2026-09-06 - WITHHELD: I/O latency quantile selection under shared-host noise (bd-cea9i)
 
 - Candidate: replace full sorting with `select_nth_unstable` at the identical
