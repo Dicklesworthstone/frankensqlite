@@ -76,6 +76,10 @@ Full workspace and all-features release validation remain in progress.
 
 ### FTS5, page storage and transaction safety
 
+- Lazy FTS5 query timing uses an optional clock supplied by the host reader.
+  `FSQLITE_FTS5_TIMING` retains its diagnostic output; disabled timing avoids
+  clock reads. The extension no longer acquires ambient clock authority
+  ([d7c943c60](https://github.com/Dicklesworthstone/frankensqlite/commit/d7c943c60)).
 - Preserve a live FTS5 index only when its persisted content metadata still
   matches. Queries observe foreign SQLite writes while unrelated commits avoid
   rebuilding an unchanged corpus (GH#408). Keep contentless lazy reads
