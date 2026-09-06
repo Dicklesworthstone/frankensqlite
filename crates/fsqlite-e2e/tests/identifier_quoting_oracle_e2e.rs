@@ -204,9 +204,8 @@ fn quoting_double_quoted_column_reference() {
     });
 }
 
-/// v0.2 deliberately rejects SQLite's legacy DQS fallback: a double-quoted
-/// token matching no identifier is not reinterpreted as a string literal.
-/// Ordinary double-quoted identifiers remain valid. See GH #148.
+/// DQS is enabled by default for stock parity (bd-jcjkf). The explicit
+/// opt-out rejects unresolved quoted names while preserving real identifiers.
 #[test]
 fn quoting_double_quoted_string_fallback() {
     asupersync::test_utils::run_test(|| async {
@@ -221,14 +220,24 @@ fn quoting_double_quoted_string_fallback() {
         }
 
         let legacy_sql = "SELECT \"no_such\" FROM t ORDER BY a";
+        let expected = sqlite_rows(&r, legacy_sql).expect("legacy SQLite DQS fallback");
         assert_eq!(
-            sqlite_rows(&r, legacy_sql).expect("legacy SQLite DQS fallback"),
-            vec![vec!["'no_such'".to_owned()], vec!["'no_such'".to_owned()]],
-            "stock SQLite must retain its legacy DQS fallback for this policy contrast"
+            expected,
+            vec![vec!["'no_such'".to_owned()], vec!["'no_such'".to_owned()]]
         );
+        assert_eq!(
+            frank_rows(&f, legacy_sql)
+                .await
+                .expect("default DQS fallback"),
+            expected,
+            "default DQS behavior must match stock SQLite"
+        );
+        f.execute("PRAGMA fsqlite.dqs = OFF")
+            .await
+            .expect("disable DQS explicitly");
         let frank_error = frank_rows(&f, legacy_sql)
             .await
-            .expect_err("FrankenSQLite must reject an unresolved quoted identifier");
+            .expect_err("DQS OFF must reject an unresolved quoted identifier");
         assert!(
             frank_error.contains("no_such"),
             "rejection must identify the unresolved quoted token: {frank_error}"
@@ -242,5 +251,16 @@ fn quoting_double_quoted_string_fallback() {
             sqlite_rows(&r, identifier_sql).expect("SQLite quoted identifier"),
             "ordinary double-quoted identifiers remain supported"
         );
+        f.execute("PRAGMA fsqlite.dqs = ON")
+            .await
+            .expect("restore DQS");
+        assert_eq!(
+            frank_rows(&f, legacy_sql)
+                .await
+                .expect("restored DQS fallback"),
+            expected,
+            "changing the knob must take effect on the same connection"
+        );
+        f.close().await.expect("close frank");
     });
 }

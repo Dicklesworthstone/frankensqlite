@@ -4,7 +4,8 @@
 //! recovery runner, then validates:
 //! - expected recovery classification per scenario,
 //! - presence/quality of structured repair evidence,
-//! - non-zero BLAKE3 witness + chain hashes in the evidence ledger.
+//! - content-derived success witnesses and honest no-payload failure markers,
+//! - non-zero chain hashes in the evidence ledger.
 
 use fsqlite_e2e::corruption_scenarios::{CorruptionScenario, scenario_catalog};
 use fsqlite_e2e::recovery_runner::{RecoveryClassification, run_recovery};
@@ -127,8 +128,12 @@ fn test_bd_n0g4q_6_repair_matrix_and_evidence_cards() {
 
     let mut recovered_count = 0_usize;
     let mut repair_evidence_count = 0_usize;
+    let mut verified_success_cards = 0_usize;
+    let mut verified_failure_cards = 0_usize;
+    let mut verified_unobserved_cards = 0_usize;
 
     for (name, expected, must_have_repairs) in matrix {
+        let previous_cards = raptorq_repair_evidence_snapshot(0).len();
         let scenario = scenario_by_name(name);
         let report = run_recovery(&scenario);
 
@@ -162,6 +167,67 @@ fn test_bd_n0g4q_6_repair_matrix_and_evidence_cards() {
             repair_evidence_count =
                 repair_evidence_count.saturating_add(report.evidence.repairs.len());
         }
+
+        // Bind each newly appended card to the actual scenario outcome. A
+        // failed decode deliberately has no repaired payload; requiring a
+        // nonzero repaired hash there would demand fabricated evidence.
+        let cards = raptorq_repair_evidence_snapshot(0);
+        assert!(cards.len() >= previous_cards, "unexpected ledger eviction");
+        let new_cards = &cards[previous_cards..];
+        if must_have_repairs {
+            assert!(!new_cards.is_empty(), "scenario '{name}' emitted no card");
+        }
+        for card in new_cards {
+            let log = report
+                .wal_recovery_log
+                .as_ref()
+                .expect("a repair card must have an actual recovery log");
+            assert_eq!(card.group_id, log.group_id, "scenario '{name}'");
+            assert_ne!(card.chain_hash, [0_u8; 32], "scenario '{name}'");
+            if log.required_symbols == 0 {
+                // Disabled recovery or missing metadata can stop before any
+                // expected/recovered content is available. These cards must
+                // record that absence, not manufacture nonzero witnesses.
+                assert!(matches!(
+                    report.classification,
+                    RecoveryClassification::Lost { .. }
+                ));
+                assert!(!log.outcome_is_recovered);
+                assert!(!log.decode_attempted);
+                assert_eq!(log.available_symbols, 0);
+                assert_eq!(
+                    card.witness,
+                    fsqlite_wal::WalFecRepairWitnessTriple::zeroed()
+                );
+                verified_unobserved_cards += 1;
+                continue;
+            }
+            assert_ne!(card.witness.corrupted_hash_blake3, [0_u8; 32]);
+            assert_ne!(card.witness.expected_hash_blake3, [0_u8; 32]);
+            assert_ne!(
+                card.witness.corrupted_hash_blake3, card.witness.expected_hash_blake3,
+                "scenario '{name}' must witness actual damaged bytes"
+            );
+            if matches!(
+                report.classification,
+                RecoveryClassification::Recovered { .. }
+            ) {
+                assert!(log.outcome_is_recovered);
+                assert_ne!(card.witness.repaired_hash_blake3, [0_u8; 32]);
+                assert_eq!(
+                    card.witness.repaired_hash_blake3, card.witness.expected_hash_blake3,
+                    "scenario '{name}' must restore the expected content"
+                );
+                verified_success_cards += 1;
+            } else {
+                assert!(!log.outcome_is_recovered);
+                assert_eq!(
+                    card.witness.repaired_hash_blake3, [0_u8; 32],
+                    "scenario '{name}' must not claim a recovered payload"
+                );
+                verified_failure_cards += 1;
+            }
+        }
     }
 
     // Ensure we actually exercised successful repair paths.
@@ -174,25 +240,10 @@ fn test_bd_n0g4q_6_repair_matrix_and_evidence_cards() {
         "matrix should emit repair evidence for recoverable cases"
     );
 
-    // Evidence cards are the append-only repair ledger entries with BLAKE3 witnesses.
-    let cards = raptorq_repair_evidence_snapshot(0);
     assert!(
-        !cards.is_empty(),
-        "repair evidence ledger should contain at least one card"
+        verified_success_cards >= 2,
+        "successful repair cards missing"
     );
-    for card in &cards {
-        assert_ne!(card.chain_hash, [0_u8; 32], "chain_hash must be non-zero");
-        assert_ne!(
-            card.witness.corrupted_hash_blake3, [0_u8; 32],
-            "corrupted witness hash must be non-zero"
-        );
-        assert_ne!(
-            card.witness.repaired_hash_blake3, [0_u8; 32],
-            "repaired witness hash must be non-zero"
-        );
-        assert_ne!(
-            card.witness.expected_hash_blake3, [0_u8; 32],
-            "expected witness hash must be non-zero"
-        );
-    }
+    assert!(verified_failure_cards >= 1, "failed repair card missing");
+    assert!(verified_unobserved_cards >= 1, "early bailout card missing");
 }
