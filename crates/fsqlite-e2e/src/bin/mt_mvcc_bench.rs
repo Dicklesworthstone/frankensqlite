@@ -1221,6 +1221,36 @@ fn current_cgroup_path(proc_self_cgroup: &str) -> Option<PathBuf> {
     None
 }
 
+fn read_effective_cpuset(root: &Path, cgroup: &Path, resource: &str) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let mut cgroup = cgroup.canonicalize().ok()?;
+    if !cgroup.starts_with(&root) {
+        return None;
+    }
+    let filenames = [
+        format!("cpuset.{resource}.effective"),
+        format!("cpuset.effective_{resource}"),
+    ];
+    loop {
+        for filename in &filenames {
+            match fs::read_to_string(cgroup.join(filename)) {
+                Ok(value) => {
+                    let value = value.trim();
+                    return (!value.is_empty()).then(|| value.to_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        // A controller not delegated to a systemd session still constrains it
+        // through its nearest controlling ancestor. Read effective values;
+        // configured sets can include CPUs or nodes that are offline.
+        if cgroup == root || !cgroup.pop() {
+            return None;
+        }
+    }
+}
+
 fn collect_dynamic_measurement_host() -> DynamicMeasurementHostReceipt {
     let unix_epoch_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1228,14 +1258,13 @@ fn collect_dynamic_measurement_host() -> DynamicMeasurementHostReceipt {
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
     let proc_self_cgroup = read_trimmed("/proc/self/cgroup");
     let cgroup_path = proc_self_cgroup.as_deref().and_then(current_cgroup_path);
-    let cpuset_cpus_effective = cgroup_path.as_deref().and_then(|path| {
-        read_trimmed(path.join("cpuset.cpus.effective"))
-            .or_else(|| read_trimmed(path.join("cpuset.cpus")))
-    });
-    let cpuset_mems_effective = cgroup_path.as_deref().and_then(|path| {
-        read_trimmed(path.join("cpuset.mems.effective"))
-            .or_else(|| read_trimmed(path.join("cpuset.mems")))
-    });
+    let cgroup_root = Path::new("/sys/fs/cgroup");
+    let cpuset_cpus_effective = cgroup_path
+        .as_deref()
+        .and_then(|path| read_effective_cpuset(cgroup_root, path, "cpus"));
+    let cpuset_mems_effective = cgroup_path
+        .as_deref()
+        .and_then(|path| read_effective_cpuset(cgroup_root, path, "mems"));
     DynamicMeasurementHostReceipt {
         unix_epoch_millis,
         process_cpu_affinity_mask: proc_status_value("Cpus_allowed"),
@@ -5585,6 +5614,73 @@ fn run(opts: Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpuset_capture_follows_inherited_controller_and_prefers_nearest_effective_set() {
+        let directory = tempfile::tempdir().expect("cpuset fixture directory");
+        let root = directory.path();
+        let controller = root.join("user.slice");
+        let session = controller.join("user-0.slice/session.scope");
+        fs::create_dir_all(&session).expect("session hierarchy");
+        fs::write(root.join("cpuset.cpus.effective"), "0-15\n").expect("root cpus");
+        fs::write(root.join("cpuset.mems.effective"), "0-1\n").expect("root nodes");
+        fs::write(controller.join("cpuset.cpus.effective"), "2-7\n").expect("slice cpus");
+        fs::write(controller.join("cpuset.mems.effective"), "1\n").expect("slice nodes");
+
+        assert_eq!(
+            read_effective_cpuset(root, &session, "cpus").as_deref(),
+            Some("2-7")
+        );
+        assert_eq!(
+            read_effective_cpuset(root, &session, "mems").as_deref(),
+            Some("1")
+        );
+        fs::write(session.join("cpuset.cpus.effective"), "4-5\n").expect("session cpus");
+        assert_eq!(
+            read_effective_cpuset(root, &session, "cpus").as_deref(),
+            Some("4-5")
+        );
+    }
+
+    #[test]
+    fn cpuset_capture_fails_closed_for_missing_empty_unreadable_or_outside_sets() {
+        let directory = tempfile::tempdir().expect("cpuset fixture directory");
+        let root = directory.path().join("mount");
+        let empty = root.join("empty");
+        let unreadable = root.join("unreadable");
+        fs::create_dir_all(&empty).expect("empty cgroup");
+        fs::create_dir_all(unreadable.join("cpuset.cpus.effective")).expect("unreadable file");
+        fs::write(directory.path().join("cpuset.cpus.effective"), "0-15\n").expect("outside set");
+        assert_eq!(read_effective_cpuset(&root, &empty, "cpus"), None);
+        assert_eq!(read_effective_cpuset(&root, directory.path(), "cpus"), None);
+        assert_eq!(
+            read_effective_cpuset(&root, &root.join("missing"), "cpus"),
+            None
+        );
+
+        fs::write(root.join("cpuset.cpus.effective"), "0-7\n").expect("root set");
+        fs::write(empty.join("cpuset.cpus.effective"), "\n").expect("empty effective set");
+        assert_eq!(read_effective_cpuset(&root, &empty, "cpus"), None);
+        assert_eq!(read_effective_cpuset(&root, &unreadable, "cpus"), None);
+    }
+
+    #[test]
+    fn cpuset_capture_reads_v1_effective_sets_instead_of_configured_offline_cpus() {
+        let directory = tempfile::tempdir().expect("cpuset fixture directory");
+        let root = directory.path();
+        fs::write(root.join("cpuset.cpus"), "0-15\n").expect("configured cpus");
+        assert_eq!(read_effective_cpuset(root, root, "cpus"), None);
+        fs::write(root.join("cpuset.effective_cpus"), "0-3\n").expect("online cpus");
+        fs::write(root.join("cpuset.effective_mems"), "0\n").expect("online nodes");
+        assert_eq!(
+            read_effective_cpuset(root, root, "cpus").as_deref(),
+            Some("0-3")
+        );
+        assert_eq!(
+            read_effective_cpuset(root, root, "mems").as_deref(),
+            Some("0")
+        );
+    }
 
     fn test_file_snapshot(hash: &str) -> FileSnapshotReceipt {
         FileSnapshotReceipt {
