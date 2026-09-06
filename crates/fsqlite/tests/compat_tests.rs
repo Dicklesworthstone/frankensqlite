@@ -840,6 +840,90 @@ fn open_with_flags_read_only_supports_datetime_builtin() {
     });
 }
 
+#[cfg(all(feature = "native", unix))]
+#[test]
+fn gh294_read_only_wal_rejects_unusable_reader_registration() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("artifact directory");
+        let source = dir.path().join("reader_registration_source.db");
+        let writer = open_with_flags(
+            source.to_str().unwrap(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .await
+        .expect("create source generation");
+        writer
+            .execute_batch(
+                "CREATE TABLE reader_probe(value INTEGER NOT NULL);
+                 INSERT INTO reader_probe VALUES (7);",
+            )
+            .await
+            .expect("seed WAL-backed row");
+        writer.close().await.expect("settle source generation");
+        assert!(suffixed_path(&source, "-wal").is_file());
+        assert!(suffixed_path(&source, "-shm").is_file());
+
+        for registration_available in [true, false] {
+            let database = dir.path().join(if registration_available {
+                "reader_registration_control.db"
+            } else {
+                "reader_registration_unavailable.db"
+            });
+            std::fs::copy(&source, &database).expect("copy settled main database");
+            for suffix in ["-wal", "-wal-cert"] {
+                std::fs::copy(
+                    suffixed_path(&source, suffix),
+                    suffixed_path(&database, suffix),
+                )
+                .expect("copy settled WAL artifact");
+            }
+            let shm = suffixed_path(&database, "-shm");
+            if registration_available {
+                std::fs::copy(suffixed_path(&source, "-shm"), &shm)
+                    .expect("copy valid reader table for control");
+            } else {
+                // A real filesystem error, independent of chmod privileges:
+                // the engine cannot open a directory as its shared reader table.
+                std::fs::create_dir(&shm).expect("make reader registration unavailable");
+            }
+            let main_before = std::fs::read(&database).expect("main before read-only admission");
+            let wal_before = std::fs::read(suffixed_path(&database, "-wal"))
+                .expect("WAL before read-only admission");
+            let result =
+                open_with_flags(database.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_ONLY).await;
+            if registration_available {
+                let reader = result.expect("valid reader table admits the control");
+                let row = reader
+                    .query_row("SELECT value FROM reader_probe")
+                    .await
+                    .unwrap();
+                assert_eq!(row.get(0), Some(&SqliteValue::Integer(7)));
+                reader
+                    .close()
+                    .await
+                    .expect("close registered control reader");
+            } else {
+                let error = result.expect_err(
+                    "read-only WAL admission must fail when no checkpoint-visible reader can register",
+                );
+                assert!(
+                    matches!(&error, FrankenError::Io(io_error) if io_error.kind() == std::io::ErrorKind::IsADirectory),
+                    "preserve the actual SHM registration error: {error:?}"
+                );
+                assert!(
+                    shm.is_dir(),
+                    "failed admission must preserve the failed artifact"
+                );
+            }
+            assert_eq!(std::fs::read(&database).unwrap(), main_before);
+            assert_eq!(
+                std::fs::read(suffixed_path(&database, "-wal")).unwrap(),
+                wal_before
+            );
+        }
+    });
+}
+
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
 fn gh294_read_only_schema_only_steady_state_preserves_every_database_artifact() {
