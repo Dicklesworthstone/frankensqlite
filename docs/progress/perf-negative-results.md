@@ -12,6 +12,45 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-06 - WITHHELD: I/O latency quantile selection under shared-host noise (bd-cea9i)
+
+- Candidate: replace full sorting with `select_nth_unstable` at the identical
+  integer rank in `crates/fsqlite-observability/src/lib.rs`. The private clone
+  `frankensqlite-metrics-candidate-20260906` retains commit `ba441edf8`;
+  shared main still uses full sorting. The full-sort reference guard passes
+  unchanged on both algorithms (76 observability tests each), including
+  duplicate/extreme samples, eviction, reset and conformal bounds.
+- Workload: `mt-mvcc-bench`, 1,000 rows per writer, 1 and 8 writers, 20
+  iterations, one bulk transaction per writer, WAL/NORMAL. Three warmup and
+  ten scored blocks alternate both algorithms and the global metrics registry
+  enabled/disabled on vmi1156319. Disabling that registry does not disable the
+  separate I/O latency instrumentation. Both portable `release-perf` binaries
+  use identical flags, line-table debug and unwind tables; baseline `f6435fa0b`
+  and candidate have the same untimed cpuset collector repair. All 2,620 source
+  files in each clone match before/after, with clean Git identities. The later
+  main VFS waker change is outside both arms.
+- Actual correctness: all 52 invocations exit zero; all 8,320 raw samples have
+  exact counts, matching payload hashes and successful integrity checks.
+  These are 37,440,000 writes across FrankenSQLite, stock SQLite and controls,
+  including warmups; they are not 37,440,000 FrankenSQLite-only writes.
+- Keep gate failed to establish a benefit. All 80 scored C/C coefficient-of-
+  variation gates are `never` (CV 56.3%-373.8%, median 129.3%). Enabled-mode
+  paired throughput geometric changes are +21.0% at one writer and -5.8% at
+  eight, with descriptive 95% bootstrap intervals [-8.7%, +59.9%] and
+  [-12.7%, +1.7%]. Disabled-mode eight-writer p95 latency is +40.8%, interval
+  [+1.4%, +89.2%]. These noisy estimates are neither speedup nor regression
+  attribution. All ten preselected blocks, tails and peak-RSS results remain
+  in `/tmp/frankensqlite-metrics-paired-analysis-20260906.json`; source receipts
+  are in `/tmp/frankensqlite-metrics-paired-source-after-20260906.json`.
+  Complete reports: `/tmp/frankensqlite-metrics-paired-cpuset-artifacts-20260906.tar.gz`,
+  SHA-256 `277bffc048943e46be7dec7596be78b029c350e722bc3d030a1a96ff849246d2`.
+- Retry only with permitted, controlled measurement capacity and passing null
+  controls, matching source/build configurations, and the existing exact-output
+  guard. Preserve 1/8-writer and enabled/disabled arms and assess tails as well
+  as throughput. Do not infer that this explains the reported recent bulk-
+  INSERT delta. The initial caller profile was incomplete, and no accepted
+  optimization or post-keep profile is claimed. No peer workload was quieted.
+
 ## 2026-09-05 - CERTIFICATION HOLD: swept bd-aoj0g journal improves C but fails the full main gate
 
 - Exact target: origin/main `08265d775a9a88df917b65e04c688c814fdde2bd`,
