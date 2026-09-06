@@ -47,7 +47,18 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main>
 
-No changes yet.
+### Native storage
+
+- Native namespace sidecars (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) no longer
+  fail `CannotOpen` on mounts that do not persist POSIX permission bits (a WSL2
+  Windows drive without the `metadata` mount option, FAT/exFAT), where the
+  0600 creation mode and every chmod are ignored and every file reports the
+  mount mask. A sidecar this process just created with `O_CREAT|O_EXCL` is
+  accepted whatever mode the mount reports back, and an existing sidecar is
+  accepted when it grants no group/other bit that the database file itself
+  does not already grant; the owner, single-hard-link and regular-file checks
+  are unchanged, and a sidecar loosened beyond its database on a real POSIX
+  filesystem still fails closed (beads_rust GH#491).
 
 ---
 

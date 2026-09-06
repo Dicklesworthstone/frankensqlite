@@ -16,6 +16,15 @@
 //! unlink/rename despite an open descriptor.  Callers must not mutate the
 //! database namespace or these sidecars outside the library while a binding
 //! is live, and must not open one database through multiple hard-link aliases.
+//!
+//! On Unix both sidecars must be regular files owned by the effective user
+//! with a single hard link, and they are created `0600`. A sidecar that is
+//! group- or other-accessible is refused unless the bits are demonstrably not
+//! an exposure: the file was created `0600` on this call and the filesystem
+//! reported them anyway (a mount that does not persist POSIX permission bits,
+//! such as a WSL2 Windows drive without `metadata`), or the sidecar grants no
+//! group/other bit that the database file itself does not already grant. See
+//! `sidecar_exposure_is_acceptable`.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -162,13 +171,13 @@ impl PendingNamespaceOpen {
                 });
             }
             (
-                open_existing_secure_lock_file(&gate_path)?,
-                open_existing_secure_lock_file(&use_path)?,
+                open_existing_secure_lock_file(stable_path, &gate_path)?,
+                open_existing_secure_lock_file(stable_path, &use_path)?,
             )
         } else {
             (
-                open_secure_lock_file(&sidecar_path(stable_path, GATE_SUFFIX))?,
-                open_secure_lock_file(&sidecar_path(stable_path, USE_SUFFIX))?,
+                open_secure_lock_file(stable_path, &sidecar_path(stable_path, GATE_SUFFIX))?,
+                open_secure_lock_file(stable_path, &sidecar_path(stable_path, USE_SUFFIX))?,
             )
         };
         let gate_mode = if intent == NamespaceOpenIntent::ReadOnlyExisting {
@@ -882,8 +891,8 @@ where
 
     let gate_path = sidecar_path(database_path, GATE_SUFFIX);
     let use_path = sidecar_path(database_path, USE_SUFFIX);
-    let gate = open_existing_transition_lock_file(&gate_path)?;
-    let mut use_file = open_existing_transition_lock_file(&use_path)?;
+    let gate = open_existing_transition_lock_file(database_path, &gate_path)?;
+    let mut use_file = open_existing_transition_lock_file(database_path, &use_path)?;
     try_lock(&gate, FileLockMode::Exclusive)?;
     if let Err(error) = try_lock(&use_file, FileLockMode::Exclusive) {
         let _ = AdvisoryFileLock::unlock(&gate);
@@ -1252,33 +1261,34 @@ fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn open_secure_lock_file(path: &Path) -> Result<File> {
-    let file = match configured_open_options(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+fn open_secure_lock_file(database_path: &Path, path: &Path) -> Result<File> {
+    let (file, provenance) = match configured_open_options(true).open(path) {
+        Ok(file) => (file, SidecarProvenance::CreatedNow),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
             configured_open_options(false)
                 .open(path)
-                .map_err(|_| cannot_open(path))?
-        }
+                .map_err(|_| cannot_open(path))?,
+            SidecarProvenance::Existing { database_path },
+        ),
         Err(_) => return Err(cannot_open(path)),
     };
-    validate_secure_lock_file(path, &file)?;
+    validate_secure_lock_file(path, &file, provenance)?;
     Ok(file)
 }
 
-fn open_existing_secure_lock_file(path: &Path) -> Result<File> {
+fn open_existing_secure_lock_file(database_path: &Path, path: &Path) -> Result<File> {
     let file = configured_existing_readonly_open_options()
         .open(path)
         .map_err(|_| cannot_open(path))?;
-    validate_secure_lock_file(path, &file)?;
+    validate_secure_lock_file(path, &file, SidecarProvenance::Existing { database_path })?;
     Ok(file)
 }
 
-fn open_existing_transition_lock_file(path: &Path) -> Result<File> {
+fn open_existing_transition_lock_file(database_path: &Path, path: &Path) -> Result<File> {
     let file = configured_open_options(false)
         .open(path)
         .map_err(|_| cannot_open(path))?;
-    validate_secure_lock_file(path, &file)?;
+    validate_secure_lock_file(path, &file, SidecarProvenance::Existing { database_path })?;
     Ok(file)
 }
 
@@ -1358,13 +1368,13 @@ fn cleanup_open_options() -> OpenOptions {
     options
 }
 
-fn open_cleanup_lock_file(path: &Path) -> Result<Option<File>> {
+fn open_cleanup_lock_file(database_path: &Path, path: &Path) -> Result<Option<File>> {
     let file = match cleanup_open_options().open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(cannot_open(path)),
     };
-    validate_secure_lock_file(path, &file)?;
+    validate_secure_lock_file(path, &file, SidecarProvenance::Existing { database_path })?;
     Ok(Some(file))
 }
 
@@ -1668,10 +1678,10 @@ fn cleanup_abandoned_private_database_with_hooks(
     validate_stable_path(database_path)?;
     let gate_path = sidecar_path(database_path, GATE_SUFFIX);
     let use_path = sidecar_path(database_path, USE_SUFFIX);
-    let Some(gate) = open_cleanup_lock_file(&gate_path)? else {
+    let Some(gate) = open_cleanup_lock_file(database_path, &gate_path)? else {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
     };
-    let Some(mut use_file) = open_cleanup_lock_file(&use_path)? else {
+    let Some(mut use_file) = open_cleanup_lock_file(database_path, &use_path)? else {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
     };
 
@@ -1928,7 +1938,31 @@ fn open_cleanup_identity_probe(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn validate_secure_lock_file(path: &Path, file: &File) -> Result<()> {
+/// How the caller came to hold a namespace sidecar handle.
+///
+/// The Unix permission policy for sidecars is "no group/other access"
+/// (`mode & 0o077 == 0`), because any principal that can open a sidecar can
+/// take advisory locks on it and, with write access, rewrite the generation
+/// record. Whether an observed group/other bit is a real exposure depends on
+/// where the file came from, so the validator needs the provenance.
+#[derive(Clone, Copy, Debug)]
+// Only the Unix validator reads the provenance; other targets carry it through
+// unchanged so the call sites stay identical.
+#[cfg_attr(not(unix), allow(dead_code))]
+enum SidecarProvenance<'a> {
+    /// `O_CREAT | O_EXCL` with mode `0600` succeeded on this call, so the
+    /// handle is exactly the file this process just created.
+    CreatedNow,
+    /// The sidecar already existed; `database_path` is the main database file
+    /// it guards.
+    Existing { database_path: &'a Path },
+}
+
+fn validate_secure_lock_file(
+    path: &Path,
+    file: &File,
+    provenance: SidecarProvenance<'_>,
+) -> Result<()> {
     let metadata = file.metadata().map_err(|_| cannot_open(path))?;
     if !metadata.is_file() {
         return Err(cannot_open(path));
@@ -1939,11 +1973,15 @@ fn validate_secure_lock_file(path: &Path, file: &File) -> Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         // SAFETY: `geteuid` has no preconditions and does not dereference data.
         let effective_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != effective_uid || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0
-        {
+        if metadata.uid() != effective_uid || metadata.nlink() != 1 {
+            return Err(cannot_open(path));
+        }
+        if !sidecar_exposure_is_acceptable(metadata.mode(), provenance) {
             return Err(cannot_open(path));
         }
     }
+    #[cfg(not(unix))]
+    let _ = provenance;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
@@ -1955,6 +1993,56 @@ fn validate_secure_lock_file(path: &Path, file: &File) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decide whether a sidecar's group/other permission bits are acceptable.
+///
+/// Sidecars are created `0600`, and on a POSIX filesystem that is what they
+/// stay unless someone loosens them, so a group/other bit on a sidecar is
+/// normally rejected (fail closed: the lock domain must not be shared with
+/// other principals). Two cases are not exposures and are accepted:
+///
+/// 1. [`SidecarProvenance::CreatedNow`]: this process created the file with
+///    `O_CREAT | O_EXCL` and mode `0600` a moment ago and the handle is that
+///    file (the kernel guarantees `O_EXCL` returns the file it created; umask
+///    can only clear bits). Group/other bits reading back anyway means the
+///    filesystem does not persist POSIX permission bits at all — WSL2 `drvfs`
+///    mounts of Windows drives without the `metadata` option report every
+///    file as `0777`, FAT/exFAT volumes report a fixed mount mask, and so on
+///    (beads_rust GH#491). The bits are a property of the mount, not of the
+///    file, and refusing them wedges every write on such a mount while
+///    protecting nothing: the database file itself carries the same bits.
+///
+/// 2. [`SidecarProvenance::Existing`]: the sidecar grants no group/other bit
+///    that the main database file does not already grant. A principal who can
+///    open the database can already take advisory locks on it (a read-only
+///    descriptor suffices for `flock`/`fcntl`), so a sidecar that is at most
+///    as exposed as the database adds no capability the database has not
+///    already handed out. This covers the same permission-less mounts on
+///    re-open (database and sidecars all report the mount mask) without
+///    accepting a sidecar that was loosened beyond its database on a real
+///    POSIX filesystem. A missing or non-regular database file offers no
+///    baseline and the sidecar fails closed as before.
+#[cfg(unix)]
+fn sidecar_exposure_is_acceptable(sidecar_mode: u32, provenance: SidecarProvenance<'_>) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let exposure = sidecar_mode & 0o077;
+    if exposure == 0 {
+        return true;
+    }
+    match provenance {
+        SidecarProvenance::CreatedNow => true,
+        SidecarProvenance::Existing { database_path } => {
+            let Ok(database) = std::fs::symlink_metadata(database_path) else {
+                return false;
+            };
+            if !database.file_type().is_file() {
+                return false;
+            }
+            exposure & !(database.mode() & 0o077) == 0
+        }
+    }
 }
 
 fn validate_generation_path_identity(
@@ -3629,8 +3717,9 @@ mod tests {
             Err(FrankenError::CannotOpen { .. })
         ));
 
-        let mut use_file = open_existing_transition_lock_file(&sidecar_path(&database, USE_SUFFIX))
-            .expect("open unchanged namespace record");
+        let mut use_file =
+            open_existing_transition_lock_file(&database, &sidecar_path(&database, USE_SUFFIX))
+                .expect("open unchanged namespace record");
         assert_eq!(
             read_identity_record(&mut use_file, &database).expect("read unchanged generation"),
             old_identity
@@ -4276,6 +4365,198 @@ mod tests {
         assert_child_admission(false);
         transition.finish().expect("finish exact replacement");
         assert_child_admission(true);
+    }
+
+    /// The permission policy in `sidecar_exposure_is_acceptable`: owner-only
+    /// always passes; a just-created file passes regardless (its bits came
+    /// from the mount, not from anyone loosening it); an existing sidecar
+    /// passes only when it grants nothing beyond its database.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_exposure_policy_is_bounded_by_the_database_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("policy.db");
+        let missing = dir.path().join("missing.db");
+        let existing = SidecarProvenance::Existing {
+            database_path: &database,
+        };
+
+        assert!(sidecar_exposure_is_acceptable(0o100_600, existing));
+        assert!(sidecar_exposure_is_acceptable(0o100_700, existing));
+        // A fresh `O_EXCL` create that reads back as 0777 is the mount
+        // reporting a fixed mask (WSL drvfs without `metadata`, FAT/exFAT).
+        assert!(sidecar_exposure_is_acceptable(
+            0o100_777,
+            SidecarProvenance::CreatedNow
+        ));
+        // No database to bound the exposure: fail closed.
+        assert!(!sidecar_exposure_is_acceptable(
+            0o100_644,
+            SidecarProvenance::Existing {
+                database_path: &missing,
+            },
+        ));
+
+        create_database(&database, b"policy");
+        for (database_mode, sidecar_mode, accepted) in [
+            (0o644, 0o644, true),
+            (0o644, 0o640, true),
+            (0o644, 0o664, false),
+            (0o664, 0o664, true),
+            (0o664, 0o666, false),
+            (0o600, 0o640, false),
+            (0o777, 0o777, true),
+            (0o777, 0o666, true),
+        ] {
+            fs::set_permissions(&database, fs::Permissions::from_mode(database_mode))
+                .expect("set database mode");
+            assert_eq!(
+                sidecar_exposure_is_acceptable(0o100_000 | sidecar_mode, existing),
+                accepted,
+                "database {database_mode:04o} sidecar {sidecar_mode:04o}"
+            );
+        }
+
+        // A symlinked database is not a baseline.
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&database, &link).expect("symlink database");
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o777)).expect("loosen");
+        assert!(!sidecar_exposure_is_acceptable(
+            0o100_777,
+            SidecarProvenance::Existing {
+                database_path: &link,
+            },
+        ));
+    }
+
+    /// GH beads_rust#491 (re-open leg): sidecars that carry exactly the
+    /// database file's group/other bits — what a permission-less mount reports
+    /// for every file — admit shared, read-only, and transition opens; a
+    /// sidecar loosened beyond its database still fails closed.
+    #[cfg(unix)]
+    #[test]
+    fn sidecars_bounded_by_database_mode_admit_but_looser_ones_fail_closed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("mask.db");
+        let identity = create_database(&database, b"generation");
+        publish_generation(&database, identity);
+        let gate_path = sidecar_path(&database, GATE_SUFFIX);
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+
+        let set_mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set mode");
+        };
+        // Everything reports the mount mask.
+        for path in [&database, &gate_path, &use_path] {
+            set_mode(path, 0o777);
+        }
+        PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("read-only admission under a mount mask")
+            .bind(identity)
+            .expect("bind read-only");
+        PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("shared admission under a mount mask")
+            .bind(identity)
+            .expect("bind shared");
+        // The transition and cleanup openers share the validator; exercise
+        // them without leaving a prepared-but-unfinished transition behind.
+        drop(
+            open_existing_transition_lock_file(&database, &gate_path)
+                .expect("transition open under a mount mask"),
+        );
+        assert!(
+            open_cleanup_lock_file(&database, &gate_path)
+                .expect("cleanup open under a mount mask")
+                .is_some()
+        );
+
+        // The database is owner-only again; the sidecars now grant more than
+        // it does and are refused, exactly as before this policy. Every
+        // refusal happens at the sidecar open, before any record is touched.
+        set_mode(&database, 0o600);
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(matches!(
+            open_existing_transition_lock_file(&database, &gate_path),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(matches!(
+            begin_database_namespace_generation_transition(&database, identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(matches!(
+            open_cleanup_lock_file(&database, &gate_path),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+
+        // Owner-only sidecars are always fine, whatever the database grants.
+        set_mode(&database, 0o664);
+        set_mode(&gate_path, 0o600);
+        set_mode(&use_path, 0o600);
+        PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("owner-only sidecars")
+            .bind(identity)
+            .expect("bind owner-only");
+    }
+
+    /// GH beads_rust#491 (creation leg), opt-in: point
+    /// `FSQLITE_PERMISSIONLESS_FS_DIR` at a writable directory on a mount that
+    /// does not persist POSIX permission bits (a WSL2 `/mnt/<drive>` without
+    /// `metadata`, or a FAT volume mounted with a `0777` mask) and a never
+    /// admitted database must bootstrap, re-open shared, and re-open read-only
+    /// there even though every sidecar reads back group/other-accessible.
+    #[cfg(unix)]
+    #[test]
+    fn permissionless_mount_admits_fresh_and_existing_sidecars() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(root) = std::env::var_os("FSQLITE_PERMISSIONLESS_FS_DIR") else {
+            eprintln!("FSQLITE_PERMISSIONLESS_FS_DIR unset; skipping");
+            return;
+        };
+        let dir = tempfile::Builder::new()
+            .prefix("fsqlite-ns-mask-")
+            .tempdir_in(root)
+            .expect("tempdir on the permission-less mount");
+        let database = dir.path().join("mask.db");
+        let identity = create_database(&database, b"generation");
+        let created = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("bootstrap on a permission-less mount")
+            .bind(identity)
+            .expect("bind bootstrap");
+        created.finish_bootstrap().expect("publish");
+        drop(created);
+
+        let gate_mode = fs::metadata(sidecar_path(&database, GATE_SUFFIX))
+            .expect("gate metadata")
+            .permissions()
+            .mode();
+        assert_ne!(
+            gate_mode & 0o077,
+            0,
+            "{} does not look like a permission-less mount (gate mode {:04o})",
+            dir.path().display(),
+            gate_mode & 0o7777
+        );
+
+        PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("shared re-open")
+            .bind(identity)
+            .expect("bind shared");
+        PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("read-only re-open")
+            .bind(identity)
+            .expect("bind read-only");
     }
 
     #[test]
