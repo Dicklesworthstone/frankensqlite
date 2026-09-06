@@ -102,11 +102,13 @@ Full workspace and all-features release validation remain in progress.
   durations, successful WAL durability barriers, MVCC conflict outcomes,
   completed version-store GC passes, local schema invalidations, integrity-check
   outcomes, and active concurrent-writer counts to the existing exporters.
+  Count held pager snapshots through their actual lifetime, including writer
+  views and cached memory reads, and aggregate them across databases.
 - Verify metric counts through real public SQL, live HTTP scrapes, structurally
   corrupted files, and an eight-writer workload with independently reopened
   stock SQLite row/payload checks. Disabled recording is covered separately.
-  The metrics overhead target remains unmeasured; history and reader gauges
-  and accurate WAL checkpoint backlog accounting remain open.
+  The metrics overhead target remains unmeasured; history gauges and accurate
+  WAL checkpoint backlog accounting remain open.
 - Expose actual SSI conflicts and bounded fallback execution events with
   connection, statement and transaction identities. Early SSI aborts report
   unmeasured edge counts explicitly. Bound pending and retained evidence counts,
