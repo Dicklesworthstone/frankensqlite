@@ -474,36 +474,6 @@ impl Parser {
         self.parse_statement_inner()
     }
 
-    /// Parse the next top-level statement and return its ending byte offset in
-    /// the original token source, including its terminating semicolon if any.
-    /// Empty statements and comments are skipped; exhausted input returns `None`.
-    ///
-    /// Reusing this cursor avoids tokenizing a batch's remaining suffix for each
-    /// statement. Callers must stop on an error; this method does not recover.
-    pub fn parse_next_statement_with_tail(
-        &mut self,
-    ) -> Result<Option<(Statement, usize)>, ParseError> {
-        while self.eat(&TokenKind::Semicolon) {}
-        if self.at_eof() {
-            return Ok(None);
-        }
-
-        let statement = self.parse_statement()?;
-        let tail_offset = if self.eat(&TokenKind::Semicolon) {
-            self.tokens[self.pos - 1].span.end as usize
-        } else if self.at_eof() {
-            self.tokens
-                .last()
-                .map_or(0, |token| token.span.end as usize)
-        } else {
-            return Err(self.err_unexpected(
-                "unexpected token after end of statement; expected ';' separator",
-            ));
-        };
-
-        Ok(Some((statement, tail_offset)))
-    }
-
     #[must_use]
     pub fn errors(&self) -> &[ParseError] {
         &self.errors
@@ -2971,7 +2941,27 @@ pub fn parse_single_statement_with_scratch(
 pub fn parse_first_statement_with_tail(
     sql: &str,
 ) -> Result<Option<(Statement, usize)>, ParseError> {
-    Parser::from_sql(sql).parse_next_statement_with_tail()
+    let mut parser = Parser::from_sql(sql);
+
+    while parser.eat(&TokenKind::Semicolon) {}
+    if parser.at_eof() {
+        return Ok(None);
+    }
+
+    let statement = parser.parse_statement()?;
+    let tail_offset = if parser.eat(&TokenKind::Semicolon) {
+        parser
+            .tokens
+            .get(parser.pos.saturating_sub(1))
+            .map_or(sql.len(), |token| token.span.end as usize)
+    } else if parser.at_eof() {
+        sql.len()
+    } else {
+        return Err(parser
+            .err_unexpected("unexpected token after end of statement; expected ';' separator"));
+    };
+
+    Ok(Some((statement, tail_offset)))
 }
 
 // ---------------------------------------------------------------------------
@@ -4523,59 +4513,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_next_statement_with_tail_preserves_batch_boundaries() {
-        let pieces = [
-            "; /* before; */ SELECT 'it''s; 雪';",
-            " CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-             INSERT INTO audit VALUES('body;'); INSERT INTO audit VALUES(NEW.x); END;",
-            " -- after;\n SELECT 3 /* trailing comment */",
-        ];
-        let sql = pieces.concat();
-        let mut parser = Parser::from_sql(&sql);
-        let mut start = 0;
-        for piece in pieces {
-            let (_, tail) = parser
-                .parse_next_statement_with_tail()
-                .expect("next complete statement")
-                .expect("statement remains");
-            assert_eq!(&sql[start..tail], piece);
-            start = tail;
-        }
-        assert_eq!(start, sql.len());
-        assert_eq!(parser.parse_next_statement_with_tail(), Ok(None));
-        assert_eq!(parser.parse_next_statement_with_tail(), Ok(None));
-        assert_eq!(
-            Parser::from_sql("; /* empty; */ ; -- done;").parse_next_statement_with_tail(),
-            Ok(None)
-        );
-    }
-
-    #[test]
-    fn test_parse_next_statement_with_tail_reports_later_error_at_original_offset() {
-        let sql = "SELECT '雪'; /* prefix; */ SELEC 2; SELECT 3;";
-        let mut parser = Parser::from_sql(sql);
-        let (_, tail) = parser
-            .parse_next_statement_with_tail()
-            .expect("valid first statement")
-            .expect("first statement");
-        assert_eq!(&sql[..tail], "SELECT '雪';");
-        let error = parser
-            .parse_next_statement_with_tail()
-            .expect_err("later malformed statement must fail");
-        assert_eq!(
-            &sql[error.span.start as usize..error.span.end as usize],
-            "SELEC"
-        );
-        assert!(error.span.start as usize >= tail);
-        assert!(
-            Parser::from_sql("SELECT 1 SELECT 2")
-                .parse_next_statement_with_tail()
-                .is_err(),
-            "do not execute a prefix missing its required separator"
-        );
-    }
-
-    #[test]
     fn test_parse_all_reports_and_recovers_from_missing_statement_separator() {
         let sql = "SELECT 1 SELECT 2";
         let mut parser = Parser::from_sql(sql);
@@ -6072,44 +6009,32 @@ mod tests {
 
     #[test]
     fn test_window_frame_rejects_illegal_bound_order_with_exact_span() {
-        for (sql, rejected, kind) in [
+        for (sql, rejected) in [
             (
                 "SELECT sum(x) OVER (ROWS UNBOUNDED FOLLOWING) FROM t",
-                "FOLLOWING",
-                ParseErrorKind::UnexpectedToken,
+                "UNBOUNDED",
             ),
-            (
-                "SELECT sum(x) OVER (ROWS 1 FOLLOWING) FROM t",
-                "1",
-                ParseErrorKind::Semantic,
-            ),
+            ("SELECT sum(x) OVER (ROWS 1 FOLLOWING) FROM t", "1"),
             (
                 "SELECT sum(x) OVER (ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t",
-                "FOLLOWING",
-                ParseErrorKind::UnexpectedToken,
+                "UNBOUNDED",
             ),
             (
                 "SELECT sum(x) OVER (ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t",
-                "PRECEDING",
-                ParseErrorKind::UnexpectedToken,
+                "UNBOUNDED",
             ),
             (
                 "SELECT sum(x) OVER (ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t",
                 "1",
-                ParseErrorKind::Semantic,
             ),
             (
                 "SELECT sum(x) OVER (ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t",
                 "CURRENT",
-                ParseErrorKind::Semantic,
             ),
         ] {
             let error = parse_first_statement_with_tail(sql)
                 .expect_err("illegal window-frame boundaries must be rejected");
-            assert_eq!(error.kind, kind, "diagnostic kind for `{sql}`");
-            if error.kind == ParseErrorKind::Semantic {
-                assert_eq!(error.message, "unsupported frame specification");
-            }
+            assert_eq!(error.kind, ParseErrorKind::Syntax);
             assert_eq!(
                 &sql[error.span.start as usize..error.span.end as usize],
                 rejected,

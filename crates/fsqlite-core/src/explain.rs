@@ -379,6 +379,73 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
     })
 }
 
+/// True when the program's ONLY way onto `table_name` is by rowid (GH #415).
+///
+/// Every access to a cursor opened on the table must be a rowid probe
+/// (`SeekRowid`/`NotExists`) and none of those cursors may ever be walked
+/// (`Rewind`/`Last`/`Next`/`Prev`), and no named index may be positioned or
+/// walked at all — an index-driven program also reaches the table only by
+/// `SeekRowid` (its lookup leg), but that is a `SEARCH ... USING INDEX`, not a
+/// rowid search. Stricter than [`program_seeks_rowid_on_table`], which a
+/// seek-then-scan program (a fast path with a scan fallback) also satisfies.
+/// Used to render `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)` for shapes
+/// that carry no planner directive (ORDER BY, aggregates), where the generic
+/// bytecode explain would otherwise report every `OpenRead` as a `SCAN`.
+#[must_use]
+pub fn program_accesses_table_only_by_rowid(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name => {
+                    table_cursors.insert(op.p1);
+                }
+                P4::Index(_) => {
+                    index_cursors.insert(op.p1);
+                }
+                _ => {}
+            }
+        }
+    }
+    if table_cursors.is_empty() {
+        return false;
+    }
+    let mut seeks = false;
+    for op in ops {
+        if index_cursors.contains(&op.p1)
+            && matches!(
+                op.opcode,
+                Opcode::SeekGE
+                    | Opcode::SeekGT
+                    | Opcode::SeekLE
+                    | Opcode::SeekLT
+                    | Opcode::IdxGE
+                    | Opcode::IdxGT
+                    | Opcode::IdxLE
+                    | Opcode::IdxLT
+                    | Opcode::IdxRowid
+                    | Opcode::Rewind
+                    | Opcode::Last
+                    | Opcode::Next
+                    | Opcode::Prev
+            )
+        {
+            return false;
+        }
+        if !table_cursors.contains(&op.p1) {
+            continue;
+        }
+        match op.opcode {
+            Opcode::SeekRowid | Opcode::NotExists => seeks = true,
+            Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev => return false,
+            _ => {}
+        }
+    }
+    seeks
+}
+
 /// True when the emitted program probes a cursor opened on `table_name`
 /// directly by a record key via `NoConflict`/`NotFound`.
 ///
@@ -768,5 +835,45 @@ mod tests {
         // but the *index* claim for an unrelated index must still fail.
         let prog = build_index_seek_program();
         assert!(!program_seeks_named_index(&prog, "idx_other"));
+    }
+
+    /// GH #415: the rowid-only access check that renders the directive-less
+    /// `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)` row.
+    #[test]
+    fn test_program_accesses_table_only_by_rowid() {
+        // A probe-set loop: an autoindex is walked, the table is only seeked.
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        let next_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("t".to_owned()), 0);
+        b.emit_op(Opcode::OpenAutoindex, 1, 1, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, 1, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 1, 0, 3, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 3, next_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 1, 2, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.resolve_label(next_label);
+        b.emit_op(Opcode::Next, 1, 5, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        let probe_loop = b.finish().unwrap();
+        assert!(program_accesses_table_only_by_rowid(&probe_loop, "t"));
+        assert!(!program_accesses_table_only_by_rowid(&probe_loop, "other"));
+
+        // An index-driven program reaches the table only by SeekRowid too, but
+        // that is `SEARCH ... USING INDEX`, never a rowid search.
+        assert!(!program_accesses_table_only_by_rowid(
+            &build_index_seek_program(),
+            "t"
+        ));
+        // A full scan walks the table.
+        assert!(!program_accesses_table_only_by_rowid(
+            &build_simple_select_program(),
+            "t"
+        ));
     }
 }

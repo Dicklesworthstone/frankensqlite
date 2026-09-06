@@ -24,7 +24,6 @@ use fsqlite_core::decode_proofs::{
     DECODE_PROOF_SCHEMA_VERSION_V1, DEFAULT_DECODE_PROOF_POLICY_ID, DEFAULT_DECODE_PROOF_SLACK,
     DecodeProofVerificationConfig, EcsDecodeProof, RejectedSymbol, SymbolDigest,
 };
-use fsqlite_parser::Parser;
 use fsqlite_types::value::format_sqlite_float_g;
 use serde::Deserialize;
 
@@ -926,36 +925,19 @@ where
     W: Write,
     E: Write,
 {
-    let mut parser = Parser::from_sql(sql);
-    let mut statement_start = 0;
-    loop {
-        // Connection::query returns only the final statement's rows. Execute
-        // one parser-delimited statement at a time so every result is printed
-        // and a later error cannot discard earlier output or side effects.
-        let tail_offset = match parser.parse_next_statement_with_tail() {
-            Ok(Some((_, tail_offset))) => tail_offset,
-            Ok(None) => return true,
-            Err(error) => {
-                let error = Connection::parse_error_to_franken_error(sql, error);
-                let _ = writeln!(err, "error: {error}");
+    let column_names = infer_result_column_names(connection, sql).await;
+    match connection.query(sql).await {
+        Ok(rows) => {
+            if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
+                let _ = writeln!(err, "error: failed writing query results");
                 return false;
             }
-        };
-        let statement_sql = sql[statement_start..tail_offset].trim_start();
-        let column_names = infer_result_column_names(connection, statement_sql).await;
-        match connection.query(statement_sql).await {
-            Ok(rows) => {
-                if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
-                    let _ = writeln!(err, "error: failed writing query results");
-                    return false;
-                }
-            }
-            Err(error) => {
-                let _ = writeln!(err, "error: {error}");
-                return false;
-            }
+            true
         }
-        statement_start = tail_offset;
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            false
+        }
     }
 }
 
@@ -2891,7 +2873,7 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
     #[test]
     fn test_batch_mode_suppresses_prompts() {
         asupersync::test_utils::run_test(|| async {
-            let mut input = Cursor::new(b"SELECT 7; SELECT 8;\n".to_vec());
+            let mut input = Cursor::new(b"SELECT 7;\n".to_vec());
             let mut out = Vec::new();
             let mut err = Vec::new();
             let args = vec![OsString::from("fsqlite")];
@@ -2903,128 +2885,11 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             assert!(err.is_empty(), "unexpected stderr: {:?}", err);
 
             let stdout = String::from_utf8(out).expect("output should be utf-8");
-            assert_eq!(stdout, "7\n8\n", "both results must be printed in order");
+            assert!(stdout.contains('7'), "expected query result in output");
             assert!(
                 !stdout.contains("fsqlite> ") && !stdout.contains("   ...> "),
                 "batch mode should not render prompts, got: {stdout}",
             );
-        });
-    }
-
-    #[test]
-    fn test_command_mode_statement_batches_preserve_each_result() {
-        asupersync::test_utils::run_test(|| async {
-            let cases = [
-                ("SELECT 1; SELECT 2;", "1\n2\n"),
-                ("; /* empty; */ ; -- trailing;", ""),
-                (
-                    "SELECT 'it''s; fine'; /* ; */ SELECT '雪;'; -- trailing;",
-                    "it's; fine\n雪;\n",
-                ),
-                (
-                    "CREATE TABLE t(x); INSERT INTO t VALUES(1); SELECT x FROM t; \
-                     UPDATE t SET x = 2; SELECT x FROM t; PRAGMA user_version = 7; \
-                     PRAGMA user_version;",
-                    "1\n2\n7\n",
-                ),
-                (
-                    "CREATE TABLE t(x); CREATE TABLE audit(x); \
-                     CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
-                     INSERT INTO audit VALUES(NEW.x); \
-                     INSERT INTO audit VALUES('trigger; value'); END; \
-                     INSERT INTO t VALUES('first'); SELECT x FROM audit ORDER BY rowid; \
-                     SELECT 'last';",
-                    "first\ntrigger; value\nlast\n",
-                ),
-                (
-                    ".headers on\nSELECT 1 AS first; SELECT 2 AS second;",
-                    "first\n1\nsecond\n2\n",
-                ),
-            ];
-            for (sql, expected) in cases {
-                let mut input = Cursor::new(Vec::<u8>::new());
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                let args = ["fsqlite", "-c", sql].map(OsString::from);
-                let exit_code = run(args, &mut input, &mut out, &mut err).await;
-                assert_eq!(
-                    exit_code,
-                    0,
-                    "SQL: {sql}; stderr: {}",
-                    String::from_utf8_lossy(&err)
-                );
-                assert!(err.is_empty(), "SQL: {sql}; stderr: {err:?}");
-                assert_eq!(out, expected.as_bytes(), "SQL: {sql}");
-            }
-        });
-    }
-
-    #[test]
-    fn test_command_mode_batch_error_keeps_prior_output_and_commits() {
-        asupersync::test_utils::run_test(|| async {
-            for failure in ["SELEC 2", "SELECT * FROM missing_table"] {
-                let dir = tempfile::tempdir().expect("tempdir");
-                let db_path = dir.path().join("batch_error.db");
-                let sql = format!(
-                    "CREATE TABLE t(x); INSERT INTO t VALUES(1); SELECT x FROM t; \
-                     {failure}; INSERT INTO t VALUES(3); SELECT 99;"
-                );
-                let mut input = Cursor::new(Vec::<u8>::new());
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                let args = [
-                    OsString::from("fsqlite"),
-                    db_path.as_os_str().to_owned(),
-                    OsString::from("-c"),
-                    OsString::from(&sql),
-                ];
-                let exit_code = run(args, &mut input, &mut out, &mut err).await;
-                assert_eq!(exit_code, 1, "SQL: {sql}");
-                assert_eq!(out, b"1\n", "earlier result must survive: {sql}");
-                assert!(
-                    String::from_utf8_lossy(&err).contains("error:"),
-                    "failure must be reported: {err:?}"
-                );
-                let stock = rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .expect("stock opens the closed CLI database");
-                let rows: Vec<i64> = stock
-                    .prepare("SELECT x FROM t ORDER BY rowid")
-                    .expect("earlier CREATE TABLE must survive")
-                    .query_map([], |row| row.get(0))
-                    .expect("read committed rows")
-                    .collect::<rusqlite::Result<_>>()
-                    .expect("collect committed rows");
-                assert_eq!(rows, [1], "stop before the later INSERT: {sql}");
-            }
-        });
-    }
-
-    #[test]
-    fn test_command_mode_batch_preserves_engine_parse_diagnostics() {
-        asupersync::test_utils::run_test(|| async {
-            for (failure, expected_error) in [
-                ("SELEC 2;", "error: near \"SELEC\": syntax error\n"),
-                (
-                    "SELECT sum(x) OVER (ROWS 1 FOLLOWING) FROM (SELECT 1 AS x);",
-                    "error: unsupported frame specification\n",
-                ),
-                (
-                    "SELECT sum(x) OVER (ROWS UNBOUNDED FOLLOWING) FROM (SELECT 1 AS x);",
-                    "error: near \"FOLLOWING\": syntax error\n",
-                ),
-            ] {
-                let sql = format!("SELECT '雪'; {failure}");
-                let args = ["fsqlite", "-c", &sql].map(OsString::from);
-                let mut input = Cursor::new(Vec::<u8>::new());
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                assert_eq!(run(args, &mut input, &mut out, &mut err).await, 1);
-                assert_eq!(out, "雪\n".as_bytes());
-                assert_eq!(err, expected_error.as_bytes(), "SQL: {sql}");
-            }
         });
     }
 

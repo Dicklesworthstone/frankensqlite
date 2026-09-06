@@ -125,11 +125,9 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   mount mask. A sidecar this process just created with `O_CREAT|O_EXCL` is
   accepted whatever mode the mount reports back, and an existing sidecar is
   accepted when it grants no group/other bit that the database file itself
-  does not already grant to the same principals — group bits count only when
-  the sidecar and the database share a group, since POSIX resolves one
-  permission class per process; the owner, single-hard-link and regular-file
-  checks are unchanged, and a sidecar loosened beyond its database on a real
-  POSIX filesystem still fails closed (beads_rust GH#491).
+  does not already grant; the owner, single-hard-link and regular-file checks
+  are unchanged, and a sidecar loosened beyond its database on a real POSIX
+  filesystem still fails closed (beads_rust GH#491).
 
 ---
 

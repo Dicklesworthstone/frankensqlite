@@ -92431,6 +92431,36 @@ impl Connection {
                         return vec![to_row(2, 0, 0, detail)];
                     }
 
+                    // GH #415: a rowid membership / equality seek under ORDER BY
+                    // or an aggregate has no planner directive (the planner
+                    // declines those shapes), and the generic bytecode explain
+                    // renders every `OpenRead` as a `SCAN`. When the program's
+                    // only way onto the table is a rowid probe — never a
+                    // `Rewind`/`Next` — report the seek it actually performs,
+                    // exactly as the directive-verified path does; a sorter
+                    // still surfaces as the temp b-tree marker.
+                    if simple_top_level_select
+                        && let Some(table_name) =
+                            single_table_source_name_from_core(&select.body.select)
+                        && crate::explain::program_accesses_table_only_by_rowid(
+                            &program, table_name,
+                        )
+                    {
+                        let mut rows = vec![to_row(
+                            2,
+                            0,
+                            0,
+                            format!("SEARCH {table_name} USING INTEGER PRIMARY KEY (rowid=?)"),
+                        )];
+                        if crate::explain::explain_query_plan(&program)
+                            .iter()
+                            .any(|row| row.detail == "USE TEMP B-TREE FOR ORDER BY")
+                        {
+                            rows.push(to_row(3, 0, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()));
+                        }
+                        return rows;
+                    }
+
                     let explained = crate::explain::explain_query_plan(&program);
                     if !explained.is_empty() {
                         let has_source_detail = explained
@@ -126999,6 +127029,24 @@ fn select_requires_temp_btree_fallback_for_order_by(select: &SelectStatement) ->
         return false;
     };
     table_or_subquery_is_or_wraps_table_function(&from_clause.source)
+}
+
+/// The schema name of a single-table `FROM` source (no joins, no subquery
+/// source); `None` for anything else. Companion of
+/// [`first_source_eqp_detail_from_core`] for program-derived EQP rows that
+/// must name the table the way the planner directive would (GH #415).
+fn single_table_source_name_from_core(core: &SelectCore) -> Option<&str> {
+    let SelectCore::Select { from, .. } = core else {
+        return None;
+    };
+    let from_clause = from.as_ref()?;
+    if !from_clause.joins.is_empty() {
+        return None;
+    }
+    match &from_clause.source {
+        TableOrSubquery::Table { name, .. } => Some(name.name.as_str()),
+        _ => None,
+    }
 }
 
 /// Build a fallback EXPLAIN QUERY PLAN detail for the first FROM source.
@@ -258406,6 +258454,16 @@ mod pager_routing_tests {
                 ),
                 // `NOT INDEXED` forbids the index, so both engines scan.
                 ("SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2", "SCAN t"),
+                // GH #415: rowid probes under an aggregate carry no planner
+                // directive; EQP still reports the seek the program performs.
+                (
+                    "SELECT COUNT(*) FROM t WHERE id = 2",
+                    "SEARCH t USING INTEGER PRIMARY KEY (rowid=?)",
+                ),
+                (
+                    "SELECT COUNT(*) FROM t WHERE id IN (2, 5)",
+                    "SEARCH t USING INTEGER PRIMARY KEY (rowid=?)",
+                ),
             ];
 
             for (sql, want) in expected {
@@ -258452,7 +258510,10 @@ mod pager_routing_tests {
             for sql in queries {
                 let eqp = eqp_details(&conn, sql).await;
                 let ops = explain_opcodes(&conn, sql).await;
-                let has_seek = ops.iter().any(|op| op == "SeekGE");
+                // GH #415: a rowid probe (`SeekRowid` with no index seek) is a
+                // SEARCH too — `COUNT(*) WHERE id = 2` renders
+                // `USING INTEGER PRIMARY KEY (rowid=?)` like C SQLite.
+                let has_seek = ops.iter().any(|op| op == "SeekGE" || op == "SeekRowid");
                 let has_table_lookup = ops.iter().any(|op| op == "SeekRowid");
 
                 assert_eq!(
