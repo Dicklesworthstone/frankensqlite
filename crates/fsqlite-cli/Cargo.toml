@@ -35,6 +35,7 @@ misc = ["fsqlite/misc"]
 fsqlite = { workspace = true, features = ["linux-asupersync-uring"] }
 fsqlite-error = { workspace = true }
 fsqlite-core = { workspace = true }
+fsqlite-parser = { workspace = true }
 fsqlite-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

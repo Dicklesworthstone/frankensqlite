@@ -34667,8 +34667,12 @@ impl Connection {
         ))
     }
 
+    /// Convert a parser diagnostic using the same SQLite-compatible error
+    /// formatting as connection execution. `sql` must be the original source
+    /// whose byte offsets the parser diagnostic refers to.
+    #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    fn parse_error_to_franken_error(
+    pub fn parse_error_to_franken_error(
         sql: &str,
         parse_error: fsqlite_parser::ParseError,
     ) -> FrankenError {
