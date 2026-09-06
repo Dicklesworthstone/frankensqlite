@@ -577,6 +577,15 @@ impl CommandMailboxSignal {
             return;
         }
         #[cfg(test)]
+        self.record_notification_gate_contention();
+        let mut generation = self.lock_generation();
+        *generation = generation.wrapping_add(1);
+        self.capacity_available.notify_one();
+        drop(generation);
+    }
+
+    #[cfg(test)]
+    fn record_notification_gate_contention(&self) {
         if self.hold_before_sync_park.load(Ordering::Acquire) {
             match self.generation.try_lock() {
                 Ok(generation) => drop(generation),
@@ -589,16 +598,14 @@ impl CommandMailboxSignal {
                 }
             }
         }
-        let mut generation = self.lock_generation();
-        *generation = generation.wrapping_add(1);
-        self.capacity_available.notify_one();
-        drop(generation);
     }
 
     fn notify_terminal(&self) {
         if self.sync_waiters.load(Ordering::Acquire) == 0 {
             return;
         }
+        #[cfg(test)]
+        self.record_notification_gate_contention();
         let mut generation = self.lock_generation();
         *generation = generation.wrapping_add(1);
         self.capacity_available.notify_all();
@@ -6282,9 +6289,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_receiver_drop_wakes_blocked_async_and_sync_admissions() {
+    fn assert_receiver_drop_wakes_blocked_admissions(panic_on_drop: bool) {
+        struct ReleaseParkOnDrop<'a>(&'a AtomicBool);
+
+        impl Drop for ReleaseParkOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         let (sender, receiver) = command_channel(1);
+        let _release_park = ReleaseParkOnDrop(&sender.signal.hold_before_sync_park);
         let (fill_tx, fill_rx) = mpsc::sync_channel(1);
         drop(fill_rx);
         sender
@@ -6299,6 +6314,11 @@ mod tests {
             future::block_on(future::poll_once(&mut reservation)).is_none(),
             "async admission should be pending behind the full mailbox"
         );
+        sender
+            .signal
+            .hold_before_sync_park
+            .store(true, Ordering::Release);
+        let generation_before_drop = sender.signal.current_generation();
 
         let sender_in_thread = sender.clone();
         let (sync_tx, sync_rx) = mpsc::sync_channel(1);
@@ -6312,20 +6332,75 @@ mod tests {
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while sender.signal.sync_waiters.load(Ordering::Acquire) == 0 {
+        while sender.signal.sync_park_predicates.load(Ordering::Acquire) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "sync admission did not reach its terminal-wakeup wait state"
+                "sync admission did not reach the controlled predicate-to-park boundary"
             );
             thread::yield_now();
         }
 
-        let generation_before_drop = sender.signal.current_generation();
-        drop(receiver);
+        // A waiter-count observation alone does not prove the sender parked:
+        // it can observe closure on its first retry and leave before the guard
+        // checks the count. Hold the actual predicate mutex until the terminal
+        // notifier has observed it, so this test requires a real wakeup.
+        sender
+            .signal
+            .panic_on_receiver_drop
+            .store(panic_on_drop, Ordering::Release);
+        let (drop_tx, drop_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            let unwound = catch_unwind(AssertUnwindSafe(|| drop(receiver))).is_err();
+            let _ = drop_tx.send(unwound);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sender
+            .signal
+            .notification_observed_gate_contention
+            .load(Ordering::Acquire)
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal notifier did not reach the held predicate mutex"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "sync admission must still be held before parking"
+        );
+        assert!(
+            matches!(drop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "receiver drop must wait for the terminal notification to complete"
+        );
+        let (late_tx, late_rx) = mpsc::sync_channel(1);
+        drop(late_rx);
+        assert!(
+            matches!(
+                sender.try_send(Command::LastInsertRowid {
+                    tx: Responder::Sync(late_tx),
+                }),
+                Err(async_mpsc::SendError::Disconnected(_))
+            ),
+            "the receiver must already be closed before terminal notification"
+        );
+        sender
+            .signal
+            .hold_before_sync_park
+            .store(false, Ordering::Release);
+        assert_eq!(
+            drop_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal notification should finish after the sender parks"),
+            panic_on_drop,
+            "only the receiver-drop sentinel should unwind"
+        );
+        dropper.join().expect("dropper should catch the sentinel");
         assert_ne!(
             sender.signal.current_generation(),
             generation_before_drop,
-            "receiver Drop must synchronously publish the terminal epoch"
+            "the normal or unwinding guard must publish the terminal epoch"
         );
         let (late_tx, late_rx) = mpsc::sync_channel(1);
         drop(late_rx);
@@ -6359,57 +6434,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_receiver_drop_wakes_blocked_async_and_sync_admissions() {
+        assert_receiver_drop_wakes_blocked_admissions(false);
+    }
+
+    #[test]
     fn receiver_drop_panic_still_wakes_a_saturated_sync_sender() {
-        let (sender, receiver) = command_channel(1);
-        let (fill_tx, fill_rx) = mpsc::sync_channel(1);
-        drop(fill_rx);
-        sender
-            .try_send(Command::LastInsertRowid {
-                tx: Responder::Sync(fill_tx),
-            })
-            .expect("initial command should fill the mailbox");
-
-        let sender_in_thread = sender.clone();
-        let (sync_tx, sync_rx) = mpsc::sync_channel(1);
-        drop(sync_rx);
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let sync_sender = thread::spawn(move || {
-            let result = sender_in_thread.send(Command::LastInsertRowid {
-                tx: Responder::Sync(sync_tx),
-            });
-            let _ = done_tx.send(result);
-        });
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while sender.signal.sync_waiters.load(Ordering::Acquire) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "sync admission did not reach its terminal-wakeup wait state"
-            );
-            thread::yield_now();
-        }
-        sender
-            .signal
-            .panic_on_receiver_drop
-            .store(true, Ordering::Release);
-        let generation_before_drop = sender.signal.current_generation();
-        let panic = catch_unwind(AssertUnwindSafe(|| drop(receiver)));
-        assert!(panic.is_err(), "the receiver-drop sentinel must unwind");
-        assert_ne!(
-            sender.signal.current_generation(),
-            generation_before_drop,
-            "the unwind guard must publish the terminal epoch"
-        );
-        assert!(
-            matches!(
-                done_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("terminal unwind must wake the sync admission"),
-                Err(async_mpsc::SendError::Disconnected(_))
-            ),
-            "the woken sender must observe the already-closed receiver"
-        );
-        sync_sender.join().expect("sync sender should not panic");
+        assert_receiver_drop_wakes_blocked_admissions(true);
     }
 
     #[test]

@@ -461,21 +461,29 @@ fn compare_query_results(
 
 /// Locates the C sqlite3 binary on the system.
 ///
-/// Returns the path if found and version is acceptable.
+/// Searches `PATH` before standard installation locations. Call
+/// [`verify_oracle_version`] separately to check the discovered version.
 pub fn find_sqlite3_binary() -> Result<PathBuf> {
-    let candidates = [
+    let search_path = std::env::var_os("PATH");
+    let binary_name = format!("sqlite3{}", std::env::consts::EXE_SUFFIX);
+    let installed_paths = [
         "/usr/bin/sqlite3",
         "/usr/local/bin/sqlite3",
         "/opt/homebrew/bin/sqlite3",
     ];
-    for path_str in candidates {
-        let path = PathBuf::from(path_str);
+    let candidates = search_path
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join(&binary_name))
+        .chain(installed_paths.into_iter().map(PathBuf::from));
+    for path in candidates {
         if path.is_file() {
             return Ok(path);
         }
     }
     Err(FrankenError::Internal(
-        "C sqlite3 binary not found on system".to_string(),
+        "C sqlite3 binary not found in PATH or standard installation locations".to_string(),
     ))
 }
 
