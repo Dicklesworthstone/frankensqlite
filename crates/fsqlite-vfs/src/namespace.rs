@@ -2016,10 +2016,13 @@ fn validate_secure_lock_file(
 ///
 /// 2. [`SidecarProvenance::Existing`]: the sidecar grants no group/other bit
 ///    that the main database file does not already grant. A principal who can
-///    open the database can already take advisory locks on it (a read-only
-///    descriptor suffices for `flock`/`fcntl`), so a sidecar that is at most
-///    as exposed as the database adds no capability the database has not
-///    already handed out. This covers the same permission-less mounts on
+///    open the sidecar can take advisory locks on it — a read-only descriptor
+///    suffices for `flock(LOCK_EX)`, which blocks readers too — while a
+///    read-only descriptor on the database yields only `fcntl` `F_RDLCK`. The
+///    delta a database-bounded sidecar hands out is therefore availability
+///    only (stalling admission), never data access, and it is handed only to
+///    principals the database already admits; a sidecar at most as exposed
+///    as its database is accepted on that basis. This covers permission-less mounts on
 ///    re-open (database and sidecars all report the mount mask) without
 ///    accepting a sidecar that was loosened beyond its database on a real
 ///    POSIX filesystem. A missing or non-regular database file offers no
