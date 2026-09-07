@@ -276,6 +276,111 @@ fn test_scan_wal_fec_corrupt_meta_retains_preceding_groups_bd_xv5cm_m4() {
 }
 
 #[test]
+fn test_scan_wal_fec_layout_error_retains_only_preceding_groups() {
+    use std::io::Write;
+
+    let dir = tempdir().expect("tempdir");
+    let spec = SampleMetaSpec {
+        start_frame_no: 1,
+        k_source: 3,
+        r_repair: 2,
+        wal_salt1: 11,
+        wal_salt2: 22,
+        object_tag: b"layout-prefix",
+        seed_base: 5,
+        db_size_pages: 128,
+    };
+    let prefix_meta = sample_meta(spec);
+    let tail_meta = sample_meta(SampleMetaSpec {
+        start_frame_no: 4,
+        object_tag: b"layout-tail",
+        ..spec
+    });
+    let prefix = WalFecGroupRecord::new(prefix_meta.clone(), sample_repair_symbols(&prefix_meta))
+        .expect("valid prefix group");
+    let tail = WalFecGroupRecord::new(tail_meta.clone(), sample_repair_symbols(&tail_meta))
+        .expect("valid tail group");
+
+    for mismatch in ["object_id", "oti", "esi"] {
+        let mut symbols = sample_repair_symbols(&tail_meta);
+        let original = &symbols[1];
+        let object_id = if mismatch == "object_id" {
+            prefix_meta.object_id
+        } else {
+            original.object_id
+        };
+        let mut oti = original.oti;
+        if mismatch == "oti" {
+            oti.al = 0;
+        }
+        let esi = if mismatch == "esi" {
+            tail_meta.k_source
+        } else {
+            original.esi
+        };
+        symbols[1] = SymbolRecord::new(
+            object_id,
+            oti,
+            esi,
+            sample_payload(9),
+            SymbolRecordFlags::empty(),
+        );
+        for symbol in &symbols {
+            assert_eq!(
+                SymbolRecord::from_bytes(&symbol.to_bytes()).expect("valid symbol checksum"),
+                *symbol,
+                "{mismatch}: each symbol must parse independently"
+            );
+        }
+        let error = WalFecGroupRecord::new(tail_meta.clone(), symbols.clone())
+            .expect_err("only the group layout must be invalid");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains(mismatch),
+            "{mismatch}: wrong rejection: {error}"
+        );
+
+        for with_prefix in [false, true] {
+            let sidecar = dir.path().join(format!("{mismatch}-{with_prefix}.wal-fec"));
+            if with_prefix {
+                append_wal_fec_group(&sidecar, &prefix).expect("append valid prefix");
+            }
+            let mut corrupt = Vec::new();
+            for record in std::iter::once(tail_meta.to_record_bytes())
+                .chain(symbols.iter().map(SymbolRecord::to_bytes))
+            {
+                corrupt.extend_from_slice(&u32::try_from(record.len()).unwrap().to_le_bytes());
+                corrupt.extend_from_slice(&record);
+            }
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar)
+                .expect("open sidecar")
+                .write_all(&corrupt)
+                .expect("append layout-invalid group");
+            append_wal_fec_group(&sidecar, &tail).expect("append valid group after corruption");
+
+            let scan = scan_wal_fec(&sidecar).expect("layout error must not poison the scan");
+            assert!(
+                scan.truncated_tail,
+                "{mismatch}: corruption must be reported"
+            );
+            assert_eq!(scan.groups.len(), usize::from(with_prefix));
+            assert_eq!(
+                find_wal_fec_group(&sidecar, prefix_meta.group_id()).expect("find valid prefix"),
+                with_prefix.then(|| prefix.clone())
+            );
+            assert!(
+                find_wal_fec_group(&sidecar, tail_meta.group_id())
+                    .expect("search must tolerate layout error")
+                    .is_none(),
+                "{mismatch}: groups after the corrupt record must not be returned"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_wal_fec_salt_binding() {
     let meta = sample_meta(SampleMetaSpec {
         start_frame_no: 2,

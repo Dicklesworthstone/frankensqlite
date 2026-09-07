@@ -1,4 +1,6 @@
 tmp_golden/
+# Generated doctor reports include a latest symlink; neither is build input.
+.doctor/
 .rch-correctness-target/
 .rch-retained-dml-target/
 # .beads/issues.jsonl is a test fixture. Runtime and recovery exclusions live

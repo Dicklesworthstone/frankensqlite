@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -101,7 +101,7 @@ impl WalFecPragmaHeader {
     }
 
     fn from_prefix(bytes: &[u8]) -> Result<Option<Self>> {
-        if bytes.len() < WAL_FEC_PRAGMA_HEADER_BYTES {
+        if bytes.len() < WAL_FEC_PRAGMA_HEADER_MAGIC.len() {
             return Ok(None);
         }
 
@@ -109,6 +109,11 @@ impl WalFecPragmaHeader {
         magic.copy_from_slice(&bytes[..8]);
         if magic != WAL_FEC_PRAGMA_HEADER_MAGIC {
             return Ok(None);
+        }
+        if bytes.len() < WAL_FEC_PRAGMA_HEADER_BYTES {
+            return Err(FrankenError::WalCorrupt {
+                detail: "truncated wal-fec pragma header".to_owned(),
+            });
         }
 
         let version = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed-length slice"));
@@ -143,6 +148,20 @@ impl WalFecPragmaHeader {
         }
 
         Ok(Some(header))
+    }
+
+    fn read_from(mut reader: impl Read) -> Result<Option<Self>> {
+        let mut bytes = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
+        let mut read_len = 0;
+        while read_len < bytes.len() {
+            match reader.read(&mut bytes[read_len..]) {
+                Ok(0) => break,
+                Ok(count) => read_len += count,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Self::from_prefix(&bytes[..read_len])
     }
 
     #[must_use]
@@ -2220,12 +2239,14 @@ pub fn wal_fec_raptorq_decode(
 /// Resolve sidecar path from WAL path.
 #[must_use]
 pub fn wal_fec_path_for_wal(wal_path: &Path) -> PathBuf {
-    let wal_name = wal_path.to_string_lossy();
-    if wal_name.ends_with("-wal") || wal_name.ends_with(".wal") {
-        PathBuf::from(format!("{wal_name}-fec"))
+    let mut sidecar_name = wal_path.as_os_str().to_os_string();
+    let wal_name = wal_path.as_os_str().as_encoded_bytes();
+    if wal_name.ends_with(b"-wal") || wal_name.ends_with(b".wal") {
+        sidecar_name.push("-fec");
     } else {
-        PathBuf::from(format!("{wal_name}.wal-fec"))
+        sidecar_name.push(".wal-fec");
     }
+    PathBuf::from(sidecar_name)
 }
 
 /// Read persistent `PRAGMA raptorq_repair_symbols` from `.wal-fec` header.
@@ -2233,19 +2254,14 @@ pub fn wal_fec_path_for_wal(wal_path: &Path) -> PathBuf {
 /// Returns [`DEFAULT_RAPTORQ_REPAIR_SYMBOLS`] when the sidecar is missing or
 /// still in legacy format without a config header.
 pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
-    if !sidecar_path.exists() {
-        return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
-    }
-
-    let mut file = match fs::File::open(sidecar_path) {
-        Ok(f) => f,
-        Err(_) => return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS),
+    let file = match fs::File::open(sidecar_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
+        }
+        Err(err) => return Err(err.into()),
     };
-    let mut bytes = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
-    use std::io::Read;
-    let read_len = file.read(&mut bytes).unwrap_or(0);
-
-    let Some(header) = WalFecPragmaHeader::from_prefix(&bytes[..read_len])? else {
+    let Some(header) = WalFecPragmaHeader::read_from(file)? else {
         return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
     };
 
@@ -2261,7 +2277,7 @@ pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
 ///
 /// Existing sidecar group data is preserved exactly after the header region.
 pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom};
 
     if !sidecar_path.exists() {
         if let Some(parent) = sidecar_path.parent()
@@ -2301,14 +2317,13 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
         .write(true)
         .open(sidecar_path)?;
 
-    let mut header_buf = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
-    let read_len = file.read(&mut header_buf).unwrap_or(0);
-    let has_header = WalFecPragmaHeader::from_prefix(&header_buf[..read_len])?.is_some();
+    let has_header = WalFecPragmaHeader::read_from(&mut file)?.is_some();
     let header = WalFecPragmaHeader::new(value);
 
     file.seek(SeekFrom::Start(0))?;
     if has_header {
         file.write_all(&header.to_bytes())?;
+        file.sync_all()?;
     } else {
         // Rewrite the file with the header prepended using a buffered stream to avoid OOM.
         // Wrap in a closure so the temp file is cleaned up on any I/O error.
@@ -2484,7 +2499,19 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
         if truncated_tail {
             break;
         }
-        groups.push(WalFecGroupRecord::new(meta, repair_symbols)?);
+        match WalFecGroupRecord::new(meta, repair_symbols) {
+            Ok(group) => groups.push(group),
+            Err(err) => {
+                truncated_tail = true;
+                warn!(
+                    sidecar = %sidecar_path.display(),
+                    cursor,
+                    error = %err,
+                    "inconsistent wal-fec group layout — stopping scan, retaining preceding groups"
+                );
+                break;
+            }
+        }
     }
 
     Ok(WalFecScanResult {
@@ -3469,6 +3496,82 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_fec_pragma_header_short_reads_and_interruption() {
+        struct ShortReads<'a> {
+            bytes: &'a [u8],
+            interrupt_next: bool,
+        }
+
+        impl Read for ShortReads<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.interrupt_next = !self.interrupt_next;
+                if self.interrupt_next {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let len = buf.len().min(3);
+                self.bytes.read(&mut buf[..len])
+            }
+        }
+
+        let header = WalFecPragmaHeader::new(17);
+        let bytes = header.to_bytes();
+        assert_eq!(
+            WalFecPragmaHeader::read_from(ShortReads {
+                bytes: &bytes,
+                interrupt_next: false,
+            })
+            .expect("short reads must be retried"),
+            Some(header)
+        );
+        assert!(
+            WalFecPragmaHeader::read_from(&bytes[..bytes.len() - 1])
+                .expect_err("recognized but incomplete header is corrupt")
+                .to_string()
+                .contains("truncated wal-fec pragma header")
+        );
+    }
+
+    #[test]
+    fn test_wal_fec_pragma_rejects_truncated_header_without_rewriting() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+        let bytes = WalFecPragmaHeader::new(17).to_bytes();
+        let truncated = &bytes[..bytes.len() - 1];
+        fs::write(&sidecar, truncated).expect("write truncated header");
+
+        assert!(read_wal_fec_raptorq_repair_symbols(&sidecar).is_err());
+        assert!(persist_wal_fec_raptorq_repair_symbols(&sidecar, 9).is_err());
+        assert_eq!(fs::read(&sidecar).expect("read sidecar"), truncated);
+    }
+
+    #[test]
+    fn test_wal_fec_pragma_read_reports_io_errors() {
+        let dir = tempdir().expect("tempdir");
+        assert!(read_wal_fec_raptorq_repair_symbols(dir.path()).is_err());
+        assert_eq!(
+            read_wal_fec_raptorq_repair_symbols(&dir.path().join("missing.wal-fec"))
+                .expect("missing sidecar uses default"),
+            DEFAULT_RAPTORQ_REPAIR_SYMBOLS
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wal_fec_path_preserves_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        for (wal, expected) in [
+            (b"db\xff-wal".as_slice(), b"db\xff-wal-fec".as_slice()),
+            (b"db\xfe.wal".as_slice(), b"db\xfe.wal-fec".as_slice()),
+            (b"db\xff".as_slice(), b"db\xff.wal-fec".as_slice()),
+        ] {
+            let actual = wal_fec_path_for_wal(Path::new(OsStr::from_bytes(wal)));
+            assert_eq!(actual.as_os_str().as_bytes(), expected);
+        }
+    }
+
+    #[test]
     fn test_wal_fec_pragma_header_default_without_header() {
         let dir = tempdir().expect("tempdir");
         let sidecar = dir.path().join("db.wal-fec");
@@ -3490,6 +3593,12 @@ mod tests {
 
         assert_eq!(first_read, 4);
         assert_eq!(second_read, 4);
+
+        persist_wal_fec_raptorq_repair_symbols(&sidecar, 8).expect("update existing header");
+        assert_eq!(
+            read_wal_fec_raptorq_repair_symbols(&sidecar).expect("read updated setting"),
+            8
+        );
     }
 
     #[test]
