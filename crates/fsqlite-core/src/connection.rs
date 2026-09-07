@@ -77289,11 +77289,12 @@ impl Connection {
             .should_skip_ssi(force_audit_hash)
     }
 
-    /// Feeds one SSI outcome observation into the e-process.
-    /// `conflict_detected` must be the real return of a
-    /// `ssi_validate_and_publish` call (true iff it returned `Err`).
-    /// Always safe to call regardless of `write_merge_mode`; the gate
-    /// is simply unconsulted under `Safe`.
+    /// Records one completed SSI edge-discovery observation.
+    /// `conflict_detected` is true when that validation discovered a pivot.
+    /// FCW conflicts, invalid handles, propagated abort marks before edge
+    /// discovery, and skipped validations provide no observation and must
+    /// not call this method. The gate is not consulted under `Safe`, but
+    /// actual observations can still train it in that mode.
     pub fn observe_ssi_outcome(&self, conflict_detected: bool) {
         self.ssi_e_process_gate
             .borrow_mut()

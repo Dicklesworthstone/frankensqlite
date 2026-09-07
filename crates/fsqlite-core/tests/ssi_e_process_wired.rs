@@ -5,14 +5,16 @@
 //!
 //! Safety contract under test:
 //!
-//! 1. Under `write_merge = SAFE`, the gate is never consulted and the
-//!    commit path runs full SSI validation on every concurrent commit.
+//! 1. Under `write_merge = SAFE`, SSI transactions never skip validation.
+//!    A transaction's BEGIN-time FCW-only policy does not consult or train
+//!    the SSI gate, even if the serializable PRAGMA changes before COMMIT.
 //! 2. Under `write_merge = LAB_UNSAFE`, the gate eventually opens on a
 //!    pivot-free workload and grants at least some skips. The final DB
 //!    ordered rows match a SAFE-mode run of the same workload.
-//! 3. An adversarial workload that injects a true page-level write-write
-//!    conflict must NOT cross the e-process threshold; FCW (first-
-//!    committer-wins) catches the conflict regardless of SSI skip.
+//! 3. Competing same-page writes reject one transaction without inventing
+//!    an SSI observation. The test records whether rejection occurred at
+//!    page admission or COMMIT; it does not require a warmed or open gate.
+//! 4. An explicitly synthetic conflict stream tests the gate's alert policy.
 
 use fsqlite_core::connection::{Connection, WriteMergeMode};
 
@@ -175,11 +177,8 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
             !matches!(lab_snap.alert_state, fsqlite_mvcc::GateAlertState::Alert),
             "clean workload must not trip the gate to Alert; snap={lab_snap}"
         );
-        // Some commits should be audit-sampled (even when the gate wants to
-        // skip, `periodic_sample_rate` forces a real observation fraction).
-        // After enough commits we require at least SOME skip grants, unless
-        // the audit stride perfectly aligned with our session-id/commit-seq
-        // mix (extremely unlikely at commits = 512).
+        // Audit sampling must leave actual skip grants in this workload.
+        // Consultation alone does not prove that any validation was skipped.
         assert!(
             lab_snap.skip_consultations > 0,
             "LAB_UNSAFE commit path must consult the gate; snap={lab_snap}"
