@@ -4,6 +4,9 @@
 //! operations to [`UnixFile`]. Data-path read/write can use `io_uring` when it
 //! is available at runtime, and transparently falls back to the Unix path when
 //! `io_uring` initialization fails.
+//! The shared driver requires synchronous cancellation support (Linux 6.0+)
+//! to retain submitted buffers safely across driver errors. Kernels without
+//! that operation use the same Unix fallback.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -65,6 +68,8 @@ static FORCE_ASUPERSYNC_READ_ABORT: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_ASUPERSYNC_DRIVER_WAIT_FAIL: AtomicBool = AtomicBool::new(false);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -368,7 +373,22 @@ impl IoUringRuntime {
             let ring_result = if forced_failure {
                 Err(io::Error::other("forced shared io_uring init failure"))
             } else {
-                IoUring::new(IO_URING_QUEUE_ENTRIES)
+                IoUring::new(IO_URING_QUEUE_ENTRIES).and_then(|ring| {
+                    // Fatal driver errors need a kernel quiescence barrier
+                    // before their submitted buffers can be released. Probe
+                    // that operation on the empty ring before admitting I/O.
+                    match ring.submitter().register_sync_cancel(
+                        Some(types::Timespec::from(Duration::from_secs(1))),
+                        types::CancelBuilder::any(),
+                    ) {
+                        Ok(()) => Ok(ring),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ring),
+                        Err(error) => Err(io::Error::new(
+                            error.kind(),
+                            format!("synchronous io_uring cancellation unavailable: {error}"),
+                        )),
+                    }
+                })
             };
             let (ring, initial_status) = match ring_result {
                 Ok(ring) => (
@@ -525,6 +545,14 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Pair admission with failure cleanup under the queue lock. An
+            // earlier availability check cannot exclude a concurrent disable.
+            if !self.is_available() {
+                return Err(FrankenError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "shared io_uring runtime was disabled before admission",
+                )));
+            }
             let id = queue.allocate_request_id();
             queue.pending.push_back(DriverRequest {
                 id,
@@ -554,7 +582,7 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if queue.active || queue.pending.is_empty() {
+            if !self.is_available() || queue.active || queue.pending.is_empty() {
                 false
             } else {
                 queue.active = true;
@@ -627,6 +655,7 @@ impl IoUringRuntime {
     fn drive_to_quiescence(self: Arc<Self>) {
         let Some(ring_mutex) = &self.ring else {
             self.fail_driver(
+                None,
                 &mut HashMap::new(),
                 &io::Error::new(io::ErrorKind::Unsupported, "io_uring is unavailable"),
             );
@@ -660,6 +689,8 @@ impl IoUringRuntime {
             );
 
             let mut submission_error = None;
+            let mut staged_requests = 0;
+            let mut staged_cancellations = 0;
             for request in requests {
                 let id = request.id;
                 let previous = inflight.insert(id, request);
@@ -689,7 +720,7 @@ impl IoUringRuntime {
                     submission_error = Some(error);
                     break;
                 }
-                self.submitted_requests.fetch_add(1, Ordering::Relaxed);
+                staged_requests += 1;
             }
 
             if submission_error.is_none() {
@@ -704,21 +735,46 @@ impl IoUringRuntime {
                         submission_error = Some(error);
                         break;
                     }
-                    self.submitted_cancellations.fetch_add(1, Ordering::Relaxed);
+                    staged_cancellations += 1;
                 }
             }
 
             if let Some(error) = submission_error {
-                drop(ring);
-                self.fail_driver(&mut inflight, &error);
+                self.fail_driver(Some(&mut ring), &mut inflight, &error);
                 return;
             }
 
-            if let Err(error) = ring.submit() {
-                drop(ring);
-                self.fail_driver(&mut inflight, &error);
-                return;
+            loop {
+                match ring.submit() {
+                    Ok(submitted) => {
+                        if ring.submission().is_empty() {
+                            break;
+                        }
+                        if submitted == 0 {
+                            self.fail_driver(
+                                Some(&mut ring),
+                                &mut inflight,
+                                &io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    "io_uring submission made no progress",
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        self.fail_driver(Some(&mut ring), &mut inflight, &error);
+                        return;
+                    }
+                }
             }
+            // SQE construction alone is not kernel submission. Publish these
+            // counters only after the kernel consumed the whole staged batch,
+            // including entries flushed while making room in push_submission.
+            self.submitted_requests
+                .fetch_add(staged_requests, Ordering::Release);
+            self.submitted_cancellations
+                .fetch_add(staged_cancellations, Ordering::Release);
 
             let completed = ring
                 .completion()
@@ -745,6 +801,16 @@ impl IoUringRuntime {
                 continue;
             }
 
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_DRIVER_WAIT_FAIL.load(Ordering::Acquire) {
+                self.fail_driver(
+                    Some(&mut ring),
+                    &mut inflight,
+                    &io::Error::other("forced shared io_uring driver wait failure"),
+                );
+                return;
+            }
+
             let timeout = types::Timespec::from(IO_URING_DRIVER_WAIT);
             let args = types::SubmitArgs::new().timespec(&timeout);
             match ring.submitter().submit_with_args(1, &args) {
@@ -755,8 +821,7 @@ impl IoUringRuntime {
                         Some(libc::ETIME | libc::EINTR | libc::EAGAIN)
                     ) => {}
                 Err(error) => {
-                    drop(ring);
-                    self.fail_driver(&mut inflight, &error);
+                    self.fail_driver(Some(&mut ring), &mut inflight, &error);
                     return;
                 }
             }
@@ -794,7 +859,12 @@ impl IoUringRuntime {
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
-    fn fail_driver(&self, inflight: &mut HashMap<u64, DriverRequest>, error: &io::Error) {
+    fn fail_driver(
+        &self,
+        ring: Option<&mut IoUring>,
+        inflight: &mut HashMap<u64, DriverRequest>,
+        error: &io::Error,
+    ) {
         self.disable(IO_URING_DRIVER_FAILED_MSG);
         let kind = error.kind();
         let message = error.to_string();
@@ -803,18 +873,65 @@ impl IoUringRuntime {
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.active = false;
-            queue.live.clear();
-            queue.cancellations.clear();
-            queue.cancellation_set.clear();
-            queue.pending.drain(..).collect::<Vec<_>>()
+            let queued = queue.pending.drain(..).collect::<Vec<_>>();
+            for request in &queued {
+                queue.live.remove(&request.id);
+                queue.cancellation_set.remove(&request.id);
+            }
+            queued
         };
-        for (_, request) in inflight.drain() {
-            request.fail(kind, &message);
-        }
         for request in queued {
             request.fail(kind, &message);
         }
+        if let Some(ring) = ring {
+            // Dropping the mutex guard does not close the ring or terminate
+            // kernel access to inflight Vec allocations. Keep this structured
+            // blocking driver and every buffer alive until cancellation has
+            // actually completed. A timeout/error is not permission to free.
+            let mut failed_barriers = 0_u64;
+            loop {
+                match ring.submitter().register_sync_cancel(
+                    Some(types::Timespec::from(Duration::from_secs(1))),
+                    types::CancelBuilder::any(),
+                ) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                    Err(error) => {
+                        failed_barriers = failed_barriers.saturating_add(1);
+                        if failed_barriers.is_power_of_two() {
+                            warn!(
+                                event = "io_uring_failure_cleanup_wait",
+                                failed_barriers,
+                                inflight_requests = inflight.len(),
+                                %error,
+                                "retaining submitted buffers until kernel quiescence"
+                            );
+                        }
+                        std::thread::sleep(IO_URING_DRIVER_WAIT);
+                    }
+                }
+            }
+            let completed = ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>();
+            // Preserve successful writes and their completion obligations when
+            // the kernel finished them before the driver failed.
+            self.finish_completions(inflight, completed);
+        }
+        // Remaining entries never reached the kernel. The ring is disabled,
+        // admits no new driver, and will never submit its residual SQ entries.
+        for (_, request) in inflight.drain() {
+            request.fail(kind, &message);
+        }
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.active = false;
+        queue.live.clear();
+        queue.cancellations.clear();
+        queue.cancellation_set.clear();
     }
 }
 
@@ -1675,6 +1792,169 @@ mod tests {
         assert_eq!(queue.allocate_request_id(), IO_URING_CANCEL_TAG - 1);
         assert_eq!(queue.allocate_request_id(), 2);
         assert!(!queue.live.contains(&IO_URING_CANCEL_TAG));
+    }
+
+    #[test]
+    fn test_driver_failure_quiesces_actual_kernel_poll_before_releasing_requests() {
+        let _guard = io_uring_test_guard();
+        let runtime = Arc::new(IoUringRuntime::new());
+        assert!(runtime.is_available(), "{}", runtime.status());
+        let cx = Cx::new();
+        let native_cx = NativeCx::for_testing();
+        let (read_fd, _write_fd) = nix::unistd::pipe().expect("create pending poll pipe");
+        let file = Arc::new(File::from(read_fd));
+        let (id, mut receiver) = runtime
+            .enqueue_read(&cx, &native_cx, Arc::clone(&file), 0, 0)
+            .expect("reserve a real request and completion permit");
+        let request = runtime.queue.lock().unwrap().pending.pop_front().unwrap();
+        let mut inflight = HashMap::from([(id, request)]);
+        let rescue_result = {
+            let mut ring = runtime.ring.as_ref().unwrap().lock().unwrap();
+            // A real pending kernel operation without a userspace buffer makes
+            // the old-cleanup negative safe: rescue it before any assertion.
+            let entry = opcode::PollAdd::new(
+                types::Fd(file.as_raw_fd()),
+                u32::try_from(libc::POLLIN).unwrap(),
+            )
+            .build()
+            .user_data(id);
+            push_submission(&mut ring, &entry).expect("queue pending kernel poll");
+            assert_eq!(ring.submit().expect("submit pending kernel poll"), 1);
+            assert!(ring.completion().next().is_none());
+
+            runtime.fail_driver(
+                Some(&mut ring),
+                &mut inflight,
+                &io::Error::other("injected driver error with pending kernel poll"),
+            );
+
+            let rescue = ring.submitter().register_sync_cancel(
+                Some(types::Timespec::from(Duration::from_secs(1))),
+                types::CancelBuilder::any(),
+            );
+            // Consume rescue CQEs even when the production cleanup is broken.
+            let _ = ring.completion().count();
+            rescue
+        };
+        assert!(
+            matches!(rescue_result, Err(ref error) if error.kind() == io::ErrorKind::NotFound),
+            "driver failure must leave no pending kernel request; rescue result: {rescue_result:?}"
+        );
+        assert!(inflight.is_empty());
+        assert!(!runtime.is_available());
+        block_on_test(&cx, async {
+            assert!(matches!(
+                receiver.recv(&native_cx).await.expect("terminal poll CQE"),
+                DriverCompletion::Cancelled
+            ));
+        });
+    }
+
+    #[test]
+    fn test_driver_failure_retains_pending_read_until_its_cancelled_cqe() {
+        let _guard = io_uring_test_guard();
+        let _forced_failure = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_DRIVER_WAIT_FAIL);
+        let proof = test_runtime().handle().spawn(async {
+            let driver_cx = NativeCx::current().expect("runtime task should install Cx");
+            let native_cx = NativeCx::for_testing();
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx.clone());
+            let runtime = Arc::new(IoUringRuntime::new());
+            assert!(runtime.is_available(), "{}", runtime.status());
+            let (read_fd, _write_fd) = nix::unistd::pipe().expect("create pending read pipe");
+            let file = Arc::new(File::from(read_fd));
+            let (id, mut receiver) = runtime
+                .enqueue_read(&cx, &native_cx, Arc::clone(&file), 1, 0)
+                .expect("enqueue actual buffered read");
+            let mut cancel_guard = RequestCancellationGuard::new(Arc::clone(&runtime), id);
+            runtime
+                .ensure_driver(&driver_cx)
+                .expect("start real driver");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let active = runtime.queue.lock().unwrap().active;
+                if !active {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "failed driver did not quiesce");
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(matches!(
+                receiver.recv(&native_cx).await.expect("terminal read CQE"),
+                DriverCompletion::Cancelled
+            ));
+            cancel_guard.disarm();
+            assert_eq!(runtime.submitted_requests.load(Ordering::Acquire), 1);
+            assert!(!runtime.is_available());
+            assert!(runtime.queue.lock().unwrap().live.is_empty());
+            assert!(matches!(
+                runtime.enqueue_read(&cx, &native_cx, file, 1, 0),
+                Err(FrankenError::Io(ref error)) if error.kind() == io::ErrorKind::Unsupported
+            ));
+        });
+        test_runtime().block_on(proof);
+    }
+
+    #[test]
+    fn test_driver_failure_preserves_completed_write_and_durability_observer() {
+        let _guard = io_uring_test_guard();
+        let runtime = Arc::new(IoUringRuntime::new());
+        assert!(runtime.is_available(), "{}", runtime.status());
+        let cx = Cx::new();
+        let native_cx = NativeCx::for_testing();
+        let directory = tempfile::tempdir().expect("create completed write directory");
+        let path = directory.path().join("completed-write.db");
+        let file = Arc::new(File::create(&path).expect("create completed write file"));
+        let completion = VfsWriteCompletion::new();
+        let (id, mut receiver) = runtime
+            .enqueue_write(
+                &cx,
+                &native_cx,
+                file,
+                b"survives".to_vec(),
+                0,
+                Some(completion.clone()),
+            )
+            .expect("enqueue actual tracked write");
+        let request = runtime.queue.lock().unwrap().pending.pop_front().unwrap();
+        let mut inflight = HashMap::from([(id, request)]);
+        {
+            let request = inflight.get(&id).unwrap();
+            let DriverRequestKind::Write(data) = &request.kind else {
+                panic!("expected write request");
+            };
+            let entry = opcode::Write::new(
+                types::Fd(request.file.as_raw_fd()),
+                data.as_ptr(),
+                u32::try_from(data.len()).unwrap(),
+            )
+            .offset(0)
+            .build()
+            .user_data(id);
+            let mut ring = runtime.ring.as_ref().unwrap().lock().unwrap();
+            push_submission(&mut ring, &entry).expect("queue actual write");
+            ring.submit_and_wait(1).expect("wait for actual write CQE");
+            runtime.fail_driver(
+                Some(&mut ring),
+                &mut inflight,
+                &io::Error::other("injected driver failure after completed write"),
+            );
+        }
+        assert!(inflight.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), b"survives");
+        block_on_test(&cx, async {
+            assert!(matches!(
+                receiver
+                    .recv(&native_cx)
+                    .await
+                    .expect("actual write result"),
+                DriverCompletion::Write { bytes_written: 8 }
+            ));
+            assert_eq!(
+                completion.wait().await,
+                crate::traits::VfsWriteCompletionState::Success
+            );
+        });
     }
 
     #[test]
