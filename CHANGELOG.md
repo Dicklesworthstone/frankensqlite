@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) (2026-09-06). v0.3.2–v0.3.4 and v0.3.6–v0.3.17 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.3.18](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.18) (2026-09-06). v0.3.2–v0.3.4 and v0.3.6–v0.3.18 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main) | HEAD | 2026-09-06 | CLI statement batches, lazy grouped IN predicates, WAL-to-DELETE visibility, acknowledgement/crash guards, namespace sidecar mount permissions, parameterized rowid IN-list seeks (GH#415) |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.18...main) | HEAD | 2026-09-06 | — |
+| [v0.3.18](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.18) | Release | 2026-09-06 | Parameterized `rowid IN (?, …)` planned as rowid seeks instead of full scans (GH#415); namespace sidecars accept mount-imposed modes with a GID-aware exposure rule (beads_rust GH#491); read-only WAL readers register byte-neutrally and fail closed when they cannot (bd-ti3xe); CLI same-line statement batches; lazy grouped IN predicates in aggregates; WAL-to-DELETE visibility; autocommit acknowledgement/crash guards; io_uring buffers retained until kernel quiescence (bd-6hdwo.35); agent-swarm replay fallback and real commit evidence |
 | [v0.3.17](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.17) | Release | 2026-09-06 | SQL/shell correctness, real metrics & diagnostics (reader gauge, WAL durability, MVCC conflict/commit counters, /metrics HTTP), PRAGMA cache_size as a real page budget, aoj0g journal-boundary savepoint (O(n^2)->flat insert ramp) + private-allocation ownership through rollback, printf/FTS5 3.53.2 parity, epoch/RaptorQ native-storage hardening |
 | [v0.3.16](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.16) | Release | 2026-09-03 | FTS5 lazy read path made usable at scale — `MATCH`/`ORDER BY rank`/`bm25()` (incl. prefix) answer without hydrating the corpus, fixing the cass runaway (Fix A/B/C + prefix scoring); bd-9inpb EOF-growth double-grant closed under the reserved append lock; GH#405 row-level FTS5 savepoint undo log; GH#382 appended-tail index; GH#406 content-backed incremental insert; dependency lockfile refresh (asupersync 0.4.10) |
 | [v0.3.15](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.15) | Release | 2026-09-02 | FTS5 `'optimize'` rewrites the index — the in-engine migration for pre-GH#404 contentless indexes (bd-aks56) + contentless empty-re-encode guard (bd-dqcf5) + legacy origin-poison self-heal (bd-kon3m) + macOS clippy `-D warnings` gate restored (bd-0v03x) |
@@ -43,9 +44,17 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.3.17
+## [Unreleased] -- development on `main` since v0.3.18
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.18...main>
+
+No changes yet.
+
+---
+
+## [0.3.18] -- 2026-09-06 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...v0.3.18>
 
 ### SQL and transaction correctness
 
@@ -125,9 +134,69 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   distinguish failed decode from early bailout without fabricating a recovered
   payload. This does not establish automatic repair through the public database
   API ([f697ed38d](https://github.com/Dicklesworthstone/frankensqlite/commit/f697ed38d)).
-- Focused Linux SQL/storage tests and workspace check/Clippy/formatting passed
-  for these committed fixes. Full workspace and all-features test execution,
-  historical benchmark comparison and release acceptance remain pending.
+- Release gate on the tagged commit: `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` clean on the
+  pinned nightly, plus the GH#415 rowid IN-list oracle suite, the `fsqlite`
+  compatibility suite (incl. the read-only WAL reader guards), the rowid
+  residual oracles, and the `fsqlite-vfs`/`fsqlite-pager` unit suites. Full
+  workspace and all-features test execution and historical benchmark
+  comparison were not part of this cut.
+
+### Storage and WAL
+
+- Read-only WAL readers keep their typed open flags independent of the shared
+  canonical descriptor's write capability. A read-only handle shares a safe
+  existing WAL mark and keeps the shared-lock recheck instead of publishing a
+  new mark into the SHM sidecar, so opening a database read-only leaves the
+  database, WAL and SHM bytes and timestamps unchanged; empty-WAL readers use
+  the database-only slot0 fence, and a reader that finds no safe mark refuses
+  rather than guessing. Writable callers keep mark publication and the
+  concurrent-writer defaults
+  ([f92a5b376](https://github.com/Dicklesworthstone/frankensqlite/commit/f92a5b376)).
+- A read-only pager that cannot register its WAL reader slot now fails closed
+  instead of warning and proceeding unregistered, where a peer could backfill
+  or reset the WAL underneath its snapshot; registration errors propagate for
+  both access modes. A directory in place of `*-shm` surfaces `IsADirectory`
+  and leaves the main and WAL bytes untouched
+  ([9d0cb346d](https://github.com/Dicklesworthstone/frankensqlite/commit/9d0cb346d),
+  [fc4bae08e](https://github.com/Dicklesworthstone/frankensqlite/commit/fc4bae08e)).
+- The Linux io_uring backend (`linux-asupersync-uring`) no longer releases
+  in-flight buffers while the kernel may still be writing them. A driver
+  failure used to disable the ring, drain the userspace queue and drop the
+  in-flight allocations; completion counters were also bumped at SQE
+  construction, so a failed `submit()` still looked submitted. Admission and
+  cleanup now fail closed: `register_sync_cancel` is probed at init (kernels
+  without it take the Unix fallback), enqueue is paired with availability
+  under the queue lock, staged SQEs are submitted until the queue drains and
+  only then counted, and `fail_driver` issues a synchronous cancel barrier
+  before failing residual entries while still honoring writes whose CQE
+  already completed (bd-6hdwo.35;
+  [36eaa5397](https://github.com/Dicklesworthstone/frankensqlite/commit/36eaa5397)).
+- The shared io_uring driver is woken by a nonblocking `eventfd` instead of
+  waiting out its poll timeout: producers that find the driver waiting write
+  the eventfd, the driver publishes `waiting` under the same lock and polls
+  the ring fd and the eventfd together, coalesced wakeups are consumed by a
+  single read, `POLLERR`/`POLLHUP`/`POLLNVAL` fail the driver, and a failed
+  wake write only warns and falls back to the periodic wait. Init fails
+  closed to the Unix backend when the eventfd cannot be created
+  ([a91409e82](https://github.com/Dicklesworthstone/frankensqlite/commit/a91409e82)).
+- `-ECANCELED` completions produced by the driver-failure quiescence barrier
+  are reported as `Failed` with the driver error, no longer as `Cancelled`,
+  which looked like the caller's own `Cx` cancellation and left a cancelled
+  context behind for a later checkpoint. The `fsqlite-vfs` README documents
+  the Linux 6.0+ synchronous-cancel probe and the Unix fallback
+  ([88fdb5dde](https://github.com/Dicklesworthstone/frankensqlite/commit/88fdb5dde)).
+
+### MVCC and SSI
+
+- The SSI audit gate's e-process is trained only by commits that actually
+  measured SSI edges. `should_skip_ssi_validation` was consulted before the
+  BEGIN-time serializable policy was read, so FCW-only connections still hit
+  the gate, and early `BusySnapshot` aborts (marked-for-abort, invalid handle,
+  FCW conflict) fed a synthesized pivot/clean outcome into
+  `observe_ssi_outcome`. The gate is now consulted only under a serializable
+  BEGIN policy and observes only a completed SSI plan or a pivot abort
+  ([c927c2a54](https://github.com/Dicklesworthstone/frankensqlite/commit/c927c2a54)).
 
 ### Replay diagnostics
 
@@ -139,6 +208,16 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   governor observations serialize as `null`. This connects the existing
   fallback producer and does not complete the broader coordination diagnostic
   surface ([300528044](https://github.com/Dicklesworthstone/frankensqlite/commit/300528044)).
+- Bounded connection-local validation, publication and read-only finish
+  events are recorded from the real concurrent commit path, tagged with
+  transaction epochs and poll-scoped statement identities, and exposed through
+  the public API and diagnostic PRAGMAs (capture controls plus snapshots).
+  Swarm replay consumes only newly emitted events and never synthesizes
+  commit evidence from trace labels or oracle rows; the SSI gate is trained
+  only when BEGIN-time policy actually selected SSI validation. Retention,
+  privacy, metric independence and event-versus-write counts are documented
+  in `docs/user/observability.md`
+  ([4b5309b03](https://github.com/Dicklesworthstone/frankensqlite/commit/4b5309b03)).
 
 ### Native storage
 
@@ -153,7 +232,9 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...m
   the sidecar and the database share a group, since POSIX resolves one
   permission class per process; the owner, single-hard-link and regular-file
   checks are unchanged, and a sidecar loosened beyond its database on a real
-  POSIX filesystem still fails closed (beads_rust GH#491).
+  POSIX filesystem still fails closed (beads_rust GH#491;
+  [947d4aa85](https://github.com/Dicklesworthstone/frankensqlite/commit/947d4aa85),
+  [64e75a742](https://github.com/Dicklesworthstone/frankensqlite/commit/64e75a742)).
 
 ---
 

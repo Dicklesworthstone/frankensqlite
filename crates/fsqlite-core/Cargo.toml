@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-core"
-version = "0.3.17"
+version = "0.3.18"
 description = "Core engine: connection, prepare, schema, DDL/DML codegen"
 edition.workspace = true
 license-file.workspace = true
