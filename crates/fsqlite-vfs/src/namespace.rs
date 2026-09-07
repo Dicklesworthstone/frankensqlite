@@ -1395,6 +1395,19 @@ struct PlannedCleanupEntry {
     state: PrivateDatabaseCleanupEntryState,
 }
 
+/// One namespace lock that cleanup has successfully acquired.
+/// Closing a `File` alone does not release a Unix `flock` while a descriptor
+/// inherited by a child or otherwise duplicated still refers to it.
+struct CleanupNamespaceLock {
+    file: File,
+}
+
+impl Drop for CleanupNamespaceLock {
+    fn drop(&mut self) {
+        let _ = AdvisoryFileLock::unlock(&self.file);
+    }
+}
+
 trait PrivateDatabaseCleanupHooks {
     #[cfg(test)]
     fn after_namespace_locks(&mut self, _gate: &File, _use_file: &File) {}
@@ -1685,7 +1698,7 @@ fn cleanup_abandoned_private_database_with_hooks(
     let Some(gate) = open_cleanup_lock_file(database_path, &gate_path)? else {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
     };
-    let Some(mut use_file) = open_cleanup_lock_file(database_path, &use_path)? else {
+    let Some(use_file) = open_cleanup_lock_file(database_path, &use_path)? else {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
     };
 
@@ -1696,6 +1709,7 @@ fn cleanup_abandoned_private_database_with_hooks(
         }
         Err(FileLockError::Io(error)) => return Err(error.into()),
     }
+    let gate = CleanupNamespaceLock { file: gate };
     match AdvisoryFileLock::try_lock(&use_file, FileLockMode::Exclusive) {
         Ok(()) => {}
         Err(FileLockError::AlreadyLocked) => {
@@ -1703,11 +1717,12 @@ fn cleanup_abandoned_private_database_with_hooks(
         }
         Err(FileLockError::Io(error)) => return Err(error.into()),
     }
+    let mut use_file = CleanupNamespaceLock { file: use_file };
 
     #[cfg(test)]
-    hooks.after_namespace_locks(&gate, &use_file);
+    hooks.after_namespace_locks(&gate.file, &use_file.file);
 
-    if read_identity_record(&mut use_file, database_path)? != expected_identity {
+    if read_identity_record(&mut use_file.file, database_path)? != expected_identity {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
     }
     let main_probe = match open_cleanup_identity_probe(database_path) {
@@ -1864,6 +1879,8 @@ fn cleanup_abandoned_private_database_with_hooks(
     // platform VFS namespace-sync hook, whose Windows contract is an explicit
     // no-op matching SQLite's own Windows VFS durability boundary.
 
+    drop(use_file);
+    drop(gate);
     Ok(PrivateDatabaseCleanupOutcome::Complete {
         entries: cleanup_entry_receipts(&entries),
         durability: if cfg!(unix) {
