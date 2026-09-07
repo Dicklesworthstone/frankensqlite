@@ -956,6 +956,16 @@ impl VirtualTable for RtreeVirtualTable {
         Ok(Some(new_rowid))
     }
 
+    fn restore_materialized_rows(
+        &mut self,
+        cx: &Cx,
+        rows: &[(i64, Vec<SqliteValue>)],
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        self.rebuild_rows(rows)?;
+        Ok(true)
+    }
+
     fn commit(&mut self, _cx: &Cx) -> Result<()> {
         self.txn_state.commit();
         Ok(())

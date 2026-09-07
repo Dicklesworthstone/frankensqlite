@@ -25137,6 +25137,24 @@ impl Connection {
         } else {
             self.clear_compilation_reuse_caches();
         }
+        // Open can load the catalog before an application's module is
+        // registered. The schema cookie does not change when that missing
+        // factory becomes available, so explicitly retry unresolved bindings
+        // at the next read boundary. Unrelated reentrant registrations must
+        // leave the current schema and prepared-statement generation alone.
+        let has_unbound_table = self.original_ddl_sql.borrow().iter().any(|(table, sql)| {
+            is_virtual_table_sql(sql)
+                && matches!(
+                    parse_single_statement(sql),
+                    Ok(Statement::CreateVirtualTable(stmt))
+                        if stmt.module.eq_ignore_ascii_case(name)
+                )
+                && !self.has_live_vtab_instance(table)
+        });
+        if has_unbound_table {
+            self.force_full_schema_reload_once.set(true);
+            self.memdb_requires_active_txn_reload.set(true);
+        }
         // Drop only after the registry RefCell borrow has ended.
         drop(displaced_factory);
     }
@@ -51422,10 +51440,9 @@ impl Connection {
     /// The VDBE update program only mutates ordinary B-tree tables, so a live
     /// UPDATE persists to the backing storage but leaves the in-memory module
     /// instance serving same-connection scans stale (GH #208 — the change is
-    /// only visible after reopening). A vtab `xUpdate` is a delete of the old
-    /// row followed by an insert of the new one, so recompute the post-SET row
-    /// images and replay them onto the live instance via the same delete/insert
-    /// plumbing DELETE and INSERT already use.
+    /// only visible after reopening). Recompute the post-SET row images and
+    /// supply both rowids to the module's update callback before persisting
+    /// them. FTS5 also maintains its incremental shadow records below.
     async fn execute_live_vtab_update(
         &self,
         update: &fsqlite_ast::UpdateStatement,
@@ -51537,12 +51554,37 @@ impl Connection {
             })
             .collect();
 
-        // xUpdate == delete the old rows, then insert the recomputed rows. The
-        // old rows are deleted explicitly above, so the insert is a plain insert
-        // (no REPLACE conflict resolution needed).
-        self.execute_live_vtab_delete_rowids(&table_name, &old_rowids)
-            .await?;
-        self.execute_live_vtab_insert_rows(&table_name, &new_rows, false)
+        // FTS5's incremental shadow-storage path applies tombstones and new
+        // postings together with the module changes. Keep that specialized
+        // persistence path until it can consume an update delta directly.
+        #[cfg(feature = "ext-fts5")]
+        if self.is_live_fts5_instance(&table_name) {
+            self.execute_live_vtab_delete_rowids(&table_name, &old_rowids)
+                .await?;
+            self.execute_live_vtab_insert_rows(&table_name, &new_rows, false)
+                .await?;
+            return Ok(old_rowids.len());
+        }
+
+        // xUpdate distinguishes UPDATE from DELETE followed by INSERT: the
+        // non-NULL old rowid lets a module validate the prior row, ownership,
+        // and generation before mutation. Deleting it first also incorrectly
+        // requires an update-capable module to permit deletion.
+        let cx = self.op_cx()?;
+        self.with_active_live_vtab_instance(&cx, &table_name, "xBegin", |instance| {
+            self.begin_live_vtab_transaction_if_needed(&table_name, instance, &cx)
+        })?;
+        for (old_rowid, row) in old_rowids.iter().zip(&new_rows) {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let mut args = Vec::with_capacity(row.values.len() + 2);
+            args.push(SqliteValue::Integer(*old_rowid));
+            args.push(SqliteValue::Integer(*old_rowid));
+            args.extend(row.values.iter().cloned());
+            self.with_active_live_vtab_instance(&cx, &table_name, "xUpdate", |instance| {
+                instance.update(&cx, &args)
+            })?;
+        }
+        self.persist_materialized_live_vtab_rows(&table_name, &new_rows, &old_rowids, false)
             .await?;
         Ok(old_rowids.len())
     }
@@ -93696,7 +93738,6 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
     async fn read_storage_table_rows_for_reload(
         &self,
         cx: &Cx,
@@ -94114,22 +94155,6 @@ impl Connection {
         specs: &[(String, String)],
         preserved_live_vtab_keys: &HashSet<String>,
     ) -> Result<PendingConnectedLiveVtabRegistryGuard<'a>> {
-        #[cfg(not(any(feature = "ext-fts5", feature = "ext-rtree")))]
-        {
-            let _ = (
-                cx,
-                txn,
-                page_size,
-                reserved_per_page,
-                schema,
-                rowid_alias_columns,
-                specs,
-                preserved_live_vtab_keys,
-            );
-            Ok(PendingConnectedLiveVtabRegistryGuard::new(self, cx))
-        }
-
-        #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
         {
             let mut reloaded = PendingConnectedLiveVtabRegistryGuard::new(self, cx);
             for (table_name, create_sql) in specs {
@@ -94347,28 +94372,15 @@ impl Connection {
                     continue;
                 }
 
-                #[cfg(feature = "ext-rtree")]
-                let is_rtree = self.invoke_live_vtab_callback("asAny", || {
-                    Ok(pending_instance
-                        .instance()
-                        .as_any()
-                        .downcast_ref::<RtreeVirtualTable>()
-                        .is_some())
-                })?;
-                #[cfg(feature = "ext-rtree")]
-                if is_rtree {
-                    self.invoke_live_vtab_callback("asAnyMut", || {
-                        let rtree = pending_instance
-                            .instance_mut()
-                            .as_any_mut()
-                            .downcast_mut::<RtreeVirtualTable>()
-                            .ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "virtual table {table_name} changed type during schema reload"
-                                ))
-                            })?;
-                        rtree.rebuild_rows(&rows)
-                    })?;
+                // Restoring a snapshot is distinct from SQL INSERT/UPDATE:
+                // modules may forbid those operations or attach side effects.
+                // Let the registered module restore its own representation,
+                // including extensions that wrap a built-in implementation.
+                if self.invoke_live_vtab_callback("restoreMaterializedRows", || {
+                    pending_instance
+                        .instance_mut()
+                        .restore_materialized_rows(cx, &rows)
+                })? {
                     reloaded.insert_pending(table_key, &mut pending_instance)?;
                     continue;
                 }

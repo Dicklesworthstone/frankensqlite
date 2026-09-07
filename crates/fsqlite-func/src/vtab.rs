@@ -523,6 +523,21 @@ pub trait VirtualTable: Send + Sync {
         Err(FrankenError::ReadOnly)
     }
 
+    /// Restore a newly connected instance from the engine's materialized rows.
+    ///
+    /// This reconstructs a persisted snapshot; it must not invoke SQL mutation
+    /// callbacks or emit mutation side effects. Return `true` only after the
+    /// complete snapshot has been restored. On error the engine discards the
+    /// pending instance without publishing it. Modules that manage their own
+    /// storage or cannot restore this representation return `false`.
+    fn restore_materialized_rows(
+        &mut self,
+        _cx: &Cx,
+        _rows: &[(i64, Vec<SqliteValue>)],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Begin a virtual table transaction.
     fn begin(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
@@ -669,6 +684,12 @@ pub trait ErasedVtabInstance: Send + Sync + erased_instance_sealed::Sealed {
     fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>>;
     /// INSERT/UPDATE/DELETE on the virtual table.
     fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>>;
+    /// Restore a newly connected instance from engine-materialized storage.
+    fn restore_materialized_rows(
+        &mut self,
+        cx: &Cx,
+        rows: &[(i64, Vec<SqliteValue>)],
+    ) -> Result<bool>;
     /// Begin a virtual table transaction.
     fn begin(&mut self, cx: &Cx) -> Result<()>;
     /// Sync a virtual table transaction.
@@ -758,6 +779,13 @@ where
     }
     fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
         VirtualTable::update(self, cx, args)
+    }
+    fn restore_materialized_rows(
+        &mut self,
+        cx: &Cx,
+        rows: &[(i64, Vec<SqliteValue>)],
+    ) -> Result<bool> {
+        VirtualTable::restore_materialized_rows(self, cx, rows)
     }
     fn begin(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::begin(self, cx)
