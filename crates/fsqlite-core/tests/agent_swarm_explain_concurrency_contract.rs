@@ -4,6 +4,218 @@ use fsqlite_types::value::SqliteValue;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_mid_scan_cancellation_preserves_diagnostic_provenance() -> TestResult {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use fsqlite_error::FrankenError;
+    use fsqlite_func::ScalarFunction;
+    use fsqlite_types::cx::CancelReason;
+
+    struct CancelDuringScan {
+        calls: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
+        cancel: Box<dyn Fn() + Send + Sync>,
+    }
+
+    impl ScalarFunction for CancelDuringScan {
+        fn name(&self) -> &str {
+            "cancel_during_scan"
+        }
+
+        fn num_args(&self) -> i32 {
+            1
+        }
+
+        fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+            let previous = self.calls.fetch_add(1, Ordering::Relaxed);
+            if previous == 0 && self.armed.load(Ordering::Relaxed) {
+                (self.cancel)();
+            }
+            // The application callback succeeds. Only the actual execution
+            // context can turn the surrounding SQL operation into Abort.
+            Ok(args[0].clone())
+        }
+    }
+
+    const ROWS: usize = 2048;
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("mid-scan-cancellation.db");
+            for memory in [true, false] {
+                let conn = Connection::open(if memory { ":memory:" } else { path.to_str().unwrap() }).await?;
+                assert!(conn.is_concurrent_mode_default());
+                conn.execute("CREATE TABLE cancel_rows(id INTEGER PRIMARY KEY)").await?;
+                conn.execute("BEGIN").await?;
+                let values = (0..ROWS).map(|id| format!("({id})")).collect::<Vec<_>>().join(",");
+                conn.execute(&format!("INSERT INTO cancel_rows VALUES {values}")).await?;
+                conn.execute("COMMIT").await?;
+
+                for capture in [true, false] {
+                    for fallback in [false, true] {
+                        for prepared in [false, true] {
+                            conn.query(if capture { "PRAGMA fsqlite.diagnostic_capture=ON" } else { "PRAGMA fsqlite.diagnostic_capture=OFF" }).await?;
+                            conn.query("PRAGMA fsqlite.fallback_reset").await?;
+                            conn.query("PRAGMA fsqlite.commit_reset").await?;
+                            conn.set_strict_mem_fallback_rejection(!fallback);
+                            conn.execute("BEGIN").await?;
+                            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+                            let calls = Arc::new(AtomicUsize::new(0));
+                            let armed = Arc::new(AtomicBool::new(false));
+                            conn.register_nondeterministic_scalar_function(CancelDuringScan {
+                                calls: Arc::clone(&calls),
+                                armed: Arc::clone(&armed),
+                                cancel: Box::new(move || {
+                                    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                                }),
+                            });
+                            let sql = if fallback {
+                                "WITH c AS (SELECT id FROM cancel_rows) SELECT cancel_during_scan(id) FROM c ORDER BY id"
+                            } else {
+                                "SELECT cancel_during_scan(id) FROM cancel_rows ORDER BY id"
+                            };
+                            let statement = if prepared { Some(conn.prepare(sql).await?) } else { None };
+                            assert!(conn.query("PRAGMA fsqlite.fallback_events").await?.is_empty(), "preparation is not execution");
+                            let control = if let Some(statement) = &statement { statement.query().await? } else { conn.query(sql).await? };
+                            assert_eq!(control.len(), ROWS);
+                            assert_eq!(calls.load(Ordering::Relaxed), ROWS);
+                            for (id, row) in control.iter().enumerate() {
+                                assert_eq!(row.values(), &[SqliteValue::Integer(i64::try_from(id)?)]);
+                            }
+                            let before = rows_to_values(&conn.query("PRAGMA fsqlite.fallback_events").await?);
+                            assert_eq!(before.len(), usize::from(capture && fallback));
+                            calls.store(0, Ordering::Relaxed);
+                            armed.store(true, Ordering::Relaxed);
+                            operation.checkpoint().expect("cancellation must start inside SQL execution");
+                            let cancelled = {
+                                let _binding = conn.bind_operation_cx(&operation);
+                                if let Some(statement) = &statement { statement.query().await } else { conn.query(sql).await }
+                            };
+                            let executed_calls = calls.load(Ordering::Relaxed);
+                            assert!(matches!(cancelled, Err(FrankenError::Abort)), "mid-scan cancellation must reach public SQL: memory={memory} fallback={fallback} prepared={prepared} capture={capture} calls={executed_calls} outcome={cancelled:?}");
+                            assert!((1..ROWS).contains(&executed_calls), "the callback must run, then execution must stop before finishing the scan");
+                            assert!(operation.checkpoint().is_err());
+                            conn.root_cx().checkpoint().expect("operation cancellation must not cancel its connection");
+                            let after = rows_to_values(&conn.query("PRAGMA fsqlite.fallback_events").await?);
+                            assert_eq!(after.len(), 2 * usize::from(capture && fallback));
+                            if capture && fallback {
+                                assert_eq!(after[0], before[0]);
+                                assert_eq!(after[1].len(), 9);
+                                assert!(matches!((&after[1][0], &before[0][0]), (SqliteValue::Integer(new), SqliteValue::Integer(old)) if new > old));
+                                assert!(matches!((&after[1][2], &before[0][2]), (SqliteValue::Integer(new), SqliteValue::Integer(old)) if new > old));
+                                assert_eq!(after[1][1], before[0][1], "same executing connection");
+                                assert_eq!(after[1][3], before[0][3], "same explicit transaction");
+                                assert!(matches!(after[1][3], SqliteValue::Integer(_)));
+                                assert_eq!(&after[1][4..], &before[0][4..], "actual admission is retained even when subsequent execution aborts");
+                                assert_eq!(after[1][6], SqliteValue::Text("allowed_compatibility_fallback".into()));
+                            }
+                            assert!(conn.query("PRAGMA fsqlite.commit_events").await?.is_empty(), "a cancelled read cannot publish a commit");
+                            assert_eq!(conn.query("SELECT 99").await?[0].values(), &[SqliteValue::Integer(99)]);
+                            assert_eq!(rows_to_values(&conn.query("PRAGMA fsqlite.fallback_events").await?), after, "unrelated SQL must not inherit a cancelled statement's admission");
+                            drop(statement);
+                            conn.execute("ROLLBACK").await?;
+                            let restored = conn.query("SELECT id FROM cancel_rows ORDER BY id").await?;
+                            assert_eq!(restored.len(), ROWS);
+                            for (id, row) in restored.iter().enumerate() {
+                                assert_eq!(row.values(), &[SqliteValue::Integer(i64::try_from(id)?)]);
+                            }
+                            eprintln!("bead_id=bd-6hdwo.14 event=public_mid_scan_cancellation_verified memory={memory} fallback={fallback} prepared={prepared} capture={capture} callback_calls={executed_calls}");
+                        }
+                    }
+                }
+                conn.close().await?;
+            }
+            let stock = rusqlite::Connection::open(path)?;
+            assert_eq!(stock.query_row("SELECT COUNT(*) FROM cancel_rows", [], |row| row.get::<_, i64>(0))?, i64::try_from(ROWS)?);
+            assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?, "ok");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_cached_prepared_reads_honor_operation_cancellation() -> TestResult {
+    use fsqlite_core::connection::{hot_path_profile_enabled, hot_path_profile_snapshot};
+    use fsqlite_error::FrankenError;
+    use fsqlite_types::cx::CancelReason;
+
+    const CHILD: &str = "FSQLITE_CACHED_CANCEL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The indexed-read counter is process-global. Isolate the actual
+        // shortcut attribution from unrelated integration tests.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "real_cached_prepared_reads_honor_operation_cancellation", "--nocapture"])
+            .env(CHILD, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("cached_cancel\n{stdout}\n{stderr}");
+        assert!(output.status.success(), "isolated cached-read cancellation keeper failed");
+        assert!(stderr.contains("event=public_cached_read_cancellation_verified"));
+        return Ok(());
+    }
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            assert!(!hot_path_profile_enabled(), "profiling can disable the shortcut under test");
+            let conn = Connection::open(":memory:").await?;
+            assert!(conn.is_concurrent_mode_default());
+            conn.execute("CREATE TABLE cached_rows(id INTEGER PRIMARY KEY, name TEXT NOT NULL)").await?;
+            conn.execute("CREATE INDEX cached_name ON cached_rows(name)").await?;
+            conn.execute("INSERT INTO cached_rows VALUES(1,'alpha'),(2,'beta'),(3,'beta')").await?;
+            let indexed = conn.prepare("SELECT * FROM cached_rows WHERE name=?1").await?;
+            let rowid = conn.prepare("SELECT * FROM cached_rows WHERE id=?1").await?;
+            let count = conn.prepare("SELECT COUNT(*) FROM cached_rows").await?;
+            let key = [SqliteValue::Text("beta".into())];
+            let id = [SqliteValue::Integer(1)];
+            let hits_before = hot_path_profile_snapshot().direct_indexed_equality_query_hits;
+            let indexed_control = rows_to_values(&indexed.query_with_params(&key).await?);
+            assert_eq!(indexed_control, vec![
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
+                vec![SqliteValue::Integer(3), SqliteValue::Text("beta".into())],
+            ]);
+            assert_eq!(hot_path_profile_snapshot().direct_indexed_equality_query_hits, hits_before + 1, "control must execute the actual indexed memory shortcut");
+            assert_eq!(rowid.query_row_with_params(&id).await?.values(), &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]);
+            assert_eq!(count.query_row().await?.values(), &[SqliteValue::Integer(3)]);
+            // Diagnostics SQL can change the retained read boundary. Reset
+            // capture through the public API and prove the shortcut remains
+            // live immediately before cancellation, with no intervening SQL.
+            conn.reset_fallback_decision_evidence();
+            conn.reset_commit_execution_evidence();
+            let hits_before_cancel = hot_path_profile_snapshot().direct_indexed_equality_query_hits;
+            assert_eq!(rows_to_values(&indexed.query_with_params(&key).await?), indexed_control);
+            assert_eq!(hot_path_profile_snapshot().direct_indexed_equality_query_hits, hits_before_cancel + 1);
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            let (indexed_cancelled, rowid_cancelled, count_cancelled) = {
+                let _binding = conn.bind_operation_cx(&operation);
+                (indexed.query_with_params(&key).await, rowid.query_row_with_params(&id).await, count.query_row().await)
+            };
+            eprintln!("event=cached_read_cancellation_observed indexed={indexed_cancelled:?} rowid={rowid_cancelled:?} count={count_cancelled:?}");
+            assert!(matches!(indexed_cancelled, Err(FrankenError::Abort)), "cached indexed lookup must observe operation cancellation before returning rows");
+            assert!(matches!(rowid_cancelled, Err(FrankenError::Abort)), "cached rowid lookup must observe operation cancellation before returning a row");
+            assert!(matches!(count_cancelled, Err(FrankenError::Abort)), "cached COUNT must observe operation cancellation before returning a count");
+            conn.root_cx().checkpoint().expect("connection remains usable after operation cancellation");
+            assert!(conn.query("PRAGMA fsqlite.fallback_events").await?.is_empty());
+            assert!(conn.query("PRAGMA fsqlite.commit_events").await?.is_empty());
+            assert_eq!(rows_to_values(&indexed.query_with_params(&key).await?), indexed_control);
+            assert_eq!(rowid.query_row_with_params(&id).await?.values(), &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]);
+            assert_eq!(count.query_row().await?.values(), &[SqliteValue::Integer(3)]);
+            drop((indexed, rowid, count));
+            conn.close().await?;
+            eprintln!("bead_id=bd-6hdwo.14 event=public_cached_read_cancellation_verified indexed=true rowid=true count=true");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
 fn real_reader_gauge_tracks_held_snapshots() -> TestResult {
     const MODE: &str = "FSQLITE_READER_GAUGE_TEST_MODE";
     let Ok(mode) = std::env::var(MODE) else {

@@ -9212,6 +9212,7 @@ impl PreparedStatement<'_> {
         // read from inside an abandoned transaction without rolling it back.
         self.conn.settle_pending_transaction_cleanup().await?;
         self.with_same_connection_schema_reprepare(async |stmt| {
+            stmt.conn.check_operation_cancellation()?;
             if let Some(rows) = stmt.try_query_clean_memory_indexed_equality_fast(params)? {
                 return Ok(rows);
             }
@@ -9278,6 +9279,7 @@ impl PreparedStatement<'_> {
         // the general dispatcher.
         self.conn.settle_pending_transaction_cleanup().await?;
         self.with_same_connection_schema_reprepare(async |stmt| {
+            stmt.conn.check_operation_cancellation()?;
             if let Some(params) = params
                 && let Some(row_outcome) =
                     stmt.try_query_row_clean_memory_rowid_lookup_fast(params)?
@@ -23483,6 +23485,19 @@ impl Connection {
     pub fn with_operation_cx<T>(&self, cx: &Cx, operation: impl FnOnce() -> T) -> T {
         let _binding = self.bind_operation_cx(cx);
         operation()
+    }
+
+    /// Observe cancellation before a prepared read can return from a shortcut
+    /// that bypasses the general dispatcher and pager checkpoints. Borrow the
+    /// existing context so this check does not allocate a new decision ID or
+    /// advance statement accounting. The borrow ends before execution resumes.
+    fn check_operation_cancellation(&self) -> Result<()> {
+        self.operation_cx_override
+            .borrow()
+            .as_ref()
+            .unwrap_or(&self.root_cx)
+            .checkpoint()
+            .map_err(|_| FrankenError::Abort)
     }
 
     /// Derive a per-operation capability context from this connection's root.
