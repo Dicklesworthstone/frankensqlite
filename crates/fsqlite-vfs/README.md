@@ -32,6 +32,12 @@ fsqlite-wal  fsqlite-btree
 - `TracingFile` / `VfsMetrics` / `GLOBAL_VFS_METRICS` -- Instrumentation wrapper that records read/write/sync counts and latencies.
 - `host_fs` (module) -- Audited helpers (`read`, `write`, `create_dir_all`, etc.) that are the only code permitted to call `std::fs` outside of VFS implementations.
 
+On Linux, the shared `io_uring` driver requires synchronous cancellation support
+(Linux 6.0 or newer) so failed operations cannot release buffers that the kernel
+still uses. The runtime probes this capability when opening the ring. If the
+kernel or host policy does not support it, data I/O uses the existing Unix
+fallback. `IoUringVfs::status_snapshot()` reports availability and the reason.
+
 ## Usage
 
 ```rust
@@ -39,23 +45,24 @@ use fsqlite_vfs::{Vfs, VfsFile, MemoryVfs};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 
-let cx = Cx::new();
-let vfs = MemoryVfs::new();
+async fn memory_roundtrip(cx: &Cx) -> fsqlite_error::Result<()> {
+    let vfs = MemoryVfs::new();
 
-// Open a database file in memory.
-let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
-let (mut file, _actual_flags) = vfs.open(&cx, Some("test.db".as_ref()), flags).unwrap();
+    // Open a database file in memory.
+    let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+    let (mut file, _actual_flags) = vfs.open(cx, Some("test.db".as_ref()), flags)?;
 
-// Write a page.
-let page = [0u8; 4096];
-file.write(&cx, &page, 0).unwrap();
+    // Write a page using the caller's context and executor.
+    let page = [0u8; 4096];
+    file.write(cx, &page, 0).await?;
 
-// Read it back.
-let mut buf = [0u8; 4096];
-file.read(&cx, &mut buf, 0).unwrap();
-assert_eq!(buf, page);
+    // Read it back.
+    let mut buf = [0u8; 4096];
+    file.read(cx, &mut buf, 0).await?;
+    assert_eq!(buf, page);
 
-file.close(&cx).unwrap();
+    file.close(cx)
+}
 ```
 
 ## Dependencies

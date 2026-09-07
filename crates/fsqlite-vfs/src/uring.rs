@@ -911,10 +911,23 @@ impl IoUringRuntime {
                     }
                 }
             }
-            let completed = ring
+            let mut completed = ring
                 .completion()
                 .map(|entry| (entry.user_data(), entry.result()))
                 .collect::<Vec<_>>();
+            // Cancellation performed by failure cleanup is an I/O failure,
+            // not a cancellation requested by the caller's Cx. Preserve that
+            // distinction so the existing Unix fallback can handle it. The
+            // terminal CQE and barrier have already ended kernel buffer access.
+            completed.retain(|(user_data, result)| {
+                if *result == -libc::ECANCELED
+                    && let Some(request) = inflight.remove(user_data)
+                {
+                    request.fail(kind, &message);
+                    return false;
+                }
+                true
+            });
             // Preserve successful writes and their completion obligations when
             // the kernel finished them before the driver failed.
             self.finish_completions(inflight, completed);
@@ -1808,7 +1821,7 @@ mod tests {
             .expect("reserve a real request and completion permit");
         let request = runtime.queue.lock().unwrap().pending.pop_front().unwrap();
         let mut inflight = HashMap::from([(id, request)]);
-        let rescue_result = {
+        let (rescue_result, rescue_completions) = {
             let mut ring = runtime.ring.as_ref().unwrap().lock().unwrap();
             // A real pending kernel operation without a userspace buffer makes
             // the old-cleanup negative safe: rescue it before any assertion.
@@ -1833,19 +1846,32 @@ mod tests {
                 types::CancelBuilder::any(),
             );
             // Consume rescue CQEs even when the production cleanup is broken.
-            let _ = ring.completion().count();
-            rescue
+            let rescued = ring
+                .completion()
+                .map(|entry| (entry.user_data(), entry.result()))
+                .collect::<Vec<_>>();
+            (rescue, rescued)
         };
         assert!(
-            matches!(rescue_result, Err(ref error) if error.kind() == io::ErrorKind::NotFound),
-            "driver failure must leave no pending kernel request; rescue result: {rescue_result:?}"
+            rescue_result.is_ok()
+                || matches!(rescue_result, Err(ref error) if error.kind() == io::ErrorKind::NotFound),
+            "rescue cancellation must quiesce the test operation: {rescue_result:?}"
+        );
+        // An empty ANY cancellation may return Ok on a supported kernel.
+        // The terminal CQE is the evidence: cleanup must already have consumed
+        // it, so rescue cannot expose this request still awaiting completion.
+        assert!(
+            !rescue_completions
+                .iter()
+                .any(|(user_data, _)| *user_data == id),
+            "driver failure left the operation's terminal CQE for rescue: {rescue_completions:?}"
         );
         assert!(inflight.is_empty());
         assert!(!runtime.is_available());
         block_on_test(&cx, async {
             assert!(matches!(
                 receiver.recv(&native_cx).await.expect("terminal poll CQE"),
-                DriverCompletion::Cancelled
+                DriverCompletion::Failed(ref error) if error.kind() == io::ErrorKind::Other
             ));
         });
     }
@@ -1881,8 +1907,12 @@ mod tests {
             }
             assert!(matches!(
                 receiver.recv(&native_cx).await.expect("terminal read CQE"),
-                DriverCompletion::Cancelled
+                DriverCompletion::Failed(ref error)
+                    if error.kind() == io::ErrorKind::Other
+                        && error.to_string().contains("forced shared io_uring driver wait failure")
             ));
+            cx.checkpoint()
+                .expect("driver failure must not cancel the caller");
             cancel_guard.disarm();
             assert_eq!(runtime.submitted_requests.load(Ordering::Acquire), 1);
             assert!(!runtime.is_available());
@@ -2389,23 +2419,34 @@ mod tests {
 
             let cancellation_started = Instant::now();
             request_cx.cancel();
+            let context_cancelled_after = cancellation_started.elapsed();
             let recv_error = receiver
                 .recv(&request_native_cx)
                 .await
                 .expect_err("cancelled request context must interrupt receive");
             assert_eq!(recv_error, oneshot::RecvError::Cancelled);
+            let receiver_cancelled_after = cancellation_started.elapsed();
             drop(cancel_guard);
+            let cancellation_enqueued_after = cancellation_started.elapsed();
 
             while runtime.submitted_cancellations.load(Ordering::Acquire) == 0 {
                 assert!(
                     cancellation_started.elapsed() < Duration::from_millis(5),
-                    "IORING_OP_ASYNC_CANCEL was not submitted within 5ms"
+                    "IORING_OP_ASYNC_CANCEL was not submitted within 5ms: \
+                     elapsed={:?} context_cancelled_after={context_cancelled_after:?} \
+                     receiver_cancelled_after={receiver_cancelled_after:?} \
+                     cancellation_enqueued_after={cancellation_enqueued_after:?}",
+                    cancellation_started.elapsed()
                 );
                 asupersync::runtime::yield_now().await;
             }
             assert!(
                 cancellation_started.elapsed() < Duration::from_millis(5),
-                "IORING_OP_ASYNC_CANCEL submission exceeded 5ms"
+                "IORING_OP_ASYNC_CANCEL submission exceeded 5ms: \
+                 elapsed={:?} context_cancelled_after={context_cancelled_after:?} \
+                 receiver_cancelled_after={receiver_cancelled_after:?} \
+                 cancellation_enqueued_after={cancellation_enqueued_after:?}",
+                cancellation_started.elapsed()
             );
 
             let completion_deadline = Instant::now() + Duration::from_secs(1);
