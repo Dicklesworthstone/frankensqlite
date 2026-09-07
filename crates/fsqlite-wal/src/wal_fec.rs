@@ -9,11 +9,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,7 +29,9 @@ use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::checksum::{
-    WalSalts, Xxh3Checksum128, verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128,
+    SqliteWalChecksum, WalFrameHeader, WalHeader, WalSalts, Xxh3Checksum128,
+    compute_wal_frame_checksum, validate_wal_header_checksum, verify_wal_fec_source_hash,
+    wal_fec_source_hash_xxh3_128,
 };
 
 /// Magic bytes for [`WalFecGroupMeta`].
@@ -1541,6 +1543,95 @@ pub struct WalFecRepairPipelineStats {
 #[derive(Debug)]
 enum WalFecPipelineMessage {
     Work(WalFecRepairWorkItem),
+    Committed(WalFecCommittedRange),
+    Shutdown,
+}
+
+/// A checksum-anchored interval covered by a successful primary WAL fsync.
+///
+/// Frame numbers are one-based and inclusive; `end_frame_no = 0` schedules
+/// generation cleanup only. Construction does no page reads or encoding; the
+/// worker splits nonempty intervals at actual commit markers.
+#[derive(Debug, Clone)]
+pub struct WalFecCommittedRange {
+    pub wal_path: PathBuf,
+    pub header: WalHeader,
+    pub start_frame_no: u32,
+    pub end_frame_no: u32,
+    pub previous_checksum: SqliteWalChecksum,
+    pub end_checksum: SqliteWalChecksum,
+    pub repair_symbols: u8,
+}
+
+/// Cheap, clonable admission endpoint retained by a WAL backend.
+#[derive(Clone)]
+pub struct WalFecRepairProducer {
+    sender: mpsc::Sender<WalFecPipelineMessage>,
+    closing: Arc<AtomicBool>,
+    cancel_flag: Arc<AtomicBool>,
+    pending_jobs: Arc<AtomicUsize>,
+    max_pending_jobs: Arc<AtomicUsize>,
+    repair_symbols: Arc<AtomicU8>,
+}
+
+impl WalFecRepairProducer {
+    /// Reserve bounded capacity BEFORE syncing the primary WAL. Dropping a
+    /// permit after a failed fsync releases capacity without publishing work.
+    pub fn try_reserve(&self) -> Result<WalFecRepairPermit<'_>> {
+        if self.closing.load(Ordering::Acquire) || self.cancel_flag.load(Ordering::Acquire) {
+            return Err(FrankenError::BackgroundWorkerFailed(
+                "wal-fec repair worker is closing".to_owned(),
+            ));
+        }
+        let permit = self.sender.try_reserve().map_err(|err| match err {
+            mpsc::SendError::Full(()) => FrankenError::Busy,
+            mpsc::SendError::Disconnected(()) | mpsc::SendError::Cancelled(()) => {
+                FrankenError::BackgroundWorkerFailed(
+                    "wal-fec repair worker disconnected".to_owned(),
+                )
+            }
+        })?;
+        Ok(WalFecRepairPermit {
+            permit,
+            producer: self,
+        })
+    }
+
+    #[must_use]
+    pub fn repair_symbols(&self) -> u8 {
+        self.repair_symbols.load(Ordering::Acquire)
+    }
+
+    /// Applied by PRAGMA before the next interval is admitted.
+    pub fn set_repair_symbols(&self, value: u8) {
+        self.repair_symbols.store(value, Ordering::Release);
+    }
+}
+
+/// A queue slot whose publication must follow successful primary WAL fsync.
+pub struct WalFecRepairPermit<'a> {
+    permit: mpsc::SendPermit<'a, WalFecPipelineMessage>,
+    producer: &'a WalFecRepairProducer,
+}
+
+impl WalFecRepairPermit<'_> {
+    /// Submit durable work. A worker that exits during fsync cannot revoke a
+    /// durable COMMIT: return false for restart catch-up, never a commit error.
+    #[must_use]
+    pub fn submit(self, range: WalFecCommittedRange) -> bool {
+        let pending = self.producer.pending_jobs.fetch_add(1, Ordering::SeqCst) + 1;
+        update_max_pending(&self.producer.max_pending_jobs, pending);
+        if self
+            .permit
+            .try_send(WalFecPipelineMessage::Committed(range))
+            .is_err()
+        {
+            self.producer.pending_jobs.fetch_sub(1, Ordering::SeqCst);
+            warn!("wal-fec worker exited after WAL fsync; durable frames require restart catch-up");
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1551,6 +1642,7 @@ enum WalFecWorkOutcome {
 
 #[derive(Debug, Clone)]
 struct WalFecRepairWorkerState {
+    closing: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
     pending_jobs: Arc<AtomicUsize>,
     completed_jobs: Arc<AtomicUsize>,
@@ -1561,6 +1653,8 @@ struct WalFecRepairWorkerState {
 
 /// Background worker that computes and appends WAL-FEC repair symbols.
 pub struct WalFecRepairPipeline {
+    closing: Arc<AtomicBool>,
+    repair_symbols: Arc<AtomicU8>,
     sender: Option<mpsc::Sender<WalFecPipelineMessage>>,
     cancel_flag: Arc<AtomicBool>,
     pending_jobs: Arc<AtomicUsize>,
@@ -1594,19 +1688,31 @@ impl WalFecRepairPipeline {
     /// therefore the awaited async `shutdown()` (analogous to `Connection::close`),
     /// while [`Drop`] is cancel-only.
     ///
-    /// This standalone pipeline is not yet owned by a `Connection`, so the raw
-    /// `RuntimeHandle::try_spawn` below is not (yet) "per-Connection background
-    /// work". When the FEC pipeline is wired into a `Connection`, its worker MUST
-    /// be routed through the blessed `Connection::try_spawn_in_region` helper
-    /// (bd-54ulg, 795b91cc0) — or the pipeline restructured so a region
-    /// `TaskHandle` tracks the worker — so that `close_and_drain` accounts for it
-    /// and quiescence-on-Connection-close holds by construction. A task without a
-    /// region `TaskHandle` is invisible to the drain. Tracked as bd-ewwia.
+    /// Standalone callers own the shutdown obligation. Connection-owned callers
+    /// use [`Self::start_scoped`] with their region's registered task handle.
     pub fn start(
         runtime: &RuntimeHandle,
         parent_cx: &Cx,
         config: WalFecRepairPipelineConfig,
     ) -> Result<Self> {
+        Self::start_scoped(runtime, parent_cx, config, ())
+    }
+
+    /// Start a worker that owns `region_task` until all encoding and sidecar
+    /// I/O have finished. The caller registers that handle in its region tree;
+    /// retaining it across the awaited blocking work makes close account for
+    /// the entire worker lifetime, including cancellation and spawn failure.
+    pub fn start_scoped<G: Send + Sync + 'static>(
+        runtime: &RuntimeHandle,
+        parent_cx: &Cx,
+        config: WalFecRepairPipelineConfig,
+        region_task: G,
+    ) -> Result<Self> {
+        if runtime.blocking_handle().is_none() {
+            return Err(FrankenError::BackgroundWorkerFailed(
+                "wal-fec repair requires a caller-owned runtime blocking pool".to_owned(),
+            ));
+        }
         if config.queue_capacity == 0 {
             return Err(FrankenError::WalCorrupt {
                 detail: "wal-fec repair pipeline queue_capacity must be >= 1".to_owned(),
@@ -1614,6 +1720,8 @@ impl WalFecRepairPipeline {
         }
 
         let (tx, rx) = mpsc::channel(config.queue_capacity);
+        let closing = Arc::new(AtomicBool::new(false));
+        let repair_symbols = Arc::new(AtomicU8::new(DEFAULT_RAPTORQ_REPAIR_SYMBOLS));
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let pending_jobs = Arc::new(AtomicUsize::new(0));
         let completed_jobs = Arc::new(AtomicUsize::new(0));
@@ -1622,6 +1730,7 @@ impl WalFecRepairPipeline {
         let max_pending_jobs = Arc::new(AtomicUsize::new(0));
         let worker_failure = Arc::new(Mutex::new(None));
         let worker_state = WalFecRepairWorkerState {
+            closing: Arc::clone(&closing),
             cancel_flag: Arc::clone(&cancel_flag),
             pending_jobs: Arc::clone(&pending_jobs),
             completed_jobs: Arc::clone(&completed_jobs),
@@ -1639,18 +1748,25 @@ impl WalFecRepairPipeline {
         // `Drop` path can request structured cancellation of the worker.
         let worker_cx = parent_cx.create_child_for_spawn();
         let worker_loop_cx = worker_cx.clone();
+        let region_task = Arc::new(region_task);
         let worker_handle = runtime
-            .try_spawn(run_repair_pipeline_worker(
-                rx,
-                worker_state,
-                worker_loop_cx,
-                config.per_symbol_delay,
-            ))
+            .try_spawn(async move {
+                run_repair_pipeline_worker(
+                    rx,
+                    worker_state,
+                    worker_loop_cx,
+                    config.per_symbol_delay,
+                    region_task,
+                )
+                .await;
+            })
             .map_err(|err| FrankenError::WalCorrupt {
                 detail: format!("failed to spawn wal-fec repair worker task: {err}"),
             })?;
 
         Ok(Self {
+            closing,
+            repair_symbols,
             sender: Some(tx),
             cancel_flag,
             pending_jobs,
@@ -1664,9 +1780,22 @@ impl WalFecRepairPipeline {
         })
     }
 
+    /// Obtain a backend endpoint. Shutdown closes admission even while a
+    /// backend retains an endpoint, and explicitly wakes an idle receiver.
+    pub fn producer(&self) -> Option<WalFecRepairProducer> {
+        self.sender.as_ref().map(|sender| WalFecRepairProducer {
+            sender: sender.clone(),
+            closing: Arc::clone(&self.closing),
+            cancel_flag: Arc::clone(&self.cancel_flag),
+            pending_jobs: Arc::clone(&self.pending_jobs),
+            max_pending_jobs: Arc::clone(&self.max_pending_jobs),
+            repair_symbols: Arc::clone(&self.repair_symbols),
+        })
+    }
+
     /// Queue a new repair-generation work item without blocking commit path.
     pub fn enqueue(&self, work_item: WalFecRepairWorkItem) -> Result<()> {
-        if self.cancel_flag.load(Ordering::SeqCst) {
+        if self.cancel_flag.load(Ordering::SeqCst) || self.closing.load(Ordering::Acquire) {
             return Err(FrankenError::WalCorrupt {
                 detail: "wal-fec repair pipeline is canceled".to_owned(),
             });
@@ -1743,7 +1872,10 @@ impl WalFecRepairPipeline {
     pub async fn shutdown(&mut self, cx: &Cx) -> Result<WalFecRepairPipelineStats> {
         {
             let _mask = cx.masked();
-            self.sender.take();
+            self.closing.store(true, Ordering::Release);
+            if let Some(sender) = self.sender.take() {
+                let _ = sender.try_send(WalFecPipelineMessage::Shutdown);
+            }
         }
         if let Some(worker) = self.worker.take() {
             worker.await;
@@ -1801,11 +1933,12 @@ impl Drop for WalFecRepairPipeline {
     }
 }
 
-async fn run_repair_pipeline_worker(
+async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
     mut receiver: mpsc::Receiver<WalFecPipelineMessage>,
     state: WalFecRepairWorkerState,
     worker_cx: Cx,
     per_symbol_delay: Duration,
+    region_task: Arc<G>,
 ) {
     let Some(native_worker_cx) = NativeCx::current() else {
         record_worker_failure(
@@ -1822,7 +1955,15 @@ async fn run_repair_pipeline_worker(
     worker_cx.set_native_cx(native_worker_cx.clone());
 
     loop {
-        let message = match receiver.recv(&native_worker_cx).await {
+        let received = if state.closing.load(Ordering::Acquire) {
+            match receiver.try_recv() {
+                Err(mpsc::RecvError::Empty | mpsc::RecvError::Disconnected) => break,
+                result => result,
+            }
+        } else {
+            receiver.recv(&native_worker_cx).await
+        };
+        let message = match received {
             Ok(message) => message,
             Err(mpsc::RecvError::Empty) => {
                 yield_now().await;
@@ -1844,23 +1985,62 @@ async fn run_repair_pipeline_worker(
         };
 
         match message {
-            WalFecPipelineMessage::Work(work_item) => {
-                let group_id = work_item.meta.group_id();
-                let cancel_flag_for_work = Arc::clone(&state.cancel_flag);
-                let work_cx = worker_cx.create_child();
-                let native_worker_cx_for_work = native_worker_cx.clone();
-                let outcome = spawn_blocking(move || {
-                    work_cx.set_native_cx(native_worker_cx_for_work);
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process_repair_work_item(
-                            &work_item,
-                            &work_cx,
-                            cancel_flag_for_work.as_ref(),
-                            per_symbol_delay,
+            work @ (WalFecPipelineMessage::Work(_) | WalFecPipelineMessage::Committed(_)) => {
+                let group_id = match &work {
+                    WalFecPipelineMessage::Work(item) => item.meta.group_id(),
+                    WalFecPipelineMessage::Committed(range) => WalFecGroupId {
+                        wal_salt1: range.header.salts.salt1,
+                        wal_salt2: range.header.salts.salt2,
+                        end_frame_no: range.end_frame_no,
+                    },
+                    WalFecPipelineMessage::Shutdown => unreachable!(),
+                };
+                let work = Arc::new(work);
+                let outcome = loop {
+                    let cancel_flag_for_work = Arc::clone(&state.cancel_flag);
+                    let work_cx = worker_cx.create_child();
+                    let native_worker_cx_for_work = native_worker_cx.clone();
+                    let work_region_task = Arc::clone(&region_task);
+                    let work_for_attempt = Arc::clone(&work);
+                    let outcome = spawn_blocking(move || {
+                        // Retain region accounting even if cancellation drops
+                        // the async waiter before this closure exits.
+                        let _region_task = work_region_task;
+                        work_cx.set_native_cx(native_worker_cx_for_work);
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            match work_for_attempt.as_ref() {
+                                WalFecPipelineMessage::Work(item) => process_repair_work_item(
+                                    item,
+                                    &work_cx,
+                                    &cancel_flag_for_work,
+                                    per_symbol_delay,
+                                ),
+                                WalFecPipelineMessage::Committed(range) => {
+                                    process_committed_wal_range(
+                                        range,
+                                        &work_cx,
+                                        &cancel_flag_for_work,
+                                        per_symbol_delay,
+                                    )
+                                }
+                                WalFecPipelineMessage::Shutdown => unreachable!(),
+                            }
+                        }))
+                    })
+                    .await;
+                    if matches!(outcome, Ok(Err(FrankenError::Busy))) {
+                        // A caller may have only one blocking thread, shared
+                        // with primary VFS I/O. Never occupy it while waiting
+                        // for the sidecar owner to finish its SQL operation.
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(1),
                         )
-                    }))
-                })
-                .await;
+                        .await;
+                        continue;
+                    }
+                    break outcome;
+                };
 
                 state.pending_jobs.fetch_sub(1, Ordering::SeqCst);
                 match outcome {
@@ -1916,6 +2096,7 @@ async fn run_repair_pipeline_worker(
                 }
                 yield_now().await;
             }
+            WalFecPipelineMessage::Shutdown => {}
         }
     }
 }
@@ -1948,9 +2129,11 @@ fn drain_abandoned_work(
     pending_jobs: &AtomicUsize,
     canceled_jobs: &AtomicUsize,
 ) {
-    while let Ok(WalFecPipelineMessage::Work(_)) = receiver.try_recv_compat() {
-        pending_jobs.fetch_sub(1, Ordering::SeqCst);
-        canceled_jobs.fetch_add(1, Ordering::SeqCst);
+    while let Ok(message) = receiver.try_recv_compat() {
+        if !matches!(message, WalFecPipelineMessage::Shutdown) {
+            pending_jobs.fetch_sub(1, Ordering::SeqCst);
+            canceled_jobs.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1999,6 +2182,284 @@ fn process_repair_work_item(
     }
     append_wal_fec_group(&work_item.sidecar_path, &group)?;
     Ok(WalFecWorkOutcome::Completed)
+}
+
+fn wal_fec_generation_matches(wal_path: &Path, expected: WalHeader) -> Result<bool> {
+    let mut file = match fs::File::open(wal_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let mut bytes = [0_u8; crate::WAL_HEADER_SIZE];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(err) => return Err(err.into()),
+    }
+    Ok(
+        WalHeader::from_bytes(&bytes).is_ok_and(|header| header == expected)
+            && validate_wal_header_checksum(&bytes, expected.big_endian_checksum())?,
+    )
+}
+
+/// Read only the admitted interval, validating the rolling checksum against
+/// both anchors captured by the WAL writer. A NORMAL sync may cover several
+/// transactions; their commit markers, rather than queue messages, define K.
+fn process_committed_wal_range(
+    range: &WalFecCommittedRange,
+    cx: &Cx,
+    cancel_flag: &AtomicBool,
+    per_symbol_delay: Duration,
+) -> Result<WalFecWorkOutcome> {
+    if range.end_frame_no == 0 {
+        return reclaim_retired_fec_on_open(range, cx, cancel_flag);
+    }
+    if range.repair_symbols == 0 {
+        return Ok(WalFecWorkOutcome::Completed);
+    }
+    if range.start_frame_no == 0 || range.start_frame_no > range.end_frame_no {
+        return Err(FrankenError::WalCorrupt {
+            detail: "invalid durable WAL-FEC interval".to_owned(),
+        });
+    }
+    if cancel_flag.load(Ordering::Acquire)
+        || cx.checkpoint().is_err()
+        || !wal_fec_generation_matches(&range.wal_path, range.header)?
+    {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    // Admission is nonblocking and precedes encoding. Busy retries release the
+    // caller's blocking-pool thread and wait in the async worker instead.
+    let sidecar_guard = try_lock_wal_fec_sidecar(&wal_fec_path_for_wal(&range.wal_path))?;
+    let page_size =
+        usize::try_from(range.header.page_size).map_err(|_| FrankenError::DatabaseFull)?;
+    let frame_size = crate::WAL_FRAME_HEADER_SIZE + page_size;
+    let offset = u64::from(range.start_frame_no - 1)
+        .checked_mul(u64::try_from(frame_size).map_err(|_| FrankenError::DatabaseFull)?)
+        .and_then(|bytes| bytes.checked_add(32))
+        .ok_or(FrankenError::DatabaseFull)?;
+    let mut file = fs::File::open(&range.wal_path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut frame = vec![0_u8; frame_size];
+    let mut previous = range.previous_checksum;
+    let mut pages = Vec::new();
+    let mut page_numbers = Vec::new();
+    let mut group_start = range.start_frame_no;
+    for frame_no in range.start_frame_no..=range.end_frame_no {
+        if cancel_flag.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+            return Ok(WalFecWorkOutcome::Canceled);
+        }
+        file.read_exact(&mut frame)?;
+        let header = WalFrameHeader::from_bytes(&frame)?;
+        let checksum = compute_wal_frame_checksum(
+            &frame,
+            page_size,
+            previous,
+            range.header.big_endian_checksum(),
+        )?;
+        if header.salts != range.header.salts
+            || header.page_number == 0
+            || checksum != header.checksum
+            || (frame_no == range.end_frame_no && checksum != range.end_checksum)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL-FEC source frame {frame_no} failed durable checksum validation"
+                ),
+            });
+        }
+        previous = checksum;
+        pages.push(frame[crate::WAL_FRAME_HEADER_SIZE..].to_vec());
+        page_numbers.push(header.page_number);
+        if !header.is_commit() {
+            continue;
+        }
+        let hashes = build_source_page_hashes(&pages);
+        let mut identity = range.header.to_bytes()?.to_vec();
+        identity.extend_from_slice(&group_start.to_le_bytes());
+        identity.extend_from_slice(&frame_no.to_le_bytes());
+        for hash in &hashes {
+            identity.extend_from_slice(&hash.to_le_bytes());
+        }
+        let k_source = frame_no - group_start + 1;
+        let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
+            wal_salt1: header.salts.salt1,
+            wal_salt2: header.salts.salt2,
+            start_frame_no: group_start,
+            end_frame_no: frame_no,
+            db_size_pages: header.db_size,
+            page_size: range.header.page_size,
+            k_source,
+            r_repair: u32::from(range.repair_symbols),
+            oti: Oti {
+                f: u64::from(k_source) * u64::from(range.header.page_size),
+                al: 1,
+                t: range.header.page_size,
+                z: 1,
+                n: 1,
+            },
+            object_id: ObjectId::derive_from_canonical_bytes(&identity),
+            page_numbers: std::mem::take(&mut page_numbers),
+            source_page_xxh3_128: hashes,
+        })?;
+        let Some(symbols) = generate_wal_fec_repair_symbols_inner(
+            &meta,
+            &pages,
+            Some(cx),
+            Some(cancel_flag),
+            per_symbol_delay,
+        )?
+        else {
+            return Ok(WalFecWorkOutcome::Canceled);
+        };
+        let group = WalFecGroupRecord::new(meta, symbols)?;
+        if !append_committed_wal_fec_group(range, &group, cx, cancel_flag, &sidecar_guard)? {
+            return Ok(WalFecWorkOutcome::Canceled);
+        }
+        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
+        debug!(group_id = %group.meta.group_id(), source_frames = k_source,
+            repair_symbols = range.repair_symbols, "durable WAL group is now repairable");
+        pages.clear();
+        group_start = frame_no.saturating_add(1);
+    }
+    if !pages.is_empty() {
+        return Err(FrankenError::WalCorrupt {
+            detail: "durable WAL-FEC interval ends before a commit marker".to_owned(),
+        });
+    }
+    Ok(WalFecWorkOutcome::Completed)
+}
+
+fn reclaim_retired_fec_on_open(
+    range: &WalFecCommittedRange,
+    cx: &Cx,
+    cancel_flag: &AtomicBool,
+) -> Result<WalFecWorkOutcome> {
+    let sidecar = wal_fec_path_for_wal(&range.wal_path);
+    if !sidecar.try_exists()? {
+        return Ok(WalFecWorkOutcome::Completed);
+    }
+    if cancel_flag.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    let _guard = try_lock_wal_fec_sidecar(&sidecar)?;
+    if !wal_fec_generation_matches(&range.wal_path, range.header)? {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    let bytes = fs::read(&sidecar)?;
+    let mut scan = scan_wal_fec_bytes(&sidecar, &bytes)?;
+    if scan.truncated_tail {
+        return Err(FrankenError::WalCorrupt {
+            detail:
+                "WAL-FEC startup cleanup preserves an incomplete sidecar until source regeneration"
+                    .to_owned(),
+        });
+    }
+    let before = scan.groups.len();
+    scan.groups.retain(|group| {
+        (group.meta.wal_salt1, group.meta.wal_salt2)
+            == (range.header.salts.salt1, range.header.salts.salt2)
+    });
+    if before != scan.groups.len() {
+        let header_len = scan_offset_after_optional_pragma_header(&bytes)?;
+        replace_wal_fec_sidecar(&sidecar, fs::metadata(&sidecar)?.permissions(), |output| {
+            output.write_all(&bytes[..header_len])?;
+            for group in &scan.groups {
+                output.write_all(&encode_wal_fec_group(group)?)?;
+            }
+            Ok(())
+        })?;
+        debug!(
+            retired_groups = before - scan.groups.len(),
+            "reclaimed retired WAL-FEC generations at open"
+        );
+    }
+    Ok(WalFecWorkOutcome::Completed)
+}
+
+fn append_committed_wal_fec_group(
+    range: &WalFecCommittedRange,
+    group: &WalFecGroupRecord,
+    cx: &Cx,
+    cancel_flag: &AtomicBool,
+    _sidecar_guard: &fs::File,
+) -> Result<bool> {
+    let sidecar = wal_fec_path_for_wal(&range.wal_path);
+    let record = encode_wal_fec_group(group)?;
+    // The guard MUST precede the generation check. A later reset cannot reclaim
+    // while we append; its pending cleanup will retire this group. If cleanup
+    // already finished, this check refuses the late job before any sidecar I/O.
+    if !wal_fec_generation_matches(&range.wal_path, range.header)?
+        || cancel_flag.load(Ordering::Acquire)
+        || cx.checkpoint().is_err()
+    {
+        return Ok(false);
+    }
+    let bytes = match fs::read(&sidecar) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
+    let mut scan = scan_wal_fec_bytes(&sidecar, &bytes)?;
+    let before = scan.groups.len();
+    scan.groups.retain(|existing| {
+        (existing.meta.wal_salt1, existing.meta.wal_salt2)
+            == (range.header.salts.salt1, range.header.salts.salt2)
+    });
+    let already_present = if let Some(existing) = scan
+        .groups
+        .iter()
+        .find(|existing| existing.meta.group_id() == group.meta.group_id())
+    {
+        if existing.meta.source_page_xxh3_128 != group.meta.source_page_xxh3_128
+            || existing.meta.page_numbers != group.meta.page_numbers
+            || existing.meta.start_frame_no != group.meta.start_frame_no
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "conflicting WAL-FEC commit group identity".to_owned(),
+            });
+        }
+        true
+    } else {
+        false
+    };
+    if already_present && !scan.truncated_tail && scan.groups.len() == before {
+        return Ok(true);
+    }
+    if scan.truncated_tail || scan.groups.len() != before {
+        // Restart catch-up replaces only an unusable suffix. Preserve the
+        // configuration header and every complete validated group atomically.
+        let header_len = scan_offset_after_optional_pragma_header(&bytes)?;
+        let permissions = fs::metadata(&sidecar)?.permissions();
+        replace_wal_fec_sidecar(&sidecar, permissions, |output| {
+            output.write_all(&bytes[..header_len])?;
+            for existing in &scan.groups {
+                output.write_all(&encode_wal_fec_group(existing)?)?;
+            }
+            if !already_present {
+                output.write_all(&record)?;
+            }
+            Ok(())
+        })?;
+        debug!(sidecar = %sidecar.display(), truncated_tail = scan.truncated_tail,
+            retired_groups = before - scan.groups.len(),
+            "replaced unusable or retired WAL-FEC records using validated durable frames");
+    } else {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&sidecar)?;
+        output.write_all(&record)?;
+        output.sync_data()?;
+        if bytes.is_empty() {
+            sync_wal_fec_parent(&sidecar)?;
+        }
+    }
+    Ok(true)
 }
 
 fn generate_wal_fec_repair_symbols_inner(

@@ -618,6 +618,17 @@ pub trait WalBackend: Send + Sync {
     /// Sync the WAL file to stable storage.
     fn sync(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Attach a caller-owned background repair queue to a native WAL backend.
+    /// In-memory and reference backends have no durable filesystem sidecar.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn set_wal_fec_producer(
+        &mut self,
+        _cx: &Cx,
+        _producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Number of valid frames currently in the WAL.
     fn frame_count(&self) -> usize;
 

@@ -13,6 +13,62 @@ use tempfile::tempdir;
 
 const PAGE_SIZE: u32 = 4096;
 
+#[test]
+fn repair_pipeline_refuses_inline_blocking_fallback() {
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let handle = runtime.handle();
+    runtime.block_on(async {
+        let result =
+            WalFecRepairPipeline::start(&handle, &test_cx(), WalFecRepairPipelineConfig::default());
+        assert!(matches!(
+            result,
+            Err(fsqlite_error::FrankenError::BackgroundWorkerFailed(detail))
+                if detail.contains("caller-owned runtime blocking pool")
+        ));
+    });
+}
+
+#[test]
+fn durable_admission_reserves_before_sync_and_abort_releases_capacity() {
+    let runtime = test_runtime();
+    let handle = runtime.handle();
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            &cx,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 1,
+                per_symbol_delay: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        let producer = pipeline.producer().unwrap();
+        let permit = producer.try_reserve().unwrap();
+        assert!(matches!(
+            producer.try_reserve(),
+            Err(fsqlite_error::FrankenError::Busy)
+        ));
+        assert_eq!(
+            pipeline.stats().pending_jobs,
+            0,
+            "a reservation is not durable work"
+        );
+        drop(permit); // Models failed WAL fsync; no work may be submitted.
+        drop(
+            producer
+                .try_reserve()
+                .expect("aborted reservation releases capacity"),
+        );
+        let stats = pipeline.shutdown(&cx).await.unwrap();
+        assert_eq!(stats.completed_jobs, 0);
+        assert!(
+            producer.try_reserve().is_err(),
+            "retained endpoints cannot submit after shutdown"
+        );
+    });
+}
+
 fn test_runtime() -> asupersync::runtime::Runtime {
     RuntimeBuilder::current_thread()
         .blocking_threads(1, 1)

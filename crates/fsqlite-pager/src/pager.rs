@@ -14372,6 +14372,19 @@ where
         Ok(())
     }
 
+    /// Attach the connection's region-owned repair producer to the WAL backend.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    pub async fn set_wal_fec_producer(
+        &self,
+        cx: &Cx,
+        producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
+    ) -> Result<()> {
+        with_wal_backend(&self.wal_backend, cx, |wal, cx| {
+            Box::pin(async move { wal.set_wal_fec_producer(cx, producer) })
+        })
+        .await
+    }
+
     /// Return the current WAL commit sync policy.
     #[must_use]
     pub fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
