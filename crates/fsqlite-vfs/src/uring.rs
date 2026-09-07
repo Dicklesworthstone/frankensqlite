@@ -3086,6 +3086,7 @@ mod tests {
 
     #[test]
     fn io_uring_vfs_default_equals_new() {
+        let _guard = io_uring_test_guard();
         let from_new = IoUringVfs::new();
         let from_default = IoUringVfs::default();
         assert_eq!(from_new.name(), from_default.name());
