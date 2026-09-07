@@ -336,6 +336,10 @@ struct IoUringRuntime {
     submitted_requests: AtomicU64,
     #[cfg(feature = "linux-asupersync-uring")]
     submitted_cancellations: AtomicU64,
+    #[cfg(test)]
+    first_cancel_queued_at: OnceLock<Instant>,
+    #[cfg(test)]
+    first_cancel_submitted_at: OnceLock<Instant>,
     #[cfg(feature = "linux-asupersync-uring")]
     largest_submission_batch: AtomicU64,
     #[cfg(test)]
@@ -427,6 +431,10 @@ impl IoUringRuntime {
                 driver_starts: AtomicU64::new(0),
                 submitted_requests: AtomicU64::new(0),
                 submitted_cancellations: AtomicU64::new(0),
+                #[cfg(test)]
+                first_cancel_queued_at: OnceLock::new(),
+                #[cfg(test)]
+                first_cancel_submitted_at: OnceLock::new(),
                 largest_submission_batch: AtomicU64::new(0),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
@@ -661,6 +669,8 @@ impl IoUringRuntime {
             } else if queue.live.contains(&request_id) && queue.cancellation_set.insert(request_id)
             {
                 queue.cancellations.push_back(request_id);
+                #[cfg(test)]
+                let _ = self.first_cancel_queued_at.set(Instant::now());
                 (None, std::mem::take(&mut queue.waiting))
             } else {
                 (None, false)
@@ -879,6 +889,10 @@ impl IoUringRuntime {
             // including entries flushed while making room in push_submission.
             self.submitted_requests
                 .fetch_add(staged_requests, Ordering::Release);
+            #[cfg(test)]
+            if staged_cancellations != 0 {
+                let _ = self.first_cancel_submitted_at.set(Instant::now());
+            }
             self.submitted_cancellations
                 .fetch_add(staged_cancellations, Ordering::Release);
 
@@ -2215,6 +2229,7 @@ mod tests {
 
     #[test]
     fn test_io_uring_vfs_roundtrip_write_read() {
+        let _guard = io_uring_test_guard();
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2525,25 +2540,50 @@ mod tests {
             let receiver_cancelled_after = cancellation_started.elapsed();
             drop(cancel_guard);
             let cancellation_enqueued_after = cancellation_started.elapsed();
+            let queued_after = || {
+                runtime.first_cancel_queued_at.get().map(|instant| {
+                    instant.duration_since(cancellation_started)
+                })
+            };
+            let submitted_after = || {
+                runtime.first_cancel_submitted_at.get().map(|instant| {
+                    instant.duration_since(cancellation_started)
+                })
+            };
 
+            // The observer can be descheduled after the kernel has consumed
+            // the cancellation. Bound observation separately, then apply the
+            // unchanged latency limit to the recorded submission upper bound.
+            let observation_deadline = cancellation_started + Duration::from_secs(2);
             while runtime.submitted_cancellations.load(Ordering::Acquire) == 0 {
                 assert!(
-                    cancellation_started.elapsed() < Duration::from_millis(5),
-                    "IORING_OP_ASYNC_CANCEL was not submitted within 5ms: \
+                    Instant::now() < observation_deadline,
+                    "IORING_OP_ASYNC_CANCEL submission was not observed within 2s: \
                      elapsed={:?} context_cancelled_after={context_cancelled_after:?} \
                      receiver_cancelled_after={receiver_cancelled_after:?} \
-                     cancellation_enqueued_after={cancellation_enqueued_after:?}",
-                    cancellation_started.elapsed()
+                     cancellation_enqueued_after={cancellation_enqueued_after:?} \
+                     queue_recorded_after={:?} kernel_submission_recorded_after={:?}",
+                    cancellation_started.elapsed(), queued_after(), submitted_after()
                 );
                 asupersync::runtime::yield_now().await;
             }
+            let submission_elapsed = submitted_after()
+                .expect("the submitted counter must publish its kernel-submission timestamp");
             assert!(
-                cancellation_started.elapsed() < Duration::from_millis(5),
+                submission_elapsed < Duration::from_millis(5),
                 "IORING_OP_ASYNC_CANCEL submission exceeded 5ms: \
-                 elapsed={:?} context_cancelled_after={context_cancelled_after:?} \
+                 submitted_after={submission_elapsed:?} observed_after={:?} \
+                 context_cancelled_after={context_cancelled_after:?} \
                  receiver_cancelled_after={receiver_cancelled_after:?} \
-                 cancellation_enqueued_after={cancellation_enqueued_after:?}",
-                cancellation_started.elapsed()
+                 cancellation_enqueued_after={cancellation_enqueued_after:?} \
+                 queue_recorded_after={:?} kernel_submission_recorded_after={:?}",
+                cancellation_started.elapsed(), queued_after(), submitted_after()
+            );
+            eprintln!(
+                "cancellation timing: context={context_cancelled_after:?} \
+                 receiver={receiver_cancelled_after:?} guard_return={cancellation_enqueued_after:?} \
+                 queued={:?} kernel_submitted={:?}",
+                queued_after(), submitted_after()
             );
 
             let completion_deadline = Instant::now() + Duration::from_secs(1);
@@ -2613,18 +2653,45 @@ mod tests {
                 oneshot::RecvError::Cancelled
             );
             drop(cancel_guard);
+            // Waiting for observation is distinct from the five-millisecond
+            // submission requirement, including when notification is broken.
+            let observation_deadline = started + Duration::from_secs(2);
             while runtime.submitted_cancellations.load(Ordering::Acquire) == 0 {
                 assert!(
-                    started.elapsed() < Duration::from_millis(5),
-                    "queue notification did not wake the one-second driver wait within 5ms: {:?}",
-                    started.elapsed()
+                    Instant::now() < observation_deadline,
+                    "queue cancellation submission was not observed within 2s: {:?} \
+                     queue_recorded_after={:?} kernel_submission_recorded_after={:?}",
+                    started.elapsed(),
+                    runtime
+                        .first_cancel_queued_at
+                        .get()
+                        .map(|instant| instant.duration_since(started)),
+                    runtime
+                        .first_cancel_submitted_at
+                        .get()
+                        .map(|instant| instant.duration_since(started))
                 );
                 asupersync::runtime::yield_now().await;
             }
+            let submission_elapsed = runtime
+                .first_cancel_submitted_at
+                .get()
+                .expect("the submitted counter must publish its kernel-submission timestamp")
+                .duration_since(started);
             assert!(
-                started.elapsed() < Duration::from_millis(5),
-                "queue wakeup exceeded 5ms: {:?}",
-                started.elapsed()
+                submission_elapsed < Duration::from_millis(5),
+                "queue notification did not wake the one-second driver wait within 5ms: \
+                 submitted_after={submission_elapsed:?} observed_after={:?} \
+                 queue_recorded_after={:?} kernel_submission_recorded_after={:?}",
+                started.elapsed(),
+                runtime
+                    .first_cancel_queued_at
+                    .get()
+                    .map(|instant| instant.duration_since(started)),
+                runtime
+                    .first_cancel_submitted_at
+                    .get()
+                    .map(|instant| instant.duration_since(started))
             );
             let completion_deadline = Instant::now() + Duration::from_secs(1);
             while runtime.queue.lock().unwrap().live.contains(&request_id) {
@@ -2837,7 +2904,8 @@ mod tests {
         assert_eq!(&buf, b"main-db");
         assert!(
             vfs.is_available(),
-            "skipping io_uring fd should not disable runtime"
+            "main-db I/O should not disable runtime: {}",
+            vfs.status()
         );
 
         // Policy reconciliation. This assertion once read `unix_fallbacks_total >= 2`
