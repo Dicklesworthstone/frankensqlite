@@ -177,76 +177,64 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
             lab_snap.skip_consultations > 0,
             "LAB_UNSAFE commit path must consult the gate; snap={lab_snap}"
         );
+        assert!(
+            lab_snap.skip_grants > 0,
+            "the real pivot-free workload must actually skip SSI; snap={lab_snap}"
+        );
     });
 }
 
-/// Adversarial workload: two transactions whose write sets overlap on
-/// the same `kv` row. FCW (first-committer-wins) aborts the second
-/// commit; the e-process must NOT cross the alert threshold (FCW is not
-/// an SSI pivot), but the gate must still keep functioning.
+/// Two real connections attempt the same page concurrently. The loser must
+/// be rejected by page admission or FCW, and that rejection cannot invent
+/// an SSI observation. Verify the winner's exact row after both close.
 #[test]
-fn lab_unsafe_fcw_conflict_does_not_trip_gate() {
+fn lab_unsafe_same_page_conflict_does_not_train_gate() {
     asupersync::test_utils::run_test(|| async {
-        let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute_batch(
-            "PRAGMA fsqlite.write_merge = LAB_UNSAFE;
-         PRAGMA fsqlite.ssi_e_process_alpha = 0.001;
-         CREATE TABLE kv (k INTEGER PRIMARY KEY, v INTEGER);
-         INSERT INTO kv(k, v) VALUES (1, 10);",
-        )
-        .await
-        .unwrap();
-
-        // Prime with a long clean history so the gate would be eligible to
-        // open. The adversarial conflict must keep it honest.
-        for _ in 0..128 {
-            conn.observe_ssi_outcome(false);
-        }
-
-        // A run of pivot-free commits on disjoint keys.
-        for i in 2..64 {
-            conn.execute_batch(&format!(
-                "BEGIN CONCURRENT; INSERT INTO kv(k, v) VALUES ({i}, {i}); COMMIT;"
-            ))
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actual-same-page-conflict.db");
+        let path = path.to_str().unwrap();
+        let first = Connection::open(path).await.unwrap();
+        first
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE kv(k INTEGER PRIMARY KEY, v INTEGER);
+                 INSERT INTO kv VALUES(1,10);",
+            )
             .await
             .unwrap();
+        let second = Connection::open(path).await.unwrap();
+        for conn in [&first, &second] {
+            assert!(conn.is_concurrent_mode_default());
+            conn.execute("PRAGMA fsqlite.write_merge=LAB_UNSAFE;")
+                .await
+                .unwrap();
+            conn.reset_ssi_e_process_gate();
+            conn.execute("BEGIN;").await.unwrap();
         }
-
-        let snap_before_conflict = conn.ssi_e_process_snapshot();
-        assert!(
-            !matches!(
-                snap_before_conflict.alert_state,
-                fsqlite_mvcc::GateAlertState::Alert
+        let before = second.ssi_e_process_snapshot();
+        first.execute("UPDATE kv SET v=11 WHERE k=1;").await.unwrap();
+        let second_write = second.execute("UPDATE kv SET v=99 WHERE k=1;").await;
+        first.execute("COMMIT;").await.unwrap();
+        let (phase, error) = match second_write {
+            Ok(_) => (
+                "commit",
+                second.execute("COMMIT;").await.expect_err("both same-page writers cannot commit"),
             ),
-            "clean prefix must not trip the gate; snap={snap_before_conflict}"
-        );
-
-        // Now try to produce a repeatable FCW-style abort. We simulate by
-        // having two logical writers on the same row in rapid succession
-        // via an UPDATE followed by a RAISE in a failing transaction.
-        //
-        // Since `:memory:` connections are single-threaded, the canonical
-        // way to trigger a real MVCC commit abort in a single-connection
-        // test is to stage an explicit SSI pivot scenario (bare UPDATE in
-        // a transaction that aborts after snapshot isolation checks). In
-        // practice, the pivot detection for single-connection-serial
-        // commits finds zero incoming+outgoing rw edges (no overlap exists
-        // after the prior commit published), so the gate stays honest.
-        //
-        // The weaker-but-real invariant we can check here: after driving
-        // the workload, the e-process must still be usable (not panicking,
-        // not permanently in Alert from spurious observations).
-        let snap_after = conn.ssi_e_process_snapshot();
-        assert!(
-            !matches!(snap_after.alert_state, fsqlite_mvcc::GateAlertState::Alert),
-            "gate must not be in Alert after a FCW-safe workload; snap={snap_after}"
-        );
-        assert!(
-            snap_after.observations >= snap_before_conflict.observations,
-            "observations must be monotonic; before={} after={}",
-            snap_before_conflict.observations,
-            snap_after.observations
-        );
+            Err(error) => ("write", error),
+        };
+        assert!(error.is_transient(), "expected retryable {phase} conflict, got {error:?}");
+        let after = second.ssi_e_process_snapshot();
+        assert_eq!(after.observations, before.observations, "{phase} conflict did not discover SSI edges");
+        assert_eq!(after.clean_streak, before.clean_streak);
+        assert_eq!(after.e_value.to_bits(), before.e_value.to_bits());
+        assert_eq!(after.skip_grants, before.skip_grants);
+        second.execute("ROLLBACK;").await.unwrap();
+        first.close().await.unwrap();
+        second.close().await.unwrap();
+        let reopened = Connection::open(path).await.unwrap();
+        assert_eq!(reopened.query("SELECT k,v FROM kv;").await.unwrap()[0].values(), &[fsqlite_types::SqliteValue::Integer(1), fsqlite_types::SqliteValue::Integer(11)]);
+        eprintln!("bead_id=bd-6hdwo.14 event=actual_same_page_conflict phase={phase} error={error:?} observations_before={} observations_after={}", before.observations, after.observations);
+        reopened.close().await.unwrap();
     });
 }
 
