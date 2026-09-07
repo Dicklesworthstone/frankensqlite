@@ -134,13 +134,20 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.3.17...v
   distinguish failed decode from early bailout without fabricating a recovered
   payload. This does not establish automatic repair through the public database
   API ([f697ed38d](https://github.com/Dicklesworthstone/frankensqlite/commit/f697ed38d)).
-- Release gate on the tagged commit: `cargo fmt --check` and
-  `cargo clippy --workspace --all-targets --locked -- -D warnings` clean on the
-  pinned nightly, plus the GH#415 rowid IN-list oracle suite, the `fsqlite`
-  compatibility suite (incl. the read-only WAL reader guards), the rowid
-  residual oracles, and the `fsqlite-vfs`/`fsqlite-pager` unit suites. Full
-  workspace and all-features test execution and historical benchmark
-  comparison were not part of this cut.
+- Release gate on the tagged commit (pinned nightly, Linux x86_64):
+  `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` clean, plus
+  the GH#415 rowid IN-list oracle suite, the `fsqlite` compatibility suite
+  (incl. the read-only WAL reader guards), the rowid residual oracles, and the
+  `fsqlite-pager` unit suite green. The `fsqlite-vfs` unit suite is green
+  single-threaded and in isolation; under default test parallelism two
+  pre-existing tests
+  (`namespace::tests::cleanup_retry_requires_a_fresh_complete_ownership_proof`,
+  `uring::tests::io_uring_vfs_default_equals_new`) flake at the same rate on
+  v0.3.17 as on this commit (4 of 6 runs each) and are tracked as a known
+  test-harness race, not a release regression. Full workspace and
+  all-features test execution and historical benchmark comparison were not
+  part of this cut.
 
 ### Storage and WAL
 
