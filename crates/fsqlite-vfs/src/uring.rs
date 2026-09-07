@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,6 +26,10 @@ use asupersync::channel::oneshot;
 use asupersync::channel::oneshot::{Receiver, SendPermit};
 #[cfg(feature = "linux-asupersync-uring")]
 use io_uring::{IoUring, opcode, types};
+#[cfg(feature = "linux-asupersync-uring")]
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+#[cfg(feature = "linux-asupersync-uring")]
+use nix::sys::eventfd::{EfdFlags, EventFd};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::{
@@ -268,6 +272,7 @@ struct DriverQueue {
     cancellation_set: HashSet<u64>,
     next_request_id: u64,
     active: bool,
+    waiting: bool,
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
@@ -322,6 +327,8 @@ struct IoUringRuntime {
     #[cfg(feature = "linux-asupersync-uring")]
     ring: Option<Mutex<IoUring>>,
     #[cfg(feature = "linux-asupersync-uring")]
+    wakeup: Option<EventFd>,
+    #[cfg(feature = "linux-asupersync-uring")]
     queue: Mutex<DriverQueue>,
     #[cfg(feature = "linux-asupersync-uring")]
     driver_starts: AtomicU64,
@@ -331,6 +338,8 @@ struct IoUringRuntime {
     submitted_cancellations: AtomicU64,
     #[cfg(feature = "linux-asupersync-uring")]
     largest_submission_batch: AtomicU64,
+    #[cfg(test)]
+    driver_wait: Duration,
     initial_status: String,
     disabled: AtomicBool,
     disable_reason: OnceLock<&'static str>,
@@ -390,12 +399,22 @@ impl IoUringRuntime {
                     }
                 })
             };
-            let (ring, initial_status) = match ring_result {
-                Ok(ring) => (
+            let ring_result = ring_result.and_then(|ring| {
+                EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                    .map(|wakeup| (ring, wakeup))
+                    .map_err(io::Error::from)
+            });
+            let (ring, wakeup, initial_status) = match ring_result {
+                Ok((ring, wakeup)) => (
                     Some(Mutex::new(ring)),
+                    Some(wakeup),
                     "available:asupersync-shared-uring".to_owned(),
                 ),
-                Err(error) => (None, format!("unavailable:asupersync-shared-uring:{error}")),
+                Err(error) => (
+                    None,
+                    None,
+                    format!("unavailable:asupersync-shared-uring:{error}"),
+                ),
             };
             let disable_reason = OnceLock::new();
             if forced_failure {
@@ -403,11 +422,14 @@ impl IoUringRuntime {
             }
             Self {
                 ring,
+                wakeup,
                 queue: Mutex::new(DriverQueue::default()),
                 driver_starts: AtomicU64::new(0),
                 submitted_requests: AtomicU64::new(0),
                 submitted_cancellations: AtomicU64::new(0),
                 largest_submission_batch: AtomicU64::new(0),
+                #[cfg(test)]
+                driver_wait: IO_URING_DRIVER_WAIT,
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
                 disable_reason,
@@ -540,7 +562,7 @@ impl IoUringRuntime {
         let len = kind.len();
         let (sender, receiver) = oneshot::channel();
         let completion = sender.reserve(native_cx).map_err(|_| FrankenError::Abort)?;
-        let id = {
+        let (id, wake_driver) = {
             let mut queue = self
                 .queue
                 .lock()
@@ -562,8 +584,11 @@ impl IoUringRuntime {
                 completion,
                 write_completion: write_completion.map(VfsWriteCompletionSource::new),
             });
-            id
+            (id, std::mem::take(&mut queue.waiting))
         };
+        if wake_driver {
+            self.wake_driver();
+        }
         trace!(
             event,
             request_id = id,
@@ -617,7 +642,7 @@ impl IoUringRuntime {
 
     #[cfg(feature = "linux-asupersync-uring")]
     fn cancel_request(&self, request_id: u64) {
-        let queued_request = {
+        let (queued_request, wake_driver) = {
             let mut queue = self
                 .queue
                 .lock()
@@ -632,15 +657,18 @@ impl IoUringRuntime {
                     .remove(index)
                     .expect("located pending request must remain present");
                 queue.live.remove(&request_id);
-                Some(request)
+                (Some(request), false)
             } else if queue.live.contains(&request_id) && queue.cancellation_set.insert(request_id)
             {
                 queue.cancellations.push_back(request_id);
-                None
+                (None, std::mem::take(&mut queue.waiting))
             } else {
-                None
+                (None, false)
             }
         };
+        if wake_driver {
+            self.wake_driver();
+        }
 
         trace!(
             event = "io_uring_cancel_requested",
@@ -648,6 +676,84 @@ impl IoUringRuntime {
         );
         if let Some(request) = queued_request {
             request.cancel();
+        }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn wake_driver(&self) {
+        let Some(wakeup) = &self.wakeup else {
+            return;
+        };
+        loop {
+            match wakeup.write(1) {
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => return,
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(error) => {
+                    // The periodic wait remains a fallback if notification
+                    // fails. It must not release any submitted allocation.
+                    warn!(%error, "io_uring driver wakeup failed");
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn wait_for_driver_work(&self, ring: &IoUring) -> io::Result<()> {
+        let wakeup = self
+            .wakeup
+            .as_ref()
+            .expect("available ring has a wakeup fd");
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !queue.pending.is_empty() || !queue.cancellations.is_empty() {
+                return Ok(());
+            }
+            // Publish before polling while holding the same lock as producers.
+            // An eventfd notification persists if it arrives before poll enters.
+            queue.waiting = true;
+        }
+        // SAFETY: ring is borrowed for this entire synchronous poll; its owner
+        // holds the ring mutex and cannot close the fd before these PollFds drop.
+        let ring_fd = unsafe { BorrowedFd::borrow_raw(ring.as_raw_fd()) };
+        let mut fds = [
+            PollFd::new(ring_fd, PollFlags::POLLIN),
+            PollFd::new(wakeup.as_fd(), PollFlags::POLLIN),
+        ];
+        #[cfg(test)]
+        let wait = self.driver_wait;
+        #[cfg(not(test))]
+        let wait = IO_URING_DRIVER_WAIT;
+        let result = poll(
+            &mut fds,
+            PollTimeout::try_from(wait).expect("bounded driver timeout"),
+        );
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting = false;
+        match result {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => return Err(io::Error::from(error)),
+        }
+        if fds.iter().any(|fd| {
+            fd.revents().is_some_and(|events| {
+                events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+            })
+        }) {
+            return Err(io::Error::other("io_uring driver poll descriptor failed"));
+        }
+        // A single eventfd read consumes all coalesced queue notifications.
+        // Producers that race this read are still visible on the next queue pass.
+        loop {
+            match wakeup.read() {
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => return Ok(()),
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(error) => return Err(io::Error::from(error)),
+            }
         }
     }
 
@@ -811,19 +917,9 @@ impl IoUringRuntime {
                 return;
             }
 
-            let timeout = types::Timespec::from(IO_URING_DRIVER_WAIT);
-            let args = types::SubmitArgs::new().timespec(&timeout);
-            match ring.submitter().submit_with_args(1, &args) {
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::ETIME | libc::EINTR | libc::EAGAIN)
-                    ) => {}
-                Err(error) => {
-                    self.fail_driver(Some(&mut ring), &mut inflight, &error);
-                    return;
-                }
+            if let Err(error) = self.wait_for_driver_work(&ring) {
+                self.fail_driver(Some(&mut ring), &mut inflight, &error);
+                return;
             }
             let completed = ring
                 .completion()
@@ -942,6 +1038,7 @@ impl IoUringRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.active = false;
+        queue.waiting = false;
         queue.live.clear();
         queue.cancellations.clear();
         queue.cancellation_set.clear();
@@ -2466,6 +2563,81 @@ mod tests {
                 );
                 asupersync::runtime::yield_now().await;
             }
+        });
+        test_runtime().block_on(proof);
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_cancellation_wakes_driver_before_long_poll_timeout() {
+        let _guard = io_uring_test_guard();
+        let proof = test_runtime().handle().spawn(async {
+            let driver_cx = NativeCx::current().expect("runtime task should install Cx");
+            let native_cx = NativeCx::for_testing();
+            let cx = Cx::new();
+            cx.set_native_cx(native_cx.clone());
+            let mut runtime = IoUringRuntime::new();
+            assert!(
+                runtime.is_available(),
+                "strict wakeup proof requires io_uring: {}",
+                runtime.status()
+            );
+            // A one-second timeout makes an actual notification necessary to
+            // meet the unchanged five-millisecond cancellation requirement.
+            runtime.driver_wait = Duration::from_secs(1);
+            let runtime = Arc::new(runtime);
+            let (read_fd, _write_fd) = nix::unistd::pipe().expect("pipe should open");
+            let (request_id, mut receiver) = runtime
+                .enqueue_read(&cx, &native_cx, Arc::new(File::from(read_fd)), 1, 0)
+                .expect("pipe read should enqueue");
+            let cancel_guard = RequestCancellationGuard::new(Arc::clone(&runtime), request_id);
+            runtime
+                .ensure_driver(&driver_cx)
+                .expect("driver should start");
+            let wait_deadline = Instant::now() + Duration::from_secs(1);
+            while !runtime.queue.lock().unwrap().waiting {
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "driver did not enter its long wait"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert_eq!(runtime.submitted_requests.load(Ordering::Acquire), 1);
+            let started = Instant::now();
+            cx.cancel();
+            assert_eq!(
+                receiver
+                    .recv(&native_cx)
+                    .await
+                    .expect_err("caller cancellation must interrupt receive"),
+                oneshot::RecvError::Cancelled
+            );
+            drop(cancel_guard);
+            while runtime.submitted_cancellations.load(Ordering::Acquire) == 0 {
+                assert!(
+                    started.elapsed() < Duration::from_millis(5),
+                    "queue notification did not wake the one-second driver wait within 5ms: {:?}",
+                    started.elapsed()
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(5),
+                "queue wakeup exceeded 5ms: {:?}",
+                started.elapsed()
+            );
+            let completion_deadline = Instant::now() + Duration::from_secs(1);
+            while runtime.queue.lock().unwrap().live.contains(&request_id) {
+                assert!(
+                    Instant::now() < completion_deadline,
+                    "woken cancellation did not reach a terminal CQE"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(
+                runtime.is_available(),
+                "normal cancellation must not disable the backend"
+            );
         });
         test_runtime().block_on(proof);
     }

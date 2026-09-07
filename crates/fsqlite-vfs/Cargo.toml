@@ -26,6 +26,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.12"
+nix = { workspace = true, features = ["event", "poll"] }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 advisory-lock = "0.3.0"
