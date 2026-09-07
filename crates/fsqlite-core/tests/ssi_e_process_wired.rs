@@ -9,7 +9,7 @@
 //!    commit path runs full SSI validation on every concurrent commit.
 //! 2. Under `write_merge = LAB_UNSAFE`, the gate eventually opens on a
 //!    pivot-free workload and grants at least some skips. The final DB
-//!    state matches a SAFE-mode run of the same workload byte-for-byte.
+//!    ordered rows match a SAFE-mode run of the same workload.
 //! 3. An adversarial workload that injects a true page-level write-write
 //!    conflict must NOT cross the e-process threshold; FCW (first-
 //!    committer-wins) catches the conflict regardless of SSI skip.
@@ -71,7 +71,10 @@ fn begin_time_fcw_policy_does_not_train_the_ssi_gate() {
             let ssi = conn.ssi_e_process_snapshot();
             assert_eq!(ssi.observations, before.observations + 1);
             assert_eq!(ssi.clean_streak, before.clean_streak + 1);
-            assert_eq!(ssi.skip_grants, 0, "an untrained gate cannot skip validation");
+            assert_eq!(
+                ssi.skip_grants, 0,
+                "an untrained gate cannot skip validation"
+            );
             assert_eq!(
                 conn.query("SELECT value FROM policy_gate WHERE id=1;")
                     .await
@@ -90,8 +93,11 @@ fn begin_time_fcw_policy_does_not_train_the_ssi_gate() {
 }
 
 /// Deterministic workload: N serial `BEGIN CONCURRENT` transactions on
-/// disjoint keys. Returns `SUM(v) FROM kv`.
-async fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
+/// disjoint keys. Returns every stored key and value in key order.
+async fn run_pivot_free_workload(
+    conn: &Connection,
+    commits: usize,
+) -> Vec<Vec<fsqlite_types::SqliteValue>> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS kv (k INTEGER PRIMARY KEY, v INTEGER);")
         .await
         .unwrap();
@@ -104,15 +110,12 @@ async fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {
         .await
         .unwrap();
     }
-    let stmt = conn
-        .prepare("SELECT COALESCE(SUM(v), 0) FROM kv")
+    conn.query("SELECT k,v FROM kv ORDER BY k;")
         .await
-        .unwrap();
-    let row = stmt.query_row().await.unwrap();
-    match &row.values()[0] {
-        fsqlite_types::SqliteValue::Integer(n) => *n,
-        other => panic!("expected integer sum, got {other:?}"),
-    }
+        .unwrap()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect()
 }
 
 /// LAB_UNSAFE + a long pivot-free workload: the gate must open (clean
@@ -125,10 +128,10 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
         let commits = 512;
 
         // SAFE baseline.
-        let safe_sum = {
+        let safe_rows = {
             let conn = Connection::open(":memory:").await.unwrap();
             assert_eq!(conn.write_merge_mode(), WriteMergeMode::Safe);
-            let sum = run_pivot_free_workload(&conn, commits).await;
+            let rows = run_pivot_free_workload(&conn, commits).await;
             // Under SAFE, the gate must never open regardless of outcomes
             // auto-fed by the commit path.
             let snap = conn.ssi_e_process_snapshot();
@@ -136,11 +139,12 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
                 snap.skip_grants, 0,
                 "SAFE must never grant a skip; snap={snap}"
             );
-            sum
+            conn.close().await.unwrap();
+            rows
         };
 
         // LAB_UNSAFE: rely on the wired commit path to feed observations.
-        let (lab_sum, lab_snap) = {
+        let (lab_rows, lab_snap) = {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute_batch(
                 "PRAGMA fsqlite.write_merge = LAB_UNSAFE;
@@ -149,14 +153,17 @@ fn lab_unsafe_wired_commit_path_opens_gate_and_matches_safe() {
             .await
             .unwrap();
             assert_eq!(conn.write_merge_mode(), WriteMergeMode::LabUnsafe);
-            let sum = run_pivot_free_workload(&conn, commits).await;
-            (sum, conn.ssi_e_process_snapshot())
+            let rows = run_pivot_free_workload(&conn, commits).await;
+            let snap = conn.ssi_e_process_snapshot();
+            conn.close().await.unwrap();
+            (rows, snap)
         };
 
         assert_eq!(
-            safe_sum, lab_sum,
-            "LAB_UNSAFE must produce identical aggregate as SAFE on a pivot-free workload"
+            safe_rows, lab_rows,
+            "LAB_UNSAFE must preserve every SAFE-mode key and value"
         );
+        assert_eq!(lab_rows.len(), commits);
 
         // The wired commit path must have fed real observations.
         assert!(
@@ -212,19 +219,31 @@ fn lab_unsafe_same_page_conflict_does_not_train_gate() {
             conn.execute("BEGIN;").await.unwrap();
         }
         let before = second.ssi_e_process_snapshot();
-        first.execute("UPDATE kv SET v=11 WHERE k=1;").await.unwrap();
+        first
+            .execute("UPDATE kv SET v=11 WHERE k=1;")
+            .await
+            .unwrap();
         let second_write = second.execute("UPDATE kv SET v=99 WHERE k=1;").await;
         first.execute("COMMIT;").await.unwrap();
         let (phase, error) = match second_write {
             Ok(_) => (
                 "commit",
-                second.execute("COMMIT;").await.expect_err("both same-page writers cannot commit"),
+                second
+                    .execute("COMMIT;")
+                    .await
+                    .expect_err("both same-page writers cannot commit"),
             ),
             Err(error) => ("write", error),
         };
-        assert!(error.is_transient(), "expected retryable {phase} conflict, got {error:?}");
+        assert!(
+            error.is_transient(),
+            "expected retryable {phase} conflict, got {error:?}"
+        );
         let after = second.ssi_e_process_snapshot();
-        assert_eq!(after.observations, before.observations, "{phase} conflict did not discover SSI edges");
+        assert_eq!(
+            after.observations, before.observations,
+            "{phase} conflict did not discover SSI edges"
+        );
         assert_eq!(after.clean_streak, before.clean_streak);
         assert_eq!(after.e_value.to_bits(), before.e_value.to_bits());
         assert_eq!(after.skip_grants, before.skip_grants);
@@ -232,8 +251,17 @@ fn lab_unsafe_same_page_conflict_does_not_train_gate() {
         first.close().await.unwrap();
         second.close().await.unwrap();
         let reopened = Connection::open(path).await.unwrap();
-        assert_eq!(reopened.query("SELECT k,v FROM kv;").await.unwrap()[0].values(), &[fsqlite_types::SqliteValue::Integer(1), fsqlite_types::SqliteValue::Integer(11)]);
-        eprintln!("bead_id=bd-6hdwo.14 event=actual_same_page_conflict phase={phase} error={error:?} observations_before={} observations_after={}", before.observations, after.observations);
+        assert_eq!(
+            reopened.query("SELECT k,v FROM kv;").await.unwrap()[0].values(),
+            &[
+                fsqlite_types::SqliteValue::Integer(1),
+                fsqlite_types::SqliteValue::Integer(11)
+            ]
+        );
+        eprintln!(
+            "bead_id=bd-6hdwo.14 event=actual_same_page_conflict phase={phase} error={error:?} observations_before={} observations_after={}",
+            before.observations, after.observations
+        );
         reopened.close().await.unwrap();
     });
 }
