@@ -2582,8 +2582,8 @@ mod tests {
             eprintln!(
                 "cancellation timing: context={context_cancelled_after:?} \
                  receiver={receiver_cancelled_after:?} guard_return={cancellation_enqueued_after:?} \
-                 queued={:?} kernel_submitted={:?}",
-                queued_after(), submitted_after()
+                 queued={:?} kernel_submitted={:?} observed_after={:?}",
+                queued_after(), submitted_after(), cancellation_started.elapsed()
             );
 
             let completion_deadline = Instant::now() + Duration::from_secs(1);
@@ -2692,6 +2692,11 @@ mod tests {
                     .first_cancel_submitted_at
                     .get()
                     .map(|instant| instant.duration_since(started))
+            );
+            eprintln!(
+                "long-poll cancellation timing: kernel_submitted={submission_elapsed:?} \
+                 observed_after={:?}",
+                started.elapsed()
             );
             let completion_deadline = Instant::now() + Duration::from_secs(1);
             while runtime.queue.lock().unwrap().live.contains(&request_id) {
