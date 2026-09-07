@@ -4547,6 +4547,23 @@ impl PagerBackend {
             .await
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn set_wal_fec_producer(
+        &self,
+        cx: &Cx,
+        producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.set_wal_fec_producer(cx, producer).await,
+            #[cfg(unix)]
+            Self::Unix(p) => p.set_wal_fec_producer(cx, producer).await,
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.set_wal_fec_producer(cx, producer).await,
+        }
+    }
+
     fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
         match self {
             Self::Memory(p) => p.set_wal_commit_sync_policy(policy),
@@ -12548,6 +12565,9 @@ pub struct Connection {
     _ambient_io_runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
     /// Region owned by this connection under the shared per-database root.
     runtime_region: Region,
+    /// Region-accounted repair worker; awaited before region teardown on close.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    wal_fec_pipeline: RefCell<Option<fsqlite_wal::wal_fec::WalFecRepairPipeline>>,
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
@@ -14178,6 +14198,8 @@ impl Connection {
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             _ambient_io_runtime_handle: ambient_io_runtime_handle,
             runtime_region,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            wal_fec_pipeline: RefCell::new(None),
             concurrent_session_id: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),
             cached_concurrent_handle: RefCell::new(None),
@@ -14704,6 +14726,8 @@ impl Connection {
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             _ambient_io_runtime_handle: ambient_io_runtime_handle,
             runtime_region,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            wal_fec_pipeline: RefCell::new(None),
             concurrent_session_id: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),
             cached_concurrent_handle: RefCell::new(None),
@@ -24793,6 +24817,27 @@ impl Connection {
             LiveVtabCleanupAction::Disconnect,
             "connection close staged drop",
         );
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if self.wal_fec_pipeline.get_mut().is_some() {
+            // Close-time checkpointing can perform another WAL sync. Remove
+            // admission before stopping the worker so that sync cannot address
+            // a closed queue. Keep the pipeline owned here if detaching fails.
+            self.pager.set_wal_fec_producer(&cx, None).await?;
+        }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(mut pipeline) = self.wal_fec_pipeline.get_mut().take() {
+            // Await before close_and_drain's synchronous region wait. In
+            // particular, current-thread runtimes must get a chance to poll
+            // the worker and release its region TaskHandle.
+            if !pipeline.flush(&cx, Duration::from_secs(30)).await {
+                pipeline.cancel();
+            }
+            match pipeline.shutdown(&cx).await {
+                Ok(stats) => tracing::info!(?stats, "WAL-FEC connection worker drained"),
+                Err(error) => tracing::warn!(%error, "WAL-FEC shutdown incomplete; primary WAL remains durable"),
+            }
+        }
 
         if checkpoint_on_close
             && !self.pager.is_memory()
@@ -73989,6 +74034,28 @@ impl Connection {
         let result_columns = pragma_result_columns(pragma);
         // First try connection-level knobs (journal_mode, synchronous, etc.).
         let pragma_name = pragma.name.name.to_ascii_lowercase();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if pragma_name == "raptorq_repair_symbols" {
+            let mut next = self.pragma_state.borrow().clone();
+            let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next, pragma)?;
+            if let fsqlite_vdbe::pragma::PragmaOutput::Int(value) = output {
+                if pragma.value.is_some() {
+                    if !self.pager.is_memory() {
+                        if self.pager.is_readonly() || next.query_only {
+                            return Err(FrankenError::ReadOnly);
+                        }
+                        let sidecar = fsqlite_wal::wal_fec_path_for_wal(&wal_path_for_db_path(&self.path));
+                        fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, next.raptorq_repair_symbols)?;
+                    }
+                    self.pragma_state.borrow_mut().raptorq_repair_symbols = next.raptorq_repair_symbols;
+                    if let Some(producer) = self.wal_fec_pipeline.borrow().as_ref().and_then(|pipeline| pipeline.producer()) {
+                        producer.set_repair_symbols(next.raptorq_repair_symbols);
+                    }
+                    tracing::info!(repair_symbols = next.raptorq_repair_symbols, "updated WAL-FEC repair budget");
+                }
+                return Ok(vec![Row { values: vec![SqliteValue::Integer(value)] }]);
+            }
+        }
         if matches!(pragma_name.as_str(), "cache_size" | "default_cache_size") {
             let mut next_state = self.pragma_state.borrow().clone();
             let output = fsqlite_vdbe::pragma::apply_connection_pragma(&mut next_state, pragma)?;
@@ -77093,6 +77160,49 @@ impl Connection {
         self.apply_journal_mode_to_pager(&journal_mode).await
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn ensure_wal_fec_pipeline(&self, cx: &Cx) -> Result<()> {
+        use fsqlite_wal::wal_fec::{WalFecRepairPipeline, WalFecRepairPipelineConfig};
+
+        if self.pager.is_memory() {
+            return Ok(());
+        }
+        if self.wal_fec_pipeline.borrow().is_none() {
+            let sidecar = fsqlite_wal::wal_fec_path_for_wal(&wal_path_for_db_path(&self.path));
+            let budget = fsqlite_wal::read_wal_fec_raptorq_repair_symbols(&sidecar)
+                .unwrap_or_else(|error| {
+                    // Optional repair metadata cannot invalidate an intact
+                    // primary WAL. The worker will preserve/refuse malformed
+                    // sidecar bytes rather than silently rewrite its header.
+                    tracing::warn!(%error, "WAL-FEC configuration unreadable; primary WAL recovery remains available");
+                    fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS
+                });
+            self.pragma_state.borrow_mut().raptorq_repair_symbols = budget;
+            if self.pager.is_readonly() {
+                return Ok(());
+            }
+            let Some(runtime) = self._shared_mvcc_state._runtime.native_runtime_handle()
+                .or_else(|| self._ambient_io_runtime_handle.clone()) else {
+                tracing::warn!("WAL-FEC requires a caller-owned native runtime; primary WAL durability is unchanged");
+                return Ok(());
+            };
+            if runtime.blocking_handle().is_none() {
+                tracing::warn!("WAL-FEC requires a caller-owned runtime blocking pool; primary WAL durability is unchanged");
+                return Ok(());
+            }
+            let (region_task, worker_cx) = self._shared_mvcc_state.register_task_in_region(self.runtime_region)?;
+            let pipeline = WalFecRepairPipeline::start_scoped(
+                &runtime, &worker_cx, WalFecRepairPipelineConfig::default(), region_task,
+            )?;
+            if let Some(producer) = pipeline.producer() {
+                producer.set_repair_symbols(budget);
+            }
+            *self.wal_fec_pipeline.borrow_mut() = Some(pipeline);
+        }
+        let producer = self.wal_fec_pipeline.borrow().as_ref().and_then(|pipeline| pipeline.producer());
+        self.pager.set_wal_fec_producer(cx, producer).await
+    }
+
     /// Build the rows for `PRAGMA fsqlite_concurrency` — a read-only
     /// introspection surface that reports the active write-concurrency
     /// model (bd-nao48).
@@ -77253,7 +77363,10 @@ impl Connection {
                     Ok(())
                 }
                 Err(err) => Err(err),
-            }
+            }?;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            self.ensure_wal_fec_pipeline(&cx).await?;
+            Ok(())
         } else {
             // bd-sw2k5: every non-WAL mode uses the pager's Delete rollback
             // path; the requested sub-mode only selects the post-commit journal
@@ -151756,6 +151869,31 @@ mod tests {
 
         drop(conn);
         drop(runtime_a);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn wal_fec_worker_is_registered_and_awaited_before_connection_region_close() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1).build().unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("fec-region.db");
+            let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
+            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("PRAGMA synchronous = FULL;").await.unwrap();
+            conn.execute("PRAGMA wal_autocheckpoint = 0;").await.unwrap();
+            let shared = Arc::clone(&conn._shared_mvcc_state);
+            let region = conn.runtime_region;
+            assert!(conn.wal_fec_pipeline.borrow().is_some());
+            assert_eq!(lock_unpoisoned(&shared.runtime_state).regions.active_tasks(region), 1);
+            conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (7);").await.unwrap();
+            conn.close_without_checkpoint().await.unwrap();
+            assert_eq!(lock_unpoisoned(&shared.runtime_state).regions.active_tasks(region), 0);
+            let sidecar = fsqlite_wal::wal_fec_path_for_wal(&wal_path_for_db_path(db.to_str().unwrap()));
+            assert!(!fsqlite_wal::scan_wal_fec(&sidecar).unwrap().groups.is_empty());
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]

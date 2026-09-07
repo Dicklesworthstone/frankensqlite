@@ -2577,6 +2577,13 @@ where
     /// replacement; repair workers must separately reject late retired jobs.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pending_fec_reclamation: Vec<WalSalts>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fec_producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
+    /// Last admitted durable boundary, including the trusted checksum anchor.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fec_admitted: Option<(WalHeader, u32, fsqlite_wal::SqliteWalChecksum)>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fec_inspected_generation: Option<WalHeader>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -2610,6 +2617,12 @@ where
             db_file_identity: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             pending_fec_reclamation: Vec::new(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            fec_producer: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            fec_admitted: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            fec_inspected_generation: None,
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -2617,6 +2630,67 @@ where
     #[must_use]
     pub fn into_inner(self) -> WalBackendAdapter<V::File> {
         self.inner
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn pending_fec_range(&mut self, cx: &Cx) -> Result<Option<fsqlite_wal::wal_fec::WalFecCommittedRange>> {
+        let Some(producer) = &self.fec_producer else { return Ok(None) };
+        let wal = &mut self.inner.wal;
+        let end = wal.frame_count();
+        // A sync of an unfinished transaction is not a repairable commit. The
+        // next commit interval still starts at the last admitted commit marker.
+        if end == 0 || wal.last_commit_frame(cx)? != end.checked_sub(1) {
+            return Ok(None);
+        }
+        let header = WalHeader::from_bytes(&wal.header().to_bytes()?)?;
+        let end_frame_no = u32::try_from(end).map_err(|_| FrankenError::DatabaseFull)?;
+        let (start, previous_checksum) = match self.fec_admitted {
+            Some((generation, count, checksum)) if generation == header => (count, checksum),
+            _ => (0, header.checksum),
+        };
+        if start >= end_frame_no {
+            return Ok(None);
+        }
+        Ok(Some(fsqlite_wal::wal_fec::WalFecCommittedRange {
+            wal_path: self.wal_path.clone(), header,
+            start_frame_no: start + 1, end_frame_no,
+            previous_checksum, end_checksum: wal.running_checksum(),
+            repair_symbols: producer.repair_symbols(),
+        }))
+    }
+
+    /// Shared durability boundary for ordinary publication and in-doubt
+    /// reconciliation. Reconciliation deliberately does not publish staged
+    /// adapter metadata; its existing certificate protocol owns that decision.
+    fn sync_with_fec(&mut self, cx: &Cx, publish_pending: bool) -> Result<()> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let range = self.pending_fec_range(cx)?;
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let producer = self.fec_producer.clone();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let permit = if range.as_ref().is_some_and(|range| range.repair_symbols != 0) {
+            producer.as_ref().map(|producer| producer.try_reserve()).transpose()?
+        } else {
+            None
+        };
+        let result = if publish_pending {
+            self.inner.sync(cx)
+        } else {
+            self.inner.wal.sync(cx, SyncFlags::NORMAL)
+        };
+        // Publication can fail after fsync. That does not undo the durable
+        // bytes, so submit their descriptor even when publication must retry.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(range) = range
+            && self.inner.wal.last_fsynced_frame_count() >= range.end_frame_no as usize
+        {
+            let boundary = (range.header, range.end_frame_no, range.end_checksum);
+            let submitted = permit.is_none_or(|permit| permit.submit(range));
+            if submitted {
+                self.fec_admitted = Some(boundary);
+            }
+        }
+        result
     }
 
     /// Swap in a replacement WAL, discarding the previous adapter.
@@ -4384,7 +4458,7 @@ where
                     });
                 }
                 if sync {
-                    self.inner.wal.sync(cx, SyncFlags::NORMAL)?;
+                    self.sync_with_fec(cx, false)?;
                     self.vfs.sync_parent_directory(cx, &self.wal_path)?;
                 }
                 return Ok(ParallelWalCommitReconciliation::Authorized);
@@ -4411,7 +4485,7 @@ where
                 .await?;
             self.inner.wal.repair_uncommitted_tail(cx)?;
             if sync {
-                self.inner.wal.sync(cx, SyncFlags::NORMAL)?;
+                self.sync_with_fec(cx, false)?;
                 self.vfs.sync_parent_directory(cx, &self.wal_path)?;
             }
             Ok(ParallelWalCommitReconciliation::NotCommitted)
@@ -4557,7 +4631,50 @@ where
         if let Some(binding) = &self.namespace_binding {
             binding.validate_path_identity()?;
         }
-        self.inner.sync(cx)
+        self.sync_with_fec(cx, true)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn set_wal_fec_producer(
+        &mut self,
+        cx: &Cx,
+        producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
+    ) -> Result<()> {
+        self.fec_producer = producer;
+        if let Some(producer) = &self.fec_producer {
+            let header = WalHeader::from_bytes(&self.inner.wal.header().to_bytes()?)?;
+            if self.fec_inspected_generation != Some(header)
+                && producer.try_reserve()?.submit(fsqlite_wal::wal_fec::WalFecCommittedRange {
+                    wal_path: self.wal_path.clone(), header,
+                    start_frame_no: 1, end_frame_no: 0,
+                    previous_checksum: header.checksum, end_checksum: header.checksum,
+                    repair_symbols: 0,
+                })
+            {
+                self.fec_inspected_generation = Some(header);
+            }
+        }
+        // Opening validated the checksum chain, but another live connection's
+        // NORMAL-sync commits may still be in the OS cache. Establish a real
+        // durability barrier before making that prefix repairable on catch-up.
+        if let Some(range) = self.pending_fec_range(cx)?
+            && self.inner.wal.last_fsynced_frame_count() >= range.end_frame_no as usize
+        {
+            let boundary = (range.header, range.end_frame_no, range.end_checksum);
+            let submitted = if range.repair_symbols == 0 {
+                true
+            } else if let Some(producer) = &self.fec_producer {
+                let permit = producer.try_reserve()?;
+                self.inner.wal.sync(cx, SyncFlags::NORMAL)?;
+                permit.submit(range)
+            } else {
+                false
+            };
+            if submitted {
+                self.fec_admitted = Some(boundary);
+            }
+        }
+        Ok(())
     }
 
     fn frame_count(&self) -> usize {
@@ -8163,6 +8280,61 @@ mod tests {
             adapter.pending_publication_frames.is_empty(),
             "a published batch must drain its staged frames"
         );
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn wal_fec_failed_sync_and_full_queue_do_not_admit_or_publish() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1).build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let wal = make_fault_adapter(&vfs, &cx).wal;
+            let mut backend = PathRefreshingWalBackend::new(
+                vfs.clone(), "test.db", "test.db-wal", PAGE_SIZE, wal, true,
+                #[cfg(any(unix, windows))]
+                None,
+            );
+            let (p1, p2) = commit_batch_pages();
+            backend.inner.append_frame(&cx, 1, &p1, 0).await.unwrap();
+            backend.inner.append_frame(&cx, 2, &p2, 2).await.unwrap();
+            let mut pipeline = fsqlite_wal::WalFecRepairPipeline::start(
+                &handle, &cx, fsqlite_wal::WalFecRepairPipelineConfig {
+                    queue_capacity: 1, per_symbol_delay: std::time::Duration::ZERO,
+                },
+            ).unwrap();
+            let producer = pipeline.producer().unwrap();
+            backend.fec_producer = Some(producer.clone());
+
+            vfs.fail_next_wal_sync();
+            let error = backend.sync(&cx).expect_err("injected fsync failure");
+            assert!(error.to_string().contains("injected WAL sync failure"));
+            assert_eq!(pipeline.stats().pending_jobs, 0);
+            assert!(backend.fec_admitted.is_none());
+            assert_publication_unchanged(&backend.inner, "failed WAL-FEC sync");
+
+            let occupied = producer.try_reserve().unwrap();
+            let _ = vfs.take_sync_observations();
+            assert!(matches!(backend.sync(&cx), Err(FrankenError::Busy)));
+            assert!(vfs.take_sync_observations().is_empty(), "backpressure must precede fsync");
+            assert_eq!(pipeline.stats().pending_jobs, 0);
+            assert_publication_unchanged(&backend.inner, "full WAL-FEC queue");
+            drop(occupied);
+
+            backend.sync(&cx).expect("retry after capacity and durability recover");
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2);
+            assert_eq!(backend.fec_admitted.unwrap().1, 2);
+            assert_eq!(pipeline.stats().pending_jobs, 1);
+            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
+            // This is a VFS fault test, not OS-sidecar coverage. Cancel before
+            // yielding to the worker; the SQL integration suite covers its I/O.
+            pipeline.cancel();
+            let stats = pipeline.shutdown(&cx).await.unwrap();
+            assert_eq!(stats.completed_jobs, 0);
+            assert_eq!(stats.canceled_jobs, 1);
+        });
     }
 
     #[test]

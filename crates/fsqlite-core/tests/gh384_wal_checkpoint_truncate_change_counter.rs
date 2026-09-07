@@ -42,6 +42,10 @@ fn truncate_checkpoint_reclaims_persisted_fec_and_retries_sidecar_contention() {
             let dir = tempfile::tempdir().expect("tempdir");
             let db = dir.path().join("fec.db");
             let conn = open(db.to_str().unwrap()).await;
+            // This keeper installs its own group to isolate checkpoint GC.
+            // Live background generation is covered by wal_fec_commit_pipeline.
+            conn.execute("PRAGMA raptorq_repair_symbols = 0;").await.unwrap();
+            conn.query("PRAGMA wal_checkpoint(TRUNCATE);").await.unwrap();
             conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
             conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
             let wal_path = dir.path().join("fec.db-wal");
