@@ -1396,6 +1396,9 @@ struct PlannedCleanupEntry {
 }
 
 trait PrivateDatabaseCleanupHooks {
+    #[cfg(test)]
+    fn after_namespace_locks(&mut self, _gate: &File, _use_file: &File) {}
+
     fn before_remove(&mut self, _ordinal: usize, _path: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -1700,6 +1703,9 @@ fn cleanup_abandoned_private_database_with_hooks(
         }
         Err(FileLockError::Io(error)) => return Err(error.into()),
     }
+
+    #[cfg(test)]
+    hooks.after_namespace_locks(&gate, &use_file);
 
     if read_identity_record(&mut use_file, database_path)? != expected_identity {
         return Ok(PrivateDatabaseCleanupOutcome::NotOwned);
@@ -5112,6 +5118,77 @@ mod tests {
             PrivateDatabaseCleanupEntryState::OperationUnknown
         );
         assert!(!paths[ordinal].exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_releases_locks_while_duplicated_descriptors_remain_open() {
+        struct DuplicateCleanupLocks {
+            descriptors: Option<(File, File)>,
+        }
+
+        impl PrivateDatabaseCleanupHooks for DuplicateCleanupLocks {
+            fn after_namespace_locks(&mut self, gate: &File, use_file: &File) {
+                // dup and fork share the same open file description and flock.
+                // Keep real duplicates alive across the cleanup return without
+                // forking a multithreaded test process or relying on a race.
+                self.descriptors = Some((
+                    gate.try_clone().expect("duplicate acquired gate"),
+                    use_file.try_clone().expect("duplicate acquired use lock"),
+                ));
+            }
+
+            fn before_remove(&mut self, ordinal: usize, _path: &Path) -> io::Result<()> {
+                if ordinal == 1 {
+                    return Err(io::Error::other("interrupt after first companion removal"));
+                }
+                Ok(())
+            }
+        }
+
+        let directory = tempdir().expect("cleanup descriptor directory");
+        let database = directory.path().join("duplicated-cleanup.db");
+        let (identity, paths) = seed_cleanup_fixture(&database, None);
+        let main_guard = File::open(&database).expect("retain main ownership descriptor");
+        assert_eq!(
+            FileIdentity::from_file(&main_guard).unwrap(),
+            Some(identity)
+        );
+        let mut hooks = DuplicateCleanupLocks { descriptors: None };
+        let first = cleanup_abandoned_private_database_with_hooks(&database, identity, &mut hooks)
+            .expect("interrupted cleanup receipt");
+        let (cause, entries, durability) = unwrap_partial_cleanup(first);
+        assert_eq!(
+            cause.stage,
+            PrivateDatabaseCleanupFailureStage::BeforeRemoval
+        );
+        assert_eq!(cause.path.as_deref(), Some(paths[1].as_path()));
+        assert_eq!(
+            entries[0].state,
+            PrivateDatabaseCleanupEntryState::RemovedOwned
+        );
+        assert_eq!(durability, PrivateDatabaseCleanupDurability::Unknown);
+        let (gate_copy, use_copy) = hooks.descriptors.as_ref().expect("real locks duplicated");
+        for (suffix, held_copy) in [(GATE_SUFFIX, gate_copy), (USE_SUFFIX, use_copy)] {
+            let probe = File::open(sidecar_path(&database, suffix)).expect("open fresh lock probe");
+            assert_eq!(
+                FileIdentity::from_file(&probe).unwrap(),
+                FileIdentity::from_file(held_copy).unwrap(),
+                "probe must address the same retained lock file"
+            );
+            let result = AdvisoryFileLock::try_lock(&probe, FileLockMode::Exclusive);
+            assert!(
+                result.is_ok(),
+                "cleanup returned while its duplicated namespace descriptor retained an exclusive lock: {suffix}: {result:?}"
+            );
+            AdvisoryFileLock::unlock(&probe).expect("release independent probe");
+        }
+        let retry = cleanup_abandoned_private_database(&database, identity)
+            .expect("fresh ownership proof retry with duplicates still live");
+        assert!(retry.is_complete(), "fresh retry must complete: {retry:?}");
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(gate_copy.metadata().is_ok());
+        assert!(use_copy.metadata().is_ok());
     }
 
     #[test]
