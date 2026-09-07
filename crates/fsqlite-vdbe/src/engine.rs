@@ -32640,6 +32640,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_cancelled_pager_read_cannot_admit_an_empty_memory_fallback() {
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_vfs::UnixVfs;
+
+        let directory = tempfile::tempdir().expect("real pager directory");
+        let path = directory.path().join("cancelled-cursor.db");
+        let setup_cx = Cx::new();
+        let root = {
+            let pager = run_async(SimplePager::open_with_cx(
+                &setup_cx,
+                UnixVfs::new(),
+                &path,
+                PageSize::MIN,
+            ))
+            .expect("create real pager");
+            let mut seed = run_async(pager.begin(&setup_cx, TransactionMode::Immediate))
+                .expect("begin seed");
+            let root = run_async(seed.allocate_page(&setup_cx)).expect("allocate root");
+            let mut page = vec![0_u8; PageSize::MIN.as_usize()];
+            page[0] = BtreePageType::LeafTable as u8;
+            page[5..7].copy_from_slice(&512_u16.to_be_bytes());
+            run_async(seed.write_page(&setup_cx, root, &page)).expect("write empty leaf");
+            run_async(seed.commit(&setup_cx)).expect("persist seed");
+            root
+        };
+        let pager = run_async(SimplePager::open_with_cx(
+            &setup_cx,
+            UnixVfs::new(),
+            &path,
+            PageSize::MIN,
+        ))
+        .expect("reopen real pager");
+        pager.set_cache_page_budget(0).expect("uncached read");
+        let txn = run_async(pager.begin(&setup_cx, TransactionMode::ReadOnly))
+            .expect("begin read");
+        let cancelled = Cx::new();
+        cancelled.transition_to_running();
+        cancelled.cancel();
+        assert!(
+            matches!(run_async(txn.get_page(&cancelled, root)), Err(FrankenError::Abort)),
+            "the real uncached pager read must report cancellation before testing fallback"
+        );
+
+        let root = i32::try_from(root.get()).expect("small root");
+        let mut db = MemDatabase::new();
+        db.create_table_at(root, 1);
+        let mut engine = VdbeEngine::new_with_execution_cx(8, &cancelled, PageSize::MIN);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.set_reject_mem_fallback(false);
+        let opened = run_async(engine.open_storage_cursor(0, root, false));
+        assert!(
+            !opened,
+            "an actual pager Abort must not authorize an empty MemPageStore cursor"
+        );
+        assert!(!engine.storage_cursors.contains_key(&0));
+    }
+
+    #[test]
     fn test_open_storage_cursor_falls_back_to_mem_without_txn() {
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
