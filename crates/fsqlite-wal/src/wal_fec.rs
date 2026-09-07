@@ -1029,14 +1029,12 @@ fn compute_health_score(state: &WalFecRepairTelemetryState) -> u32 {
 }
 
 fn build_repair_event(log: &WalFecRecoveryLog, latency: Duration) -> Option<WalFecRepairEvent> {
+    if !repair_attempt_for_log(log) {
+        return None;
+    }
     let symbols_lost = log
         .required_symbols
         .saturating_sub(log.validated_source_symbols);
-    let repair_activated =
-        symbols_lost > 0 || log.decode_attempted || log.fallback_reason.is_some();
-    if !repair_activated {
-        return None;
-    }
 
     let symbols_used = log.available_symbols.min(log.required_symbols);
     let repair_budget = log.validated_repair_symbols.max(1);
@@ -2273,18 +2271,110 @@ pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
     Ok(header.raptorq_repair_symbols)
 }
 
+/// Coordinate sidecar mutations across processes without waiting for a lock.
+///
+/// The companion inode stays stable while header migration replaces the
+/// sidecar. Acquire this guard BEFORE opening that replaceable file, and never
+/// unlink the companion during checkpoint/reset. The guard covers FEC metadata
+/// and symbol persistence only; it must never guard primary WAL commits.
+fn try_lock_wal_fec_sidecar(sidecar_path: &Path) -> Result<fs::File> {
+    let mut lock_path = sidecar_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(Path::new(&lock_path))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(FrankenError::Busy),
+        Err(fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+fn create_wal_fec_temporary(sidecar_path: &Path) -> Result<(PathBuf, fs::File)> {
+    static NEXT_TEMPORARY_ID: AtomicUsize = AtomicUsize::new(0);
+    for _ in 0..16 {
+        let mut temp_path = sidecar_path.as_os_str().to_os_string();
+        temp_path.push(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            NEXT_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp_path = PathBuf::from(temp_path);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique wal-fec temporary file",
+    )
+    .into())
+}
+
+fn sync_wal_fec_parent(sidecar_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = sidecar_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = sidecar_path;
+    Ok(())
+}
+
+/// Caller must hold the stable sidecar mutation guard through replacement.
+fn replace_wal_fec_sidecar(
+    sidecar_path: &Path,
+    permissions: fs::Permissions,
+    write: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> Result<()>,
+) -> Result<()> {
+    let (temp_path, temp_file) = create_wal_fec_temporary(sidecar_path)?;
+    let result = (|| -> Result<()> {
+        let mut temp_file = std::io::BufWriter::new(temp_file);
+        write(&mut temp_file)?;
+        let inner = temp_file.into_inner().map_err(|err| err.into_error())?;
+        inner.set_permissions(permissions)?;
+        inner.sync_all()?;
+        drop(inner);
+        fs::rename(&temp_path, sidecar_path)?;
+        sync_wal_fec_parent(sidecar_path)
+    })();
+    if let Err(err) = &result {
+        warn!(temporary = %temp_path.display(), error = %err,
+            "wal-fec replacement failed; any temporary bytes are retained");
+    }
+    result
+}
+
 /// Persist `PRAGMA raptorq_repair_symbols` in a checksummed `.wal-fec` header.
 ///
 /// Existing sidecar group data is preserved exactly after the header region.
+/// Returns [`FrankenError::Busy`] if another sidecar mutation is in progress.
 pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) -> Result<()> {
     use std::io::{Seek, SeekFrom};
 
+    if let Some(parent) = sidecar_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let _sidecar_guard = try_lock_wal_fec_sidecar(sidecar_path)?;
     if !sidecar_path.exists() {
-        if let Some(parent) = sidecar_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
         let header = WalFecPragmaHeader::new(value);
         // Use create_new (O_EXCL) to atomically create the file, avoiding a
         // TOCTOU race where another process could create the sidecar between
@@ -2297,6 +2387,7 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
             Ok(mut file) => {
                 file.write_all(&header.to_bytes())?;
                 file.sync_all()?;
+                sync_wal_fec_parent(sidecar_path)?;
                 info!(
                     sidecar = %sidecar_path.display(),
                     raptorq_repair_symbols = value,
@@ -2325,22 +2416,12 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
         file.write_all(&header.to_bytes())?;
         file.sync_all()?;
     } else {
-        // Rewrite the file with the header prepended using a buffered stream to avoid OOM.
-        // Wrap in a closure so the temp file is cleaned up on any I/O error.
-        let temp_path = sidecar_path.with_extension("wal-fec.tmp");
-        let result = (|| -> Result<()> {
-            let mut temp_file = std::io::BufWriter::new(fs::File::create(&temp_path)?);
-            temp_file.write_all(&header.to_bytes())?;
-            std::io::copy(&mut file, &mut temp_file)?;
-            let inner = temp_file.into_inner().map_err(|e| e.into_error())?;
-            inner.sync_all()?;
-            fs::rename(&temp_path, sidecar_path)?;
+        let permissions = file.metadata()?.permissions();
+        replace_wal_fec_sidecar(sidecar_path, permissions, move |output| {
+            output.write_all(&header.to_bytes())?;
+            std::io::copy(&mut file, output)?;
             Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result?;
+        })?;
     }
 
     info!(
@@ -2366,8 +2447,10 @@ pub fn ensure_wal_with_fec_sidecar(wal_path: &Path) -> Result<PathBuf> {
 }
 
 /// Append a complete group (meta + repair symbols) to a sidecar file.
+///
+/// Returns [`FrankenError::Busy`] if another sidecar mutation is in progress.
 pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> Result<()> {
-    group.validate_layout()?;
+    let record = encode_wal_fec_group(group)?;
     let group_id = group.meta.group_id();
     debug!(
         group_id = %group_id,
@@ -2382,13 +2465,9 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
     // multi-write append left a half-written group in the sidecar; a later
     // successful append then framed AFTER it, so scan misread the partial group's
     // tail as the next group's metadata and poisoned every following group. A
-    // single buffered append lands the whole group, or on a torn write leaves a
-    // truncated tail that scan already tolerates.
-    let mut record = Vec::new();
-    push_length_prefixed(&mut record, &group.meta.to_record_bytes(), "group metadata")?;
-    for symbol in &group.repair_symbols {
-        push_length_prefixed(&mut record, &symbol.to_bytes(), "repair symbol")?;
-    }
+    // single buffered append reduces partial-record boundaries. It is not an
+    // atomic-write guarantee: an I/O failure can still leave a truncated tail.
+    let _sidecar_guard = try_lock_wal_fec_sidecar(sidecar_path)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -2404,6 +2483,63 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
     Ok(())
 }
 
+fn encode_wal_fec_group(group: &WalFecGroupRecord) -> Result<Vec<u8>> {
+    group.validate_layout()?;
+    let mut record = Vec::new();
+    push_length_prefixed(&mut record, &group.meta.to_record_bytes(), "group metadata")?;
+    for symbol in &group.repair_symbols {
+        push_length_prefixed(&mut record, &symbol.to_bytes(), "repair symbol")?;
+    }
+    Ok(record)
+}
+
+/// Reclaim groups durably backfilled from the specified WAL generation.
+///
+/// Other generations and groups extending beyond `backfilled_through` are
+/// preserved. A reset caller can pass `u32::MAX` for its retired generation.
+/// Returns the number of reclaimed groups. A missing sidecar is a no-op;
+/// contention or corruption refuses the rewrite without discarding any bytes.
+/// The caller remains responsible for excluding late jobs for retired WALs.
+pub fn reclaim_wal_fec_groups(
+    sidecar_path: &Path,
+    checkpoint_salts: WalSalts,
+    backfilled_through: u32,
+) -> Result<usize> {
+    match fs::metadata(sidecar_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    }
+    let _sidecar_guard = try_lock_wal_fec_sidecar(sidecar_path)?;
+    let bytes = fs::read(sidecar_path)?;
+    let header_len = scan_offset_after_optional_pragma_header(&bytes)?;
+    let mut scan = scan_wal_fec_bytes(sidecar_path, &bytes)?;
+    if scan.truncated_tail {
+        return Err(FrankenError::WalCorrupt {
+            detail: "refusing to reclaim a wal-fec sidecar with an unvalidated tail".to_owned(),
+        });
+    }
+    let before = scan.groups.len();
+    scan.groups.retain(|group| {
+        group.meta.wal_salt1 != checkpoint_salts.salt1
+            || group.meta.wal_salt2 != checkpoint_salts.salt2
+            || group.meta.end_frame_no > backfilled_through
+    });
+    let reclaimed = before - scan.groups.len();
+    if reclaimed == 0 {
+        return Ok(0);
+    }
+    let permissions = fs::metadata(sidecar_path)?.permissions();
+    replace_wal_fec_sidecar(sidecar_path, permissions, |output| {
+        output.write_all(&bytes[..header_len])?;
+        for group in &scan.groups {
+            output.write_all(&encode_wal_fec_group(group)?)?;
+        }
+        Ok(())
+    })?;
+    Ok(reclaimed)
+}
+
 /// Scan a sidecar file and parse all fully-written groups.
 ///
 /// On truncated tail (e.g. crash during append), returns `truncated_tail=true`
@@ -2413,12 +2549,16 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
         return Ok(WalFecScanResult::default());
     }
     let bytes = fs::read(sidecar_path)?;
-    let mut cursor = scan_offset_after_optional_pragma_header(&bytes)?;
+    scan_wal_fec_bytes(sidecar_path, &bytes)
+}
+
+fn scan_wal_fec_bytes(sidecar_path: &Path, bytes: &[u8]) -> Result<WalFecScanResult> {
+    let mut cursor = scan_offset_after_optional_pragma_header(bytes)?;
     let mut groups = Vec::new();
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
-        let Some(meta_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
+        let Some(meta_bytes) = read_length_prefixed(bytes, &mut cursor)? else {
             truncated_tail = true;
             warn!(
                 sidecar = %sidecar_path.display(),
@@ -2467,7 +2607,7 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
         let mut repair_symbols = Vec::with_capacity(r_repair_usize);
 
         for _ in 0..meta.r_repair {
-            let Some(symbol_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
+            let Some(symbol_bytes) = read_length_prefixed(bytes, &mut cursor)? else {
                 truncated_tail = true;
                 warn!(
                     sidecar = %sidecar_path.display(),
@@ -2707,7 +2847,6 @@ where
             decode_succeeded: false,
         };
         record_raptorq_recovery_log(&log, Duration::ZERO);
-        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_repair(false, 0);
         return Ok((outcome, log));
     }
 
@@ -2755,8 +2894,10 @@ where
         }
     };
     record_raptorq_recovery_log_with_witness(&log, content_witness, elapsed);
-    crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
-        .record_repair(log.outcome_is_recovered, duration_us);
+    if repair_attempt {
+        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
+            .record_repair(log.outcome_is_recovered, duration_us);
+    }
     Ok((outcome, log))
 }
 
@@ -3615,6 +3756,45 @@ mod tests {
         assert_eq!(
             &rewritten[WAL_FEC_PRAGMA_HEADER_BYTES..],
             legacy_payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_wal_fec_migration_preserves_other_temporary_files() {
+        let dir = tempdir().expect("tempdir");
+        let collision = dir.path().join("db.wal-fec.tmp");
+        fs::write(&collision, b"another operation owns these bytes")
+            .expect("write unrelated temporary file");
+        for (name, payload) in [
+            ("db.one", b"first".as_slice()),
+            ("db.two", b"second".as_slice()),
+        ] {
+            let sidecar = dir.path().join(name);
+            fs::write(&sidecar, payload).expect("write legacy sidecar");
+            persist_wal_fec_raptorq_repair_symbols(&sidecar, 7).expect("migrate header");
+            let migrated = fs::read(&sidecar).expect("read migrated sidecar");
+            assert_eq!(&migrated[WAL_FEC_PRAGMA_HEADER_BYTES..], payload);
+            assert_eq!(
+                fs::read(&collision).expect("unrelated temporary file must remain"),
+                b"another operation owns these bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wal_fec_migration_preserves_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("private.wal-fec");
+        fs::write(&sidecar, b"private legacy data").expect("write legacy sidecar");
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))
+            .expect("make sidecar private");
+        persist_wal_fec_raptorq_repair_symbols(&sidecar, 7).expect("migrate header");
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

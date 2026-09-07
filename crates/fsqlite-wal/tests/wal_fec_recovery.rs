@@ -1002,6 +1002,8 @@ fn test_raptorq_decode_proof() {
 
 #[test]
 fn test_recovery_with_config_records_evidence_card() {
+    use fsqlite_wal::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS;
+
     reset_raptorq_repair_telemetry();
 
     let temp_dir = tempdir().expect("tempdir should be created");
@@ -1014,6 +1016,34 @@ fn test_recovery_with_config_records_evidence_card() {
     append_fixture(&sidecar_path, &fixture);
 
     let mut candidates = frame_candidates(&fixture);
+    let before = GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot();
+    for recovery_enabled in [true, false] {
+        let (outcome, log) = recover_wal_fec_group_with_config(
+            &sidecar_path,
+            fixture.meta.group_id(),
+            salts,
+            fixture.meta.start_frame_no,
+            &candidates,
+            &fsqlite_wal::WalFecRecoveryConfig { recovery_enabled },
+            |_, _| panic!("intact or disabled recovery must not invoke the decoder"),
+        )
+        .expect("intact or disabled recovery should run");
+        assert_eq!(
+            matches!(outcome, WalFecRecoveryOutcome::Recovered(_)),
+            recovery_enabled
+        );
+        assert!(!log.decode_attempted);
+        let after = GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot();
+        assert_eq!(after.repairs_total, before.repairs_total);
+        assert_eq!(after.repairs_succeeded, before.repairs_succeeded);
+        assert_eq!(after.repairs_failed, before.repairs_failed);
+        assert_eq!(
+            after.repair_duration_us_total,
+            before.repair_duration_us_total
+        );
+        assert!(raptorq_repair_evidence_snapshot(0).is_empty());
+    }
+
     let mismatch_frame = fixture.meta.start_frame_no + 2;
     corrupt_frame(&mut candidates, mismatch_frame);
 
@@ -1046,6 +1076,40 @@ fn test_recovery_with_config_records_evidence_card() {
     });
     assert_eq!(by_frame.len(), 1);
     assert_eq!(by_frame[0].chain_hash, card.chain_hash);
+
+    let after_repair = GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot();
+    assert_eq!(after_repair.repairs_total, before.repairs_total + 1);
+    assert_eq!(after_repair.repairs_succeeded, before.repairs_succeeded + 1);
+    assert_eq!(after_repair.repairs_failed, before.repairs_failed);
+
+    let (outcome, log) = recover_wal_fec_group_with_config(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        mismatch_frame,
+        &candidates,
+        &fsqlite_wal::WalFecRecoveryConfig::default(),
+        |_, _| {
+            Err(FrankenError::Internal(
+                "injected decoder failure".to_owned(),
+            ))
+        },
+    )
+    .expect("failed decode must produce a recovery decision");
+    assert!(matches!(
+        outcome,
+        WalFecRecoveryOutcome::TruncateBeforeGroup { .. }
+    ));
+    assert!(log.decode_attempted);
+    assert!(!log.decode_succeeded);
+    let after_failure = GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot();
+    assert_eq!(after_failure.repairs_total, before.repairs_total + 2);
+    assert_eq!(
+        after_failure.repairs_succeeded,
+        before.repairs_succeeded + 1
+    );
+    assert_eq!(after_failure.repairs_failed, before.repairs_failed + 1);
+    assert_eq!(raptorq_repair_evidence_snapshot(0).len(), 2);
 }
 
 #[test]

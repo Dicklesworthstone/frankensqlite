@@ -4,7 +4,8 @@ use fsqlite_types::{ObjectId, Oti, SymbolRecord, SymbolRecordFlags};
 use fsqlite_wal::{
     WAL_FEC_GROUP_META_MAGIC, WAL_FEC_GROUP_META_VERSION, WalFecGroupId, WalFecGroupMeta,
     WalFecGroupMetaInit, WalFecGroupRecord, append_wal_fec_group, build_source_page_hashes,
-    ensure_wal_with_fec_sidecar, find_wal_fec_group, scan_wal_fec, wal_fec_path_for_wal,
+    ensure_wal_with_fec_sidecar, find_wal_fec_group, persist_wal_fec_raptorq_repair_symbols,
+    read_wal_fec_raptorq_repair_symbols, scan_wal_fec, wal_fec_path_for_wal,
 };
 use tempfile::tempdir;
 
@@ -88,6 +89,191 @@ fn sample_repair_symbols(meta: &WalFecGroupMeta) -> Vec<SymbolRecord> {
             )
         })
         .collect()
+}
+
+fn run_sidecar_mutation_child(sidecar: &std::path::Path, phase: &str) {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "test_sidecar_migration_excludes_cross_process_mutations",
+            "--nocapture",
+        ])
+        .env("FSQLITE_FEC_MUTATION_CHILD_PATH", sidecar)
+        .env("FSQLITE_FEC_MUTATION_CHILD_PHASE", phase)
+        .spawn()
+        .expect("spawn sidecar mutation child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll sidecar mutation child") {
+            assert!(status.success(), "sidecar child {phase}: {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("stop child after timeout");
+            child.wait().expect("reap timed-out child");
+            panic!("sidecar child {phase} blocked instead of returning");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn test_sidecar_migration_excludes_cross_process_mutations() {
+    let spec = SampleMetaSpec {
+        start_frame_no: 1,
+        k_source: 3,
+        r_repair: 2,
+        wal_salt1: 11,
+        wal_salt2: 22,
+        object_tag: b"cross-process-prefix",
+        seed_base: 5,
+        db_size_pages: 128,
+    };
+    let tail_meta = sample_meta(SampleMetaSpec {
+        start_frame_no: 4,
+        object_tag: b"cross-process-tail",
+        ..spec
+    });
+    let tail = WalFecGroupRecord::new(tail_meta.clone(), sample_repair_symbols(&tail_meta))
+        .expect("valid tail group");
+    if let Some(path) = std::env::var_os("FSQLITE_FEC_MUTATION_CHILD_PATH") {
+        let path = std::path::Path::new(&path);
+        match std::env::var("FSQLITE_FEC_MUTATION_CHILD_PHASE")
+            .unwrap()
+            .as_str()
+        {
+            "busy" => {
+                let before = fs::read(path).expect("read original bytes");
+                assert!(matches!(
+                    append_wal_fec_group(path, &tail),
+                    Err(fsqlite_error::FrankenError::Busy)
+                ));
+                assert!(matches!(
+                    persist_wal_fec_raptorq_repair_symbols(path, 9),
+                    Err(fsqlite_error::FrankenError::Busy)
+                ));
+                assert_eq!(fs::read(path).expect("read after refusal"), before);
+            }
+            "migrate_then_append" => {
+                persist_wal_fec_raptorq_repair_symbols(path, 9).expect("migrate legacy header");
+                append_wal_fec_group(path, &tail).expect("append after migration");
+            }
+            phase => panic!("unexpected sidecar child phase: {phase}"),
+        }
+        return;
+    }
+
+    let dir = tempdir().expect("tempdir");
+    let sidecar = dir.path().join("db.wal-fec");
+    let prefix_meta = sample_meta(spec);
+    let prefix = WalFecGroupRecord::new(prefix_meta.clone(), sample_repair_symbols(&prefix_meta))
+        .expect("valid prefix group");
+    append_wal_fec_group(&sidecar, &prefix).expect("append legacy prefix");
+    let lock_path = dir.path().join("db.wal-fec.lock");
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open persistent sidecar coordination file");
+    guard.try_lock().expect("hold sidecar mutation guard");
+    run_sidecar_mutation_child(&sidecar, "busy");
+    drop(guard);
+    run_sidecar_mutation_child(&sidecar, "migrate_then_append");
+    let scan = scan_wal_fec(&sidecar).expect("scan migrated sidecar");
+    assert!(!scan.truncated_tail);
+    assert_eq!(scan.groups, vec![prefix, tail]);
+    assert_eq!(read_wal_fec_raptorq_repair_symbols(&sidecar).unwrap(), 9);
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    guard.try_lock().expect("child must release its guard");
+}
+
+#[test]
+fn test_reclaim_sidecar_groups_preserves_uncheckpointed_generations() {
+    use fsqlite_wal::WalSalts;
+    use fsqlite_wal::wal_fec::reclaim_wal_fec_groups;
+
+    let dir = tempdir().expect("tempdir");
+    let sidecar = dir.path().join("gc.wal-fec");
+    let salts = WalSalts {
+        salt1: 11,
+        salt2: 22,
+    };
+    assert_eq!(
+        reclaim_wal_fec_groups(&sidecar, salts, u32::MAX).unwrap(),
+        0
+    );
+    assert!(!sidecar.exists());
+    let spec = SampleMetaSpec {
+        start_frame_no: 1,
+        k_source: 3,
+        r_repair: 2,
+        wal_salt1: salts.salt1,
+        wal_salt2: salts.salt2,
+        object_tag: b"gc-prefix",
+        seed_base: 5,
+        db_size_pages: 128,
+    };
+    let mut groups = Vec::new();
+    for meta in [
+        sample_meta(spec),
+        sample_meta(SampleMetaSpec {
+            start_frame_no: 4,
+            object_tag: b"gc-tail",
+            ..spec
+        }),
+        sample_meta(SampleMetaSpec {
+            wal_salt1: 33,
+            object_tag: b"gc-next-generation",
+            ..spec
+        }),
+    ] {
+        groups.push(WalFecGroupRecord::new(meta.clone(), sample_repair_symbols(&meta)).unwrap());
+    }
+    persist_wal_fec_raptorq_repair_symbols(&sidecar, 17).unwrap();
+    for group in &groups {
+        append_wal_fec_group(&sidecar, group).unwrap();
+    }
+    let before = fs::read(&sidecar).unwrap();
+    assert_eq!(reclaim_wal_fec_groups(&sidecar, salts, 2).unwrap(), 0);
+    assert_eq!(fs::read(&sidecar).unwrap(), before);
+    assert_eq!(reclaim_wal_fec_groups(&sidecar, salts, 3).unwrap(), 1);
+    assert_eq!(scan_wal_fec(&sidecar).unwrap().groups, groups[1..]);
+    assert!(fs::metadata(&sidecar).unwrap().len() < u64::try_from(before.len()).unwrap());
+    assert_eq!(
+        reclaim_wal_fec_groups(&sidecar, salts, u32::MAX).unwrap(),
+        1
+    );
+    assert_eq!(scan_wal_fec(&sidecar).unwrap().groups, groups[2..]);
+    assert_eq!(read_wal_fec_raptorq_repair_symbols(&sidecar).unwrap(), 17);
+
+    let remaining = fs::read(&sidecar).unwrap();
+    let mut corrupt = remaining.clone();
+    corrupt.extend_from_slice(&[0xff, 0xff]);
+    fs::write(&sidecar, &corrupt).unwrap();
+    let error = reclaim_wal_fec_groups(
+        &sidecar,
+        WalSalts {
+            salt1: 33,
+            salt2: 22,
+        },
+        u32::MAX,
+    )
+    .expect_err("corrupt-tail reclamation must be refused");
+    assert!(
+        error.to_string().contains("unvalidated tail"),
+        "wrong refusal: {error}"
+    );
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        corrupt,
+        "refused GC must preserve all bytes"
+    );
 }
 
 #[test]

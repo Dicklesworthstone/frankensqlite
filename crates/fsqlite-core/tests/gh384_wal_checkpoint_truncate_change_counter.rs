@@ -27,6 +27,90 @@ const BULK_ROWS: usize = 200;
 const AFTER_TXNS: usize = 2;
 const AFTER_ROWS: usize = 50;
 
+#[test]
+fn truncate_checkpoint_reclaims_persisted_fec_and_retries_sidecar_contention() {
+    use fsqlite_types::{ObjectId, Oti};
+    use fsqlite_wal::{
+        WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord, WalHeader,
+        append_wal_fec_group, build_source_page_hashes, generate_wal_fec_repair_symbols,
+        persist_wal_fec_raptorq_repair_symbols, read_wal_fec_raptorq_repair_symbols,
+        scan_wal_fec, wal_fec_path_for_wal,
+    };
+
+    asupersync::test_utils::run_test(|| async {
+        for contend in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("fec.db");
+            let conn = open(db.to_str().unwrap()).await;
+            conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            let wal_path = dir.path().join("fec.db-wal");
+            let wal_bytes = std::fs::read(&wal_path).expect("read actual committed WAL");
+            let header = WalHeader::from_bytes(&wal_bytes).expect("parse actual WAL header");
+            let page_size = usize::try_from(header.page_size).unwrap();
+            let frame_size = 24 + page_size;
+            let frame_count = (wal_bytes.len() - 32) / frame_size;
+            assert!(frame_count > 0);
+            let offset = 32 + (frame_count - 1) * frame_size;
+            let page_no = u32::from_be_bytes(wal_bytes[offset..offset + 4].try_into().unwrap());
+            let db_size_pages = u32::from_be_bytes(wal_bytes[offset + 4..offset + 8].try_into().unwrap());
+            assert!(db_size_pages > 0, "last WAL frame must be a commit marker");
+            let pages = vec![wal_bytes[offset + 24..offset + frame_size].to_vec()];
+            let frame_no = u32::try_from(frame_count).unwrap();
+            let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
+                wal_salt1: header.salts.salt1,
+                wal_salt2: header.salts.salt2,
+                start_frame_no: frame_no,
+                end_frame_no: frame_no,
+                db_size_pages,
+                page_size: header.page_size,
+                k_source: 1,
+                r_repair: 2,
+                oti: Oti { f: u64::from(header.page_size), al: 1, t: header.page_size, z: 1, n: 1 },
+                object_id: ObjectId::derive_from_canonical_bytes(&pages[0]),
+                page_numbers: vec![page_no],
+                source_page_xxh3_128: build_source_page_hashes(&pages),
+            }).expect("metadata from committed WAL bytes");
+            let symbols = generate_wal_fec_repair_symbols(&meta, &pages).expect("encode actual WAL page");
+            let group = WalFecGroupRecord::new(meta, symbols).unwrap();
+            let sidecar = wal_fec_path_for_wal(&wal_path);
+            persist_wal_fec_raptorq_repair_symbols(&sidecar, 17).unwrap();
+            append_wal_fec_group(&sidecar, &group).unwrap();
+            let before = std::fs::read(&sidecar).unwrap();
+            assert_eq!(scan_wal_fec(&sidecar).unwrap().groups, vec![group]);
+
+            let mut lock_path = sidecar.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            let guard = if contend {
+                let file = std::fs::OpenOptions::new().read(true).write(true)
+                    .open(std::path::Path::new(&lock_path)).unwrap();
+                file.try_lock().expect("hold sidecar guard across checkpoint");
+                Some(file)
+            } else {
+                None
+            };
+            let status = conn.query("PRAGMA wal_checkpoint(TRUNCATE);").await.unwrap();
+            assert_eq!(status[0].values()[0], SqliteValue::Integer(0), "sidecar contention must not block the database checkpoint");
+            assert!(std::fs::metadata(&wal_path).unwrap().len() <= 32);
+            assert_eq!(count_rows(&conn).await, 1);
+            if contend {
+                assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+                drop(guard);
+                conn.query("PRAGMA wal_checkpoint(PASSIVE);").await.expect("retry deferred sidecar cleanup");
+            }
+            let scan = scan_wal_fec(&sidecar).unwrap();
+            assert!(!scan.truncated_tail);
+            assert!(scan.groups.is_empty(), "retired generation must be reclaimed");
+            assert_eq!(read_wal_fec_raptorq_repair_symbols(&sidecar).unwrap(), 17);
+            assert!(std::fs::metadata(&sidecar).unwrap().len() < u64::try_from(before.len()).unwrap());
+            assert!(std::path::Path::new(&lock_path).exists(), "coordination inode must survive reclamation");
+            conn.execute("INSERT INTO t VALUES (2);").await.expect("write after FEC reclamation");
+            assert_eq!(count_rows(&conn).await, 2);
+            conn.close_without_checkpoint().await.unwrap();
+        }
+    });
+}
+
 async fn open(path: &str) -> Connection {
     let conn = Connection::open(path).await.expect("open connection");
     conn.query("PRAGMA journal_mode = WAL;")

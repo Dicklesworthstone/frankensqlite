@@ -287,6 +287,10 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Accumulated FEC commit results (for later sidecar persistence).
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_pending: Vec<FecCommitResult>,
+    /// Generation actually retired by the last successful checkpoint, captured
+    /// after refreshing the WAL rather than from a possibly stale caller view.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    checkpoint_retired_salts: Option<WalSalts>,
     /// Maximum number of unique pages the index will track. Defaults to a
     /// full authoritative index in steady state. Tests can lower the cap to
     /// exercise the partial-index fallback path explicitly.
@@ -336,6 +340,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_hook: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_pending: Vec::new(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            checkpoint_retired_salts: None,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
             checkpoint_backfill_watermark: None,
             appended_tail_index: None,
@@ -360,6 +366,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             pending_publication_generation: None,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
+            checkpoint_retired_salts: None,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
             checkpoint_backfill_watermark: None,
             appended_tail_index: None,
@@ -2183,6 +2190,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                         .to_owned(),
                 });
             }
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            {
+                self.checkpoint_retired_salts = None;
+            }
             // Refresh so planner state reflects the latest on-disk WAL shape.
             self.wal.refresh(cx).await?;
             self.refresh_before_append = true;
@@ -2236,6 +2247,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             // and invalidate the page index (salts changed).
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if result.wal_was_reset {
+                self.checkpoint_retired_salts = Some(generation.salts);
                 self.fec_discard();
             }
             if result.wal_was_reset {
@@ -2560,6 +2572,11 @@ where
     /// [`Self::conflicts_after_generation_change`] rather than a fresh per-call
     /// main-db open, which would release this process's fcntl locks (bd-qduu1).
     db_file_identity: Option<[u8; 16]>,
+    /// Retired generations whose sidecar cleanup must retry on a later
+    /// checkpoint after contention or I/O failure. This survives inner WAL
+    /// replacement; repair workers must separately reject late retired jobs.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    pending_fec_reclamation: Vec<WalSalts>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -2591,6 +2608,8 @@ where
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
             db_file_identity: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            pending_fec_reclamation: Vec::new(),
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -4572,10 +4591,43 @@ where
                 self.persist_checkpoint_certificate_handoff(cx, record)
                     .await?;
             }
-            let result = self
+            let checkpoint_result = self
                 .inner
                 .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
-                .await?;
+                .await;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            if let Some(salts) = self.inner.checkpoint_retired_salts
+                && !self.pending_fec_reclamation.contains(&salts)
+            {
+                self.pending_fec_reclamation.push(salts);
+            }
+            let result = checkpoint_result?;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            if !self.pending_fec_reclamation.is_empty() {
+                let sidecar_path = fsqlite_wal::wal_fec_path_for_wal(&self.wal_path);
+                // The reset is already durable. Retire only that generation:
+                // another writer may have appended repair groups for a newer
+                // WAL by the time this best-effort cleanup acquires its guard.
+                // Sidecar contention never waits or changes checkpoint success.
+                self.pending_fec_reclamation.retain(|salts| {
+                    match fsqlite_wal::wal_fec::reclaim_wal_fec_groups(
+                        &sidecar_path,
+                        *salts,
+                        u32::MAX,
+                    ) {
+                        Ok(reclaimed) => {
+                            debug!(reclaimed, sidecar = %sidecar_path.display(),
+                                "reclaimed persisted FEC groups after WAL reset");
+                            false
+                        }
+                        Err(err) => {
+                            warn!(sidecar = %sidecar_path.display(), error = %err,
+                                "WAL reset completed but FEC sidecar reclamation was deferred");
+                            true
+                        }
+                    }
+                });
+            }
             // bd-smxhz: the checkpoint reset the WAL generation and its
             // -wal-cert sidecar, so the cached certificate descriptor is stale;
             // drop it so the next read re-opens against the fresh generation.
