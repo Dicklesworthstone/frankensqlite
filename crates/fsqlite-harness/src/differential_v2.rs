@@ -806,6 +806,12 @@ pub trait SqlExecutor {
         None
     }
 
+    /// Actual concurrent commit evidence, when this backend exposes it.
+    /// Snapshot reads must not execute statements or change capture policy.
+    fn commit_execution_snapshot(&self) -> Option<fsqlite::CommitExecutionSnapshot> {
+        None
+    }
+
     /// Best-effort classification of whether a statement produces result rows.
     ///
     /// Real executors should prefer prepared-statement metadata over keyword
@@ -1001,6 +1007,10 @@ impl SqlExecutor for FsqliteExecutor {
 
     fn fallback_execution_snapshot(&self) -> Option<fsqlite::FallbackExecutionSnapshot> {
         Some(self.conn.fallback_execution_snapshot())
+    }
+
+    fn commit_execution_snapshot(&self) -> Option<fsqlite::CommitExecutionSnapshot> {
+        Some(self.conn.commit_execution_snapshot())
     }
 }
 

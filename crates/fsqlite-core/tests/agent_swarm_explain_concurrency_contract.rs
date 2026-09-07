@@ -549,6 +549,171 @@ fn real_commit_metrics_count_public_durable_outcomes() -> TestResult {
 
 #[test]
 #[cfg(feature = "diagnostic-pragmas")]
+fn real_commit_events_identify_validation_publication_and_statement() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("private-commit-evidence.db");
+            let conn = Connection::open(path.to_str().unwrap()).await?;
+            assert!(conn.is_concurrent_mode_default());
+            conn.query("PRAGMA journal_mode=WAL;").await?;
+            conn.execute("CREATE TABLE private_rows(id INTEGER PRIMARY KEY, body TEXT);").await?;
+            conn.query("PRAGMA fsqlite.commit_reset;").await?;
+            let prepared_insert = conn.prepare("INSERT INTO private_rows VALUES(7,'private commit payload');").await?;
+            assert!(conn.query("PRAGMA fsqlite.commit_events;").await?.is_empty(), "preparation is not a commit");
+            conn.execute("BEGIN;").await?;
+            prepared_insert.execute().await?;
+            assert!(conn.query("PRAGMA fsqlite.commit_events;").await?.is_empty(), "a write inside an open transaction is not publication");
+            conn.execute("COMMIT;").await?;
+            let events = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+            assert_eq!(events.len(), 2, "actual default-concurrent write needs validation and publication evidence");
+            let allowed = &events[0];
+            let published = &events[1];
+            assert_eq!(allowed.len(), 11);
+            assert_eq!(allowed[10], published[10], "transaction epoch must match across validation and publication");
+            assert_eq!(allowed[6], SqliteValue::Text("validation_allowed".into()));
+            assert!(matches!(&allowed[7], SqliteValue::Text(reason) if matches!(reason.as_ref(), "ssi_clean" | "fcw_clean")));
+            assert_eq!(allowed[8], SqliteValue::Null, "permission to commit is not publication");
+            assert_eq!(published[6], SqliteValue::Text("published".into()));
+            assert_eq!(published[7], SqliteValue::Text("concurrent_write_committed".into()));
+            for column in 1..=5 {
+                assert_eq!(allowed[column], published[column], "identity column {column}");
+                assert!(matches!(allowed[column], SqliteValue::Integer(_)), "actual identity required");
+            }
+            let SqliteValue::Integer(first_event) = allowed[0] else { panic!("event identity required") };
+            assert_eq!(published[0], SqliteValue::Integer(first_event + 1));
+            assert!(matches!((&published[8], &published[5]), (SqliteValue::Integer(commit), SqliteValue::Integer(snapshot)) if commit > snapshot));
+            assert!(matches!(&published[9], SqliteValue::Text(backend) if matches!(backend.as_ref(), "unix" | "io_uring" | "windows")));
+            assert_eq!(conn.query("SELECT body FROM private_rows WHERE id=7;").await?[0].values(), &[SqliteValue::Text("private commit payload".into())]);
+            conn.query("SELECT 'validation_allowed', 'concurrent_write_committed';").await?;
+            assert_eq!(rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?), events, "unrelated reads and synthetic labels must not create events");
+            let rendered = format!("{events:?}");
+            assert!(!rendered.contains("private_rows") && !rendered.contains("private commit") && !rendered.contains("private-commit-evidence"));
+            let peer = Connection::open(path.to_str().unwrap()).await?;
+            assert!(peer.query("PRAGMA fsqlite.commit_events;").await?.is_empty(), "evidence belongs to its executing connection");
+
+            conn.execute("BEGIN;").await?;
+            conn.query("SELECT id FROM private_rows;").await?;
+            conn.execute("COMMIT;").await?;
+            let after_read = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+            assert_eq!(after_read.len(), 3);
+            assert_eq!(after_read[2][6], SqliteValue::Text("read_finished".into()));
+            assert_eq!(after_read[2][7], SqliteValue::Text("concurrent_read_finished".into()));
+            assert_eq!(after_read[2][8], SqliteValue::Null, "ending a read-only transaction does not publish writes");
+            assert_ne!(after_read[2][2], published[2], "later statement must have a new identity");
+            assert_ne!(after_read[2][3], published[3], "later transaction must have a new identity");
+            conn.begin_transaction().await?;
+            conn.commit_transaction().await?;
+            let after_api = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+            assert_eq!(after_api.len(), 4);
+            assert_eq!(after_api[3][2], SqliteValue::Null, "direct API must not inherit the last SQL statement identity");
+            conn.execute("BEGIN;").await?;
+            conn.execute("ROLLBACK;").await?;
+            assert!(conn.execute("COMMIT;").await.is_err());
+            assert_eq!(rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?), after_api, "rollback and a rejected inactive COMMIT cannot become publication");
+            eprintln!("bead_id=bd-6hdwo.14 event=public_commit_provenance_verified records={after_api:?}");
+            drop(prepared_insert);
+            peer.close().await?;
+            conn.close().await?;
+            let stock = rusqlite::Connection::open(path)?;
+            assert_eq!(stock.query_row("SELECT body FROM private_rows WHERE id=7", [], |row| row.get::<_, String>(0))?, "private commit payload");
+            assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?, "ok");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_commit_validation_reports_the_begin_time_policy() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            conn.execute("CREATE TABLE policy_rows(id INTEGER PRIMARY KEY, value INTEGER);").await?;
+            conn.execute("INSERT INTO policy_rows VALUES(1,0);").await?;
+            for (begin_policy, later_policy, expected) in [("OFF", "ON", "fcw_clean"), ("ON", "OFF", "ssi_clean")] {
+                conn.execute(&format!("PRAGMA fsqlite.serializable={begin_policy};")).await?;
+                conn.query("PRAGMA fsqlite.commit_reset;").await?;
+                conn.execute("BEGIN;").await?;
+                assert!(conn.is_concurrent_transaction());
+                conn.execute("UPDATE policy_rows SET value=value+1 WHERE id=1;").await?;
+                conn.execute(&format!("PRAGMA fsqlite.serializable={later_policy};")).await?;
+                conn.execute("COMMIT;").await?;
+                let events = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0][6], SqliteValue::Text("validation_allowed".into()));
+                assert_eq!(events[0][7], SqliteValue::Text(expected.into()), "diagnostics must identify the preparer selected from BEGIN's policy");
+                assert_eq!(events[1][7], SqliteValue::Text("concurrent_write_committed".into()));
+            }
+            assert_eq!(conn.query("SELECT value FROM policy_rows;").await?[0].values(), &[SqliteValue::Integer(2)]);
+            conn.close().await?;
+            eprintln!("bead_id=bd-6hdwo.14 event=begin_time_commit_validation_verified fcw_then_ssi=true");
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
+fn real_commit_evidence_is_bounded_and_joint_capture_clears_it() -> TestResult {
+    let mut outcome: TestResult = Ok(());
+    asupersync::test_utils::run_test(|| async {
+        outcome = async {
+            let conn = Connection::open(":memory:").await?;
+            for _ in 0..70 {
+                conn.execute("BEGIN;").await?;
+                conn.execute("COMMIT;").await?;
+            }
+            let events = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+            assert_eq!(events.len(), 64);
+            assert_eq!(events[0][0], SqliteValue::Integer(7));
+            assert_eq!(events[63][0], SqliteValue::Integer(70));
+            assert!(events.iter().all(|row| row[7] == SqliteValue::Text("concurrent_read_finished".into())));
+            assert!(events.iter().all(|row| row[6] == SqliteValue::Text("read_finished".into()) && row[8] == SqliteValue::Null));
+            let stats = conn.query("PRAGMA fsqlite.commit_stats;").await?;
+            for (key, expected) in [("capacity", 64), ("retained_events", 64), ("dropped_events", 6)] {
+                assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(name), SqliteValue::Integer(value)] if name.as_ref() == key && *value == expected)), "incorrect {key}: {stats:?}");
+            }
+            conn.query("WITH c(v) AS (SELECT 7) SELECT v FROM c;").await?;
+            assert!(!conn.query("PRAGMA fsqlite.fallback_events;").await?.is_empty());
+            conn.execute("PRAGMA fsqlite.diagnostic_capture=OFF;").await?;
+            assert_eq!(conn.query("PRAGMA fsqlite.diagnostic_capture;").await?[0].values(), &[SqliteValue::Integer(0), SqliteValue::Integer(0), SqliteValue::Integer(0)]);
+            assert!(conn.query("PRAGMA fsqlite.commit_events;").await?.is_empty());
+            assert!(conn.query("PRAGMA fsqlite.fallback_events;").await?.is_empty());
+            assert!(conn.ssi_decisions_snapshot().is_empty());
+            conn.execute("BEGIN;").await?;
+            assert_eq!(conn.query("WITH c(v) AS (SELECT 8) SELECT v FROM c;").await?[0].values(), &[SqliteValue::Integer(8)]);
+            conn.execute("COMMIT;").await?;
+            assert!(conn.query("PRAGMA fsqlite.commit_events;").await?.is_empty());
+            assert!(conn.query("PRAGMA fsqlite.fallback_events;").await?.is_empty());
+            assert!(conn.ssi_decisions_snapshot().is_empty());
+            assert!(conn.execute("PRAGMA fsqlite.diagnostic_capture='invalid';").await.is_err());
+            assert_eq!(conn.query("PRAGMA fsqlite.diagnostic_capture;").await?[0].values(), &[SqliteValue::Integer(0), SqliteValue::Integer(0), SqliteValue::Integer(0)]);
+            conn.execute("PRAGMA fsqlite.diagnostic_capture=ON;").await?;
+            assert!(conn.query("PRAGMA fsqlite.commit_events;").await?.is_empty(), "enabling cannot resurrect old evidence");
+            conn.execute("BEGIN;").await?;
+            conn.execute("COMMIT;").await?;
+            let resumed = rows_to_values(&conn.query("PRAGMA fsqlite.commit_events;").await?);
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(resumed[0][0], SqliteValue::Integer(71));
+            conn.query("PRAGMA fsqlite.commit_reset;").await?;
+            conn.execute("BEGIN;").await?;
+            conn.execute("COMMIT;").await?;
+            assert_eq!(conn.query("PRAGMA fsqlite.commit_events;").await?[0].values()[0], SqliteValue::Integer(72));
+            eprintln!("bead_id=bd-6hdwo.14 event=public_commit_capture_bound_verified retained=64 dropped=6 disabled_events=0 resumed_id=71 reset_id=72");
+            conn.close().await?;
+            Ok(())
+        }.await;
+    });
+    outcome
+}
+
+#[test]
+#[cfg(feature = "diagnostic-pragmas")]
 fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> TestResult {
     let mut outcome: TestResult = Ok(());
     asupersync::test_utils::run_test(|| async {
@@ -568,9 +733,9 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
             let mut previous_txn = None;
             for (round, capture) in [true, false, true].into_iter().enumerate() {
                 first.execute(if capture {
-                    "PRAGMA fsqlite.ssi_evidence_capture=ON;"
+                    "PRAGMA fsqlite.diagnostic_capture=ON;"
                 } else {
-                    "PRAGMA fsqlite.ssi_evidence_capture=OFF;"
+                    "PRAGMA fsqlite.diagnostic_capture=OFF;"
                 }).await?;
                 let enabled = first.query("PRAGMA ssi_evidence_capture;").await?;
                 assert_eq!(enabled[0].values(), &[SqliteValue::Integer(i64::from(capture))]);
@@ -586,9 +751,16 @@ fn real_ssi_evidence_capture_preserves_validation_and_reports_retention() -> Tes
                 assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }));
                 let cards = first.ssi_decisions_snapshot();
                 assert_eq!(cards.len(), usize::from(capture));
+                let commits = rows_to_values(&first.query("PRAGMA fsqlite.commit_events;").await?);
+                assert_eq!(commits.len(), usize::from(capture), "capture must govern actual rejected commit observations");
                 if let Some(card) = cards.first() {
                     assert_ne!(previous_txn, Some(card.txn));
                     previous_txn = Some(card.txn);
+                    assert_eq!(commits[0][3], SqliteValue::Integer(i64::try_from(card.txn.id.get())?));
+                    assert_eq!(commits[0][10], SqliteValue::Integer(i64::from(card.txn.epoch.get())));
+                    assert_eq!(commits[0][6], SqliteValue::Text("validation_rejected".into()));
+                    assert_eq!(commits[0][7], SqliteValue::Text("ssi_pivot".into()));
+                    assert_eq!(commits[0][8], SqliteValue::Null, "rejection cannot claim publication");
                 }
                 let stats = first.query("PRAGMA fsqlite.ssi_evidence_stats;").await?;
                 for (key, expected) in [("capture_enabled", i64::from(capture)), ("capacity", 4096), ("max_payload_bytes", 65_536), ("retained", i64::from(capture)), ("pending", 0), ("pending_dropped", 0), ("oversized_dropped", 0), ("retained_evicted", 0)] {

@@ -5568,6 +5568,25 @@ fn pragma_result_columns(pragma: &fsqlite_ast::PragmaStatement) -> &'static [&'s
 
     #[cfg(feature = "diagnostic-pragmas")]
     {
+        if full_name_is("fsqlite.diagnostic_capture") || full_name_is("diagnostic_capture") {
+            return &["fallback_capture", "commit_capture", "ssi_capture"];
+        }
+        if full_name_is("fsqlite.commit_capture") || full_name_is("commit_capture") {
+            return &["commit_capture"];
+        }
+        if full_name_is("fsqlite.commit_events") || full_name_is("commit_events") {
+            return &[
+                "event_id", "connection_id", "statement_id", "transaction_id",
+                "session_id", "snapshot_seq", "phase", "reason", "commit_seq",
+                "storage_backend", "transaction_epoch",
+            ];
+        }
+        if full_name_is("fsqlite.commit_stats") || full_name_is("commit_stats") {
+            return &PRAGMA_NAME_VALUE_COLUMNS;
+        }
+        if full_name_is("fsqlite.commit_reset") || full_name_is("commit_reset") {
+            return &PRAGMA_STATUS_COLUMNS;
+        }
         if full_name_is("fsqlite.fallback_capture") || full_name_is("fallback_capture") {
             return &["fallback_capture"];
         }
@@ -11618,6 +11637,73 @@ type CustomAggregateArities = HashMap<(String, i32), FunctionArity>;
 const TEMP_MEMDB_ROOT_START: i32 = i32::MAX - 1;
 
 const MAX_FALLBACK_DECISION_EVIDENCE: usize = 64;
+const MAX_COMMIT_EXECUTION_EVIDENCE: usize = 64;
+
+/// An observed concurrent commit decision, without SQL, parameters or paths.
+///
+/// Validation permits a commit attempt; only publication records a completed
+/// MVCC publication. A published commit can still report a later cleanup error.
+/// Read-only completion has its own phase and never supplies a new commit sequence.
+/// Transaction ID/epoch pairs identify MVCC transactions; session IDs identify
+/// registry slots. Statement IDs share the fallback event namespace and are absent when
+/// the operation did not enter through an attributed statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitExecutionRecord {
+    pub event_id: u64,
+    pub connection_id: Option<u64>,
+    pub statement_id: Option<u64>,
+    pub transaction_id: u64,
+    pub transaction_epoch: u32,
+    pub session_id: u64,
+    pub snapshot_seq: u64,
+    pub phase: &'static str,
+    pub reason: &'static str,
+    pub commit_seq: Option<u64>,
+    pub storage_backend: &'static str,
+}
+
+/// The latest 64 concurrent commit observations from this connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitExecutionSnapshot {
+    pub events: Vec<CommitExecutionRecord>,
+    pub dropped_events: u64,
+}
+
+#[derive(Debug, Default)]
+struct CommitExecutionCapture {
+    events: VecDeque<CommitExecutionRecord>,
+    last_event_id: u64,
+    dropped_events: u64,
+}
+
+impl CommitExecutionCapture {
+    fn record(&mut self, mut event: CommitExecutionRecord) {
+        if self.last_event_id >= i64::MAX as u64 {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+            return;
+        }
+        self.last_event_id += 1;
+        event.event_id = self.last_event_id;
+        if self.events.len() == MAX_COMMIT_EXECUTION_EVIDENCE {
+            self.events.pop_front();
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn snapshot(&self) -> CommitExecutionSnapshot {
+        CommitExecutionSnapshot {
+            events: self.events.iter().cloned().collect(),
+            dropped_events: self.dropped_events,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.events.clear();
+        self.dropped_events = 0;
+        // A reset must not let consumers mistake new events for old identities.
+    }
+}
 
 /// One distinct fallback routing decision captured by a [`Connection`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12670,6 +12756,8 @@ pub struct Connection {
     fallback_capture_enabled: Cell<bool>,
     fallback_statement_id: Cell<Option<u64>>,
     last_fallback_statement_id: Cell<u64>,
+    commit_execution_capture: RefCell<CommitExecutionCapture>,
+    commit_capture_enabled: Cell<bool>,
     // ── Virtual table module registry (bd-196x4) ────────────────────────────
     /// Registered virtual-table module factories, keyed by module name
     /// (uppercased).  Used by `CREATE VIRTUAL TABLE ... USING module(args)`.
@@ -14150,6 +14238,8 @@ impl Connection {
             fallback_capture_enabled: Cell::new(true),
             fallback_statement_id: Cell::new(None),
             last_fallback_statement_id: Cell::new(0),
+            commit_execution_capture: RefCell::new(CommitExecutionCapture::default()),
+            commit_capture_enabled: Cell::new(true),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             dropped_vtab_instances: RefCell::new(HashMap::new()),
@@ -14686,6 +14776,8 @@ impl Connection {
             fallback_capture_enabled: Cell::new(true),
             fallback_statement_id: Cell::new(None),
             last_fallback_statement_id: Cell::new(0),
+            commit_execution_capture: RefCell::new(CommitExecutionCapture::default()),
+            commit_capture_enabled: Cell::new(true),
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
@@ -22317,11 +22409,98 @@ impl Connection {
         }
     }
 
+    /// Return actual concurrent validation and publication observations.
+    ///
+    /// Ordinary single-writer commits and planner choices are not represented
+    /// by this surface. Reading it does not execute SQL or create evidence.
+    #[must_use]
+    pub fn commit_execution_snapshot(&self) -> CommitExecutionSnapshot {
+        self.commit_execution_capture.borrow().snapshot()
+    }
+
+    /// Toggle connection-local commit evidence without changing validation.
+    /// Disabling clears retained events and loss counters.
+    pub fn set_commit_capture_enabled(&self, enabled: bool) {
+        self.commit_capture_enabled.set(enabled);
+        if !enabled {
+            self.reset_commit_execution_evidence();
+        }
+    }
+
+    /// Clear concurrent commit evidence while keeping event identities monotone.
+    pub fn reset_commit_execution_evidence(&self) {
+        self.commit_execution_capture.borrow_mut().reset();
+    }
+
+    /// Toggle all connection-local fallback, commit and SSI evidence together.
+    ///
+    /// Disabling clears each retained/pending evidence store. MVCC validation,
+    /// process-wide conflict observers, metrics and ordinary tracing remain
+    /// independent; this setting cannot disable their correctness checks.
+    pub fn set_diagnostic_capture_enabled(&self, enabled: bool) {
+        self.set_fallback_capture_enabled(enabled);
+        self.set_commit_capture_enabled(enabled);
+        self.set_ssi_evidence_capture_enabled(enabled);
+    }
+
+    fn record_commit_execution(
+        &self,
+        transaction: TxnToken,
+        session_id: u64,
+        snapshot_seq: CommitSeq,
+        phase: &'static str,
+        reason: &'static str,
+        commit_seq: Option<CommitSeq>,
+    ) {
+        if !self.commit_capture_enabled.get() {
+            return;
+        }
+        self.commit_execution_capture.borrow_mut().record(CommitExecutionRecord {
+            event_id: 0,
+            connection_id: self.pool_metrics.get().map(|metrics| metrics.connection_id),
+            statement_id: self.fallback_statement_id.get(),
+            transaction_id: transaction.id.get(),
+            transaction_epoch: transaction.epoch.get(),
+            session_id,
+            snapshot_seq: snapshot_seq.get(),
+            phase,
+            reason,
+            commit_seq: commit_seq.map(CommitSeq::get),
+            storage_backend: self.pager_backend_label(),
+        });
+    }
+
+    fn record_commit_validation_rejection(
+        &self,
+        registry: &ConcurrentRegistry,
+        session_id: u64,
+        reason: &'static str,
+    ) {
+        if !self.commit_capture_enabled.get() {
+            return;
+        }
+        // A missing registry handle cannot supply a real transaction identity.
+        let Some(handle) = registry.get(session_id) else {
+            return;
+        };
+        let transaction = handle.txn_token();
+        let snapshot_seq = handle.snapshot().high;
+        drop(handle);
+        self.record_commit_execution(
+            transaction,
+            session_id,
+            snapshot_seq,
+            "validation_rejected",
+            reason,
+            None,
+        );
+    }
+
     fn allocate_fallback_statement_id(&self) -> Option<u64> {
         if let Some(statement_id) = self.fallback_statement_id.get() {
             return Some(statement_id);
         }
-        if self.fallback_capture_enabled.get() {
+        if self.fallback_capture_enabled.get() || self.commit_capture_enabled.get() {
             let last = self.last_fallback_statement_id.get();
             if last < i64::MAX as u64 {
                 self.last_fallback_statement_id.set(last + 1);
@@ -69632,6 +69811,12 @@ impl Connection {
             pending_conflict_pages,
         ) {
             record_concurrent_commit_plan_error(&error);
+            let reason = match &error {
+                FrankenError::BusySnapshot { .. } => "pending_page_conflict",
+                FrankenError::Busy => "pending_page_lock_busy",
+                _ => "pending_page_tracking_error",
+            };
+            self.record_commit_validation_rejection(registry, session_id, reason);
             return Err(error);
         }
 
@@ -69652,10 +69837,12 @@ impl Connection {
                     conflicting_pages: String::new(),
                 };
                 record_concurrent_commit_plan_error(&error);
+                self.record_commit_validation_rejection(registry, session_id, "stale_schema_snapshot");
                 return Err(error);
             }
             Err(error) => {
                 record_concurrent_commit_plan_error(&error);
+                self.record_commit_validation_rejection(registry, session_id, "schema_validation_error");
                 return Err(error);
             }
         }
@@ -69677,10 +69864,12 @@ impl Connection {
                         conflicting_pages: String::new(),
                     };
                     record_concurrent_commit_plan_error(&error);
+                    self.record_commit_validation_rejection(registry, session_id, "stale_schema_change_snapshot");
                     return Err(error);
                 }
                 Err(error) => {
                     record_concurrent_commit_plan_error(&error);
+                    self.record_commit_validation_rejection(registry, session_id, "schema_change_validation_error");
                     return Err(error);
                 }
             }
@@ -69836,6 +70025,23 @@ impl Connection {
                         "mvcc commit visibility conflict"
                     );
 
+                    let diagnostic_reason = match &fcw_result {
+                        FcwResult::Conflict { .. } => "fcw_conflict",
+                        FcwResult::Abort { reason } => match reason {
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::Pivot => "ssi_pivot",
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::MarkedForAbort => "ssi_marked_for_abort",
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::CommittedPivot => "ssi_committed_pivot",
+                        },
+                        FcwResult::Clean => "ssi_validation_abort",
+                    };
+                    self.record_commit_execution(
+                        snapshot.txn,
+                        session_id,
+                        snapshot.snapshot_seq,
+                        "validation_rejected",
+                        diagnostic_reason,
+                        None,
+                    );
                     abort_card = Some(Self::build_ssi_decision_draft(
                         &snapshot,
                         decision_type,
@@ -69852,10 +70058,10 @@ impl Connection {
         }
 
         // Feed the real outcome back to the e-process ONLY when full SSI
-        // validation actually ran. `gate_skipped_ssi` → we have no honest
-        // observation to report; feeding synthesized outcomes is
+        // validation actually ran. A gate skip or BEGIN-time FCW-only policy
+        // provides no SSI observation; feeding synthesized outcomes is
         // explicitly forbidden by the e-process module contract.
-        if !gate_skipped_ssi {
+        if !gate_skipped_ssi && begin_time_serializable {
             let pivot_detected = match &validate_result {
                 Ok(plan) => plan.has_in_rw() && plan.has_out_rw(),
                 Err((_, fcw_result)) => matches!(
@@ -69873,6 +70079,18 @@ impl Connection {
         match validate_result {
             Ok(plan) => {
                 record_concurrent_commit_plan_success(&plan);
+                self.record_commit_execution(
+                    plan.txn_token(),
+                    plan.session_id(),
+                    plan.begin_seq(),
+                    "validation_allowed",
+                    if gate_skipped_ssi || !begin_time_serializable {
+                        "fcw_clean"
+                    } else {
+                        "ssi_clean"
+                    },
+                    None,
+                );
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     let first_page = plan
                         .write_set_pages()
@@ -69941,6 +70159,14 @@ impl Connection {
             &plan,
             committed_seq,
         );
+        self.record_commit_execution(
+            plan.txn_token(),
+            session_id,
+            plan.begin_seq(),
+            "published",
+            "concurrent_write_committed",
+            Some(committed_seq),
+        );
         self.clear_cached_concurrent_handle();
         registry.remove_and_recycle(session_id);
         self.end_concurrent_rowid_session();
@@ -69972,6 +70198,14 @@ impl Connection {
             self.end_concurrent_rowid_session();
             self.clear_memory_concurrent_synced_write_roots();
             let committed_seq = self.current_global_commit_seq();
+            self.record_commit_execution(
+                snapshot.txn,
+                session_id,
+                snapshot.snapshot_seq,
+                "read_finished",
+                "concurrent_read_finished",
+                None,
+            );
             {
                 let mut last = self.last_local_commit_seq.borrow_mut();
                 *last = Some(last.map_or(committed_seq, |existing| existing.max(committed_seq)));
@@ -74570,6 +74804,69 @@ impl Connection {
             "fsqlite.differential_status"
             | "differential_status"
             | "fsqlite_differential_status" => Ok(self.differential_status_rows()),
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.diagnostic_capture" | "diagnostic_capture" => {
+                if let Some(ref value) = pragma.value {
+                    self.set_diagnostic_capture_enabled(parse_pragma_bool(value)?);
+                }
+                Ok(vec![Row {
+                    values: vec![
+                        SqliteValue::Integer(i64::from(self.fallback_capture_enabled.get())),
+                        SqliteValue::Integer(i64::from(self.commit_capture_enabled.get())),
+                        SqliteValue::Integer(i64::from(self.ssi_evidence_retention_snapshot().capture_enabled)),
+                    ],
+                }])
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.commit_capture" | "commit_capture" => {
+                if let Some(ref value) = pragma.value {
+                    self.set_commit_capture_enabled(parse_pragma_bool(value)?);
+                }
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(self.commit_capture_enabled.get()))],
+                }])
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.commit_events" | "commit_events" => {
+                let identity = |value: Option<u64>| {
+                    value.and_then(|value| i64::try_from(value).ok())
+                        .map_or(SqliteValue::Null, SqliteValue::Integer)
+                };
+                Ok(self.commit_execution_snapshot().events.into_iter().map(|event| Row {
+                    values: vec![
+                        identity(Some(event.event_id)),
+                        identity(event.connection_id),
+                        identity(event.statement_id),
+                        identity(Some(event.transaction_id)),
+                        identity(Some(event.session_id)),
+                        identity(Some(event.snapshot_seq)),
+                        SqliteValue::Text(event.phase.into()),
+                        SqliteValue::Text(event.reason.into()),
+                        identity(event.commit_seq),
+                        SqliteValue::Text(event.storage_backend.into()),
+                        SqliteValue::Integer(i64::from(event.transaction_epoch)),
+                    ],
+                }).collect())
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.commit_stats" | "commit_stats" => {
+                let capture = self.commit_execution_capture.borrow();
+                Ok([
+                    ("retained_events", capture.events.len() as u64),
+                    ("dropped_events", capture.dropped_events),
+                    ("capacity", MAX_COMMIT_EXECUTION_EVIDENCE as u64),
+                ].into_iter().map(|(name, value)| Row {
+                    values: vec![
+                        SqliteValue::Text(name.into()),
+                        SqliteValue::Integer(i64::try_from(value).unwrap_or(i64::MAX)),
+                    ],
+                }).collect())
+            }
+            #[cfg(feature = "diagnostic-pragmas")]
+            "fsqlite.commit_reset" | "commit_reset" => {
+                self.reset_commit_execution_evidence();
+                Ok(vec![Row { values: vec![SqliteValue::Text("ok".into())] }])
+            }
             #[cfg(feature = "diagnostic-pragmas")]
             "fsqlite.fallback_capture" | "fallback_capture" => {
                 if let Some(ref value) = pragma.value {
@@ -218704,6 +219001,72 @@ mod pager_routing_tests {
                 conn.fallback_execution_snapshot().events[0].event_id,
                 last + 2
             );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_commit_execution_exhaustion_preserves_unique_ids() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.commit_execution_capture.borrow_mut().last_event_id = i64::MAX as u64 - 1;
+            conn.execute("BEGIN; COMMIT;").await.unwrap();
+            let last = conn.commit_execution_snapshot();
+            assert_eq!(last.events.len(), 1);
+            assert_eq!(last.events[0].event_id, i64::MAX as u64);
+            conn.execute("BEGIN; COMMIT;").await.unwrap();
+            let overflow = conn.commit_execution_snapshot();
+            assert_eq!(overflow.events, last.events);
+            assert_eq!(overflow.dropped_events, 1);
+            conn.reset_commit_execution_evidence();
+            conn.execute("BEGIN; COMMIT;").await.unwrap();
+            let reset = conn.commit_execution_snapshot();
+            assert!(reset.events.is_empty(), "reset cannot recycle exhausted identities");
+            assert_eq!(reset.dropped_events, 1);
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostic-pragmas")]
+    fn test_commit_execution_read_finish_and_suspended_statement_attribution() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                // Ending this memory read transaction has no write or fallible
+                // I/O to cancel. Evidence must describe its actual completion,
+                // without treating a cancelled context as a published write.
+                conn.execute("COMMIT;").await.unwrap();
+            }
+            let finished = conn.commit_execution_snapshot();
+            assert_eq!(finished.events.len(), 1);
+            assert_eq!(finished.events[0].phase, "read_finished");
+            assert_eq!(finished.events[0].commit_seq, None);
+            conn.reset_commit_execution_evidence();
+            conn.execute("BEGIN;").await.unwrap();
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            let suspended_id = Cell::new(None);
+            let mut pending = Box::pin(conn.with_fallback_statement(Box::pin(async {
+                suspended_id.set(conn.fallback_statement_id.get());
+                std::future::pending::<()>().await;
+            })));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(pending.as_mut().poll(&mut context).is_pending());
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            conn.execute("COMMIT;").await.unwrap();
+            let published = conn.commit_execution_snapshot();
+            assert_eq!(published.events.len(), 1);
+            assert!(published.events[0].statement_id > suspended_id.get());
+            drop(pending);
+            assert_eq!(conn.fallback_statement_id.get(), None);
+            conn.begin_transaction().await.unwrap();
+            conn.commit_transaction().await.unwrap();
+            assert_eq!(conn.commit_execution_snapshot().events[1].statement_id, None);
+            conn.close().await.unwrap();
         });
     }
 

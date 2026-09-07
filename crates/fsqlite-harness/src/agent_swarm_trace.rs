@@ -910,6 +910,42 @@ pub struct AgentSwarmFallbackEvidence {
     pub dropped_events: u64,
 }
 
+/// An actual engine commit observation, independent of trace labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmCommitEvent {
+    /// Monotone event identity on the executing connection.
+    pub event_id: u64,
+    /// Actual engine connection identity.
+    pub connection_id: Option<u64>,
+    /// Actual executing SQL statement identity, absent for direct API commits.
+    pub statement_id: Option<u64>,
+    /// Actual MVCC transaction identity; interpret together with its epoch.
+    pub transaction_id: u64,
+    /// Generation of the actual transaction identity.
+    pub transaction_epoch: u32,
+    /// Actual registry session identity.
+    pub session_id: u64,
+    /// Transaction snapshot frontier.
+    pub snapshot_seq: u64,
+    /// Validation, publication or read-only completion phase.
+    pub phase: String,
+    /// Stable reason emitted by the actual commit path.
+    pub reason: String,
+    /// Published write sequence, absent for validation and read-only completion.
+    pub commit_seq: Option<u64>,
+    /// Actual pager backend.
+    pub storage_backend: String,
+}
+
+/// Bounded concurrent commit observations emitted while replaying one statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSwarmCommitEvidence {
+    /// Newly emitted events retained by the engine after execution.
+    pub events: Vec<AgentSwarmCommitEvent>,
+    /// Increase in engine drops, including older events evicted during execution.
+    pub dropped_events: u64,
+}
+
 /// Replay record for one trace statement on one backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSwarmStatementReplay {
@@ -941,6 +977,8 @@ pub struct AgentSwarmStatementReplay {
     pub outcome: StmtOutcome,
     /// Actual fallback evidence; `None` means the executor does not expose it.
     pub fallback_evidence: Option<AgentSwarmFallbackEvidence>,
+    /// Actual commit evidence; `None` means the executor does not expose it.
+    pub commit_evidence: Option<AgentSwarmCommitEvidence>,
     /// Normalized outcome class.
     pub outcome_class: AgentSwarmReplayOutcomeClass,
     /// Statement latency in nanoseconds.
@@ -1295,6 +1333,9 @@ pub struct AgentSwarmCoordinationMetrics {
     pub explain_concurrency_row_count: Option<u64>,
     /// Actual newly emitted fallback events retained by the replay executor.
     pub fallback_reason_count: u64,
+    /// Actual retained commit events; unavailable if any statement lacks an engine snapshot.
+    /// Validation and publication are separate events, not two committed writes.
+    pub commit_event_count: Option<u64>,
     /// Actual governor decisions, unavailable without an engine producer.
     pub resource_governor_decision_count: Option<u64>,
     /// Score of expected-vs-actual coordination outcomes, per mille.
@@ -2438,6 +2479,7 @@ where
 {
     let materialized_sql = materialize_replay_sql_for_backend(backend, &statement.scrubbed_sql);
     let fallback_before = executor.fallback_execution_snapshot();
+    let commit_before = executor.commit_execution_snapshot();
     let started_at = Instant::now();
     let outcome = executor.run_stmt(&materialized_sql);
     let latency_ns = elapsed_nanos_u64(started_at.elapsed());
@@ -2465,6 +2507,9 @@ where
                 dropped_events: after.dropped_events.saturating_sub(before.dropped_events),
             }
         });
+    let commit_evidence = commit_before
+        .zip(executor.commit_execution_snapshot())
+        .map(|(before, after)| commit_evidence_since(&before, after));
     let outcome_class = classify_stmt_outcome(&outcome);
     let expected_matched = expected_result_matches(statement.expected_result_class, outcome_class);
     let first_failure_diag = if expected_matched {
@@ -2492,6 +2537,7 @@ where
         expected_result_class: statement.expected_result_class,
         outcome,
         fallback_evidence,
+        commit_evidence,
         outcome_class,
         latency_ns,
         retry_count: 0,
@@ -2500,6 +2546,34 @@ where
     };
     log_agent_swarm_replay_statement(trace, &record);
     record
+}
+
+fn commit_evidence_since(
+    before: &fsqlite::CommitExecutionSnapshot,
+    after: fsqlite::CommitExecutionSnapshot,
+) -> AgentSwarmCommitEvidence {
+    let previous_id = before.events.last().map_or(0, |event| event.event_id);
+    AgentSwarmCommitEvidence {
+        events: after
+            .events
+            .into_iter()
+            .filter(|event| event.event_id > previous_id)
+            .map(|event| AgentSwarmCommitEvent {
+                event_id: event.event_id,
+                connection_id: event.connection_id,
+                statement_id: event.statement_id,
+                transaction_id: event.transaction_id,
+                transaction_epoch: event.transaction_epoch,
+                session_id: event.session_id,
+                snapshot_seq: event.snapshot_seq,
+                phase: event.phase.to_owned(),
+                reason: event.reason.to_owned(),
+                commit_seq: event.commit_seq,
+                storage_backend: event.storage_backend.to_owned(),
+            })
+            .collect(),
+        dropped_events: after.dropped_events.saturating_sub(before.dropped_events),
+    }
 }
 
 fn materialize_replay_sql_for_backend(backend: AgentSwarmReplayBackend, sql: &str) -> String {
@@ -2726,6 +2800,7 @@ fn coordination_metrics_for_backend(
     let mut lease_expiration_count = 0_u64;
     let mut range_allocation_count = 0_u64;
     let mut fallback_reason_count = 0_u64;
+    let mut commit_event_count = (!backend.statements.is_empty()).then_some(0_u64);
     let mut scenarios = BTreeSet::new();
 
     if backend.summary.success_count > 0 {
@@ -2736,6 +2811,9 @@ fn coordination_metrics_for_backend(
     }
 
     for statement in &backend.statements {
+        commit_event_count = commit_event_count
+            .zip(statement.commit_evidence.as_ref())
+            .map(|(count, evidence)| count.saturating_add(usize_to_u64(evidence.events.len())));
         if statement_has_signal(statement, &["fsqlite_queue", "task_queue", "queue"]) {
             if statement_has_signal(statement, &["claim", "ready", "queue_claim"]) {
                 queue_claim_count = queue_claim_count.saturating_add(1);
@@ -2793,6 +2871,7 @@ fn coordination_metrics_for_backend(
         // SQL text and labels cannot provide these engine observations.
         explain_concurrency_row_count: None,
         fallback_reason_count,
+        commit_event_count,
         resource_governor_decision_count: None,
         coordination_correctness_per_mille: coordination_correctness_per_mille(&backend.summary),
         conflict_transparency_per_mille: conflict_transparency_per_mille(
@@ -4415,6 +4494,172 @@ mod tests {
     }
 
     #[test]
+    fn agent_swarm_replay_captures_actual_commits_without_stale_or_seeded_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut statements = Vec::new();
+        for _ in 0..35 {
+            for (boundary, sql) in [
+                (TransactionBoundary::Begin, "BEGIN"),
+                (
+                    TransactionBoundary::None,
+                    "UPDATE replay_rows SET value=value+id",
+                ),
+                (TransactionBoundary::Commit, "COMMIT"),
+            ] {
+                statements.push(TraceStatement::from_raw(RawTraceStatement {
+                    logical_order: usize_to_u64(statements.len()),
+                    logical_timestamp: None,
+                    actor_id: "trace-actor",
+                    connection_id: "trace-connection",
+                    transaction_id: Some("trace-transaction"),
+                    transaction_boundary: boundary,
+                    concurrency_group: "commit-replay",
+                    workload_phase: "ordinary-write",
+                    sql,
+                    expected_result_class: ExpectedResultClass::Success,
+                    row_count_class: RowCountClass::Unknown,
+                    error_class: None,
+                    source: StatementSource::new("inline-harness", "bd-6hdwo.14")?,
+                })?);
+            }
+        }
+        statements.push(TraceStatement::from_raw(RawTraceStatement {
+            logical_order: usize_to_u64(statements.len()),
+            logical_timestamp: None,
+            actor_id: "trace-actor",
+            connection_id: "trace-connection",
+            transaction_id: None,
+            transaction_boundary: TransactionBoundary::None,
+            concurrency_group: "commit-replay",
+            workload_phase: "published",
+            sql: "SELECT phase FROM seeded_commit_events",
+            expected_result_class: ExpectedResultClass::Success,
+            row_count_class: RowCountClass::Unknown,
+            error_class: None,
+            source: StatementSource::new("inline-harness", "bd-6hdwo.14")?,
+        })?);
+        let trace = AgentSwarmTrace::new(
+            "trace-actual-commits",
+            "run-actual-commits",
+            "actual-commits",
+            TraceMetadata::new("inline-harness", "bd-6hdwo.14")?,
+            statements,
+        )?;
+        for enabled in [true, false] {
+            let subject = FsqliteExecutor::open_in_memory()?;
+            let oracle = CsqliteExecutor::open_in_memory()?;
+            for executor in [&subject as &dyn SqlExecutor, &oracle as &dyn SqlExecutor] {
+                for sql in [
+                    "CREATE TABLE replay_rows(id INTEGER PRIMARY KEY, value INTEGER)",
+                    "INSERT INTO replay_rows VALUES(1,0)",
+                    "CREATE TABLE seeded_commit_events(phase TEXT)",
+                    "INSERT INTO seeded_commit_events VALUES('published')",
+                    "BEGIN",
+                    "UPDATE replay_rows SET value=value+id",
+                    "COMMIT",
+                ] {
+                    executor.execute(sql)?;
+                }
+            }
+            let previous = subject.commit_execution_snapshot().unwrap();
+            assert_eq!(previous.events.len(), 2);
+            let previous_id = previous.events.last().unwrap().event_id;
+            if !enabled {
+                subject.execute("PRAGMA fsqlite.diagnostic_capture=OFF")?;
+            }
+            let report = replay_agent_swarm_trace_with_executors(
+                &trace,
+                &AgentSwarmReplayConfig::smoke(0xC011_1714),
+                &subject,
+                &oracle,
+            )?;
+            assert!(report.first_failure.is_none(), "{report:?}");
+            let mut event_ids = BTreeSet::new();
+            let mut statement_ids = BTreeSet::new();
+            let mut transactions = BTreeSet::new();
+            let mut dropped = 0;
+            for statement in &report.backends[0].statements {
+                let evidence = statement
+                    .commit_evidence
+                    .as_ref()
+                    .expect("replay must expose actual engine commit evidence");
+                dropped += evidence.dropped_events;
+                let committed = statement.transaction_boundary == TransactionBoundary::Commit;
+                assert_eq!(
+                    evidence.events.len(),
+                    if enabled && committed { 2 } else { 0 }
+                );
+                if let [validated, published] = evidence.events.as_slice() {
+                    assert_eq!(validated.phase, "validation_allowed");
+                    assert_eq!(validated.commit_seq, None);
+                    assert_eq!(published.phase, "published");
+                    assert_eq!(published.reason, "concurrent_write_committed");
+                    assert!(
+                        published
+                            .commit_seq
+                            .is_some_and(|seq| seq > published.snapshot_seq)
+                    );
+                    assert_eq!(validated.connection_id, published.connection_id);
+                    assert_eq!(validated.statement_id, published.statement_id);
+                    assert_eq!(validated.transaction_id, published.transaction_id);
+                    assert_eq!(validated.transaction_epoch, published.transaction_epoch);
+                    assert!(statement_ids.insert(published.statement_id.unwrap()));
+                    assert!(
+                        transactions
+                            .insert((published.transaction_id, published.transaction_epoch))
+                    );
+                    for event in &evidence.events {
+                        assert!(event.event_id > previous_id);
+                        assert!(event_ids.insert(event.event_id));
+                        assert_eq!(event.storage_backend, "memory");
+                    }
+                }
+            }
+            assert_eq!(event_ids.len(), if enabled { 70 } else { 0 });
+            assert_eq!(transactions.len(), if enabled { 35 } else { 0 });
+            assert_eq!(dropped, if enabled { 8 } else { 0 });
+            let scorecard = score_agent_swarm_resource_envelope(
+                &report,
+                &AgentSwarmResourceScorecardConfig::new(AgentSwarmResourceProfile::local_smoke()),
+            );
+            assert_eq!(
+                scorecard.backends[0]
+                    .coordination_metrics
+                    .commit_event_count,
+                Some(if enabled { 70 } else { 0 })
+            );
+            assert_eq!(
+                scorecard.backends[1]
+                    .coordination_metrics
+                    .commit_event_count,
+                None
+            );
+            assert!(
+                report.backends[1]
+                    .statements
+                    .iter()
+                    .all(|statement| statement.commit_evidence.is_none())
+            );
+            let json = serde_json::to_value(&report)?;
+            if enabled {
+                assert_eq!(
+                    json["backends"][0]["statements"][2]["commit_evidence"]["events"][1]["phase"],
+                    "published"
+                );
+            }
+            assert_eq!(
+                subject.query("SELECT value FROM replay_rows")?,
+                oracle.query("SELECT value FROM replay_rows")?
+            );
+            assert_eq!(
+                subject.query("SELECT value FROM replay_rows")?,
+                vec![vec![crate::differential_v2::NormalizedValue::Integer(36)]]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_swarm_scorecard_exposes_coordination_bridge_metrics() {
         let mut queue_claim = resource_replay_record(
             "agent-a",
@@ -5081,6 +5326,7 @@ mod tests {
             expected_result_class: ExpectedResultClass::Success,
             outcome,
             fallback_evidence: None,
+            commit_evidence: None,
             outcome_class,
             latency_ns,
             retry_count,

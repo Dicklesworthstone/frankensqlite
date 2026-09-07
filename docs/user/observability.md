@@ -306,6 +306,53 @@ outside this bound. Disabling evidence capture clears retained and queued
 evidence and resets its loss counters; it does not disable SSI validation or
 the shared conflict observer.
 
+## Connection-local execution evidence
+
+With the `diagnostic-pragmas` feature, inspect the executing connection's
+concurrent commit decisions after running a transaction:
+
+```sql
+CREATE TABLE commit_example(id INTEGER PRIMARY KEY);
+PRAGMA fsqlite.commit_reset;
+BEGIN;
+INSERT INTO commit_example VALUES(1);
+COMMIT;
+PRAGMA fsqlite.commit_events;
+PRAGMA fsqlite.commit_stats;
+```
+
+`validation_allowed` means that a commit attempt passed validation;
+`validation_rejected` identifies a rejected attempt. Only `published` records
+completed MVCC write publication and supplies a `commit_seq`. A later cleanup
+error can still reach the caller after publication. `read_finished` records
+the completion of a read-only concurrent transaction and has no new write
+sequence. These events cover concurrent transactions; they are not a complete
+history of ordinary single-writer commits, planner choices, or admission policy.
+
+Rows carry the actual connection, statement, transaction ID and epoch, session,
+snapshot, phase, reason, and pager backend. Direct transaction API calls outside
+an attributed SQL statement have a null statement ID. SQL text, parameters,
+table names, and database paths are excluded. Event IDs increase across resets;
+the connection retains its latest 64 events and reports evictions or exhausted
+event IDs through `dropped_events`. Validation retries can produce multiple
+observations for one transaction, so event counts are not commit counts.
+
+Use `PRAGMA fsqlite.commit_capture=OFF` to clear and disable commit evidence,
+or `PRAGMA fsqlite.diagnostic_capture=OFF` to clear and disable connection-local
+fallback, commit, and SSI evidence together. `=ON` resumes capture without
+restoring cleared records. The combined control reports all three capture
+flags. It is separate from process-wide metrics, conflict observers, and
+tracing, and cannot disable transaction validation.
+
+Embedded callers can use `Connection::commit_execution_snapshot()` and the
+corresponding `set_commit_capture_enabled`, `reset_commit_execution_evidence`,
+and `set_diagnostic_capture_enabled` methods without executing SQL. Swarm replay
+reports expose each statement's newly retained engine events as
+`commit_evidence`, including the increase in engine drops during that statement.
+The scorecard's `commit_event_count` counts those retained events. An executor
+without this snapshot API, including the stock SQLite oracle, reports unavailable
+evidence as null; SQL labels or rows named `published` do not create observations.
+
 ## Roadmap
 
 The recording registry, both serializers, the StatsD UDP push transport, and the

@@ -16,6 +16,74 @@
 
 use fsqlite_core::connection::{Connection, WriteMergeMode};
 
+/// Only commits that actually select the SSI preparer may train its gate.
+/// The policy is captured at BEGIN, so changing the PRAGMA inside a transaction
+/// must not relabel an FCW-only commit as an observed clean SSI validation.
+#[test]
+fn begin_time_fcw_policy_does_not_train_the_ssi_gate() {
+    asupersync::test_utils::run_test(|| async {
+        for mode in ["SAFE", "LAB_UNSAFE"] {
+            let conn = Connection::open(":memory:").await.unwrap();
+            assert!(conn.is_concurrent_mode_default());
+            conn.execute_batch(
+                "CREATE TABLE policy_gate(id INTEGER PRIMARY KEY, value INTEGER);
+                 INSERT INTO policy_gate VALUES(1,0);",
+            )
+            .await
+            .unwrap();
+            conn.execute(&format!("PRAGMA fsqlite.write_merge={mode};"))
+                .await
+                .unwrap();
+            conn.reset_ssi_e_process_gate();
+            let before = conn.ssi_e_process_snapshot();
+            assert_eq!(before.observations, 0);
+
+            conn.execute_batch(
+                "PRAGMA fsqlite.serializable=OFF;
+                 BEGIN;
+                 UPDATE policy_gate SET value=value+1 WHERE id=1;
+                 PRAGMA fsqlite.serializable=ON;
+                 COMMIT;",
+            )
+            .await
+            .unwrap();
+            let fcw = conn.ssi_e_process_snapshot();
+            assert_eq!(
+                fcw.observations, before.observations,
+                "{mode}: FCW-only validation must not fabricate an SSI observation"
+            );
+            assert_eq!(fcw.clean_streak, before.clean_streak);
+            assert_eq!(fcw.e_value.to_bits(), before.e_value.to_bits());
+
+            conn.execute_batch(
+                "BEGIN;
+                 UPDATE policy_gate SET value=value+1 WHERE id=1;
+                 PRAGMA fsqlite.serializable=OFF;
+                 COMMIT;",
+            )
+            .await
+            .unwrap();
+            let ssi = conn.ssi_e_process_snapshot();
+            assert_eq!(ssi.observations, before.observations + 1);
+            assert_eq!(ssi.clean_streak, before.clean_streak + 1);
+            assert_eq!(ssi.skip_grants, 0, "an untrained gate cannot skip validation");
+            assert_eq!(
+                conn.query("SELECT value FROM policy_gate WHERE id=1;")
+                    .await
+                    .unwrap()[0]
+                    .values(),
+                &[fsqlite_types::SqliteValue::Integer(2)]
+            );
+            eprintln!(
+                "bead_id=bd-6hdwo.14 event=begin_policy_ssi_training_verified \
+                 mode={mode} fcw_observations={} ssi_observations={}",
+                fcw.observations, ssi.observations
+            );
+            conn.close().await.unwrap();
+        }
+    });
+}
+
 /// Deterministic workload: N serial `BEGIN CONCURRENT` transactions on
 /// disjoint keys. Returns `SUM(v) FROM kv`.
 async fn run_pivot_free_workload(conn: &Connection, commits: usize) -> i64 {

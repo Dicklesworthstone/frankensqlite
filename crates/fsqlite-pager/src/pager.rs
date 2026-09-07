@@ -5104,9 +5104,9 @@ fn wal_backend_handle(wal_backend: &SharedWalBackend) -> Result<WalBackendHandle
 
 /// Read access to WAL backend (read_page_pinned, frame_count).
 ///
-/// Takes only a shared (read) lock on the WAL backend RwLock. This allows
-/// multiple concurrent readers without blocking the append path, and the
-/// append path without blocking readers.
+/// Takes a shared lock on the installed WAL backend, allowing concurrent
+/// readers. Appending and other exclusive operations still wait for those
+/// readers, and an active exclusive guard blocks new reads.
 ///
 /// # bd-db300.3.8.7
 async fn with_wal_backend_read<T>(
@@ -15804,17 +15804,11 @@ where
 
     /// Number of frames currently in the WAL for this pager.
     ///
-    /// Read-only probe: `WalBackend::frame_count(&self) -> usize` is a
-    /// plain field read, so we take the `SharedWalBackend` RwLock in
-    /// `read()` mode — shared with other readers and, critically,
-    /// non-blocking against concurrent WAL writers that only take
-    /// `read()` themselves on their own read paths. The previous
-    /// `with_wal_backend` (write-lock) acquisition here made every
-    /// `maybe_run_adaptive_autocheckpoint` probe serialize against
-    /// every other WAL operation — the checkpoint advisor samples this
-    /// on every commit, so under MT-writer workloads it turned each
-    /// post-commit poll into a global WAL RwLock write-contention
-    /// point.
+    /// Uses a shared lock on the installed WAL backend so advisory probes
+    /// can run alongside other backend readers. An active exclusive appender
+    /// or checkpoint still blocks the probe. The checkpoint advisor samples
+    /// this after commits; it must not acquire an exclusive lock merely to
+    /// read the frame count.
     pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
         if self
             .group_commit_queue
@@ -54726,84 +54720,53 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_frame_count_read_lock_does_not_block_behind_writer() {
-        // Regression gate for the `wal_frame_count()` read-lock fix.
-        //
-        // The real scenario: one thread is mid-`append_prepared_frames`
-        // holding the `SharedWalBackend` in `write()` mode (a ≥100 µs
-        // WAL-append + fsync on this host). A concurrent commit path
-        // fires `wal_frame_count()` via the checkpoint advisor.
-        // Pre-fix, that probe ALSO took `write()`, so it serialized
-        // behind the in-flight appender for the whole append-duration
-        // and then re-exported the same serialization window to every
-        // subsequent commit on the same pager. Post-fix it takes
-        // `read()` — std RwLock still blocks reads behind an active
-        // writer, BUT the probe itself does not block PEERS, so N
-        // concurrent commits each pay one write-holder-wait instead of
-        // N write-holder-waits stacking serially.
-        //
-        // This test encodes the latter invariant directly: while a
-        // single thread holds the SharedWalBackend-analogue in write()
-        // for a fixed hold duration, N "reader" threads take read()
-        // concurrently and must all finish inside roughly one
-        // hold-duration, not N stacked holds.
-        use std::sync::Barrier;
-        use std::sync::RwLock;
-        use std::sync::atomic::AtomicUsize;
-        use std::time::{Duration, Instant};
+    fn test_wal_frame_count_shares_backend_reads_and_waits_for_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let pager = SimplePager::open(
+                vfs.clone(),
+                Path::new("/frame-count-lock.db"),
+                PageSize::DEFAULT,
+            )
+            .await
+            .unwrap();
+            // Reuse the adapter's real WalFile append/count implementation.
+            // Its unrelated read_page/checkpoint stubs are never called here.
+            let mut backend = TrackCBenchmarkWalBackend::new(
+                &vfs,
+                &cx,
+                Path::new("/frame-count-lock.db-wal"),
+                TrackCBatchMode::Batched,
+            )
+            .await;
+            backend.wal.append_frame(&cx, 1, &sample_page(0x42), 1).await.unwrap();
+            assert_eq!(backend.wal.frame_count(), 1);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            let handle = wal_backend_handle(&pager.wal_backend).unwrap();
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
-        const READERS: usize = 8;
-        const HOLD: Duration = Duration::from_millis(20);
+            // An actual outstanding backend read must permit the production
+            // probe to finish. A write-lock regression returns Pending here.
+            let reader = handle.try_read().unwrap();
+            for _ in 0..8 {
+                let mut probe = Box::pin(pager.wal_frame_count(&cx));
+                assert_eq!(
+                    probe.as_mut().poll(&mut context),
+                    std::task::Poll::Ready(1),
+                    "wal_frame_count must share the actual held backend read lock"
+                );
+            }
+            drop(reader);
 
-        let shared = StdArc::new(RwLock::new(AtomicUsize::new(42)));
-        let barrier = StdArc::new(Barrier::new(READERS + 1));
-
-        // Writer: grab write(), pin for HOLD, release.
-        let writer = {
-            let shared = StdArc::clone(&shared);
-            let barrier = StdArc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                let _g = shared.write().unwrap();
-                std::thread::sleep(HOLD);
-            })
-        };
-
-        // Readers: wait for barrier, then race to take read() and
-        // immediately return once unblocked.
-        let started = Instant::now();
-        let readers: Vec<_> = (0..READERS)
-            .map(|_| {
-                let shared = StdArc::clone(&shared);
-                let barrier = StdArc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let g = shared.read().unwrap();
-                    std::hint::black_box(g.load(std::sync::atomic::Ordering::Relaxed));
-                })
-            })
-            .collect();
-        for r in readers {
-            r.join().expect("reader join");
-        }
-        let readers_elapsed = started.elapsed();
-        writer.join().expect("writer join");
-
-        eprintln!(
-            "wal_frame_count contention: {READERS} concurrent read-lock probes finished \
-             in {readers_elapsed:?} behind a {HOLD:?} write-hold. \
-             Stacked-write upper bound would be {READERS}×{HOLD:?} = {:?}.",
-            HOLD * READERS as u32
-        );
-        // Gate: readers finish in roughly one HOLD, not N × HOLD.
-        // Before the fix, each `wal_frame_count()` call would have
-        // taken write(), stacking serially behind the in-flight
-        // appender AND serially behind each other. 3 × HOLD is a very
-        // loose ceiling that still catches an accidental revert.
-        assert!(
-            readers_elapsed < HOLD * 3,
-            "read-lock probes should not stack serially: elapsed={readers_elapsed:?} HOLD={HOLD:?}"
-        );
+            // A writer really is exclusive. The same pending production probe
+            // must return the stored frame count after that guard is released.
+            let writer = handle.try_write().unwrap();
+            let mut probe = Box::pin(pager.wal_frame_count(&cx));
+            assert!(probe.as_mut().poll(&mut context).is_pending());
+            drop(writer);
+            assert_eq!(probe.await, 1);
+        });
     }
 
     #[test]
