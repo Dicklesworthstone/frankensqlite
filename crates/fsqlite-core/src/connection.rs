@@ -69884,8 +69884,6 @@ impl Connection {
         // We mix the session id and the planning-frontier commit seq into
         // the audit-sampling hash so successive commits distribute roughly
         // uniformly across the audit stride.
-        let audit_hash = session_id ^ planned_commit_seq.get();
-        let gate_skipped_ssi = self.should_skip_ssi_validation(audit_hash);
         // GH#390: the connection's `PRAGMA fsqlite.serializable` policy was
         // snapped onto the registry handle at BEGIN. OFF selects the FCW-only
         // preparer directly — it still rejects base drift as `BusySnapshot`
@@ -69894,6 +69892,9 @@ impl Connection {
         let begin_time_serializable = registry
             .get(session_id)
             .is_none_or(|handle| handle.serializable());
+        let audit_hash = session_id ^ planned_commit_seq.get();
+        let gate_skipped_ssi =
+            begin_time_serializable && self.should_skip_ssi_validation(audit_hash);
 
         let prepare_outcome = if gate_skipped_ssi || !begin_time_serializable {
             prepare_concurrent_commit_fcw_only(
@@ -70058,22 +70059,26 @@ impl Connection {
         }
 
         // Feed the real outcome back to the e-process ONLY when full SSI
-        // validation actually ran. A gate skip or BEGIN-time FCW-only policy
-        // provides no SSI observation; feeding synthesized outcomes is
-        // explicitly forbidden by the e-process module contract.
+        // validation actually ran. Gate skips, BEGIN-time FCW-only policy,
+        // and rejections before edge discovery provide no SSI observation.
+        // Feeding synthesized outcomes is explicitly forbidden by the gate.
         if !gate_skipped_ssi && begin_time_serializable {
-            let pivot_detected = match &validate_result {
-                Ok(plan) => plan.has_in_rw() && plan.has_out_rw(),
-                Err((_, fcw_result)) => matches!(
-                    fcw_result,
+            let observed_pivot = match &validate_result {
+                Ok(plan) => Some(plan.has_in_rw() && plan.has_out_rw()),
+                Err((
+                    _,
                     FcwResult::Abort {
                         reason: fsqlite_mvcc::ssi_validation::SsiAbortReason::Pivot
-                            | fsqlite_mvcc::ssi_validation::SsiAbortReason::CommittedPivot
-                            | fsqlite_mvcc::ssi_validation::SsiAbortReason::MarkedForAbort
-                    }
-                ),
+                            | fsqlite_mvcc::ssi_validation::SsiAbortReason::CommittedPivot,
+                    },
+                )) => Some(true),
+                // FCW conflicts, invalid handles, and propagated abort marks
+                // return before this transaction discovers any SSI edges.
+                Err(_) => None,
             };
-            self.observe_ssi_outcome(pivot_detected);
+            if let Some(pivot_detected) = observed_pivot {
+                self.observe_ssi_outcome(pivot_detected);
+            }
         }
 
         match validate_result {

@@ -820,6 +820,7 @@ fn real_ssi_early_abort_reports_unmeasured_edges() -> TestResult {
             downstream.execute("COMMIT;").await?;
             upstream.execute("COMMIT;").await?;
             assert!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.is_empty());
+            let gate_before = pivot.ssi_e_process_snapshot();
             let error = pivot.execute("COMMIT;").await.expect_err("propagated pivot abort is enforced");
             assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }));
             let cards = pivot.ssi_decisions_snapshot();
@@ -832,6 +833,10 @@ fn real_ssi_early_abort_reports_unmeasured_edges() -> TestResult {
             assert!(event.contains("reason: MarkedForAbort"), "actual early path required: {event}");
             assert!(event.contains("in_edge_count: None") && event.contains("out_edge_count: None"));
             assert!(event.contains(&format!("txn: {:?}", cards[0].txn)));
+            let gate_after = pivot.ssi_e_process_snapshot();
+            assert_eq!(gate_after.observations, gate_before.observations, "early abort without SSI edge discovery must not fabricate a clean SSI observation");
+            assert_eq!(gate_after.clean_streak, gate_before.clean_streak);
+            assert_eq!(gate_after.e_value.to_bits(), gate_before.e_value.to_bits());
             for (table, expected) in [("a", 11), ("c", 10), ("d", 11), ("e", 10)] {
                 assert_eq!(monitor.query(&format!("SELECT value FROM {table} WHERE id=1;")).await?[0].values(), &[SqliteValue::Integer(expected)]);
             }
@@ -886,6 +891,7 @@ fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
             first.execute("UPDATE a SET value=11 WHERE id=1;").await?;
             second.execute("UPDATE b SET value=21 WHERE id=1;").await?;
             assert!(monitor.query("PRAGMA fsqlite.conflict_log;").await?.is_empty());
+            let gate_before = first.ssi_e_process_snapshot();
             let error = first.execute("COMMIT;").await.expect_err("real write skew must be rejected");
             assert!(matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }), "unexpected rejection: {error:?}");
 
@@ -899,6 +905,10 @@ fn real_ssi_abort_reaches_shared_conflict_pragmas() -> TestResult {
             assert!(event.contains("SsiAbort") && event.contains("reason: Pivot"));
             assert!(event.contains("in_edge_count: Some(1),") && event.contains("out_edge_count: Some(1),"));
             assert!(event.contains(&format!("txn: {:?}", cards[0].txn)), "event and actual decision must identify the same transaction");
+            let gate_after = first.ssi_e_process_snapshot();
+            assert_eq!(gate_after.observations, gate_before.observations + 1, "an actually measured pivot must train the SSI gate");
+            assert_eq!(gate_after.clean_streak, 0);
+            assert!(gate_after.e_value > gate_before.e_value, "a measured pivot must be a conflict observation");
             let stats = monitor.query("PRAGMA fsqlite.conflict_stats;").await?;
             for (name, expected) in [("conflicts_total", 1), ("ssi_aborts", 1), ("fcw_drifts", 0), ("page_contentions", 0), ("conflicts_resolved", 0)] {
                 assert!(stats.iter().any(|row| matches!(row.values(), [SqliteValue::Text(key), SqliteValue::Integer(value)] if key.as_ref() == name && *value == expected)), "missing exact metric {name}={expected}: {stats:?}");

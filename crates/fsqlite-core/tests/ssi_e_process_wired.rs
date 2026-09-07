@@ -54,6 +54,11 @@ fn begin_time_fcw_policy_does_not_train_the_ssi_gate() {
             );
             assert_eq!(fcw.clean_streak, before.clean_streak);
             assert_eq!(fcw.e_value.to_bits(), before.e_value.to_bits());
+            assert_eq!(
+                fcw.skip_consultations, before.skip_consultations,
+                "{mode}: BEGIN-time FCW-only policy must not consult the SSI audit gate"
+            );
+            assert_eq!(fcw.skip_grants, before.skip_grants);
 
             conn.execute_batch(
                 "BEGIN;
