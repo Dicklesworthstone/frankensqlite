@@ -476,34 +476,44 @@ impl BtreeCursorPageLayout {
 async fn btree_cursor_page_layout_from_page_one<P: PageReader>(
     page_reader: &P,
     cx: &Cx,
-) -> Option<BtreeCursorPageLayout> {
-    let page_one = page_reader.read_page(cx, PageNumber::ONE).await.ok()?;
-    let header_prefix: [u8; DATABASE_HEADER_SIZE] =
-        page_one.get(..DATABASE_HEADER_SIZE)?.try_into().ok()?;
-    let header = DatabaseHeader::from_bytes(&header_prefix).ok()?;
+) -> Result<Option<BtreeCursorPageLayout>> {
+    let page_one = match page_reader.read_page(cx, PageNumber::ONE).await {
+        Ok(page) => page,
+        Err(FrankenError::Abort) => return Err(FrankenError::Abort),
+        Err(_) => return Ok(None),
+    };
+    let Some(header_prefix) = page_one.get(..DATABASE_HEADER_SIZE) else {
+        return Ok(None);
+    };
+    let Ok(header_prefix) = <[u8; DATABASE_HEADER_SIZE]>::try_from(header_prefix) else {
+        return Ok(None);
+    };
+    let Ok(header) = DatabaseHeader::from_bytes(&header_prefix) else {
+        return Ok(None);
+    };
     let usable_size = header.page_size.usable(header.reserved_per_page);
     if usable_size <= 4 {
-        return None;
+        return Ok(None);
     }
-    Some(BtreeCursorPageLayout {
+    Ok(Some(BtreeCursorPageLayout {
         usable_size,
         page_size: header.page_size.get(),
         text_encoding: header.text_encoding,
-    })
+    }))
 }
 
 async fn btree_cursor_page_layout_for_reader_or_default<P: PageReader>(
     page_reader: &P,
     cx: &Cx,
     default_page_size: PageSize,
-) -> BtreeCursorPageLayout {
+) -> Result<BtreeCursorPageLayout> {
     // Synthetic pager mocks used in unit tests often do not populate page 1
     // with a real SQLite database header. Fall back to the engine's configured
     // page size in that case, but prefer the real header whenever it exists so
     // transaction-backed cursors honor reserved bytes.
-    btree_cursor_page_layout_from_page_one(page_reader, cx)
-        .await
-        .unwrap_or_else(|| BtreeCursorPageLayout::no_reserved_bytes(default_page_size))
+    Ok(btree_cursor_page_layout_from_page_one(page_reader, cx)
+        .await?
+        .unwrap_or_else(|| BtreeCursorPageLayout::no_reserved_bytes(default_page_size)))
 }
 
 fn configure_btree_cursor_page_size<P>(
@@ -9797,7 +9807,7 @@ impl VdbeEngine {
                         pc += 1;
                         continue;
                     }
-                    if !self.open_storage_cursor(cursor_id, root_page, false).await {
+                    if !self.open_storage_cursor(cursor_id, root_page, false).await? {
                         return Err(FrankenError::Internal(format!(
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
                         )));
@@ -9842,7 +9852,7 @@ impl VdbeEngine {
                         pc += 1;
                         continue;
                     }
-                    if !self.open_storage_cursor(cursor_id, root_page, true).await {
+                    if !self.open_storage_cursor(cursor_id, root_page, true).await? {
                         return Err(FrankenError::Internal(format!(
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
                         )));
@@ -15088,7 +15098,7 @@ impl VdbeEngine {
 
         if !self
             .open_storage_cursor(template.cursor_id, template.root_page, true)
-            .await
+            .await?
         {
             return Err(FrankenError::internal(format!(
                 "compiled simple INSERT could not open writable cursor {} on root {}",
@@ -15234,7 +15244,7 @@ impl VdbeEngine {
     ) -> Result<ExecOutcome> {
         if !self
             .open_storage_cursor(template.cursor_id, template.root_page, false)
-            .await
+            .await?
         {
             return Err(FrankenError::internal(format!(
                 "compiled rowid-lookup SELECT could not open cursor {} on root {}",
@@ -15289,7 +15299,7 @@ impl VdbeEngine {
     ) -> Result<ExecOutcome> {
         if !self
             .open_storage_cursor(template.cursor_id, template.root_page, false)
-            .await
+            .await?
         {
             return Err(FrankenError::internal(format!(
                 "compiled full-scan SELECT could not open cursor {} on root {}",
@@ -16905,13 +16915,14 @@ impl VdbeEngine {
         Ok(SqliteValue::Null)
     }
 
+    /// Preserve terminal cancellation separately from an ordinary cursor refusal.
     #[allow(clippy::cast_sign_loss)]
     async fn open_storage_cursor(
         &mut self,
         cursor_id: i32,
         root_page: i32,
         writable: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         let _page_size_u32 = self.page_size.get();
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
@@ -16944,7 +16955,7 @@ impl VdbeEngine {
                 decision_reason = "invalid_page_number",
                 "open_storage_cursor: invalid root page number"
             );
-            return false;
+            return Ok(false);
         };
 
         let has_txn = self.txn_page_io.is_some();
@@ -16973,7 +16984,7 @@ impl VdbeEngine {
                     backend_kind = existing.cursor.kind_str(),
                     "open_storage_cursor: reused retained cursor"
                 );
-                return true;
+                return Ok(true);
             }
         }
         let mut mem_decision_reason = "no_pager_transaction";
@@ -17001,6 +17012,9 @@ impl VdbeEngine {
                 // MemDatabase allocates root pages beyond the pager's db_size.
                 let page_data = match page_io.read_page(&txn_cx, root_pgno).await {
                     Ok(bytes) => bytes,
+                    // Cancellation is terminal for this execution. It cannot
+                    // authorize a successful read from a transient snapshot.
+                    Err(FrankenError::Abort) => return Err(FrankenError::Abort),
                     Err(err) => {
                         // Check if MemDatabase can serve this table.
                         let has_mem_table = self
@@ -17058,7 +17072,7 @@ impl VdbeEngine {
                             reject_mem_fallback = self.reject_mem_fallback,
                             "open_storage_cursor: failed to read root page from pager"
                         );
-                        return false;
+                        return Ok(false);
                     }
                 };
                 let hdr_offset = header_offset_for_page(root_pgno);
@@ -17077,7 +17091,7 @@ impl VdbeEngine {
                     &txn_cx,
                     self.page_size,
                 )
-                .await;
+                .await?;
                 // bd-bld9w: adopt this database's TEXT encoding from the page-1
                 // header so the Column decode hot path (which reads
                 // `self.text_encoding`) decodes UTF-16 TEXT correctly. `Utf8`
@@ -17191,7 +17205,7 @@ impl VdbeEngine {
                         is_table_btree,
                         "open_storage_cursor: routed through pager transaction"
                     );
-                    return true;
+                    return Ok(true);
                 }
 
                 // For writable cursors on truly zeroed pages (e.g., freshly
@@ -17268,7 +17282,11 @@ impl VdbeEngine {
                             error = %err,
                             "open_storage_cursor: failed to initialize writable root page in pager"
                         );
-                        return false;
+                        return if matches!(err, FrankenError::Abort) {
+                            Err(err)
+                        } else {
+                            Ok(false)
+                        };
                     }
                     let mut cursor = BtCursor::new_with_index_desc(
                         page_io.clone(),
@@ -17347,7 +17365,7 @@ impl VdbeEngine {
                         is_table_btree,
                         "open_storage_cursor: initialized empty root page via pager"
                     );
-                    return true;
+                    return Ok(true);
                 }
 
                 // If the page is zero/invalid but MemDatabase has this table
@@ -17384,7 +17402,7 @@ impl VdbeEngine {
                         has_mem_table,
                         "open_storage_cursor: refusing on invalid transaction-backed root page"
                     );
-                    return false;
+                    return Ok(false);
                 }
                 // else: fall through to MemDatabase path
                 mem_decision_reason = "txn_page_invalid_mem_fallback";
@@ -17435,7 +17453,7 @@ impl VdbeEngine {
                 decision_reason = "parity_cert_rejection",
                 "open_storage_cursor: MemPageStore fallback rejected in parity-cert mode"
             );
-            return false;
+            return Ok(false);
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
@@ -17475,8 +17493,12 @@ impl VdbeEngine {
         {
             for row in &table.rows {
                 let payload = encode_record_with_encoding(&row.values, self.text_encoding);
-                if cursor.table_insert(&cx, row.rowid, &payload).await.is_err() {
-                    return false;
+                if let Err(err) = cursor.table_insert(&cx, row.rowid, &payload).await {
+                    return if matches!(err, FrankenError::Abort) {
+                        Err(err)
+                    } else {
+                        Ok(false)
+                    };
                 }
             }
         }
@@ -17539,7 +17561,7 @@ impl VdbeEngine {
             is_table_btree,
             "open_storage_cursor: routed through MemPageStore fallback"
         );
-        true
+        Ok(true)
     }
 
     fn trace_opcode(&self, pc: usize, op: &VdbeOp) {
@@ -20307,7 +20329,8 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(cursor_id, index_root, true)),
+            run_async(engine.open_storage_cursor(cursor_id, index_root, true))
+                .expect("storage cursor open should not error"),
             "index storage cursor should open"
         );
 
@@ -20352,7 +20375,8 @@ mod tests {
         )]));
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "NOCASE index storage cursor should open"
         );
 
@@ -20389,7 +20413,8 @@ mod tests {
         )]));
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "NOCASE index storage cursor should open"
         );
 
@@ -20419,7 +20444,8 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "index storage cursor should open"
         );
 
@@ -20454,7 +20480,8 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "index storage cursor should open"
         );
 
@@ -20497,7 +20524,8 @@ mod tests {
             vec![Some("NOCASE".to_owned())],
         )]));
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "NOCASE index storage cursor should open"
         );
 
@@ -20544,7 +20572,8 @@ mod tests {
             vec![Some("NOCASE".to_owned())],
         )]));
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "NOCASE index storage cursor should open"
         );
 
@@ -20590,7 +20619,8 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "index storage cursor should open"
         );
 
@@ -20707,7 +20737,8 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
             "index storage cursor should open"
         );
 
@@ -20780,8 +20811,14 @@ mod tests {
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, index_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, table_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, table_root, true))
+                .expect("storage cursor open should not error")
+        );
 
         {
             let index_cursor = engine
@@ -20882,7 +20919,10 @@ mod tests {
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error")
+        );
 
         {
             let index_cursor = engine
@@ -22121,7 +22161,10 @@ mod tests {
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, false))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, root);
         {
             let sc = engine
@@ -22516,7 +22559,10 @@ mod tests {
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, false))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, root);
         {
             let sc = engine
@@ -22600,7 +22646,10 @@ mod tests {
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, root);
         {
             let sc = engine
@@ -23138,8 +23187,14 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
 
         let payload = encode_record(&[SqliteValue::Integer(99)]);
         {
@@ -28349,7 +28404,10 @@ mod tests {
         engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
         engine.set_reject_mem_fallback(false);
 
-        assert!(run_async(engine.open_storage_cursor(0, root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, root);
         {
             let sc = engine
@@ -29913,8 +29971,14 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -30009,8 +30073,14 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -30103,8 +30173,14 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -30176,8 +30252,14 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -30248,8 +30330,14 @@ mod tests {
             .into_boxed_slice(),
         )]));
 
-        assert!(run_async(engine.open_storage_cursor(0, table_root, true)));
-        assert!(run_async(engine.open_storage_cursor(1, index_root, true)));
+        assert!(
+            run_async(engine.open_storage_cursor(0, table_root, true))
+                .expect("storage cursor open should not error")
+        );
+        assert!(
+            run_async(engine.open_storage_cursor(1, index_root, true))
+                .expect("storage cursor open should not error")
+        );
         engine.cursor_root_pages.insert(0, table_root);
         engine.cursor_root_pages.insert(1, index_root);
 
@@ -30931,7 +31019,7 @@ mod tests {
         engine.set_transaction(txn);
 
         // open_storage_cursor should succeed using the Txn backend.
-        let opened = run_async(engine.open_storage_cursor(0, root, false));
+        let opened = run_async(engine.open_storage_cursor(0, root, false)).unwrap();
         assert!(opened);
 
         // Verify the cursor exists in storage_cursors.
@@ -30960,7 +31048,7 @@ mod tests {
         engine.set_index_desc_flags_by_root_page(HashMap::from([(root, vec![true])]));
 
         assert!(
-            run_async(engine.open_storage_cursor(0, root, true)),
+            run_async(engine.open_storage_cursor(0, root, true)).unwrap(),
             "writable txn-backed index cursor should open on a fresh root page"
         );
 
@@ -31016,7 +31104,7 @@ mod tests {
         engine.set_transaction(txn);
 
         assert!(
-            run_async(engine.open_storage_cursor(0, root_pgno.get() as i32, true)),
+            run_async(engine.open_storage_cursor(0, root_pgno.get() as i32, true)).unwrap(),
             "txn-backed writable cursor should open on a fresh reserved-byte root page"
         );
 
@@ -31087,7 +31175,7 @@ mod tests {
         // delta isolates exactly the zero-page initialization path.
         let before = vdbe_metrics_snapshot();
         assert!(
-            run_async(engine.open_storage_cursor(0, root_pgno.get() as i32, true)),
+            run_async(engine.open_storage_cursor(0, root_pgno.get() as i32, true)).unwrap(),
             "txn-backed writable cursor should open on a fresh zeroed root page"
         );
         let after = vdbe_metrics_snapshot();
@@ -31147,7 +31235,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(7, root_page, true)),
+            run_async(engine.open_storage_cursor(7, root_page, true)).unwrap(),
             "manual storage cursor open should succeed"
         );
         assert_eq!(
@@ -32125,7 +32213,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true)).unwrap(),
             "index storage cursor should open"
         );
 
@@ -32167,7 +32255,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true)).unwrap(),
             "index storage cursor should open"
         );
 
@@ -32230,7 +32318,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true)).unwrap(),
             "index storage cursor should open"
         );
 
@@ -32439,7 +32527,7 @@ mod tests {
         engine.set_index_desc_flags_by_root_page(HashMap::from([(index_root, vec![true])]));
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true)).unwrap(),
             "descending index storage cursor should open"
         );
 
@@ -32490,7 +32578,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         assert!(
-            run_async(engine.open_storage_cursor(0, index_root, true)),
+            run_async(engine.open_storage_cursor(0, index_root, true)).unwrap(),
             "index storage cursor should open"
         );
 
@@ -32595,7 +32683,7 @@ mod tests {
         handle.lock().mark_aborted();
         engine.set_transaction_concurrent(txn, session_id, handle, lock_table, commit_index, 5000);
 
-        let opened = run_async(engine.open_storage_cursor(0, root, true));
+        let opened = run_async(engine.open_storage_cursor(0, root, true)).unwrap();
         assert!(
             !opened,
             "write-init errors must fail cursor open instead of silently falling back to Mem"
@@ -32628,7 +32716,7 @@ mod tests {
         engine.set_transaction(txn);
         engine.set_reject_mem_fallback(false);
 
-        let opened = run_async(engine.open_storage_cursor(0, root, true));
+        let opened = run_async(engine.open_storage_cursor(0, root, true)).unwrap();
         assert!(
             !opened,
             "writable cursor opens must fail when pager reads error instead of falling back to Mem"
@@ -32693,10 +32781,88 @@ mod tests {
         engine.set_reject_mem_fallback(false);
         let opened = run_async(engine.open_storage_cursor(0, root, false));
         assert!(
-            !opened,
+            matches!(opened, Err(FrankenError::Abort)),
             "an actual pager Abort must not authorize an empty MemPageStore cursor"
         );
         assert!(!engine.storage_cursors.contains_key(&0));
+        let page_io = engine
+            .txn_page_io
+            .as_ref()
+            .expect("real pager remains attached");
+        assert!(
+            matches!(
+                run_async(btree_cursor_page_layout_for_reader_or_default(
+                    page_io,
+                    &cancelled,
+                    PageSize::MIN,
+                )),
+                Err(FrankenError::Abort)
+            ),
+            "an actual page-one read Abort must not authorize a default page layout"
+        );
+
+        struct CancelDuringCompare {
+            cx: Cx,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl fsqlite_func::collation::CollationFunction for CancelDuringCompare {
+            fn name(&self) -> &str {
+                "CANCEL_DURING_COMPARE"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
+                self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+                self.cx.cancel();
+                left.cmp(right)
+            }
+        }
+
+        // Enter execute with a live context, then cancel from a real registered
+        // collation between the entry checkpoint and the cursor-open opcode.
+        // A pre-cancelled execute call would stop before reaching the pager.
+        for opcode in [Opcode::OpenRead, Opcode::OpenWrite] {
+            let execution_cx = Cx::new();
+            execution_cx.transition_to_running();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+            registry
+                .lock()
+                .expect("collation registry")
+                .register(CancelDuringCompare {
+                    cx: execution_cx.clone(),
+                    calls: Arc::clone(&calls),
+                });
+            engine.set_execution_cx(execution_cx);
+            engine.set_collation_registry(registry);
+
+            let mut program = ProgramBuilder::new();
+            let left = program.alloc_regs(1);
+            let right = program.alloc_regs(1);
+            program.emit_op(Opcode::String8, 0, left, 0, P4::Str("left".to_owned()), 0);
+            program.emit_op(Opcode::String8, 0, right, 0, P4::Str("right".to_owned()), 0);
+            program.emit_op(
+                Opcode::Compare,
+                left,
+                right,
+                1,
+                P4::Collation("CANCEL_DURING_COMPARE".to_owned()),
+                0,
+            );
+            program.emit_op(opcode, 0, root, 0, P4::None, 0);
+            program.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let program = program.finish().expect("cursor-open program");
+            assert_eq!(calls.load(AtomicOrdering::Relaxed), 0);
+            observe_execution_cancellation(&engine.execution_cx)
+                .expect("execution must begin with a live context");
+            let outcome = run_async(engine.execute(&program));
+            assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+            assert!(
+                matches!(outcome, Err(FrankenError::Abort)),
+                "{opcode:?} must preserve the pager cancellation through execute: {outcome:?}"
+            );
+            assert!(!engine.storage_cursors.contains_key(&0));
+        }
     }
 
     #[test]
@@ -32713,7 +32879,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         // Without a transaction, should fall back to Mem backend.
-        let opened = run_async(engine.open_storage_cursor(0, root, false));
+        let opened = run_async(engine.open_storage_cursor(0, root, false)).unwrap();
         assert!(opened);
         assert!(engine.storage_cursors.contains_key(&0));
     }
@@ -32731,7 +32897,7 @@ mod tests {
 
         // MockTransaction synthesizes page bytes from the page number; page 256
         // yields first byte 0x00, simulating an uninitialized root page.
-        let opened = run_async(engine.open_storage_cursor(0, 256, false));
+        let opened = run_async(engine.open_storage_cursor(0, 256, false)).unwrap();
         assert!(
             !opened,
             "transaction-backed opens must not silently fall back to MemPageStore"
@@ -32759,7 +32925,7 @@ mod tests {
         engine.set_transaction(txn);
         engine.set_reject_mem_fallback(false);
 
-        let opened = run_async(engine.open_storage_cursor(0, root, true));
+        let opened = run_async(engine.open_storage_cursor(0, root, true)).unwrap();
         assert!(
             !opened,
             "writable cursor opens must fail on invalid pager pages instead of falling back to Mem"
@@ -34416,7 +34582,7 @@ mod tests {
         engine.set_reject_mem_fallback(false);
 
         // No txn_page_io set — should fall back to MemPageStore.
-        assert!(run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(run_async(engine.open_storage_cursor(0, root, false)).unwrap());
         assert!(engine.storage_cursors.get(&0).is_some());
     }
 
@@ -34436,7 +34602,7 @@ mod tests {
         engine.set_reject_mem_fallback(true);
 
         // No txn_page_io set — parity-cert should reject the fallback.
-        assert!(!run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(!run_async(engine.open_storage_cursor(0, root, false)).unwrap());
         assert!(engine.storage_cursors.get(&0).is_none());
     }
 
@@ -34444,7 +34610,7 @@ mod tests {
     fn test_open_storage_cursor_invalid_page_number() {
         // Root page 0 is invalid (PageNumber requires nonzero).
         let mut engine = VdbeEngine::new(8);
-        assert!(!run_async(engine.open_storage_cursor(0, 0, false)));
+        assert!(!run_async(engine.open_storage_cursor(0, 0, false)).unwrap());
     }
 
     #[test]
@@ -34784,7 +34950,7 @@ mod tests {
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
-        assert!(run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(run_async(engine.open_storage_cursor(0, root, false)).unwrap());
         assert!(
             engine.has_mem_cursor(),
             "cursor should be mem-backed without txn"
@@ -34804,7 +34970,7 @@ mod tests {
         engine.set_transaction(txn);
 
         // Open cursor on page 1 (valid with pager txn).
-        assert!(run_async(engine.open_storage_cursor(0, 1, false)));
+        assert!(run_async(engine.open_storage_cursor(0, 1, false)).unwrap());
         assert!(
             engine.all_cursors_are_txn_backed(),
             "cursor should be txn-backed with pager transaction"
@@ -34834,7 +35000,7 @@ mod tests {
         engine.set_transaction(txn);
         engine.set_reject_mem_fallback(true);
 
-        assert!(run_async(engine.open_storage_cursor(0, 1, false)));
+        assert!(run_async(engine.open_storage_cursor(0, 1, false)).unwrap());
         assert!(
             engine.validate_parity_cert_invariant().is_ok(),
             "txn-backed cursor satisfies parity-cert invariant"
@@ -34850,7 +35016,7 @@ mod tests {
         engine.set_database(db);
         // Explicitly disable parity-cert — mem cursors allowed.
         engine.set_reject_mem_fallback(false);
-        assert!(run_async(engine.open_storage_cursor(0, root, false)));
+        assert!(run_async(engine.open_storage_cursor(0, root, false)).unwrap());
         assert!(
             engine.validate_parity_cert_invariant().is_ok(),
             "parity-cert disabled should always pass"
@@ -34875,7 +35041,7 @@ mod tests {
         let mut engine = VdbeEngine::new(8);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
-        run_async(engine.open_storage_cursor(0, root, false));
+        run_async(engine.open_storage_cursor(0, root, false)).unwrap();
 
         let sc = engine.storage_cursors.get(&0).unwrap();
         assert_eq!(sc.cursor.kind_str(), "mem");
@@ -34896,7 +35062,7 @@ mod tests {
         engine.set_reject_mem_fallback(true);
 
         // Attempt to open cursor — should fail.
-        let opened = run_async(engine.open_storage_cursor(0, root, false));
+        let opened = run_async(engine.open_storage_cursor(0, root, false)).unwrap();
         assert!(
             !opened,
             "ratchet must prevent cursor creation in parity-cert mode"
@@ -34920,7 +35086,7 @@ mod tests {
         engine.set_reject_mem_fallback(true);
 
         // With txn set, cursor creation should succeed via pager path.
-        let opened = run_async(engine.open_storage_cursor(0, 1, false));
+        let opened = run_async(engine.open_storage_cursor(0, 1, false)).unwrap();
         assert!(opened, "txn-backed cursor should work in parity-cert mode");
         assert!(engine.all_cursors_are_txn_backed());
         assert!(engine.validate_parity_cert_invariant().is_ok());
@@ -34939,12 +35105,12 @@ mod tests {
         engine.set_reject_mem_fallback(true);
 
         // Open cursor 0 on page 1 — should succeed (txn path).
-        assert!(run_async(engine.open_storage_cursor(0, 1, false)));
+        assert!(run_async(engine.open_storage_cursor(0, 1, false)).unwrap());
         assert!(engine.all_cursors_are_txn_backed());
 
         // Attempt cursor 1 on non-existent high page — should still
         // succeed via txn path (MockMvccPager returns zero-filled pages).
-        assert!(run_async(engine.open_storage_cursor(1, 1, false)));
+        assert!(run_async(engine.open_storage_cursor(1, 1, false)).unwrap());
         assert!(engine.all_cursors_are_txn_backed());
         assert!(engine.validate_parity_cert_invariant().is_ok());
     }
