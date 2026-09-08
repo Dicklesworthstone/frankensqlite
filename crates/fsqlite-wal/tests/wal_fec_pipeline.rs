@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::runtime::RuntimeBuilder;
@@ -12,6 +14,219 @@ use fsqlite_wal::{
 use tempfile::tempdir;
 
 const PAGE_SIZE: u32 = 4096;
+
+#[derive(Clone, Default)]
+struct RepairLogCapture {
+    events: Arc<Mutex<Vec<RepairLogEvent>>>,
+}
+
+struct RepairLogEvent {
+    level: tracing::Level,
+    fields: BTreeMap<String, String>,
+}
+
+impl tracing::field::Visit for RepairLogEvent {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl tracing::Subscriber for RepairLogCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "fsqlite_wal::wal_fec"
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut captured = RepairLogEvent {
+            level: *event.metadata().level(),
+            fields: BTreeMap::new(),
+        };
+        event.record(&mut captured);
+        self.events.lock().unwrap().push(captured);
+    }
+}
+
+#[test]
+fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
+    const CHILD_ENV: &str = "FSQLITE_WAL_FEC_LOG_CAPTURE_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // A process-wide collector sees the blocking-pool thread as well as
+        // the async worker, without changing other tests' tracing or timing.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repair_pipeline_emits_bounded_diagnostics_with_exact_totals",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let capture = RepairLogCapture::default();
+    tracing::subscriber::set_global_default(capture.clone()).unwrap();
+    let temp_dir = tempdir().unwrap();
+    let path = temp_dir.path().join("diagnostics.wal-fec");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            &cx,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 64,
+                per_symbol_delay: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        let producer = pipeline.producer().unwrap();
+        let permits = (0..64)
+            .map(|_| producer.try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        for _ in 0..32 {
+            assert!(matches!(
+                producer.try_reserve(),
+                Err(fsqlite_error::FrankenError::Busy)
+            ));
+        }
+        assert_eq!(
+            pipeline.stats().pending_jobs,
+            0,
+            "reserved capacity is not durable backlog"
+        );
+        drop(permits);
+        for frame in 1..=64 {
+            pipeline
+                .enqueue(sample_work_item(&path, frame, 1, 1, 4, b"log-capture", 512))
+                .unwrap();
+        }
+        assert!(
+            pipeline
+                .enqueue(sample_work_item(&path, 65, 1, 1, 4, b"log-capture", 512))
+                .is_err()
+        );
+        assert!(pipeline.flush(&cx, Duration::from_secs(30)).await);
+        pipeline
+            .enqueue(sample_work_item(&path, 65, 1, 1, 4, b"log-capture", 512))
+            .unwrap();
+        let mut invalid = sample_work_item(&path, 66, 1, 1, 4, b"log-capture", 512);
+        invalid.source_pages.clear();
+        pipeline.enqueue(invalid).unwrap();
+        let stats = pipeline.shutdown(&cx).await.unwrap();
+        assert_eq!(stats.completed_jobs, 65);
+        assert_eq!(stats.failed_jobs, 1);
+        assert_eq!(stats.pending_jobs, 0);
+    });
+    assert_eq!(
+        scan_wal_fec(&std::fs::read(&path).unwrap())
+            .unwrap()
+            .groups
+            .len(),
+        65
+    );
+    let events = capture.events.lock().unwrap();
+    let matching = |message: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("message")
+                    .is_some_and(|value| value == message)
+            })
+            .collect::<Vec<_>>()
+    };
+    let groups = matching("wal-fec group repair generation completed");
+    assert_eq!(groups.len(), 2, "DEBUG samples the first and 64th group");
+    for (event, total) in groups.iter().zip(["1", "64"]) {
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        assert_eq!(event.fields["processed_groups"], total);
+        assert_eq!(event.fields["source_frames"], "1");
+        assert_eq!(event.fields["repair_symbols"], "1");
+        assert!(event.fields.contains_key("group_id"));
+    }
+    let pressure =
+        matching("wal-fec repair admission capacity exhausted (including reserved slots)");
+    assert_eq!(
+        pressure.len(),
+        6,
+        "WARN retries are sampled at powers of two"
+    );
+    for (event, total) in pressure.iter().zip(["1", "2", "4", "8", "16", "32"]) {
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.fields["rejected_admissions"], total);
+        assert_eq!(event.fields["pending_jobs"], "0");
+        assert_eq!(event.fields["queue_capacity"], "64");
+    }
+    let backlog =
+        matching("wal-fec repair backlog near queue limit (pending includes in-flight work)");
+    assert!(!backlog.is_empty());
+    assert_eq!(backlog[0].level, tracing::Level::WARN);
+    assert_eq!(backlog[0].fields["pending_jobs"], "64");
+    let summaries = matching("wal-fec repair worker throughput summary");
+    assert_eq!(
+        summaries.len(),
+        2,
+        "INFO reports periodic and final totals, not each job"
+    );
+    assert_eq!(summaries[0].fields["completed_jobs"], "64");
+    assert_eq!(summaries[0].fields["final_summary"], "false");
+    let final_event = summaries[1];
+    assert_eq!(final_event.level, tracing::Level::INFO);
+    for (field, value) in [
+        ("completed_jobs", "65"),
+        ("failed_jobs", "1"),
+        ("canceled_jobs", "0"),
+        ("pending_jobs", "0"),
+        ("processed_groups", "65"),
+        ("rejected_admissions", "33"),
+        ("final_summary", "true"),
+    ] {
+        assert_eq!(final_event.fields[field], value);
+    }
+    let rate = final_event.fields["completed_jobs_per_second"]
+        .parse::<f64>()
+        .unwrap();
+    let seconds = final_event.fields["elapsed_seconds"]
+        .parse::<f64>()
+        .unwrap();
+    assert!(rate.is_finite() && rate > 0.0 && seconds > 0.0);
+    assert!((rate * seconds - 65.0).abs() < 1e-6);
+    let failures = matching("wal-fec repair work item failed");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].level, tracing::Level::ERROR);
+    assert!(failures[0].fields.contains_key("error"));
+    for event in groups
+        .iter()
+        .chain(&pressure)
+        .chain(&backlog)
+        .chain(&summaries)
+        .chain(&failures)
+    {
+        assert_eq!(
+            event.fields["pipeline_id"],
+            final_event.fields["pipeline_id"]
+        );
+    }
+    assert!(matching("wal-fec repair work item completed").is_empty());
+}
 
 #[test]
 fn repair_pipeline_refuses_inline_blocking_fallback() {

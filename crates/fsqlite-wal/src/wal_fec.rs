@@ -1540,6 +1540,55 @@ pub struct WalFecRepairPipelineStats {
     pub max_pending_jobs: usize,
 }
 
+// Sample by work count so burst logging is bounded without clocks or logging
+// locks on successful durable admission. Summaries retain the full counters.
+const WAL_FEC_LOG_SAMPLE_INTERVAL: usize = 64;
+static NEXT_WAL_FEC_PIPELINE_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Debug)]
+struct WalFecRepairDiagnostics {
+    // Process-local correlation only; never used for admission or durability.
+    pipeline_id: usize,
+    queue_capacity: usize,
+    rejected_admissions: AtomicUsize,
+    processed_groups: AtomicUsize,
+}
+
+impl WalFecRepairDiagnostics {
+    fn record_full(&self, pending_jobs: usize) {
+        let rejected_admissions = self.rejected_admissions.fetch_add(1, Ordering::Relaxed) + 1;
+        // Repeated retries must not flood logs. The final summary includes
+        // every rejection, including those after the last power-of-two sample.
+        if rejected_admissions.is_power_of_two() {
+            warn!(
+                pipeline_id = self.pipeline_id,
+                queue_capacity = self.queue_capacity,
+                pending_jobs,
+                rejected_admissions,
+                "wal-fec repair admission capacity exhausted (including reserved slots)"
+            );
+        }
+    }
+
+    fn record_group(&self, sidecar_path: &Path, meta: &WalFecGroupMeta) {
+        // Catch-up may encode an already-present group before deduplication;
+        // this counts processing, not newly protected commits.
+        let processed_groups = self.processed_groups.fetch_add(1, Ordering::Relaxed) + 1;
+        if processed_groups == 1 || processed_groups.is_multiple_of(WAL_FEC_LOG_SAMPLE_INTERVAL) {
+            debug!(
+                pipeline_id = self.pipeline_id,
+                sidecar_path = %sidecar_path.display(),
+                group_id = %meta.group_id(),
+                source_frames = meta.k_source,
+                repair_symbols = meta.r_repair,
+                processed_groups,
+                sample_interval_groups = WAL_FEC_LOG_SAMPLE_INTERVAL,
+                "wal-fec group repair generation completed"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WalFecPipelineMessage {
     Work(WalFecRepairWorkItem),
@@ -1664,6 +1713,7 @@ pub struct WalFecRepairProducer {
     max_pending_jobs: Arc<AtomicUsize>,
     repair_symbols: Arc<AtomicU8>,
     ordering: Arc<WalFecProducerOrdering>,
+    diagnostics: Arc<WalFecRepairDiagnostics>,
 }
 
 impl WalFecRepairProducer {
@@ -1676,7 +1726,11 @@ impl WalFecRepairProducer {
             ));
         }
         let permit = self.sender.try_reserve().map_err(|err| match err {
-            mpsc::SendError::Full(()) => FrankenError::Busy,
+            mpsc::SendError::Full(()) => {
+                self.diagnostics
+                    .record_full(self.pending_jobs.load(Ordering::SeqCst));
+                FrankenError::Busy
+            }
             mpsc::SendError::Disconnected(()) | mpsc::SendError::Cancelled(()) => {
                 FrankenError::BackgroundWorkerFailed(
                     "wal-fec repair worker disconnected".to_owned(),
@@ -1751,6 +1805,38 @@ struct WalFecRepairWorkerState {
     failed_jobs: Arc<AtomicUsize>,
     canceled_jobs: Arc<AtomicUsize>,
     worker_failure: Arc<Mutex<Option<String>>>,
+    diagnostics: Arc<WalFecRepairDiagnostics>,
+}
+
+impl WalFecRepairWorkerState {
+    #[allow(clippy::cast_precision_loss)] // Approximate diagnostic rate, never accounting.
+    fn log_summary(&self, started: Instant, final_summary: bool) {
+        let completed_jobs = self.completed_jobs.load(Ordering::SeqCst);
+        let failed_jobs = self.failed_jobs.load(Ordering::SeqCst);
+        let canceled_jobs = self.canceled_jobs.load(Ordering::SeqCst);
+        let rejected_admissions = self.diagnostics.rejected_admissions.load(Ordering::Relaxed);
+        if completed_jobs == 0 && failed_jobs == 0 && canceled_jobs == 0 && rejected_admissions == 0
+        {
+            return;
+        }
+        let elapsed_seconds = started.elapsed().as_secs_f64();
+        info!(
+            pipeline_id = self.diagnostics.pipeline_id,
+            completed_jobs,
+            failed_jobs,
+            canceled_jobs,
+            pending_jobs = self.pending_jobs.load(Ordering::SeqCst),
+            processed_groups = self.diagnostics.processed_groups.load(Ordering::Relaxed),
+            rejected_admissions,
+            queue_capacity = self.diagnostics.queue_capacity,
+            elapsed_seconds,
+            completed_jobs_per_second = completed_jobs as f64 / elapsed_seconds.max(f64::EPSILON),
+            final_summary,
+            // A job can span several commits or revisit existing sidecar
+            // groups. This is worker throughput, not SQL commit throughput.
+            "wal-fec repair worker throughput summary"
+        );
+    }
 }
 
 /// Background worker that computes and appends WAL-FEC repair symbols.
@@ -1758,6 +1844,7 @@ pub struct WalFecRepairPipeline {
     closing: Arc<AtomicBool>,
     repair_symbols: Arc<AtomicU8>,
     ordering: Arc<WalFecProducerOrdering>,
+    diagnostics: Arc<WalFecRepairDiagnostics>,
     sender: Option<mpsc::Sender<WalFecPipelineMessage>>,
     cancel_flag: Arc<AtomicBool>,
     pending_jobs: Arc<AtomicUsize>,
@@ -1832,6 +1919,12 @@ impl WalFecRepairPipeline {
         let canceled_jobs = Arc::new(AtomicUsize::new(0));
         let max_pending_jobs = Arc::new(AtomicUsize::new(0));
         let worker_failure = Arc::new(Mutex::new(None));
+        let diagnostics = Arc::new(WalFecRepairDiagnostics {
+            pipeline_id: NEXT_WAL_FEC_PIPELINE_ID.fetch_add(1, Ordering::Relaxed),
+            queue_capacity: config.queue_capacity,
+            rejected_admissions: AtomicUsize::new(0),
+            processed_groups: AtomicUsize::new(0),
+        });
         let worker_state = WalFecRepairWorkerState {
             closing: Arc::clone(&closing),
             cancel_flag: Arc::clone(&cancel_flag),
@@ -1840,6 +1933,7 @@ impl WalFecRepairPipeline {
             failed_jobs: Arc::clone(&failed_jobs),
             canceled_jobs: Arc::clone(&canceled_jobs),
             worker_failure: Arc::clone(&worker_failure),
+            diagnostics: Arc::clone(&diagnostics),
         };
 
         // bd-gwoi0: `create_child_for_spawn` is the spawn-correct primitive for a
@@ -1871,6 +1965,7 @@ impl WalFecRepairPipeline {
             closing,
             repair_symbols,
             ordering: Arc::new(WalFecProducerOrdering::default()),
+            diagnostics,
             sender: Some(tx),
             cancel_flag,
             pending_jobs,
@@ -1895,6 +1990,7 @@ impl WalFecRepairPipeline {
             max_pending_jobs: Arc::clone(&self.max_pending_jobs),
             repair_symbols: Arc::clone(&self.repair_symbols),
             ordering: Arc::clone(&self.ordering),
+            diagnostics: Arc::clone(&self.diagnostics),
         })
     }
 
@@ -1919,6 +2015,8 @@ impl WalFecRepairPipeline {
             Ok(()) => Ok(()),
             Err(mpsc::SendError::Full(_)) => {
                 self.pending_jobs.fetch_sub(1, Ordering::SeqCst);
+                self.diagnostics
+                    .record_full(self.pending_jobs.load(Ordering::SeqCst));
                 Err(FrankenError::WalCorrupt {
                     detail: "wal-fec repair pipeline queue full".to_owned(),
                 })
@@ -2045,6 +2143,8 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
     per_symbol_delay: Duration,
     region_task: Arc<G>,
 ) {
+    let started = Instant::now();
+    let mut last_backlog_warning = None::<Instant>;
     let Some(native_worker_cx) = NativeCx::current() else {
         record_worker_failure(
             &state.worker_failure,
@@ -2055,6 +2155,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
             state.pending_jobs.as_ref(),
             state.canceled_jobs.as_ref(),
         );
+        state.log_summary(started, true);
         return;
     };
     worker_cx.set_native_cx(native_worker_cx.clone());
@@ -2091,6 +2192,20 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
 
         match message {
             work @ (WalFecPipelineMessage::Work(_) | WalFecPipelineMessage::Committed(_)) => {
+                let pending_jobs = state.pending_jobs.load(Ordering::SeqCst);
+                let queue_capacity = state.diagnostics.queue_capacity;
+                if pending_jobs >= queue_capacity - queue_capacity / 4
+                    && last_backlog_warning
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                {
+                    last_backlog_warning = Some(Instant::now());
+                    warn!(
+                        pipeline_id = state.diagnostics.pipeline_id,
+                        pending_jobs,
+                        queue_capacity,
+                        "wal-fec repair backlog near queue limit (pending includes in-flight work)"
+                    );
+                }
                 let group_id = match &work {
                     WalFecPipelineMessage::Work(item) => item.meta.group_id(),
                     WalFecPipelineMessage::Committed(work) => WalFecGroupId {
@@ -2123,6 +2238,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     let native_worker_cx_for_work = native_worker_cx.clone();
                     let work_region_task = Arc::clone(&region_task);
                     let work_for_attempt = Arc::clone(&work);
+                    let diagnostics = Arc::clone(&state.diagnostics);
                     let outcome = spawn_blocking(move || {
                         // Retain region accounting even if cancellation drops
                         // the async waiter before this closure exits.
@@ -2135,6 +2251,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                                     &work_cx,
                                     &cancel_flag_for_work,
                                     per_symbol_delay,
+                                    &diagnostics,
                                 ),
                                 WalFecPipelineMessage::Committed(ordered) => {
                                     process_committed_wal_range(
@@ -2142,6 +2259,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                                         &work_cx,
                                         &cancel_flag_for_work,
                                         per_symbol_delay,
+                                        &diagnostics,
                                     )
                                 }
                                 WalFecPipelineMessage::Shutdown => unreachable!(),
@@ -2167,15 +2285,15 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                 state.pending_jobs.fetch_sub(1, Ordering::SeqCst);
                 match outcome {
                     Ok(Ok(WalFecWorkOutcome::Completed)) => {
-                        state.completed_jobs.fetch_add(1, Ordering::SeqCst);
-                        info!(
-                            group_id = %group_id,
-                            "wal-fec repair work item completed"
-                        );
+                        let completed = state.completed_jobs.fetch_add(1, Ordering::SeqCst) + 1;
+                        if completed.is_multiple_of(WAL_FEC_LOG_SAMPLE_INTERVAL) {
+                            state.log_summary(started, false);
+                        }
                     }
                     Ok(Ok(WalFecWorkOutcome::Canceled)) => {
                         state.canceled_jobs.fetch_add(1, Ordering::SeqCst);
                         warn!(
+                            pipeline_id = state.diagnostics.pipeline_id,
                             group_id = %group_id,
                             "wal-fec repair work item canceled before append"
                         );
@@ -2183,6 +2301,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     Ok(Err(err)) => {
                         state.failed_jobs.fetch_add(1, Ordering::SeqCst);
                         error!(
+                            pipeline_id = state.diagnostics.pipeline_id,
                             group_id = %group_id,
                             error = %err,
                             "wal-fec repair work item failed"
@@ -2194,7 +2313,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                             "wal-fec repair worker task panicked while processing group {group_id}"
                         );
                         record_worker_failure(&state.worker_failure, detail.clone());
-                        error!(group_id = %group_id, "{detail}");
+                        error!(pipeline_id = state.diagnostics.pipeline_id, group_id = %group_id, "{detail}");
                         drain_abandoned_work(
                             &mut receiver,
                             state.pending_jobs.as_ref(),
@@ -2221,6 +2340,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
             WalFecPipelineMessage::Shutdown => {}
         }
     }
+    state.log_summary(started, true);
 }
 
 fn record_worker_failure(worker_failure: &Mutex<Option<String>>, detail: String) {
@@ -2280,6 +2400,7 @@ fn process_repair_work_item(
     cx: &Cx,
     cancel_flag: &AtomicBool,
     per_symbol_delay: Duration,
+    diagnostics: &WalFecRepairDiagnostics,
 ) -> Result<WalFecWorkOutcome> {
     if cancel_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
         return Ok(WalFecWorkOutcome::Canceled);
@@ -2303,6 +2424,7 @@ fn process_repair_work_item(
         return Ok(WalFecWorkOutcome::Canceled);
     }
     append_wal_fec_group(&work_item.sidecar_path, &group)?;
+    diagnostics.record_group(&work_item.sidecar_path, &group.meta);
     Ok(WalFecWorkOutcome::Completed)
 }
 
@@ -2332,6 +2454,7 @@ fn process_committed_wal_range(
     cx: &Cx,
     cancel_flag: &AtomicBool,
     per_symbol_delay: Duration,
+    diagnostics: &WalFecRepairDiagnostics,
 ) -> Result<WalFecWorkOutcome> {
     if range.end_frame_no == 0 {
         return reclaim_retired_fec_on_open(range, cx, cancel_flag);
@@ -2439,8 +2562,7 @@ fn process_committed_wal_range(
             return Ok(WalFecWorkOutcome::Canceled);
         }
         crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
-        debug!(group_id = %group.meta.group_id(), source_frames = k_source,
-            repair_symbols = range.repair_symbols, "durable WAL group is now repairable");
+        diagnostics.record_group(&wal_fec_path_for_wal(&range.wal_path), &group.meta);
         pages.clear();
         group_start = frame_no.saturating_add(1);
     }
