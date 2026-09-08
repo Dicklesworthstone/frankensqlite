@@ -14,19 +14,29 @@
 //! creates. bd-mnane's protection (reject a foreign `-lock-reserved`) is
 //! preserved.
 //!
-//! This test is platform-agnostic: it passes trivially on Linux (no advisory
-//! sidecars exist there) and is the load-bearing guard on a Windows runner,
-//! where the pre-fix code produced no target file.
+//! Both literal SQL and HFDT's exact bound-parameter call must produce a
+//! self-contained, stock-readable image with every source value intact. Only
+//! native Windows execution verifies the platform-specific ordering repair.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
 #[test]
 fn bd_dd24l_vacuum_into_writes_reserved_target_gh376() {
+    assert_vacuum_into_reserved_target(false);
+}
+
+#[test]
+fn bd_dd24l_bound_vacuum_into_writes_reserved_target_gh376() {
+    assert_vacuum_into_reserved_target(true);
+}
+
+fn assert_vacuum_into_reserved_target(bound_parameter: bool) {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let src = dir.path().join("src.db");
-        let target = dir.path().join("out.db");
+        // A quote and a space must survive parameter binding verbatim.
+        let target = dir.path().join("out ' snapshot.db");
         let src_str = src.to_string_lossy().into_owned();
         let target_str = target.to_string_lossy().into_owned();
 
@@ -53,12 +63,23 @@ fn bd_dd24l_vacuum_into_writes_reserved_target_gh376() {
 
         {
             let conn = Connection::open(&src_str).await.expect("reopen source");
-            conn.execute(&format!(
-                "VACUUM INTO '{}';",
-                target_str.replace('\'', "''")
-            ))
-            .await
-            .expect("VACUUM INTO must succeed and open its reserved target (GH#376)");
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                .await
+                .expect("checkpoint source as in the reported HFDT call sequence");
+            let result = if bound_parameter {
+                conn.execute_with_params(
+                    "VACUUM INTO ?1;",
+                    &[SqliteValue::from(target_str.clone())],
+                )
+                .await
+            } else {
+                conn.execute(&format!(
+                    "VACUUM INTO '{}';",
+                    target_str.replace('\'', "''")
+                ))
+                .await
+            };
+            result.expect("VACUUM INTO must succeed and open its reserved target (GH#376)");
             conn.close().await.expect("close source");
         }
 
@@ -68,20 +89,46 @@ fn bd_dd24l_vacuum_into_writes_reserved_target_gh376() {
             "VACUUM INTO must produce an output file (GH#376: none was produced on Windows)",
         );
 
-        // And it must be a usable copy carrying the source rows.
+        // Check the image before a FrankenSQLite reopen can repair or alter it.
+        {
+            let stock = rusqlite::Connection::open_with_flags(
+                &target,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("stock SQLite must open the vacuumed image read-only");
+            let integrity: String = stock
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .expect("stock integrity_check");
+            assert_eq!(integrity, "ok", "vacuumed image must be structurally sound");
+            let mut stmt = stock
+                .prepare("SELECT x, v FROM t ORDER BY x;")
+                .expect("prepare stock row query");
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query stock rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("read stock rows");
+            let expected: Vec<_> = (0..25).map(|i| (i, format!("row{i}"))).collect();
+            assert_eq!(rows, expected, "stock reader must recover every source value");
+        }
+
+        // And FrankenSQLite must reopen the same output with identical values.
         {
             let out = Connection::open(&target_str)
                 .await
                 .expect("open the vacuumed target");
             let rows = out
-                .query("SELECT count(*) FROM t;")
+                .query("SELECT x, v FROM t ORDER BY x;")
                 .await
                 .expect("query the vacuumed target");
-            let count = match rows[0].values()[0] {
-                SqliteValue::Integer(n) => n,
-                ref other => panic!("expected integer count, got {other:?}"),
-            };
-            assert_eq!(count, 25, "vacuumed target must carry all source rows");
+            assert_eq!(rows.len(), 25, "vacuumed target must carry all source rows");
+            for (i, row) in (0_i64..25).zip(&rows) {
+                assert_eq!(
+                    row.values(),
+                    &[SqliteValue::Integer(i), SqliteValue::from(format!("row{i}"))],
+                    "vacuumed target row {i}",
+                );
+            }
             out.close().await.expect("close target");
         }
     });
