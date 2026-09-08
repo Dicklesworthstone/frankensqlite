@@ -9,7 +9,7 @@ use fsqlite_types::{ObjectId, Oti, cx::Cx};
 use fsqlite_wal::{
     WalFecGroupMeta, WalFecGroupMetaInit, WalFecRepairPipeline, WalFecRepairPipelineConfig,
     WalFecRepairWorkItem, build_source_page_hashes, find_wal_fec_group,
-    generate_wal_fec_repair_symbols, scan_wal_fec,
+    generate_wal_fec_repair_symbols, persist_wal_fec_raptorq_repair_symbols, scan_wal_fec,
 };
 use tempfile::tempdir;
 
@@ -83,6 +83,7 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
     tracing::subscriber::set_global_default(capture.clone()).unwrap();
     let temp_dir = tempdir().unwrap();
     let path = temp_dir.path().join("diagnostics.wal-fec");
+    persist_wal_fec_raptorq_repair_symbols(&path, 1).unwrap();
     let runtime = test_runtime();
     let handle = runtime.handle();
     runtime.block_on(async {
@@ -91,15 +92,13 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
             &handle,
             &cx,
             WalFecRepairPipelineConfig {
-                queue_capacity: 64,
+                queue_capacity: 1,
                 per_symbol_delay: Duration::ZERO,
             },
         )
         .unwrap();
         let producer = pipeline.producer().unwrap();
-        let permits = (0..64)
-            .map(|_| producer.try_reserve().unwrap())
-            .collect::<Vec<_>>();
+        let permit = producer.try_reserve().unwrap();
         for _ in 0..32 {
             assert!(matches!(
                 producer.try_reserve(),
@@ -111,21 +110,20 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
             0,
             "reserved capacity is not durable backlog"
         );
-        drop(permits);
-        for frame in 1..=64 {
-            pipeline
-                .enqueue(sample_work_item(&path, frame, 1, 1, 4, b"log-capture", 512))
-                .unwrap();
-        }
+        // Hold capacity without runnable work: neither producer admission nor
+        // standalone enqueue can race the worker into an available slot.
         assert!(
             pipeline
                 .enqueue(sample_work_item(&path, 65, 1, 1, 4, b"log-capture", 512))
                 .is_err()
         );
-        assert!(pipeline.flush(&cx, Duration::from_secs(30)).await);
-        pipeline
-            .enqueue(sample_work_item(&path, 65, 1, 1, 4, b"log-capture", 512))
-            .unwrap();
+        drop(permit);
+        for frame in 1..=65 {
+            pipeline
+                .enqueue(sample_work_item(&path, frame, 1, 1, 4, b"log-capture", 512))
+                .unwrap();
+            assert!(pipeline.flush(&cx, Duration::from_secs(30)).await);
+        }
         let mut invalid = sample_work_item(&path, 66, 1, 1, 4, b"log-capture", 512);
         invalid.source_pages.clear();
         pipeline.enqueue(invalid).unwrap();
@@ -134,13 +132,7 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
         assert_eq!(stats.failed_jobs, 1);
         assert_eq!(stats.pending_jobs, 0);
     });
-    assert_eq!(
-        scan_wal_fec(&std::fs::read(&path).unwrap())
-            .unwrap()
-            .groups
-            .len(),
-        65
-    );
+    assert_eq!(scan_wal_fec(&path).unwrap().groups.len(), 65);
     let events = capture.events.lock().unwrap();
     let matching = |message: &str| {
         events
@@ -155,6 +147,14 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
     };
     let groups = matching("wal-fec group repair generation completed");
     assert_eq!(groups.len(), 2, "DEBUG samples the first and 64th group");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.level == tracing::Level::DEBUG)
+            .count(),
+        groups.len(),
+        "lower-level helpers must not emit an unsampled DEBUG event per group"
+    );
     for (event, total) in groups.iter().zip(["1", "64"]) {
         assert_eq!(event.level, tracing::Level::DEBUG);
         assert_eq!(event.fields["processed_groups"], total);
@@ -173,18 +173,30 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
         assert_eq!(event.level, tracing::Level::WARN);
         assert_eq!(event.fields["rejected_admissions"], total);
         assert_eq!(event.fields["pending_jobs"], "0");
-        assert_eq!(event.fields["queue_capacity"], "64");
+        assert_eq!(event.fields["queue_capacity"], "1");
     }
     let backlog =
         matching("wal-fec repair backlog near queue limit (pending includes in-flight work)");
     assert!(!backlog.is_empty());
     assert_eq!(backlog[0].level, tracing::Level::WARN);
-    assert_eq!(backlog[0].fields["pending_jobs"], "64");
+    assert_eq!(backlog[0].fields["pending_jobs"], "1");
     let summaries = matching("wal-fec repair worker throughput summary");
     assert_eq!(
         summaries.len(),
         2,
         "INFO reports periodic and final totals, not each job"
+    );
+    let settings = matching("persisted wal-fec repair symbol setting (new file)");
+    assert_eq!(settings.len(), 1);
+    assert_eq!(settings[0].level, tracing::Level::INFO);
+    assert_eq!(settings[0].fields["raptorq_repair_symbols"], "1");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.level == tracing::Level::INFO)
+            .count(),
+        summaries.len() + settings.len(),
+        "INFO is limited to settings and summaries, including lower-level helpers"
     );
     assert_eq!(summaries[0].fields["completed_jobs"], "64");
     assert_eq!(summaries[0].fields["final_summary"], "false");
@@ -208,7 +220,7 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
         .parse::<f64>()
         .unwrap();
     assert!(rate.is_finite() && rate > 0.0 && seconds > 0.0);
-    assert!((rate * seconds - 65.0).abs() < 1e-6);
+    assert!(rate.mul_add(seconds, -65.0).abs() < 1e-6);
     let failures = matching("wal-fec repair work item failed");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].level, tracing::Level::ERROR);

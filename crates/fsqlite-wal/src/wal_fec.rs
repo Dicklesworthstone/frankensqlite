@@ -25,7 +25,7 @@ use asupersync::runtime::{
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags, cx::Cx};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::checksum::{
@@ -3157,7 +3157,7 @@ pub fn ensure_wal_with_fec_sidecar(wal_path: &Path) -> Result<PathBuf> {
 pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> Result<()> {
     let record = encode_wal_fec_group(group)?;
     let group_id = group.meta.group_id();
-    debug!(
+    trace!(
         group_id = %group_id,
         k_source = group.meta.k_source,
         r_repair = group.meta.r_repair,
@@ -3179,7 +3179,7 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
         .open(sidecar_path)?;
     file.write_all(&record)?;
     file.sync_data()?;
-    info!(
+    trace!(
         group_id = %group_id,
         sidecar = %sidecar_path.display(),
         repair_symbols = group.repair_symbols.len(),
@@ -4236,7 +4236,7 @@ fn scan_offset_after_optional_pragma_header(bytes: &[u8]) -> Result<usize> {
     let Some(header) = WalFecPragmaHeader::from_prefix(bytes)? else {
         return Ok(0);
     };
-    debug!(
+    trace!(
         raptorq_repair_symbols = header.raptorq_repair_symbols,
         "detected wal-fec pragma header during scan"
     );
