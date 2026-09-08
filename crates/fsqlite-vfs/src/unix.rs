@@ -752,11 +752,23 @@ struct InodeInfo {
     /// caller can detect the silent downgrade (GH #343 / bd-qll76). Always
     /// `false` on Linux, which never falls back.
     flock_fallback_engaged: bool,
+    /// The `(dev, ino)` this generation is currently registered under in the
+    /// process-wide inode table — the identity every handle sharing this
+    /// state reports from `file_identity`.
+    ///
+    /// GH#416: on filesystems that number a file by its first data cluster
+    /// (macOS `msdosfs`) a zero-length file has a placeholder inode that
+    /// changes on its first write. [`InodeTable::migrate`] moves the entry to
+    /// the live key and updates this field, so every handle opened during the
+    /// placeholder phase — not only the one that observed the change — keeps
+    /// reporting one identity and finalizes against the entry it lives in.
+    key: InodeKey,
 }
 
 impl InodeInfo {
-    fn new(file: Arc<File>) -> Self {
+    fn new(key: InodeKey, file: Arc<File>) -> Self {
         Self {
+            key,
             file,
             n_ref: 0,
             n_shared: 0,
@@ -882,11 +894,94 @@ impl InodeTable {
 
         before_register();
         let canonical = opened;
-        let mut info = InodeInfo::new(Arc::clone(&canonical));
+        let mut info = InodeInfo::new(key, Arc::clone(&canonical));
         info.n_ref = 1;
         let inode_info = Arc::new(Mutex::new(info));
         map.insert(key, Arc::clone(&inode_info));
         Ok((inode_info, canonical))
+    }
+
+    /// GH#416: move a live inode generation from the key it was registered
+    /// under to the key the descriptor reports now.
+    ///
+    /// Only the placeholder-inode transition reaches here: a file that was
+    /// zero-length at open is renumbered by the filesystem on its first
+    /// write, so the `(dev, ino)` captured at open no longer names it. The
+    /// entry keeps its canonical descriptor, lock claims, and deferred
+    /// descriptors — nothing about the POSIX lock domain changes, only the
+    /// key later opens will look it up by. Both shard mutexes are taken in
+    /// index order (one when the keys share a shard) before the inode mutex,
+    /// matching every other table path.
+    ///
+    /// Fails closed when `new` already names a different live generation
+    /// (a stale entry for a file that previously owned the cluster); the
+    /// caller then keeps the old identity and the mismatch surfaces as
+    /// `CannotOpen` exactly as before.
+    fn migrate(
+        &self,
+        old: InodeKey,
+        new: InodeKey,
+        inode_info: &Arc<Mutex<InodeInfo>>,
+    ) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let old_idx = self.shard_idx(old);
+        let new_idx = self.shard_idx(new);
+        let lock_shard = |idx: usize| {
+            self.shards[idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        // `old_map` always guards the old key's shard; `new_map` is `None`
+        // when the new key lives in the same shard.
+        let (mut old_map, mut new_map) = match old_idx.cmp(&new_idx) {
+            std::cmp::Ordering::Equal => (lock_shard(old_idx), None),
+            std::cmp::Ordering::Less => {
+                let old_map = lock_shard(old_idx);
+                (old_map, Some(lock_shard(new_idx)))
+            }
+            std::cmp::Ordering::Greater => {
+                let new_map = lock_shard(new_idx);
+                (lock_shard(old_idx), Some(new_map))
+            }
+        };
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if info.key == new {
+            // Another handle of the same generation already migrated it.
+            return Ok(());
+        }
+        if info.key != old {
+            return Err(FrankenError::internal(
+                "Unix inode generation is registered under an unexpected key",
+            ));
+        }
+        let collides = |map: &HashMap<InodeKey, Arc<Mutex<InodeInfo>>>| {
+            map.get(&new)
+                .is_some_and(|existing| !Arc::ptr_eq(existing, inode_info))
+        };
+        if new_map
+            .as_deref()
+            .map_or_else(|| collides(&old_map), collides)
+        {
+            return Err(FrankenError::internal(
+                "Unix inode table already maps the refreshed identity to another generation",
+            ));
+        }
+        if old_map
+            .get(&old)
+            .is_some_and(|existing| Arc::ptr_eq(existing, inode_info))
+        {
+            old_map.remove(&old);
+        }
+        match new_map.as_deref_mut() {
+            Some(new_map) => new_map.insert(new, Arc::clone(inode_info)),
+            None => old_map.insert(new, Arc::clone(inode_info)),
+        };
+        info.key = new;
+        Ok(())
     }
 
     /// Remove the exact inode generation once it is truly quiescent.
@@ -895,15 +990,34 @@ impl InodeTable {
     /// surviving `Arc<File>` clones can still keep the canonical fd alive. If we
     /// evict the table entry too early, a concurrent reopen can install a second
     /// canonical fd generation for the same inode.
-    fn finish_handle_drop(
-        &self,
-        key: InodeKey,
-        inode_info: Arc<Mutex<InodeInfo>>,
-        file: Arc<File>,
-    ) {
-        let mut map = self.shards[self.shard_idx(key)]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ///
+    /// The generation is looked up under the key it is registered under NOW
+    /// (`InodeInfo::key`), not the key the dropping handle captured at open:
+    /// after a GH#416 migration the two differ for every handle opened during
+    /// the placeholder phase, and finalizing under the stale key would leave
+    /// the live entry (and its canonical descriptor) in the table forever —
+    /// where a later file that reuses the cluster number would find it.
+    fn finish_handle_drop(&self, inode_info: Arc<Mutex<InodeInfo>>, file: Arc<File>) {
+        let (key, mut map) = loop {
+            let current_key = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .key;
+            let map = self.shards[self.shard_idx(current_key)]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Shard before inode is the table's lock order; re-check the key
+            // under the shard mutex so a migration that raced the unlocked
+            // read above cannot leave us holding the wrong shard.
+            let settled_key = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .key;
+            if settled_key == current_key {
+                break (current_key, map);
+            }
+            drop(map);
+        };
 
         if let Some(current) = map.get(&key) {
             if !Arc::ptr_eq(current, &inode_info) {
@@ -2473,7 +2587,39 @@ impl VfsFile for UnixFile {
     }
 
     fn file_identity(&self) -> Result<Option<FileIdentity>> {
-        Ok(Some(self.inode_key))
+        // Report the key the shared generation is registered under now, so a
+        // GH#416 migration performed through any handle of this file is
+        // visible from every handle (see `InodeInfo::key`). A closed handle
+        // falls back to the key it captured at open.
+        Ok(Some(self.inode_info.as_ref().map_or(
+            self.inode_key,
+            |info| {
+                info.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .key
+            },
+        )))
+    }
+
+    /// GH#416: re-`fstat` the canonical descriptor and, when the filesystem
+    /// renumbered the file since open (a zero-length msdosfs file gains its
+    /// real inode on the first write), migrate the shared inode generation to
+    /// the live key so this handle, every sibling handle, and every later open
+    /// of the file share one lock domain.
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+        let (Some(file), Some(inode_info)) = (self.file.as_deref(), self.inode_info.as_ref())
+        else {
+            return self.file_identity();
+        };
+        let live = inode_key_from_file(file)?;
+        let registered = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .key;
+        if live != registered {
+            global_inode_table().migrate(registered, live, inode_info)?;
+        }
+        Ok(Some(live))
     }
 
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -3608,7 +3754,7 @@ impl Drop for UnixFile {
         }
 
         if let (Some(inode_info), Some(file)) = (self.inode_info.take(), self.file.take()) {
-            global_inode_table().finish_handle_drop(self.inode_key, inode_info, file);
+            global_inode_table().finish_handle_drop(inode_info, file);
         }
     }
 }
@@ -3722,15 +3868,100 @@ mod tests {
 
         // Delayed finalization from the old handle must observe the published
         // reopen and retain the exact canonical generation.
-        table.finish_handle_drop(key, old_info, old_file);
+        table.finish_handle_drop(old_info, old_file);
         let mapped = table.get(key).expect("reopened generation remains mapped");
         assert!(Arc::ptr_eq(&mapped, &reopened_info));
         assert_eq!(mapped.lock().expect("mapped inode state").n_ref, 1);
 
         reopened_info.lock().expect("reopened inode state").n_ref = 0;
         drop(mapped);
-        table.finish_handle_drop(key, reopened_info, reopened_file);
+        table.finish_handle_drop(reopened_info, reopened_file);
         assert!(table.get(key).is_none());
+    }
+
+    /// GH#416: migrating a live generation to the key the descriptor reports
+    /// now must keep one shared lock domain (every handle sees the new
+    /// identity), let a later open under the new key join it, and finalize
+    /// the entry under the migrated key even from a handle that captured the
+    /// old key at open.
+    #[test]
+    fn inode_migration_rekeys_the_live_generation_for_every_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("inode-migration.db");
+        fs::write(&path, b"").expect("seed zero-length inode");
+        let table = InodeTable::new();
+
+        let opened = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open initial descriptor");
+        let real = inode_key_from_file(&opened).expect("descriptor identity");
+        // Stand in for the msdosfs placeholder: register under an identity the
+        // filesystem will never report for this descriptor.
+        let placeholder = FileIdentity::from_unix_parts(0x5EED, 999_999_999);
+        let (info, canonical) = table
+            .register_opened_file(placeholder, opened)
+            .expect("register under the placeholder key");
+        let sibling = File::open(&path).expect("open sibling descriptor");
+        let (sibling_info, sibling_file) = table
+            .register_opened_file(placeholder, sibling)
+            .expect("sibling joins the placeholder generation");
+        assert!(Arc::ptr_eq(&info, &sibling_info));
+        assert_eq!(info.lock().expect("inode state").n_ref, 2);
+
+        table
+            .migrate(placeholder, real, &info)
+            .expect("migrate to the descriptor's live key");
+        assert_eq!(info.lock().expect("inode state").key, real);
+        assert!(table.get(placeholder).is_none());
+        assert!(Arc::ptr_eq(
+            &table.get(real).expect("mapped under real"),
+            &info
+        ));
+        // Idempotent for a sibling that observes the same transition.
+        table
+            .migrate(placeholder, real, &info)
+            .expect("repeat migration is a no-op");
+        // A stale key that is neither the registered nor the target key is
+        // refused; a request whose target is already current is a no-op.
+        let other = FileIdentity::from_unix_parts(0x5EED, 42);
+        let another = FileIdentity::from_unix_parts(0x5EED, 43);
+        assert!(table.migrate(other, another, &info).is_err());
+        assert!(table.migrate(other, real, &info).is_ok());
+        assert_eq!(info.lock().expect("inode state").key, real);
+        assert!(
+            table.migrate(real, other, &info).is_ok(),
+            "moving on from the migrated key is allowed"
+        );
+        table
+            .migrate(other, real, &info)
+            .expect("move back to the real key");
+
+        // A later open under the live key converges on the same generation.
+        let reopened = File::open(&path).expect("reopen under real key");
+        let (reopened_info, reopened_file) = table
+            .register_opened_file(real, reopened)
+            .expect("join under the live key");
+        assert!(Arc::ptr_eq(&reopened_info, &info));
+        assert_eq!(info.lock().expect("inode state").n_ref, 3);
+
+        // Handles that captured the placeholder at open finalize under the
+        // migrated key: the entry stays until the last one, then goes away.
+        for (handle_info, handle_file) in
+            [(sibling_info, sibling_file), (reopened_info, reopened_file)]
+        {
+            handle_info.lock().expect("inode state").n_ref -= 1;
+            table.finish_handle_drop(handle_info, handle_file);
+            assert!(table.get(real).is_some(), "entry must outlive its siblings");
+        }
+        info.lock().expect("inode state").n_ref = 0;
+        table.finish_handle_drop(info, canonical);
+        assert!(
+            table.get(real).is_none(),
+            "last handle evicts under the live key"
+        );
+        assert!(table.get(placeholder).is_none());
     }
 
     #[test]

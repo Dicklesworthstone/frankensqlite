@@ -31,6 +31,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
@@ -400,9 +401,14 @@ impl PendingNamespaceOpen {
             }
         };
 
+        // GH#416: an identity read from a still-empty main file may be a
+        // filesystem placeholder; remember that so exactly one materialization
+        // can be adopted later instead of being classified as a supersession.
+        let provisional_identity = main_file_is_zero_length(&self.stable_path);
         Ok(Arc::new(DatabaseNamespaceBinding {
             stable_path: std::mem::take(&mut self.stable_path),
-            identity,
+            identity: Mutex::new(identity),
+            provisional_identity: AtomicBool::new(provisional_identity),
             lease: Mutex::new(state),
         }))
     }
@@ -456,8 +462,24 @@ enum BindingLease {
 #[derive(Debug)]
 pub struct DatabaseNamespaceBinding {
     stable_path: PathBuf,
-    identity: FileIdentity,
+    identity: Mutex<FileIdentity>,
+    /// GH#416: `true` while the bound identity was captured from a
+    /// zero-length main file. Filesystems that number a file by its first
+    /// data cluster (macOS `msdosfs`) report a placeholder inode for an empty
+    /// file and a different one once data is allocated, so such an identity
+    /// may legitimately move exactly once — at the first page write. Cleared
+    /// by [`DatabaseNamespaceBinding::validate_path_identity_with_descriptor`]
+    /// when the materialized identity is adopted, or as soon as a plain
+    /// validation proves the identity did not move.
+    provisional_identity: AtomicBool,
     lease: Mutex<BindingLease>,
+}
+
+/// GH#416: whether the main file at `path` is currently a zero-length regular
+/// file — the only state in which a captured `(dev, ino)` may be a
+/// filesystem placeholder rather than the file's durable identity.
+fn main_file_is_zero_length(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
 }
 
 /// Outcome of re-probing whether a binding's bound generation is still
@@ -484,19 +506,144 @@ impl DatabaseNamespaceBinding {
     }
 
     /// The main-file identity to which this lease is bound.
+    ///
+    /// Stable for the binding's lifetime except for the single GH#416
+    /// materialization adoption of an identity captured from a zero-length
+    /// file (see [`Self::validate_path_identity_with_descriptor`]).
     #[must_use]
-    pub const fn identity(&self) -> FileIdentity {
-        self.identity
+    pub fn identity(&self) -> FileIdentity {
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// GH#416: whether the bound identity was captured from a zero-length
+    /// main file and has not yet been confirmed (or replaced) by a validation
+    /// against the materialized file.
+    #[must_use]
+    pub fn identity_is_provisional(&self) -> bool {
+        self.provisional_identity.load(Ordering::Acquire)
     }
 
     /// Side-effect-free identity validation for operation boundaries.  The
     /// caller obtains the current pathname identity through its VFS first.
     pub fn validate_identity(&self, current: Option<FileIdentity>) -> Result<()> {
-        if current == Some(self.identity) {
+        if current == Some(self.identity()) {
             Ok(())
         } else {
             Err(cannot_open(&self.stable_path))
         }
+    }
+
+    /// [`Self::validate_path_identity`] with the GH#416 placeholder-inode
+    /// adoption: when the bound identity is provisional (captured from a
+    /// zero-length file) and the stable path now names a non-empty regular
+    /// file whose identity the caller's OPEN DESCRIPTOR also reports
+    /// (`descriptor_identity`, re-read from the live descriptor), the file
+    /// was not replaced — the filesystem renumbered it on first allocation —
+    /// so the binding adopts the materialized identity, republishes it in the
+    /// `-ns-use` record, and validates. A descriptor that still reports the
+    /// old identity means the path was rebound to a different file (the
+    /// rename/quarantine case), which stays a fail-closed mismatch exactly as
+    /// in the plain probe.
+    ///
+    /// The adoption never opens the main file (bd-qduu1): the path side is a
+    /// `symlink_metadata`, the descriptor side comes from the caller.
+    pub fn validate_path_identity_with_descriptor(
+        &self,
+        descriptor_identity: Option<FileIdentity>,
+    ) -> Result<()> {
+        let error = match self.validate_path_identity() {
+            Ok(()) => {
+                // A match against a NON-EMPTY file proves the identity did not
+                // move on first allocation (or already moved and was adopted):
+                // it is durable from here on. A match while the file is still
+                // empty proves nothing — the placeholder is still in effect.
+                if self.identity_is_provisional() && !main_file_is_zero_length(&self.stable_path) {
+                    self.provisional_identity.store(false, Ordering::Release);
+                }
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        if !self.identity_is_provisional() {
+            return Err(error);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Ok(metadata) = std::fs::symlink_metadata(&self.stable_path) else {
+                return Err(error);
+            };
+            if !metadata.is_file() || metadata.len() == 0 || metadata.nlink() != 1 {
+                return Err(error);
+            }
+            let materialized = FileIdentity::from_unix_parts(metadata.dev(), metadata.ino());
+            if descriptor_identity != Some(materialized) {
+                return Err(error);
+            }
+            let bound = self.identity();
+            if bound == materialized {
+                self.provisional_identity.store(false, Ordering::Release);
+                return Ok(());
+            }
+            self.adopt_materialized_identity(bound, materialized)
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Windows file identifiers are assigned at creation and never
+            // move; a provisional identity there can only be a real mismatch.
+            let _ = descriptor_identity;
+            Err(error)
+        }
+    }
+
+    /// Replace a provisional (zero-length-captured) identity with the
+    /// materialized one the filesystem assigned on first allocation.
+    ///
+    /// The namespace record is rewritten in place under the lease mutex so a
+    /// peer admitted afterwards reads the live identity. Only a pristine
+    /// record (no transition ledger, no prepared marker) that still names the
+    /// provisional identity is rewritten; anything else is left untouched
+    /// and the mismatch stays fail-closed.
+    #[cfg(unix)]
+    fn adopt_materialized_identity(
+        &self,
+        bound: FileIdentity,
+        materialized: FileIdentity,
+    ) -> Result<()> {
+        let mut lease = self
+            .lease
+            .lock()
+            .map_err(|_| FrankenError::internal("namespace lease mutex poisoned"))?;
+        match &mut *lease {
+            BindingLease::Shared { use_file }
+            | BindingLease::BootstrapExclusive { use_file, .. }
+            | BindingLease::BootstrapUseShared { use_file, .. } => {
+                rewrite_materialized_identity_record(
+                    use_file,
+                    &self.stable_path,
+                    bound,
+                    materialized,
+                )?;
+            }
+            // Sidecar-less read-only admission published nothing to rewrite.
+            BindingLease::ReadOnlyUnadmitted => {}
+            BindingLease::Transitioning | BindingLease::Quiesced => {
+                return Err(cannot_open(&self.stable_path));
+            }
+        }
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = materialized;
+        self.provisional_identity.store(false, Ordering::Release);
+        drop(lease);
+        Ok(())
     }
 
     /// Verify that the stable main pathname (without following its final
@@ -753,7 +900,7 @@ impl DatabaseNamespaceBinding {
                 Ok(metadata) => {
                     if metadata.is_file()
                         && FileIdentity::from_unix_parts(metadata.dev(), metadata.ino())
-                            == self.identity
+                            == self.identity()
                     {
                         GenerationProbe::Current
                     } else {
@@ -2177,6 +2324,28 @@ fn replace_quiescent_identity_record(
         }
     }
     write_fresh_identity_record(file, identity)
+}
+
+/// GH#416: republish a namespace record whose identity was captured from a
+/// zero-length main file with the identity the filesystem assigned once data
+/// was allocated. Refuses anything but a pristine record (header only, no
+/// transition ledger, no prepared marker) that still names `bound`, so a
+/// generation transition can never be silently collapsed by this path.
+#[cfg(unix)]
+fn rewrite_materialized_identity_record(
+    file: &mut File,
+    database_path: &Path,
+    bound: FileIdentity,
+    materialized: FileIdentity,
+) -> Result<()> {
+    let state = read_namespace_record_state(file, database_path, false)?;
+    if state.current_identity != bound
+        || state.last_sequence != 0
+        || state.valid_bytes != RECORD_BYTES as u64
+    {
+        return Err(cannot_open(database_path));
+    }
+    write_fresh_identity_record(file, materialized)
 }
 
 fn write_fresh_identity_record(file: &mut File, identity: FileIdentity) -> Result<()> {
@@ -4654,6 +4823,125 @@ mod tests {
             .expect("read-only re-open")
             .bind(identity)
             .expect("bind read-only");
+    }
+
+    /// GH#416: an identity captured from a zero-length main file is
+    /// provisional. Simulate the msdosfs placeholder inode by binding an
+    /// identity that is NOT the file's real one while the file is empty, then
+    /// materialize the file and validate with the descriptor's live identity.
+    #[cfg(unix)]
+    #[test]
+    fn provisional_zero_length_identity_is_adopted_once_the_file_materializes() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("placeholder.db");
+        let real = create_database(&database, b"");
+        let placeholder = FileIdentity::from_unix_parts(0x5EED, 999_999_999);
+        assert_ne!(placeholder, real);
+
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit fresh namespace")
+            .bind(placeholder)
+            .expect("bind placeholder identity");
+        assert!(binding.identity_is_provisional());
+        assert_eq!(binding.identity(), placeholder);
+        assert!(binding.validate_path_identity().is_err());
+
+        // Still zero-length: nothing materialized, so even a matching
+        // descriptor must not adopt (the path's inode may still move).
+        assert!(
+            binding
+                .validate_path_identity_with_descriptor(Some(real))
+                .is_err()
+        );
+        assert_eq!(binding.identity(), placeholder);
+
+        fs::write(&database, b"page one").expect("materialize the main file");
+
+        // The descriptor still reporting the placeholder means the path was
+        // rebound to a different file: no adoption, fail closed.
+        assert!(
+            binding
+                .validate_path_identity_with_descriptor(Some(placeholder))
+                .is_err()
+        );
+        assert!(
+            binding
+                .validate_path_identity_with_descriptor(None)
+                .is_err()
+        );
+        assert_eq!(binding.identity(), placeholder);
+        assert!(binding.identity_is_provisional());
+
+        // Path and descriptor agree on the materialized identity: adopt once.
+        binding
+            .validate_path_identity_with_descriptor(Some(real))
+            .expect("adopt the materialized identity");
+        assert_eq!(binding.identity(), real);
+        assert!(!binding.identity_is_provisional());
+        binding
+            .validate_path_identity()
+            .expect("plain validation passes after adoption");
+        binding
+            .guard_generation()
+            .expect("generation probe sees the adopted identity as current");
+
+        // The republished record is what a later peer admission reads.
+        binding.finish_bootstrap().expect("publish generation");
+        let peer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("peer admission");
+        assert_eq!(peer.expected_identity(), Some(real));
+        peer.bind(real).expect("peer binds the adopted identity");
+
+        // A later mismatch on the now-durable identity is a real supersession.
+        let replacement = dir.path().join("replacement.db");
+        fs::write(&replacement, b"other generation").expect("write replacement");
+        let replacement_identity = FileIdentity::from_file(&File::open(&replacement).unwrap())
+            .unwrap()
+            .unwrap();
+        fs::rename(&replacement, &database).expect("rename over the main file");
+        assert!(
+            binding
+                .validate_path_identity_with_descriptor(Some(replacement_identity))
+                .is_err(),
+            "a durable identity must never be re-adopted"
+        );
+        assert_eq!(binding.identity(), real);
+    }
+
+    /// GH#416: a binding whose main file was already non-empty at bind time
+    /// is never provisional, so a replaced file stays a fail-closed mismatch
+    /// even when the descriptor identity the caller offers matches the path.
+    #[cfg(unix)]
+    #[test]
+    fn durable_identity_never_adopts_a_replacement() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("durable.db");
+        let identity = create_database(&database, b"generation");
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        assert!(!binding.identity_is_provisional());
+        binding
+            .validate_path_identity_with_descriptor(Some(identity))
+            .expect("current generation validates");
+
+        let replacement = dir.path().join("replacement.db");
+        fs::write(&replacement, b"other generation").expect("write replacement");
+        let replacement_identity = FileIdentity::from_file(&File::open(&replacement).unwrap())
+            .unwrap()
+            .unwrap();
+        fs::rename(&replacement, &database).expect("rename over the main file");
+        assert!(
+            binding
+                .validate_path_identity_with_descriptor(Some(replacement_identity))
+                .is_err()
+        );
+        assert_eq!(binding.identity(), identity);
+        assert!(matches!(
+            binding.probe_generation(),
+            GenerationProbe::Superseded
+        ));
     }
 
     #[test]

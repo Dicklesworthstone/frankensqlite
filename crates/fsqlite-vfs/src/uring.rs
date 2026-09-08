@@ -1207,6 +1207,10 @@ impl VfsFile for IoUringFile {
         self.inner.file_identity()
     }
 
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.refresh_file_identity()
+    }
+
     fn read<'a>(
         &'a self,
         cx: &'a Cx,

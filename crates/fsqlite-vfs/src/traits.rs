@@ -1092,6 +1092,21 @@ pub trait VfsFile: Send + Sync {
         Ok(None)
     }
 
+    /// Re-derive this handle's identity from the live descriptor.
+    ///
+    /// GH#416: some filesystems number a file by its first data cluster
+    /// (macOS `msdosfs`), so a zero-length file carries a placeholder
+    /// `st_ino` that changes on its first write. A backend whose
+    /// [`Self::file_identity`] is a snapshot taken at open time must re-read
+    /// the descriptor here and, when the identity moved, re-key any
+    /// process-wide state it coalesces by identity so later opens of the same
+    /// file converge on the same lock domain. The default returns the cached
+    /// identity unchanged, which is correct for every backend whose identity
+    /// is stable for the life of an open descriptor.
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.file_identity()
+    }
+
     /// Read `buf.len()` bytes starting at byte offset `offset`.
     ///
     /// Returns the number of bytes actually read. If fewer bytes are read

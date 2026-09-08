@@ -1784,6 +1784,58 @@ impl GroupCommitQueue {
         refresh_process_root_finalization_binding(self);
     }
 
+    /// GH#416: move this queue's finalization identity from the placeholder
+    /// `(dev, ino)` a zero-length main file was opened under to the identity
+    /// the filesystem assigned on first allocation. Mirrors the
+    /// `bind_finalization_identity` -> registry lock order; the process-root
+    /// index is re-keyed so identity-wide settlement by a later opener (which
+    /// derives the adopted identity from its own descriptor) still finds
+    /// this queue. A queue bound to any other identity is left untouched.
+    fn rebind_finalization_identity(
+        self: &Arc<Self>,
+        previous: FileIdentity,
+        adopted: FileIdentity,
+    ) {
+        let mut binding = self
+            .finalization_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match binding.identity {
+            Some(bound) if bound == previous => binding.identity = Some(adopted),
+            Some(bound) if bound == adopted => {}
+            Some(_) | None => return,
+        }
+        let Some(registry) = PROCESS_ROOT_FINALIZATION_REGISTRY.get() else {
+            return;
+        };
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queue_id = self.queue_id;
+        let rooted_under_adopted = match registry.by_queue.get_mut(&queue_id) {
+            Some(rooted) => {
+                if rooted.identity == Some(previous) {
+                    rooted.identity = Some(adopted);
+                }
+                rooted.identity == Some(adopted)
+            }
+            None => false,
+        };
+        if let Some(queue_ids) = registry.by_identity.get_mut(&previous) {
+            queue_ids.remove(&queue_id);
+            if queue_ids.is_empty() {
+                registry.by_identity.remove(&previous);
+            }
+        }
+        if rooted_under_adopted {
+            registry
+                .by_identity
+                .entry(adopted)
+                .or_default()
+                .insert(queue_id);
+        }
+    }
+
     fn has_process_root_finalization_attempt(&self) -> bool {
         self.rooted_finalization_attempts
             .load(AtomicOrdering::Acquire)
@@ -5672,6 +5724,54 @@ impl<T> IdentityWeakRegistry<T> {
             self.sweep_after_mutations = self.entries.len().max(64);
         }
         value
+    }
+
+    /// GH#416: make the live value registered under `from` reachable under
+    /// `to` as well, so an open that derives the materialized identity of a
+    /// file first opened while zero-length converges on the state the creator
+    /// registered under the placeholder identity. A dead or absent `from`
+    /// entry aliases nothing; the alias dies with the value like any entry.
+    fn alias(&mut self, from: FileIdentity, to: FileIdentity) -> Option<Arc<T>> {
+        if from == to {
+            return None;
+        }
+        let value = self.entries.get(&from).and_then(Weak::upgrade)?;
+        self.entries.insert(to, Arc::downgrade(&value));
+        self.mutations_since_sweep = self.mutations_since_sweep.saturating_add(1);
+        Some(value)
+    }
+}
+
+/// GH#416: after a namespace binding adopted the materialized identity of a
+/// main file that was zero-length at open, re-key every process-wide
+/// identity-bound registry so a later open of the same file (which reads the
+/// materialized identity from its descriptor) joins the maintenance gate,
+/// recovery fence, and group-commit queue this pager already uses instead of
+/// creating a parallel set.
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn alias_identity_bound_registries(previous: FileIdentity, adopted: FileIdentity) {
+    if let Some(gates) = MAINTENANCE_IDENTITY_GATES.get() {
+        gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .alias(previous, adopted);
+    }
+    if let Some(fences) = RECOVERY_IDENTITY_FENCES.get() {
+        fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .alias(previous, adopted);
+    }
+    if let Some(queues) = GROUP_COMMIT_IDENTITY_QUEUES.get() {
+        let queue = queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .alias(previous, adopted);
+        // Outside the registry lock: rebinding takes the queue's binding mutex
+        // and the process-root registry, never the identity registry.
+        if let Some(queue) = queue {
+            queue.rebind_finalization_identity(previous, adopted);
+        }
     }
 }
 
@@ -13343,7 +13443,8 @@ where
             }
             // A stale lexical namespace must not consume an identity-owned
             // orphan receipt that another valid alias needs to recover.
-            self.validate_namespace_binding()?;
+            // (`inner` is held here, so validate through it — GH#416.)
+            self.validate_namespace_binding_locked(&mut inner)?;
             inner.adopt_orphaned_rollback_journal_recovery()?;
             // Derive and admit the exact takeover owner while PagerInner is
             // still locked. No await or local-state ABA can occur between this
@@ -14216,9 +14317,95 @@ where
             // inode; `Drop` and the explicit `quiesce()` pool-teardown release
             // them. `validate_path_identity` is the pure, side-effect-free
             // liveness check: identical `Err` semantics, no lock release.
-            binding.validate_path_identity()?;
+            match binding.validate_path_identity() {
+                Ok(()) => {}
+                // GH#416: an identity captured while the main file was still
+                // zero-length may be a filesystem placeholder (msdosfs numbers
+                // a file by its first data cluster). Re-read the identity from
+                // our own open descriptor and let the binding adopt the
+                // materialized identity when path and descriptor agree; a
+                // real replacement (descriptor still on the old inode) stays
+                // the fail-closed mismatch above.
+                Err(error) if binding.identity_is_provisional() => {
+                    let db_file = {
+                        let inner = self
+                            .inner
+                            .lock()
+                            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+                        Arc::clone(&inner.db_file)
+                    };
+                    if let Some(adopted) =
+                        Self::adopt_materialized_namespace_identity(binding, &db_file, error)?
+                    {
+                        self.inner
+                            .lock()
+                            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
+                            .database_identity = Some(adopted);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
+    }
+
+    /// [`Self::validate_namespace_binding`] for callers that already hold the
+    /// `inner` mutex, which the plain variant would re-lock for the GH#416
+    /// adoption path.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn validate_namespace_binding_locked(&self, inner: &mut PagerInner<V::File>) -> Result<()> {
+        if let Some(binding) = &self.namespace_binding {
+            match binding.validate_path_identity() {
+                Ok(()) => {}
+                Err(error) if binding.identity_is_provisional() => {
+                    if let Some(adopted) = Self::adopt_materialized_namespace_identity(
+                        binding,
+                        &inner.db_file,
+                        error,
+                    )? {
+                        inner.database_identity = Some(adopted);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    fn validate_namespace_binding_locked(&self, _inner: &mut PagerInner<V::File>) -> Result<()> {
+        Ok(())
+    }
+
+    /// GH#416: resolve a provisional-identity mismatch against the live
+    /// descriptor. `refresh_file_identity` re-derives the identity from the
+    /// open main-file descriptor (migrating the VFS's process-wide lock domain
+    /// to the new key when it moved); the binding then adopts it only if the
+    /// stable path names that same identity. On success every identity-bound
+    /// process registry is aliased so later opens converge on this pager's
+    /// gates, and the adopted identity is returned so the caller can refresh
+    /// the pager's own snapshot of it. Any failure — including a momentarily
+    /// unavailable descriptor (another task holds the handle write-locked) —
+    /// returns the original fail-closed error unchanged.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn adopt_materialized_namespace_identity(
+        binding: &Arc<DatabaseNamespaceBinding>,
+        db_file: &SharedDbFile<V::File>,
+        error: FrankenError,
+    ) -> Result<Option<FileIdentity>> {
+        let Ok(file) = db_file.try_read() else {
+            return Err(error);
+        };
+        let previous = binding.identity();
+        let descriptor_identity = file.refresh_file_identity()?;
+        drop(file);
+        binding.validate_path_identity_with_descriptor(descriptor_identity)?;
+        let adopted = binding.identity();
+        if adopted == previous {
+            return Ok(None);
+        }
+        alias_identity_bound_registries(previous, adopted);
+        Ok(Some(adopted))
     }
 
     #[cfg(not(all(feature = "native", any(unix, windows))))]
