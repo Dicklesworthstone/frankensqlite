@@ -66,7 +66,7 @@ signature fails closed rather than silently downgrading authenticity.
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | SQLite 3.x layout; UTF-8 and UTF-16le/be text encodings are admitted for reads and writes, with parity verification deepest on the UTF-8 surface |
-| Self-healing storage | No | Native/ECS design plus optional infrastructure; the current compatibility WAL commit/recovery path neither writes nor consults RaptorQ repair symbols |
+| Self-healing storage | No | Native file-backed connections can generate WAL repair symbols asynchronously; automatic FEC recovery is not wired to the compatibility WAL reader |
 | Page-level encryption | No (commercial SEE extension) | Not currently available: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
@@ -778,7 +778,7 @@ The WAL provides crash recovery with the following guarantees:
 
 1. **Atomic commit:** A transaction is either fully visible or fully invisible after crash recovery. Partial commits cannot occur. In Native mode, a commit is committed if and only if its `CommitMarker` is durable.
 2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`). A configurable durability policy (`PRAGMA durability = local`, `PRAGMA durability = quorum(M)`) is a Native-mode design target, **not current behavior**: no such PRAGMA is dispatched, and unrecognised PRAGMAs are silently ignored, so setting it has no effect.
-3. **Self-healing (design / optional infrastructure, not current compatibility-runtime behavior):** RaptorQ WAL repair symbols and the xxhash3-driven repair routines are implemented in `fsqlite-wal`, but the compatibility WAL commit and recovery paths do not write `.wal-fec` sidecars or attempt FEC repair; that machinery is exercised only by the `fsqlite-e2e` recovery demo and harness tests. Ordinary WAL checksum verification still detects mismatches, but it does not invoke the optional FEC machinery.
+3. **Repair symbol generation (live native path; automatic recovery pending):** Native file-backed connections with a caller-owned runtime and blocking pool enqueue durable WAL ranges for background RaptorQ encoding. A group becomes protected only after its `.wal-fec` record and repair symbols are written and synced, after the primary WAL durability acknowledgment. Startup can regenerate missing or torn sidecar entries from surviving, validated WAL frames. Ordinary WAL recovery still stops at checksum failures and does not invoke the FEC decoder; `bd-1hi.11` tracks that missing integration.
 4. **Recovery procedure:**
    - On database open, check for a WAL file.
    - Read the WAL header; validate magic number and checksums.
@@ -786,6 +786,17 @@ The WAL provides crash recovery with the following guarantees:
    - Validate frame checksums. RaptorQ repair from available repair symbols is the Native-mode design; it is not attempted by the current compatibility recovery path.
    - Discard any frames after the last commit boundary (incomplete transaction).
    - Rebuild the WAL index from the replayed frames.
+
+The CLI supplies the required blocking pool. Library consumers must supply one
+through their asupersync runtime; in-memory databases and runtimes without a
+blocking pool do not generate these sidecars. `PRAGMA raptorq_repair_symbols`
+controls the repair budget, with `0` disabling generation. Work is admitted at
+WAL fsync boundaries: `synchronous=FULL` provides one for each commit, while
+`NORMAL` can defer it. Await connection close to drain pending work; dropping
+the connection only cancels it. Generation and shutdown regression coverage is
+in `crates/fsqlite-core/tests/wal_fec_commit_pipeline.rs` and the CLI's
+`test_shell_runtime_generates_wal_fec_before_exit`. This is not a claim of
+automatic corruption repair or a measured end-to-end performance guarantee.
 
 ---
 
@@ -1523,7 +1534,7 @@ The current user-facing runtime is the compatibility/pager-backed path over stan
 
 ### Compatibility Runtime (Current)
 
-The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. An existing C SQLite database opens without conversion when its header declares encoding 1 (UTF-8) or encodings 2/3 (UTF-16le/UTF-16be); mixed-encoding ATTACH is rejected. A FrankenSQLite-written database remains readable by C SQLite without conversion. Optional low-level/demo paths can emit a `.wal-fec` sidecar containing RaptorQ repair symbols, but the standard public connection path does not emit or consume it. The core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
+The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. An existing C SQLite database opens without conversion when its header declares encoding 1 (UTF-8) or encodings 2/3 (UTF-16le/UTF-16be); mixed-encoding ATTACH is rejected. A FrankenSQLite-written database remains readable by C SQLite without conversion. Native public connections with a caller-owned blocking pool can emit a separate `.wal-fec` sidecar containing RaptorQ repair symbols after WAL fsync; the standard recovery path does not yet consume those symbols. The core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
 
 ### Native Mode (Design / Partial Implementation)
 
@@ -2772,7 +2783,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
 | File format | SQLite 3.x | SQLite 3.x with UTF-8 and UTF-16le/be encodings (Compat), or ECS (Native target) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
 | Page encryption | Commercial (SEE) | XChaCha20-Poly1305 implemented in `fsqlite-pager` but not wired to the public API | No | No | No |
-| Self-healing storage | No | RaptorQ repair symbols (Native-mode design / optional infrastructure; not on the compatibility WAL path) | No | No | No |
+| Self-healing storage | No | Background WAL repair symbol generation on supported native runtimes; automatic recovery pending | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
 | Extensions | Loadable + built-in | Built-in | Built-in + WASM | Built-in | Limited |
@@ -3028,7 +3039,7 @@ an idle transaction. Public active/idle lifetime enforcement remains tracked by
 A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: a transaction that would become a dangerous rw-antidependency pivot is aborted. PostgreSQL's SSI work is prior art, but its measured overhead is not evidence for FrankenSQLite; this implementation's cost is covered by the release matrix. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
 
 **Q: What does RaptorQ actually buy me in practice?**
-A: Nothing yet — this is the Native-mode design, plus optional infrastructure that the compatibility runtime does not use. The intended payoffs are three. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies. Today the compatibility WAL commit and recovery paths write no `.wal-fec` sidecar and attempt no FEC repair, so none of these are live behavior.
+A: Native file-backed connections can now generate repair symbols in a separate `.wal-fec` sidecar after durable WAL commits, using a caller-owned blocking pool. This prepares recovery data; it does not yet repair corrupt databases automatically. The compatibility WAL reader still does not call the decoder (`bd-1hi.11`). Fountain-coded replication and version-chain compression remain Native-mode design goals, and the generation pipeline's end-to-end performance work remains open (`bd-1hi.10`).
 
 **Q: What is the difference between Compatibility and Native mode?**
 A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files (UTF-8 or UTF-16le/be encodings). Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.

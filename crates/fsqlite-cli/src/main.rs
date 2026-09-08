@@ -201,7 +201,7 @@ fn main() {
     // The CLI is the top-level consumer, so it owns the async runtime and hands
     // the resulting `Cx` down into the engine. FrankenSQLite itself never builds
     // a runtime (AGENTS.md).
-    let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+    let runtime = match shell_runtime_builder().build() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = writeln!(stderr, "error: failed to start async runtime: {error}");
@@ -219,6 +219,12 @@ fn main() {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+fn shell_runtime_builder() -> asupersync::runtime::RuntimeBuilder {
+    // Native WAL repair and file I/O share this caller-owned pool. Keep it
+    // bounded, and retain it until the shell has awaited connection shutdown.
+    asupersync::runtime::RuntimeBuilder::current_thread().blocking_threads(1, 2)
 }
 
 #[cfg(test)]
@@ -2814,6 +2820,57 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 format!("fsqlite {}", env!("CARGO_PKG_VERSION"))
             );
         });
+    }
+
+    #[test]
+    fn test_shell_runtime_generates_wal_fec_before_exit() {
+        let runtime = super::shell_runtime_builder()
+            .build()
+            .expect("shell runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("shell-fec.db");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            db.clone().into_os_string(),
+            OsString::from("-c"),
+            OsString::from(
+                "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (42); \
+                 SELECT value FROM t;",
+            ),
+        ];
+        let exit_code = runtime.block_on(run_with_shell_options(
+            args,
+            &mut input,
+            &mut out,
+            &mut err,
+            ShellOptions::batch(),
+        ));
+        assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&out)
+                .lines()
+                .any(|line| line == "42")
+        );
+
+        // No repair PRAGMA was written, so a group marker proves this is
+        // generated repair data rather than only a persisted config header.
+        // The shell's awaited close drains the worker before returning here.
+        let sidecar = fs::read(dir.path().join("shell-fec.db-wal-fec"))
+            .expect("the shipped shell runtime must generate WAL repair symbols");
+        assert!(sidecar.windows(8).any(|bytes| bytes == b"FSQLWFEC"));
+        let stock = rusqlite::Connection::open(&db).expect("stock SQLite open");
+        assert_eq!(
+            stock
+                .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                .expect("stock SQLite query"),
+            42,
+        );
     }
 
     #[test]
