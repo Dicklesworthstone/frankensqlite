@@ -6,7 +6,7 @@
 //!
 //! Source symbols remain in `.wal` frames and are never duplicated in sidecar.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -14,7 +14,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1543,8 +1543,99 @@ pub struct WalFecRepairPipelineStats {
 #[derive(Debug)]
 enum WalFecPipelineMessage {
     Work(WalFecRepairWorkItem),
-    Committed(WalFecCommittedRange),
+    Committed(OrderedWalFecRange),
     Shutdown,
+}
+
+/// Connections retain their own workers, but overlapping catch-up intervals
+/// must run in admission order so a later producer cannot choose an earlier
+/// commit's repair budget. This order covers producers in this process only.
+#[derive(Debug, Default)]
+struct WalFecRepairOrder {
+    issued: AtomicUsize,
+    ready: AtomicUsize,
+    finished: Mutex<BTreeSet<usize>>,
+}
+
+fn repair_order_for_path(path: &Path) -> Arc<WalFecRepairOrder> {
+    static ORDERS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<WalFecRepairOrder>>>> = OnceLock::new();
+    let mut orders = lock_unpoisoned(ORDERS.get_or_init(|| Mutex::new(BTreeMap::new())));
+    if let Some(order) = orders.get(path).and_then(Weak::upgrade) {
+        return order;
+    }
+    // Bind once per producer; discard dead path entries when a new binding is
+    // needed instead of retaining every database ever opened by the process.
+    orders.retain(|_, order| order.strong_count() != 0);
+    let order = Arc::new(WalFecRepairOrder::default());
+    orders.insert(path.to_owned(), Arc::downgrade(&order));
+    order
+}
+
+#[derive(Default)]
+struct WalFecProducerOrdering {
+    binding: OnceLock<(PathBuf, Arc<WalFecRepairOrder>)>,
+    // Clones of one producer must publish in ticket order; otherwise its
+    // worker could wait for an earlier ticket queued behind the current one.
+    // Separate connections have separate publication locks. No I/O or repair
+    // computation occurs under this lock.
+    publication: Mutex<()>,
+}
+
+impl WalFecProducerOrdering {
+    fn for_path(&self, path: &Path) -> Arc<WalFecRepairOrder> {
+        let (bound_path, order) = self
+            .binding
+            .get_or_init(|| (path.to_owned(), repair_order_for_path(path)));
+        if bound_path == path {
+            Arc::clone(order)
+        } else {
+            repair_order_for_path(path)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WalFecRepairTurn {
+    order: Arc<WalFecRepairOrder>,
+    sequence: usize,
+}
+
+impl WalFecRepairTurn {
+    fn new(order: Arc<WalFecRepairOrder>) -> Option<Self> {
+        let sequence = order
+            .issued
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .ok()?;
+        Some(Self { order, sequence })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.order.ready.load(Ordering::Acquire) == self.sequence
+    }
+}
+
+impl Drop for WalFecRepairTurn {
+    fn drop(&mut self) {
+        let mut finished = lock_unpoisoned(&self.order.finished);
+        finished.insert(self.sequence);
+        let mut ready = self.order.ready.load(Ordering::Relaxed);
+        while finished.remove(&ready) {
+            // Issuance refuses usize::MAX, so retiring the final issued turn
+            // reaches that sentinel without wrapping back to an old ticket.
+            ready += 1;
+        }
+        self.order.ready.store(ready, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct OrderedWalFecRange {
+    range: WalFecCommittedRange,
+    // Retained inside the work Arc, including the blocking closure. Canceling
+    // an async waiter cannot release this turn while its sidecar I/O continues.
+    turn: WalFecRepairTurn,
 }
 
 /// A checksum-anchored interval covered by a successful primary WAL fsync.
@@ -1572,6 +1663,7 @@ pub struct WalFecRepairProducer {
     pending_jobs: Arc<AtomicUsize>,
     max_pending_jobs: Arc<AtomicUsize>,
     repair_symbols: Arc<AtomicU8>,
+    ordering: Arc<WalFecProducerOrdering>,
 }
 
 impl WalFecRepairProducer {
@@ -1619,13 +1711,23 @@ impl WalFecRepairPermit<'_> {
     /// durable COMMIT: return false for restart catch-up, never a commit error.
     #[must_use]
     pub fn submit(self, range: WalFecCommittedRange) -> bool {
+        let publication = lock_unpoisoned(&self.producer.ordering.publication);
+        let Some(turn) = WalFecRepairTurn::new(self.producer.ordering.for_path(&range.wal_path))
+        else {
+            drop(publication);
+            warn!("wal-fec repair ordering exhausted; durable frames require restart catch-up");
+            return false;
+        };
         let pending = self.producer.pending_jobs.fetch_add(1, Ordering::SeqCst) + 1;
         update_max_pending(&self.producer.max_pending_jobs, pending);
-        if self
-            .permit
-            .try_send(WalFecPipelineMessage::Committed(range))
-            .is_err()
-        {
+        let submitted =
+            self.permit
+                .try_send(WalFecPipelineMessage::Committed(OrderedWalFecRange {
+                    range,
+                    turn,
+                }));
+        drop(publication);
+        if submitted.is_err() {
             self.producer.pending_jobs.fetch_sub(1, Ordering::SeqCst);
             warn!("wal-fec worker exited after WAL fsync; durable frames require restart catch-up");
             return false;
@@ -1655,6 +1757,7 @@ struct WalFecRepairWorkerState {
 pub struct WalFecRepairPipeline {
     closing: Arc<AtomicBool>,
     repair_symbols: Arc<AtomicU8>,
+    ordering: Arc<WalFecProducerOrdering>,
     sender: Option<mpsc::Sender<WalFecPipelineMessage>>,
     cancel_flag: Arc<AtomicBool>,
     pending_jobs: Arc<AtomicUsize>,
@@ -1767,6 +1870,7 @@ impl WalFecRepairPipeline {
         Ok(Self {
             closing,
             repair_symbols,
+            ordering: Arc::new(WalFecProducerOrdering::default()),
             sender: Some(tx),
             cancel_flag,
             pending_jobs,
@@ -1790,6 +1894,7 @@ impl WalFecRepairPipeline {
             pending_jobs: Arc::clone(&self.pending_jobs),
             max_pending_jobs: Arc::clone(&self.max_pending_jobs),
             repair_symbols: Arc::clone(&self.repair_symbols),
+            ordering: Arc::clone(&self.ordering),
         })
     }
 
@@ -1988,15 +2093,31 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
             work @ (WalFecPipelineMessage::Work(_) | WalFecPipelineMessage::Committed(_)) => {
                 let group_id = match &work {
                     WalFecPipelineMessage::Work(item) => item.meta.group_id(),
-                    WalFecPipelineMessage::Committed(range) => WalFecGroupId {
-                        wal_salt1: range.header.salts.salt1,
-                        wal_salt2: range.header.salts.salt2,
-                        end_frame_no: range.end_frame_no,
+                    WalFecPipelineMessage::Committed(work) => WalFecGroupId {
+                        wal_salt1: work.range.header.salts.salt1,
+                        wal_salt2: work.range.header.salts.salt2,
+                        end_frame_no: work.range.end_frame_no,
                     },
                     WalFecPipelineMessage::Shutdown => unreachable!(),
                 };
                 let work = Arc::new(work);
                 let outcome = loop {
+                    if state.cancel_flag.load(Ordering::Acquire) || worker_cx.checkpoint().is_err()
+                    {
+                        break Ok(Ok(WalFecWorkOutcome::Canceled));
+                    }
+                    if let WalFecPipelineMessage::Committed(ordered) = work.as_ref()
+                        && !ordered.turn.is_ready()
+                    {
+                        // Leave the caller's blocking pool available to the
+                        // earlier producer and to primary database I/O.
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(1),
+                        )
+                        .await;
+                        continue;
+                    }
                     let cancel_flag_for_work = Arc::clone(&state.cancel_flag);
                     let work_cx = worker_cx.create_child();
                     let native_worker_cx_for_work = native_worker_cx.clone();
@@ -2015,9 +2136,9 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                                     &cancel_flag_for_work,
                                     per_symbol_delay,
                                 ),
-                                WalFecPipelineMessage::Committed(range) => {
+                                WalFecPipelineMessage::Committed(ordered) => {
                                     process_committed_wal_range(
-                                        range,
+                                        &ordered.range,
                                         &work_cx,
                                         &cancel_flag_for_work,
                                         per_symbol_delay,
@@ -2042,6 +2163,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     break outcome;
                 };
 
+                drop(work);
                 state.pending_jobs.fetch_sub(1, Ordering::SeqCst);
                 match outcome {
                     Ok(Ok(WalFecWorkOutcome::Completed)) => {
@@ -4095,6 +4217,47 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn test_wal_fec_repair_order_skips_canceled_turns_after_active_io_finishes() {
+        let order = Arc::new(WalFecRepairOrder::default());
+        let first = Arc::new(WalFecRepairTurn::new(Arc::clone(&order)).unwrap());
+        let blocking_work = Arc::clone(&first);
+        let canceled = WalFecRepairTurn::new(Arc::clone(&order)).unwrap();
+        let survivor = WalFecRepairTurn::new(Arc::clone(&order)).unwrap();
+        assert!(first.is_ready());
+        assert!(!canceled.is_ready());
+        assert!(!survivor.is_ready());
+
+        drop(canceled);
+        drop(first); // The canceled async waiter no longer owns the work.
+        assert!(
+            !survivor.is_ready(),
+            "blocking I/O still owns the first turn"
+        );
+        drop(blocking_work);
+        assert!(
+            survivor.is_ready(),
+            "canceled queued work must not strand its successor"
+        );
+        drop(survivor);
+        assert!(WalFecRepairTurn::new(order).unwrap().is_ready());
+    }
+
+    #[test]
+    fn test_wal_fec_repair_order_refuses_counter_wraparound() {
+        let order = Arc::new(WalFecRepairOrder {
+            issued: AtomicUsize::new(usize::MAX - 1),
+            ready: AtomicUsize::new(usize::MAX - 1),
+            finished: Mutex::new(BTreeSet::new()),
+        });
+        let final_turn = WalFecRepairTurn::new(Arc::clone(&order)).unwrap();
+        assert!(final_turn.is_ready());
+        assert!(WalFecRepairTurn::new(Arc::clone(&order)).is_none());
+        drop(final_turn);
+        assert_eq!(order.ready.load(Ordering::Acquire), usize::MAX);
+        assert!(WalFecRepairTurn::new(order).is_none());
     }
 
     #[test]

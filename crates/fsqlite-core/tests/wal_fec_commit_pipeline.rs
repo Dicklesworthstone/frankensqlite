@@ -153,6 +153,107 @@ fn repair_budget_zero_and_changes_apply_to_subsequent_groups() {
 }
 
 #[test]
+fn two_connections_keep_each_commit_repair_budget() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        for first_writer_is_a in [true, false] {
+            let db = dir.path().join(format!("paired-budgets-{first_writer_is_a}.db"));
+            let a = open(&db).await;
+            a.execute("PRAGMA raptorq_repair_symbols = 3;").await.unwrap();
+            a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);").await.unwrap();
+            wait_for_last_group(&db).await;
+            let b = open(&db).await;
+            b.execute("PRAGMA raptorq_repair_symbols = 5;").await.unwrap();
+            assert_eq!(a.query("PRAGMA raptorq_repair_symbols;").await.unwrap()[0].values(), &[SqliteValue::Integer(3)]);
+            assert_eq!(b.query("PRAGMA raptorq_repair_symbols;").await.unwrap()[0].values(), &[SqliteValue::Integer(5)]);
+
+            let wal = wal_path(&db);
+            let header = WalHeader::from_bytes(&fs::read(&wal).unwrap()).unwrap();
+            let sidecar = wal_fec_path_for_wal(&wal);
+            let guard = hold_sidecar_guard(&sidecar).await;
+            let before = fs::read(&sidecar).unwrap();
+            let mut expected = Vec::new();
+            for id in 0..16 {
+                let use_a = (id % 2 == 0) == first_writer_is_a;
+                let (writer, budget) = if use_a { (&a, 3) } else { (&b, 5) };
+                writer.execute(&format!("INSERT INTO t VALUES ({id});")).await.unwrap();
+                let end_frame = u32::try_from(
+                    (fs::metadata(&wal).unwrap().len() - 32) / (24 + u64::from(header.page_size)),
+                ).unwrap();
+                expected.push((end_frame, budget));
+            }
+            assert_eq!(fs::read(&sidecar).unwrap(), before, "durable commits must not wait for sidecar ownership");
+            drop(guard);
+            a.close_without_checkpoint().await.unwrap();
+            b.close_without_checkpoint().await.unwrap();
+
+            let scan = scan_wal_fec(&sidecar).unwrap();
+            assert!(!scan.truncated_tail);
+            assert!(scan.groups.windows(2).all(|groups| groups[0].meta.end_frame_no < groups[1].meta.start_frame_no));
+            for (end_frame, budget) in expected {
+                let matching: Vec<_> = scan.groups.iter().filter(|group| group.meta.end_frame_no == end_frame).collect();
+                assert_eq!(matching.len(), 1, "commit ending at frame {end_frame} must have exactly one repair group");
+                assert_eq!(matching[0].meta.r_repair, budget, "first_writer_is_a={first_writer_is_a}, frame={end_frame}: another connection must not replace the committing connection's repair budget");
+                assert_eq!(matching[0].repair_symbols.len(), budget as usize);
+            }
+            let stock = rusqlite::Connection::open(&db).unwrap();
+            assert_eq!(stock.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 16);
+        }
+    });
+}
+
+#[test]
+fn two_connections_keep_surviving_repair_worker_after_close() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("surviving-worker.db");
+        let a = open(&db).await;
+        a.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        wait_for_last_group(&db).await;
+        let b = open(&db).await;
+        a.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        a.close_without_checkpoint().await.unwrap();
+        b.execute("INSERT INTO t VALUES (2);").await.unwrap();
+        wait_for_last_group(&db).await;
+        b.close_without_checkpoint().await.unwrap();
+        let scan = scan_wal_fec(&wal_fec_path_for_wal(&wal_path(&db))).unwrap();
+        assert!(!scan.truncated_tail);
+        assert!(scan.groups.len() >= 3);
+        let stock = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(stock.query_row("SELECT SUM(value) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+    });
+}
+
+#[test]
+fn two_connections_keep_surviving_repair_worker_after_drop_with_backlog() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("paired-drop.db");
+        let a = open(&db).await;
+        a.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        wait_for_last_group(&db).await;
+        let b = open(&db).await;
+        let sidecar = wal_fec_path_for_wal(&wal_path(&db));
+        let guard = hold_sidecar_guard(&sidecar).await;
+        let before = fs::read(&sidecar).unwrap();
+        for value in 1..=4 {
+            a.execute(&format!("INSERT INTO t VALUES ({value});")).await.unwrap();
+            b.execute(&format!("INSERT INTO t VALUES ({});", value + 4)).await.unwrap();
+        }
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        drop(a); // Cancel both an active repair and queued turns before B drains.
+        drop(guard);
+        wait_for_last_group(&db).await;
+        b.close_without_checkpoint().await.unwrap();
+        let scan = scan_wal_fec(&sidecar).unwrap();
+        assert!(!scan.truncated_tail);
+        assert!(scan.groups.windows(2).all(|pair| pair[0].meta.end_frame_no < pair[1].meta.start_frame_no));
+        let stock = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(stock.query_row("SELECT SUM(value) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 36);
+    });
+}
+
+#[test]
 fn restart_regenerates_missing_and_interrupted_sidecar_suffixes() {
     run_with_repair_pool(async {
         let dir = tempfile::tempdir().unwrap();
