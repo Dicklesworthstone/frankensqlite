@@ -290,6 +290,105 @@ fn restart_regenerates_missing_and_interrupted_sidecar_suffixes() {
 }
 
 #[test]
+fn process_exit_after_durable_commit_before_repair_is_recoverable() {
+    const CHILD_DB: &str = "FSQLITE_WAL_FEC_DURABLE_EXIT_DB";
+    const DURABLE_EXIT: i32 = 73;
+    const PHASE_MARKER: &str = "wal_fec_phase=durable repair_append=blocked committed_rows=5";
+
+    if let Some(db) = std::env::var_os(CHILD_DB) {
+        let db = PathBuf::from(db);
+        run_with_repair_pool(async {
+            let conn = open(&db).await;
+            conn.execute("PRAGMA raptorq_repair_symbols = 7;").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB);").await.unwrap();
+            wait_for_last_group(&db).await;
+            let sidecar = wal_fec_path_for_wal(&wal_path(&db));
+            let _guard = hold_sidecar_guard(&sidecar).await;
+            let before = fs::read(&sidecar).unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            for id in 1..=5 {
+                conn.execute(&format!("INSERT INTO t VALUES ({id}, zeroblob(3000));")).await.unwrap();
+            }
+            conn.execute("COMMIT;").await.expect("primary COMMIT while repair append is blocked");
+            assert_eq!(fs::read(&sidecar).unwrap(), before, "repair must still be incomplete at process exit");
+            assert_eq!(conn.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(5)]);
+            eprintln!("{PHASE_MARKER}");
+            std::io::stderr().flush().unwrap();
+            // No Connection/Runtime/guard destructors: the OS releases the
+            // locks while the acknowledged WAL remains unprotected by FEC.
+            std::process::exit(DURABLE_EXIT);
+        });
+        unreachable!("child must exit at the durability boundary");
+    }
+
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db = dir.join("durable-exit.db");
+    let log_path = dir.join("child.log");
+    let log = File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "process_exit_after_durable_commit_before_repair_is_recoverable", "--nocapture"])
+        .env(CHILD_DB, &db)
+        .stdout(log.try_clone().unwrap()).stderr(log)
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() { break status; }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("durability child timed out; artifacts={} log={}", dir.display(), fs::read_to_string(&log_path).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert_eq!(status.code(), Some(DURABLE_EXIT), "child did not reach the intended exit: {log}");
+    assert!(log.lines().any(|line| line == PHASE_MARKER), "missing durable phase receipt: {log}");
+
+    let wal = wal_path(&db);
+    let durable_wal = fs::read(&wal).unwrap();
+    let header = WalHeader::from_bytes(&durable_wal).unwrap();
+    let last = u32::try_from((durable_wal.len() - 32) / (24 + header.page_size as usize)).unwrap();
+    let sidecar = wal_fec_path_for_wal(&wal);
+    let before = scan_wal_fec(&sidecar).unwrap();
+    assert!(!before.truncated_tail);
+    let protected = before.groups.last().expect("schema group was repaired before the child transaction").meta.end_frame_no;
+    assert!(last >= protected + 5, "multi-page durable commit must lack a repair group");
+
+    // This oracle runs before FrankenSQLite can regenerate any repair data.
+    let stock = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(stock.query_row("SELECT COUNT(*), SUM(id), SUM(length(payload)) FROM t", [], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+    }).unwrap(), (5, 15, 15_000));
+    drop(stock);
+    assert_eq!(scan_wal_fec(&sidecar).unwrap().groups, before.groups);
+
+    run_with_repair_pool(async {
+        let reopened = open(&db).await;
+        assert_eq!(reopened.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(5)]);
+        assert_eq!(reopened.query("PRAGMA raptorq_repair_symbols;").await.unwrap()[0].values(), &[SqliteValue::Integer(7)]);
+        reopened.close_without_checkpoint().await.unwrap();
+    });
+    let repaired = scan_wal_fec(&sidecar).unwrap();
+    assert!(!repaired.truncated_tail);
+    assert_eq!(repaired.groups.len(), before.groups.len() + 1);
+    assert_eq!(&repaired.groups[..before.groups.len()], &before.groups);
+    let recovered = repaired.groups.last().unwrap();
+    assert_eq!((recovered.meta.wal_salt1, recovered.meta.wal_salt2), (header.salts.salt1, header.salts.salt2));
+    assert_eq!((recovered.meta.start_frame_no, recovered.meta.end_frame_no), (protected + 1, last));
+    assert_eq!(recovered.meta.k_source, last - protected);
+    assert_eq!(recovered.meta.r_repair, 7);
+    assert_eq!(recovered.repair_symbols.len(), 7);
+    assert_eq!(fs::read(&wal).unwrap(), durable_wal, "catch-up must preserve the primary WAL");
+
+    let repaired_bytes = fs::read(&sidecar).unwrap();
+    run_with_repair_pool(async {
+        open(&db).await.close_without_checkpoint().await.unwrap();
+    });
+    assert_eq!(fs::read(&sidecar).unwrap(), repaired_bytes, "second restart must not duplicate repair groups");
+    eprintln!("wal_fec_process_exit_verified exit={DURABLE_EXIT} durable_end={last} recovered_sources={} repair_symbols=7 artifacts={}", last - protected, dir.display());
+}
+
+#[test]
 fn real_commit_overhead_and_hundred_commit_catch_up() {
     run_with_repair_pool(async {
         let dir = tempfile::tempdir().unwrap();
