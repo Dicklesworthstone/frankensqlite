@@ -5,7 +5,7 @@
 //! On fsqlite 0.1.19 this topology was tolerated indefinitely (0/60 failures
 //! downstream). On the 0.2 line it regressed: 7/60 on registry 0.2.1
 //! (asupersync 0.3.10 — so not an asupersync 0.4 issue), 15/60 plus
-//! indefinite hangs on master@e6122cc4. Errors surface as
+//! indefinite hangs on main@e6122cc4. Errors surface as
 //! `Database(BusyRecovery)` on open, or `Busy` on update/close. This is the
 //! documented-intended single-process/multi-Connection MVCC shape — plain
 //! concurrent open+UPDATE must not hit busy-class refusals at all

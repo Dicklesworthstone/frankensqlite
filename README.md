@@ -999,7 +999,7 @@ async caller
     → compile eligible SQL to VDBE; dispatch supported fallback shapes
     → execute against the pager/B-tree with that Cx
     → on commit: validate → pager commit → publish
-  ← Result<Rows>
+  ← Result<usize> (affected row count)
 ```
 
 The caller supplies the executor polling this future. The default connection

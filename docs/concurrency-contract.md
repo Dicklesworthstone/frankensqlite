@@ -155,9 +155,9 @@ family. The contract:
 - Historically, plan-cache entries did **not** always invalidate on
   *data* changes that shifted index layout (e.g. a B-tree split from a
   concurrent INSERT could leave a cached cursor pointing at a stale
-  page). That class is what beads_rust#252/#254/#255 saw as
+  page). The historical beads_rust#252/#254/#255 reports describe
   `SELECT … WHERE pk = ?` returning zero rows for a freshly-committed
-  row, or the wrong row.
+  row, or the wrong row; those symptoms alone do not establish a cache defect.
 - A cached prepared statement must bind its reads to the transaction's current
   visibility state; reusing compiled bytecode must not reuse a stale snapshot
   or cursor. The `cross_process_visibility` and `wrong_row_returns` criteria
@@ -289,7 +289,7 @@ It returns key/value rows: `journal_mode`, `write_concurrency`
 `sqlite_single_writer` | `n/a`), `write_merge`, and a human-readable
 `note`. It is purely observational and changes no behavior. The classic
 single-writer WAL contract is available as a comparison/fallback path —
-see "Supported: multi-reader, single-writer WAL" below.
+see "Intended: multi-reader, single-writer WAL" below.
 
 **Obligation on callers**: open one Connection per logical worker;
 do not try to share a single `Connection` across OS threads — it is
