@@ -98,6 +98,35 @@ fn dysy4_like_does_not_imply_partial_index_not_null_predicate() {
             }
             reject_query(&c, &forced).await;
         }
+        for predicate in ["b LIKE 'a%'", "b GLOB 'a*'", "b LIKE 'abc'"] {
+            let sql = format!("SELECT a FROM t INDEXED BY ni WHERE {predicate} ORDER BY a");
+            let stock_row: i64 = stock.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(stock_row, 1, "stock prefix control: {sql}");
+            assert_eq!(int_rows(&c, &sql).await, vec![stock_row], "{sql}");
+        }
+        for predicate in ["b LIKE 'a%' OR b LIKE 'x%'", "b LIKE 'a%' ESCAPE '界'"] {
+            let sql = format!("SELECT a FROM t INDEXED BY ni WHERE {predicate}");
+            let error = stock.prepare(&sql).expect_err("stock cannot derive a prefix range");
+            assert!(error.to_string().contains("no query solution"), "{error}");
+            reject_query(&c, &sql).await;
+        }
+        for sql in [
+            "INSERT INTO t VALUES(4,'1abc')",
+            "CREATE TABLE n(a, b)",
+            "CREATE INDEX nn ON n(a) WHERE b IS NOT NULL",
+            "INSERT INTO n VALUES(4,'1abc'),(5,NULL)",
+        ] {
+            c.execute(sql).await.unwrap();
+            stock.execute_batch(sql).unwrap();
+        }
+        let numeric_prefix = "SELECT a FROM t INDEXED BY ni WHERE b LIKE '1%'";
+        let expected: i64 = stock.query_row(numeric_prefix, [], |row| row.get(0)).unwrap();
+        assert_eq!(expected, 4, "TEXT affinity permits a numeric prefix");
+        assert_eq!(int_rows(&c, numeric_prefix).await, vec![expected]);
+        let untyped_prefix = "SELECT a FROM n INDEXED BY nn WHERE b LIKE '1%'";
+        let error = stock.prepare(untyped_prefix).expect_err("numeric prefix requires TEXT affinity");
+        assert!(error.to_string().contains("no query solution"), "{error}");
+        reject_query(&c, untyped_prefix).await;
     });
 }
 

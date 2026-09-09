@@ -48952,9 +48952,11 @@ impl Connection {
             Expr::IsNull {
                 expr, not: true, ..
             } => expr.as_ref() == col,
-            // NULL propagates through IN / BETWEEN / LIKE on `col`, so any of
+            // NULL propagates through IN / BETWEEN on `col`, so any of
             // these (negated or not) is NULL — never true — when `col` is NULL.
-            Expr::In { expr, .. } | Expr::Between { expr, .. } | Expr::Like { expr, .. } => {
+            // LIKE-family operators are replaceable functions, which SQLite
+            // does not use for this implication or LEFT-join strength reduction.
+            Expr::In { expr, .. } | Expr::Between { expr, .. } => {
                 expr.as_ref() == col
             }
             _ => false,
@@ -49099,11 +49101,12 @@ impl Connection {
     /// a null-rejecting comparison covering an `IS NOT NULL` — but NOT full
     /// arithmetic implication (`b > 5` does not cover `b > 0`).
     fn forced_partial_index_predicate_covered(
+        &self,
         predicate: &Expr,
         query_conjuncts: &[&Expr],
         targets: &[&str],
     ) -> bool {
-        let normalized_query: Vec<Expr> = query_conjuncts
+        let mut normalized_query: Vec<Expr> = query_conjuncts
             .iter()
             .map(|conjunct| {
                 let mut owned = (*conjunct).clone();
@@ -49111,6 +49114,24 @@ impl Connection {
                 owned
             })
             .collect();
+
+        // SQLite's LIKE/GLOB prefix optimization contributes virtual range
+        // terms even when the chosen partial index is on another column.
+        // Those comparisons cover IS NOT NULL; the function call itself does
+        // not. Keep the original term for exact predicate matching, and never
+        // apply this deduction inside OR or to a replaced LIKE/GLOB function.
+        if !self.like_or_glob_overridden.get() {
+            let schema = self.schema.borrow();
+            let table = targets.first().and_then(|name| {
+                schema.iter().find(|table| table.name.eq_ignore_ascii_case(name))
+            });
+            let range_covers: Vec<Expr> = normalized_query.iter().filter_map(|term| {
+                Self::like_prefix_non_null_column(term, table).map(|column| Expr::IsNull {
+                    expr: Box::new(column.clone()), not: true, span: Span::ZERO,
+                })
+            }).collect();
+            normalized_query.extend(range_covers);
+        }
 
         let mut predicate_conjuncts: Vec<&Expr> = Vec::new();
         Self::collect_and_conjuncts(predicate, &mut predicate_conjuncts);
@@ -49122,6 +49143,38 @@ impl Connection {
                 Self::query_term_implies_predicate(query_conjunct, &normalized_predicate)
             })
         })
+    }
+
+    fn like_prefix_non_null_column<'a>(term: &'a Expr, table: Option<&TableSchema>) -> Option<&'a Expr> {
+        let Expr::Like { expr, pattern, escape, not: false, op, .. } = term else {
+            return None;
+        };
+        let Expr::Column(column, _) = expr.as_ref() else { return None; };
+        let Expr::Literal(Literal::String(pattern), _) = pattern.as_ref() else { return None; };
+        let escape = match escape.as_deref() {
+            None => None,
+            Some(Expr::Literal(Literal::String(value), _)) if value.len() == 1 && value.is_ascii() => value.chars().next(),
+            Some(_) => return None,
+        };
+        let mut chars = pattern.chars();
+        let first = chars.next()?;
+        let first = match op {
+            LikeOp::Like if Some(first) == escape => chars.next()?,
+            LikeOp::Like if matches!(first, '%' | '_') => return None,
+            LikeOp::Glob if matches!(first, '*' | '?' | '[') => return None,
+            LikeOp::Like | LikeOp::Glob => first,
+            LikeOp::Match | LikeOp::Regexp => return None,
+        };
+        if first == '\0' {
+            return None;
+        }
+        let has_text_affinity = table.is_some_and(|table| table.columns.iter().any(|info| {
+            info.name.eq_ignore_ascii_case(&column.column) && info.affinity == 'B'
+        }));
+        if !has_text_affinity && (first == '-' || first.is_ascii_digit()) {
+            return None;
+        }
+        Some(expr)
     }
 
     /// `INDEXED BY <name>` must reference an existing index on the named
@@ -49244,7 +49297,7 @@ impl Connection {
                             } else {
                                 &regular_conjuncts
                             };
-                            Self::forced_partial_cover_or_err(
+                            self.forced_partial_cover_or_err(
                                 predicate,
                                 available,
                                 name.name.as_str(),
@@ -49309,6 +49362,7 @@ impl Connection {
     /// [`Self::forced_partial_index_predicate_covered`]). Otherwise C SQLite
     /// fails at prepare with "no query solution" (GH#173, bd-qfgsa, bd-wlo29).
     fn forced_partial_cover_or_err(
+        &self,
         predicate: &Expr,
         available: &[&Expr],
         name: &str,
@@ -49318,7 +49372,7 @@ impl Connection {
         if let Some(alias) = alias {
             targets.push(alias);
         }
-        if Self::forced_partial_index_predicate_covered(predicate, available, &targets) {
+        if self.forced_partial_index_predicate_covered(predicate, available, &targets) {
             Ok(())
         } else {
             Err(FrankenError::FunctionError("no query solution".to_owned()))
@@ -49347,7 +49401,7 @@ impl Connection {
             if let Some(where_expr) = where_clause {
                 Self::collect_and_conjuncts(where_expr, &mut available);
             }
-            Self::forced_partial_cover_or_err(
+            self.forced_partial_cover_or_err(
                 predicate,
                 &available,
                 table.name.name.as_str(),
@@ -68367,7 +68421,11 @@ impl Connection {
         &self,
         select: &'a SelectStatement,
     ) -> Cow<'a, SelectStatement> {
-        if !self.select_has_bare_pragma_table_function(select) {
+        // This allocation-free preflight includes expression-position
+        // subqueries. Scope/shadowing is checked by the rewrite itself.
+        if !select_contains_relation_reference(select, &mut |name: &QualifiedName| {
+            name.schema.is_none() && pragma_table_function_is_no_arg(&name.name)
+        }) {
             return Cow::Borrowed(select);
         }
         let mut owned = select.clone();
@@ -68390,85 +68448,6 @@ impl Connection {
         scope
     }
 
-    /// Whether *any* SELECT core in the statement — the primary core, every
-    /// compound (UNION/INTERSECT/EXCEPT) arm, or a nested FROM-subquery — has a
-    /// bare FROM source that is a routable no-arg pragma table-valued function.
-    /// bd-bzd19 L11: stock resolves `pragma_database_list` (etc.) in every one
-    /// of those positions, so the bare-to-call rewrite must reach all of them.
-    fn select_has_bare_pragma_table_function(&self, select: &SelectStatement) -> bool {
-        self.statement_has_bare_pragma_tvf(select, &[])
-    }
-
-    /// Whether any SELECT core reachable from `stmt` — including its CTE
-    /// definition bodies and nested subqueries — has a bare pragma TVF source.
-    /// bd-7p5z3(a): the walk must reach `WITH w AS (SELECT ... FROM
-    /// pragma_database_list)` bodies, not only the primary query. Expression-
-    /// position subqueries (e.g. `SELECT (SELECT count(*) FROM
-    /// pragma_database_list)`) remain a separate gap tracked on bd-7p5z3.
-    fn statement_has_bare_pragma_tvf(
-        &self,
-        stmt: &SelectStatement,
-        outer_scope: &[String],
-    ) -> bool {
-        let scope = Self::extend_cte_scope(outer_scope, stmt);
-        stmt.with.as_ref().is_some_and(|with| {
-            with.ctes
-                .iter()
-                .any(|cte| self.statement_has_bare_pragma_tvf(&cte.query, &scope))
-        }) || self.select_body_has_bare_pragma_tvf(&stmt.body, &scope)
-    }
-
-    fn select_body_has_bare_pragma_tvf(&self, body: &SelectBody, cte_names: &[String]) -> bool {
-        std::iter::once(&body.select)
-            .chain(body.compounds.iter().map(|(_, core)| core))
-            .any(|core| self.select_core_has_bare_pragma_tvf(core, cte_names))
-    }
-
-    fn select_core_has_bare_pragma_tvf(&self, core: &SelectCore, cte_names: &[String]) -> bool {
-        let SelectCore::Select {
-            from: Some(from), ..
-        } = core
-        else {
-            return false;
-        };
-        self.from_clause_has_bare_pragma_tvf(from, cte_names)
-    }
-
-    // `from_` here refers to the SQL FROM clause, not a type conversion, so
-    // clippy's wrong_self_convention heuristic is a false positive.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_clause_has_bare_pragma_tvf(&self, from: &FromClause, cte_names: &[String]) -> bool {
-        self.source_is_bare_pragma_tvf(&from.source, cte_names)
-            || from
-                .joins
-                .iter()
-                .any(|join| self.source_is_bare_pragma_tvf(&join.table, cte_names))
-    }
-
-    fn source_is_bare_pragma_tvf(&self, source: &TableOrSubquery, cte_names: &[String]) -> bool {
-        match source {
-            TableOrSubquery::Table {
-                name,
-                index_hint,
-                time_travel,
-                ..
-            } => {
-                name.schema.is_none()
-                    && index_hint.is_none()
-                    && time_travel.is_none()
-                    && pragma_table_function_is_no_arg(&name.name)
-                    && !self.bare_name_shadows_pragma_tvf(&name.name, cte_names)
-            }
-            TableOrSubquery::ParenJoin(from) => {
-                self.from_clause_has_bare_pragma_tvf(from, cte_names)
-            }
-            TableOrSubquery::Subquery { query, .. } => {
-                self.statement_has_bare_pragma_tvf(query, cte_names)
-            }
-            TableOrSubquery::TableFunction { .. } => false,
-        }
-    }
-
     /// A real table, view, or in-scope CTE with the same name shadows the
     /// eponymous pragma TVF (matching SQLite), so the bare form must resolve to
     /// that relation rather than the pragma.
@@ -68485,9 +68464,8 @@ impl Connection {
     }
 
     /// Rewrite bare pragma TVFs everywhere in a statement: its CTE definition
-    /// bodies first (so `WITH w AS (SELECT ... FROM pragma_database_list)`
-    /// resolves), then the primary/compound bodies. Mirrors the detection walk
-    /// in [`Self::statement_has_bare_pragma_tvf`]. bd-7p5z3(a).
+    /// bodies, primary/compound cores, and expression-position subqueries all
+    /// inherit the enclosing CTE scope (bd-7p5z3 / bd-dysy4).
     fn rewrite_bare_pragma_in_statement(&self, stmt: &mut SelectStatement, outer_scope: &[String]) {
         let scope = Self::extend_cte_scope(outer_scope, stmt);
         if let Some(with) = &mut stmt.with {
@@ -68496,6 +68474,15 @@ impl Connection {
             }
         }
         self.rewrite_bare_pragma_in_body(&mut stmt.body, &scope);
+        for term in &mut stmt.order_by {
+            self.rewrite_bare_pragma_in_expr(&mut term.expr, &scope);
+        }
+        if let Some(limit) = &mut stmt.limit {
+            self.rewrite_bare_pragma_in_expr(&mut limit.limit, &scope);
+            if let Some(offset) = &mut limit.offset {
+                self.rewrite_bare_pragma_in_expr(offset, &scope);
+            }
+        }
     }
 
     fn rewrite_bare_pragma_in_body(&self, body: &mut SelectBody, cte_names: &[String]) {
@@ -68506,11 +68493,36 @@ impl Connection {
     }
 
     fn rewrite_bare_pragma_in_core(&self, core: &mut SelectCore, cte_names: &[String]) {
-        if let SelectCore::Select {
-            from: Some(from), ..
-        } = core
-        {
-            self.rewrite_bare_pragma_in_from_clause(from, cte_names);
+        match core {
+            SelectCore::Select {
+                columns, from, where_clause, group_by, having, windows, ..
+            } => {
+                for column in columns {
+                    if let ResultColumn::Expr { expr, .. } = column {
+                        self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                    }
+                }
+                if let Some(from) = from {
+                    self.rewrite_bare_pragma_in_from_clause(from, cte_names);
+                }
+                if let Some(expr) = where_clause {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+                for expr in group_by {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+                if let Some(expr) = having {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+                for window in windows {
+                    self.rewrite_bare_pragma_in_window(&mut window.spec, cte_names);
+                }
+            }
+            SelectCore::Values(rows) => {
+                for expr in rows.iter_mut().flatten() {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+            }
         }
     }
 
@@ -68518,6 +68530,9 @@ impl Connection {
         self.rewrite_bare_pragma_in_source(&mut from.source, cte_names);
         for join in &mut from.joins {
             self.rewrite_bare_pragma_in_source(&mut join.table, cte_names);
+            if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+            }
         }
     }
 
@@ -68550,7 +68565,106 @@ impl Connection {
             TableOrSubquery::Subquery { query, .. } => {
                 self.rewrite_bare_pragma_in_statement(query, cte_names);
             }
-            TableOrSubquery::TableFunction { .. } => {}
+            TableOrSubquery::TableFunction { args, .. } => {
+                for expr in args {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+            }
+        }
+    }
+
+    fn rewrite_bare_pragma_in_expr(&self, expr: &mut Expr, cte_names: &[String]) {
+        match expr {
+            Expr::BoundOuterValue { .. } | Expr::Literal(_, _) | Expr::Column(_, _)
+            | Expr::Raise { .. } | Expr::Placeholder(_, _) => {}
+            Expr::BinaryOp { left, right, .. } => {
+                self.rewrite_bare_pragma_in_expr(left, cte_names);
+                self.rewrite_bare_pragma_in_expr(right, cte_names);
+            }
+            Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. }
+            | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+            }
+            Expr::Between { expr, low, high, .. } => {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                self.rewrite_bare_pragma_in_expr(low, cte_names);
+                self.rewrite_bare_pragma_in_expr(high, cte_names);
+            }
+            Expr::In { expr, set, .. } => {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                match set {
+                    InSet::List(values) => {
+                        for value in values {
+                            self.rewrite_bare_pragma_in_expr(value, cte_names);
+                        }
+                    }
+                    InSet::Subquery(query) => self.rewrite_bare_pragma_in_statement(query, cte_names),
+                    InSet::Table(_) => {}
+                }
+            }
+            Expr::Like { expr, pattern, escape, .. } => {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                self.rewrite_bare_pragma_in_expr(pattern, cte_names);
+                if let Some(escape) = escape {
+                    self.rewrite_bare_pragma_in_expr(escape, cte_names);
+                }
+            }
+            Expr::Case { operand, whens, else_expr, .. } => {
+                if let Some(operand) = operand {
+                    self.rewrite_bare_pragma_in_expr(operand, cte_names);
+                }
+                for (when, then) in whens {
+                    self.rewrite_bare_pragma_in_expr(when, cte_names);
+                    self.rewrite_bare_pragma_in_expr(then, cte_names);
+                }
+                if let Some(else_expr) = else_expr {
+                    self.rewrite_bare_pragma_in_expr(else_expr, cte_names);
+                }
+            }
+            Expr::Subquery(query, _) | Expr::Exists { subquery: query, .. } => {
+                self.rewrite_bare_pragma_in_statement(query, cte_names);
+            }
+            Expr::FunctionCall { args, order_by, filter, over, .. } => {
+                if let FunctionArgs::List(args) = args {
+                    for arg in args {
+                        self.rewrite_bare_pragma_in_expr(arg, cte_names);
+                    }
+                }
+                for term in order_by {
+                    self.rewrite_bare_pragma_in_expr(&mut term.expr, cte_names);
+                }
+                if let Some(filter) = filter {
+                    self.rewrite_bare_pragma_in_expr(filter, cte_names);
+                }
+                if let Some(window) = over {
+                    self.rewrite_bare_pragma_in_window(window, cte_names);
+                }
+            }
+            Expr::JsonAccess { expr, path, .. } => {
+                self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                self.rewrite_bare_pragma_in_expr(path, cte_names);
+            }
+            Expr::RowValue(values, _) => {
+                for value in values {
+                    self.rewrite_bare_pragma_in_expr(value, cte_names);
+                }
+            }
+        }
+    }
+
+    fn rewrite_bare_pragma_in_window(&self, window: &mut WindowSpec, cte_names: &[String]) {
+        for expr in &mut window.partition_by {
+            self.rewrite_bare_pragma_in_expr(expr, cte_names);
+        }
+        for term in &mut window.order_by {
+            self.rewrite_bare_pragma_in_expr(&mut term.expr, cte_names);
+        }
+        if let Some(frame) = &mut window.frame {
+            for bound in std::iter::once(&mut frame.start).chain(frame.end.iter_mut()) {
+                if let FrameBound::Preceding(expr) | FrameBound::Following(expr) = bound {
+                    self.rewrite_bare_pragma_in_expr(expr, cte_names);
+                }
+            }
         }
     }
 
@@ -89342,6 +89456,11 @@ impl Connection {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
         let ctes = &with_clause.ctes;
+        let materialization_order = cte_materialization_order(ctes)?;
+        // Sibling bodies resolve through temporary roots too. Caching their
+        // bare SQL would retain a dropped CTE root after scope cleanup, or
+        // reuse a persistent-table program while the CTE shadows that table.
+        let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
         // Recursive fallback joins read their working table from MemDatabase.
         // Hydrate persistent rows before installing any CTE roots so a mixed
         // persistent/working-table join uses one complete execution image.
@@ -89359,7 +89478,8 @@ impl Connection {
             CteResultMetadataResolver::new(self, &schema).resolve_with_clause(with_clause)
         };
         self.reserve_clean_memdb_root_pages(ctes.len()).await?;
-        for (cte_index, cte) in ctes.iter().enumerate() {
+        for cte_index in materialization_order {
+            let cte = &ctes[cte_index];
             let cte_name = &cte.name;
             // The anchor position — the CTE's first/main SELECT core — must not
             // reference the CTE itself: a self-reference there has no base case and
@@ -109979,15 +110099,101 @@ fn in_subquery_matches_native_probe_source_shape(sub: &SelectStatement, conn: &C
     )
 }
 
+/// Relation walks can stop at a lexical boundary without treating references
+/// to a nested, shadowing CTE as dependencies of the enclosing WITH clause.
+trait RelationReferencePredicate {
+    fn matches(&mut self, name: &QualifiedName) -> bool;
+
+    fn enter_select(&self, _select: &SelectStatement) -> bool {
+        true
+    }
+
+    fn visit_cte(&self, _select: &SelectStatement, _cte: &fsqlite_ast::Cte) -> bool {
+        true
+    }
+}
+
+impl<F: FnMut(&QualifiedName) -> bool> RelationReferencePredicate for F {
+    fn matches(&mut self, name: &QualifiedName) -> bool {
+        self(name)
+    }
+}
+
+struct CteReference<'a>(&'a str);
+
+impl RelationReferencePredicate for CteReference<'_> {
+    fn matches(&mut self, name: &QualifiedName) -> bool {
+        name.schema.is_none() && name.name.eq_ignore_ascii_case(self.0)
+    }
+
+    fn enter_select(&self, select: &SelectStatement) -> bool {
+        !select.with.as_ref().is_some_and(|with| {
+            with.ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(self.0))
+        })
+    }
+
+    fn visit_cte(&self, select: &SelectStatement, cte: &fsqlite_ast::Cte) -> bool {
+        prune_unreferenced_ctes(select).is_none_or(|used| {
+            used.ctes.iter().any(|entry| entry.name.eq_ignore_ascii_case(&cte.name))
+        })
+    }
+}
+
+/// All siblings are visible throughout a WITH clause, including forward
+/// references that shadow persistent tables. Install dependencies first while
+/// retaining declaration indices for result metadata. Self-recursion remains
+/// the responsibility of the recursive CTE executor.
+fn cte_materialization_order(ctes: &[fsqlite_ast::Cte]) -> Result<Vec<usize>> {
+    if ctes.len() < 2 {
+        return Ok((0..ctes.len()).collect());
+    }
+    let dependencies: Vec<Vec<usize>> = ctes.iter().enumerate().map(|(index, cte)| {
+        ctes.iter().enumerate().filter_map(|(dependency, target)| {
+            (dependency != index && select_contains_relation_reference(
+                &cte.query, &mut CteReference(&target.name),
+            )).then_some(dependency)
+        }).collect()
+    }).collect();
+    let mut installed = vec![false; ctes.len()];
+    let mut order = Vec::with_capacity(ctes.len());
+    while order.len() < ctes.len() {
+        let ready = dependencies.iter().enumerate().position(|(index, deps)| {
+            !installed[index] && deps.iter().all(|dependency| installed[*dependency])
+        });
+        let Some(index) = ready else {
+            // A consumer blocked by a cycle is not necessarily cyclic itself.
+            let mut cycle = installed.iter().position(|done| !done).unwrap_or(0);
+            let mut seen = vec![false; ctes.len()];
+            while !seen[cycle] {
+                seen[cycle] = true;
+                cycle = *dependencies[cycle]
+                    .iter()
+                    .find(|dependency| !installed[**dependency])
+                    .ok_or_else(|| FrankenError::internal("unresolved CTE has no dependency"))?;
+            }
+            return Err(FrankenError::FunctionError(format!(
+                "circular reference: {}", ctes[cycle].name,
+            )));
+        };
+        installed[index] = true;
+        order.push(index);
+    }
+    Ok(order)
+}
+
 fn select_contains_relation_reference(
     select: &SelectStatement,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
+    if !predicate.enter_select(select) {
+        return false;
+    }
     if let Some(with_clause) = &select.with
         && with_clause
             .ctes
             .iter()
-            .any(|cte| select_contains_relation_reference(&cte.query, predicate))
+            .any(|cte| predicate.visit_cte(select, cte)
+                && select_contains_relation_reference(&cte.query, predicate))
     {
         return true;
     }
@@ -110010,7 +110216,7 @@ fn select_contains_relation_reference(
 
 fn select_core_contains_relation_reference(
     core: &SelectCore,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     match core {
         SelectCore::Select {
@@ -110051,7 +110257,7 @@ fn select_core_contains_relation_reference(
 
 fn from_clause_contains_relation_reference(
     from: &fsqlite_ast::FromClause,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     table_or_subquery_contains_relation_reference(&from.source, predicate)
         || from.joins.iter().any(|join| {
@@ -110066,10 +110272,10 @@ fn from_clause_contains_relation_reference(
 
 fn table_or_subquery_contains_relation_reference(
     source: &TableOrSubquery,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     match source {
-        TableOrSubquery::Table { name, .. } => predicate(name),
+        TableOrSubquery::Table { name, .. } => predicate.matches(name),
         TableOrSubquery::Subquery { query, .. } => {
             select_contains_relation_reference(query, predicate)
         }
@@ -110084,7 +110290,7 @@ fn table_or_subquery_contains_relation_reference(
 
 fn expr_contains_relation_reference(
     expr: &Expr,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     match expr {
         Expr::BoundOuterValue { .. }
@@ -110116,7 +110322,7 @@ fn expr_contains_relation_reference(
                     InSet::Subquery(subquery) => {
                         select_contains_relation_reference(subquery, predicate)
                     }
-                    InSet::Table(name) => predicate(name),
+                    InSet::Table(name) => predicate.matches(name),
                 }
         }
         Expr::Like {
@@ -110189,14 +110395,14 @@ fn expr_contains_relation_reference(
 
 fn window_contains_relation_reference(
     window: &fsqlite_ast::WindowDef,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     window_spec_contains_relation_reference(&window.spec, predicate)
 }
 
 fn window_spec_contains_relation_reference(
     spec: &fsqlite_ast::WindowSpec,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     spec.partition_by
         .iter()
@@ -110213,7 +110419,7 @@ fn window_spec_contains_relation_reference(
 
 fn frame_spec_contains_relation_reference(
     frame: &fsqlite_ast::FrameSpec,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     frame_bound_contains_relation_reference(&frame.start, predicate)
         || frame
@@ -110224,7 +110430,7 @@ fn frame_spec_contains_relation_reference(
 
 fn frame_bound_contains_relation_reference(
     bound: &fsqlite_ast::FrameBound,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     match bound {
         fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
@@ -110238,7 +110444,7 @@ fn frame_bound_contains_relation_reference(
 
 fn limit_clause_contains_relation_reference(
     limit: &LimitClause,
-    predicate: &mut impl FnMut(&QualifiedName) -> bool,
+    predicate: &mut impl RelationReferencePredicate,
 ) -> bool {
     expr_contains_relation_reference(&limit.limit, predicate)
         || limit
@@ -110276,7 +110482,7 @@ fn subquery_references_view(sub: &SelectStatement, conn: &Connection) -> bool {
     if conn.views.borrow().is_empty() {
         return false;
     }
-    select_contains_relation_reference(sub, &mut |name| {
+    select_contains_relation_reference(sub, &mut |name: &QualifiedName| {
         conn.local_view_index_for_relation(name).is_some()
     })
 }
@@ -110287,7 +110493,7 @@ fn in_subquery_references_view(sub: &SelectStatement, conn: &Connection) -> bool
 
 fn subquery_references_sqlite_schema(sub: &SelectStatement, conn: &Connection) -> bool {
     let schema = conn.schema.borrow();
-    select_contains_relation_reference(sub, &mut |name| {
+    select_contains_relation_reference(sub, &mut |name: &QualifiedName| {
         qualified_relation_name(name)
             .and_then(|local_name| {
                 canonical_sqlite_schema_name(local_name)
@@ -111675,7 +111881,7 @@ fn view_output_column_names(view: &ViewDef) -> Option<Vec<String>> {
 fn rewrite_probe_is_correlated(conn: &Connection, sub: &SelectStatement) -> bool {
     let schema = conn.schema.borrow();
     let views = conn.views.borrow();
-    let references_synthetic_relation = select_contains_relation_reference(sub, &mut |name| {
+    let references_synthetic_relation = select_contains_relation_reference(sub, &mut |name: &QualifiedName| {
         name.schema.is_none()
             && (is_sqlite_schema_name(&name.name)
                 || views

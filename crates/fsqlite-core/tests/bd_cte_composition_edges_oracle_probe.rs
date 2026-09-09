@@ -72,9 +72,15 @@ fn dysy4_forward_cte_shadows_outer_table() {
         for (sql, expected) in [
             ("WITH q AS (SELECT v FROM a), a(v) AS (VALUES(2)) SELECT v FROM q", 2),
             ("WITH q AS (SELECT v FROM later), later(v) AS (VALUES(3)) SELECT v FROM q", 3),
-            ("WITH q AS (SELECT v FROM main.a), a(v) AS (VALUES(2)) SELECT v FROM q", 1),
+            ("WITH q AS (SELECT v FROM main.a) SELECT v FROM q", 1),
             ("WITH q AS (WITH a(v) AS (VALUES(4)) SELECT v FROM a), a(v) AS (VALUES(2)) SELECT v FROM q", 4),
             ("WITH q AS (SELECT (SELECT v FROM a) AS v), a(v) AS (VALUES(2)) SELECT v FROM q", 2),
+            ("WITH q AS (SELECT v FROM b), b AS (SELECT v+1 AS v FROM a), a(v) AS (VALUES(2)) SELECT v FROM q", 3),
+            ("WITH q AS (WITH a(v) AS (VALUES(4)) SELECT v FROM a), a AS (SELECT v FROM q) SELECT v FROM a", 4),
+            ("WITH q AS (WITH unused AS (SELECT v FROM a) SELECT 5 AS v), a AS (SELECT v FROM q) SELECT v FROM a", 5),
+            ("WITH q AS (SELECT 2 IN a AS v), a(v) AS (VALUES(2)) SELECT v FROM q", 1),
+            ("WITH q AS (SELECT v FROM a), a(v) AS (SELECT 2 WHERE 0) SELECT count(*) FROM q", 0),
+            ("WITH q AS (SELECT v FROM a), a(v) AS (SELECT CAST(2 AS TEXT)) SELECT v=2 FROM q", 1),
         ] {
             let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
             assert_eq!(stock, expected, "stock control: {sql}");
@@ -82,7 +88,63 @@ fn dysy4_forward_cte_shadows_outer_table() {
             assert_eq!(actual.len(), 1, "{sql}");
             assert_eq!(actual[0].values(), &[SqliteValue::Integer(stock)], "{sql}");
             // Materialization must restore the real table after every statement.
+            let restored = f.query("SELECT v FROM a").await
+                .unwrap_or_else(|e| panic!("persistent table after {sql}: {e}"));
+            assert_eq!(restored.len(), 1, "persistent table after {sql}");
+            assert_eq!(restored[0].values(), &[SqliteValue::Integer(1)], "persistent table after {sql}");
+        }
+    });
+}
+
+#[test]
+fn dysy4_qualified_cte_collision_keeps_existing_explicit_refusal() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in ["CREATE TABLE a(v INTEGER)", "INSERT INTO a VALUES(1)"] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        // This pre-existing namespace limitation is outside the unqualified
+        // sibling-resolution fix. Do not silently read the CTE as main.a.
+        let sql = "WITH q AS (SELECT v FROM main.a), a(v) AS (VALUES(2)) SELECT v FROM q";
+        let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(stock, 1);
+        let error = f.query(sql).await.expect_err("qualified collision remains unsupported");
+        assert!(matches!(error, fsqlite_error::FrankenError::NotImplemented(_)), "{error}");
+        let rows = f.query("SELECT v FROM main.a").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[SqliteValue::Integer(stock)]);
+    });
+}
+
+#[test]
+fn dysy4_cte_cycles_fail_without_leaking_materialized_tables() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in ["CREATE TABLE a(v)", "INSERT INTO a VALUES(1)"] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for cycle in [
+            "WITH q AS (SELECT v FROM a), a AS (SELECT v FROM q) SELECT v FROM q",
+            "WITH x AS (SELECT v FROM q), q AS (SELECT v FROM a), a AS (SELECT v FROM q) SELECT v FROM x",
+        ] {
+            let stock = r.prepare(cycle).expect_err("stock detects sibling cycle");
+            assert!(stock.to_string().contains("circular reference: q"), "{stock}");
+            let actual = f.query(cycle).await.expect_err("sibling cycle must fail");
+            assert!(actual.to_string().contains("circular reference: q"), "{actual}");
             assert_eq!(fq(&f, "SELECT v FROM a").await, vec![vec!["int:1"]]);
+        }
+        for sql in [
+            "WITH q AS (SELECT * FROM z), z AS (SELECT * FROM q) SELECT 1",
+            "WITH RECURSIVE q(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM q WHERE v<3) SELECT sum(v) FROM q",
+        ] {
+            let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
+            let actual = f.query(sql).await.unwrap();
+            assert_eq!(actual.len(), 1, "{sql}");
+            assert_eq!(actual[0].values(), &[SqliteValue::Integer(stock)], "{sql}");
         }
     });
 }
