@@ -1228,6 +1228,18 @@ pub trait VfsFile: Send + Sync {
     /// returning control to the caller.
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()>;
 
+    /// Acquire an appender-excluding fence for a WAL checkpoint.
+    ///
+    /// Unlike whole-image replacement, a checkpoint also observes the WAL
+    /// reader horizon and acquires the backfill/reset gates before mutating
+    /// protected pages. A backend may therefore admit idle WAL attachments
+    /// while excluding both native and stock appenders. The conservative
+    /// default retains the whole-image fence. Restore every attempt through
+    /// [`Self::restore_external_maintenance_attempt`], including failures.
+    fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        self.lock_external_maintenance(cx, true)
+    }
+
     /// Restore the exact baseline of an external maintenance acquisition
     /// attempt.
     ///

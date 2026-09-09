@@ -4354,6 +4354,18 @@ impl<F: VfsFile + 'static> BeginExternalLockState<F> {
         shared_db_lock_external_maintenance(&self.db_file, cx, wal_mode).await
     }
 
+    async fn acquire_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        debug_assert!(
+            self.restore_target.is_none(),
+            "checkpoint acquisition requires no previously armed external lock"
+        );
+        self.restore_target = Some(PendingExternalUnlockTarget::ExternalMaintenance);
+        self.restore_scope = Some(ProcessRootFinalizationScope::IdentityWide);
+        shared_db_file_write(&self.db_file, cx)
+            .await?
+            .lock_external_wal_checkpoint(cx)
+    }
+
     async fn restore(&mut self) -> Result<()> {
         let Some(restore_target) = self.restore_target else {
             return Ok(());
@@ -13960,6 +13972,12 @@ where
                         },
                         PageNumber::ONE,
                     );
+                } else if inner.active_transactions == 0 && !inner.checkpoint_active {
+                    // Retry a WAL-detachment cleanup that failed after the
+                    // rollback-mode header and metadata were published.
+                    shared_db_file_write(&inner.db_file, cx)
+                        .await?
+                        .shm_unmap(cx, false)?;
                 }
                 return Ok(mode);
             }
@@ -13975,6 +13993,17 @@ where
             if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
                 return Err(FrankenError::Unsupported);
             }
+
+            // Changing the file format is whole-image maintenance, even
+            // though the preceding WAL checkpoint can admit idle readers.
+            let mut external_lock = BeginExternalLockState::new(
+                &self.group_commit_queue,
+                Arc::clone(&inner.db_file),
+                cx,
+            );
+            external_lock
+                .acquire_maintenance(cx, inner.journal_mode == JournalMode::Wal)
+                .await?;
 
             // Update the file format version in the database header (bytes 18-19).
             // WAL mode uses version 2; all rollback journal modes use version 1.
@@ -14023,6 +14052,14 @@ where
                 },
                 PageNumber::ONE,
             );
+            // Restore the attempt's WAL slots before detaching SHM: unmap
+            // releases its owner record, which the exact restoration needs.
+            external_lock.restore().await?;
+            if mode == JournalMode::Delete {
+                shared_db_file_write(&inner.db_file, cx)
+                    .await?
+                    .shm_unmap(cx, false)?;
+            }
             drop(inner);
             Ok(mode)
         }
@@ -27763,16 +27800,16 @@ where
 
             let wal = wal_backend_handle(&self.wal_backend)?;
 
-            // Participate in the same VFS-defined whole-image fence used by
-            // VACUUM. On Windows this includes stock SQLite's real main-file
-            // and -shm byte ranges in addition to FrankenSQLite's cooperative
-            // sidecars; on Unix the default hook is the native lock protocol.
+            // Exclude appenders while taking a stable WAL view. Unix keeps
+            // idle foreign WAL attachments admitted; the reader horizon and
+            // backfill/reset gates below protect their live snapshots. Full
+            // image replacement retains its stronger maintenance fence.
             let mut external_lock = BeginExternalLockState::new(
                 &self.group_commit_queue,
                 Arc::clone(&inner.db_file),
                 cx,
             );
-            external_lock.acquire_maintenance(cx, true).await?;
+            external_lock.acquire_wal_checkpoint(cx).await?;
 
             // GH #384: a pager that has been idle while a peer committed can
             // still carry its old local commit sequence here. Refresh only

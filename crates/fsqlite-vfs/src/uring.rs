@@ -1275,6 +1275,10 @@ impl VfsFile for IoUringFile {
         self.inner.lock_external_maintenance(cx, wal_mode)
     }
 
+    fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_wal_checkpoint(cx)
+    }
+
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
         self.inner.restore_external_maintenance_attempt(cx)
     }
