@@ -49,10 +49,14 @@ struct Deltas {
     commit_handle_finalize_ns: u64,
     commit_post_maint_ns: u64,
     finalize_post_publish_ns: u64,
+    wal_frames_written: u64,
+    checkpoint_frames_backfilled: u64,
+    checkpoint_duration_us: u64,
 }
 
 fn snapshot_deltas() -> Deltas {
     let snap = hot_path_profile_snapshot();
+    let wal = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
     Deltas {
         memdb_refresh: snap.memdb_refresh_count,
         schema_full_scans: snap.memdb_txn_schema_full_scans,
@@ -70,6 +74,9 @@ fn snapshot_deltas() -> Deltas {
         commit_handle_finalize_ns: snap.commit_handle_finalize_time_ns,
         commit_post_maint_ns: snap.commit_post_write_maintenance_time_ns,
         finalize_post_publish_ns: snap.finalize_post_publish_time_ns,
+        wal_frames_written: wal.frames_written_total,
+        checkpoint_frames_backfilled: wal.checkpoint_frames_backfilled_total,
+        checkpoint_duration_us: wal.checkpoint_duration_us_total,
     }
 }
 
@@ -112,6 +119,12 @@ fn window_report(
         ),
         file_kb(db_path),
         file_kb(&wal),
+    );
+    println!(
+        "[gh402] {label} tables={window_tables} wal_frames_written={} checkpoint_frames_backfilled={} checkpoint_us={}",
+        after.wal_frames_written - before.wal_frames_written,
+        after.checkpoint_frames_backfilled - before.checkpoint_frames_backfilled,
+        after.checkpoint_duration_us - before.checkpoint_duration_us,
     );
 }
 
@@ -237,7 +250,7 @@ fn gh402_measure_residual_schema_matrix() {
         let maximum = table_count().max(6);
         for tables in [maximum / 6, maximum / 2, maximum] {
             for file_backed in [false, true] {
-                for explicit_transaction in [false, true] {
+                for ddl_mode in ["seq", "batch", "txn"] {
                     let dir = tempfile::tempdir().expect("tempdir");
                     let path = dir.path().join("residual.db");
                     let target = if file_backed {
@@ -246,18 +259,37 @@ fn gh402_measure_residual_schema_matrix() {
                         ":memory:"
                     };
                     let label = format!(
-                        "residual storage={} mode={} tables={tables}",
+                        "residual storage={} mode={ddl_mode} tables={tables}",
                         if file_backed { "file" } else { "memory" },
-                        if explicit_transaction { "txn" } else { "seq" },
                     );
                     let conn = Connection::open(target).await.expect("open");
                     reset_hot_path_profile();
                     let started = Instant::now();
-                    if explicit_transaction {
+                    if ddl_mode == "txn" {
                         conn.execute("BEGIN IMMEDIATE;").await.expect("begin DDL");
                     }
-                    create_schema_autocommit(&conn, tables, &label, &path).await;
-                    if explicit_transaction {
+                    if ddl_mode == "batch" {
+                        let mut sql = String::new();
+                        for i in 0..tables {
+                            sql.push_str(&format!(
+                                "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b REAL, c BLOB);\n\
+                                 CREATE INDEX idx_t{i}_a ON t{i}(a);\n"
+                            ));
+                        }
+                        let before = snapshot_deltas();
+                        conn.execute_batch(&sql).await.expect("batch DDL");
+                        window_report(
+                            &label,
+                            tables,
+                            started.elapsed().as_millis(),
+                            &before,
+                            &snapshot_deltas(),
+                            &path,
+                        );
+                    } else {
+                        create_schema_autocommit(&conn, tables, &label, &path).await;
+                    }
+                    if ddl_mode == "txn" {
                         conn.execute("COMMIT;").await.expect("commit DDL");
                     }
                     println!(
