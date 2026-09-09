@@ -16,7 +16,8 @@ for this revision. External DSR configuration and release asset inventories
 were not re-audited. Operational host names, filesystem key locations and key
 material remain outside this document.
 
-Local-tree facts checked for this revision:
+Local-tree snapshot checked on 2026-09-05 (versions below are historical;
+consult the manifests for the current development line):
 
 - The [workspace manifests](../Cargo.toml) have 28 members, all locally declared
   at `0.3.16`; two members (`fsqlite-e2e`, `fsqlite-harness`) are marked

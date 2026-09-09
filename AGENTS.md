@@ -56,7 +56,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
-- **Workspace:** 27 crates under `crates/` (see members list in root `Cargo.toml`)
+- **Workspace:** 28 crates under `crates/` (see members list in root `Cargo.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via workspace lints)
@@ -73,7 +73,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 **Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
 
-**Pattern**: All async functions take `&Cx` as first parameter. The `Cx` flows down from the consumer's runtime — FrankenSQLite does NOT create its own runtime.
+**Pattern**: Internal I/O and lock operations receive `&Cx`; propagate it through those boundaries. Public `Connection::open` and `execute` do not take `&Cx`. Their futures are polled by the caller's executor, while the default `ConnectionEnv` uses a process-global `RuntimeContext`. Callers can inject their own context lineage with `ConnectionEnv::new_with_root_cx` and `Connection::open_with_env`.
 
 ### Key Dependencies
 
@@ -244,6 +244,8 @@ directory — primarily `crates/fsqlite-e2e/tests/` and
 `tests/` directory: the root `Cargo.toml` is a virtual manifest (no
 `[package]`), so files there are never compiled or run by
 `cargo test --workspace`.
+The root `tests/regression_baseline.json` is active release-certificate input,
+not a Cargo test target. Preserve it; do not move or regenerate it as test cleanup.
 
 ### CI Coverage Warning: GitHub Actions Is Off; Workflow Allowlists Are Inert (bd-ohk1x)
 
@@ -281,6 +283,12 @@ state in the bead/commit that it is local-only. History: bd-ohk1x
 (fsqlite-e2e allowlist drift, fixed by discovery in 2026-07); bd-kon3m sat in
 a file no workflow named while Actions was off and surfaced only through a
 local run two weeks later (2026-08-18 to 2026-09-01).
+
+The E2E discovery gate checks configured target coverage against
+`.github/e2e-tests-not-run-in-ci.txt`; that inventory is distinct from the
+release-certificate baseline in `tests/regression_baseline.json`. Discovery
+proves neither workflow execution nor passing tests. Default libtest execution
+also skips `#[ignore]` bodies; ignored correctness keepers need explicit runs.
 
 ### Unit Tests
 
@@ -330,7 +338,7 @@ cargo test --workspace --all-features
 | `fsqlite-harness` | SQLite conformance test suite execution |
 | `fsqlite-e2e` | End-to-end concurrent writer tests, fairness benchmarks |
 | `fsqlite-observability` | Metrics collection, tracing integration |
-| `tests/` (workspace) | Cross-component integration and end-to-end tests |
+| `tests/` (workspace) | Release-certificate metadata and non-Cargo artifacts; integration tests belong in owning crates |
 | `benches/` (workspace) | Criterion benchmarks |
 
 ### Property-Based & Snapshot Tests
@@ -398,7 +406,7 @@ Storage: VFS --> Pager --> WAL --> MVCC --> B-Tree --> Page I/O
 
 ```
 frankensqlite/
-├── Cargo.toml                         # Workspace root — all 27 members, shared deps, profiles
+├── Cargo.toml                         # Workspace root — all 28 members, shared deps, profiles
 ├── rust-toolchain.toml                # Nightly toolchain requirement
 ├── crates/
 │   ├── fsqlite-types/                 # Foundation types (Value, PageNumber, RowId, etc.)
@@ -425,9 +433,12 @@ frankensqlite/
 │   ├── fsqlite-cli/                   # Command-line shell (like sqlite3 CLI)
 │   ├── fsqlite-harness/               # Test harness and conformance testing framework
 │   ├── fsqlite-e2e/                   # End-to-end tests, concurrent writer harness
-│   └── fsqlite-observability/         # Metrics collection and tracing integration
+│   ├── fsqlite-observability/         # Metrics collection and tracing integration
+│   ├── fsqlite-c-api/                 # Optional C ABI
+│   ├── fsqlite-wasm/                  # Experimental WebAssembly API
+│   └── beads-doctor/                  # Beads database health tool
 ├── src/                               # Additional source files and utilities
-├── tests/                             # Integration and end-to-end tests
+├── tests/                             # Release-certificate metadata; not Cargo integration targets
 ├── benches/                           # Criterion benchmarks
 ├── fuzz/                              # Fuzz testing targets
 └── conformance/                       # SQLite conformance test data

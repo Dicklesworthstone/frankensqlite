@@ -1,9 +1,9 @@
 # FrankenSQLite Concurrency Contract
 
 **Bead / Issue:** [frankensqlite#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-(closed 2026-05-24; this document is the durable contract that outlived the
-tracking issue). Remaining multi-process durability work is carried by the open
-P0 Beads epic `bd-zywqc`.
+(reopened 2026-08-27 after the earlier closure lacked a current swarm receipt).
+The public acceptance issue and the open P0 Beads epic `bd-zywqc` both retain
+the remaining multi-process durability work.
 
 **Purpose:** state, unambiguously, what concurrency guarantees FrankenSQLite
 claims today — and what it does *not* — so caller projects stop re-filing
@@ -33,7 +33,7 @@ issues whose common cause was never named.
 - **Multi-process, multi-writer WAL**: *partial, bounded by measured harness
   scale*.
   The `swarm_multiprocess` harness exists (`crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs`)
-  because this path was the source of the closed
+  because this path was the source of the reopened
   [#70 roll-up](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
   family of bugs. Known limitations are enumerated below; the harness remains
   authoritative for the largest process count proven green on each platform.
@@ -50,10 +50,11 @@ This document is advisory/normative. The machine-readable sources of
 truth are:
 
 1. **`crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs`** — the
-   multi-process swarm harness. Reproducible: what it asserts is what
-   fsqlite currently guarantees under swarm-write load. What it fails
-   on (check `crates/fsqlite-e2e/artifacts/swarm-multiprocess/` for
-   captured forensic bundles) is what fsqlite does *not* yet guarantee.
+   multi-process swarm harness. Its assertions define the intended checks;
+   only a completed passing run establishes evidence for its exact source,
+   platform, workload, process count and duration. Check
+   `crates/fsqlite-e2e/artifacts/swarm-multiprocess/` for retained results and
+   failure bundles. The harness source alone is not a passing receipt.
 2. **`crates/fsqlite-e2e/tests/concurrent_writer_mvcc_oracle_e2e.rs`** —
    file-backed tests using distinct Connections on OS threads, including
    snapshot isolation and stock SQLite reads of retained data. The canonical
@@ -92,10 +93,10 @@ mechanism (MVCC, DPOR, page-conflict math), see the README's
   remaining churn work in `bd-ioq6x`.
 - **Multi-process**: target is N ≤ 32 short-lived writers per file
   (matching the swarm harness scale). Today the multi-process surface is
-  *partial* — see the closed
+  *partial* — see the reopened
   [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
   roll-up for root-cause history. Treat the largest N at which
-  `cargo run -p fsqlite-e2e --bin swarm-multiprocess --workers N --seconds 3600`
+  `cargo run -p fsqlite-e2e --bin swarm-multiprocess -- --workers N --seconds 3600`
   is green on your platform as the conservative upper bound. Mixing
   fsqlite and stock-SQLite *concurrent* opens against the same file is
   not supported (each side enforces invariants over its own pager only;
@@ -120,7 +121,10 @@ must not produce process-global state leakage.
 
 - **Read-your-own-writes**: immediately, on the same `Connection`.
   `COMMIT` returning `Ok` means the next `query`/`query_with_params` on
-  the same `Connection` sees the new row. This is unconditional.
+  the same `Connection` must see the new row. This is a required invariant,
+  not an unconditional multi-process certification: the mixed-stock-connection
+  data-loss report [#411](https://github.com/Dicklesworthstone/frankensqlite/issues/411)
+  remains open.
 - **Cross-Connection (same process)**: visible at B's next transaction
   boundary. Shared commit publication and
   `refresh_memdb_if_stale_with_publication_and_mode` refresh data visibility;
@@ -134,8 +138,11 @@ must not produce process-global state leakage.
   read marks and VFS coordination; `SharedMvccState` is process-local.
   Native `*.fsqlite-shm` components exist, but do not establish a complete
   public shared-version/commit/retention path. Cross-process acceptance must
-  execute on the actual platform/backend. No nanosecond propagation bound is
-  established by the presence of shared-memory types.
+  execute on the actual platform/backend. A supported cross-process visibility
+  claim requires a current passing target-platform receipt; #70 requires at
+  least eight processes for at least one hour. Shared WAL-index publication
+  remains tracked by #19 (Unix) and #395 (Windows). No nanosecond propagation
+  bound is established by the presence of shared-memory types.
 
 ### 4. Plan-cache visibility — does the prepared-statement cache participate?
 
@@ -151,18 +158,17 @@ family. The contract:
   page). That class is what beads_rust#252/#254/#255 saw as
   `SELECT … WHERE pk = ?` returning zero rows for a freshly-committed
   row, or the wrong row.
-- After the fixes referenced in the
-  `flat-combining-page-locks` /
-  `feat/conformal-retry-budget` series, the prepared-plan cache is
-  required to invalidate on cross-Connection commit boundaries that
-  touch the cache's covered pages. The
-  `cross_process_visibility` and `wrong_row_returns` criteria in the
-  swarm harness exist to nail this down.
+- A cached prepared statement must bind its reads to the transaction's current
+  visibility state; reusing compiled bytecode must not reuse a stale snapshot
+  or cursor. The `cross_process_visibility` and `wrong_row_returns` criteria
+  exist to test this requirement. Historical fixes and schema-cookie checks
+  do not prove it for current multi-process execution: data-only commits need
+  not change the schema cookie. Treat cross-process cache correctness as
+  conditional on the same source-bound target-platform receipt as visibility.
 - Caller obligation: do **not** assume that re-using a prepared
   statement across transaction boundaries on the same connection
-  preserves a snapshot. Re-prepare or rely on the connection-level
-  invalidation; do not cache plan handles in an outer pool that
-  outlives a transaction without consulting `schema_cookie`.
+  preserves a snapshot. The engine owns snapshot refresh; re-preparing or
+  consulting `schema_cookie` alone cannot certify cross-process data visibility.
 
 ### 5. Lock-timeout semantics — does `PRAGMA busy_timeout` apply across processes?
 
@@ -199,18 +205,16 @@ These are intentional or known gaps documented so callers can plan:
   serialize through a single owner.
 - **Stale prepared-plan cache vs. concurrent index growth**: stock
   SQLite re-validates prepared statements aggressively on schema or
-  catalog change; fsqlite's plan cache participates in cross-process
-  visibility but historically has had narrower invalidation windows
-  than stock. This is the beads_rust#252/#254/#255 class. Best caller
-  defense today: do not pool prepared statements across transaction
-  boundaries in code that runs against fsqlite without explicit
-  `schema_cookie` checks.
+  catalog change. FrankenSQLite's required cross-process visibility and
+  prepared-read behavior still need current native evidence. This is the
+  beads_rust#252/#254/#255 symptom class; a schema-cookie check alone does not
+  detect data-only commits or establish that a cached read is current.
 - **Cross-process advisory lock interop with non-fsqlite openers**:
   stock SQLite is the de-facto standard. If you open the same file
-  with both fsqlite and stock SQLite *at the same time*, only stock's
-  invariants are guaranteed at the wire format. Sequential
-  hand-off (close one, open the other) is fine and is what
-  conformance tests exercise.
+  with both fsqlite and stock SQLite *at the same time*, the participants do
+  not yet share a certified WAL-index protocol. #411 reports committed data
+  lost when a stock peer closes. Sequential hand-off after successful
+  checkpoint and close is the separate file-format conformance surface.
 - **No shm-less WAL fallback parity** when shared memory is
   unavailable: stock SQLite degrades gracefully via heap-shm; fsqlite
   falls back to file-lock-based coordination that degrades to
@@ -229,7 +233,7 @@ These are intentional or known gaps documented so callers can plan:
   criterion.
 - SQL surface for the conformance corpus: see
   [`docs/canonical_parity_contract.md`](./canonical_parity_contract.md).
-- Single-writer + multi-reader WAL semantics: full parity, including
+- Single-writer + multi-reader WAL semantics: target parity, including
   `busy_timeout` honor, `SQLITE_BUSY` error codes, and `PRAGMA
   wal_autocheckpoint` thresholds.
 - `PRAGMA integrity_check` semantics: parity is the target. `bd-y5urj` closed
@@ -291,7 +295,7 @@ see "Supported: multi-reader, single-writer WAL" below.
 do not try to share a single `Connection` across OS threads — it is
 `!Send + !Sync` and will not compile.
 
-### Supported: multi-reader, single-writer WAL
+### Intended: multi-reader, single-writer WAL
 
 - The classic SQLite WAL contract: readers never block, one writer at
   a time, `PRAGMA busy_timeout` governs contention.
@@ -300,13 +304,17 @@ do not try to share a single `Connection` across OS threads — it is
   for the historical `F_SETLK` gap — check its status before relying on
   cross-process busy-timeout honor.
 
+This mode does not certify mixed-stock or multi-process execution. The same
+native receipt requirements and shared WAL-index gaps apply.
+
 ### Partial: multi-process, multi-writer WAL
 
-This is the path the closed
+This is the path the reopened
 [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70) roll-up
 described. Historical symptom families were individually patched, and the
-meta-issue closed once substantial work landed, handing its remaining scope to
-the Beads tree that now carries multi-process durability:
+meta-issue was reopened on 2026-08-27 because the earlier closure did not carry
+the required current native swarm evidence. The Beads tree also tracks the
+remaining implementation and verification:
 
 | Family | Example issues | Observable symptom |
 |---|---|---|
@@ -327,6 +335,9 @@ root rather than through another point fix.
 remains **partial** until the swarm harness is green at
 N ≥ 8 for ≥ 1 hour on the target platform. The bound is the measurement, not a
 claim that the historical issue closure completed every root-cause gate.
+The receipt must demonstrate #70's full correctness criteria, including
+short-lived connection churn and stock integrity checks; elapsed time and
+process count alone do not pass that gate.
 
 ### Not supported today
 
@@ -451,10 +462,13 @@ let callers detect a second-process open and refuse with a
 specific `FrankenError::MultiProcessAccessRefused` variant rather than
 silently accepting it.
 
-This is **not implemented yet**. It was sketched out in the closed
-[#70 triage](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-comment thread as a candidate follow-up and has no live GitHub tracker.
-The broader multi-process durability program remains tracked by `bd-zywqc`.
+That universal second-process-open refusal is **not implemented**. A narrower,
+default-off strict mode exists through `Connection::open_strict_multi_process`
+or `ConnectionEnv::set_strict_multi_process(true)`: it reports selected
+ambiguous concurrency conditions. It does not reject every second-process open
+and is not a multi-process correctness certificate. The broader program
+remains tracked by reopened [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+and `bd-zywqc`.
 Design notes for whoever
 picks it up:
 
@@ -502,3 +516,8 @@ grow a scenario that proves the refusal actually refuses.
   `--bin swarm-multiprocess` invocation (was `swarm_multiprocess`) and refreshed
   the stale `unix.rs` `F_SETLK` line-range anchor to a `grep`-stable pointer.
   (bd-concurrency-contract-drift-2m25e)
+- **2026-09-09**: Reconciled the 2026-08-27 reopening of #70, made
+  cross-process visibility/prepared-read claims conditional on current native
+  receipts, and distinguished the existing targeted strict mode from a
+  universal second-process-open refusal (#391, bd-q0t78). No new runtime
+  certification is implied.

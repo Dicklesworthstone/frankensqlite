@@ -175,6 +175,8 @@ FrankenSQLite is organized as a 28-member Cargo workspace with layered dependenc
 | | `fsqlite-e2e` | Differential testing, workload replay, fairness/benchmark execution |
 | | `fsqlite-harness` | Verification/conformance/orchestration platform around the engine |
 | | `fsqlite-c-api` | Optional C ABI shim for embedding/integration |
+| | `fsqlite-wasm` | Experimental WebAssembly API |
+| | `beads-doctor` | Beads database health tool |
 
 The `crates/fsqlite-wasm/` crate provides experimental WebAssembly support and is included as a workspace member.
 
@@ -270,9 +272,9 @@ All threshold PRAGMAs clamp invalid low values to safe minimums.
 > concurrency shapes are intended (`single-process / multi-Connection / MVCC WAL`),
 > which are not (`single-Connection shared across threads`), and which are
 > partial at a measured harness scale (`multi-process swarm-write`). The
-> closed [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
-> records the original validation milestone; the remaining multi-process work
-> is carried by the Beads tracker. The concurrent-writer certification track also
+> reopened [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70)
+> requires a current target-platform swarm receipt with at least eight processes
+> for at least one hour; `bd-zywqc` carries the remaining execution work. The concurrent-writer certification track also
 > closed the double-allocation failure `bd-9inpb` on September 4; orphaned-page
 > churn remains tracked by `bd-ioq6x`. The harness under
 > `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the canonical source of
@@ -992,16 +994,17 @@ Cx threads three capabilities through the entire call chain:
 
 ```
 async caller
-  → Connection::execute(sql, &cx).await
-    → spawn_blocking(|| {
-        parse(sql)
-        plan(ast)
-        execute(bytecode, &cx)
-      })
-    → on commit: tx.send(CommitRequest { write_set, intent_log, response: oneshot })
-    → response.await
+  → Connection::execute(sql).await
+    → parse and dispatch using the connection's operation Cx
+    → compile eligible SQL to VDBE; dispatch supported fallback shapes
+    → execute against the pager/B-tree with that Cx
+    → on commit: validate → pager commit → publish
   ← Result<Rows>
 ```
+
+The caller supplies the executor polling this future. The default connection
+uses the process-global `RuntimeContext`; `ConnectionEnv::new_with_root_cx`
+and `Connection::open_with_env` opt into caller-rooted context lineage.
 
 The live compatibility commit runs in the owning `Connection`; it does not
 submit SQL commits to an MPSC coordinator. `execute_commit_with_cx` takes a
@@ -2856,7 +2859,7 @@ cargo bench --bench parser_throughput
 
 FrankenSQLite deliberately omits several components of the C SQLite ecosystem. Each exclusion has a technical rationale; none are omitted from laziness.
 
-**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 27 members provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
+**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 28 members provides modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
 
 **TCL test harness.** C SQLite's test suite is driven by ~90,000+ lines of TCL scripts deeply intertwined with the C API. These cannot be meaningfully ported. Instead, FrankenSQLite uses native Rust `#[test]` modules, proptest for property-based testing, a conformance harness comparing SQL output against C SQLite golden files, and asupersync's lab reactor for deterministic concurrency tests.
 
@@ -3076,7 +3079,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 
 ```
 frankensqlite/
-├── Cargo.toml                # Workspace: 27 members, shared deps, lint config
+├── Cargo.toml                # Workspace: 28 members, shared deps, lint config
 ├── Cargo.lock                # Pinned dependency versions
 ├── rust-toolchain.toml       # Pinned dated nightly + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
@@ -3111,13 +3114,19 @@ frankensqlite/
 │   ├── fsqlite-harness/      # Verification/conformance harness
 │   ├── fsqlite-e2e/          # Differential/E2E runner crate
 │   ├── fsqlite-observability/ # Metrics and tracing helpers
-│   └── fsqlite-c-api/        # Optional C ABI adapter
+│   ├── fsqlite-c-api/        # Optional C ABI adapter
+│   ├── fsqlite-wasm/         # Experimental WebAssembly API
+│   └── beads-doctor/         # Beads database health tool
 ├── legacy_sqlite_code/
 │   └── sqlite/               # C SQLite reference (git submodule)
 ├── benches/                  # Criterion benchmarks
 ├── conformance/              # SQLite compatibility test fixtures
-└── tests/                    # Integration tests
+└── tests/                    # Release-certificate metadata; not Cargo integration targets
 ```
+
+The root manifest is virtual. Cargo integration tests live under the owning
+crates' `tests/` directories; root `tests/regression_baseline.json` is consumed
+by the release-certificate code and is not an executable test target.
 
 ---
 
