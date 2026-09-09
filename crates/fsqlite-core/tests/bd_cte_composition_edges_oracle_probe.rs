@@ -61,6 +61,33 @@ async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
 }
 
 #[test]
+fn dysy4_forward_cte_shadows_outer_table() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in ["CREATE TABLE a(v INTEGER)", "INSERT INTO a VALUES (1)"] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for (sql, expected) in [
+            ("WITH q AS (SELECT v FROM a), a(v) AS (VALUES(2)) SELECT v FROM q", 2),
+            ("WITH q AS (SELECT v FROM later), later(v) AS (VALUES(3)) SELECT v FROM q", 3),
+            ("WITH q AS (SELECT v FROM main.a), a(v) AS (VALUES(2)) SELECT v FROM q", 1),
+            ("WITH q AS (WITH a(v) AS (VALUES(4)) SELECT v FROM a), a(v) AS (VALUES(2)) SELECT v FROM q", 4),
+            ("WITH q AS (SELECT (SELECT v FROM a) AS v), a(v) AS (VALUES(2)) SELECT v FROM q", 2),
+        ] {
+            let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(stock, expected, "stock control: {sql}");
+            let actual = f.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(actual.len(), 1, "{sql}");
+            assert_eq!(actual[0].values(), &[SqliteValue::Integer(stock)], "{sql}");
+            // Materialization must restore the real table after every statement.
+            assert_eq!(fq(&f, "SELECT v FROM a").await, vec![vec!["int:1"]]);
+        }
+    });
+}
+
+#[test]
 fn cte_composition_edges_match_rusqlite_oracle() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();

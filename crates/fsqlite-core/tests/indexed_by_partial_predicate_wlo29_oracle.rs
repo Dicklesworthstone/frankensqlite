@@ -68,6 +68,39 @@ async fn allow_exec(conn: &Connection, sql: &str) {
         .unwrap_or_else(|e| panic!("`{sql}` must be allowed, got: {e:?}"));
 }
 
+#[test]
+fn dysy4_like_does_not_imply_partial_index_not_null_predicate() {
+    asupersync::test_utils::run_test(|| async {
+        let ddl = [
+            "CREATE TABLE t(a INTEGER, b TEXT)",
+            "CREATE INDEX ni ON t(a) WHERE b IS NOT NULL",
+            "INSERT INTO t VALUES(1,'abc'),(2,'xyz'),(3,NULL)",
+        ];
+        let c = conn(&ddl).await;
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in ddl {
+            stock.execute_batch(sql).unwrap();
+        }
+        // Leading wildcards prevent SQLite's separate prefix-range optimization.
+        for predicate in ["b LIKE '%a%'", "b NOT LIKE 'x%'", "b GLOB '*a*'"] {
+            let forced = format!("SELECT a FROM t INDEXED BY ni WHERE {predicate}");
+            let error = stock.prepare(&forced).expect_err("stock must reject the forced partial index");
+            assert!(error.to_string().contains("no query solution"), "{error}");
+            // Ordinary scans and an explicit non-NULL conjunct still work.
+            for sql in [
+                format!("SELECT a FROM t WHERE {predicate} ORDER BY a"),
+                format!("SELECT a FROM t INDEXED BY ni WHERE b IS NOT NULL AND {predicate} ORDER BY a"),
+            ] {
+                let mut statement = stock.prepare(&sql).unwrap();
+                let expected: Vec<i64> = statement.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+                assert_eq!(expected, vec![1], "stock control: {sql}");
+                assert_eq!(int_rows(&c, &sql).await, expected, "{sql}");
+            }
+            reject_query(&c, &forced).await;
+        }
+    });
+}
+
 // ------------------------------------------------------------------ H3 -----
 
 #[test]

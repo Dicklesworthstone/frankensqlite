@@ -78,6 +78,55 @@ async fn agree(setup: &[&str], query: &str, msg: &str) {
     assert_eq!(fr, rr, "{msg}\n  frank={fr:?}\n  stock={rr:?}");
 }
 
+#[test]
+fn dysy4_bare_pragma_tvf_in_expressions() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "SELECT (SELECT count(*) FROM pragma_database_list WHERE name='main')",
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM pragma_database_list WHERE name='main')",
+            "SELECT CASE WHEN 1 IN (SELECT seq+1 FROM pragma_database_list WHERE name='main') THEN (SELECT count(*) FROM pragma_database_list WHERE name='main') ELSE 0 END",
+            "SELECT coalesce((SELECT count(*) FROM pragma_database_list WHERE name='main'), 0)",
+            "SELECT 1 ORDER BY (SELECT count(*) FROM pragma_database_list) LIMIT (SELECT count(*) FROM pragma_database_list WHERE name='main')",
+            "VALUES ((SELECT count(*) FROM pragma_database_list WHERE name='main'))",
+            "SELECT 1 FROM (SELECT 1 AS x) a JOIN (SELECT 1 AS y) b ON a.x=b.y AND EXISTS (SELECT 1 FROM pragma_database_list)",
+        ] {
+            let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(stock, 1, "stock control: {sql}");
+            let actual = f.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(actual.len(), 1, "{sql}");
+            assert_eq!(actual[0].values(), &[SqliteValue::Integer(stock)], "{sql}");
+        }
+    });
+}
+
+#[test]
+fn dysy4_bare_pragma_expression_respects_cte_and_table_shadowing() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TEMP TABLE pragma_database_list(v)",
+            "INSERT INTO pragma_database_list VALUES(2),(3)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for (sql, expected) in [
+            ("SELECT (SELECT sum(v) FROM pragma_database_list)", 5),
+            ("SELECT (WITH pragma_database_list(v) AS (VALUES(7)) SELECT v FROM pragma_database_list)", 7),
+            ("WITH pragma_database_list(v) AS (VALUES(9)) SELECT (SELECT v FROM pragma_database_list)", 9),
+        ] {
+            let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(stock, expected, "stock control: {sql}");
+            let actual = f.query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(actual.len(), 1, "{sql}");
+            assert_eq!(actual[0].values(), &[SqliteValue::Integer(stock)], "{sql}");
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // L11: bare pragma-TVF must resolve in compound arms and FROM-subqueries, and
 // must yield to a same-named TEMP table / CTE that shadows the pragma.
