@@ -11,6 +11,7 @@
 use std::collections::VecDeque;
 
 use fsqlite_types::PageNumber;
+// Membership lookup never determines queue order; the VecDeque queues do.
 use hashbrown::HashMap;
 
 const DEFAULT_SMALL_RATIO_NUM: usize = 1;
