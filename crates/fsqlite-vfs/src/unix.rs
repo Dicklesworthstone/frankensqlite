@@ -4380,10 +4380,8 @@ mod tests {
         // Instrumentation must preserve the dedicated checkpoint fence. The
         // trait's conservative maintenance default would request EXCLUSIVE
         // and fail while the foreign idle lifetime claim remains held.
-        let mut checkpointer = crate::metrics::TracingFile::new(
-            checkpointer,
-            path.to_string_lossy().into_owned(),
-        );
+        let mut checkpointer =
+            crate::metrics::TracingFile::new(checkpointer, path.to_string_lossy().into_owned());
         checkpointer
             .lock_external_wal_checkpoint(&cx)
             .expect("idle foreign lifetime permits checkpoint");
