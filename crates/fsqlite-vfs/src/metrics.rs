@@ -400,6 +400,16 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         )
     }
 
+    fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "lock_external_wal_checkpoint",
+            &*self.path,
+            LockLevel::Reserved,
+            self.inner.lock_external_wal_checkpoint(cx)
+        )
+    }
+
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS
             .unlock_ops
