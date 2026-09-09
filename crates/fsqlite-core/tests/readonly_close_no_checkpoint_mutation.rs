@@ -28,31 +28,78 @@ fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
     if let Some(path) = std::env::var_os(CHILD_PATH) {
         let stock = rusqlite::Connection::open(std::path::Path::new(&path)).unwrap();
         stock.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mode: String = stock
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mode, "delete",
+            "stock writer must exercise rollback locking"
+        );
         stock
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT;")
             .expect("an idle rollback-mode peer must not retain the WAL lifetime fence");
         return;
     }
     asupersync::test_utils::run_test(|| async {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("wal-to-delete.db");
-        let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
-        conn.execute("PRAGMA journal_mode=WAL;").await.unwrap();
-        conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
-        conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
-        assert!(wal_len(db.to_str().unwrap()) > 32);
-        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([TEST, "--exact", "--nocapture"])
-            .env(CHILD_PATH, &db)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "stock writer failed: {output:?}");
-        let rows = conn.query("SELECT x FROM t ORDER BY x;").await.unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        conn.close().await.unwrap();
+        for with_idle_peer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("wal-to-delete.db");
+            let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
+            conn.execute("PRAGMA journal_mode=WAL;").await.unwrap();
+            conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+            assert!(wal_len(db.to_str().unwrap()) > 32);
+            let peer = if with_idle_peer {
+                let peer = Connection::open(db.to_str().unwrap()).await.unwrap();
+                assert_eq!(
+                    peer.query_row("SELECT x FROM t;").await.unwrap().values(),
+                    &[SqliteValue::Integer(1)]
+                );
+                Some(peer)
+            } else {
+                None
+            };
+            let mode = conn
+                .query_row("PRAGMA journal_mode=DELETE;")
+                .await
+                .unwrap();
+            assert_eq!(mode.values(), &[SqliteValue::Text("delete".into())]);
+            if let Some(peer) = &peer {
+                // Every attached handle explicitly leaves WAL mode. A peer
+                // observing the already-published rollback mode must still
+                // detach its own lifetime claim through the same-mode path.
+                let mode = peer
+                    .query_row("PRAGMA journal_mode=DELETE;")
+                    .await
+                    .unwrap();
+                assert_eq!(mode.values(), &[SqliteValue::Text("delete".into())]);
+            }
+            assert_eq!(&db_bytes(db.to_str().unwrap())[18..20], &[1, 1]);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD_PATH, &db)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stock writer failed (idle_peer={with_idle_peer}): {output:?}"
+            );
+            let rows = conn.query("SELECT x FROM t ORDER BY x;").await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+            if let Some(peer) = peer {
+                assert_eq!(
+                    peer.query_row("SELECT count(*) FROM t;")
+                        .await
+                        .unwrap()
+                        .values(),
+                    &[SqliteValue::Integer(2)]
+                );
+                peer.close().await.unwrap();
+            }
+            conn.close().await.unwrap();
+        }
     });
 }
 
