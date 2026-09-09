@@ -219,6 +219,156 @@ fn gh402_measure_autocommit_schema_scaling() {
     });
 }
 
+/// Current residual matrix: keep storage mode, schema size and transaction
+/// shape separate. Timings are observations, never machine-specific pass bars.
+#[test]
+#[ignore = "GH#402 residual measurement matrix; run explicitly with --nocapture"]
+fn gh402_measure_residual_schema_matrix() {
+    asupersync::test_utils::run_test(|| async {
+        set_hot_path_profile_enabled(true);
+        let maximum = table_count().max(6);
+        for tables in [maximum / 6, maximum / 2, maximum] {
+            for file_backed in [false, true] {
+                for explicit_transaction in [false, true] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().join("residual.db");
+                    let target = if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    };
+                    let label = format!(
+                        "residual storage={} mode={} tables={tables}",
+                        if file_backed { "file" } else { "memory" },
+                        if explicit_transaction { "txn" } else { "seq" },
+                    );
+                    let conn = Connection::open(target).await.expect("open");
+                    reset_hot_path_profile();
+                    let started = Instant::now();
+                    if explicit_transaction {
+                        conn.execute("BEGIN IMMEDIATE;").await.expect("begin DDL");
+                    }
+                    create_schema_autocommit(&conn, tables, &label, &path).await;
+                    if explicit_transaction {
+                        conn.execute("COMMIT;").await.expect("commit DDL");
+                    }
+                    println!(
+                        "[gh402] {label} schema_total_us={}",
+                        started.elapsed().as_micros()
+                    );
+
+                    let stock = rusqlite::Connection::open_in_memory().unwrap();
+                    for i in 0..tables {
+                        stock
+                            .execute_batch(&format!(
+                                "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b REAL, c BLOB);
+                                 CREATE INDEX idx_t{i}_a ON t{i}(a);"
+                            ))
+                            .unwrap();
+                    }
+                    for (in_transaction, value) in [(false, "x"), (true, "y")] {
+                        let before = snapshot_deltas();
+                        let started = Instant::now();
+                        if in_transaction {
+                            conn.execute("BEGIN IMMEDIATE;")
+                                .await
+                                .expect("begin INSERTs");
+                        }
+                        for _ in 0..20 {
+                            conn.execute(&format!("INSERT INTO t0 (a) VALUES ('{value}');"))
+                                .await
+                                .expect("insert");
+                        }
+                        if in_transaction {
+                            conn.execute("COMMIT;").await.expect("commit INSERTs");
+                        }
+                        window_report(
+                            &format!("{label} inserts_txn={in_transaction}"),
+                            tables,
+                            started.elapsed().as_millis(),
+                            &before,
+                            &snapshot_deltas(),
+                            &path,
+                        );
+                        for _ in 0..20 {
+                            stock
+                                .execute("INSERT INTO t0 (a) VALUES (?1)", [value])
+                                .unwrap();
+                        }
+                    }
+                    let sql = "SELECT id, a FROM t0 ORDER BY id;";
+                    let expected: Vec<(i64, String)> = stock
+                        .prepare(sql)
+                        .unwrap()
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap();
+                    let actual = conn.query(sql).await.unwrap();
+                    assert_eq!(actual.len(), expected.len());
+                    for (actual, (id, value)) in actual.iter().zip(&expected) {
+                        assert_eq!(
+                            actual.values(),
+                            &[
+                                SqliteValue::Integer(*id),
+                                SqliteValue::Text(value.clone().into())
+                            ]
+                        );
+                    }
+                    let count = conn
+                        .query_row(
+                            "SELECT count(*) FROM sqlite_schema WHERE type IN ('table', 'index');",
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        count.values(),
+                        &[SqliteValue::Integer(i64::try_from(tables * 2).unwrap())]
+                    );
+
+                    for sample in 0..3 {
+                        let started = Instant::now();
+                        let stats = conn.memory_stats().expect("memory_stats");
+                        println!(
+                            "[gh402] {label} sample={sample} memory_stats_us={} cached_pages={} page_size={}",
+                            started.elapsed().as_micros(),
+                            stats.page_cache.cached_pages,
+                            stats.page_size_bytes
+                        );
+                        if file_backed {
+                            let before = snapshot_deltas();
+                            let started = Instant::now();
+                            let peer = Connection::open(target).await.expect("peer open");
+                            let open_us = started.elapsed().as_micros();
+                            let started = Instant::now();
+                            let row = peer
+                                .query_row("SELECT count(*) FROM t0;")
+                                .await
+                                .unwrap();
+                            let first_us = started.elapsed().as_micros();
+                            assert_eq!(row.values(), &[SqliteValue::Integer(40)]);
+                            println!(
+                                "[gh402] {label} sample={sample} reopen_us={open_us} first_statement_us={first_us}"
+                            );
+                            window_report(
+                                &format!("{label} reopen-profile"),
+                                tables,
+                                0,
+                                &before,
+                                &snapshot_deltas(),
+                                &path,
+                            );
+                            peer.close().await.expect("close peer");
+                        }
+                    }
+                    conn.close().await.expect("close");
+                }
+            }
+        }
+        set_hot_path_profile_enabled(false);
+    });
+}
+
 /// GH#402 keeper: total checkpoint backfill work across a file-backed
 /// autocommit DDL loop must stay linear in the frames actually written.
 ///

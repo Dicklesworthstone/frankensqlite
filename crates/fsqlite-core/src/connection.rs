@@ -1380,6 +1380,22 @@ static FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS: AtomicU64 = AtomicU64::new
 /// vtab/FTS5 source, unstreamable backend, ...), falling back to the generic
 /// materialize path.
 static FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Test-only, connection-local work observations. Bytes count value payloads
+/// actually materialized, including repeated copies; they are not heap usage.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct JoinMaterializationProfile {
+    inner_rows: usize,
+    inner_payload_bytes: usize,
+    outer_rows: usize,
+    outer_payload_bytes: usize,
+    combined_rows: usize,
+    combined_payload_bytes: usize,
+    generic_route_hits: usize,
+    generic_source_rows: usize,
+    generic_source_payload_bytes: usize,
+}
+
 #[cfg(test)]
 thread_local! {
     static FSQLITE_JOIN_HASH_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
@@ -12775,6 +12791,8 @@ pub struct Connection {
     /// Bounded structured evidence emitted from the authoritative fallback
     /// decision point. This remains active even when tracing is disabled.
     fallback_decision_capture: RefCell<FallbackDecisionCapture>,
+    #[cfg(test)]
+    join_materialization_profile: RefCell<JoinMaterializationProfile>,
     fallback_capture_enabled: Cell<bool>,
     fallback_statement_id: Cell<Option<u64>>,
     last_fallback_statement_id: Cell<u64>,
@@ -14259,6 +14277,8 @@ impl Connection {
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
+            #[cfg(test)]
+            join_materialization_profile: RefCell::new(JoinMaterializationProfile::default()),
             fallback_capture_enabled: Cell::new(true),
             fallback_statement_id: Cell::new(None),
             last_fallback_statement_id: Cell::new(0),
@@ -14799,6 +14819,8 @@ impl Connection {
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
+            #[cfg(test)]
+            join_materialization_profile: RefCell::new(JoinMaterializationProfile::default()),
             fallback_capture_enabled: Cell::new(true),
             fallback_statement_id: Cell::new(None),
             last_fallback_statement_id: Cell::new(0),
@@ -85228,6 +85250,16 @@ impl Connection {
                 row.resize(right_width, SqliteValue::Null);
             }
         }
+        #[cfg(test)]
+        {
+            let mut profile = self.join_materialization_profile.borrow_mut();
+            profile.inner_rows += inner_rows.len();
+            profile.inner_payload_bytes += inner_rows
+                .iter()
+                .flatten()
+                .map(bounded_sqlite_value_bytes)
+                .sum::<usize>();
+        }
 
         let limit_rows = shape.limit_rows;
         let primary_width = outer_src.scan_width();
@@ -85257,12 +85289,30 @@ impl Connection {
         // Probe one outer row against the inner rows in scan order; returns
         // `true` once LIMIT joined rows exist.
         let mut join_outer_row = |outer_row: &[SqliteValue]| -> Result<bool> {
+            #[cfg(test)]
+            {
+                let mut profile = self.join_materialization_profile.borrow_mut();
+                profile.outer_rows += 1;
+                profile.outer_payload_bytes += outer_row
+                    .iter()
+                    .map(bounded_sqlite_value_bytes)
+                    .sum::<usize>();
+            }
             for right_row in &inner_rows {
                 scratch.clear();
                 scratch.extend_from_slice(&outer_row[..primary_width]);
                 scratch.extend_from_slice(&right_row[..right_width]);
                 if eval_join_predicate(on_expr, &scratch, col_map)? {
                     combined.push(scratch.clone());
+                    #[cfg(test)]
+                    {
+                        let mut profile = self.join_materialization_profile.borrow_mut();
+                        profile.combined_rows += 1;
+                        profile.combined_payload_bytes += scratch
+                            .iter()
+                            .map(bounded_sqlite_value_bytes)
+                            .sum::<usize>();
+                    }
                     if combined.len() >= limit_rows {
                         return Ok(true);
                     }
@@ -90657,6 +90707,12 @@ impl Connection {
             None
         };
         let keyset_stream_active = keyset_streamed.is_some();
+        #[cfg(test)]
+        if !keyset_stream_active {
+            self.join_materialization_profile
+                .borrow_mut()
+                .generic_route_hits += 1;
+        }
 
         // ── 3. Load each table's raw rows ──
         // Cache scanned rows by resolved scan identity so that repeated
@@ -90728,6 +90784,16 @@ impl Connection {
                     if row.len() != scan_width {
                         row.resize(scan_width, SqliteValue::Null);
                     }
+                }
+                #[cfg(test)]
+                {
+                    let mut profile = self.join_materialization_profile.borrow_mut();
+                    profile.generic_source_rows += row_data.len();
+                    profile.generic_source_payload_bytes += row_data
+                        .iter()
+                        .flatten()
+                        .map(bounded_sqlite_value_bytes)
+                        .sum::<usize>();
                 }
                 // Only clone into the cache when the same table might appear
                 // again (self-join, CTE).  Check remaining sources for a match.
@@ -290284,6 +290350,10 @@ mod join_keyset_stream_tests {
     use fsqlite_types::value::SqliteValue;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
+    const Q2_PARAMS: &str = "SELECT m.id, m.conversation_id, c.title FROM messages m \
+        JOIN conversations c ON m.conversation_id = c.id \
+        WHERE m.id > ?1 ORDER BY m.id ASC LIMIT ?2;";
+
     fn lane_hits() -> u64 {
         FSQLITE_JOIN_KEYSET_STREAM_LANE_HITS.load(AtomicOrdering::Relaxed)
     }
@@ -290295,6 +290365,126 @@ mod join_keyset_stream_tests {
     }
     fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
         rows.iter().map(|row| row.values().to_vec()).collect()
+    }
+
+    fn stock_rows(
+        stock: &rusqlite::Connection,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Vec<Vec<SqliteValue>> {
+        let mut stmt = stock.prepare(sql).unwrap();
+        let width = stmt.column_count();
+        stmt.query_map(params, |row| {
+            (0..width)
+                .map(|column| {
+                    row.get::<_, rusqlite::types::Value>(column)
+                        .map(|value| match value {
+                            rusqlite::types::Value::Null => SqliteValue::Null,
+                            rusqlite::types::Value::Integer(value) => SqliteValue::Integer(value),
+                            rusqlite::types::Value::Real(value) => SqliteValue::Float(value),
+                            rusqlite::types::Value::Text(value) => SqliteValue::Text(value.into()),
+                            rusqlite::types::Value::Blob(value) => SqliteValue::Blob(value.into()),
+                        })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    }
+
+    fn stock_fixture(outer_rows: i64, conversations: i64) -> rusqlite::Connection {
+        let mut stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, content TEXT);",
+        )
+        .unwrap();
+        let txn = stock.transaction().unwrap();
+        {
+            let mut parent = txn
+                .prepare("INSERT INTO conversations VALUES (?1, ?2)")
+                .unwrap();
+            for cid in 1..=conversations {
+                parent
+                    .execute(rusqlite::params![cid, format!("conversation {cid}")])
+                    .unwrap();
+            }
+            let mut message = txn
+                .prepare("INSERT INTO messages VALUES (?1, ?2, ?3)")
+                .unwrap();
+            for mid in 1..=outer_rows {
+                message
+                    .execute(rusqlite::params![
+                        mid,
+                        mid % conversations + 1,
+                        format!("message body {mid}")
+                    ])
+                    .unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        stock
+    }
+
+    fn rss_kb() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+    }
+
+    /// A sampled process RSS observation, not an exact per-query heap peak.
+    /// Missing /proc is reported as None, never as a measured zero.
+    struct RssSampler {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<(Option<u64>, Option<u64>, usize)>>,
+    }
+
+    impl RssSampler {
+        fn start() -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let baseline = rss_kb();
+            let worker = std::thread::spawn(move || {
+                let mut peak = baseline;
+                let mut samples = usize::from(baseline.is_some());
+                loop {
+                    if let Some(rss) = rss_kb() {
+                        peak = Some(peak.map_or(rss, |previous| previous.max(rss)));
+                        samples += 1;
+                    }
+                    if worker_stop.load(AtomicOrdering::Relaxed) {
+                        return (baseline, peak, samples);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            Self {
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn finish(mut self) -> (Option<u64>, Option<u64>, usize) {
+            self.stop.store(true, AtomicOrdering::Relaxed);
+            self.worker.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for RssSampler {
+        fn drop(&mut self) {
+            self.stop.store(true, AtomicOrdering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
     }
 
     /// Build the standard messages/conversations fixture: `outer_rows`
@@ -290371,6 +290561,7 @@ mod join_keyset_stream_tests {
             let path = dir.path().join("gh386_keyset.db");
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             populate_fixture(&conn, 4000, 40).await;
+            let stock = stock_fixture(4000, 40);
 
             for (cursor, limit, expected_len) in [
                 (0i64, 7i64, 7usize),
@@ -290381,9 +290572,21 @@ mod join_keyset_stream_tests {
             ] {
                 let hits_before = lane_hits();
                 let visited_before = visited_outer();
-                let fast = conn.query(&q2(cursor, limit)).await.unwrap();
+                conn.reset_fallback_decision_evidence();
+                let fast = conn
+                    .query_with_params(
+                        Q2_PARAMS,
+                        &[SqliteValue::Integer(cursor), SqliteValue::Integer(limit)],
+                    )
+                    .await
+                    .unwrap();
                 let hits_after = lane_hits();
                 let visited_after = visited_outer();
+                assert!(conn.fallback_decision_snapshot().decisions.is_empty());
+                assert_eq!(
+                    values_of(&fast),
+                    stock_rows(&stock, Q2_PARAMS, rusqlite::params![cursor, limit])
+                );
                 let generic = conn.query(&q2_generic(cursor, limit)).await.unwrap();
                 assert_eq!(
                     values_of(&fast),
@@ -290406,6 +290609,24 @@ mod join_keyset_stream_tests {
                     expected_visits,
                     "outer scan must start at the bound and stop at LIMIT \
                      (cursor={cursor} limit={limit})"
+                );
+                let single = "SELECT id FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2;";
+                let hits = lane_hits();
+                let rows = conn
+                    .query_with_params(
+                        single,
+                        &[SqliteValue::Integer(cursor), SqliteValue::Integer(limit)],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    lane_hits(),
+                    hits,
+                    "single-table control must use its own route"
+                );
+                assert_eq!(
+                    values_of(&rows),
+                    stock_rows(&stock, single, rusqlite::params![cursor, limit])
                 );
             }
         });
@@ -290446,6 +290667,13 @@ mod join_keyset_stream_tests {
                 )
                 .await
                 .unwrap();
+                let stock = rusqlite::Connection::open_in_memory().unwrap();
+                stock.execute_batch(
+                    "CREATE TABLE c (id INTEGER PRIMARY KEY, v TEXT);
+                     INSERT INTO c VALUES (0, 'zero'), (1, 'one'), (2, 'two');
+                     CREATE TABLE m (id INTEGER PRIMARY KEY, fk);
+                     INSERT INTO m VALUES (1, NULL), (2, 'junk'), (3, 999), (4, 1), (5, 1), (6, 2);"
+                ).unwrap();
                 let hits_before = lane_hits();
                 let rows = conn
                     .query(
@@ -290468,6 +290696,38 @@ mod join_keyset_stream_tests {
                     1,
                     "lane must engage on the {} backend",
                     if file_backed { "pager" } else { "memdb" }
+                );
+                let sql = "SELECT m.id, m.fk FROM m JOIN c ON m.fk = c.id \
+                    WHERE m.id > ?1 ORDER BY m.id ASC LIMIT ?2;";
+                for (cursor, limit) in [(0, 2), (4, 2), (6, 2)] {
+                    let rows = conn
+                        .query_with_params(
+                            sql,
+                            &[SqliteValue::Integer(cursor), SqliteValue::Integer(limit)],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        values_of(&rows),
+                        stock_rows(&stock, sql, rusqlite::params![cursor, limit])
+                    );
+                }
+                conn.execute("DELETE FROM c;").await.unwrap();
+                stock.execute("DELETE FROM c;", []).unwrap();
+                let visits = visited_outer();
+                let rows = conn
+                    .query_with_params(sql, &[SqliteValue::Integer(0), SqliteValue::Integer(2)])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    values_of(&rows),
+                    stock_rows(&stock, sql, rusqlite::params![0, 2])
+                );
+                assert!(rows.is_empty());
+                assert_eq!(
+                    visited_outer(),
+                    visits,
+                    "empty inner side must not scan the outer table"
                 );
             }
         });
@@ -290555,6 +290815,7 @@ mod join_keyset_stream_tests {
             let path = dir.path().join("gh386_nearmiss.db");
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             populate_fixture(&conn, 200, 8).await;
+            let stock = stock_fixture(200, 8);
 
             // `>=` IS eligible: boundary parity against `>` on the
             // predecessor cursor.
@@ -290617,6 +290878,11 @@ mod join_keyset_stream_tests {
                     "near-miss shape must refuse the keyset lane: {sql}"
                 );
                 assert!(rows.len() <= 5, "near-miss still limited: {sql}");
+                assert_eq!(
+                    values_of(&rows),
+                    stock_rows(&stock, sql, []),
+                    "near-miss stock parity: {sql}"
+                );
             }
 
             // OFFSET parity: rows [3..8) of the no-offset ordering.
@@ -290709,6 +290975,22 @@ mod join_keyset_stream_tests {
                     vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())],
                 ],
             );
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            stock.execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, tag TEXT);
+                 INSERT INTO parent VALUES (1, 'a'), (2, 'b');
+                 CREATE TABLE w (id INTEGER PRIMARY KEY, fk INTEGER) WITHOUT ROWID;
+                 INSERT INTO w VALUES (1, 1), (2, 2), (3, 1);"
+            ).unwrap();
+            assert_eq!(
+                values_of(&rows),
+                stock_rows(
+                    &stock,
+                    "SELECT w.id, p.tag FROM w JOIN parent p ON w.fk = p.id \
+                     WHERE w.id > 0 ORDER BY w.id ASC LIMIT 2;",
+                    []
+                )
+            );
         });
     }
 
@@ -290726,29 +291008,70 @@ mod join_keyset_stream_tests {
                 let path = dir.path().join(format!("gh386_scale_{outer_rows}.db"));
                 let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
                 populate_fixture(&conn, outer_rows, 30).await;
+                let stock = stock_fixture(outer_rows, 30);
+                conn.reset_fallback_decision_evidence();
+                conn.join_materialization_profile.replace(Default::default());
                 let hits_before = lane_hits();
                 let visited_before = visited_outer();
+                let rss = RssSampler::start();
                 let started = std::time::Instant::now();
-                let fast = conn.query(&q2(500, 20)).await.unwrap();
+                let fast = conn
+                    .query_with_params(
+                        Q2_PARAMS,
+                        &[SqliteValue::Integer(500), SqliteValue::Integer(20)],
+                    )
+                    .await
+                    .unwrap();
                 let fast_elapsed = started.elapsed();
+                let fast_rss = rss.finish();
+                let fast_profile = conn.join_materialization_profile.replace(Default::default());
                 assert_eq!(lane_hits() - hits_before, 1);
                 assert_eq!(fast.len(), 20);
+                assert_eq!(fast_profile.outer_rows, 20);
+                assert_eq!(fast_profile.inner_rows, 30);
+                assert_eq!(fast_profile.combined_rows, 20);
+                assert_eq!(fast_profile.generic_route_hits, 0);
+                assert_eq!(fast_profile.generic_source_rows, 0);
+                assert_eq!(fast_profile.generic_source_payload_bytes, 0);
+                assert!(conn.fallback_decision_snapshot().decisions.is_empty());
+                assert_eq!(
+                    values_of(&fast),
+                    stock_rows(&stock, Q2_PARAMS, rusqlite::params![500, 20])
+                );
                 let visited = visited_outer() - visited_before;
+                let rss = RssSampler::start();
                 let started = std::time::Instant::now();
                 let generic = conn.query(&q2_generic(500, 20)).await.unwrap();
                 let generic_elapsed = started.elapsed();
+                let generic_rss = rss.finish();
+                let generic_profile = *conn.join_materialization_profile.borrow();
+                assert_eq!(generic_profile.generic_route_hits, 1);
+                assert_eq!(
+                    generic_profile.generic_source_rows,
+                    usize::try_from(outer_rows).unwrap() + 30
+                );
+                assert!(
+                    generic_profile.generic_source_payload_bytes > fast_profile.outer_payload_bytes
+                );
                 assert_eq!(values_of(&fast), values_of(&generic));
                 println!(
                     "GH#386 scaling: N={outer_rows} visited_outer={visited} \
-                     lane={fast_elapsed:?} generic_materialize={generic_elapsed:?}"
+                     lane={fast_elapsed:?} generic_materialize={generic_elapsed:?} \
+                     fast_materialization={fast_profile:?} generic_materialization={generic_profile:?} \
+                     rss_baseline_sampled_peak_kb_and_samples={fast_rss:?}/{generic_rss:?}"
                 );
-                visits.push(visited);
+                #[cfg(target_os = "linux")]
+                assert!(
+                    fast_rss.1.is_some() && generic_rss.1.is_some(),
+                    "Linux RSS must be measured"
+                );
+                visits.push((visited, fast_profile));
             }
             assert_eq!(
                 visits[0], visits[1],
                 "visited outer rows must not scale with table size"
             );
-            assert_eq!(visits[0], 20, "all-matching join visits exactly LIMIT rows");
+            assert_eq!(visits[0].0, 20, "all-matching join visits exactly LIMIT rows");
         });
     }
 
@@ -290763,6 +291086,7 @@ mod join_keyset_stream_tests {
             let path = dir.path().join("gh386_params.db");
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             populate_fixture(&conn, 300, 10).await;
+            let stock = stock_fixture(300, 10);
             let hits_before = lane_hits();
             let rows = conn
                 .query_with_params(
@@ -290776,6 +291100,10 @@ mod join_keyset_stream_tests {
             assert_eq!(lane_hits() - hits_before, 1, "parameterized Q2 must stream");
             let generic = conn.query(&q2_generic(120, 9)).await.unwrap();
             assert_eq!(values_of(&rows), values_of(&generic));
+            assert_eq!(
+                values_of(&rows),
+                stock_rows(&stock, Q2_PARAMS, rusqlite::params![120, 9])
+            );
 
             let hits_before = lane_hits();
             let rows = conn
@@ -290793,6 +291121,15 @@ mod join_keyset_stream_tests {
                 "a NULL cursor bound must refuse the lane"
             );
             assert!(rows.is_empty(), "a NULL comparison matches nothing");
+            assert_eq!(
+                values_of(&rows),
+                stock_rows(
+                    &stock,
+                    "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                     WHERE m.id > ?1 ORDER BY m.id LIMIT ?2;",
+                    rusqlite::params![Option::<i64>::None, 9]
+                )
+            );
         });
     }
 }
