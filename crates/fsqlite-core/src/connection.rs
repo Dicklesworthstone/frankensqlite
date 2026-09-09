@@ -27547,6 +27547,7 @@ impl Connection {
                 stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
                     .await
             } else {
+                let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
                 execute_program_with_postprocess(
                     stmt.program.as_ref(),
                     Some(params),
@@ -27554,7 +27555,7 @@ impl Connection {
                     Some(&self.collation_registry),
                     &op_cx,
                     stmt.expression_postprocess.as_ref(),
-                    page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                    page_size,
                 )
                 .await
             };
@@ -27885,13 +27886,14 @@ impl Connection {
                     )
                     .await
                 } else {
+                    let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
                     execute_program_exactly_one_row_with_row_cap(
                         stmt.program.as_ref(),
                         params,
                         stmt.func_registry.as_ref(),
                         Some(&self.collation_registry),
                         &op_cx,
-                        page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                        page_size,
                         Some(QUERY_ROW_RESULT_ROW_CAP),
                     )
                     .await
@@ -27911,6 +27913,7 @@ impl Connection {
                 stmt.execute_table_query(&op_cx, params, entry_proof.publication)
                     .await
             } else {
+                let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
                 execute_program_with_postprocess(
                     stmt.program.as_ref(),
                     params,
@@ -27918,7 +27921,7 @@ impl Connection {
                     Some(&self.collation_registry),
                     &op_cx,
                     stmt.expression_postprocess.as_ref(),
-                    page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                    page_size,
                 )
                 .await
             };
@@ -37570,6 +37573,7 @@ impl Connection {
                     let program =
                         compile_expression_select(rewritten.as_ref(), Arc::clone(&registry))?;
                     let op_cx = self.op_cx()?;
+                    let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
                     let mut rows = execute_program_with_postprocess(
                         &program,
                         params,
@@ -37577,7 +37581,7 @@ impl Connection {
                         Some(&self.collation_registry),
                         &op_cx,
                         Some(&build_expression_postprocess(rewritten.as_ref())),
-                        page_size_from_pragma_state(self.pragma_state.borrow().page_size)?,
+                        page_size,
                     )
                     .await?;
                     if distinct {
@@ -56433,7 +56437,8 @@ impl Connection {
 
     /// Discard the cached read-only pager snapshot, rolling it back properly.
     async fn invalidate_cached_read_snapshot(&self, cx: &Cx) {
-        if let Some(mut txn) = self.cached_read_snapshot.borrow_mut().take() {
+        let cached_snapshot = self.cached_read_snapshot.borrow_mut().take();
+        if let Some(mut txn) = cached_snapshot {
             let _ = txn.rollback(cx).await;
         }
         self.cached_read_snapshot_commit_epoch.set(0);
@@ -56441,15 +56446,15 @@ impl Connection {
 
     /// Discard the cached write transaction, committing it properly.
     async fn invalidate_cached_write_txn(&self, cx: &Cx) {
-        let invalidated_cached_writer =
-            if let Some(mut txn) = self.cached_write_txn.borrow_mut().take() {
-                // The retained transaction has already committed its write-set.
-                // We need to finalize it properly (release writer state in pager).
-                let _ = txn.commit(cx).await;
-                true
-            } else {
-                false
-            };
+        let cached_writer = self.cached_write_txn.borrow_mut().take();
+        let invalidated_cached_writer = if let Some(mut txn) = cached_writer {
+            // The retained transaction has already committed its write-set.
+            // We need to finalize it properly (release writer state in pager).
+            let _ = txn.commit(cx).await;
+            true
+        } else {
+            false
+        };
         self.cached_write_txn_memdb_row_mirror_exact.set(false);
         if invalidated_cached_writer {
             self.clear_prepared_direct_insert_append_hint();
@@ -58300,7 +58305,8 @@ impl Connection {
             // Rollback any previously parked snapshot (possible if a
             // re-entrant connection-fallback subquery parked its own
             // read snapshot while the outer VDBE was executing).
-            if let Some(mut old) = self.cached_read_snapshot.borrow_mut().take() {
+            let old_snapshot = self.cached_read_snapshot.borrow_mut().take();
+            if let Some(mut old) = old_snapshot {
                 let _ = old.rollback(cx).await;
             }
             let cookie = *self.schema_cookie.borrow();
@@ -58570,7 +58576,8 @@ impl Connection {
                         // Park the retained transaction for the next autocommit.
                         let cookie = *self.schema_cookie.borrow();
                         // Discard any stale cached write transaction.
-                        if let Some(mut old) = self.cached_write_txn.borrow_mut().take() {
+                        let old_writer = self.cached_write_txn.borrow_mut().take();
+                        if let Some(mut old) = old_writer {
                             let _ = old.commit(cx).await;
                         }
                         let retained_reload_error = retained_reload_result.err();
@@ -58879,7 +58886,8 @@ impl Connection {
         if committed_write {
             self.discard_cached_vdbe_engine();
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
-            if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
+            let last_local_commit_seq = *self.last_local_commit_seq.borrow();
+            if let Some(committed_seq) = last_local_commit_seq {
                 self.emit_differential_commit_invalidations(committed_seq);
                 if capture_time_travel_snapshot && self.time_travel_capture_enabled.get() {
                     self.capture_time_travel_snapshot(committed_seq.get()).await;
@@ -70491,7 +70499,8 @@ impl Connection {
             }
 
             self.txn_metrics_note_rollback();
-            let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+            let active_txn = self.active_txn.borrow_mut().take();
+            let rollback_result = if let Some(mut txn) = active_txn {
                 txn.rollback(cx).await
             } else {
                 Ok(())
@@ -71017,7 +71026,8 @@ impl Connection {
 
             // Capture time-travel snapshot AFTER cleanup so the write transaction
             // handle is fully dropped and the pager can serve reads to reload_memdb.
-            if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
+            let last_local_commit_seq = *self.last_local_commit_seq.borrow();
+            if let Some(committed_seq) = last_local_commit_seq {
                 self.emit_differential_commit_invalidations(committed_seq);
                 if self.time_travel_capture_enabled.get() {
                     self.capture_time_travel_snapshot(committed_seq.get()).await;
