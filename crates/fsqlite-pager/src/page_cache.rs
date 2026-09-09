@@ -4233,7 +4233,10 @@ impl ShardedPageCache {
             .collect();
         let capture_queue_snapshot = {
             let tracker = self.eviction_policy.lock();
-            matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_))
+            matches!(
+                &*tracker,
+                PageCacheEvictionTracker::S3Fifo(_) | PageCacheEvictionTracker::S3FifoAdaptive(_)
+            )
         };
         let mut dirty_pages = flat_snapshots
             .iter()
@@ -6494,6 +6497,43 @@ mod tests {
     }
 
     #[test]
+    fn test_sharded_page_cache_s3_fifo_adaptive_reports_real_queue_metrics_bd_86ct9() {
+        for fast_path in [true, false] {
+            let mut cache =
+                ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 1);
+            if fast_path {
+                cache.enable_fast_path();
+            }
+            cache.set_eviction_policy(PageCacheEvictionPolicy::S3FifoAdaptive(
+                S3FifoConfig::with_limits(4, 1, 1, 1),
+            ));
+            for raw in 1..=4 {
+                let page_no = PageNumber::new(raw).unwrap();
+                cache.insert_buffer(page_no, track_q_page_buf(page_no));
+            }
+            for _ in 0..8 {
+                for raw in [1, 2] {
+                    let page_no = PageNumber::new(raw).unwrap();
+                    let data = cache.get_copy(page_no).expect("hot resident page");
+                    assert_track_q_page(page_no, &data);
+                }
+            }
+            assert!(cache.evict_any(), "one cold page must be evicted");
+            let snapshot = cache.metrics_snapshot();
+            assert_eq!(snapshot.cached_pages, 3);
+            assert!(
+                snapshot.t2_size >= 1,
+                "adaptive main-queue metrics must survive fast_path={fast_path}: {snapshot:?}"
+            );
+            for raw in [1, 2] {
+                let page_no = PageNumber::new(raw).unwrap();
+                let data = cache.get_copy(page_no).expect("hot page survives eviction");
+                assert_track_q_page(page_no, &data);
+            }
+        }
+    }
+
+    #[test]
     fn test_sharded_page_cache_s3_fifo_evict_any_keeps_hot_pages() {
         let cache = ShardedPageCache::new(PageSize::DEFAULT);
         cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::with_limits(
@@ -7419,6 +7459,97 @@ mod tests {
             S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS,
             "arbitrary fallback must remove exactly one page"
         );
+    }
+
+    /// Isolate GH402's statistics cost from SQL, WAL I/O and connection open.
+    /// Keep the first call, three warmups and ten measured calls; timings are
+    /// observations, while unchanged counters and page contents are required.
+    #[test]
+    #[ignore = "GH402 cache statistics measurement; run explicitly with --nocapture"]
+    fn gh402_measure_cache_metrics_reconstruction() {
+        for resident_count in [0_usize, 103, 307, 500] {
+            for fast_path in [false, true] {
+                for adaptive in [false, true] {
+                    for hot_trace in [false, true] {
+                        let mut cache = ShardedPageCache::with_max_buffers_and_shards(
+                            PageSize::DEFAULT,
+                            resident_count.max(1),
+                            1,
+                        );
+                        if fast_path {
+                            cache.enable_fast_path();
+                        }
+                        let config = S3FifoConfig::new(6144);
+                        cache.set_eviction_policy(if adaptive {
+                            PageCacheEvictionPolicy::S3FifoAdaptive(config)
+                        } else {
+                            PageCacheEvictionPolicy::S3Fifo(config)
+                        });
+                        for raw in 1..=resident_count {
+                            let page_no = PageNumber::new(u32::try_from(raw).unwrap()).unwrap();
+                            cache.insert_buffer(page_no, track_q_page_buf(page_no));
+                        }
+                        if hot_trace {
+                            for _ in 0..3 {
+                                for raw in 1..=resident_count {
+                                    let page_no =
+                                        PageNumber::new(u32::try_from(raw).unwrap()).unwrap();
+                                    let data = cache.get_copy(page_no).expect("resident page");
+                                    assert_track_q_page(page_no, &data);
+                                }
+                            }
+                        }
+                        let counters_before = cache.metrics_lightweight_snapshot();
+                        let mut expected = None;
+                        for sample in 0..13 {
+                            let started = Instant::now();
+                            let snapshot = cache.metrics_snapshot();
+                            let elapsed_ns = started.elapsed().as_nanos();
+                            assert_eq!(snapshot.cached_pages, resident_count);
+                            assert_eq!(snapshot.dirty_ratio_pct, 0);
+                            assert_eq!(cache.metrics_lightweight_snapshot(), counters_before);
+                            if let Some(before) = expected {
+                                assert_eq!(snapshot, before, "statistics must be read-only");
+                            } else {
+                                expected = Some(snapshot);
+                                println!(
+                                    "[gh402-cache-golden] {}",
+                                    json!({
+                                        "residents": resident_count,
+                                        "fast_path": fast_path,
+                                        "adaptive": adaptive,
+                                        "hot_trace": hot_trace,
+                                        "hits": snapshot.hits,
+                                        "misses": snapshot.misses,
+                                        "admits": snapshot.admits,
+                                        "evictions": snapshot.evictions,
+                                        "cached_pages": snapshot.cached_pages,
+                                        "pool_capacity": snapshot.pool_capacity,
+                                        "cache_page_budget": snapshot.cache_page_budget,
+                                        "dirty_ratio_pct": snapshot.dirty_ratio_pct,
+                                        "t1_size": snapshot.t1_size,
+                                        "t2_size": snapshot.t2_size,
+                                        "b1_size": snapshot.b1_size,
+                                        "b2_size": snapshot.b2_size,
+                                        "p_target": snapshot.p_target,
+                                        "mvcc_multi_version_pages": snapshot.mvcc_multi_version_pages,
+                                    })
+                                );
+                            }
+                            println!(
+                                "[gh402-cache-sample] residents={resident_count} fast_path={fast_path} adaptive={adaptive} hot_trace={hot_trace} sample={sample} warmup={} elapsed_ns={elapsed_ns}",
+                                sample < 3
+                            );
+                        }
+                        for raw in 1..=resident_count {
+                            let page_no = PageNumber::new(u32::try_from(raw).unwrap()).unwrap();
+                            let data = cache.get_copy(page_no).expect("statistics retain pages");
+                            assert_track_q_page(page_no, &data);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

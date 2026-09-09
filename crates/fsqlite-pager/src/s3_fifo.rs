@@ -8,9 +8,10 @@
 //! The structure tracks queue membership in a hash map for O(1) queue-location
 //! lookup and performs deterministic transitions suitable for unit testing.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use fsqlite_types::PageNumber;
+use hashbrown::HashMap;
 
 const DEFAULT_SMALL_RATIO_NUM: usize = 1;
 const DEFAULT_SMALL_RATIO_DEN: usize = 10;
