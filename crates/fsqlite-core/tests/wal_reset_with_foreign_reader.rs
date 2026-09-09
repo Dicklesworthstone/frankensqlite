@@ -148,7 +148,8 @@ fn signal_child(child: &mut std::process::Child, line: &str) {
     .expect("signal the foreign reader");
 }
 
-/// Explicit investigation of the remaining attachment-lifetime boundary.
+/// Explicit investigation of the remaining attachment-lifetime boundary when
+/// the writer closes before the pinned stock reader releases its snapshot.
 /// This must pass before GH411 can claim reverse-close-order durability;
 /// it is separate from the unchanged original regression below.
 #[test]
@@ -181,6 +182,7 @@ fn committed_row_survives_writer_close_before_foreign_reader_exit() {
                 break;
             }
         }
+        let wal_before_commit = wal_len(&db_path);
         conn.execute("INSERT INTO t(k) VALUES ('committed-before-writer-close');")
             .await
             .expect("commit while stock reader is pinned");
@@ -189,6 +191,10 @@ fn committed_row_survives_writer_close_before_foreign_reader_exit() {
             2
         );
         let committed_wal_len = wal_len(&db_path);
+        assert!(
+            committed_wal_len > wal_before_commit,
+            "the acknowledged commit must append a WAL tail"
+        );
         eprintln!(
             "gh411 reverse-close before writer close: wal={committed_wal_len} shm={:?}",
             shm_header(&db_path)
