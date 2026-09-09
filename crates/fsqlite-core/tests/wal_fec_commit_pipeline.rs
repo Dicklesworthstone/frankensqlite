@@ -291,9 +291,25 @@ fn restart_regenerates_missing_and_interrupted_sidecar_suffixes() {
 
 #[test]
 fn process_exit_after_durable_commit_before_repair_is_recoverable() {
+    assert_process_crash_recovery(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn process_crash_during_real_sidecar_append_is_recoverable() {
+    assert_process_crash_recovery(true);
+}
+
+fn assert_process_crash_recovery(crash_during_append: bool) {
     const CHILD_DB: &str = "FSQLITE_WAL_FEC_DURABLE_EXIT_DB";
     const DURABLE_EXIT: i32 = 73;
     const PHASE_MARKER: &str = "wal_fec_phase=durable repair_append=blocked committed_rows=5";
+    const PARTIAL_APPEND_BYTES: usize = 47;
+    let test_name = if crash_during_append {
+        "process_crash_during_real_sidecar_append_is_recoverable"
+    } else {
+        "process_exit_after_durable_commit_before_repair_is_recoverable"
+    };
 
     if let Some(db) = std::env::var_os(CHILD_DB) {
         let db = PathBuf::from(db);
@@ -303,7 +319,7 @@ fn process_exit_after_durable_commit_before_repair_is_recoverable() {
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB);").await.unwrap();
             wait_for_last_group(&db).await;
             let sidecar = wal_fec_path_for_wal(&wal_path(&db));
-            let _guard = hold_sidecar_guard(&sidecar).await;
+            let guard = hold_sidecar_guard(&sidecar).await;
             let before = fs::read(&sidecar).unwrap();
             conn.execute("BEGIN;").await.unwrap();
             for id in 1..=5 {
@@ -314,6 +330,19 @@ fn process_exit_after_durable_commit_before_repair_is_recoverable() {
             assert_eq!(conn.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(5)]);
             eprintln!("{PHASE_MARKER}");
             std::io::stderr().flush().unwrap();
+            if crash_during_append {
+                // The parent lowers only this child's file-size limit after
+                // durability, then permits the real background append.
+                let release = db.with_extension("release-append");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !release.exists() {
+                    assert!(Instant::now() < deadline, "parent did not arm the append fault");
+                    yield_now().await;
+                }
+                drop(guard);
+                conn.close_without_checkpoint().await.expect("SIGXFSZ must interrupt the actual append");
+                panic!("repair unexpectedly survived the file-size limit");
+            }
             // No Connection/Runtime/guard destructors: the OS releases the
             // locks while the acknowledged WAL remains unprotected by FEC.
             std::process::exit(DURABLE_EXIT);
@@ -326,11 +355,44 @@ fn process_exit_after_durable_commit_before_repair_is_recoverable() {
     let log_path = dir.join("child.log");
     let log = File::create(&log_path).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "process_exit_after_durable_commit_before_repair_is_recoverable", "--nocapture"])
+        .args(["--exact", test_name, "--nocapture"])
         .env(CHILD_DB, &db)
         .stdout(log.try_clone().unwrap()).stderr(log)
         .spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
+    let wal = wal_path(&db);
+    let sidecar = wal_fec_path_for_wal(&wal);
+    let mut append_prefix = None;
+    let mut acknowledged_wal = None;
+    if crash_during_append {
+        loop {
+            let log = fs::read_to_string(&log_path).unwrap();
+            if log.lines().any(|line| line == PHASE_MARKER) { break; }
+            assert!(child.try_wait().unwrap().is_none(), "child exited before durable phase: {log}");
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child never reached durable phase; artifacts={} log={log}", dir.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let prefix = fs::read(&sidecar).unwrap();
+        acknowledged_wal = Some(fs::read(&wal).unwrap());
+        let limit = prefix.len() + PARTIAL_APPEND_BYTES;
+        // Linux prlimit changes only our child. A write up to RLIMIT_FSIZE
+        // succeeds partially; write_all's next write receives fatal SIGXFSZ.
+        // Disable that child's core dump so the test retains only its fixtures.
+        let limited = std::process::Command::new("prlimit")
+            .args(["--pid", &child.id().to_string(), &format!("--fsize={limit}:{limit}"), "--core=0:0"])
+            .output();
+        if !limited.as_ref().is_ok_and(|output| output.status.success()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("could not arm child append fault; artifacts={} result={limited:?}", dir.display());
+        }
+        append_prefix = Some(prefix);
+        fs::write(db.with_extension("release-append"), b"file-size limit armed").unwrap();
+    }
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() { break status; }
         if Instant::now() >= deadline {
@@ -341,16 +403,33 @@ fn process_exit_after_durable_commit_before_repair_is_recoverable() {
         std::thread::sleep(Duration::from_millis(10));
     };
     let log = fs::read_to_string(&log_path).unwrap();
-    assert_eq!(status.code(), Some(DURABLE_EXIT), "child did not reach the intended exit: {log}");
+    if crash_during_append {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(25), "child must die from Linux SIGXFSZ, not a panic: {log}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        panic!("the RLIMIT_FSIZE crash keeper requires Linux");
+    } else {
+        assert_eq!(status.code(), Some(DURABLE_EXIT), "child did not reach the intended exit: {log}");
+    }
     assert!(log.lines().any(|line| line == PHASE_MARKER), "missing durable phase receipt: {log}");
 
-    let wal = wal_path(&db);
     let durable_wal = fs::read(&wal).unwrap();
+    if let Some(acknowledged) = acknowledged_wal {
+        assert_eq!(durable_wal, acknowledged, "the append fault must not alter the acknowledged WAL");
+    }
     let header = WalHeader::from_bytes(&durable_wal).unwrap();
     let last = u32::try_from((durable_wal.len() - 32) / (24 + header.page_size as usize)).unwrap();
-    let sidecar = wal_fec_path_for_wal(&wal);
+    let crashed_bytes = fs::read(&sidecar).unwrap();
+    if let Some(prefix) = append_prefix {
+        assert_eq!(crashed_bytes.len(), prefix.len() + PARTIAL_APPEND_BYTES);
+        assert_eq!(&crashed_bytes[..prefix.len()], &prefix, "short append must preserve complete repair groups");
+        fs::copy(&sidecar, db.with_extension("interrupted-fec")).unwrap();
+    }
     let before = scan_wal_fec(&sidecar).unwrap();
-    assert!(!before.truncated_tail);
+    assert_eq!(before.truncated_tail, crash_during_append);
     let protected = before.groups.last().expect("schema group was repaired before the child transaction").meta.end_frame_no;
     assert!(last >= protected + 5, "multi-page durable commit must lack a repair group");
 
@@ -381,11 +460,13 @@ fn process_exit_after_durable_commit_before_repair_is_recoverable() {
     assert_eq!(fs::read(&wal).unwrap(), durable_wal, "catch-up must preserve the primary WAL");
 
     let repaired_bytes = fs::read(&sidecar).unwrap();
+    assert!(repaired_bytes.starts_with(&crashed_bytes), "regeneration must reproduce the exact interrupted record prefix");
     run_with_repair_pool(async {
         open(&db).await.close_without_checkpoint().await.unwrap();
     });
     assert_eq!(fs::read(&sidecar).unwrap(), repaired_bytes, "second restart must not duplicate repair groups");
-    eprintln!("wal_fec_process_exit_verified exit={DURABLE_EXIT} durable_end={last} recovered_sources={} repair_symbols=7 artifacts={}", last - protected, dir.display());
+    eprintln!("wal_fec_process_exit_verified test={test_name} status={status} partial_append={} durable_end={last} recovered_sources={} repair_symbols=7 artifacts={}",
+        if crash_during_append { PARTIAL_APPEND_BYTES } else { 0 }, last - protected, dir.display());
 }
 
 #[test]
