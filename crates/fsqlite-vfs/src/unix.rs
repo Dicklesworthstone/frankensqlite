@@ -4149,12 +4149,29 @@ mod tests {
 
     #[test]
     fn wal_lifetime_claim_preserves_foreign_fence_without_pinning_idle_peers() {
+        const PROBE_PATH: &str = "FSQLITE_VFS_LIFETIME_EXCLUSIVE_PROBE";
+        const TEST: &str =
+            "unix::tests::wal_lifetime_claim_preserves_foreign_fence_without_pinning_idle_peers";
         let cx = Cx::new();
         let vfs = UnixVfs::new();
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let (mut probe, _) = vfs
+                .open(&cx, Some(Path::new(&path)), open_flags_create())
+                .unwrap();
+            let acquired = match probe.lock(&cx, LockLevel::Exclusive) {
+                Ok(()) => true,
+                Err(FrankenError::Busy) => false,
+                Err(error) => panic!("unexpected raw-lock probe failure: {error}"),
+            };
+            println!("lifetime-exclusive={acquired}");
+            probe.close(&cx).unwrap();
+            return;
+        }
         let (_dir, path) = make_temp_path("wal-lifetime.db");
-        setup_sqlite_delete_journal_db(&path);
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut first, _) = vfs.open(&cx, Some(&path), flags).expect("first handle");
+        let (mut first, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("first handle");
         first.ensure_shm_info(&cx).expect("first WAL attachment");
         let (mut second, _) = vfs.open(&cx, Some(&path), flags).expect("second handle");
         second.ensure_shm_info(&cx).expect("second WAL attachment");
@@ -4165,26 +4182,65 @@ mod tests {
             assert_eq!(info.deferred_close_files.len(), 1);
         }
         let foreign_exclusive = || {
-            sqlite3_exec(&path, "PRAGMA busy_timeout=0; BEGIN EXCLUSIVE; ROLLBACK;")
-                .status
-                .success()
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(PROBE_PATH, &path)
+                .output()
+                .expect("run a separate-process kernel lock probe");
+            assert!(output.status.success(), "probe failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.contains("lifetime-exclusive="),
+                "missing probe witness"
+            );
+            stdout.contains("lifetime-exclusive=true")
         };
-        assert!(!foreign_exclusive(), "foreign last-close lock must conflict");
+        assert!(
+            !foreign_exclusive(),
+            "foreign last-close lock must conflict"
+        );
         assert_eq!(second.wal_checkpoint_reader_horizon(&cx, 41).unwrap(), 41);
-        second.lock_external_maintenance(&cx, true).expect("idle peer permits maintenance");
-        second.restore_external_maintenance_attempt(&cx).expect("restore maintenance");
-        assert!(!foreign_exclusive(), "downgrade must restore the lifetime fence");
+        second
+            .lock_external_maintenance(&cx, true)
+            .expect("idle peer permits maintenance");
+        second
+            .restore_external_maintenance_attempt(&cx)
+            .expect("restore maintenance");
+        assert!(
+            !foreign_exclusive(),
+            "downgrade must restore the lifetime fence"
+        );
 
-        first.lock_external_shared_snapshot(&cx).expect("real reader snapshot");
-        assert!(matches!(second.lock_external_maintenance(&cx, true), Err(FrankenError::Busy)));
-        second.restore_external_maintenance_attempt(&cx).expect("failed upgrade restores");
-        first.restore_external_shared_snapshot_attempt(&cx).expect("end snapshot");
+        first
+            .lock_external_shared_snapshot(&cx)
+            .expect("real reader snapshot");
+        assert!(matches!(
+            second.lock_external_maintenance(&cx, true),
+            Err(FrankenError::Busy)
+        ));
+        second
+            .restore_external_maintenance_attempt(&cx)
+            .expect("failed upgrade restores");
+        first
+            .restore_external_shared_snapshot_attempt(&cx)
+            .expect("end snapshot");
         assert_eq!(first.lock_level, LockLevel::None);
-        assert!(!foreign_exclusive(), "transaction exit must retain the fence");
+        assert!(
+            !foreign_exclusive(),
+            "transaction exit must retain the fence"
+        );
         drop(first);
-        assert!(!foreign_exclusive(), "a sibling attachment still owns the fence");
-        second.shm_unmap(&cx, false).expect("last attachment unmaps");
-        assert!(foreign_exclusive(), "last unmap releases the real kernel lock");
+        assert!(
+            !foreign_exclusive(),
+            "a sibling attachment still owns the fence"
+        );
+        second
+            .shm_unmap(&cx, false)
+            .expect("last attachment unmaps");
+        assert!(
+            foreign_exclusive(),
+            "last unmap releases the real kernel lock"
+        );
         {
             let info = second.inode_info_ref().lock().expect("inode state");
             assert!(!info.has_lock_claims());
@@ -4201,11 +4257,16 @@ mod tests {
         let (mut blocker, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         let (mut contender, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         blocker.lock(&cx, LockLevel::Exclusive).unwrap();
-        assert!(matches!(contender.ensure_shm_info(&cx), Err(FrankenError::Busy)));
+        assert!(matches!(
+            contender.ensure_shm_info(&cx),
+            Err(FrankenError::Busy)
+        ));
         assert!(!contender.wal_lifetime_claim);
         assert!(contender.shm_info.is_none());
         blocker.unlock(&cx, LockLevel::None).unwrap();
-        contender.ensure_shm_info(&cx).expect("retry after blocker drains");
+        contender
+            .ensure_shm_info(&cx)
+            .expect("retry after blocker drains");
         assert!(contender.wal_lifetime_claim);
         contender.close(&cx).unwrap();
         assert!(!blocker.inode_info_ref().lock().unwrap().has_lock_claims());
@@ -4224,7 +4285,8 @@ mod tests {
         assert!(file.wal_lifetime_claim);
         let inode = Arc::clone(file.inode_info_ref());
         assert_eq!(inode.lock().unwrap().n_wal_lifetime, 1);
-        file.close(&cx).expect("close releases the independent retained claim");
+        file.close(&cx)
+            .expect("close releases the independent retained claim");
         assert!(!inode.lock().unwrap().has_lock_claims());
     }
 
@@ -4249,7 +4311,12 @@ mod tests {
             };
             expect("probe");
             assert!(matches!(
-                reader.shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+                reader.shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE
+                ),
                 Err(FrankenError::Busy)
             ));
             println!("checkpoint-child-writer-blocked");
@@ -4278,32 +4345,61 @@ mod tests {
         let mut wait_for = |expected: &str| {
             loop {
                 let mut line = String::new();
-                assert_ne!(output.read_line(&mut line).unwrap(), 0, "child exited before {expected}");
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "child exited before {expected}"
+                );
                 if line.trim() == expected {
                     break;
                 }
             }
         };
         wait_for("checkpoint-child-ready");
-        checkpointer.lock_external_wal_checkpoint(&cx).expect("reader does not prevent bounded backfill");
+        checkpointer
+            .lock_external_wal_checkpoint(&cx)
+            .expect("reader does not prevent bounded backfill");
         assert_eq!(checkpointer.lock_level, LockLevel::Reserved);
-        assert_eq!(checkpointer.wal_checkpoint_reader_horizon(&cx, 25).unwrap(), 17);
+        assert_eq!(
+            checkpointer.wal_checkpoint_reader_horizon(&cx, 25).unwrap(),
+            17
+        );
         assert!(!checkpointer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
         writeln!(input, "probe").unwrap();
         wait_for("checkpoint-child-writer-blocked");
         let (mut appender, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
-        assert!(matches!(appender.lock(&cx, LockLevel::Reserved), Err(FrankenError::Busy)));
-        checkpointer.restore_external_maintenance_attempt(&cx).unwrap();
+        assert!(matches!(
+            appender.lock(&cx, LockLevel::Reserved),
+            Err(FrankenError::Busy)
+        ));
+        checkpointer
+            .restore_external_maintenance_attempt(&cx)
+            .unwrap();
         writeln!(input, "idle").unwrap();
         wait_for("checkpoint-child-idle");
-        checkpointer.lock_external_wal_checkpoint(&cx).expect("idle foreign lifetime permits checkpoint");
-        assert_eq!(checkpointer.wal_checkpoint_reader_horizon(&cx, 25).unwrap(), 25);
-        assert!(checkpointer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap());
-        checkpointer.wal_checkpoint_backfill_gate_release(&cx).unwrap();
+        checkpointer
+            .lock_external_wal_checkpoint(&cx)
+            .expect("idle foreign lifetime permits checkpoint");
+        assert_eq!(
+            checkpointer.wal_checkpoint_reader_horizon(&cx, 25).unwrap(),
+            25
+        );
+        assert!(
+            checkpointer
+                .wal_checkpoint_backfill_gate_acquire(&cx)
+                .unwrap()
+        );
+        checkpointer
+            .wal_checkpoint_backfill_gate_release(&cx)
+            .unwrap();
         assert!(checkpointer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
         checkpointer.wal_checkpoint_reset_gate_release(&cx).unwrap();
-        checkpointer.restore_external_maintenance_attempt(&cx).unwrap();
-        appender.lock(&cx, LockLevel::Reserved).expect("appender resumes after checkpoint");
+        checkpointer
+            .restore_external_maintenance_attempt(&cx)
+            .unwrap();
+        appender
+            .lock(&cx, LockLevel::Reserved)
+            .expect("appender resumes after checkpoint");
         appender.unlock(&cx, LockLevel::None).unwrap();
         writeln!(input, "exit").unwrap();
         assert!(child.wait().unwrap().success());
