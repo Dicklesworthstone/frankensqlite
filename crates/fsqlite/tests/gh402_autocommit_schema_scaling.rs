@@ -124,6 +124,7 @@ async fn create_schema_autocommit(
     let mut window_times = Vec::new();
     let mut window_start = Instant::now();
     let mut before = snapshot_deltas();
+    let mut parses_before = conn.schema_reload_parse_count();
     for i in 0..tables {
         conn.execute(&format!(
             "CREATE TABLE t{i} (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b REAL, c BLOB);"
@@ -137,6 +138,13 @@ async fn create_schema_autocommit(
             let elapsed = window_start.elapsed().as_millis();
             let after = snapshot_deltas();
             window_report(label, i + 1, elapsed, &before, &after, db_path);
+            let parses_after = conn.schema_reload_parse_count();
+            println!(
+                "[gh402] {label} tables={} stored_schema_parse_delta={}",
+                i + 1,
+                parses_after - parses_before
+            );
+            parses_before = parses_after;
             window_times.push(elapsed);
             before = after;
             window_start = Instant::now();
@@ -253,8 +261,9 @@ fn gh402_measure_residual_schema_matrix() {
                         conn.execute("COMMIT;").await.expect("commit DDL");
                     }
                     println!(
-                        "[gh402] {label} schema_total_us={}",
-                        started.elapsed().as_micros()
+                        "[gh402] {label} schema_total_us={} stored_schema_parses={}",
+                        started.elapsed().as_micros(),
+                        conn.schema_reload_parse_count()
                     );
 
                     let stock = rusqlite::Connection::open_in_memory().unwrap();
@@ -341,14 +350,12 @@ fn gh402_measure_residual_schema_matrix() {
                             let peer = Connection::open(target).await.expect("peer open");
                             let open_us = started.elapsed().as_micros();
                             let started = Instant::now();
-                            let row = peer
-                                .query_row("SELECT count(*) FROM t0;")
-                                .await
-                                .unwrap();
+                            let row = peer.query_row("SELECT count(*) FROM t0;").await.unwrap();
                             let first_us = started.elapsed().as_micros();
                             assert_eq!(row.values(), &[SqliteValue::Integer(40)]);
                             println!(
-                                "[gh402] {label} sample={sample} reopen_us={open_us} first_statement_us={first_us}"
+                                "[gh402] {label} sample={sample} reopen_us={open_us} first_statement_us={first_us} stored_schema_parses={}",
+                                peer.schema_reload_parse_count()
                             );
                             window_report(
                                 &format!("{label} reopen-profile"),

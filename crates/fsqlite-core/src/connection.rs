@@ -1380,8 +1380,10 @@ static FSQLITE_JOIN_KEYSET_STREAM_VISITED_OUTER_ROWS: AtomicU64 = AtomicU64::new
 /// vtab/FTS5 source, unstreamable backend, ...), falling back to the generic
 /// materialize path.
 static FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// Test-only, connection-local work observations. Bytes count value payloads
-/// actually materialized, including repeated copies; they are not heap usage.
+/// Test-only, connection-local work observations. Bytes count logical value
+/// payloads represented at each materialization boundary, including repeated
+/// values. Shared text/blob storage is counted each time it is represented;
+/// these counters do not measure allocation or bytes physically copied.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct JoinMaterializationProfile {
@@ -1389,6 +1391,8 @@ struct JoinMaterializationProfile {
     inner_payload_bytes: usize,
     outer_rows: usize,
     outer_payload_bytes: usize,
+    outer_pager_rows: usize,
+    outer_mem_rows: usize,
     combined_rows: usize,
     combined_payload_bytes: usize,
     generic_route_hits: usize,
@@ -85341,6 +85345,10 @@ impl Connection {
                     memdb_handled = true;
                     for (rowid, values) in table.iter_rows_from(lower_bound) {
                         visited_outer += 1;
+                        #[cfg(test)]
+                        {
+                            self.join_materialization_profile.borrow_mut().outer_mem_rows += 1;
+                        }
                         let mut row = values.to_vec();
                         if let Some(alias_value) = row.get_mut(ipk_idx) {
                             *alias_value = SqliteValue::Integer(rowid);
@@ -85501,6 +85509,10 @@ impl Connection {
                 )
                 .await?;
             *visited_outer += 1;
+            #[cfg(test)]
+            {
+                self.join_materialization_profile.borrow_mut().outer_pager_rows += 1;
+            }
             if push_hidden_rowid {
                 row.push(SqliteValue::Integer(rowid));
             }
@@ -290540,8 +290552,8 @@ mod join_keyset_stream_tests {
 
     /// Same semantics as [`q2`] but with the bound term duplicated, which the
     /// static shape gate refuses (WHERE is not a single comparison), forcing
-    /// the generic materialize-then-limit route. Used as the byte-parity
-    /// oracle: identical rows in identical order are required.
+    /// the generic materialize-then-limit route. This is a same-engine control;
+    /// the stock SQLite fixture supplies the independent result oracle.
     fn q2_generic(cursor: i64, limit: i64) -> String {
         format!(
             "SELECT m.id, m.conversation_id, c.title FROM messages m \
@@ -290561,6 +290573,8 @@ mod join_keyset_stream_tests {
             let path = dir.path().join("gh386_keyset.db");
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             populate_fixture(&conn, 4000, 40).await;
+            conn.close().await.unwrap();
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             let stock = stock_fixture(4000, 40);
 
             for (cursor, limit, expected_len) in [
@@ -290572,6 +290586,7 @@ mod join_keyset_stream_tests {
             ] {
                 let hits_before = lane_hits();
                 let visited_before = visited_outer();
+                let hydrated_before = conn.memdb_row_hydration_count();
                 conn.reset_fallback_decision_evidence();
                 let fast = conn
                     .query_with_params(
@@ -290583,6 +290598,7 @@ mod join_keyset_stream_tests {
                 let hits_after = lane_hits();
                 let visited_after = visited_outer();
                 assert!(conn.fallback_decision_snapshot().decisions.is_empty());
+                assert_eq!(conn.memdb_row_hydration_count(), hydrated_before);
                 assert_eq!(
                     values_of(&fast),
                     stock_rows(&stock, Q2_PARAMS, rusqlite::params![cursor, limit])
@@ -290861,6 +290877,9 @@ mod join_keyset_stream_tests {
                 // Residual WHERE term.
                 "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
                  WHERE m.id > 50 AND m.conversation_id = 3 ORDER BY m.id ASC LIMIT 5;",
+                // A non-rowid predicate cannot supply the outer rowid seek.
+                "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE m.conversation_id > 3 ORDER BY m.id ASC LIMIT 5;",
                 // Non-integer bound literal (text keeps affinity semantics).
                 "SELECT m.id FROM messages m JOIN conversations c ON m.conversation_id = c.id \
                  WHERE m.id > '50' ORDER BY m.id ASC LIMIT 5;",
@@ -291008,9 +291027,12 @@ mod join_keyset_stream_tests {
                 let path = dir.path().join(format!("gh386_scale_{outer_rows}.db"));
                 let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
                 populate_fixture(&conn, outer_rows, 30).await;
+                conn.close().await.unwrap();
+                let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
                 let stock = stock_fixture(outer_rows, 30);
                 conn.reset_fallback_decision_evidence();
                 conn.join_materialization_profile.replace(Default::default());
+                let hydrated_before = conn.memdb_row_hydration_count();
                 let hits_before = lane_hits();
                 let visited_before = visited_outer();
                 let rss = RssSampler::start();
@@ -291028,12 +291050,16 @@ mod join_keyset_stream_tests {
                 assert_eq!(lane_hits() - hits_before, 1);
                 assert_eq!(fast.len(), 20);
                 assert_eq!(fast_profile.outer_rows, 20);
+                assert_eq!(fast_profile.outer_pager_rows, 20);
+                assert_eq!(fast_profile.outer_mem_rows, 0);
                 assert_eq!(fast_profile.inner_rows, 30);
                 assert_eq!(fast_profile.combined_rows, 20);
                 assert_eq!(fast_profile.generic_route_hits, 0);
                 assert_eq!(fast_profile.generic_source_rows, 0);
                 assert_eq!(fast_profile.generic_source_payload_bytes, 0);
                 assert!(conn.fallback_decision_snapshot().decisions.is_empty());
+                let hydration_delta = conn.memdb_row_hydration_count() - hydrated_before;
+                assert_eq!(hydration_delta, 0);
                 assert_eq!(
                     values_of(&fast),
                     stock_rows(&stock, Q2_PARAMS, rusqlite::params![500, 20])
@@ -291055,7 +291081,7 @@ mod join_keyset_stream_tests {
                 );
                 assert_eq!(values_of(&fast), values_of(&generic));
                 println!(
-                    "GH#386 scaling: N={outer_rows} visited_outer={visited} \
+                    "GH#386 scaling: N={outer_rows} visited_outer={visited} hydration_delta={hydration_delta} \
                      lane={fast_elapsed:?} generic_materialize={generic_elapsed:?} \
                      fast_materialization={fast_profile:?} generic_materialization={generic_profile:?} \
                      rss_baseline_sampled_peak_kb_and_samples={fast_rss:?}/{generic_rss:?}"
