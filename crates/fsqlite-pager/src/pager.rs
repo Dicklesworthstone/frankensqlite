@@ -5926,6 +5926,40 @@ struct PagerMaintenanceLease {
     exclusive_upgrade_prior: Option<PagerMaintenanceLeaseKind>,
 }
 
+/// Restore an admission lease after a bounded format transition, including
+/// when its future is dropped. Namespace bootstrap retains its original open
+/// lease; it must not acquire a competing transaction lease for this work.
+struct JournalModeMaintenanceUpgrade<'a> {
+    lease: &'a mut PagerMaintenanceLease,
+    prior: Option<PagerMaintenanceLeaseKind>,
+}
+
+impl<'a> JournalModeMaintenanceUpgrade<'a> {
+    fn new(lease: &'a mut PagerMaintenanceLease) -> Result<Self> {
+        let prior = lease.upgrade_to_exclusive(None)?;
+        Ok(Self {
+            lease,
+            prior: Some(prior),
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if let Some(prior) = self.prior {
+            self.lease.downgrade_from_exclusive(prior)?;
+            self.prior = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for JournalModeMaintenanceUpgrade<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            tracing::error!(%error, "journal-mode admission restoration failed");
+        }
+    }
+}
+
 impl PagerMaintenanceGate {
     fn rollback_recovery_owner(&self) -> Option<RollbackRecoveryOwnerId> {
         RollbackRecoveryOwnerId::new(self.rollback_recovery_pending.load(AtomicOrdering::Acquire))
@@ -13948,7 +13982,26 @@ where
     ) -> impl Future<Output = Result<JournalMode>> + 'a {
         async move {
             settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-            let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
+            if self.maintenance_gate.rollback_recovery_pending() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            // Connection bootstrap already owns this pager's opener lease.
+            // Borrow that exact lease instead of counting bootstrap twice.
+            // The slot stays locked until its temporary upgrade is restored,
+            // so finish_namespace_bootstrap cannot retire it mid-transition.
+            let mut open_lease = self
+                .maintenance_open_lease
+                .lock()
+                .map_err(|_| FrankenError::internal("pager open-lease lock poisoned"))?;
+            let mut transaction_lease = if open_lease.is_none() {
+                Some(self.maintenance_gate.enter_transaction()?)
+            } else {
+                None
+            };
+            let maintenance_lease = open_lease
+                .as_mut()
+                .or(transaction_lease.as_mut())
+                .ok_or_else(|| FrankenError::internal("journal-mode admission missing"))?;
             self.validate_namespace_binding()?;
             let mut inner = self
                 .inner
@@ -13972,14 +14025,17 @@ where
                         },
                         PageNumber::ONE,
                     );
-                } else if inner.active_transactions == 0 && !inner.checkpoint_active {
+                    return Ok(mode);
+                } else if !has_wal_backend(&self.wal_backend)? {
                     // Retry a WAL-detachment cleanup that failed after the
                     // rollback-mode header and metadata were published.
-                    shared_db_file_write(&inner.db_file, cx)
-                        .await?
-                        .shm_unmap(cx, false)?;
+                    if inner.active_transactions == 0 && !inner.checkpoint_active {
+                        shared_db_file_write(&inner.db_file, cx)
+                            .await?
+                            .shm_unmap(cx, false)?;
+                    }
+                    return Ok(mode);
                 }
-                return Ok(mode);
             }
 
             if inner.checkpoint_active {
@@ -13994,6 +14050,18 @@ where
                 return Err(FrankenError::Unsupported);
             }
 
+            // A real format change (or pending WAL retirement) must exclude
+            // new same-process transactions until the complete transition ends.
+            // Idempotent confirmations above retain normal reader admission.
+            let mut maintenance_upgrade = JournalModeMaintenanceUpgrade::new(maintenance_lease)?;
+
+            let retiring_wal =
+                if mode == JournalMode::Delete && has_wal_backend(&self.wal_backend)? {
+                    Some(wal_backend_handle(&self.wal_backend)?)
+                } else {
+                    None
+                };
+
             // Changing the file format is whole-image maintenance, even
             // though the preceding WAL checkpoint can admit idle readers.
             let mut external_lock = BeginExternalLockState::new(
@@ -14002,8 +14070,29 @@ where
                 cx,
             );
             external_lock
-                .acquire_maintenance(cx, inner.journal_mode == JournalMode::Wal)
+                .acquire_maintenance(
+                    cx,
+                    inner.journal_mode == JournalMode::Wal || retiring_wal.is_some(),
+                )
                 .await?;
+
+            let mut retiring_backend = if let Some(wal) = &retiring_wal {
+                let mut backend = async_rwlock_write(wal, cx, "retiring WAL backend").await?;
+                // A publisher may have committed between the caller's
+                // checkpoint and this fence. Refuse remaining frames or an
+                // unsupported backend before touching the main-file header.
+                backend.validate_empty_wal_for_retirement(cx).await?;
+                Some(backend)
+            } else {
+                None
+            };
+
+            // Once page one changes, cancellation must not split header
+            // publication from WAL retirement and the matching in-memory mode.
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let transition_cx = cleanup_child_cx(cx);
+            let _transition_mask = transition_cx.masked();
+            let cx = &transition_cx;
 
             // Update the file format version in the database header (bytes 18-19).
             // WAL mode uses version 2; all rollback journal modes use version 1.
@@ -14014,7 +14103,7 @@ where
             if inner.db_size > 0 && !inner.access_mode.is_readonly() {
                 let page_size = inner.page_size.as_usize();
                 let mut page1 = vec![0u8; page_size];
-                let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
                 let bytes_read = db_file.read(cx, &mut page1, 0).await?;
                 if bytes_read >= DATABASE_HEADER_SIZE {
                     main_file_change_counter = Some(u64::from(u32::from_be_bytes([
@@ -14023,9 +14112,24 @@ where
                     page1[18] = version_byte;
                     page1[19] = version_byte;
                     db_file.write(cx, &page1, 0).await?;
+                    db_file.sync(cx, SyncFlags::FULL)?;
                     self.cache.evict(PageNumber::ONE);
                 }
             }
+
+            if let Some(backend) = retiring_backend.as_mut() {
+                backend.retire_empty_wal(cx).await?;
+            }
+            drop(retiring_backend);
+            if retiring_wal.is_some() {
+                drop(
+                    self.wal_backend
+                        .write()
+                        .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?
+                        .take(),
+                );
+            }
+            drop(retiring_wal);
 
             inner.journal_mode = mode;
             if mode == JournalMode::Delete {
@@ -14060,6 +14164,7 @@ where
                     .await?
                     .shm_unmap(cx, false)?;
             }
+            maintenance_upgrade.restore()?;
             drop(inner);
             Ok(mode)
         }
@@ -37821,6 +37926,20 @@ mod tests {
 
         fn frame_count(&self) -> usize {
             self.frames.lock().unwrap().len()
+        }
+
+        fn validate_empty_wal_for_retirement<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                if self.frames.lock().unwrap().is_empty() {
+                    Ok(())
+                } else {
+                    Err(FrankenError::Busy)
+                }
+            })
+        }
+
+        fn retire_empty_wal<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+            self.validate_empty_wal_for_retirement(cx)
         }
 
         fn checkpoint<'a>(

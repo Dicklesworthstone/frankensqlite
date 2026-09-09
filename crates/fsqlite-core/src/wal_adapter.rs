@@ -2168,6 +2168,33 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
     }
 
+    fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if self.has_pending_publication() {
+                return Err(FrankenError::Busy);
+            }
+            // A prior truncate may have succeeded before its sync failed.
+            // Only an already-empty handle can retry that terminal sync.
+            if self.wal.file().file_size(cx)? != 0 || self.wal.frame_count() != 0 {
+                self.wal.refresh(cx).await?;
+            }
+            if self.wal.frame_count() != 0 {
+                return Err(FrankenError::Busy);
+            }
+            Ok(())
+        })
+    }
+
+    fn retire_empty_wal<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            self.validate_empty_wal_for_retirement(cx).await?;
+            self.wal.file_mut().truncate(cx, 0)?;
+            self.wal.file_mut().sync(cx, SyncFlags::FULL)?;
+            self.invalidate_publication();
+            Ok(())
+        })
+    }
+
     fn checkpoint<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -4240,6 +4267,20 @@ where
         Box::pin(async move {
             self.ensure_current_wal_path(cx).await?;
             self.inner.refresh_published_snapshot(cx).await.map(Some)
+        })
+    }
+
+    fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            self.ensure_current_wal_path(cx).await?;
+            self.inner.validate_empty_wal_for_retirement(cx).await
+        })
+    }
+
+    fn retire_empty_wal<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            self.ensure_current_wal_path(cx).await?;
+            self.inner.retire_empty_wal(cx).await
         })
     }
 
@@ -8335,6 +8376,34 @@ mod tests {
             assert_eq!(stats.completed_jobs, 0);
             assert_eq!(stats.canceled_jobs, 1);
         });
+    }
+
+    #[test]
+    fn test_wal_retirement_failed_terminal_sync_is_retryable() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut adapter = make_fault_adapter(&vfs, &cx);
+        assert_eq!(adapter.wal.file().file_size(&cx).unwrap(), 32);
+
+        vfs.fail_next_wal_sync();
+        let failure = adapter
+            .retire_empty_wal(&cx)
+            .expect_err("terminal WAL sync failure must surface");
+        assert!(failure.to_string().contains("injected WAL sync failure"));
+        assert_eq!(adapter.wal.file().file_size(&cx).unwrap(), 0);
+        assert_eq!(adapter.wal.frame_count(), 0);
+        assert!(!adapter.has_pending_publication());
+
+        // The truncated file has no header to refresh. A retry must finish
+        // durability rather than reject that already-empty terminal state.
+        adapter
+            .validate_empty_wal_for_retirement(&cx)
+            .expect("validate after failed terminal sync");
+        adapter
+            .retire_empty_wal(&cx)
+            .expect("retry terminal WAL sync");
+        assert_eq!(adapter.wal.file().file_size(&cx).unwrap(), 0);
+        assert_publication_unchanged(&adapter, "after retirement retry");
     }
 
     #[test]

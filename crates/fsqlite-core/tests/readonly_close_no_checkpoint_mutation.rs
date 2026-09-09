@@ -21,6 +21,72 @@ fn wal_len(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn wal_retirement_refuses_staged_and_committed_frames_without_mutation() {
+    use fsqlite_core::wal_adapter::WalBackendAdapter;
+    use fsqlite_pager::WalBackend;
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::{UnixVfs, Vfs};
+    use fsqlite_wal::{WalFile, WalSalts};
+
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for with_frame in [false, true] {
+            let path = dir.path().join(format!("retirement-{with_frame}.wal"));
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(&path),
+                    VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+                )
+                .unwrap();
+            let wal = WalFile::create(
+                &cx,
+                file,
+                4096,
+                0,
+                WalSalts {
+                    salt1: 17,
+                    salt2: 23,
+                },
+            )
+            .await
+            .unwrap();
+            let mut backend = WalBackendAdapter::new(wal);
+            if with_frame {
+                backend.append_frame(&cx, 1, &[7; 4096], 1).await.unwrap();
+                let before = std::fs::read(&path).unwrap();
+                assert!(before.len() > 32);
+                for committed in [false, true] {
+                    if committed {
+                        backend.sync(&cx).unwrap();
+                    }
+                    assert!(matches!(
+                        backend.validate_empty_wal_for_retirement(&cx).await,
+                        Err(fsqlite_error::FrankenError::Busy)
+                    ));
+                    assert!(matches!(
+                        backend.retire_empty_wal(&cx).await,
+                        Err(fsqlite_error::FrankenError::Busy)
+                    ));
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                }
+            } else {
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 32);
+                for _ in 0..2 {
+                    backend.validate_empty_wal_for_retirement(&cx).await.unwrap();
+                    backend.retire_empty_wal(&cx).await.unwrap();
+                    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+                }
+            }
+        }
+    });
+}
+
 #[test]
 fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
     const CHILD_PATH: &str = "FSQLITE_WAL_TO_DELETE_STOCK_WRITER";
@@ -59,6 +125,19 @@ fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
             } else {
                 None
             };
+            if let Some(peer) = &peer {
+                peer.execute("BEGIN;").await.unwrap();
+                peer.query_row("SELECT x FROM t;").await.unwrap();
+                let before = db_bytes(db.to_str().unwrap());
+                let error = conn
+                    .query_row("PRAGMA journal_mode=DELETE;")
+                    .await
+                    .expect_err("a pinned peer must prevent the mode transition");
+                assert!(matches!(error, fsqlite_error::FrankenError::Busy));
+                assert_eq!(db_bytes(db.to_str().unwrap()), before);
+                assert!(wal_len(db.to_str().unwrap()) > 32);
+                peer.execute("ROLLBACK;").await.unwrap();
+            }
             let mode = conn
                 .query_row("PRAGMA journal_mode=DELETE;")
                 .await
@@ -75,6 +154,11 @@ fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
                 assert_eq!(mode.values(), &[SqliteValue::Text("delete".into())]);
             }
             assert_eq!(&db_bytes(db.to_str().unwrap())[18..20], &[1, 1]);
+            assert_eq!(
+                wal_len(db.to_str().unwrap()),
+                0,
+                "retire the WAL header too"
+            );
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([TEST, "--exact", "--nocapture"])
                 .env(CHILD_PATH, &db)
@@ -98,7 +182,24 @@ fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
                 );
                 peer.close().await.unwrap();
             }
+            // The retired adapter cannot be reused: re-entering WAL installs
+            // a fresh header/backend and must retain the stock writer's row.
+            let mode = conn.query_row("PRAGMA journal_mode=WAL;").await.unwrap();
+            assert_eq!(mode.values(), &[SqliteValue::Text("wal".into())]);
+            conn.execute("INSERT INTO t VALUES (3);").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM t;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(3)]
+            );
             conn.close().await.unwrap();
+            let stock = rusqlite::Connection::open(&db).unwrap();
+            let count: i64 = stock
+                .query_row("SELECT count(*) FROM t;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 3);
         }
     });
 }

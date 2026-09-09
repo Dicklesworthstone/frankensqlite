@@ -148,6 +148,81 @@ fn signal_child(child: &mut std::process::Child, line: &str) {
     .expect("signal the foreign reader");
 }
 
+/// Explicit investigation of the remaining attachment-lifetime boundary.
+/// This must pass before GH411 can claim reverse-close-order durability;
+/// it is separate from the unchanged original regression below.
+#[test]
+#[ignore = "GH411 reverse-close-order investigation; run explicitly before issue closure"]
+fn committed_row_survives_writer_close_before_foreign_reader_exit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh411-writer-closes-first.db");
+        let conn = Connection::open(db_path.to_str().unwrap())
+            .await
+            .expect("open writer");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE);")
+            .await
+            .expect("create table");
+        conn.execute("INSERT INTO t(k) VALUES ('baseline');")
+            .await
+            .expect("baseline row");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture"])
+            .env(READER_PATH_ENV, db_path.as_os_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn pinned stock reader");
+        let mut child_out = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(child_out.read_line(&mut line).unwrap() > 0);
+            if line.contains(READER_READY) {
+                break;
+            }
+        }
+        conn.execute("INSERT INTO t(k) VALUES ('committed-before-writer-close');")
+            .await
+            .expect("commit while stock reader is pinned");
+        assert_eq!(
+            scalar_i64(&conn.query("SELECT COUNT(*) FROM t;").await.unwrap()),
+            2
+        );
+        let committed_wal_len = wal_len(&db_path);
+        eprintln!(
+            "gh411 reverse-close before writer close: wal={committed_wal_len} shm={:?}",
+            shm_header(&db_path)
+        );
+        conn.close().await.expect("writer closes before reader");
+        eprintln!(
+            "gh411 reverse-close writer closed, reader pinned: wal={} shm={:?}",
+            wal_len(&db_path),
+            shm_header(&db_path)
+        );
+
+        signal_child(&mut child, "release");
+        let mut rolled = String::new();
+        child_out.read_line(&mut rolled).unwrap();
+        assert!(rolled.contains(READER_ROLLED_BACK));
+        eprintln!(
+            "gh411 reverse-close reader rolled back, process alive: wal={} shm={:?}",
+            wal_len(&db_path),
+            shm_header(&db_path)
+        );
+        signal_child(&mut child, "exit");
+        assert!(child.wait().unwrap().success());
+        let surviving_rows = canonical_count(&db_path);
+        eprintln!(
+            "gh411 reverse-close reader exited: wal={} stock_rows={surviving_rows}",
+            wal_len(&db_path)
+        );
+        assert_eq!(
+            surviving_rows, 2,
+            "acknowledged rows must survive both close orders (committed WAL {committed_wal_len})"
+        );
+    });
+}
+
 #[test]
 fn commit_survives_foreign_canonical_reader_pinning_a_snapshot() {
     if let Some(db_path) = std::env::var_os(READER_PATH_ENV) {

@@ -642,6 +642,26 @@ pub trait WalBackend: Send + Sync {
         0
     }
 
+    /// Refresh and verify that this backend can retire an empty WAL.
+    ///
+    /// Called under whole-image maintenance before the database header is
+    /// changed. Refuse unsupported retirement or any remaining/pending frames.
+    fn validate_empty_wal_for_retirement<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
+    }
+
+    /// Retire a fully checkpointed, empty WAL before leaving WAL mode.
+    ///
+    /// The caller holds whole-image maintenance, has refreshed and verified
+    /// that no frames remain, and has synced the rollback-mode database header.
+    /// A header-only WAL still makes stock SQLite select WAL mode, so file
+    /// backends must truncate it to zero and sync it. Reject pending frames;
+    /// the caller discards this backend after success and installs a fresh
+    /// backend if WAL mode is requested again.
+    fn retire_empty_wal<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
+    }
+
     /// Run a checkpoint to transfer frames from the WAL to the database.
     ///
     /// Takes a `CheckpointPageWriter` that handles the actual page writes

@@ -77533,12 +77533,22 @@ impl Connection {
                 // SQLite checkpoints outstanding WAL frames before leaving WAL
                 // mode so the main database stays self-contained for readers.
                 if self.pager.journal_mode() == JournalMode::Wal {
-                    self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+                    let checkpoint = self
+                        .pager
+                        .checkpoint(&cx, CheckpointMode::Truncate)
+                        .await?;
+                    if !checkpoint.completed
+                        || checkpoint.effective_mode != CheckpointMode::Truncate
+                    {
+                        return Err(FrankenError::Busy);
+                    }
                 }
-                self.pager
-                    .set_journal_mode(&cx, JournalMode::Delete)
-                    .await?;
             }
+            // Even an already-published rollback mode must detach this
+            // handle's own WAL backend and lifetime claim (or retry cleanup).
+            self.pager
+                .set_journal_mode(&cx, JournalMode::Delete)
+                .await?;
             self.pager.set_rollback_cleanup(cleanup)?;
             Ok(())
         }
@@ -207612,6 +207622,20 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
+        fn validate_empty_wal_for_retirement<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.validate_empty_wal_for_retirement(cx)
+        }
+
+        fn retire_empty_wal<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.retire_empty_wal(cx)
+        }
+
         fn begin_transaction<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -207852,6 +207876,20 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
+        fn validate_empty_wal_for_retirement<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.validate_empty_wal_for_retirement(cx)
+        }
+
+        fn retire_empty_wal<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.retire_empty_wal(cx)
+        }
+
         fn begin_transaction<'a>(
             &'a mut self,
             cx: &'a Cx,
