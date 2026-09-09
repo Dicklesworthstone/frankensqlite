@@ -1381,7 +1381,7 @@ impl Vfs for UnixVfs {
             path: resolved,
             open_flags: out_flags,
             lock_level: LockLevel::None,
-            wal_lifetime_claim: false,
+            wal_lifetime_claim: WalLifetimeClaim::Unclaimed,
             transient_shared_pending_gate: false,
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
@@ -1531,6 +1531,13 @@ impl UnixExternalMaintenanceAttempt {
     }
 }
 
+/// This handle's ownership of an inode's WAL attachment claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalLifetimeClaim {
+    Unclaimed,
+    Held,
+}
+
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
 pub struct UnixFile {
@@ -1541,7 +1548,7 @@ pub struct UnixFile {
     open_flags: VfsOpenFlags,
     lock_level: LockLevel,
     /// Independent of the transaction prefix; retained until SHM unmap/close.
-    wal_lifetime_claim: bool,
+    wal_lifetime_claim: WalLifetimeClaim,
     /// A transient SHARED-acquisition read lock on SQLite's PENDING byte.
     ///
     /// This remains armed until the raw unlock succeeds. It is deliberately
@@ -1743,7 +1750,7 @@ impl UnixFile {
         // attachment, even after a transaction restores its prior prefix.
         // Reuse the ordinary acquisition protocol so PENDING-byte exclusion
         // and partial-acquisition cleanup retain their existing guarantees.
-        if !self.wal_lifetime_claim {
+        if self.wal_lifetime_claim == WalLifetimeClaim::Unclaimed {
             let prior_level = self.lock_level;
             self.lock(cx, LockLevel::Shared)?;
             let inode_info = Arc::clone(self.inode_info_ref());
@@ -1760,7 +1767,7 @@ impl UnixFile {
                 );
             };
             info.n_wal_lifetime = next_lifetime;
-            self.wal_lifetime_claim = true;
+            self.wal_lifetime_claim = WalLifetimeClaim::Held;
             Self::rollback_main_lock_state(
                 &mut info,
                 &mut self.lock_level,
@@ -1778,7 +1785,7 @@ impl UnixFile {
     }
 
     fn release_wal_lifetime_claim(&mut self) -> Result<()> {
-        if !self.wal_lifetime_claim {
+        if self.wal_lifetime_claim == WalLifetimeClaim::Unclaimed {
             return Ok(());
         }
         let inode_info = Arc::clone(self.inode_info_ref());
@@ -1795,7 +1802,7 @@ impl UnixFile {
             posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
         }
         info.n_wal_lifetime -= 1;
-        self.wal_lifetime_claim = false;
+        self.wal_lifetime_claim = WalLifetimeClaim::Unclaimed;
         info.close_deferred_files_if_unlocked();
         Ok(())
     }
@@ -2607,7 +2614,7 @@ impl UnixFile {
         };
 
         self.lock_level = LockLevel::None;
-        self.wal_lifetime_claim = false;
+        self.wal_lifetime_claim = WalLifetimeClaim::Unclaimed;
         self.transient_shared_pending_gate = false;
         self.delete_on_close = false;
         self.closed = true;
@@ -4261,13 +4268,13 @@ mod tests {
             contender.ensure_shm_info(&cx),
             Err(FrankenError::Busy)
         ));
-        assert!(!contender.wal_lifetime_claim);
+        assert_eq!(contender.wal_lifetime_claim, WalLifetimeClaim::Unclaimed);
         assert!(contender.shm_info.is_none());
         blocker.unlock(&cx, LockLevel::None).unwrap();
         contender
             .ensure_shm_info(&cx)
             .expect("retry after blocker drains");
-        assert!(contender.wal_lifetime_claim);
+        assert_eq!(contender.wal_lifetime_claim, WalLifetimeClaim::Held);
         contender.close(&cx).unwrap();
         assert!(!blocker.inode_info_ref().lock().unwrap().has_lock_claims());
         blocker.close(&cx).unwrap();
@@ -4282,7 +4289,7 @@ mod tests {
         fs::create_dir(&file.shm_path).expect("make SHM path unopenable as a file");
         assert!(file.ensure_shm_info(&cx).is_err());
         assert!(file.shm_info.is_none());
-        assert!(file.wal_lifetime_claim);
+        assert_eq!(file.wal_lifetime_claim, WalLifetimeClaim::Held);
         let inode = Arc::clone(file.inode_info_ref());
         assert_eq!(inode.lock().unwrap().n_wal_lifetime, 1);
         file.close(&cx)
@@ -4323,7 +4330,7 @@ mod tests {
             std::io::stdout().flush().unwrap();
             expect("idle");
             reader.wal_reader_slot_release(&cx, slot).unwrap();
-            assert!(reader.wal_lifetime_claim);
+            assert_eq!(reader.wal_lifetime_claim, WalLifetimeClaim::Held);
             println!("checkpoint-child-idle");
             std::io::stdout().flush().unwrap();
             expect("exit");
@@ -4380,10 +4387,8 @@ mod tests {
         // Instrumentation must preserve the dedicated checkpoint fence. The
         // trait's conservative maintenance default would request EXCLUSIVE
         // and fail while the foreign idle lifetime claim remains held.
-        let mut checkpointer = crate::metrics::TracingFile::new(
-            checkpointer,
-            path.to_string_lossy().into_owned(),
-        );
+        let mut checkpointer =
+            crate::metrics::TracingFile::new(checkpointer, path.to_string_lossy().into_owned());
         checkpointer
             .lock_external_wal_checkpoint(&cx)
             .expect("idle foreign lifetime permits checkpoint");
@@ -4652,8 +4657,11 @@ mod tests {
         assert!(dropped_shell.file.is_none());
         assert!(dropped_shell.inode_info.is_none());
         assert!(dropped_shell.shm_info.is_none());
-        assert!(!dropped_shell.wal_lifetime_claim);
-        assert!(deferred.wal_lifetime_claim);
+        assert_eq!(
+            dropped_shell.wal_lifetime_claim,
+            WalLifetimeClaim::Unclaimed
+        );
+        assert_eq!(deferred.wal_lifetime_claim, WalLifetimeClaim::Held);
         assert_eq!(deferred.lock_level, LockLevel::Exclusive);
         assert!(deferred.external_maintenance_attempt.is_some());
 

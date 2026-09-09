@@ -6499,8 +6499,7 @@ mod tests {
     #[test]
     fn test_sharded_page_cache_s3_fifo_adaptive_reports_real_queue_metrics_bd_86ct9() {
         for fast_path in [true, false] {
-            let mut cache =
-                ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 1);
+            let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 1);
             if fast_path {
                 cache.enable_fast_path();
             }

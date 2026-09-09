@@ -290492,9 +290492,15 @@ mod join_keyset_stream_tests {
 
     /// A sampled process RSS observation, not an exact per-query heap peak.
     /// Missing /proc is reported as None, never as a measured zero.
+    struct RssObservation {
+        baseline_kib: Option<u64>,
+        peak_kib: Option<u64>,
+        samples: usize,
+    }
+
     struct RssSampler {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        worker: Option<std::thread::JoinHandle<(Option<u64>, Option<u64>, usize)>>,
+        worker: Option<std::thread::JoinHandle<RssObservation>>,
     }
 
     impl RssSampler {
@@ -290511,7 +290517,11 @@ mod join_keyset_stream_tests {
                         samples += 1;
                     }
                     if worker_stop.load(AtomicOrdering::Relaxed) {
-                        return (baseline, peak, samples);
+                        return RssObservation {
+                            baseline_kib: baseline,
+                            peak_kib: peak,
+                            samples,
+                        };
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -290522,7 +290532,7 @@ mod join_keyset_stream_tests {
             }
         }
 
-        fn finish(mut self) -> (Option<u64>, Option<u64>, usize) {
+        fn finish(mut self) -> RssObservation {
             self.stop.store(true, AtomicOrdering::Relaxed);
             self.worker.take().unwrap().join().unwrap()
         }
@@ -291122,11 +291132,13 @@ mod join_keyset_stream_tests {
                     "GH#386 scaling: N={outer_rows} visited_outer={visited} hydration_delta={hydration_delta} \
                      lane={fast_elapsed:?} generic_materialize={generic_elapsed:?} \
                      fast_materialization={fast_profile:?} generic_materialization={generic_profile:?} \
-                     rss_baseline_sampled_peak_kb_and_samples={fast_rss:?}/{generic_rss:?}"
+                     rss_baseline_sampled_peak_kb_and_samples={:?}/{:?}",
+                    (fast_rss.baseline_kib, fast_rss.peak_kib, fast_rss.samples),
+                    (generic_rss.baseline_kib, generic_rss.peak_kib, generic_rss.samples),
                 );
                 #[cfg(target_os = "linux")]
                 assert!(
-                    fast_rss.1.is_some() && generic_rss.1.is_some(),
+                    fast_rss.peak_kib.is_some() && generic_rss.peak_kib.is_some(),
                     "Linux RSS must be measured"
                 );
                 visits.push((visited, fast_profile));
