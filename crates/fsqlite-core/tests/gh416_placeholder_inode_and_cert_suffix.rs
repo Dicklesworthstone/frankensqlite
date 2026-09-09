@@ -154,7 +154,11 @@ fn corrupt_certificate_suffix_fails_closed_without_wedging_the_writer() {
         use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
         let cx = Cx::new();
         let (mut file, _) = UnixVfs::new()
-            .open(&cx, Some(Path::new(&path)), VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE)
+            .open(
+                &cx,
+                Some(Path::new(&path)),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
             .expect("raw probe opens without decoding the corrupt certificate");
         file.lock_external_wal_checkpoint(&cx)
             .expect("failed writer must release RESERVED, WAL WRITE and CKPT locks");
@@ -257,9 +261,13 @@ fn corrupt_certificate_suffix_fails_closed_without_wedging_the_writer() {
         }
         {
             let _guard = watchdog("original connection after the repair");
-            conn.execute("INSERT INTO t VALUES (5);").await.expect("original writer resumes");
+            conn.execute("INSERT INTO t VALUES (5);")
+                .await
+                .expect("original writer resumes");
             assert_eq!(count_rows(&conn).await, 3);
-            conn.close_without_checkpoint().await.expect("close original writer");
+            conn.close_without_checkpoint()
+                .await
+                .expect("close original writer");
         }
     });
 }
@@ -289,8 +297,16 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                 Err(error) => panic!("read required source {suffix}: {error}"),
             }
         }
-        assert!(snapshots.iter().any(|(suffix, _, bytes)| *suffix == "-wal" && bytes.len() > 32));
-        assert!(snapshots.iter().any(|(suffix, _, bytes)| *suffix == "-wal-cert" && !bytes.is_empty()));
+        assert!(
+            snapshots
+                .iter()
+                .any(|(suffix, _, bytes)| *suffix == "-wal" && bytes.len() > 32)
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|(suffix, _, bytes)| *suffix == "-wal-cert" && !bytes.is_empty())
+        );
 
         for include_shm in [false, true] {
             for (case, suffix_bytes) in [
@@ -311,8 +327,12 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                 }
                 let certificate = dir.path().join(format!("{name}-wal-cert"));
                 if !suffix_bytes.is_empty() {
-                    std::fs::OpenOptions::new().append(true).open(&certificate).unwrap()
-                        .write_all(suffix_bytes).unwrap();
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&certificate)
+                        .unwrap()
+                        .write_all(suffix_bytes)
+                        .unwrap();
                 }
                 let before = std::fs::read(&certificate).unwrap();
                 let opened = Connection::open(destination.to_str().unwrap()).await;
@@ -325,22 +345,35 @@ fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
                         }
                         Err(error) => error,
                     };
-                    assert!(error.to_string().contains("record boundary"), "{case}: {error}");
-                    assert_eq!(std::fs::read(&certificate).unwrap(), before,
-                        "unrecognized bytes must not be silently truncated");
+                    assert!(
+                        error.to_string().contains("record boundary"),
+                        "{case}: {error}"
+                    );
+                    assert_eq!(
+                        std::fs::read(&certificate).unwrap(),
+                        before,
+                        "unrecognized bytes must not be silently truncated"
+                    );
                 } else {
                     let copy = opened.expect("coherent copy with an intact or torn certificate opens");
                     assert_eq!(count_rows(&copy).await, 1);
-                    copy.execute("INSERT INTO t VALUES (2);").await.expect("copied snapshot accepts writes");
+                    copy.execute("INSERT INTO t VALUES (2);")
+                        .await
+                        .expect("copied snapshot accepts writes");
                     assert_eq!(count_rows(&copy).await, 2);
                     copy.close_without_checkpoint().await.unwrap();
-                    let reopened = Connection::open(destination.to_str().unwrap()).await.unwrap();
+                    let reopened = Connection::open(destination.to_str().unwrap())
+                        .await
+                        .unwrap();
                     assert_eq!(count_rows(&reopened).await, 2);
                     reopened.close_without_checkpoint().await.unwrap();
                 }
                 for (_, source_path, bytes) in &snapshots {
-                    assert_eq!(std::fs::read(source_path).unwrap(), *bytes,
-                        "destination recovery must leave the source snapshot unchanged");
+                    assert_eq!(
+                        std::fs::read(source_path).unwrap(),
+                        *bytes,
+                        "destination recovery must leave the source snapshot unchanged"
+                    );
                 }
                 eprintln!("GH416 copied snapshot: include_shm={include_shm} suffix={case} verified");
             }
