@@ -143,6 +143,25 @@ fn database_created_on_a_placeholder_inode_mount_survives_its_first_write() {
 
 #[test]
 fn corrupt_certificate_suffix_fails_closed_without_wedging_the_writer() {
+    #[cfg(all(unix, feature = "native"))]
+    const PROBE_PATH: &str = "FSQLITE_GH416_RAW_LOCK_PROBE";
+    #[cfg(all(unix, feature = "native"))]
+    const TEST: &str = "corrupt_certificate_suffix_fails_closed_without_wedging_the_writer";
+    #[cfg(all(unix, feature = "native"))]
+    if let Some(path) = std::env::var_os(PROBE_PATH) {
+        use fsqlite_types::cx::Cx;
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_vfs::{UnixVfs, Vfs, VfsFile};
+        let cx = Cx::new();
+        let (mut file, _) = UnixVfs::new()
+            .open(&cx, Some(Path::new(&path)), VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE)
+            .expect("raw probe opens without decoding the corrupt certificate");
+        file.lock_external_wal_checkpoint(&cx)
+            .expect("failed writer must release RESERVED, WAL WRITE and CKPT locks");
+        file.restore_external_maintenance_attempt(&cx).unwrap();
+        file.close(&cx).unwrap();
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("cert.db");
     let cert = dir.path().join("cert.db-wal-cert");
@@ -185,21 +204,35 @@ fn corrupt_certificate_suffix_fails_closed_without_wedging_the_writer() {
             );
         }
         {
-            // The connection that hit the error must not be wedged: the next
-            // attempt returns (any result) instead of hanging on a lock it
-            // still holds.
+            // A repeated attempt must still refuse the same corruption.
             let _guard = watchdog("second write on the same connection");
-            let _ = conn.execute("INSERT INTO t VALUES (3);").await;
+            let error = conn.execute("INSERT INTO t VALUES (3);").await.unwrap_err();
+            assert!(error.to_string().contains("record boundary"), "{error}");
+        }
+        #[cfg(all(unix, feature = "native"))]
+        {
+            // This process bypasses certificate parsing and actually acquires
+            // the raw appender gates. An early peer-open refusal cannot prove
+            // that the failed writer released them.
+            let _guard = watchdog("foreign process acquires the released writer gates");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(PROBE_PATH, &db)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "raw lock probe failed: {output:?}");
         }
         {
-            // Nor may it wedge a peer: RESERVED must have been released.
+            // A peer also refuses the malformed certificate promptly. The
+            // subprocess above independently checks actual lock availability.
             let _guard = watchdog("peer connection while the failed writer is alive");
             match Connection::open(db.to_str().expect("utf-8 path")).await {
                 Ok(peer) => {
-                    let _ = peer.execute("INSERT INTO t VALUES (3);").await;
+                    let error = peer.execute("INSERT INTO t VALUES (3);").await.unwrap_err();
+                    assert!(error.to_string().contains("record boundary"), "{error}");
                     let _ = peer.close_without_checkpoint().await;
                 }
-                Err(error) => eprintln!("peer open refused (fail-closed is fine): {error}"),
+                Err(error) => assert!(error.to_string().contains("record boundary"), "{error}"),
             }
         }
 
@@ -219,13 +252,98 @@ fn corrupt_certificate_suffix_fails_closed_without_wedging_the_writer() {
             peer.execute("INSERT INTO t VALUES (4);")
                 .await
                 .expect("writes resume once the sidecar is repaired");
-            assert!(count_rows(&peer).await >= 2);
+            assert_eq!(count_rows(&peer).await, 2, "failed writes must add no rows");
             peer.close_without_checkpoint().await.expect("close peer");
         }
         {
             let _guard = watchdog("original connection after the repair");
-            let _ = conn.execute("INSERT INTO t VALUES (5);").await;
-            let _ = conn.close_without_checkpoint().await;
+            conn.execute("INSERT INTO t VALUES (5);").await.expect("original writer resumes");
+            assert_eq!(count_rows(&conn).await, 3);
+            conn.close_without_checkpoint().await.expect("close original writer");
+        }
+    });
+}
+
+#[test]
+fn copied_wal_snapshot_preserves_source_and_validates_certificate_suffixes() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.db");
+    asupersync::test_utils::run_test(|| async {
+        let conn = open(&source).await;
+        conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        conn.close_without_checkpoint().await.unwrap();
+
+        // The source is closed before capturing any file, so every copy uses
+        // one coherent generation. A copied certificate retains the source
+        // inode identity; it cannot authorize a different destination inode.
+        let mut snapshots = Vec::new();
+        for suffix in ["", "-wal", "-shm", "-wal-cert", "-wal-cert-head"] {
+            let path = dir.path().join(format!("source.db{suffix}"));
+            match std::fs::read(&path) {
+                Ok(bytes) => snapshots.push((suffix, path, bytes)),
+                Err(error) if ["-shm", "-wal-cert-head"].contains(&suffix)
+                    && error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read required source {suffix}: {error}"),
+            }
+        }
+        assert!(snapshots.iter().any(|(suffix, _, bytes)| *suffix == "-wal" && bytes.len() > 32));
+        assert!(snapshots.iter().any(|(suffix, _, bytes)| *suffix == "-wal-cert" && !bytes.is_empty()));
+
+        for include_shm in [false, true] {
+            for (case, suffix_bytes) in [
+                ("intact", &[][..]),
+                ("torn", &fsqlite_wal::PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC[..4]),
+                ("garbage", b"GARBAGEGARBAGEGARBAGE".as_slice()),
+            ] {
+                let _guard = watchdog("copied snapshot recovery and append");
+                let name = format!("copy-{include_shm}-{case}.db");
+                let destination = dir.path().join(&name);
+                for (suffix, source_path, bytes) in &snapshots {
+                    if *suffix == "-shm" && !include_shm {
+                        continue;
+                    }
+                    let copied = dir.path().join(format!("{name}{suffix}"));
+                    std::fs::copy(source_path, &copied).unwrap();
+                    assert_eq!(std::fs::read(copied).unwrap(), *bytes);
+                }
+                let certificate = dir.path().join(format!("{name}-wal-cert"));
+                if !suffix_bytes.is_empty() {
+                    std::fs::OpenOptions::new().append(true).open(&certificate).unwrap()
+                        .write_all(suffix_bytes).unwrap();
+                }
+                let before = std::fs::read(&certificate).unwrap();
+                let opened = Connection::open(destination.to_str().unwrap()).await;
+                if case == "garbage" {
+                    let error = match opened {
+                        Ok(copy) => {
+                            let error = copy.execute("INSERT INTO t VALUES (2);").await.unwrap_err();
+                            let _ = copy.close_without_checkpoint().await;
+                            error
+                        }
+                        Err(error) => error,
+                    };
+                    assert!(error.to_string().contains("record boundary"), "{case}: {error}");
+                    assert_eq!(std::fs::read(&certificate).unwrap(), before,
+                        "unrecognized bytes must not be silently truncated");
+                } else {
+                    let copy = opened.expect("coherent copy with an intact or torn certificate opens");
+                    assert_eq!(count_rows(&copy).await, 1);
+                    copy.execute("INSERT INTO t VALUES (2);").await.expect("copied snapshot accepts writes");
+                    assert_eq!(count_rows(&copy).await, 2);
+                    copy.close_without_checkpoint().await.unwrap();
+                    let reopened = Connection::open(destination.to_str().unwrap()).await.unwrap();
+                    assert_eq!(count_rows(&reopened).await, 2);
+                    reopened.close_without_checkpoint().await.unwrap();
+                }
+                for (_, source_path, bytes) in &snapshots {
+                    assert_eq!(std::fs::read(source_path).unwrap(), *bytes,
+                        "destination recovery must leave the source snapshot unchanged");
+                }
+                eprintln!("GH416 copied snapshot: include_shm={include_shm} suffix={case} verified");
+            }
         }
     });
 }
