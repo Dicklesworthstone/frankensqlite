@@ -2,11 +2,11 @@
 //! FOREIGN (stock-SQLite, separate process) connection closes its handle on
 //! the same WAL-mode database.
 //!
-//! # The bug
+//! # The original bug
 //!
-//! fsqlite appends committed frames to `-wal` and fsyncs them, but never
-//! advances `mxFrame` in the shared `-shm` WAL-index, and holds no SHARED lock
-//! on the main database file while the WAL is open. So:
+//! fsqlite appended committed frames to `-wal` without advancing `mxFrame`
+//! in the shared `-shm` WAL-index or retaining a main-file SHARED claim for
+//! the WAL attachment. That allowed this sequence:
 //!
 //! 1. every attached stock connection still reads the pre-commit `mxFrame` and
 //!    cannot see the commit (GH #19 — `write_shm_header` and
@@ -35,12 +35,14 @@
 //!
 //! # Status
 //!
-//! Committed `#[ignore]`d: red by design until GH #411 / GH #19 land. It is a
-//! local-only keeper (nothing under `crates/fsqlite-core/tests/` is named by a
-//! workflow allowlist), so run it explicitly with `--ignored`:
+//! The Unix VFS now retains an independent SHM-lifetime main-file read claim.
+//! This keeper runs by default and also verifies fresh stock/fsqlite reopen.
+//! GH #19 shared-index publication remains a separate open issue: this test
+//! does not require an already-attached stock reader to see the new commit.
+//! GitHub Actions is disabled; run the integration target explicitly:
 //!
 //! ```text
-//! cargo test -p fsqlite-core --test wal_reset_with_foreign_reader -- --ignored --nocapture
+//! cargo test -p fsqlite-core --test wal_reset_with_foreign_reader -- --nocapture
 //! ```
 //!
 //! The `eprintln!` probes are deliberate: `(mxFrame, nBackfill, aReadMark)`
@@ -146,7 +148,6 @@ fn signal_child(child: &mut std::process::Child, line: &str) {
     .expect("signal the foreign reader");
 }
 
-#[ignore = "GH#411 keeper: red by design — a foreign stock-SQLite connection's close deletes the -wal and destroys committed frames; needs the GH#19 shm WAL-index publication (and the WAL-open db-file SHARED fence) to go green"]
 #[test]
 fn commit_survives_foreign_canonical_reader_pinning_a_snapshot() {
     if let Some(db_path) = std::env::var_os(READER_PATH_ENV) {
@@ -181,7 +182,6 @@ fn commit_survives_foreign_canonical_reader_pinning_a_snapshot() {
             )
             .arg(TEST_NAME)
             .arg("--exact")
-            .arg("--ignored")
             .arg("--nocapture")
             .env(READER_PATH_ENV, db_path.as_os_str())
             .stdin(Stdio::piped())

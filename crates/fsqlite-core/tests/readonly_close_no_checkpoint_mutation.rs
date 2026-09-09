@@ -22,6 +22,41 @@ fn wal_len(path: &str) -> u64 {
 }
 
 #[test]
+fn wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer() {
+    const CHILD_PATH: &str = "FSQLITE_WAL_TO_DELETE_STOCK_WRITER";
+    const TEST: &str = "wal_to_delete_releases_lifetime_fence_for_foreign_stock_writer";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let stock = rusqlite::Connection::open(std::path::Path::new(&path)).unwrap();
+        stock.busy_timeout(std::time::Duration::ZERO).unwrap();
+        stock
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT;")
+            .expect("an idle rollback-mode peer must not retain the WAL lifetime fence");
+        return;
+    }
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wal-to-delete.db");
+        let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
+        conn.execute("PRAGMA journal_mode=WAL;").await.unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        assert!(wal_len(db.to_str().unwrap()) > 32);
+        conn.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--nocapture"])
+            .env(CHILD_PATH, &db)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stock writer failed: {output:?}");
+        let rows = conn.query("SELECT x FROM t ORDER BY x;").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
 fn readonly_connection_close_does_not_mutate_main_db_bytes() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
