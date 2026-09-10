@@ -157,9 +157,11 @@ pub fn plan_checkpoint(mode: CheckpointMode, state: CheckpointState) -> Checkpoi
         CheckpointMode::Truncate => {
             let frames_to_backfill = reader_eligible.min(remaining_frames);
             let progress = completion_for(frames_to_backfill, remaining_frames);
+            // RESTART can leave old-generation bytes behind a valid empty
+            // header. TRUNCATE still owes physical truncation in that state;
+            // the executor retains the ordinary reader gate and reset owner.
             let post_action = if matches!(progress, CheckpointProgress::Complete)
                 && !has_active_reader
-                && state.total_frames > 0
             {
                 CheckpointPostAction::TruncateWal
             } else {
@@ -326,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_wal_all_modes_are_noop() {
+    fn test_empty_wal_non_truncating_modes_are_noop() {
         let empty = CheckpointState {
             total_frames: 0,
             backfilled_frames: 0,
@@ -336,7 +338,6 @@ mod tests {
             CheckpointMode::Passive,
             CheckpointMode::Full,
             CheckpointMode::Restart,
-            CheckpointMode::Truncate,
         ] {
             let plan = plan_checkpoint(mode, empty);
             assert_eq!(plan.frames_to_backfill, 0, "{mode:?} on empty WAL");
@@ -346,6 +347,25 @@ mod tests {
                 !plan.should_reset_wal() && !plan.should_truncate_wal(),
                 "{mode:?} on empty WAL should not request post-actions"
             );
+        }
+    }
+
+    #[test]
+    fn test_empty_wal_truncate_still_requires_reader_drain() {
+        for oldest_reader_frame in [None, Some(0)] {
+            let plan = plan_checkpoint(
+                CheckpointMode::Truncate,
+                CheckpointState {
+                    total_frames: 0,
+                    backfilled_frames: 0,
+                    oldest_reader_frame,
+                },
+            );
+            assert_eq!(plan.frames_to_backfill, 0);
+            assert!(plan.completes_checkpoint());
+            assert_eq!(plan.blocked_by_readers, oldest_reader_frame.is_some());
+            assert_eq!(plan.should_truncate_wal(), oldest_reader_frame.is_none());
+            assert!(!plan.should_reset_wal());
         }
     }
 

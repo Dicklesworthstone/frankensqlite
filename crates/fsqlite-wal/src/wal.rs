@@ -99,13 +99,15 @@ async fn read_wal_header_torn_tolerant<F: VfsFile>(
     })
 }
 
-struct VfsWritePreflight<'a> {
-    completion: Option<&'a VfsWriteCompletion>,
+struct VfsWritePreflight {
+    completion: Option<VfsWriteCompletion>,
 }
 
-impl<'a> VfsWritePreflight<'a> {
-    fn new(completion: Option<&'a VfsWriteCompletion>) -> Self {
-        Self { completion }
+impl VfsWritePreflight {
+    fn new(completion: Option<&VfsWriteCompletion>) -> Self {
+        Self {
+            completion: completion.cloned(),
+        }
     }
 
     fn hand_off(&mut self) {
@@ -113,9 +115,9 @@ impl<'a> VfsWritePreflight<'a> {
     }
 }
 
-impl Drop for VfsWritePreflight<'_> {
+impl Drop for VfsWritePreflight {
     fn drop(&mut self) {
-        if let Some(completion) = self.completion {
+        if let Some(completion) = &self.completion {
             completion.complete_error();
         }
     }
@@ -186,8 +188,12 @@ pub struct WalFile<F: VfsFile> {
     running_checksum: SqliteWalChecksum,
     /// Number of valid frames currently in the WAL.
     frame_count: usize,
-    /// Index of the latest visible commit frame for the active generation.
-    last_commit_frame: Option<usize>,
+    /// Latest written or validated commit marker and its exact frame header.
+    ///
+    /// The physical tail may contain later uncommitted frames, so its running
+    /// checksum cannot supply the committed WAL-index header. Durability and
+    /// publication remain separate from this append/replay metadata.
+    last_commit: Option<(usize, WalFrameHeader)>,
     /// Reusable contiguous scratch for direct append paths.
     ///
     /// Ownership is per-`WalFile` handle. Append methods already require
@@ -230,7 +236,7 @@ impl<F: VfsFile> WalFile<F> {
         // This is necessary even if file_size == expected_size to detect ABA
         // where the WAL was reset and then appended back to the exact same size.
         // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
-        let (disk_header, _disk_header_checksum) =
+        let (disk_header, disk_header_checksum) =
             read_wal_header_torn_tolerant(&self.file, cx, "refresh", self.frame_count).await?;
 
         // Header changed under us (e.g., RESET/TRUNCATE checkpoint) — rebuild.
@@ -273,8 +279,10 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut new_frame_count = self.frame_count;
         let mut new_running_checksum = self.running_checksum;
-        let mut last_commit_count = self.frame_count;
-        let mut last_commit_checksum = self.running_checksum;
+        let mut last_commit = self.last_commit;
+        let mut last_commit_count = last_commit.map_or(0, |(index, _)| index + 1);
+        let mut last_commit_checksum =
+            last_commit.map_or(disk_header_checksum, |(_, header)| header.checksum);
 
         let mut frame_buf = vec![0u8; frame_size];
         for frame_index in self.frame_count..available_frames {
@@ -324,6 +332,7 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
                 last_commit_checksum = new_running_checksum;
+                last_commit = Some((frame_index, frame_header));
                 log_replay_decision(
                     "refresh_incremental",
                     frame_no,
@@ -342,15 +351,127 @@ impl<F: VfsFile> WalFile<F> {
 
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
-        self.last_commit_frame = last_commit_count.checked_sub(1);
+        self.last_commit = last_commit;
 
         Ok(())
     }
 
-    async fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
-        // A rebuild is entered only when the old in-memory view no longer
-        // describes this file (generation change or shrink). Its prior sync
-        // watermark cannot authorize frames in the rebuilt view, so clear it
+    /// Refresh an in-doubt append while preserving its previously accepted prefix.
+    ///
+    /// The caller must hold the physical append owner, prove terminal source
+    /// completion, and supply the generation/count/checksum captured before its
+    /// attempted write. Unlike ordinary recovery, that prefix may end in a
+    /// locally accepted noncommit frame. Validate it in full before retaining
+    /// it; later bytes are accepted only through a checksum-valid commit marker.
+    /// Errors and cancellation leave all cached WAL state unchanged.
+    pub async fn refresh_preserving_append_prefix(
+        &mut self,
+        cx: &Cx,
+        generation: WalGenerationIdentity,
+        prefix_frame_count: usize,
+        prefix_checksum: SqliteWalChecksum,
+    ) -> Result<()> {
+        if generation != self.generation_identity() {
+            return Err(FrankenError::WalCorrupt {
+                detail: "retained append prefix belongs to another WAL generation".to_owned(),
+            });
+        }
+        let (header, header_checksum) =
+            read_wal_header_torn_tolerant(&self.file, cx, "retained_append", prefix_frame_count)
+                .await?;
+        // create() may retain a zero checksum field; serialization computes
+        // the canonical header checksum just as it did for the actual write.
+        if header.to_bytes()? != self.header.to_bytes()?
+            || (prefix_frame_count == 0 && prefix_checksum != header_checksum)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "retained append prefix no longer matches the WAL header".to_owned(),
+            });
+        }
+        let frame_size = self.frame_size();
+        let file_size = self.file.file_size(cx)?;
+        let available_frames = usize::try_from(
+            file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(32))
+                / u64::try_from(frame_size).map_err(|_| FrankenError::DatabaseFull)?,
+        )
+        .map_err(|_| FrankenError::DatabaseFull)?;
+        if available_frames < prefix_frame_count {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL shrank below the retained append prefix".to_owned(),
+            });
+        }
+        if available_frames > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+        let mut running_checksum = header_checksum;
+        let mut accepted_checksum = header_checksum;
+        let mut accepted_count = 0;
+        let mut last_commit = None;
+        let mut frame_buf = vec![0; frame_size];
+        for index in 0..available_frames {
+            let read = self
+                .file
+                .read(cx, &mut frame_buf, self.frame_offset(index))
+                .await?;
+            if read != frame_size {
+                if index < prefix_frame_count {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "short read inside the retained append prefix".to_owned(),
+                    });
+                }
+                break;
+            }
+            let header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            let expected = compute_wal_frame_checksum(
+                &frame_buf,
+                self.page_size,
+                running_checksum,
+                self.big_endian_checksum,
+            )?;
+            if header.salts != generation.salts || header.checksum != expected {
+                if index < prefix_frame_count {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "retained append prefix failed complete checksum validation"
+                            .to_owned(),
+                    });
+                }
+                break;
+            }
+            running_checksum = expected;
+            let frame_count = index + 1;
+            if frame_count == prefix_frame_count && running_checksum != prefix_checksum {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "retained append prefix checksum differs from its captured boundary"
+                        .to_owned(),
+                });
+            }
+            if header.is_commit() {
+                last_commit = Some((index, header));
+            }
+            if header.is_commit() || frame_count == prefix_frame_count {
+                accepted_count = frame_count;
+                accepted_checksum = running_checksum;
+            }
+        }
+        self.frame_count = accepted_count;
+        self.running_checksum = accepted_checksum;
+        self.last_commit = last_commit;
+        self.last_fsynced_frame_count = self.last_fsynced_frame_count.min(accepted_count);
+        Ok(())
+    }
+
+    /// Validate the complete committed WAL prefix, even at unchanged length.
+    ///
+    /// Native index recovery calls this while holding its canonical recovery
+    /// owner. Unlike incremental refresh, every complete frame payload is
+    /// checked from frame zero. Invalid/torn tails stop at the prior commit.
+    /// I/O failure clears the old sync authority and may reset cached state;
+    /// callers must refuse reads until a later validated rebinding succeeds.
+    /// This never creates, truncates, or writes the WAL file.
+    pub async fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
+        // Generation changes, shrink, and explicit native index recovery must
+        // fully revalidate this descriptor. Its prior sync watermark cannot
+        // authorize frames in the rebuilt view, so clear it
         // before any fallible I/O and fail closed if rebuilding fails.
         self.last_fsynced_frame_count = 0;
 
@@ -365,11 +486,13 @@ impl<F: VfsFile> WalFile<F> {
         self.big_endian_checksum = big_endian_checksum;
         self.running_checksum = header_checksum;
         self.frame_count = 0;
+        self.last_commit = None;
 
         let mut new_frame_count = 0;
         let mut new_running_checksum = header_checksum;
         let mut last_commit_count = 0;
         let mut last_commit_checksum = header_checksum;
+        let mut last_commit = None;
 
         let frame_size = self.frame_size();
         let file_size = self.file.file_size(cx)?;
@@ -395,6 +518,10 @@ impl<F: VfsFile> WalFile<F> {
             }
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            if frame_header.page_number == 0 {
+                log_replay_decision("rebuild", frame_no, last_commit_count, "zero_page_stop");
+                break;
+            }
             if frame_header.salts != self.header.salts {
                 log_replay_decision("rebuild", frame_no, last_commit_count, "salt_mismatch_stop");
                 break;
@@ -422,6 +549,7 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
                 last_commit_checksum = new_running_checksum;
+                last_commit = Some((frame_index, frame_header));
                 log_replay_decision("rebuild", frame_no, last_commit_count, "accept_commit");
             } else {
                 log_replay_decision("rebuild", frame_no, last_commit_count, "accept_non_commit");
@@ -430,7 +558,7 @@ impl<F: VfsFile> WalFile<F> {
 
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
-        self.last_commit_frame = last_commit_count.checked_sub(1);
+        self.last_commit = last_commit;
 
         Ok(())
     }
@@ -564,7 +692,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum,
             frame_count: 0,
-            last_commit_frame: None,
+            last_commit: None,
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: 0,
         })
@@ -594,6 +722,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut valid_frames = 0_usize;
         let mut last_commit_frames = 0_usize;
         let mut last_commit_checksum = header_checksum;
+        let mut last_commit = None;
         let mut frame_buf = vec![0u8; frame_size];
 
         for frame_index in 0..max_frames {
@@ -658,6 +787,7 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_frames = valid_frames;
                 last_commit_checksum = running_checksum;
+                last_commit = Some((frame_index, frame_header));
                 log_replay_decision(
                     "startup_open",
                     frame_no,
@@ -691,7 +821,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum: last_commit_checksum,
             frame_count: last_commit_frames,
-            last_commit_frame: last_commit_frames.checked_sub(1),
+            last_commit,
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: last_commit_frames,
         })
@@ -787,7 +917,15 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = new_checksum;
         self.frame_count += 1;
         if db_size_if_commit != 0 {
-            self.last_commit_frame = Some(self.frame_count - 1);
+            self.last_commit = Some((
+                self.frame_count - 1,
+                WalFrameHeader {
+                    page_number,
+                    db_size: db_size_if_commit,
+                    salts,
+                    checksum: new_checksum,
+                },
+            ));
         }
         crate::metrics::GLOBAL_WAL_METRICS
             .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
@@ -1039,6 +1177,44 @@ impl<F: VfsFile> WalFile<F> {
         .await
     }
 
+    /// Validate commit metadata after the caller checks frame count and byte length.
+    fn validated_prepared_commit_header(
+        &self,
+        prepared_frame_bytes: &[u8],
+        last_commit_offset: Option<usize>,
+    ) -> Result<Option<(usize, WalFrameHeader)>> {
+        let frame_size = self.frame_size();
+        let actual_last_commit_offset = prepared_frame_bytes
+            .chunks_exact(frame_size)
+            .rposition(|frame| frame[4..8] != [0; 4]);
+        if actual_last_commit_offset != last_commit_offset {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared commit offset does not identify the final commit marker"
+                    .to_owned(),
+            });
+        }
+        let Some(index) = actual_last_commit_offset else {
+            return Ok(None);
+        };
+        let start = index
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let end = start
+            .checked_add(WAL_FRAME_HEADER_SIZE)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let header = WalFrameHeader::from_bytes(&prepared_frame_bytes[start..end])?;
+        if !header.is_commit() || header.salts != self.header.salts {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared commit header does not match the WAL generation".to_owned(),
+            });
+        }
+        let frame_index = self
+            .frame_count
+            .checked_add(index)
+            .ok_or(FrankenError::DatabaseFull)?;
+        Ok(Some((frame_index, header)))
+    }
+
     async fn append_finalized_prepared_frame_bytes_with_completion(
         &mut self,
         cx: &Cx,
@@ -1050,6 +1226,12 @@ impl<F: VfsFile> WalFile<F> {
     ) -> Result<()> {
         let mut preflight = VfsWritePreflight::new(completion);
         if frame_count == 0 {
+            if !prepared_frame_bytes.is_empty() || last_commit_offset.is_some() {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "empty prepared batch contains frame bytes or commit metadata"
+                        .to_owned(),
+                });
+            }
             if let Some(completion) = completion {
                 completion.complete_success();
             }
@@ -1080,6 +1262,11 @@ impl<F: VfsFile> WalFile<F> {
 
         let start_frame_index = self.frame_count;
         let offset = self.frame_offset(start_frame_index);
+        // Validate and capture the commit marker before handing off the write.
+        // The finalized running checksum belongs to the physical batch tail,
+        // which may extend beyond this marker with uncommitted frames.
+        let last_commit =
+            self.validated_prepared_commit_header(prepared_frame_bytes, last_commit_offset)?;
 
         #[cfg(any(test, feature = "fault-injection"))]
         crate::fault_hooks::maybe_inject_crash_at(
@@ -1096,8 +1283,8 @@ impl<F: VfsFile> WalFile<F> {
             self.file.write(cx, prepared_frame_bytes, offset).await?;
         }
         self.advance_state_after_write(frame_count, final_running_checksum)?;
-        if let Some(last_commit_offset) = last_commit_offset {
-            self.last_commit_frame = Some(start_frame_index + last_commit_offset);
+        if let Some(last_commit) = last_commit {
+            self.last_commit = Some(last_commit);
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -1476,7 +1663,17 @@ impl<F: VfsFile> WalFile<F> {
     /// Find the last commit frame index, or `None` if there are no commits.
     pub fn last_commit_frame(&mut self, cx: &Cx) -> Result<Option<usize>> {
         let _ = cx;
-        Ok(self.last_commit_frame)
+        Ok(self.last_commit.map(|(index, _)| index))
+    }
+
+    /// Last commit marker and its header, excluding any uncommitted suffix.
+    ///
+    /// This is append/replay metadata, not proof of durability or publication.
+    /// The index is zero-based; the header includes the checksum at that exact
+    /// marker rather than the checksum at the physical end of the WAL.
+    #[must_use]
+    pub const fn last_commit_frame_header(&self) -> Option<(usize, WalFrameHeader)> {
+        self.last_commit
     }
 
     /// Sync the WAL file to stable storage and record every appended frame
@@ -1496,7 +1693,7 @@ impl<F: VfsFile> WalFile<F> {
         Ok(())
     }
 
-    /// Remove every physical byte after the checksum-valid committed prefix
+    /// Remove every physical byte after the checksum-valid accepted prefix
     /// represented by this handle.
     ///
     /// Callers must first refresh the handle while holding the external writer
@@ -1504,6 +1701,9 @@ impl<F: VfsFile> WalFile<F> {
     /// tracking: a terminal write error can still leave a partial frame or a
     /// complete but uncommitted interval, neither of which may be reused as an
     /// append base.
+    /// A retained append reconciler may instead call
+    /// [`Self::refresh_preserving_append_prefix`] first; in that case the
+    /// accepted prefix includes the caller's prior unpublished noncommit frames.
     pub fn repair_uncommitted_tail(&mut self, cx: &Cx) -> Result<()> {
         let committed_size = u64::try_from(WAL_HEADER_SIZE)
             .unwrap_or(u64::MAX)
@@ -1617,6 +1817,50 @@ impl<F: VfsFile> WalFile<F> {
         new_salts: WalSalts,
         truncate_file: bool,
     ) -> Result<()> {
+        self.reset_with_completion(
+            cx,
+            new_checkpoint_seq,
+            new_salts,
+            truncate_file,
+            None,
+            VfsWritePreflight::new(None),
+        )
+        .await
+    }
+
+    /// Reset with a caller-retained completion token for the header write.
+    /// A dropped caller must wait for this source-owned write to terminate
+    /// before retrying its fixed reset target or releasing its reader gates.
+    /// Even dropping the returned future without polling terminalizes the
+    /// token; after handoff, only the actual VFS source may terminalize it.
+    pub fn reset_tracked<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        new_checkpoint_seq: u32,
+        new_salts: WalSalts,
+        truncate_file: bool,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        let preflight = VfsWritePreflight::new(Some(&completion));
+        self.reset_with_completion(
+            cx,
+            new_checkpoint_seq,
+            new_salts,
+            truncate_file,
+            Some(completion),
+            preflight,
+        )
+    }
+
+    async fn reset_with_completion(
+        &mut self,
+        cx: &Cx,
+        new_checkpoint_seq: u32,
+        new_salts: WalSalts,
+        truncate_file: bool,
+        completion: Option<VfsWriteCompletion>,
+        mut preflight: VfsWritePreflight,
+    ) -> Result<()> {
         let new_header = WalHeader {
             magic: self.header.magic,
             format_version: WAL_FORMAT_VERSION,
@@ -1633,7 +1877,14 @@ impl<F: VfsFile> WalFile<F> {
             &format!("checkpoint_seq={new_checkpoint_seq}"),
         )?;
 
-        self.file.write(cx, &header_bytes, 0).await?;
+        preflight.hand_off();
+        if let Some(completion) = completion {
+            self.file
+                .write_tracked(cx, &header_bytes, 0, completion)
+                .await?;
+        } else {
+            self.file.write(cx, &header_bytes, 0).await?;
+        }
 
         // H9 fault hook: crash after header write, before truncate.
         // Simulates power loss leaving new salts in the header but old
@@ -1665,7 +1916,7 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;
-        self.last_commit_frame = None;
+        self.last_commit = None;
         self.last_fsynced_frame_count = 0;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
@@ -1799,6 +2050,10 @@ mod tests {
     }
 
     impl VfsFile for ScriptedHeaderFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn read<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -1852,8 +2107,14 @@ mod tests {
         fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
             unreachable!()
         }
+        fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
             unreachable!()
+        }
+        fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
         }
         fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
             unreachable!()
@@ -1862,7 +2123,8 @@ mod tests {
             unreachable!()
         }
         fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
-            unreachable!()
+            // Unsupported recovery never acquires a maintenance obligation.
+            Ok(())
         }
         fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
             unreachable!()
@@ -2300,6 +2562,188 @@ mod tests {
     }
 
     #[test]
+    fn retained_append_refresh_preserves_prior_uncommitted_prefix_and_repairs_only_candidate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let prior = sample_page(0x61);
+        wal.append_frame(&cx, 1, &prior, 0)
+            .expect("prior accepted noncommit frame");
+        let generation = wal.generation_identity();
+        let checksum = wal.running_checksum();
+        let candidate = sample_page(0x62);
+        let frames = [frame_ref(2, &candidate, 0), frame_ref(3, &candidate, 3)];
+        let mut bytes = Vec::new();
+        let mut transforms = Vec::new();
+        wal.prepare_frame_bytes_with_transforms_into(
+            frames.len(),
+            frames,
+            &mut bytes,
+            &mut transforms,
+        )
+        .expect("prepare candidate");
+        wal.finalize_prepared_frame_bytes(&mut bytes, &transforms)
+            .unwrap();
+        let prefix_size = u64::try_from(WAL_HEADER_SIZE + wal.frame_size()).unwrap();
+        wal.file
+            .write(&cx, &bytes[..wal.frame_size() + 7], prefix_size)
+            .expect("candidate source wrote complete noncommit plus partial marker");
+        let size_before = wal.file.file_size(&cx).unwrap();
+        let ordinary = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("ordinary recovery");
+        assert_eq!(
+            ordinary.frame_count(),
+            0,
+            "ordinary recovery excludes owned noncommit prefix"
+        );
+        let wrong_checksum = SqliteWalChecksum {
+            s1: checksum.s1 ^ 1,
+            s2: checksum.s2,
+        };
+        assert!(matches!(
+            wal.refresh_preserving_append_prefix(&cx, generation, 1, wrong_checksum)
+                .wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.running_checksum(), checksum);
+        assert_eq!(wal.file.file_size(&cx).unwrap(), size_before);
+        wal.refresh_preserving_append_prefix(&cx, generation, 1, checksum)
+            .expect("validate and preserve exact accepted prefix");
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.running_checksum(), checksum);
+        assert_eq!(wal.last_commit_frame(&cx).unwrap(), None);
+        wal.repair_uncommitted_tail(&cx)
+            .expect("trim only failed candidate");
+        assert_eq!(wal.file.file_size(&cx).unwrap(), prefix_size);
+        assert_eq!(wal.read_frame(&cx, 0).expect("prior frame").1, prior);
+        wal.append_frame(&cx, 2, &candidate, 2)
+            .expect("retry commit after exact repair");
+        wal.refresh_preserving_append_prefix(&cx, generation, 1, checksum)
+            .expect("accept the complete candidate commit after the retained prefix");
+        assert_eq!(wal.frame_count(), 2);
+        assert_eq!(wal.last_commit_frame(&cx).unwrap(), Some(1));
+        wal.sync(&cx, SyncFlags::NORMAL).unwrap();
+        let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("verify final chain");
+        assert_eq!(reopened.frame_count(), 2);
+        assert_eq!(
+            reopened.read_frame(&cx, 0).expect("retained prior frame").1,
+            prior
+        );
+        assert_eq!(
+            reopened.read_frame(&cx, 1).expect("retry frame").1,
+            candidate
+        );
+    }
+
+    #[test]
+    fn retained_append_refresh_rejects_changed_prefix_without_mutating_cached_state() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        wal.append_frame(&cx, 1, &sample_page(0x63), 0)
+            .expect("append prior uncommitted prefix");
+        let generation = wal.generation_identity();
+        let checksum = wal.running_checksum();
+        let changed = WalGenerationIdentity {
+            checkpoint_seq: generation.checkpoint_seq + 1,
+            ..generation
+        };
+        assert!(matches!(
+            wal.refresh_preserving_append_prefix(&cx, changed, 1, checksum)
+                .wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+        wal.file
+            .write(
+                &cx,
+                &[0xFF],
+                u64::try_from(WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE).unwrap(),
+            )
+            .expect("corrupt prior payload without touching its header");
+        assert!(matches!(
+            wal.refresh_preserving_append_prefix(&cx, generation, 1, checksum)
+                .wait(),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.running_checksum(), checksum);
+        assert_eq!(wal.last_commit_frame(&cx).unwrap(), None);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+    }
+
+    #[test]
+    fn test_force_rebuild_detects_same_length_corruption_and_preserves_prior_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let first = sample_page(0x19);
+        let second = sample_page(0x29);
+        wal.append_frame(&cx, 1, &first, 1).expect("first commit");
+        wal.append_frame(&cx, 2, &second, 2).expect("second commit");
+        wal.sync(&cx, SyncFlags::NORMAL)
+            .expect("sync committed prefix");
+        let prior_marker = wal.read_frame_header(&cx, 0).expect("prior marker");
+        let size = wal.file().file_size(&cx).unwrap();
+        let offset = wal.frame_offset(1) + u64::try_from(WAL_FRAME_HEADER_SIZE).unwrap();
+        wal.file()
+            .write(&cx, &[second[0] ^ 1], offset)
+            .expect("same-size payload corruption");
+        wal.refresh(&cx).expect("ordinary same-size refresh");
+        assert_eq!(
+            wal.frame_count(),
+            2,
+            "causal control: incremental refresh does not rescan the prefix"
+        );
+        wal.rebuild_state_from_file(&cx)
+            .expect("force full payload validation");
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.last_commit_frame_header(), Some((0, prior_marker)));
+        assert_eq!(wal.running_checksum(), prior_marker.checksum);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+        assert_eq!(
+            wal.file().file_size(&cx).unwrap(),
+            size,
+            "rebuild never truncates physical tail"
+        );
+        let mut observed = [0; 1];
+        wal.file()
+            .read(&cx, &mut observed, offset)
+            .expect("corrupt tail remains unchanged");
+        assert_eq!(observed[0], second[0] ^ 1);
+    }
+
+    #[test]
+    fn test_force_rebuild_stops_at_zero_page_and_discards_only_uncommitted_horizon() {
+        let cx = test_cx();
+        for zero_page in [false, true] {
+            let vfs = MemoryVfs::new();
+            let mut wal =
+                WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+                    .expect("create WAL");
+            let page = sample_page(0x39);
+            wal.append_frame(&cx, 1, &page, 1)
+                .expect("committed prefix");
+            let marker = wal.last_commit_frame_header();
+            wal.append_frame(
+                &cx,
+                if zero_page { 0 } else { 2 },
+                &page,
+                if zero_page { 2 } else { 0 },
+            )
+            .expect("construct complete checksum-valid invalid/uncommitted tail");
+            let size = wal.file().file_size(&cx).unwrap();
+            wal.rebuild_state_from_file(&cx)
+                .expect("full recovery scan");
+            assert_eq!(wal.frame_count(), 1);
+            assert_eq!(wal.last_commit_frame_header(), marker);
+            assert_eq!(wal.file().file_size(&cx).unwrap(), size);
+        }
+    }
+
+    #[test]
     fn test_append_commit_frame() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
@@ -2371,6 +2815,7 @@ mod tests {
 
         // No frames yet.
         assert_eq!(wal.last_commit_frame(&cx).expect("query"), None);
+        assert_eq!(wal.last_commit_frame_header(), None);
 
         // Append non-commit frame.
         wal.append_frame(&cx, 1, &sample_page(1), 0)
@@ -2381,15 +2826,321 @@ mod tests {
         wal.append_frame(&cx, 2, &sample_page(2), 3)
             .expect("append");
         assert_eq!(wal.last_commit_frame(&cx).expect("query"), Some(1));
+        let first_commit = wal.last_commit_frame_header().expect("commit header");
+        assert_eq!(first_commit.0, 1);
+        assert_eq!(first_commit.1.db_size, 3);
+        assert_eq!(first_commit.1.checksum, wal.running_checksum());
 
         // Append more non-commit, then another commit.
         wal.append_frame(&cx, 3, &sample_page(3), 0)
             .expect("append");
+        assert_eq!(wal.last_commit_frame_header(), Some(first_commit));
+        assert_ne!(first_commit.1.checksum, wal.running_checksum());
         wal.append_frame(&cx, 4, &sample_page(4), 5)
             .expect("append");
         assert_eq!(wal.last_commit_frame(&cx).expect("query"), Some(3));
 
         wal.close(&cx).expect("close WAL");
+    }
+
+    #[test]
+    fn test_committed_header_excludes_raw_and_prepared_uncommitted_suffix() {
+        for prepared in [false, true] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal =
+                WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+            let mut reader =
+                WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("open empty reader");
+            let pages = [sample_page(1), sample_page(2), sample_page(3)];
+            let frames = [
+                WalAppendFrameRef {
+                    page_number: 1,
+                    page_data: &pages[0],
+                    db_size_if_commit: 0,
+                },
+                WalAppendFrameRef {
+                    page_number: 2,
+                    page_data: &pages[1],
+                    db_size_if_commit: 2,
+                },
+                WalAppendFrameRef {
+                    page_number: 3,
+                    page_data: &pages[2],
+                    db_size_if_commit: 0,
+                },
+            ];
+            if prepared {
+                let mut bytes = Vec::new();
+                let mut transforms = Vec::new();
+                wal.prepare_frame_bytes_with_transforms_into(
+                    frames.len(),
+                    frames.iter().copied(),
+                    &mut bytes,
+                    &mut transforms,
+                )
+                .expect("prepare batch");
+                wal.append_prepared_frame_bytes(&cx, &mut bytes, &transforms)
+                    .expect("append prepared batch");
+            } else {
+                wal.append_frames(&cx, &frames).expect("append raw batch");
+            }
+
+            let committed = wal.read_frame_header(&cx, 1).expect("read commit marker");
+            let tail = wal
+                .read_frame_header(&cx, 2)
+                .expect("read uncommitted tail");
+            assert_eq!(committed.db_size, 2);
+            assert_eq!(committed.salts, test_salts());
+            assert_eq!(tail.db_size, 0);
+            assert_ne!(committed.checksum, tail.checksum);
+            assert_eq!(wal.running_checksum(), tail.checksum);
+            assert_eq!(wal.frame_count(), 3);
+            assert_eq!(wal.last_commit_frame_header(), Some((1, committed)));
+            assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+            reader.refresh(&cx).expect("refresh committed prefix");
+            assert_eq!(reader.frame_count(), 2);
+            assert_eq!(reader.last_commit_frame_header(), Some((1, committed)));
+            let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("reopen WAL");
+            assert_eq!(reopened.last_commit_frame_header(), Some((1, committed)));
+            // Extend the valid but uncommitted tail from another handle.
+            // Refresh must not promote this handle's old physical tail to a commit.
+            reader
+                .append_frame(&cx, 3, &pages[2], 0)
+                .expect("repeat tail frame");
+            reader
+                .append_frame(&cx, 4, &sample_page(4), 0)
+                .expect("extend tail");
+            wal.refresh(&cx).expect("refresh without a new commit");
+            assert_eq!(wal.frame_count(), 2);
+            assert_eq!(wal.running_checksum(), committed.checksum);
+            assert_eq!(wal.last_commit_frame_header(), Some((1, committed)));
+
+            wal.reset(&cx, 1, test_salts().next_generation(), true)
+                .expect("reset generation");
+            assert_eq!(wal.last_commit_frame_header(), None);
+            reader.refresh(&cx).expect("rebuild after reset");
+            assert_eq!(reader.last_commit_frame_header(), None);
+            wal.append_frame(&cx, 4, &sample_page(4), 4)
+                .expect("commit in replacement generation");
+            reader.refresh(&cx).expect("refresh replacement commit");
+            assert_eq!(
+                reader.last_commit_frame_header(),
+                wal.last_commit_frame_header()
+            );
+        }
+    }
+
+    #[test]
+    fn test_failed_rebuild_header_read_preserves_committed_state_for_retry() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("append commit");
+        wal.sync(&cx, SyncFlags::NORMAL).expect("sync prior commit");
+        let before_header = *wal.header();
+        let before_commit = wal.last_commit_frame_header();
+        let before_checksum = wal.running_checksum();
+        let before_count = wal.frame_count();
+        let before_size = wal.file().file_size(&cx).expect("capture WAL size");
+        assert!(before_commit.is_some());
+        assert_eq!(wal.last_fsynced_frame_count(), before_count);
+        let mut original_bytes = [0; WAL_HEADER_SIZE];
+        assert_eq!(
+            wal.file()
+                .read(&cx, &mut original_bytes, 0)
+                .expect("capture header"),
+            WAL_HEADER_SIZE
+        );
+        let mut corrupt_bytes = original_bytes;
+        corrupt_bytes[WAL_HEADER_SIZE - 1] ^= 0xFF;
+        wal.file()
+            .write(&cx, &corrupt_bytes, 0)
+            .expect("corrupt header checksum");
+
+        let error = wal
+            .rebuild_state_from_file(&cx)
+            .expect_err("initial header validation must fail");
+        assert!(matches!(error, FrankenError::WalCorrupt { .. }));
+        assert_eq!(*wal.header(), before_header);
+        assert_eq!(wal.frame_count(), before_count);
+        assert_eq!(wal.running_checksum(), before_checksum);
+        assert_eq!(wal.last_commit_frame_header(), before_commit);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+        wal.file()
+            .write(&cx, &original_bytes, 0)
+            .expect("restore valid header");
+        assert_eq!(
+            wal.file().file_size(&cx).expect("restored WAL size"),
+            before_size
+        );
+        wal.refresh(&cx)
+            .expect("retry same-header equal-size refresh");
+        assert_eq!(*wal.header(), before_header);
+        assert_eq!(wal.frame_count(), before_count);
+        assert_eq!(wal.running_checksum(), before_checksum);
+        assert_eq!(wal.last_commit_frame_header(), before_commit);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+
+        wal.rebuild_state_from_file(&cx)
+            .expect("retry full rebuild");
+        assert_eq!(wal.header().to_bytes().unwrap(), original_bytes);
+        assert_eq!(wal.frame_count(), before_count);
+        assert_eq!(wal.running_checksum(), before_checksum);
+        assert_eq!(wal.last_commit_frame_header(), before_commit);
+        assert_eq!(wal.last_fsynced_frame_count(), 0);
+    }
+
+    #[test]
+    fn test_invalid_prepared_commit_metadata_refuses_before_write() {
+        use fsqlite_vfs::VfsWriteCompletionState;
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        wal.append_frame(&cx, 7, &sample_page(7), 7)
+            .expect("append prior commit");
+        let before_commit = wal.last_commit_frame_header();
+        let before_checksum = wal.running_checksum();
+        let before_size = wal.file().file_size(&cx).unwrap();
+        let mut before_bytes = vec![0; usize::try_from(before_size).unwrap()];
+        assert_eq!(
+            wal.file()
+                .read(&cx, &mut before_bytes, 0)
+                .expect("capture bytes"),
+            before_bytes.len()
+        );
+        let pages = [sample_page(1), sample_page(2), sample_page(3)];
+        let frames = [
+            frame_ref(1, &pages[0], 1),
+            frame_ref(2, &pages[1], 2),
+            frame_ref(3, &pages[2], 0),
+        ];
+        let mut bytes = Vec::new();
+        let mut transforms = Vec::new();
+        wal.prepare_frame_bytes_with_transforms_into(
+            frames.len(),
+            frames.iter().copied(),
+            &mut bytes,
+            &mut transforms,
+        )
+        .expect("prepare two commits and an uncommitted suffix");
+        let checksum = wal
+            .finalize_prepared_frame_bytes(&mut bytes, &transforms)
+            .expect("finalize frames");
+        for tracked in [false, true] {
+            for (frame_bytes, count, commit_offset) in [
+                (bytes.as_slice(), 3, None),
+                (bytes.as_slice(), 3, Some(0)),
+                (bytes.as_slice(), 3, Some(2)),
+                (bytes.as_slice(), 3, Some(3)),
+                (bytes.as_slice(), 0, None),
+                (&[][..], 0, Some(0)),
+            ] {
+                let completion = VfsWriteCompletion::new();
+                let result = if tracked {
+                    wal.append_finalized_prepared_frame_bytes_tracked(
+                        &cx,
+                        frame_bytes,
+                        count,
+                        checksum,
+                        commit_offset,
+                        completion.clone(),
+                    )
+                    .wait()
+                } else {
+                    wal.append_finalized_prepared_frame_bytes(
+                        &cx,
+                        frame_bytes,
+                        count,
+                        checksum,
+                        commit_offset,
+                    )
+                    .wait()
+                };
+                assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })));
+                if tracked {
+                    assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                    assert!(!completion.complete_success());
+                }
+                assert_eq!(wal.frame_count(), 1);
+                assert_eq!(wal.last_commit_frame_header(), before_commit);
+                assert_eq!(wal.running_checksum(), before_checksum);
+                assert_eq!(wal.file().file_size(&cx).unwrap(), before_size);
+                let mut after_bytes = vec![0; before_bytes.len()];
+                assert_eq!(
+                    wal.file()
+                        .read(&cx, &mut after_bytes, 0)
+                        .expect("verify bytes"),
+                    before_bytes.len()
+                );
+                assert_eq!(after_bytes, before_bytes);
+            }
+        }
+        let completion = VfsWriteCompletion::new();
+        wal.append_finalized_prepared_frame_bytes_tracked(
+            &cx,
+            &bytes,
+            frames.len(),
+            checksum,
+            Some(1),
+            completion.clone(),
+        )
+        .expect("valid final marker remains appendable after refusals");
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+        assert_eq!(wal.frame_count(), 4);
+        let header = wal
+            .read_frame_header(&cx, 2)
+            .expect("read true final marker");
+        assert_eq!(wal.last_commit_frame_header(), Some((2, header)));
+        assert_ne!(header.checksum, wal.running_checksum());
+    }
+
+    #[test]
+    fn test_unpolled_tracked_reset_terminalizes_before_any_source_write() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("commit");
+        let length = usize::try_from(wal.file().file_size(&cx).expect("WAL length"))
+            .expect("small fixture length");
+        let mut before = vec![0; length];
+        assert_eq!(
+            wal.file().read(&cx, &mut before, 0).expect("old bytes"),
+            length
+        );
+        let old_header = *wal.header();
+        let completion = VfsWriteCompletion::new();
+        let reset = wal.reset_tracked(&cx, 1, WalSalts::generate(), true, completion.clone());
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::VfsWriteCompletionState::Pending
+        );
+        drop(reset);
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::VfsWriteCompletionState::Error
+        );
+        let mut after = vec![0; length];
+        assert_eq!(
+            wal.file().read(&cx, &mut after, 0).expect("retained bytes"),
+            length
+        );
+        assert_eq!(after, before, "an unpolled reset has no physical source");
+        assert_eq!(*wal.header(), old_header);
+        assert_eq!(wal.frame_count(), 1);
+        let retry = VfsWriteCompletion::new();
+        wal.reset_tracked(&cx, 1, WalSalts::generate(), true, retry.clone())
+            .expect("fresh tracked attempt succeeds");
+        assert_eq!(retry.state(), fsqlite_vfs::VfsWriteCompletionState::Success);
     }
 
     #[test]
@@ -2413,9 +3164,16 @@ mod tests {
             salt1: 0x1111_2222,
             salt2: 0x3333_4444,
         };
-        wal.reset(&cx, 1, new_salts, true).expect("reset");
+        let completion = VfsWriteCompletion::new();
+        wal.reset_tracked(&cx, 1, new_salts, true, completion.clone())
+            .expect("reset");
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::VfsWriteCompletionState::Success
+        );
         assert_eq!(wal.frame_count(), 0);
         assert_eq!(wal.last_commit_frame(&cx).expect("query"), None);
+        assert_eq!(wal.last_commit_frame_header(), None);
         assert_eq!(wal.header().checkpoint_seq, 1);
         assert_eq!(wal.header().salts, new_salts);
 
@@ -2782,7 +3540,7 @@ mod tests {
     /// H9 / F9: Crash between WAL header rewrite (new salts) and truncation.
     ///
     /// After injection, the WAL file has:
-    /// - New header with new salts (written and synced)
+    /// - New header with new salts (written; the reset sync was not reached)
     /// - Old frames with OLD salts (not yet truncated)
     ///
     /// Recovery (WalFile::open) must see the salt mismatch between header
@@ -2822,9 +3580,15 @@ mod tests {
             salt1: original_salts.salt1.wrapping_add(1),
             salt2: original_salts.salt2.wrapping_add(1),
         };
+        let completion = VfsWriteCompletion::new();
         let err = wal
-            .reset(&cx, 1, new_salts, true)
+            .reset_tracked(&cx, 1, new_salts, true, completion.clone())
             .expect_err("fault hook should fire between header write and truncate");
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::VfsWriteCompletionState::Success,
+            "header source success is distinct from completion of the full reset"
+        );
         assert!(
             err.to_string()
                 .contains("fault_inject:wal_crash_header_truncate"),
@@ -2832,7 +3596,8 @@ mod tests {
         );
 
         // The WAL is now in a corrupted state:
-        // - Header has new salts (written and synced before hook fired)
+        // - Header has new salts (the write completed before the hook fired;
+        //   the reset durability barrier was not reached)
         // - Frames still have old salts (truncation was prevented)
         // Close the handle without further I/O.
         wal.close(&cx).expect("close WAL handle");
@@ -5258,9 +6023,15 @@ mod tests {
             salt1: original_salts.salt1.wrapping_add(1),
             salt2: original_salts.salt2.wrapping_add(1),
         };
+        let completion = VfsWriteCompletion::new();
         let err = wal
-            .reset(&cx, 1, new_salts, true)
+            .reset_tracked(&cx, 1, new_salts, true, completion.clone())
             .expect_err("should fail at crash boundary");
+        assert_eq!(
+            completion.state(),
+            fsqlite_vfs::VfsWriteCompletionState::Error,
+            "pre-submission refusal must not strand a pending source receipt"
+        );
         assert!(
             err.to_string().contains("fault_inject"),
             "error identifies the fault hook: {err}"

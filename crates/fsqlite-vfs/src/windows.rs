@@ -2403,6 +2403,10 @@ impl WindowsFile {
 }
 
 impl VfsFile for WindowsFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn close(&mut self, cx: &Cx) -> Result<()> {
         if self.is_closed() && self.shm_state.is_none() {
             return Ok(());
@@ -2620,6 +2624,12 @@ impl VfsFile for WindowsFile {
         Ok(())
     }
 
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        // Native orphan-tail ownership certification is not supported here.
+        Err(FrankenError::Unsupported)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         self.ensure_open()?;
@@ -2804,6 +2814,15 @@ impl VfsFile for WindowsFile {
         // `restore_external_maintenance_attempt` via `main_restore_pending`.
         self.lock(cx, LockLevel::Exclusive)?;
         Ok(())
+    }
+
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        // GH #395: native recovery needs supplemental reader/RECOVER ownership
+        // and close-time retention of outer fences after a failed restore.
+        // The current maintenance close path releases its handles on error;
+        // reject this distinct capability before creating or changing locks.
+        Err(FrankenError::Unsupported)
     }
 
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
@@ -4087,6 +4106,26 @@ mod tests {
             .expect("maintenance restoration before acquisition");
         file.restore_external_wal_append_attempt(&cx)
             .expect("append restoration before acquisition");
+        assert!(matches!(
+            file.owns_external_wal_append_write(&cx),
+            Err(FrankenError::Unsupported)
+        ));
+        assert!(matches!(
+            file.lock_external_wal_recovery(&cx),
+            Err(FrankenError::Unsupported)
+        ));
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("unsupported recovery owns nothing to restore");
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(matches!(
+            file.owns_external_wal_append_write(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert!(matches!(
+            file.lock_external_wal_recovery(&cancelled),
+            Err(FrankenError::Abort)
+        ));
 
         assert_eq!(file.lock_level, LockLevel::None);
         assert!(file.external_shared_snapshot_prior_level.is_none());
@@ -4109,6 +4148,17 @@ mod tests {
         let main_probe = open_stock_shm_probe(&path);
         file.lock_external_shared_snapshot(&cx).unwrap();
         file.lock_external_wal_append(&cx).unwrap();
+        assert!(matches!(
+            file.owns_external_wal_append_write(&cx),
+            Err(FrankenError::Unsupported)
+        ));
+        assert!(matches!(
+            file.lock_external_wal_recovery(&cx),
+            Err(FrankenError::Unsupported)
+        ));
+        assert!(file.external_shared_snapshot_prior_level.is_some());
+        assert!(file.external_wal_append_attempt.is_some());
+        assert!(file.external_maintenance_locks.is_none());
         let shm_probe = open_stock_shm_probe(&file.shm_path);
         assert_eq!(file.lock_level, LockLevel::Reserved);
         assert!(matches!(

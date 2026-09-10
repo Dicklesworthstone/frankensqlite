@@ -251,6 +251,11 @@ macro_rules! vfs_trace_lock {
 }
 
 impl<F: VfsFile> VfsFile for TracingFile<F> {
+    fn wal_reader_mark_exclusive_acquire(&mut self, cx: &Cx, reader_slot: u32) -> Result<()> {
+        self.inner
+            .wal_reader_mark_exclusive_acquire(cx, reader_slot)
+    }
+
     fn close(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS.close_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_op!("close", &*self.path, 0_u64, self.inner.close(cx))
@@ -390,6 +395,10 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         )
     }
 
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        self.inner.owns_external_wal_append_write(cx)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_lock!(
@@ -429,6 +438,16 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
             &*self.path,
             LockLevel::Reserved,
             self.inner.lock_external_wal_checkpoint(cx)
+        )
+    }
+
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "lock_external_wal_recovery",
+            &*self.path,
+            LockLevel::Reserved,
+            self.inner.lock_external_wal_recovery(cx)
         )
     }
 
@@ -542,6 +561,10 @@ mod tests {
     }
 
     impl VfsFile for DurableSyncProbe {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _: &Cx) -> Result<()> {
             Ok(())
         }
@@ -611,7 +634,15 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
 

@@ -14,6 +14,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_vfs::ShmRegion;
 
 use crate::checksum::sqlite_wal_checksum;
+use crate::{WalFrameHeader, WalGenerationIdentity, WalHeader};
 
 /// SQLite's prime hash multiplier (`HASHTABLE_HASH_1` in upstream SQLite).
 pub const WAL_INDEX_HASH_MULTIPLIER: u32 = 383;
@@ -369,6 +370,165 @@ pub fn read_shared_wal_index_header(region: &ShmRegion) -> Result<Option<WalInde
     Ok(header.validate().is_ok().then_some(header))
 }
 
+/// Read the durable backfill watermark for one exact accepted publication.
+///
+/// The caller retains its checkpoint/reader owner. A changed header or an
+/// impossible attempted/completed interval requires recovery, not clamping.
+pub fn read_shared_wal_index_backfill(
+    region: &ShmRegion,
+    expected_header: &WalIndexHdr,
+) -> Result<u32> {
+    read_shared_wal_index_backfill_state(region, expected_header).map(|(backfill, _)| backfill)
+}
+
+fn read_shared_wal_index_backfill_state(
+    region: &ShmRegion,
+    expected_header: &WalIndexHdr,
+) -> Result<(u32, u32)> {
+    validate_shared_segment(region)?;
+    expected_header.validate()?;
+    if read_shared_wal_index_header(region)? != Some(*expected_header) {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let backfill = region.atomic_load_u32_ne(96, Ordering::Acquire)?;
+    let attempted = region.atomic_load_u32_ne(128, Ordering::Acquire)?;
+    fence(Ordering::SeqCst);
+    if read_shared_wal_index_header(region)? != Some(*expected_header)
+        || backfill > attempted
+        || attempted > expected_header.mx_frame
+    {
+        return Err(FrankenError::BusyRecovery);
+    }
+    Ok((backfill, attempted))
+}
+
+/// Publish cumulative backfill only after the caller has synced the database.
+///
+/// The caller retains WRITE/CKPT and the required backfill reader gate through
+/// validation and publication. Attempted precedes completed; every header,
+/// reader, lock, reserved and mapping byte remains untouched. On error retain
+/// the owner and retry the same cumulative watermark after durability is known.
+pub fn publish_shared_wal_index_backfill(
+    region: &ShmRegion,
+    expected_header: &WalIndexHdr,
+    cumulative: u32,
+) -> Result<()> {
+    let (backfill, attempted) = read_shared_wal_index_backfill_state(region, expected_header)?;
+    if cumulative < backfill || cumulative > expected_header.mx_frame {
+        return Err(FrankenError::BusyRecovery);
+    }
+    region.atomic_store_u32_ne(128, attempted.max(cumulative), Ordering::Release)?;
+    fence(Ordering::SeqCst);
+    region.atomic_store_u32_ne(96, cumulative, Ordering::Release)
+}
+
+/// Bind a shared publication to the exact WAL header and committed marker.
+///
+/// The marker's frame number is one-based and must identify `mx_frame`.
+/// Callers read that exact frame while retaining their external lock owner;
+/// this validates metadata, not durability or lock ownership. An empty
+/// publication has no terminal frame checksum to compare.
+pub fn validate_shared_wal_index_wal_binding(
+    header: &WalIndexHdr,
+    wal_header: &WalHeader,
+    terminal: Option<(u32, WalFrameHeader)>,
+) -> Result<()> {
+    header.validate()?;
+    if wal_header.format_version != crate::WAL_FORMAT_VERSION
+        || !matches!(wal_header.magic, crate::WAL_MAGIC_BE | crate::WAL_MAGIC_LE)
+        || header.page_size()? != wal_header.page_size
+        || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+        || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+    {
+        return Err(FrankenError::WalCorrupt {
+            detail: "shared WAL-index header does not match the WAL generation format".to_owned(),
+        });
+    }
+    match (header.mx_frame, terminal) {
+        (0, None) => Ok(()),
+        (frame, Some((number, marker)))
+            if frame != 0
+                && number == frame
+                && marker.is_commit()
+                && marker.salts == wal_header.salts
+                && marker.db_size == header.n_page
+                && [marker.checksum.s1, marker.checksum.s2] == header.a_frame_cksum =>
+        {
+            Ok(())
+        }
+        _ => Err(FrankenError::WalCorrupt {
+            detail: "shared WAL-index terminal marker does not match its publication".to_owned(),
+        }),
+    }
+}
+
+/// Page-source bounds sampled while the caller owns a native reader slot.
+///
+/// The caller must separately validate the header against the WAL generation
+/// and terminal committed frame. These bounds remain valid only while that
+/// exact reader-slot claim is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalIndexReadBoundary {
+    /// Frames through this boundary may be read from the database file.
+    pub backfilled_frames: u32,
+    /// Last frame admitted by the validated shared publication header.
+    pub maximum_wal_frame: u32,
+    /// Slot zero protects a database-only image; every WAL lookup is bypassed.
+    pub database_only: bool,
+}
+
+/// Read one native reader mark without borrowing live shared bytes.
+pub fn read_shared_wal_index_read_mark(region: &ShmRegion, slot: u32) -> Result<u32> {
+    validate_shared_segment(region)?;
+    let slot = usize::try_from(slot).map_err(|_| FrankenError::BusyRecovery)?;
+    if slot >= WAL_READ_MARK_COUNT {
+        return Err(FrankenError::BusyRecovery);
+    }
+    region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES + 4 + slot * 4, Ordering::Acquire)
+}
+
+/// Revalidate a captured publication after acquiring its native reader slot.
+///
+/// Sample `nBackfill` before the barrier and header reread. Otherwise a newer
+/// checkpoint could make an older page appear safe in the database while its
+/// replacement lies beyond this reader's publication. A changed header or
+/// mark asks the caller to release the exact slot and retry before reading any
+/// database or WAL page. Slot zero ignores the stored mark and requires a
+/// completely backfilled image. This function never acquires or releases locks.
+pub fn revalidate_shared_wal_index_reader(
+    region: &ShmRegion,
+    expected_header: &WalIndexHdr,
+    slot: u32,
+    expected_read_mark: u32,
+) -> Result<Option<WalIndexReadBoundary>> {
+    validate_shared_segment(region)?;
+    expected_header.validate()?;
+    if usize::try_from(slot).map_or(true, |slot| slot >= WAL_READ_MARK_COUNT) {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let backfilled_frames =
+        region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES, Ordering::Acquire)?;
+    fence(Ordering::SeqCst);
+    if slot != 0
+        && (expected_read_mark == u32::MAX
+            || expected_read_mark > expected_header.mx_frame
+            || read_shared_wal_index_read_mark(region, slot)? != expected_read_mark)
+    {
+        return Ok(None);
+    }
+    if read_shared_wal_index_header(region)? != Some(*expected_header)
+        || backfilled_frames > expected_header.mx_frame
+        || (slot == 0 && backfilled_frames != expected_header.mx_frame)
+    {
+        return Ok(None);
+    }
+    Ok(Some(WalIndexReadBoundary {
+        backfilled_frames,
+        maximum_wal_frame: expected_header.mx_frame,
+        database_only: slot == 0,
+    }))
+}
+
 /// Publish only the two live header copies, in copy 2/barrier/copy 1 order.
 ///
 /// The caller owns WAL_WRITE_LOCK, has installed every committed frame/hash
@@ -384,6 +544,83 @@ pub fn publish_shared_wal_index_header(region: &ShmRegion, header: &WalIndexHdr)
     write_shared_header_copy(region, WAL_INDEX_HDR_BYTES, &bytes)?;
     fence(Ordering::SeqCst);
     write_shared_header_copy(region, 0, &bytes)
+}
+
+/// Leave the shared index explicitly unreadable before an exclusive rebuild.
+///
+/// The caller owns WRITE/CKPT/RECOVER and every reader slot. Invalidation
+/// precedes all asynchronous work which can leave a partial rebuilt index.
+/// A dropped/failed rebuild may release its locks with this invalid pair;
+/// readers must recover again instead of consuming partial mappings.
+pub fn invalidate_shared_wal_index_header(region: &ShmRegion) -> Result<()> {
+    validate_shared_segment(region)?;
+    region.atomic_store_u32_ne(12, 0, Ordering::Release)?;
+    region.atomic_store_u32_ne(WAL_INDEX_HDR_BYTES + 12, 0, Ordering::Release)?;
+    fence(Ordering::SeqCst);
+    Ok(())
+}
+
+/// Install one privately prepared recovery segment while its header is invalid.
+///
+/// The caller retains the canonical recovery owner and never borrows live
+/// bytes. Header/checkpoint/lock bytes are excluded; page words and hash slots
+/// use their distinct protocol widths. Superseded tails in this segment are
+/// replaced by the scratch's zeros, without unmapping or truncating SHM.
+pub fn replace_shared_wal_index_region(
+    region: &ShmRegion,
+    number: u32,
+    scratch: &[u8],
+) -> Result<()> {
+    validate_shared_segment(region)?;
+    if scratch.len() != WAL_SHM_SEGMENT_BYTES {
+        return Err(FrankenError::WalCorrupt {
+            detail: "invalid private recovery segment size".to_owned(),
+        });
+    }
+    if number == 0 && read_shared_wal_index_header(region)?.is_some() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let page_start = if number == 0 {
+        WAL_SHM_FIRST_HEADER_BYTES
+    } else {
+        0
+    };
+    for offset in (page_start..WAL_SHM_PAGE_ARRAY_BYTES).step_by(4) {
+        region.atomic_store_u32_ne(
+            offset,
+            u32::from_ne_bytes(scratch[offset..offset + 4].try_into().expect("page word")),
+            Ordering::Release,
+        )?;
+    }
+    for offset in (WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES).step_by(2) {
+        region.atomic_store_u16_ne(
+            offset,
+            u16::from_ne_bytes(scratch[offset..offset + 2].try_into().expect("hash slot")),
+            Ordering::Release,
+        )?;
+    }
+    Ok(())
+}
+
+/// Reset only checkpoint and reader metadata before recovery header publication.
+///
+/// Every reader slot, including zero, is exclusively held. Slot one remains
+/// usable even for an empty WAL so readonly WAL-dependent consumers can pin
+/// that generation without rewriting a mark. No backfill is claimed.
+pub fn reset_shared_wal_index_recovery_marks(region: &ShmRegion, maximum_frame: u32) -> Result<()> {
+    validate_shared_segment(region)?;
+    if read_shared_wal_index_header(region)?.is_some() {
+        return Err(FrankenError::BusyRecovery);
+    }
+    region.atomic_store_u32_ne(96, 0, Ordering::Release)?;
+    region.atomic_store_u32_ne(128, 0, Ordering::Release)?;
+    region.atomic_store_u32_ne(100, 0, Ordering::Release)?;
+    region.atomic_store_u32_ne(104, maximum_frame, Ordering::Release)?;
+    for offset in (108..120).step_by(4) {
+        region.atomic_store_u32_ne(offset, u32::MAX, Ordering::Release)?;
+    }
+    fence(Ordering::SeqCst);
+    Ok(())
 }
 
 fn validate_shared_segment(region: &ShmRegion) -> Result<()> {
@@ -653,6 +890,389 @@ pub fn append_shared_wal_index_entry(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedWalIndexResetPhase {
+    Prepared,
+    InvalidatingHeaders,
+    ResettingMetadata,
+    PublishingHeaders,
+    HeadersPublished,
+}
+
+/// A fixed empty-generation publication owned by one checkpoint reset.
+///
+/// The caller retains WRITE/CKPT, the backfill reader-zero claim and reset
+/// reader slots one through four until this plan completes. Preparation is
+/// read-only. Publish only after the exact target WAL header and any truncate
+/// are durable. Keep this plan and every gate on error; aliases retain the
+/// mapping but do not acquire or represent those physical locks.
+pub struct SharedWalIndexResetPlan {
+    region: ShmRegion,
+    baseline: WalIndexHdr,
+    target: WalIndexHdr,
+    phase: SharedWalIndexResetPhase,
+}
+
+impl SharedWalIndexResetPlan {
+    /// Validate an exact fully backfilled baseline and a new empty generation.
+    pub fn prepare(region: ShmRegion, baseline: WalIndexHdr, target: WalIndexHdr) -> Result<Self> {
+        baseline.validate()?;
+        target.validate()?;
+        if target.mx_frame != 0
+            || target.n_page != 0
+            || target.a_frame_cksum != [0, 0]
+            || target.i_version != baseline.i_version
+            || target.unused != baseline.unused
+            || target.i_change != baseline.i_change
+            || target.is_init != baseline.is_init
+            || target.big_end_cksum != baseline.big_end_cksum
+            || target.sz_page != baseline.sz_page
+            || target.a_salt == baseline.a_salt
+            || read_shared_wal_index_backfill(&region, &baseline)? != baseline.mx_frame
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(Self {
+            region,
+            baseline,
+            target,
+            phase: SharedWalIndexResetPhase::Prepared,
+        })
+    }
+
+    #[must_use]
+    pub const fn baseline(&self) -> WalIndexHdr {
+        self.baseline
+    }
+
+    fn invalidated_baseline(&self) -> [u8; WAL_INDEX_HDR_BYTES] {
+        let mut bytes = self.baseline.to_bytes();
+        bytes[12..16].fill(0);
+        bytes
+    }
+
+    fn validate_owned_invalidation(&self, fully_invalid: bool) -> Result<()> {
+        let first = read_shared_header_copy(&self.region, 0)?;
+        fence(Ordering::SeqCst);
+        let second = read_shared_header_copy(&self.region, WAL_INDEX_HDR_BYTES)?;
+        let baseline = self.baseline.to_bytes();
+        let invalid = self.invalidated_baseline();
+        if (first == invalid && second == invalid)
+            || (!fully_invalid && second == baseline && (first == baseline || first == invalid))
+        {
+            Ok(())
+        } else {
+            Err(FrankenError::BusyRecovery)
+        }
+    }
+
+    fn validate_owned_header_publication(&self) -> Result<()> {
+        let first = read_shared_header_copy(&self.region, 0)?;
+        fence(Ordering::SeqCst);
+        let second = read_shared_header_copy(&self.region, WAL_INDEX_HDR_BYTES)?;
+        let invalid = self.invalidated_baseline();
+        let target = self.target.to_bytes();
+        // Header words are written in ascending order, copy two before one.
+        // A torn pair belongs to this plan only if it is one such prefix.
+        let is_prefix = |copy: &[u8; WAL_INDEX_HDR_BYTES]| {
+            (0..=WAL_INDEX_HDR_BYTES)
+                .step_by(4)
+                .any(|split| copy[..split] == target[..split] && copy[split..] == invalid[split..])
+        };
+        if (first == invalid && is_prefix(&second)) || (second == target && is_prefix(&first)) {
+            Ok(())
+        } else {
+            Err(FrankenError::BusyRecovery)
+        }
+    }
+
+    /// Reset metadata and mappings, then publish both headers last.
+    ///
+    /// A retry admits only this plan's recorded partial phase or its exact
+    /// completed target. An unrelated accepted or torn header is never repaired.
+    /// Reset preserves the commit counter because it publishes no transaction.
+    pub fn publish(&mut self) -> Result<()> {
+        let live = read_shared_wal_index_header(&self.region)?;
+        match self.phase {
+            SharedWalIndexResetPhase::Prepared => {
+                if live != Some(self.baseline)
+                    || read_shared_wal_index_backfill(&self.region, &self.baseline)?
+                        != self.baseline.mx_frame
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                // Retain ownership before the first destructive shared store.
+                self.phase = SharedWalIndexResetPhase::InvalidatingHeaders;
+            }
+            SharedWalIndexResetPhase::InvalidatingHeaders => {
+                self.validate_owned_invalidation(false)?;
+            }
+            SharedWalIndexResetPhase::ResettingMetadata => {
+                self.validate_owned_invalidation(true)?;
+            }
+            SharedWalIndexResetPhase::PublishingHeaders => {
+                if live == Some(self.target) {
+                    self.phase = SharedWalIndexResetPhase::HeadersPublished;
+                    return Ok(());
+                }
+                self.validate_owned_header_publication()?;
+            }
+            SharedWalIndexResetPhase::HeadersPublished => {
+                return if live == Some(self.target) {
+                    Ok(())
+                } else {
+                    Err(FrankenError::BusyRecovery)
+                };
+            }
+        }
+        if self.phase == SharedWalIndexResetPhase::InvalidatingHeaders {
+            invalidate_shared_wal_index_header(&self.region)?;
+            self.phase = SharedWalIndexResetPhase::ResettingMetadata;
+        }
+        if self.phase == SharedWalIndexResetPhase::ResettingMetadata {
+            reset_shared_wal_index_recovery_marks(&self.region, 0)?;
+            clear_shared_wal_index_tail(&self.region, 0, 0)?;
+            self.phase = SharedWalIndexResetPhase::PublishingHeaders;
+        }
+        publish_shared_wal_index_header(&self.region, &self.target)?;
+        self.phase = SharedWalIndexResetPhase::HeadersPublished;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedWalPublicationPhase {
+    Prepared,
+    InstallingMappings,
+    PublishingHeaders,
+    HeadersPublished,
+}
+
+/// Prepared append publication for an already initialized native WAL index.
+///
+/// The caller retains the same WRITE-lock owner from preparation through
+/// publication or exact rejection. Aliases retain mappings; they do not own
+/// that lock. Preparation never mutates live index bytes. The plan contains
+/// only the unpublished suffix and affected region aliases.
+pub struct SharedWalIndexAppendPlan {
+    baseline: WalIndexHdr,
+    generation: WalGenerationIdentity,
+    regions: Vec<(u32, ShmRegion)>,
+    entries: Vec<(u32, u32, bool)>,
+    target: Option<WalIndexHdr>,
+    phase: SharedWalPublicationPhase,
+}
+
+impl SharedWalIndexAppendPlan {
+    /// Validate a contiguous append on bounded private segment scratch.
+    ///
+    /// Region zero is always required; every other supplied region must be
+    /// ordered and unique. Live page words and hash slots are captured at
+    /// their protocol widths, without borrowing concurrently shared bytes.
+    pub fn prepare(
+        baseline: WalIndexHdr,
+        generation: WalGenerationIdentity,
+        regions: Vec<(u32, ShmRegion)>,
+        entries: Vec<(u32, u32, bool)>,
+    ) -> Result<Self> {
+        baseline.validate()?;
+        if regions.first().is_none_or(|(region, _)| *region != 0)
+            || regions.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || entries.is_empty()
+            || baseline.a_salt != [generation.salts.salt1, generation.salts.salt2]
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let mut previous = baseline.mx_frame;
+        for &(frame, page, _) in &entries {
+            if previous.checked_add(1) != Some(frame) || page == 0 {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "shared WAL-index append has an invalid page or frame gap".to_owned(),
+                });
+            }
+            let region = WalIndexFrameLocation::new(frame)?.region;
+            if regions
+                .binary_search_by_key(&region, |(number, _)| *number)
+                .is_err()
+            {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "shared WAL-index append is missing a mapped region".to_owned(),
+                });
+            }
+            previous = frame;
+        }
+        if read_shared_wal_index_header(&regions[0].1)? != Some(baseline) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let mut entry_cursor = 0;
+        for (number, region) in &regions {
+            validate_shared_segment(region)?;
+            let mut scratch = vec![0_u8; WAL_SHM_SEGMENT_BYTES];
+            let page_start = if *number == 0 {
+                WAL_SHM_FIRST_HEADER_BYTES
+            } else {
+                0
+            };
+            for offset in (page_start..WAL_SHM_PAGE_ARRAY_BYTES).step_by(4) {
+                scratch[offset..offset + 4].copy_from_slice(
+                    &region
+                        .atomic_load_u32_ne(offset, Ordering::Acquire)?
+                        .to_ne_bytes(),
+                );
+            }
+            for offset in (WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES).step_by(2) {
+                scratch[offset..offset + 2].copy_from_slice(
+                    &region
+                        .atomic_load_u16_ne(offset, Ordering::Acquire)?
+                        .to_ne_bytes(),
+                );
+            }
+            clear_native_wal_index_tail(&mut scratch, *number, baseline.mx_frame)?;
+            while let Some(&(frame, page, _)) = entries.get(entry_cursor) {
+                if WalIndexFrameLocation::new(frame)?.region != *number {
+                    break;
+                }
+                append_native_wal_index_entry(&mut scratch, frame, page)?;
+                entry_cursor += 1;
+            }
+        }
+        if read_shared_wal_index_header(&regions[0].1)? != Some(baseline) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(Self {
+            baseline,
+            generation,
+            regions,
+            entries,
+            target: None,
+            phase: SharedWalPublicationPhase::Prepared,
+        })
+    }
+
+    #[must_use]
+    pub const fn baseline(&self) -> WalIndexHdr {
+        self.baseline
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> WalGenerationIdentity {
+        self.generation
+    }
+
+    /// A partial shared publication must finish before another append starts.
+    #[must_use]
+    pub const fn can_extend(&self) -> bool {
+        matches!(self.phase, SharedWalPublicationPhase::Prepared) && self.target.is_none()
+    }
+
+    /// Count newly published commit markers, excluding a later staged suffix.
+    pub fn publication_change(&self, maximum_frame: u32) -> Result<u32> {
+        let mut change = self.baseline.i_change;
+        for &(frame, _, is_commit) in &self.entries {
+            if frame > maximum_frame {
+                break;
+            }
+            change = change.wrapping_add(u32::from(is_commit));
+            if frame == maximum_frame {
+                return if is_commit {
+                    Ok(change)
+                } else {
+                    Err(FrankenError::BusyRecovery)
+                };
+            }
+        }
+        Err(FrankenError::BusyRecovery)
+    }
+
+    /// Publish entries then both header copies without async I/O or mapping.
+    ///
+    /// The caller has already established durability or deferred authority.
+    /// On error retain this exact plan and its external writer owner. A retry
+    /// after header publication never clears newly visible mappings.
+    pub fn publish(&mut self, target: WalIndexHdr) -> Result<()> {
+        target.validate()?;
+        if target.mx_frame <= self.baseline.mx_frame
+            || self
+                .entries
+                .last()
+                .is_none_or(|(frame, _, _)| target.mx_frame > *frame)
+            || target.i_version != self.baseline.i_version
+            || target.unused != self.baseline.unused
+            || target.is_init != self.baseline.is_init
+            || target.big_end_cksum != self.baseline.big_end_cksum
+            || target.sz_page != self.baseline.sz_page
+            || target.a_salt != self.baseline.a_salt
+            || target.i_change != self.publication_change(target.mx_frame)?
+            || self.target.is_some_and(|previous| previous != target)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "shared WAL-index publication does not match its retained target"
+                    .to_owned(),
+            });
+        }
+        self.target = Some(target);
+        let live = read_shared_wal_index_header(&self.regions[0].1)?;
+        match self.phase {
+            SharedWalPublicationPhase::Prepared | SharedWalPublicationPhase::InstallingMappings => {
+                if live != Some(self.baseline) {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                self.phase = SharedWalPublicationPhase::InstallingMappings;
+                for (number, region) in &self.regions {
+                    clear_shared_wal_index_tail(region, *number, self.baseline.mx_frame)?;
+                }
+                for &(frame, page, _) in &self.entries {
+                    if frame > target.mx_frame {
+                        break;
+                    }
+                    let number = WalIndexFrameLocation::new(frame)?.region;
+                    let index = self
+                        .regions
+                        .binary_search_by_key(&number, |(region, _)| *region)
+                        .map_err(|_| FrankenError::BusyRecovery)?;
+                    append_shared_wal_index_entry(&self.regions[index].1, frame, page)?;
+                }
+                self.phase = SharedWalPublicationPhase::PublishingHeaders;
+            }
+            SharedWalPublicationPhase::PublishingHeaders => {
+                if live == Some(target) {
+                    self.phase = SharedWalPublicationPhase::HeadersPublished;
+                    return Ok(());
+                }
+                if live.is_some_and(|header| header != self.baseline) {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                // A mismatched pair is admissible only here: this owner has
+                // installed every mapping and already started these headers.
+            }
+            SharedWalPublicationPhase::HeadersPublished => {
+                return if live == Some(target) {
+                    Ok(())
+                } else {
+                    Err(FrankenError::BusyRecovery)
+                };
+            }
+        }
+        publish_shared_wal_index_header(&self.regions[0].1, &target)?;
+        self.phase = SharedWalPublicationPhase::HeadersPublished;
+        Ok(())
+    }
+
+    /// Retire a completed private publication while retaining its staged suffix.
+    ///
+    /// Call only after `publish` succeeded and private publication completed.
+    /// Returns whether a later, still-uncommitted suffix remains staged.
+    pub fn finish_private_publication(&mut self) -> bool {
+        assert_eq!(self.phase, SharedWalPublicationPhase::HeadersPublished);
+        let target = self.target.take().expect("published native header target");
+        self.entries
+            .retain(|(frame, _, _)| *frame > target.mx_frame);
+        self.baseline = target;
+        self.phase = SharedWalPublicationPhase::Prepared;
+        !self.entries.is_empty()
+    }
+}
+
 /// Find the latest mapping at or before a reader's committed frame horizon.
 ///
 /// The caller supplies a stable snapshot of one region and retains its reader
@@ -901,6 +1521,451 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_backfill_preserves_unrelated_bytes_and_refuses_regression() {
+        let region = ShmRegion::from_vec(vec![0xa7; WAL_SHM_SEGMENT_BYTES]);
+        let mut header = shared_header_fixture(4096, 7);
+        header.mx_frame = 20;
+        header.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        region
+            .atomic_store_u32_ne(96, 3, Ordering::Release)
+            .unwrap();
+        region
+            .atomic_store_u32_ne(128, 8, Ordering::Release)
+            .unwrap();
+        let before = region.lock().to_vec();
+        assert_eq!(read_shared_wal_index_backfill(&region, &header).unwrap(), 3);
+        for (cumulative, attempted) in [(5, 8), (12, 12), (20, 20)] {
+            publish_shared_wal_index_backfill(&region, &header, cumulative).unwrap();
+            let mut expected = before.clone();
+            write4(&mut expected, 96, cumulative);
+            write4(&mut expected, 128, attempted);
+            assert_eq!(
+                region.lock().to_vec(),
+                expected,
+                "only the two watermarks change"
+            );
+            assert_eq!(
+                read_shared_wal_index_backfill(&region, &header).unwrap(),
+                cumulative
+            );
+            publish_shared_wal_index_backfill(&region, &header, cumulative).unwrap();
+            assert_eq!(
+                region.lock().to_vec(),
+                expected,
+                "same cumulative publication is idempotent"
+            );
+        }
+        let full = region.lock().to_vec();
+        for cumulative in [0, 19, 21, u32::MAX] {
+            assert!(publish_shared_wal_index_backfill(&region, &header, cumulative).is_err());
+            assert_eq!(region.lock().to_vec(), full);
+        }
+        let mut foreign = header;
+        foreign.i_change += 1;
+        foreign.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &foreign).unwrap();
+        let changed = region.lock().to_vec();
+        assert!(read_shared_wal_index_backfill(&region, &header).is_err());
+        assert!(publish_shared_wal_index_backfill(&region, &header, 20).is_err());
+        assert_eq!(region.lock().to_vec(), changed);
+    }
+
+    #[test]
+    fn test_shared_backfill_refuses_invalid_intervals_and_mapping_sizes() {
+        let mut header = shared_header_fixture(1, 0);
+        header.mx_frame = 20;
+        header.update_checksum().unwrap();
+        for size in [0, 96, WAL_SHM_SEGMENT_BYTES - 1, WAL_SHM_SEGMENT_BYTES + 1] {
+            let region = ShmRegion::from_vec(vec![0xa7; size]);
+            let before = region.lock().to_vec();
+            assert!(read_shared_wal_index_backfill(&region, &header).is_err());
+            assert!(publish_shared_wal_index_backfill(&region, &header, 0).is_err());
+            assert_eq!(region.lock().to_vec(), before);
+        }
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        for (backfill, attempted) in [(9, 8), (3, 21), (21, 21)] {
+            region
+                .atomic_store_u32_ne(96, backfill, Ordering::Release)
+                .unwrap();
+            region
+                .atomic_store_u32_ne(128, attempted, Ordering::Release)
+                .unwrap();
+            let before = region.lock().to_vec();
+            assert!(read_shared_wal_index_backfill(&region, &header).is_err());
+            assert!(publish_shared_wal_index_backfill(&region, &header, 20).is_err());
+            assert_eq!(region.lock().to_vec(), before);
+        }
+        for maximum in [0, u32::MAX] {
+            header.mx_frame = maximum;
+            header.update_checksum().unwrap();
+            publish_shared_wal_index_header(&region, &header).unwrap();
+            region
+                .atomic_store_u32_ne(96, 0, Ordering::Release)
+                .unwrap();
+            region
+                .atomic_store_u32_ne(128, 0, Ordering::Release)
+                .unwrap();
+            publish_shared_wal_index_backfill(&region, &header, maximum).unwrap();
+            assert_eq!(
+                read_shared_wal_index_backfill(&region, &header).unwrap(),
+                maximum
+            );
+        }
+    }
+
+    fn shared_checkpoint_reset_fixture() -> (ShmRegion, WalIndexHdr, WalIndexHdr) {
+        let region = ShmRegion::from_vec(vec![0xa7; WAL_SHM_SEGMENT_BYTES]);
+        let mut baseline = shared_header_fixture(4096, 0);
+        baseline.mx_frame = 20;
+        baseline.i_change = u32::MAX;
+        baseline.unused = 0x1234_5678;
+        baseline.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &baseline).unwrap();
+        region
+            .atomic_store_u32_ne(96, 20, Ordering::Release)
+            .unwrap();
+        region
+            .atomic_store_u32_ne(128, 20, Ordering::Release)
+            .unwrap();
+        let mut target = baseline;
+        target.mx_frame = 0;
+        target.n_page = 0;
+        target.a_frame_cksum = [0, 0];
+        target.a_salt[0] ^= 1;
+        target.update_checksum().unwrap();
+        (region, baseline, target)
+    }
+
+    #[test]
+    fn test_shared_reset_prepare_refuses_short_torn_and_foreign_baselines() {
+        let (region, baseline, target) = shared_checkpoint_reset_fixture();
+        let before = region.lock().to_vec();
+        for size in [0, WAL_SHM_SEGMENT_BYTES - 1, WAL_SHM_SEGMENT_BYTES + 1] {
+            let short = ShmRegion::from_vec(vec![0xa7; size]);
+            let untouched = short.lock().to_vec();
+            assert!(SharedWalIndexResetPlan::prepare(short.share(), baseline, target).is_err());
+            assert_eq!(short.lock().to_vec(), untouched);
+        }
+        let mut foreign_baseline = baseline;
+        foreign_baseline.a_salt[1] ^= 2;
+        foreign_baseline.update_checksum().unwrap();
+        assert!(
+            SharedWalIndexResetPlan::prepare(region.share(), foreign_baseline, target).is_err()
+        );
+        let mut bad_checksum = target;
+        bad_checksum.a_cksum[0] ^= 1;
+        assert!(SharedWalIndexResetPlan::prepare(region.share(), baseline, bad_checksum).is_err());
+        assert_eq!(region.lock().to_vec(), before);
+        region
+            .atomic_store_u32_ne(WAL_INDEX_HDR_BYTES + 8, 0, Ordering::Release)
+            .unwrap();
+        let torn = region.lock().to_vec();
+        assert!(SharedWalIndexResetPlan::prepare(region.share(), baseline, target).is_err());
+        assert_eq!(region.lock().to_vec(), torn);
+        write_shared_header_copy(&region, WAL_INDEX_HDR_BYTES, &baseline.to_bytes()).unwrap();
+        assert_eq!(region.lock().to_vec(), before);
+    }
+
+    #[test]
+    fn test_shared_reset_prepare_is_pure_and_publication_preserves_noncommit_state() {
+        let (region, baseline, target) = shared_checkpoint_reset_fixture();
+        let before = region.lock().to_vec();
+        for case in 0..8 {
+            let mut invalid = target;
+            match case {
+                0 => invalid.mx_frame = 1,
+                1 => invalid.n_page = 1,
+                2 => invalid.a_frame_cksum[0] = 1,
+                3 => invalid.a_salt = baseline.a_salt,
+                4 => invalid.i_change = 0,
+                5 => invalid.unused ^= 1,
+                6 => invalid.sz_page = 512,
+                7 => invalid.big_end_cksum ^= 1,
+                _ => unreachable!(),
+            }
+            invalid.update_checksum().unwrap();
+            assert!(SharedWalIndexResetPlan::prepare(region.share(), baseline, invalid).is_err());
+            assert_eq!(region.lock().to_vec(), before);
+        }
+        region
+            .atomic_store_u32_ne(96, 19, Ordering::Release)
+            .unwrap();
+        let partial = region.lock().to_vec();
+        assert!(SharedWalIndexResetPlan::prepare(region.share(), baseline, target).is_err());
+        assert_eq!(region.lock().to_vec(), partial);
+        region
+            .atomic_store_u32_ne(96, 20, Ordering::Release)
+            .unwrap();
+        let mut plan = SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+        assert_eq!(plan.baseline(), baseline);
+        assert_eq!(
+            region.lock().to_vec(),
+            before,
+            "successful preparation is read-only"
+        );
+        plan.publish().unwrap();
+        let after = region.lock().to_vec();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+        assert_eq!(
+            target.i_change,
+            u32::MAX,
+            "reset publishes no commit and does not wrap iChange"
+        );
+        assert_eq!(
+            &after[120..128],
+            &before[120..128],
+            "physical lock bytes remain untouched"
+        );
+        assert_eq!(
+            &after[132..136],
+            &before[132..136],
+            "checkpoint reserved bytes remain untouched"
+        );
+        assert!(
+            after[WAL_SHM_FIRST_HEADER_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(read_shared_wal_index_backfill(&region, &target).unwrap(), 0);
+        for (slot, mark) in [0, 0, u32::MAX, u32::MAX, u32::MAX].into_iter().enumerate() {
+            assert_eq!(
+                read_shared_wal_index_read_mark(&region, u32::try_from(slot).unwrap()).unwrap(),
+                mark
+            );
+        }
+        plan.publish().unwrap();
+        assert_eq!(region.lock().to_vec(), after);
+    }
+
+    #[test]
+    fn test_shared_reset_retries_owned_invalidation_and_metadata_only() {
+        for phase in [
+            SharedWalIndexResetPhase::InvalidatingHeaders,
+            SharedWalIndexResetPhase::ResettingMetadata,
+        ] {
+            let (region, baseline, target) = shared_checkpoint_reset_fixture();
+            let mut plan =
+                SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+            let mut unstarted =
+                SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+            plan.phase = phase;
+            region
+                .atomic_store_u32_ne(12, 0, Ordering::Release)
+                .unwrap();
+            if phase == SharedWalIndexResetPhase::ResettingMetadata {
+                region
+                    .atomic_store_u32_ne(WAL_INDEX_HDR_BYTES + 12, 0, Ordering::Release)
+                    .unwrap();
+                region
+                    .atomic_store_u32_ne(96, 0, Ordering::Release)
+                    .unwrap();
+                region
+                    .atomic_store_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES, 0, Ordering::Release)
+                    .unwrap();
+            }
+            let interrupted = region.lock().to_vec();
+            assert_eq!(read_shared_wal_index_header(&region).unwrap(), None);
+            assert!(
+                unstarted.publish().is_err(),
+                "a fresh plan cannot adopt an invalid pair"
+            );
+            assert_eq!(region.lock().to_vec(), interrupted);
+            plan.publish().unwrap();
+            assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+            assert_eq!(read_shared_wal_index_backfill(&region, &target).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn test_shared_reset_header_last_retries_only_exact_owned_word_prefixes() {
+        for (first_words, second_words) in [
+            (0, 0),
+            (0, 1),
+            (0, 11),
+            (0, 12),
+            (1, 12),
+            (11, 12),
+            (12, 12),
+        ] {
+            let (region, baseline, target) = shared_checkpoint_reset_fixture();
+            let mut plan =
+                SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+            let mut unstarted =
+                SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+            invalidate_shared_wal_index_header(&region).unwrap();
+            reset_shared_wal_index_recovery_marks(&region, 0).unwrap();
+            clear_shared_wal_index_tail(&region, 0, 0).unwrap();
+            plan.phase = SharedWalIndexResetPhase::PublishingHeaders;
+            let target_bytes = target.to_bytes();
+            for (offset, words) in [(WAL_INDEX_HDR_BYTES, second_words), (0, first_words)] {
+                let mut partial = plan.invalidated_baseline();
+                partial[..words * 4].copy_from_slice(&target_bytes[..words * 4]);
+                write_shared_header_copy(&region, offset, &partial).unwrap();
+            }
+            let interrupted = region.lock().to_vec();
+            if first_words != 12 {
+                assert_eq!(read_shared_wal_index_header(&region).unwrap(), None);
+            }
+            assert!(unstarted.publish().is_err());
+            assert_eq!(region.lock().to_vec(), interrupted);
+            plan.publish().unwrap();
+            assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+            // A completed retry must not clear any mapping bytes a second time.
+            region
+                .atomic_store_u32_ne(WAL_SHM_FIRST_HEADER_BYTES, 77, Ordering::Release)
+                .unwrap();
+            let completed = region.lock().to_vec();
+            plan.publish().unwrap();
+            assert_eq!(region.lock().to_vec(), completed);
+        }
+    }
+
+    #[test]
+    fn test_shared_reset_refuses_foreign_accepted_and_unrelated_invalid_headers() {
+        for phase in [
+            SharedWalIndexResetPhase::Prepared,
+            SharedWalIndexResetPhase::InvalidatingHeaders,
+            SharedWalIndexResetPhase::ResettingMetadata,
+            SharedWalIndexResetPhase::PublishingHeaders,
+            SharedWalIndexResetPhase::HeadersPublished,
+        ] {
+            let (region, baseline, target) = shared_checkpoint_reset_fixture();
+            let mut plan =
+                SharedWalIndexResetPlan::prepare(region.share(), baseline, target).unwrap();
+            plan.phase = phase;
+            let mut foreign = target;
+            foreign.a_salt[1] ^= 1;
+            foreign.update_checksum().unwrap();
+            publish_shared_wal_index_header(&region, &foreign).unwrap();
+            for invalidate in [false, true] {
+                if invalidate {
+                    invalidate_shared_wal_index_header(&region).unwrap();
+                }
+                let before = region.lock().to_vec();
+                assert!(plan.publish().is_err());
+                assert_eq!(region.lock().to_vec(), before);
+                assert_eq!(
+                    plan.phase, phase,
+                    "refusal preserves the exact retained phase"
+                );
+                assert_eq!(plan.target, target);
+                assert_eq!(plan.baseline(), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_recovery_replaces_cross_region_maps_with_header_last() {
+        let regions = [
+            ShmRegion::from_vec(vec![0xa7; WAL_SHM_SEGMENT_BYTES]),
+            ShmRegion::from_vec(vec![0xb8; WAL_SHM_SEGMENT_BYTES]),
+        ];
+        let old_header = shared_header_fixture(4096, 7);
+        publish_shared_wal_index_header(&regions[0], &old_header).unwrap();
+        let before = regions[0].lock().to_vec();
+        let mut scratch = vec![0; WAL_SHM_SEGMENT_BYTES];
+        assert!(replace_shared_wal_index_region(&regions[0], 0, &scratch).is_err());
+        assert!(reset_shared_wal_index_recovery_marks(&regions[0], 4063).is_err());
+        assert_eq!(
+            regions[0].lock().to_vec(),
+            before,
+            "accepted headers prohibit in-place rebuild"
+        );
+        invalidate_shared_wal_index_header(&regions[0]).unwrap();
+        assert_eq!(read_shared_wal_index_header(&regions[0]).unwrap(), None);
+        for frame in 1..=4062_u32 {
+            append_native_wal_index_entry(&mut scratch, frame, 1 + (frame % 2) * 8192).unwrap();
+        }
+        replace_shared_wal_index_region(&regions[0], 0, &scratch).unwrap();
+        scratch.fill(0);
+        append_native_wal_index_entry(&mut scratch, 4063, 1).unwrap();
+        replace_shared_wal_index_region(&regions[1], 1, &scratch).unwrap();
+        assert_eq!(read_shared_wal_index_header(&regions[0]).unwrap(), None);
+        reset_shared_wal_index_recovery_marks(&regions[0], 4063).unwrap();
+        let rebuilt = regions[0].lock().to_vec();
+        assert_eq!(
+            &rebuilt[120..128],
+            &before[120..128],
+            "lock bytes are never recovery payload"
+        );
+        assert_eq!(
+            &rebuilt[132..136],
+            &before[132..136],
+            "reserved bytes remain untouched"
+        );
+        assert_eq!(
+            regions[0]
+                .atomic_load_u32_ne(96, Ordering::Acquire)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            regions[0]
+                .atomic_load_u32_ne(128, Ordering::Acquire)
+                .unwrap(),
+            0
+        );
+        for (slot, expected) in [0, 4063, u32::MAX, u32::MAX, u32::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                regions[0]
+                    .atomic_load_u32_ne(100 + slot * 4, Ordering::Acquire)
+                    .unwrap(),
+                expected
+            );
+        }
+        let mut target = old_header;
+        target.mx_frame = 4063;
+        target.i_change = 0;
+        target.update_checksum().unwrap();
+        publish_shared_wal_index_header(&regions[0], &target).unwrap();
+        assert_eq!(
+            read_shared_wal_index_header(&regions[0]).unwrap(),
+            Some(target)
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&rebuilt, 0, 1, 4063).unwrap(),
+            Some(4062)
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&regions[1].lock(), 1, 1, 4063).unwrap(),
+            Some(4063)
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&regions[1].lock(), 1, 8193, 4063).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_shared_recovery_refuses_short_inputs_and_admits_empty_nonzero_reader_mark() {
+        for size in [0, 96, WAL_SHM_SEGMENT_BYTES - 1, WAL_SHM_SEGMENT_BYTES + 1] {
+            let region = ShmRegion::from_vec(vec![0xa7; size]);
+            let before = region.lock().to_vec();
+            assert!(invalidate_shared_wal_index_header(&region).is_err());
+            assert!(
+                replace_shared_wal_index_region(&region, 0, &vec![0; WAL_SHM_SEGMENT_BYTES])
+                    .is_err()
+            );
+            assert!(reset_shared_wal_index_recovery_marks(&region, 0).is_err());
+            assert_eq!(region.lock().to_vec(), before);
+        }
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let before = region.lock().to_vec();
+        for size in [0, WAL_SHM_SEGMENT_BYTES - 1, WAL_SHM_SEGMENT_BYTES + 1] {
+            assert!(replace_shared_wal_index_region(&region, 0, &vec![0; size]).is_err());
+            assert_eq!(region.lock().to_vec(), before);
+        }
+        reset_shared_wal_index_recovery_marks(&region, 0).unwrap();
+        assert_eq!(read_shared_wal_index_read_mark(&region, 1).unwrap(), 0);
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), None);
+    }
+
+    #[test]
     fn test_shared_header_preserves_reader_state_and_refuses_torn_copies() {
         for page_size in [512, 4096, 1] {
             let region = ShmRegion::from_vec(vec![0xa7; WAL_SHM_SEGMENT_BYTES]);
@@ -934,6 +1999,104 @@ mod tests {
             );
             assert!(region.lock().iter().all(|byte| *byte == 0));
         }
+    }
+
+    #[test]
+    fn test_shared_reader_revalidation_preserves_bounds_and_rejects_stale_state() {
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut header = shared_header_fixture(4096, 7);
+        header.mx_frame = 20;
+        header.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        region
+            .atomic_store_u32_ne(96, 8, Ordering::Release)
+            .unwrap();
+        region
+            .atomic_store_u32_ne(108, 12, Ordering::Release)
+            .unwrap();
+        let before = region.lock().to_vec();
+        assert_eq!(read_shared_wal_index_read_mark(&region, 2).unwrap(), 12);
+        assert_eq!(
+            revalidate_shared_wal_index_reader(&region, &header, 2, 12).unwrap(),
+            Some(WalIndexReadBoundary {
+                backfilled_frames: 8,
+                maximum_wal_frame: 20,
+                database_only: false,
+            })
+        );
+        for (slot, mark) in [(2, 11), (2, 21), (0, 0)] {
+            assert!(
+                revalidate_shared_wal_index_reader(&region, &header, slot, mark)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(revalidate_shared_wal_index_reader(&region, &header, 5, 0).is_err());
+        assert!(read_shared_wal_index_read_mark(&region, 5).is_err());
+        assert_eq!(region.lock().to_vec(), before);
+
+        let mut newer = header;
+        newer.i_change += 1;
+        newer.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &newer).unwrap();
+        assert!(
+            revalidate_shared_wal_index_reader(&region, &header, 2, 12)
+                .unwrap()
+                .is_none()
+        );
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        region
+            .atomic_store_u32_ne(96, 21, Ordering::Release)
+            .unwrap();
+        assert!(
+            revalidate_shared_wal_index_reader(&region, &header, 2, 12)
+                .unwrap()
+                .is_none()
+        );
+        region
+            .atomic_store_u32_ne(96, 20, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            revalidate_shared_wal_index_reader(&region, &header, 0, u32::MAX).unwrap(),
+            Some(WalIndexReadBoundary {
+                backfilled_frames: 20,
+                maximum_wal_frame: 20,
+                database_only: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_shared_reader_revalidation_handles_empty_and_maximum_frame_boundaries() {
+        for frame_count in [0, u32::MAX] {
+            let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+            let mut header = shared_header_fixture(1, 0);
+            header.mx_frame = frame_count;
+            header.update_checksum().unwrap();
+            publish_shared_wal_index_header(&region, &header).unwrap();
+            region
+                .atomic_store_u32_ne(96, frame_count, Ordering::Release)
+                .unwrap();
+            let boundary = revalidate_shared_wal_index_reader(&region, &header, 0, 0)
+                .unwrap()
+                .expect("fully backfilled database-only boundary");
+            assert_eq!(boundary.backfilled_frames, frame_count);
+            assert_eq!(boundary.maximum_wal_frame, frame_count);
+            assert!(boundary.database_only);
+            region
+                .atomic_store_u32_ne(104, u32::MAX, Ordering::Release)
+                .unwrap();
+            assert!(
+                revalidate_shared_wal_index_reader(&region, &header, 1, u32::MAX)
+                    .unwrap()
+                    .is_none(),
+                "the unused-reader sentinel is not a claim, even at maximum mxFrame"
+            );
+        }
+        let short = ShmRegion::new(136);
+        let header = shared_header_fixture(4096, 0);
+        assert!(revalidate_shared_wal_index_reader(&short, &header, 0, 0).is_err());
+        assert!(read_shared_wal_index_read_mark(&short, 0).is_err());
     }
 
     #[test]
@@ -1008,6 +2171,267 @@ mod tests {
         assert!(append_shared_wal_index_entry(&shared[1], 4064, 5).is_err());
         assert_eq!(shared[0].lock().to_vec(), before);
         assert!(shared[1].lock().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_shared_publication_binding_rejects_format_and_terminal_mismatch() {
+        for page_size in [512, 4096, 65536] {
+            let mut header = shared_header_fixture(
+                if page_size == 65536 {
+                    1
+                } else {
+                    u16::try_from(page_size).unwrap()
+                },
+                9,
+            );
+            let wal = WalHeader {
+                magic: crate::WAL_MAGIC_BE,
+                format_version: crate::WAL_FORMAT_VERSION,
+                page_size,
+                checkpoint_seq: 17,
+                salts: crate::WalSalts {
+                    salt1: header.a_salt[0],
+                    salt2: header.a_salt[1],
+                },
+                checksum: crate::SqliteWalChecksum { s1: 3, s2: 4 },
+            };
+            let marker = WalFrameHeader {
+                page_number: 7,
+                db_size: header.n_page,
+                salts: wal.salts,
+                checksum: crate::SqliteWalChecksum {
+                    s1: header.a_frame_cksum[0],
+                    s2: header.a_frame_cksum[1],
+                },
+            };
+            validate_shared_wal_index_wal_binding(&header, &wal, Some((header.mx_frame, marker)))
+                .unwrap();
+            for mutation in 0..7 {
+                let mut changed = header;
+                match mutation {
+                    0 => changed.a_salt[0] ^= 1,
+                    1 => changed.big_end_cksum ^= 1,
+                    2 => changed.sz_page = if header.sz_page == 512 { 4096 } else { 512 },
+                    3 => changed.mx_frame -= 1,
+                    4 => changed.n_page += 1,
+                    5 => changed.a_frame_cksum[1] ^= 1,
+                    _ => changed.mx_frame = 0,
+                }
+                changed.update_checksum().unwrap();
+                assert!(
+                    validate_shared_wal_index_wal_binding(
+                        &changed,
+                        &wal,
+                        Some((header.mx_frame, marker)),
+                    )
+                    .is_err()
+                );
+            }
+            let mut uncommitted = marker;
+            uncommitted.db_size = 0;
+            assert!(
+                validate_shared_wal_index_wal_binding(
+                    &header,
+                    &wal,
+                    Some((header.mx_frame, uncommitted)),
+                )
+                .is_err()
+            );
+            assert!(validate_shared_wal_index_wal_binding(&header, &wal, None).is_err());
+            header.mx_frame = 0;
+            header.update_checksum().unwrap();
+            validate_shared_wal_index_wal_binding(&header, &wal, None).unwrap();
+            let mut invalid_format = wal;
+            invalid_format.format_version += 1;
+            assert!(validate_shared_wal_index_wal_binding(&header, &invalid_format, None).is_err());
+        }
+    }
+
+    #[test]
+    fn test_shared_append_plan_counts_markers_crosses_region_and_preserves_prefix() {
+        let regions = [
+            ShmRegion::new(WAL_SHM_SEGMENT_BYTES),
+            ShmRegion::new(WAL_SHM_SEGMENT_BYTES),
+        ];
+        let mut baseline = shared_header_fixture(4096, 0);
+        baseline.mx_frame = 4061;
+        baseline.i_change = u32::MAX;
+        baseline.update_checksum().unwrap();
+        publish_shared_wal_index_header(&regions[0], &baseline).unwrap();
+        for offset in (96..WAL_SHM_FIRST_HEADER_BYTES).step_by(4) {
+            regions[0]
+                .atomic_store_u32_ne(offset, 0x6172_8394, Ordering::Release)
+                .unwrap();
+        }
+        for frame in 1..=baseline.mx_frame {
+            append_shared_wal_index_entry(&regions[0], frame, frame).unwrap();
+        }
+        let before = [regions[0].lock().to_vec(), regions[1].lock().to_vec()];
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 17,
+            salts: crate::WalSalts {
+                salt1: baseline.a_salt[0],
+                salt2: baseline.a_salt[1],
+            },
+        };
+        let mut plan = SharedWalIndexAppendPlan::prepare(
+            baseline,
+            generation,
+            vec![(0, regions[0].share()), (1, regions[1].share())],
+            vec![
+                (4062, 7, true),
+                (4063, 8199, false),
+                (4064, 7, true),
+                (4065, 9, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(regions[0].lock().to_vec(), before[0]);
+        assert_eq!(regions[1].lock().to_vec(), before[1]);
+        assert!(
+            plan.publication_change(4063).is_err(),
+            "noncommit cannot be a publication horizon"
+        );
+        let mut target = baseline;
+        target.mx_frame = 4064;
+        target.i_change = plan.publication_change(target.mx_frame).unwrap();
+        assert_eq!(
+            target.i_change, 1,
+            "two markers wrap the previous counter once"
+        );
+        target.n_page = 47;
+        target.a_frame_cksum = [77, 88];
+        target.update_checksum().unwrap();
+        let mut wrong_count = target;
+        wrong_count.i_change = 0;
+        wrong_count.update_checksum().unwrap();
+        assert!(plan.publish(wrong_count).is_err());
+        assert_eq!(regions[0].lock().to_vec(), before[0]);
+        plan.publish(target).unwrap();
+        assert_eq!(
+            read_shared_wal_index_header(&regions[0]).unwrap(),
+            Some(target)
+        );
+        let published = [regions[0].lock().to_vec(), regions[1].lock().to_vec()];
+        assert_eq!(
+            &published[0][96..WAL_SHM_FIRST_HEADER_BYTES],
+            &before[0][96..WAL_SHM_FIRST_HEADER_BYTES]
+        );
+        assert_eq!(
+            &published[0][WAL_SHM_FIRST_HEADER_BYTES..WAL_SHM_PAGE_ARRAY_BYTES - 4],
+            &before[0][WAL_SHM_FIRST_HEADER_BYTES..WAL_SHM_PAGE_ARRAY_BYTES - 4],
+            "every previously published page word remains byte-identical",
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&published[0], 0, 7, 4061).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&published[1], 1, 7, target.mx_frame).unwrap(),
+            Some(4064)
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(&published[1], 1, 9, 4065).unwrap(),
+            None
+        );
+        plan.publish(target).unwrap();
+        assert_eq!(regions[0].lock().to_vec(), published[0]);
+        assert_eq!(regions[1].lock().to_vec(), published[1]);
+        assert!(plan.finish_private_publication());
+        assert_eq!(plan.baseline(), target);
+        assert_eq!(plan.entries, vec![(4065, 9, false)]);
+        assert!(plan.can_extend());
+    }
+
+    #[test]
+    fn test_shared_append_plan_exact_partial_header_retry_and_foreign_header_refusal() {
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut baseline = shared_header_fixture(512, 0);
+        baseline.mx_frame = 0;
+        baseline.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &baseline).unwrap();
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 0,
+            salts: crate::WalSalts {
+                salt1: baseline.a_salt[0],
+                salt2: baseline.a_salt[1],
+            },
+        };
+        let mut plan = SharedWalIndexAppendPlan::prepare(
+            baseline,
+            generation,
+            vec![(0, region.share())],
+            vec![(1, 7, true), (2, 7, true)],
+        )
+        .unwrap();
+        let mut target = baseline;
+        target.mx_frame = 2;
+        target.i_change = 2;
+        target.update_checksum().unwrap();
+        // Controlled interruption: replay an owned partial mapping installation.
+        plan.phase = SharedWalPublicationPhase::InstallingMappings;
+        append_shared_wal_index_entry(&region, 1, 7).unwrap();
+        plan.publish(target).unwrap();
+        let published = region.lock().to_vec();
+        // Controlled interruption after copy two, with the exact retained plan.
+        plan.phase = SharedWalPublicationPhase::PublishingHeaders;
+        write_shared_header_copy(&region, 0, &baseline.to_bytes()).unwrap();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), None);
+        plan.publish(target).unwrap();
+        assert_eq!(region.lock().to_vec(), published);
+        assert!(!plan.finish_private_publication());
+        let mut stale = SharedWalIndexAppendPlan::prepare(
+            target,
+            generation,
+            vec![(0, region.share())],
+            vec![(3, 9, true)],
+        )
+        .unwrap();
+        let mut foreign = target;
+        foreign.i_change += 1;
+        foreign.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &foreign).unwrap();
+        let foreign_bytes = region.lock().to_vec();
+        let mut next = target;
+        next.mx_frame = 3;
+        next.i_change += 1;
+        next.update_checksum().unwrap();
+        assert!(stale.publish(next).is_err());
+        assert_eq!(region.lock().to_vec(), foreign_bytes);
+    }
+
+    #[test]
+    fn test_shared_append_plan_preflight_refuses_missing_region_and_invalid_entries() {
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut baseline = shared_header_fixture(4096, 0);
+        baseline.mx_frame = 4062;
+        baseline.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &baseline).unwrap();
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 0,
+            salts: crate::WalSalts {
+                salt1: baseline.a_salt[0],
+                salt2: baseline.a_salt[1],
+            },
+        };
+        let before = region.lock().to_vec();
+        for entries in [
+            vec![(4063, 9, true)],
+            vec![(4064, 9, true)],
+            vec![(4063, 0, true)],
+            vec![],
+        ] {
+            assert!(
+                SharedWalIndexAppendPlan::prepare(
+                    baseline,
+                    generation,
+                    vec![(0, region.share())],
+                    entries,
+                )
+                .is_err()
+            );
+            assert_eq!(region.lock().to_vec(), before);
+        }
     }
 
     #[test]

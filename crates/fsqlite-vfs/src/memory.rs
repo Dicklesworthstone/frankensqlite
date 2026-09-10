@@ -924,6 +924,10 @@ impl Drop for MemoryFile {
 }
 
 impl VfsFile for MemoryFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.restore_external_wal_append_attempt(cx)?;
         self.restore_external_shared_snapshot_attempt(cx)?;
@@ -1173,6 +1177,12 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        // Memory append ownership is bookkeeping, without a physical WRITE lock.
+        Err(FrankenError::Unsupported)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         if self.external_wal_append_prior_level.is_some() {
@@ -1231,6 +1241,15 @@ impl VfsFile for MemoryFile {
             self.acquire_external_maintenance_wal_slot(cx, WAL_CKPT_LOCK)?;
         }
         self.lock(cx, LockLevel::Exclusive)
+    }
+
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        // Native WAL-index recovery requires excluding physical appenders.
+        // MemoryVfs writers deliberately do not participate in writer SHM
+        // locking, so this native capability cannot be claimed here. Its
+        // private in-memory WAL index remains independent of this operation.
+        Err(FrankenError::Unsupported)
     }
 
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
@@ -2576,6 +2595,52 @@ mod tests {
     }
 
     #[test]
+    fn external_wal_recovery_refusal_preserves_memory_state() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("recovery_refusal.db")), flags)
+            .unwrap();
+        file.write(&cx, b"unchanged", 0).unwrap();
+        for baseline in [LockLevel::None, LockLevel::Shared, LockLevel::Reserved] {
+            file.lock(&cx, baseline).unwrap();
+            assert!(matches!(
+                file.owns_external_wal_append_write(&cx),
+                Err(FrankenError::Unsupported)
+            ));
+            assert!(matches!(
+                file.lock_external_wal_recovery(&cx),
+                Err(FrankenError::Unsupported)
+            ));
+            file.restore_external_maintenance_attempt(&cx).unwrap();
+            assert_eq!(file.lock_level, baseline);
+            assert!(file.external_maintenance_attempt.is_none());
+            assert!(file.external_shared_snapshot_prior_level.is_none());
+            assert!(file.external_wal_append_prior_level.is_none());
+            assert!(file.shm_info.is_none());
+            let mut bytes = [0_u8; 9];
+            assert_eq!(file.read(&cx, &mut bytes, 0).unwrap(), bytes.len());
+            assert_eq!(&bytes, b"unchanged");
+            file.unlock(&cx, LockLevel::None).unwrap();
+        }
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(matches!(
+            file.owns_external_wal_append_write(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert!(matches!(
+            file.lock_external_wal_recovery(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_maintenance_attempt.is_none());
+        assert!(file.shm_info.is_none());
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
     fn external_wal_append_does_not_serialize_memory_writers() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -2595,6 +2660,22 @@ mod tests {
 
         first.lock_external_wal_append(&cx).unwrap();
         second.lock_external_wal_append(&cx).unwrap();
+        for writer in [&mut first, &mut second] {
+            assert!(matches!(
+                writer.owns_external_wal_append_write(&cx),
+                Err(FrankenError::Unsupported)
+            ));
+            assert!(matches!(
+                writer.lock_external_wal_recovery(&cx),
+                Err(FrankenError::Unsupported)
+            ));
+            assert_eq!(
+                writer.external_wal_append_prior_level,
+                Some(LockLevel::None)
+            );
+            assert!(writer.external_maintenance_attempt.is_none());
+            writer.restore_external_maintenance_attempt(&cx).unwrap();
+        }
         assert_eq!(first.lock_level, LockLevel::Reserved);
         assert_eq!(second.lock_level, LockLevel::Reserved);
         assert!(first.shm_info.is_none());

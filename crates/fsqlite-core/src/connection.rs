@@ -4840,13 +4840,22 @@ where
         #[cfg(all(feature = "native", any(unix, windows)))]
         pager.namespace_binding(),
     );
+    #[cfg(all(feature = "native", unix))]
+    let adapter = {
+        let mut adapter = adapter;
+        if !pager.vfs_handle().is_memory() {
+            adapter.attach_wal_index_shm_source(pager.wal_index_shm_source()?)?;
+        }
+        adapter
+    };
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
             let adapter = adapter.into_inner();
-            // GH #187: consuming the adapter fails closed while staged,
-            // unpublished frames remain. This is a cleanup path for an error
-            // already in flight, so skip the close rather than mask `err`.
+            // This adapter was constructed immediately above. Rejected
+            // installation never calls its methods, so it has no append or
+            // publication owner and extraction succeeds. General extraction
+            // callers must retain the returned adapter on refusal.
             if let Ok(wal) = adapter.into_inner() {
                 let _ = wal.close(cx);
             }
@@ -4875,10 +4884,19 @@ where
         });
     }
     let adapter = WalBackendAdapter::new(wal);
+    #[cfg(all(feature = "native", unix))]
+    let adapter = {
+        let mut adapter = adapter;
+        if !pager.vfs_handle().is_memory() {
+            adapter.attach_wal_index_shm_source(pager.wal_index_shm_source()?)?;
+        }
+        adapter
+    };
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
-            // GH #187: see above — fail closed without masking `err`.
+            // As above, rejected installation returns the untouched fresh
+            // adapter; no append owner can be lost by this cleanup branch.
             if let Ok(wal) = adapter.into_inner() {
                 let _ = wal.close(cx);
             }
@@ -4901,6 +4919,37 @@ async fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<b
     Ok(fsqlite_wal::wal_header_treated_as_empty(&header_buf))
 }
 
+async fn open_valid_wal_for_install<V: Vfs>(
+    vfs: &V,
+    cx: &Cx,
+    wal_path: &Path,
+) -> Result<Option<WalFile<V::File>>> {
+    if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
+        if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+            if wal_sidecar_treated_as_empty(cx, &file).await? {
+                // GH #292: stock SQLite (`walIndexRecover`) treats a WAL whose
+                // header fails magic/page-size/checksum validation as EMPTY —
+                // e.g. a torn or garbage sidecar left by a killed process —
+                // and proceeds against the main database. This observation
+                // does not authorize replacement: the initializer repeats it
+                // under whole-image maintenance before creating a generation.
+                tracing::warn!(
+                    wal_path = %wal_path.display(),
+                    "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
+                );
+                let _ = file.close(cx);
+            } else {
+                return WalFile::open(cx, file).await.map(Some);
+            }
+        } else {
+            let _ = file.close(cx);
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) async fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
@@ -4911,43 +4960,26 @@ where
     V: Vfs + Send + Sync + 'static,
     V::File: Send + Sync + 'static,
 {
-    if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
-        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
-        let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
-        if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
-            if wal_sidecar_treated_as_empty(cx, &file).await? {
-                // GH #292: stock SQLite (`walIndexRecover`) treats a WAL whose
-                // header fails magic/page-size/checksum validation as EMPTY —
-                // e.g. a torn or garbage sidecar left by a killed process —
-                // and proceeds against the main database. Hard-failing here
-                // made FrankenSQLite refuse databases that native SQLite
-                // reports as fully consistent. Discard the unusable sidecar
-                // and fall through to a fresh WAL generation; fresh random
-                // salts guarantee no stale tail frame can ever validate.
-                tracing::warn!(
-                    wal_path = %wal_path.display(),
-                    "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
-                );
-                let _ = file.close(cx);
-            } else {
-                match WalFile::open(cx, file).await {
-                    Ok(wal) => {
-                        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        } else {
-            let _ = file.close(cx);
-        }
+    if let Some(wal) = open_valid_wal_for_install(&vfs, cx, wal_path).await? {
+        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
     }
-
-    let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-    let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
-    // Random salts (GH #201): a fresh WAL generation must not validate
-    // frames from any stale or copied WAL of a previous generation.
-    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate()).await?;
-    install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
+    let mut state = (vfs, wal_path.to_path_buf(), pager.page_size().get());
+    let wal = pager
+        .with_wal_initialization(cx, &mut state, |cx, (vfs, path, page_size)| {
+            Box::pin(async move {
+                if let Some(wal) = open_valid_wal_for_install(vfs, cx, path).await? {
+                    return Ok(wal);
+                }
+                let create_flags =
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+                let (file, _) = vfs.open(cx, Some(path), create_flags)?;
+                // Random salts (GH #201) exclude frames from prior generations.
+                // Both the final inspection and physical creation are fenced.
+                WalFile::create(cx, file, *page_size, 0, WalSalts::generate()).await
+            })
+        })
+        .await?;
+    install_opened_wal_backend(pager, cx, state.0, wal_path, wal, true)
 }
 
 async fn install_existing_wal_backend_with_vfs<V>(
@@ -14355,6 +14387,12 @@ impl Connection {
                 conn.apply_current_journal_mode_to_pager_readonly().await?;
             }
             conn.apply_current_synchronous_to_pager()?;
+            // Bind/recover native WAL state while the exact bootstrap Open
+            // lease is still available, before schema loading begins a read.
+            #[cfg(all(feature = "native", unix))]
+            if !conn.pager.is_memory() {
+                conn.pager.refresh_published_snapshot(&op_cx).await?;
+            }
             // Explicitly load schema only — never hydrate row data.
             conn.reload_memdb_from_pager_with_mode(&op_cx, false)
                 .await?;
@@ -14899,6 +14937,10 @@ impl Connection {
             conn.apply_cache_size_to_pager(conn.pragma_state.borrow().cache_size)?;
             conn.apply_current_journal_mode_to_pager().await?;
             conn.apply_current_synchronous_to_pager()?;
+            #[cfg(all(feature = "native", unix))]
+            if !conn.pager.is_memory() {
+                conn.pager.refresh_published_snapshot(&op_cx).await?;
+            }
             // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
             // Fresh private `:memory:` opens start from the same empty MemDatabase
             // state that an empty page-1 reload would produce, so avoid the pager
@@ -201300,6 +201342,8 @@ mod tests {
     struct ReadWriteWalInstallProbeVfs {
         inner: MemoryVfs,
         readonly_open_attempted: Arc<std::sync::atomic::AtomicBool>,
+        refuse_readwrite_wal: bool,
+        hide_existing_wal_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Vfs for ReadOnlyWalProbeVfs {
@@ -201361,6 +201405,14 @@ mod tests {
     }
 
     impl VfsFile for ReadOnlyWalProbeFile {
+        fn wal_reader_mark_exclusive_acquire(
+            &mut self,
+            _: &Cx,
+            _: u32,
+        ) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _cx: &Cx) -> std::result::Result<(), FrankenError> {
             Ok(())
         }
@@ -201432,7 +201484,21 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(
+            &self,
+            _cx: &Cx,
+        ) -> std::result::Result<bool, FrankenError> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(
+            &mut self,
+            _cx: &Cx,
+        ) -> std::result::Result<(), FrankenError> {
             Err(FrankenError::Unsupported)
         }
 
@@ -201514,7 +201580,10 @@ mod tests {
                 self.readonly_open_attempted
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            if is_wal_path && flags.contains(VfsOpenFlags::READWRITE) {
+            if is_wal_path
+                && self.refuse_readwrite_wal
+                && flags.contains(VfsOpenFlags::READWRITE)
+            {
                 return Err(FrankenError::CannotOpen {
                     path: resolved.to_path_buf(),
                 });
@@ -201537,8 +201606,17 @@ mod tests {
             path: &Path,
             flags: AccessFlags,
         ) -> std::result::Result<bool, FrankenError> {
-            if path == Path::new("/install-probe.db-wal") && flags == AccessFlags::READWRITE {
-                return Ok(false);
+            if path == Path::new("/install-probe.db-wal") {
+                if flags == AccessFlags::READWRITE && self.refuse_readwrite_wal {
+                    return Ok(false);
+                }
+                if flags == AccessFlags::EXISTS
+                    && self
+                        .hide_existing_wal_once
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(false);
+                }
             }
             self.inner.access(cx, path, flags)
         }
@@ -201591,6 +201669,62 @@ mod tests {
                 wal.page_size(),
                 usize::try_from(requested_page_size.get()).unwrap()
             );
+        });
+    }
+
+    #[test]
+    fn test_install_wal_backend_rechecks_absence_before_replacing_peer_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ReadWriteWalInstallProbeVfs {
+                inner: MemoryVfs::new(),
+                readonly_open_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                refuse_readwrite_wal: false,
+                hide_existing_wal_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let pager = Arc::new(
+                SimplePager::open_with_cx(
+                    &cx,
+                    vfs.clone(),
+                    Path::new("/install-probe.db"),
+                    PageSize::DEFAULT,
+                )
+                .await
+                .unwrap(),
+            );
+            let wal_path = wal_path_for_db_path("/install-probe.db");
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+            let (file, _) = vfs.inner.open(&cx, Some(&wal_path), flags).unwrap();
+            let salts = fsqlite_wal::WalSalts { salt1: 17, salt2: 29 };
+            let mut wal = fsqlite_wal::WalFile::create(
+                &cx,
+                file,
+                PageSize::DEFAULT.get(),
+                0,
+                salts,
+            )
+            .await
+            .unwrap();
+            let page = vec![0x6d; PageSize::DEFAULT.as_usize()];
+            wal.append_frame(&cx, 1, &page, 1).await.unwrap();
+            wal.close(&cx).unwrap();
+            let (file, _) = vfs.inner.open(&cx, Some(&wal_path), flags).unwrap();
+            let mut before = vec![0; usize::try_from(file.file_size(&cx).unwrap()).unwrap()];
+            assert_eq!(file.read(&cx, &mut before, 0).await.unwrap(), before.len());
+
+            // Model a peer creating this committed generation after our first
+            // absence observation. The next inspection sees its actual bytes.
+            vfs.hide_existing_wal_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
+                .await
+                .expect("recheck must adopt the peer's valid WAL");
+            let mut after = vec![0; usize::try_from(file.file_size(&cx).unwrap()).unwrap()];
+            assert_eq!(file.read(&cx, &mut after, 0).await.unwrap(), after.len());
+            assert_eq!(after, before, "initial absence cannot authorize replacement");
+            let reopened = fsqlite_wal::WalFile::open(&cx, file).await.unwrap();
+            assert_eq!(reopened.frame_count(), 1);
+            assert_eq!(reopened.header().salts, salts);
         });
     }
 
@@ -201717,6 +201851,8 @@ mod tests {
             let vfs = ReadWriteWalInstallProbeVfs {
                 inner: MemoryVfs::new(),
                 readonly_open_attempted: Arc::clone(&readonly_open_attempted),
+                refuse_readwrite_wal: true,
+                hide_existing_wal_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             let db_path = Path::new("/install-probe.db");
             let pager = Arc::new(
@@ -207633,6 +207769,51 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
+        fn native_recovery_required(&self) -> Option<fsqlite_pager::traits::WalNativeRecoveryReason> {
+            self.inner.native_recovery_required()
+        }
+
+        fn preflight_native_append<'a>(&'a mut self, cx: &'a Cx) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.preflight_native_append(cx)
+        }
+
+        fn native_reader_required(&self) -> bool {
+            self.inner.native_reader_required()
+        }
+
+        fn native_read_binding(&self) -> Option<fsqlite_pager::traits::WalNativeReadBinding> {
+            self.inner.native_read_binding()
+        }
+
+        fn begin_native_read<'a>(
+            &'a mut self, cx: &'a Cx, binding: fsqlite_pager::traits::WalNativeReadBinding,
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::WalNativeReadOutcome> {
+            self.inner.begin_native_read(cx, binding)
+        }
+
+        fn end_native_read(&mut self, token: &fsqlite_pager::traits::WalNativeReadToken) -> Result<()> {
+            self.inner.end_native_read(token)
+        }
+
+        fn recover_native_read_state<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            reason: fsqlite_pager::traits::WalNativeRecoveryReason,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.recover_native_read_state(cx, reason).await })
+        }
+
+        fn checkpoint_recovery_pending(&self) -> bool {
+            self.inner.checkpoint_recovery_pending()
+        }
+
+        fn reconcile_checkpoint_reset<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.reconcile_checkpoint_reset(cx).await })
+        }
+
         fn validate_empty_wal_for_retirement<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -207887,6 +208068,51 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
+        fn native_recovery_required(&self) -> Option<fsqlite_pager::traits::WalNativeRecoveryReason> {
+            self.inner.native_recovery_required()
+        }
+
+        fn preflight_native_append<'a>(&'a mut self, cx: &'a Cx) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            self.inner.preflight_native_append(cx)
+        }
+
+        fn native_reader_required(&self) -> bool {
+            self.inner.native_reader_required()
+        }
+
+        fn native_read_binding(&self) -> Option<fsqlite_pager::traits::WalNativeReadBinding> {
+            self.inner.native_read_binding()
+        }
+
+        fn begin_native_read<'a>(
+            &'a mut self, cx: &'a Cx, binding: fsqlite_pager::traits::WalNativeReadBinding,
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::WalNativeReadOutcome> {
+            self.inner.begin_native_read(cx, binding)
+        }
+
+        fn end_native_read(&mut self, token: &fsqlite_pager::traits::WalNativeReadToken) -> Result<()> {
+            self.inner.end_native_read(token)
+        }
+
+        fn recover_native_read_state<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            reason: fsqlite_pager::traits::WalNativeRecoveryReason,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.recover_native_read_state(cx, reason).await })
+        }
+
+        fn checkpoint_recovery_pending(&self) -> bool {
+            self.inner.checkpoint_recovery_pending()
+        }
+
+        fn reconcile_checkpoint_reset<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.reconcile_checkpoint_reset(cx).await })
+        }
+
         fn validate_empty_wal_for_retirement<'a>(
             &'a mut self,
             cx: &'a Cx,

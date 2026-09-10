@@ -37,6 +37,8 @@ struct MmapBacking {
     ptr: *mut u8,
     len: usize,
     mutex: Mutex<()>,
+    // Field destruction follows Drop::drop, so this owner outlives munmap.
+    lifetime: Option<Box<dyn Send + Sync>>,
 }
 
 #[cfg(unix)]
@@ -256,8 +258,24 @@ impl ShmRegion {
                 ptr,
                 len,
                 mutex: Mutex::new(()),
+                lifetime: None,
             })),
         }
+    }
+
+    /// Attach the native file/lock lifetime to a fresh, uniquely owned mapping.
+    /// The owner's destructor runs only after the final alias is unmapped.
+    #[cfg(unix)]
+    pub(crate) fn retain_mmap_lifetime(&mut self, lifetime: Box<dyn Send + Sync>) {
+        let ShmRegionBacking::Mmap(backing) = &mut self.backing else {
+            unreachable!("only a native mapping may retain a native lifetime");
+        };
+        let backing = Arc::get_mut(backing).expect("fresh mapping must be uniquely owned");
+        assert!(
+            backing.lifetime.is_none(),
+            "mapping lifetime is installed once"
+        );
+        backing.lifetime = Some(lifetime);
     }
 
     /// Return an aliased view of this region — a handle that shares the

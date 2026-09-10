@@ -4919,6 +4919,10 @@ mod tests {
     }
 
     impl VfsFile for ControlledReadFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
@@ -5020,7 +5024,15 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
 
@@ -5123,6 +5135,10 @@ mod tests {
     }
 
     impl VfsFile for ControlledWritebackFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
@@ -5182,7 +5198,15 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
 
