@@ -53,6 +53,12 @@ impl VfsFile for DemoFile {
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
+    fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+    fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
     fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
         Err(FrankenError::Unsupported)
     }

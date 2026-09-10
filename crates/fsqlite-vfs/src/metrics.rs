@@ -390,6 +390,28 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         )
     }
 
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "lock_external_wal_append",
+            &*self.path,
+            LockLevel::Reserved,
+            self.inner.lock_external_wal_append(cx)
+        )
+    }
+
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        GLOBAL_VFS_METRICS
+            .unlock_ops
+            .fetch_add(1, Ordering::Relaxed);
+        vfs_trace_lock!(
+            "restore_external_wal_append_attempt",
+            &*self.path,
+            LockLevel::None,
+            self.inner.restore_external_wal_append_attempt(cx)
+        )
+    }
+
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
         GLOBAL_VFS_METRICS.lock_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_lock!(
@@ -586,6 +608,14 @@ mod tests {
         }
 
         fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
             Ok(())
         }
 

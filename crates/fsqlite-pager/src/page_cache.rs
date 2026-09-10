@@ -5020,6 +5020,14 @@ mod tests {
             Ok(())
         }
 
+        fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
         fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
@@ -5171,6 +5179,14 @@ mod tests {
         }
 
         fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
 
@@ -6499,8 +6515,7 @@ mod tests {
     #[test]
     fn test_sharded_page_cache_s3_fifo_adaptive_reports_real_queue_metrics_bd_86ct9() {
         for fast_path in [true, false] {
-            let mut cache =
-                ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 1);
+            let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 1);
             if fast_path {
                 cache.enable_fast_path();
             }

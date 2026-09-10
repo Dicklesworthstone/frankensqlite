@@ -10,9 +10,9 @@
 //! [`VfsFile`]: crate::traits::VfsFile
 
 use std::ops::{Deref, DerefMut, Range};
-#[cfg(unix)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fsqlite_error::{FrankenError, Result};
@@ -53,8 +53,10 @@ impl Drop for MmapBacking {
 
 // SAFETY: The mmap region is backed by a `MAP_SHARED` file mapping.
 // Multiple processes/threads can safely access it via the POSIX shared memory
-// contract (coordinated by fcntl locks and memory barriers). The raw pointer
-// is only dereferenced through the `ShmRegionGuard` which holds a mutex lock.
+// contract (coordinated by fcntl locks and memory barriers). Byte guards and
+// atomic accesses hold the same backing mutex, so local aliases cannot race
+// non-atomic or mixed-width accesses. Independent mappings must obey the
+// access protocol required by `ShmRegion::from_mmap`.
 #[cfg(unix)]
 unsafe impl Send for MmapBacking {}
 #[cfg(unix)]
@@ -195,6 +197,19 @@ pub const fn wal_lock_byte(slot: u32) -> Option<u64> {
 /// - **Mmap** (Unix only): `MAP_SHARED` mapping of the `*-shm` file. Changes
 ///   are visible across processes. Coordinated by `fcntl` locks and memory
 ///   barriers (`shm_barrier`).
+///
+/// # Atomic access protocol
+///
+/// All byte and atomic accesses through handles sharing one backing hold
+/// the same mutex. This also serializes overlapping accesses of different
+/// widths through those handles. The mutex does not cover independent
+/// mappings or other processes: their concurrent accesses to a written field
+/// must use the same atomic width and byte range, or be externally synchronized.
+/// In particular, a `u16` hash slot must not race an overlapping `u32`/`u64`
+/// access or a byte-slice write. Read-only accesses may overlap.
+///
+/// These scalar operations do not provide a coherent multi-field snapshot
+/// or implement WAL-index publication; the caller still owns that protocol.
 #[derive(Debug, Clone)]
 pub struct ShmRegion {
     len: usize,
@@ -230,6 +245,9 @@ impl ShmRegion {
     /// - The mapped region must be exactly `len` bytes.
     /// - The caller must not `munmap` the region; `ShmRegion` will do it on
     ///   drop (when all clones are dropped).
+    /// - Access through independent mappings or raw pointers must obey the
+    ///   atomic access protocol above: conflicting non-atomic accesses and
+    ///   partially overlapping atomic accesses require synchronization.
     #[cfg(unix)]
     pub unsafe fn from_mmap(ptr: *mut u8, len: usize) -> Self {
         Self {
@@ -396,6 +414,170 @@ impl ShmRegion {
         let range = self.checked_range(offset, 8, guard.len(), "SHM u64 LE write")?;
         guard[range].copy_from_slice(&val.to_le_bytes());
         Ok(())
+    }
+
+    /// Atomically load a native-endian `u32` at the given byte offset.
+    ///
+    /// Heap-backed regions emulate the atomic through the region mutex.
+    /// Mmap-backed regions use `AtomicU32` while holding that same mutex for
+    /// local aliases. Independent mappings must follow the region's atomic
+    /// access protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 4-byte aligned,
+    /// would overflow, or exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Mmap-backed loads panic for `Release` or `AcqRel` ordering, like
+    /// `AtomicU32::load`.
+    pub fn atomic_load_u32_ne(&self, offset: usize, ordering: Ordering) -> Result<u32> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u32_offset(offset, guard.len())?;
+                let bytes: [u8; 4] = guard[range].try_into().expect("slice is exactly 4 bytes");
+                Ok(u32::from_ne_bytes(bytes))
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u32_offset(offset, m.len)?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: Bounds/alignment were checked; the backing owns the
+                // mapping and its mutex excludes local conflicting accesses.
+                Ok(unsafe { atomic_u32_at(m, offset) }.load(ordering))
+            }
+        }
+    }
+
+    /// Atomically store a native-endian `u32` at the given byte offset.
+    ///
+    /// Uses the same backing and access protocol as [`Self::atomic_load_u32_ne`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 4-byte aligned,
+    /// would overflow, or exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Mmap-backed stores panic for `Acquire` or `AcqRel` ordering, like
+    /// `AtomicU32::store`.
+    pub fn atomic_store_u32_ne(&self, offset: usize, val: u32, ordering: Ordering) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u32_offset(offset, guard.len())?;
+                guard[range].copy_from_slice(&val.to_ne_bytes());
+                Ok(())
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u32_offset(offset, m.len)?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: Bounds/alignment were checked; the backing owns the
+                // mapping and its mutex excludes local conflicting accesses.
+                unsafe { atomic_u32_at(m, offset) }.store(val, ordering);
+                Ok(())
+            }
+        }
+    }
+
+    /// Atomically load a native-endian `u16` at the given byte offset.
+    ///
+    /// Heap-backed regions emulate the atomic through the region mutex.
+    /// Mmap-backed regions use `AtomicU16` while holding that same mutex for
+    /// local aliases. Independent mappings must follow the region's atomic
+    /// access protocol, including fixed-width access to WAL-index hash slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 2-byte aligned,
+    /// would overflow, or exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Mmap-backed loads panic for `Release` or `AcqRel` ordering, like
+    /// `AtomicU16::load`.
+    pub fn atomic_load_u16_ne(&self, offset: usize, ordering: Ordering) -> Result<u16> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u16_offset(offset, guard.len())?;
+                let bytes: [u8; 2] = guard[range].try_into().expect("slice is exactly 2 bytes");
+                Ok(u16::from_ne_bytes(bytes))
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u16_offset(offset, m.len)?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: Bounds/alignment were checked; the backing owns the
+                // mapping and its mutex excludes local conflicting accesses.
+                Ok(unsafe { atomic_u16_at(m, offset) }.load(ordering))
+            }
+        }
+    }
+
+    /// Atomically store a native-endian `u16` at the given byte offset.
+    ///
+    /// Uses the same backing and access protocol as [`Self::atomic_load_u16_ne`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 2-byte aligned,
+    /// would overflow, or exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Mmap-backed stores panic for `Acquire` or `AcqRel` ordering, like
+    /// `AtomicU16::store`.
+    pub fn atomic_store_u16_ne(&self, offset: usize, val: u16, ordering: Ordering) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u16_offset(offset, guard.len())?;
+                guard[range].copy_from_slice(&val.to_ne_bytes());
+                Ok(())
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u16_offset(offset, m.len)?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: Bounds/alignment were checked; the backing owns the
+                // mapping and its mutex excludes local conflicting accesses.
+                unsafe { atomic_u16_at(m, offset) }.store(val, ordering);
+                Ok(())
+            }
+        }
     }
 
     /// Atomically load a little-endian `u64` at the given byte offset.
@@ -650,6 +832,26 @@ impl ShmRegion {
         Self::checked_range_for_len(offset, width, self.len.min(actual_len), what)
     }
 
+    fn checked_aligned_u32_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
+        if !offset.is_multiple_of(4) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u32 access".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        self.checked_range(offset, 4, actual_len, "SHM atomic u32 access")
+    }
+
+    fn checked_aligned_u16_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
+        if !offset.is_multiple_of(2) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u16 access".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        self.checked_range(offset, 2, actual_len, "SHM atomic u16 access")
+    }
+
     fn checked_aligned_u64_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
         if !offset.is_multiple_of(std::mem::align_of::<u64>()) {
             return Err(FrankenError::OutOfRange {
@@ -680,6 +882,24 @@ impl ShmRegion {
         }
         Ok(offset..end)
     }
+}
+
+#[cfg(unix)]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn atomic_u32_at(backing: &MmapBacking, offset: usize) -> &AtomicU32 {
+    // SAFETY: Callers hold the backing mutex and validate 4-byte alignment and
+    // bounds. mmap supplies a page-aligned base; the borrow keeps it mapped.
+    // The atomic reference never escapes the caller's locked operation.
+    unsafe { &*backing.ptr.add(offset).cast::<AtomicU32>() }
+}
+
+#[cfg(unix)]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn atomic_u16_at(backing: &MmapBacking, offset: usize) -> &AtomicU16 {
+    // SAFETY: Callers hold the backing mutex and validate 2-byte alignment and
+    // bounds. mmap supplies a page-aligned base; the borrow keeps it mapped.
+    // The atomic reference never escapes the caller's locked operation.
+    unsafe { &*backing.ptr.add(offset).cast::<AtomicU16>() }
 }
 
 #[cfg(unix)]
@@ -804,6 +1024,212 @@ mod tests {
             Ok(42)
         );
         assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst).unwrap(), 99);
+    }
+
+    #[test]
+    fn test_shm_region_atomic_native_bytes_and_aliases() {
+        let region = ShmRegion::from_vec(vec![0xA5; 16]);
+        let shared = region.share();
+        region
+            .atomic_store_u32_ne(0, 0x1234_5678, Ordering::Release)
+            .unwrap();
+        shared
+            .atomic_store_u16_ne(6, 0x9ABC, Ordering::Release)
+            .unwrap();
+        region
+            .atomic_store_u32_ne(12, u32::MAX, Ordering::SeqCst)
+            .unwrap();
+        assert_eq!(
+            shared.atomic_load_u32_ne(0, Ordering::Acquire).unwrap(),
+            0x1234_5678
+        );
+        assert_eq!(
+            region.atomic_load_u16_ne(6, Ordering::Acquire).unwrap(),
+            0x9ABC
+        );
+        let mut expected = [0xA5; 16];
+        expected[..4].copy_from_slice(&0x1234_5678_u32.to_ne_bytes());
+        expected[6..8].copy_from_slice(&0x9ABC_u16.to_ne_bytes());
+        expected[12..].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(&*region.lock(), &expected);
+
+        let copied = region.clone();
+        shared.atomic_store_u32_ne(0, 0, Ordering::Relaxed).unwrap();
+        shared
+            .atomic_store_u16_ne(14, u16::MAX, Ordering::Relaxed)
+            .unwrap();
+        assert_eq!(region.atomic_load_u32_ne(0, Ordering::Relaxed).unwrap(), 0);
+        assert_eq!(
+            copied.atomic_load_u32_ne(0, Ordering::Relaxed).unwrap(),
+            0x1234_5678
+        );
+        assert_eq!(
+            region.atomic_load_u16_ne(14, Ordering::Relaxed).unwrap(),
+            u16::MAX
+        );
+        shared
+            .atomic_store_u16_ne(14, 0, Ordering::Relaxed)
+            .unwrap();
+        assert_eq!(region.atomic_load_u16_ne(14, Ordering::Relaxed).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_shm_region_atomic_native_bad_offsets_preserve_bytes() {
+        let region = ShmRegion::from_vec(vec![0xA5; 14]);
+        for offset in [1, 2, 12, usize::MAX - 3] {
+            assert!(matches!(
+                region.atomic_load_u32_ne(offset, Ordering::SeqCst),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert!(matches!(
+                region.atomic_store_u32_ne(offset, 0, Ordering::SeqCst),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+        }
+        for offset in [1, 13, 14, usize::MAX - 1] {
+            assert!(matches!(
+                region.atomic_load_u16_ne(offset, Ordering::SeqCst),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert!(matches!(
+                region.atomic_store_u16_ne(offset, 0, Ordering::SeqCst),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+        }
+        assert_eq!(&*region.lock(), &[0xA5; 14]);
+        region.atomic_store_u32_ne(8, 0, Ordering::SeqCst).unwrap();
+        region.atomic_store_u16_ne(12, 0, Ordering::SeqCst).unwrap();
+        let empty = ShmRegion::new(0);
+        assert!(empty.atomic_load_u32_ne(0, Ordering::Relaxed).is_err());
+        assert!(empty.atomic_store_u32_ne(0, 0, Ordering::Relaxed).is_err());
+        assert!(empty.atomic_load_u16_ne(0, Ordering::Relaxed).is_err());
+        assert!(empty.atomic_store_u16_ne(0, 0, Ordering::Relaxed).is_err());
+    }
+
+    #[test]
+    fn test_shm_region_atomic_native_shared_resize_bounds() {
+        let mut region = ShmRegion::new(4);
+        let shared = region.share();
+        region.try_resize_heap(8).unwrap();
+        region
+            .atomic_store_u32_ne(4, u32::MAX, Ordering::SeqCst)
+            .unwrap();
+        assert!(shared.atomic_load_u32_ne(4, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_store_u32_ne(4, 0, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_load_u16_ne(4, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_store_u16_ne(4, 0, Ordering::SeqCst).is_err());
+
+        region.try_resize_heap(2).unwrap();
+        assert!(shared.atomic_load_u32_ne(0, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_store_u32_ne(0, 0, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_load_u16_ne(2, Ordering::SeqCst).is_err());
+        assert!(shared.atomic_store_u16_ne(2, 0, Ordering::SeqCst).is_err());
+        shared
+            .atomic_store_u16_ne(0, u16::MAX, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            region.atomic_load_u16_ne(0, Ordering::Acquire).unwrap(),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn test_shm_region_atomic_native_shared_mixed_width_serialization() {
+        let region = ShmRegion::new(8);
+        let word = region.share();
+        let half = region.share();
+        // Partial overlap is valid here because both handles hold the same
+        // backing mutex. This does not model independently mapped peers.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1_000 {
+                    word.atomic_store_u32_ne(0, 0x1234_5678, Ordering::Relaxed)
+                        .unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..1_000 {
+                    half.atomic_store_u16_ne(0, 0x9ABC, Ordering::Relaxed)
+                        .unwrap();
+                }
+            });
+        });
+        let mut overlaid = 0x1234_5678_u32.to_ne_bytes();
+        overlaid[..2].copy_from_slice(&0x9ABC_u16.to_ne_bytes());
+        let observed = region.atomic_load_u32_ne(0, Ordering::Acquire).unwrap();
+        assert!(observed == 0x1234_5678 || observed == u32::from_ne_bytes(overlaid));
+        assert_eq!(&region.lock()[4..], &[0; 4]);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shm_region_atomic_native_mmap_aliases_and_boundaries() {
+        use crate::traits::{Vfs, VfsFile};
+        use crate::unix::UnixVfs;
+        use fsqlite_types::cx::Cx;
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-atomics.db");
+        let cx = Cx::new();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = UnixVfs::new().open(&cx, Some(&path), flags).unwrap();
+        let region = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        assert!(region.is_mmap_backed());
+        let shared = region.share();
+        let cloned = region.clone();
+        let end = region.len();
+        region
+            .atomic_store_u32_ne(end - 4, 0x1234_5678, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            shared
+                .atomic_load_u32_ne(end - 4, Ordering::Acquire)
+                .unwrap(),
+            0x1234_5678
+        );
+        cloned
+            .atomic_store_u16_ne(end - 2, 0x9ABC, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            region
+                .atomic_load_u16_ne(end - 2, Ordering::Acquire)
+                .unwrap(),
+            0x9ABC
+        );
+        let mut expected = 0x1234_5678_u32.to_ne_bytes();
+        expected[2..].copy_from_slice(&0x9ABC_u16.to_ne_bytes());
+        assert_eq!(&region.lock()[end - 4..], &expected);
+        let bytes = std::fs::read(dir.path().join("native-atomics.db-shm")).unwrap();
+        assert_eq!(&bytes[end - 4..end], &expected);
+        for offset in [1, end - 2, end, usize::MAX - 3] {
+            assert!(region.atomic_load_u32_ne(offset, Ordering::SeqCst).is_err());
+            assert!(
+                region
+                    .atomic_store_u32_ne(offset, 0, Ordering::SeqCst)
+                    .is_err()
+            );
+        }
+        for offset in [1, end - 1, end, usize::MAX - 1] {
+            assert!(region.atomic_load_u16_ne(offset, Ordering::SeqCst).is_err());
+            assert!(
+                region
+                    .atomic_store_u16_ne(offset, 0, Ordering::SeqCst)
+                    .is_err()
+            );
+        }
+        assert_eq!(&region.lock()[end - 4..], &expected);
+        file.shm_unmap(&cx, false).unwrap();
+        file.close(&cx).unwrap();
+        drop(region);
+        drop(shared);
+        assert_eq!(
+            cloned
+                .atomic_load_u16_ne(end - 2, Ordering::SeqCst)
+                .unwrap(),
+            0x9ABC,
+            "the last alias keeps the mapping alive after VFS unmap and close"
+        );
     }
 
     #[test]

@@ -12,6 +12,49 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-09 - REJECTED: broad S3-FIFO membership-map replacement (GH#402, bd-sde05.3)
+
+- Target: `gh402_measure_residual_schema_matrix`, 50/150/300 empty tables plus
+  indexes, file/memory storage, sequential/batch/transaction DDL, INSERT windows,
+  reopen/first statement and three statistics samples. Candidate changed only
+  the private `S3Fifo` membership map in `crates/fsqlite-pager/src/s3_fifo.rs`
+  from std HashMap to the existing hashbrown dependency. This map serves both
+  statistics reconstruction and actual eviction; queue ordering stays in VecDeque.
+- Evidence: strict RCH on Linux/ext4 vmi1149989, shared worker, test profile,
+  native/json/fts5 features, September 9. Current std baseline 25020 and candidate
+  25068 each passed all four selected tests; 19 scoped input hashes match remote
+  readback and only s3_fifo.rs differs between arms. Candidate source is
+  e2e0ed03633c1c0dc504bc11cfdd65c9e51e349d. Preserved std/candidate ELF SHA-256:
+  `677ec2ccda5e47ac67df5103c3943cab8b5de772537ce86c5494280a4f8cda79` /
+  `85af187c09583deb7d6717a2779ba130f5cea8fbbd391cb3712d4b8b3b48fa95`.
+- Two paired campaigns (RCH 30004650170125071 and 30004650170125105) each ran
+  three warmups and ten measured full matrices per arm, alternating order and
+  reversing the initial order in campaign two. All 52 matrices passed stock
+  result checks. Twelve actual-500-resident statistics groups improved median
+  3.315-5.823x and 3.661-4.445x respectively. Earlier isolated 32-case snapshot
+  comparisons were exact, including fixed/adaptive policies and page contents.
+- The prespecified no-regression gate failed: five non-statistics metric groups
+  and four DDL/INSERT windows exceeded 10% median growth in BOTH campaigns.
+  Memory transaction 50-table schema total grew 23.2% then 12.9%; file batch
+  50-table first-statement sample 2 grew 11.9% then 12.0%. File reopen/INSERT
+  observations have especially large spreads and variable checkpoint work.
+  These shared-worker measurements do not establish the map as their cause,
+  but they do not satisfy the keep gate. Lower overall matrix medians are not
+  a substitute. Sparse-cache residency groups are retained separately rather
+  than compared as equal populations. No release/quiet-host claim is made.
+- Raw logs: `/tmp/frankensqlite-gh402-paired-repeat-rch-20260909.log` and
+  `/tmp/frankensqlite-gh402-paired-repeat2-rch-20260909.log`. Parsed samples,
+  comparison and window-comparison artifacts use the corresponding
+  `/tmp/frankensqlite-gh402-paired*-20260909.json` paths; isolated evidence is
+  `/tmp/frankensqlite-cache-map-comparison-20260909.json`. Both executables are
+  preserved on vmi1149989 outside disposable target pools as
+  `/tmp/frankensqlite-gh402-current-{std,hashbrown}-20260909`.
+- Restore the original std map manually; retain the harness and the separately
+  verified bd-86ct9 adaptive flat-slot metrics guard. Retry only after isolating
+  statistics reconstruction from runtime eviction, or with a controlled paired
+  matrix that resolves every recurring non-statistics regression. GH#402's
+  remaining schema/open/statistics costs stay open.
+
 ## 2026-09-06 - REJECTED: grouped IN short-circuit routing without RHS reuse (bd-0pkki)
 
 - Removing the obsolete aggregate exclusion in `connection.rs` connects the

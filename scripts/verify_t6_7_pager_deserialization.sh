@@ -221,7 +221,7 @@ extract_benchmark_report() {
     capture {print}
   ' "${BENCHMARK_LOG}" > "${BENCHMARK_JSON}"
   if [[ ! -s "${BENCHMARK_JSON}" ]]; then
-    echo "[GATE FAIL] failed to extract publish-window benchmark JSON payload" >&2
+    echo "[GATE FAIL] failed to extract synthetic WAL critical section benchmark JSON payload" >&2
     return 1
   fi
 }
@@ -266,12 +266,45 @@ run_phase \
   rch exec -- env CARGO_TERM_COLOR=never CARGO_TARGET_DIR="/tmp/${RUN_ID_SAFE}_pager_publish_window" cargo test -p fsqlite-pager pager::tests::wal_publish_window_shrink_benchmark_report -- --ignored --exact --nocapture --test-threads=1
 extract_benchmark_report
 
-jq -e '
-  .schema_version == "fsqlite.track_c.publish_window_benchmark.v1"
-  and (.cases | length) >= 1
-  and ([.cases[] | .exclusive_window_hold_candidate.median_ns > 0] | all)
-  and ([.cases[] | .contending_writer_stall_candidate.median_ns > 0] | all)
-' "${BENCHMARK_JSON}" >/dev/null
+if ! jq -e '
+  .schema_version == "fsqlite.track_c.publish_window_benchmark.v2"
+  and .bead_id == "bd-db300.3.2.3"
+  and .measured_operation == "synthetic_wal_append_critical_section"
+  and (.cases | type == "array" and length >= 1)
+  and all(.cases[];
+    all([
+      .synthetic_wal_lock_hold_baseline,
+      .synthetic_wal_lock_hold_candidate,
+      .synthetic_wal_lock_contended_wait_baseline,
+      .synthetic_wal_lock_contended_wait_candidate
+    ][]; all([.median_ns, .p95_ns][]; type == "number" and . >= 0))
+  )
+' "${BENCHMARK_JSON}" >/dev/null; then
+  emit_event "publish_window_benchmark" "fail" "fail" 0 "invalid v2 synthetic WAL critical section benchmark schema or timing fields"
+  echo "[GATE FAIL] invalid v2 synthetic WAL critical section benchmark schema or timing fields" >&2
+  exit 1
+fi
+
+if ! jq -e '
+  all(.cases[];
+    all([
+      .synthetic_wal_lock_contended_wait_baseline,
+      .synthetic_wal_lock_contended_wait_candidate
+    ][]; .median_ns > 0 and .p95_ns > 0)
+  )
+' "${BENCHMARK_JSON}" >/dev/null; then
+  emit_event "publish_window_benchmark" "fail" "fail" 0 "synthetic WAL critical section wait evidence is unmeasured: baseline or candidate contended wait is zero"
+  echo "[GATE FAIL] synthetic WAL critical section wait evidence is unmeasured: baseline or candidate contended wait is zero; acceptance remains unmet" >&2
+  exit 1
+fi
+
+if ! jq -e '
+  all(.cases[]; .synthetic_wal_lock_hold_candidate.median_ns > 0)
+' "${BENCHMARK_JSON}" >/dev/null; then
+  emit_event "publish_window_benchmark" "fail" "fail" 0 "synthetic WAL critical section candidate hold evidence is unmeasured"
+  echo "[GATE FAIL] synthetic WAL critical section candidate hold evidence is unmeasured" >&2
+  exit 1
+fi
 
 emit_serialized_phase_event \
   "checkpoint_gate" \
@@ -297,23 +330,23 @@ done < <(
   jq -r '
     .cases[]
     | [
-        "exclusive_publish_window:" + .scenario_id,
-        (.exclusive_window_hold_candidate.median_ns | tostring),
+        "synthetic_wal_critical_section:" + .scenario_id,
+        (.synthetic_wal_lock_hold_candidate.median_ns | tostring),
         "0",
-        "durable_state_transition",
+        "synthetic_wal_append_critical_section",
         "1",
         "false",
-        "blocking_memory_vfs:prepared_candidate",
+        "blocking_memory_vfs:synthetic_wal_lock:prepared_candidate",
         "none"
       ],
       [
-        "contending_writer_wait:" + .scenario_id,
+        "synthetic_wal_lock_contended_wait:" + .scenario_id,
         "0",
-        (.contending_writer_stall_candidate.median_ns | tostring),
-        "exclusive_writer_wait",
+        (.synthetic_wal_lock_contended_wait_candidate.median_ns | tostring),
+        "synthetic_wal_lock_contention",
         "2",
         "false",
-        "blocking_memory_vfs:prepared_candidate",
+        "blocking_memory_vfs:synthetic_wal_lock:prepared_candidate",
         "none"
       ]
     | @tsv
@@ -363,6 +396,8 @@ jq -n \
       published_read_trace_contract: true,
       file_backed_visibility_trace_contract: true,
       checkpoint_gate_busy_path: true,
+      synthetic_wal_lock_candidate_hold_measured: true,
+      synthetic_wal_lock_contended_wait_measured_in_all_cases: true,
       serialized_phase_events_emitted: true
     },
     publish_window_benchmark: $benchmark[0]
@@ -379,22 +414,24 @@ jq -n \
   echo "- published read path log: \`${PUBLISHED_LOG}\`"
   echo "- file-backed visibility log: \`${FILE_BACKED_LOG}\`"
   echo "- checkpoint gate log: \`${CHECKPOINT_LOG}\`"
-  echo "- publish-window benchmark log: \`${BENCHMARK_LOG}\`"
-  echo "- publish-window benchmark JSON: \`${BENCHMARK_JSON}\`"
+  echo "- synthetic WAL critical section benchmark log: \`${BENCHMARK_LOG}\`"
+  echo "- synthetic WAL critical section benchmark JSON: \`${BENCHMARK_JSON}\`"
   echo "- report_json: \`${REPORT_JSON}\`"
   echo "- watched source snapshot JSON: \`${SOURCE_SNAPSHOT_JSON}\`"
   echo
-  echo "This gate combines three evidence layers:"
+  echo "This gate combines:"
   printf '%s\n' "- published-read and snapshot-publication traces from \`fsqlite-pager\`"
   printf '%s\n' "- file-backed strict-visibility routing traces from \`fsqlite-core\`"
-  printf '%s\n' "- explicit hold/wait metrics harvested from the existing deterministic publish-window benchmark"
+  printf '%s\n' "- synthetic WAL critical section hold and contended wait metrics; uncontended acquisitions contribute zero wait"
   printf '%s\n' "- a watched-source snapshot that invalidates the run if \`pager.rs\`, \`connection.rs\`, or this gate changes mid-flight"
   echo
-  echo "| Scenario | Candidate Hold Median (ns) | Candidate Wait Median (ns) | Serialized Reason | Backend Identity |"
+  echo "OS and main-file lock windows are unmeasured by the synthetic WAL critical section benchmark."
+  echo
+  echo "| Scenario | Synthetic WAL Candidate Hold Median (ns) | Synthetic WAL Candidate Wait Median (ns) | Serialized Reason | Backend Identity |"
   echo "| --- | ---: | ---: | --- | --- |"
   jq -r '
     .publish_window_benchmark.cases[]
-    | "| \(.scenario_id) | \(.exclusive_window_hold_candidate.median_ns) | \(.contending_writer_stall_candidate.median_ns) | durable_state_transition / exclusive_writer_wait | blocking_memory_vfs:prepared_candidate |"
+    | "| \(.scenario_id) | \(.synthetic_wal_lock_hold_candidate.median_ns) | \(.synthetic_wal_lock_contended_wait_candidate.median_ns) | synthetic_wal_append_critical_section / synthetic_wal_lock_contention | blocking_memory_vfs:synthetic_wal_lock:prepared_candidate |"
   ' "${REPORT_JSON}"
   echo
   echo "Checkpoint gate evidence:"

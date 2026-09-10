@@ -1203,6 +1203,28 @@ pub trait VfsFile: Send + Sync {
     /// Release the file lock to the given level.
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
 
+    /// Acquire the external writer fence for one physical WAL append.
+    ///
+    /// This belongs inside the ordered flush interval, never transaction
+    /// preparation. Native backends exclude stock WAL writers through WRITE
+    /// and retain their existing native appender fence. Memory backends must
+    /// preserve their non-serializing lock-state semantics.
+    ///
+    /// Arm the exact prior main-file level and newly acquired WRITE ownership
+    /// before the first side effect. An existing shared-snapshot attempt may
+    /// enclose this attempt; another append or maintenance attempt may not.
+    /// Every outcome, including partial acquisition failure, must be restored
+    /// through [`Self::restore_external_wal_append_attempt`].
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Restore an append attempt without releasing its enclosing snapshot.
+    ///
+    /// This must be idempotent before acquisition and after success or failure.
+    /// Retain the exact owner of every failed raw unlock for retry, and release
+    /// only WRITE ownership newly acquired by this attempt. Close must restore
+    /// this inner attempt before its enclosing shared-snapshot attempt.
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()>;
+
     /// Acquire the cross-process SHARED fence used while capturing a coherent
     /// main-database snapshot.
     ///
@@ -1467,6 +1489,12 @@ mod tests {
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -1545,6 +1573,12 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
@@ -1682,6 +1716,12 @@ mod tests {
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -1745,6 +1785,12 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
@@ -1838,6 +1884,12 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
@@ -1938,6 +1990,12 @@ mod tests {
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
@@ -2005,6 +2063,12 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
@@ -2107,6 +2171,12 @@ mod tests {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_shared_snapshot_attempt(&mut self, _: &Cx) -> Result<()> {
+                Ok(())
+            }
+            fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
             fn lock_external_maintenance(&mut self, _: &Cx, _: bool) -> Result<()> {
