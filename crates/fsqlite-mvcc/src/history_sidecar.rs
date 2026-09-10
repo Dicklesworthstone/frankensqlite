@@ -2037,6 +2037,15 @@ mod tests {
     }
 
     impl VfsFile for ReadFaultFile {
+        fn wal_reader_mark_exclusive_acquire(
+            &mut self,
+            cx: &Cx,
+            reader_slot: u32,
+        ) -> Result<(), FrankenError> {
+            self.inner
+                .wal_reader_mark_exclusive_acquire(cx, reader_slot)
+        }
+
         fn close(&mut self, cx: &Cx) -> Result<(), FrankenError> {
             self.inner.close(cx)
         }
@@ -2102,6 +2111,10 @@ mod tests {
             self.inner.restore_external_shared_snapshot_attempt(cx)
         }
 
+        fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool, FrankenError> {
+            self.inner.owns_external_wal_append_write(cx)
+        }
+
         fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<(), FrankenError> {
             self.inner.lock_external_wal_append(cx)
         }
@@ -2116,6 +2129,10 @@ mod tests {
             wal_mode: bool,
         ) -> Result<(), FrankenError> {
             self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<(), FrankenError> {
+            self.inner.lock_external_wal_recovery(cx)
         }
 
         fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<(), FrankenError> {

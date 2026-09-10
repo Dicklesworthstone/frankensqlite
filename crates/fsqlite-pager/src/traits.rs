@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::pager::{RollbackCleanup, SimpleTransaction};
 use fsqlite_error::{FrankenError, Result};
@@ -167,6 +168,69 @@ pub enum ParallelWalCommitReconciliation {
     NotCommitted,
 }
 
+/// Observation requiring revalidation under the canonical WAL recovery owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalNativeRecoveryReason {
+    SharedIndexUnavailable,
+    SharedHeaderInvalid,
+    WalGenerationMismatch,
+    WalTerminalMismatch,
+    /// A complete unadvertised tail observed under a fresh native WRITE owner.
+    /// This survives unwind and requests canonical recovery at later admission.
+    UnpublishedWalTail,
+}
+
+/// Reader admission result; ordinary errors never authorize recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalNativeReadOutcome {
+    Ready,
+    RecoveryRequired(WalNativeRecoveryReason),
+}
+
+/// Identity of one reader attempt, distinct even for identical WAL horizons.
+#[derive(Debug, Clone)]
+pub struct WalNativeReadToken(Arc<()>);
+
+impl WalNativeReadToken {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Captured native publication whose claim is retained by the pager owner.
+///
+/// This metadata is not a lock. The owner must retire the matching backend
+/// pin before releasing its native claim and main-file snapshot fence.
+#[derive(Debug, Clone)]
+pub struct WalNativeReadBinding {
+    pub(crate) token: WalNativeReadToken,
+    pub(crate) source_key: usize,
+    pub(crate) header: fsqlite_wal::wal_index::WalIndexHdr,
+    pub(crate) boundary: fsqlite_wal::wal_index::WalIndexReadBoundary,
+}
+
+impl WalNativeReadBinding {
+    #[must_use]
+    pub fn token(&self) -> &WalNativeReadToken {
+        &self.token
+    }
+
+    #[must_use]
+    pub fn header(&self) -> fsqlite_wal::wal_index::WalIndexHdr {
+        self.header
+    }
+
+    #[must_use]
+    pub fn boundary(&self) -> fsqlite_wal::wal_index::WalIndexReadBoundary {
+        self.boundary
+    }
+}
+
 /// Backend interface for WAL operations consumed by the pager.
 ///
 /// This trait breaks the `pager ↔ wal` circular dependency: it is defined
@@ -202,6 +266,83 @@ impl Drop for WalTrackedCompletionGuard {
 }
 
 pub trait WalBackend: Send + Sync {
+    /// Whether an interrupted checkpoint still owns a fixed reset target.
+    fn checkpoint_recovery_pending(&self) -> bool {
+        false
+    }
+
+    /// Finish the retained physical/shared reset before any checkpoint fence
+    /// is released. The caller retains the original maintenance admission and
+    /// every native reader/WRITE/CKPT claim throughout this reconciliation.
+    fn reconcile_checkpoint_reset<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if self.checkpoint_recovery_pending() {
+                Err(FrankenError::Unsupported)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// A retained native observation that requires full canonical recovery.
+    fn native_recovery_required(&self) -> Option<WalNativeRecoveryReason> {
+        None
+    }
+
+    /// Refresh the conflict horizon inside the already acquired append window.
+    ///
+    /// Native adapters prove their current shared baseline before conflicts
+    /// can reject a writer; an orphaned tail requests recovery after unwind.
+    /// An implementation advertising native readers must supply this method.
+    fn preflight_native_append<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if self.native_reader_required() {
+                return Err(FrankenError::Unsupported);
+            }
+            self.refresh_published_snapshot(cx).await.map(|_| ())
+        })
+    }
+
+    /// Whether ordinary pager reads require explicit native reader admission.
+    fn native_reader_required(&self) -> bool {
+        false
+    }
+
+    /// The exact native reader binding currently protecting the pinned image.
+    fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
+        None
+    }
+
+    /// Pin only the captured native horizon, under the caller-retained claim.
+    fn begin_native_read<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _binding: WalNativeReadBinding,
+    ) -> WalFuture<'a, WalNativeReadOutcome> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
+    }
+
+    /// Retire exactly this pin before the caller releases its physical claim.
+    fn end_native_read(&mut self, _token: &WalNativeReadToken) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    /// Rebuild native reader metadata under the caller's canonical recovery owner.
+    ///
+    /// The caller first retires every reader/backend pin and its main snapshot,
+    /// then acquires the exact WRITE/CKPT/Reserved/RECOVER/all-readers attempt.
+    /// A classified observation does not authorize mutation before that fence.
+    /// Rebuild must finish with a coherent header or an explicitly invalid
+    /// pair before restoration; it cannot abandon an advertised partial index.
+    /// This operation never creates or resets the physical WAL generation.
+    fn recover_native_read_state<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _reason: WalNativeRecoveryReason,
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
+    }
+
     /// Prepare WAL state for a newly-started transaction.
     ///
     /// Implementations may refresh internal snapshot metadata so reads during
@@ -1304,6 +1445,25 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
 
     /// Sync the database file to stable storage.
     fn sync<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()>;
+
+    /// Exact page-1 normalization receipt for checkpoint verification.
+    /// Bytes 0..8 hold accepted/written page offsets 24..32, and bytes 8..12
+    /// hold 92..96. Capture during checkpoint writes or normalization, never
+    /// from the final verification read. `None` permits no page-byte changes.
+    fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
+        None
+    }
+
+    /// Read the actual database page for post-backfill verification.
+    /// Targets without readable storage may explicitly return `None`.
+    fn read_page_if_supported<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+        _buf: &'a mut [u8],
+    ) -> WalFuture<'a, Option<usize>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// GH#399: take the cross-process gate that excludes every WAL reader
     /// pinned to the current generation while it is replaced by a

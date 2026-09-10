@@ -18,15 +18,15 @@ use std::pin::Pin;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
-use fsqlite_vfs::VfsFile;
+use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
 use tracing::{debug, info};
 
 use crate::checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
-use crate::checksum::WAL_FRAME_HEADER_SIZE;
-use crate::recovery_fence::{CheckpointChecksumVerdict, ExpectedPageChecksum};
+use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalHeader, WalSalts, Xxh3Checksum128};
+use crate::recovery_fence::CheckpointChecksumVerdict;
 use crate::wal::WalFile;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,14 @@ pub trait CheckpointTarget: Send {
         Box::pin(async { Ok(None) })
     }
 
+    /// Exact page-1 header fields accepted or written by this checkpoint target.
+    /// Bytes 0..8 correspond to page offsets 24..32; bytes 8..12 to 92..96.
+    /// This receipt must be captured during write/normalization, never from
+    /// the verification read. `None` means every WAL page byte is unchanged.
+    fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
+        None
+    }
+
     /// GH#399: take the cross-process gate that excludes every WAL reader
     /// pinned to the current generation while a RESTART/TRUNCATE replaces it
     /// (C SQLite holds `WAL_READ_LOCK(1..WAL_NREADER)` exclusively across
@@ -90,6 +98,43 @@ pub trait CheckpointTarget: Send {
     /// Release the gate taken by a successful [`Self::acquire_wal_reset_gate`].
     fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Publish the durable backfill prefix for this exact WAL generation.
+    /// Called only after all page writes and database syncs have succeeded.
+    fn publish_backfill<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _header: &'a WalHeader,
+        _backfilled_frames: u32,
+    ) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Retain a fixed reset target before its first physical header write.
+    /// Called under the reader reset gate after database durability and any
+    /// supported checksum verification. A returned token tracks the actual
+    /// header-write source, including when this executor future is dropped.
+    fn prepare_wal_reset<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _header: &'a WalHeader,
+        _new_checkpoint_seq: u32,
+        _new_salts: WalSalts,
+        _truncate: bool,
+    ) -> CheckpointTargetFuture<'a, Option<VfsWriteCompletion>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Publish the shared reset header before relinquishing reader exclusion.
+    fn finish_wal_reset<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Whether a retained reset still requires physical/shared reconciliation.
+    /// The owner must keep the reset gate until this obligation is terminal.
+    fn wal_reset_pending(&self) -> bool {
+        false
     }
 }
 
@@ -123,6 +168,15 @@ impl CheckpointExecutionResult {
 // ---------------------------------------------------------------------------
 // Execution entry point
 // ---------------------------------------------------------------------------
+
+/// The exact source frame used for one deduplicated database write. Keep its
+/// frame index and digest instead of retaining a page-sized allocation; final
+/// verification rereads and checks the WAL source before applying any receipt.
+struct CheckpointPageExpectation {
+    page: PageNumber,
+    frame_index: usize,
+    source_checksum: Xxh3Checksum128,
+}
 
 /// Execute a WAL checkpoint.
 ///
@@ -180,9 +234,9 @@ pub async fn execute_checkpoint<F: VfsFile>(
 
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
-    // bd-yfdb6: accumulate expected post-checkpoint page checksums so the
-    // truncate path can verify the DB state before discarding WAL frames.
-    let mut expected_checksums: Vec<ExpectedPageChecksum> = Vec::new();
+    // Retain exact written WAL pages for full-byte database readback before
+    // discarding this generation. No reserved checksum trailer is required.
+    let mut expected_pages: Vec<CheckpointPageExpectation> = Vec::new();
     if plan.frames_to_backfill > 0 {
         // Backfill frames [backfilled_frames .. backfilled_frames + frames_to_backfill).
         let start = usize::try_from(normalized.backfilled_frames).unwrap_or(usize::MAX);
@@ -232,20 +286,11 @@ pub async fn execute_checkpoint<F: VfsFile>(
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
             target.write_page(cx, *page_no, page_data).await?;
 
-            // bd-yfdb6: capture the expected post-checkpoint checksum so the
-            // truncate path can verify disk state before discarding WAL
-            // frames. Page checksums live in the trailer; if the trailer
-            // length is too small (tests with tiny pages), we skip the
-            // capture silently — this is additive insurance, not a hard
-            // invariant.
-            if page_data.len() >= crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES
-                && let Ok(checksum) = crate::checksum::read_page_checksum(page_data)
-            {
-                expected_checksums.push(ExpectedPageChecksum {
-                    page: *page_no,
-                    checksum,
-                });
-            }
+            expected_pages.push(CheckpointPageExpectation {
+                page: *page_no,
+                frame_index: *frame_idx,
+                source_checksum: Xxh3Checksum128::compute(&frame_buf),
+            });
 
             debug!(
                 frame_idx = *frame_idx,
@@ -264,17 +309,35 @@ pub async fn execute_checkpoint<F: VfsFile>(
         {
             target.truncate_db(cx, db_size).await?;
             target.sync_db(cx).await?;
+            // Earlier commits may have written pages beyond the final size.
+            // After durable truncation those pages are intentionally absent;
+            // only the surviving database extent can be read back for reset.
+            expected_pages.retain(|expected| expected.page.get() <= db_size);
         }
     }
 
+    // Native backfill publication authorizes database-only readers, including
+    // in PASSIVE/FULL mode. Detect disagreement before advertising this newly
+    // written prefix. The reset path checks again after its later sync.
+    require_checkpoint_pages_match(cx, wal, target, &expected_pages).await?;
+    let backfilled_prefix = normalized
+        .backfilled_frames
+        .saturating_add(frames_backfilled);
+
     // Post-action: reset or truncate WAL. Passes `target` so the
     // truncate path can issue an explicit fsync(db, FULL) before the
-    // WAL is truncated, and the expected-checksums prefix so the same
+    // WAL is truncated, and the expected-page prefix so the same
     // path can verify on-disk DB state matches the post-checkpoint
     // state before truncating (both bd-yfdb6).
-    let wal_was_reset =
-        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)
-            .await?;
+    let wal_was_reset = apply_checkpoint_post_action(
+        cx,
+        wal,
+        plan.post_action,
+        target,
+        &expected_pages,
+        backfilled_prefix,
+    )
+    .await?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -308,7 +371,8 @@ async fn apply_checkpoint_post_action<F: VfsFile>(
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
     target: &mut impl CheckpointTarget,
-    expected_checksums: &[ExpectedPageChecksum],
+    expected_pages: &[CheckpointPageExpectation],
+    backfilled_prefix: u32,
 ) -> Result<bool> {
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
@@ -324,17 +388,41 @@ async fn apply_checkpoint_post_action<F: VfsFile>(
                     action = ?post_action,
                     "WAL reset deferred: a peer reader still pins the current WAL generation"
                 );
+                target
+                    .publish_backfill(cx, wal.header(), backfilled_prefix)
+                    .await?;
                 return Ok(false);
             }
-            let reset =
-                replace_wal_generation(cx, wal, post_action, target, expected_checksums).await;
+            let reset = replace_wal_generation(
+                cx,
+                wal,
+                post_action,
+                target,
+                expected_pages,
+                backfilled_prefix,
+            )
+            .await;
+            if target.wal_reset_pending() {
+                return match reset {
+                    Err(error) => Err(error),
+                    Ok(()) => Err(FrankenError::CheckpointFailed {
+                        detail: "WAL reset returned with an unfinished publication owner"
+                            .to_owned(),
+                    }),
+                };
+            }
             let release = target.release_wal_reset_gate(cx).await;
             match (reset, release) {
                 (Ok(()), Ok(())) => Ok(true),
                 (Err(error), _) | (Ok(()), Err(error)) => Err(error),
             }
         }
-        CheckpointPostAction::None => Ok(false),
+        CheckpointPostAction::None => {
+            target
+                .publish_backfill(cx, wal.header(), backfilled_prefix)
+                .await?;
+            Ok(false)
+        }
     }
 }
 
@@ -346,7 +434,8 @@ async fn replace_wal_generation<F: VfsFile>(
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
     target: &mut impl CheckpointTarget,
-    expected_checksums: &[ExpectedPageChecksum],
+    expected_pages: &[CheckpointPageExpectation],
+    backfilled_prefix: u32,
 ) -> Result<()> {
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
@@ -376,34 +465,27 @@ async fn replace_wal_generation<F: VfsFile>(
             })?;
 
             // bd-yfdb6: if the target supports read-back, verify that
-            // every page we just checkpointed still matches its
-            // expected post-checkpoint checksum on disk. On mismatch,
+            // every surviving page we just checkpointed still matches its
+            // expected complete post-checkpoint bytes on disk. On mismatch,
             // refuse the reset — the WAL must stay intact so a retry
             // can complete the backfill.
-            if !expected_checksums.is_empty() {
-                let verdict = verify_checkpoint_checksums_via_target(
-                    cx,
-                    target,
-                    wal.page_size(),
-                    expected_checksums,
-                )
+            require_checkpoint_pages_match(cx, wal, target, expected_pages).await?;
+            // No database writes/syncs follow this publication. Publishing
+            // before the final sync could advertise a copy that later fails
+            // verification while cleanup releases the database-only reader gate.
+            target
+                .publish_backfill(cx, wal.header(), backfilled_prefix)
                 .await?;
-                if let CheckpointChecksumVerdict::Mismatch { first_bad_page } = verdict {
-                    tracing::error!(
-                        target: "fsqlite.wal.recovery_fence",
-                        first_bad_page = first_bad_page.get(),
-                        "UNRECOVERABLE: post-checkpoint DB/WAL disagreed; refusing WAL reset"
-                    );
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "post-checkpoint DB/WAL state disagreed at page {}; WAL reset refused \
-                             to preserve committed frames (bd-yfdb6)",
-                            first_bad_page.get()
-                        ),
-                    });
-                }
+            let completion = target
+                .prepare_wal_reset(cx, wal.header(), new_seq, new_salts, truncate)
+                .await?;
+            if let Some(completion) = completion {
+                wal.reset_tracked(cx, new_seq, new_salts, truncate, completion)
+                    .await?;
+            } else {
+                wal.reset(cx, new_seq, new_salts, truncate).await?;
             }
-            wal.reset(cx, new_seq, new_salts, truncate).await?;
+            target.finish_wal_reset(cx).await?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?post_action,
@@ -416,18 +498,50 @@ async fn replace_wal_generation<F: VfsFile>(
     }
 }
 
+async fn require_checkpoint_pages_match<F: VfsFile>(
+    cx: &Cx,
+    wal: &WalFile<F>,
+    target: &mut impl CheckpointTarget,
+    expected: &[CheckpointPageExpectation],
+) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    match verify_checkpoint_pages_via_target(cx, wal, target, expected).await? {
+        CheckpointChecksumVerdict::Match => Ok(()),
+        CheckpointChecksumVerdict::Mismatch { first_bad_page } => {
+            tracing::error!(
+                target: "fsqlite.wal.recovery_fence",
+                first_bad_page = first_bad_page.get(),
+                "post-checkpoint DB/WAL disagreed; refusing publication or reset"
+            );
+            Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "post-checkpoint DB/WAL state disagreed at page {}; publication or \
+                     WAL reset refused to preserve committed frames (bd-yfdb6)",
+                    first_bad_page.get()
+                ),
+            })
+        }
+    }
+}
+
 /// Walk each expected page through the target's optional read-back hook
-/// and compare on-disk trailers. When the target opts out
+/// and compare all bytes against the unchanged WAL source plus the target's
+/// exact page-1 normalization receipt. When the target opts out
 /// (`read_page_if_supported` returns `None`), verification is silently
 /// skipped — which matches the audit-requested behaviour of "additive
 /// insurance, not a hard invariant" for targets without a read path.
-async fn verify_checkpoint_checksums_via_target(
+async fn verify_checkpoint_pages_via_target<F: VfsFile>(
     cx: &Cx,
+    wal: &WalFile<F>,
     target: &mut impl CheckpointTarget,
-    page_size: usize,
-    expected: &[ExpectedPageChecksum],
+    expected: &[CheckpointPageExpectation],
 ) -> Result<CheckpointChecksumVerdict> {
+    let page_size = wal.page_size();
     let mut buf = vec![0u8; page_size];
+    let mut frame_buf = vec![0; wal.frame_size()];
+    let page1_patch = target.checkpoint_page1_header_patch();
     for exp in expected {
         let maybe_read = target
             .read_page_if_supported(cx, exp.page, &mut buf)
@@ -436,13 +550,36 @@ async fn verify_checkpoint_checksums_via_target(
             // Target does not support read-back; abort further checks.
             return Ok(CheckpointChecksumVerdict::Match);
         };
-        if n < page_size {
+        if n != page_size {
             return Ok(CheckpointChecksumVerdict::Mismatch {
                 first_bad_page: exp.page,
             });
         }
-        let observed = crate::checksum::read_page_checksum(&buf)?;
-        if observed != exp.checksum {
+        let header = wal
+            .read_frame_into(cx, exp.frame_index, &mut frame_buf)
+            .await?;
+        if header.page_number != exp.page.get()
+            || header.salts != wal.header().salts
+            || !exp.source_checksum.verify(&frame_buf)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "checkpoint verification source changed after its database write"
+                    .to_owned(),
+            });
+        }
+        let page = &mut frame_buf[WAL_FRAME_HEADER_SIZE..];
+        if exp.page == PageNumber::ONE
+            && let Some(patch) = page1_patch
+        {
+            if page.len() < 96 {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "checkpoint page-1 patch exceeds the WAL page".to_owned(),
+                });
+            }
+            page[24..32].copy_from_slice(&patch[..8]);
+            page[92..96].copy_from_slice(&patch[8..]);
+        }
+        if page != buf.as_slice() {
             return Ok(CheckpointChecksumVerdict::Mismatch {
                 first_bad_page: exp.page,
             });
@@ -540,6 +677,156 @@ mod tests {
         fn sync_db<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
             Box::pin(async move {
                 self.sync_count += 1;
+                Ok(())
+            })
+        }
+    }
+
+    /// Target with actual VFS bytes, including EOF after truncation. Corruption
+    /// is injected once at the first database sync, after backfill writes.
+    struct ReadbackTarget {
+        file: <MemoryVfs as Vfs>::File,
+        written_pages: Vec<PageNumber>,
+        read_pages: Vec<PageNumber>,
+        truncate_to: Option<u32>,
+        corrupt_on_sync: Option<(PageNumber, usize)>,
+        corrupt_sync_call: u32,
+        fail_sync_call: Option<u32>,
+        published_prefixes: Vec<u32>,
+        apply_page1_patch_on_sync: Option<[u8; 12]>,
+        page1_header_patch: Option<[u8; 12]>,
+        sync_count: u32,
+        allow_reset: bool,
+        gate_acquired: u32,
+        gate_released: u32,
+    }
+
+    impl ReadbackTarget {
+        fn new(vfs: &MemoryVfs, cx: &Cx) -> Self {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE;
+            let (file, _) = vfs
+                .open(cx, Some(std::path::Path::new("readback.db")), flags)
+                .expect("open database");
+            Self {
+                file,
+                written_pages: Vec::new(),
+                read_pages: Vec::new(),
+                truncate_to: None,
+                corrupt_on_sync: None,
+                corrupt_sync_call: 1,
+                fail_sync_call: None,
+                published_prefixes: Vec::new(),
+                apply_page1_patch_on_sync: None,
+                page1_header_patch: None,
+                sync_count: 0,
+                allow_reset: true,
+                gate_acquired: 0,
+                gate_released: 0,
+            }
+        }
+    }
+
+    impl CheckpointTarget for ReadbackTarget {
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                let offset = u64::from(page_no.get() - 1) * u64::from(PAGE_SIZE);
+                self.file.write(cx, data, offset).await?;
+                self.written_pages.push(page_no);
+                Ok(())
+            })
+        }
+
+        fn truncate_db<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.file
+                    .truncate(cx, u64::from(n_pages) * u64::from(PAGE_SIZE))?;
+                self.truncate_to = Some(n_pages);
+                Ok(())
+            })
+        }
+
+        fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                if let Some(patch) = self.apply_page1_patch_on_sync.take() {
+                    self.file.write(cx, &patch[..8], 24).await?;
+                    self.file.write(cx, &patch[8..], 92).await?;
+                    self.page1_header_patch = Some(patch);
+                }
+                if self.sync_count + 1 == self.corrupt_sync_call
+                    && let Some((page, byte)) = self.corrupt_on_sync.take()
+                {
+                    let offset = u64::from(page.get() - 1) * u64::from(PAGE_SIZE)
+                        + u64::try_from(byte).expect("page offset fits u64");
+                    let mut value = [0];
+                    assert_eq!(self.file.read(cx, &mut value, offset).await?, 1);
+                    value[0] ^= 0x80;
+                    self.file.write(cx, &value, offset).await?;
+                }
+                self.file.sync(cx, fsqlite_types::flags::SyncFlags::FULL)?;
+                if self.fail_sync_call == Some(self.sync_count + 1) {
+                    return Err(FrankenError::Io(std::io::Error::other(
+                        "injected database sync failure at final reset fence",
+                    )));
+                }
+                self.sync_count += 1;
+                Ok(())
+            })
+        }
+
+        fn read_page_if_supported<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            buf: &'a mut [u8],
+        ) -> CheckpointTargetFuture<'a, Option<usize>> {
+            Box::pin(async move {
+                assert!(self.sync_count > 0);
+                self.read_pages.push(page_no);
+                let offset = u64::from(page_no.get() - 1) * u64::from(PAGE_SIZE);
+                self.file.read(cx, buf, offset).await.map(Some)
+            })
+        }
+
+        fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
+            self.page1_header_patch
+        }
+
+        fn publish_backfill<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _header: &'a WalHeader,
+            frames: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.published_prefixes.push(frames);
+                Ok(())
+            })
+        }
+
+        fn acquire_wal_reset_gate<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> CheckpointTargetFuture<'a, bool> {
+            Box::pin(async move {
+                if self.allow_reset {
+                    self.gate_acquired += 1;
+                }
+                Ok(self.allow_reset)
+            })
+        }
+
+        fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.gate_released += 1;
                 Ok(())
             })
         }
@@ -850,6 +1137,9 @@ mod tests {
         allow_reset: bool,
         gate_acquired: u32,
         gate_released: u32,
+        reset_target: Option<(u32, WalSalts, bool)>,
+        reset_completion: Option<VfsWriteCompletion>,
+        fail_reset_publication: bool,
     }
 
     impl CheckpointTarget for GatedTarget {
@@ -888,9 +1178,57 @@ mod tests {
 
         fn release_wal_reset_gate<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
             Box::pin(async move {
+                assert!(
+                    self.reset_target.is_none(),
+                    "publication precedes reader release"
+                );
                 self.gate_released += 1;
                 Ok(())
             })
+        }
+
+        fn prepare_wal_reset<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            header: &'a WalHeader,
+            new_checkpoint_seq: u32,
+            new_salts: WalSalts,
+            truncate: bool,
+        ) -> CheckpointTargetFuture<'a, Option<VfsWriteCompletion>> {
+            Box::pin(async move {
+                assert_eq!(self.gate_acquired, 1);
+                assert_eq!(self.gate_released, 0);
+                assert!(
+                    self.inner.sync_count > 0,
+                    "database durability precedes reset"
+                );
+                assert_eq!(new_checkpoint_seq, header.checkpoint_seq.wrapping_add(1));
+                assert!(self.reset_target.is_none());
+                self.reset_target = Some((new_checkpoint_seq, new_salts, truncate));
+                let completion = VfsWriteCompletion::new();
+                self.reset_completion = Some(completion.clone());
+                Ok(Some(completion))
+            })
+        }
+
+        fn finish_wal_reset<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(self.gate_released, 0);
+                assert!(self.reset_target.is_some());
+                assert_eq!(
+                    self.reset_completion.as_ref().unwrap().state(),
+                    fsqlite_vfs::VfsWriteCompletionState::Success
+                );
+                if self.fail_reset_publication {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                self.reset_target = None;
+                Ok(())
+            })
+        }
+
+        fn wal_reset_pending(&self) -> bool {
+            self.reset_target.is_some()
         }
     }
 
@@ -914,6 +1252,9 @@ mod tests {
             allow_reset: false,
             gate_acquired: 0,
             gate_released: 0,
+            reset_target: None,
+            reset_completion: None,
+            fail_reset_publication: false,
         };
         let result =
             execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
@@ -951,6 +1292,9 @@ mod tests {
             allow_reset: true,
             gate_acquired: 0,
             gate_released: 0,
+            reset_target: None,
+            reset_completion: None,
+            fail_reset_publication: false,
         };
         let result =
             execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
@@ -962,6 +1306,58 @@ mod tests {
         assert_eq!(wal.header().checkpoint_seq, 1);
         assert_eq!(target.gate_acquired, 1);
         assert_eq!(target.gate_released, 1, "the gate is released exactly once");
+    }
+
+    #[test]
+    fn test_reset_publication_failure_keeps_reader_gate_until_retry() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 6);
+        let state = CheckpointState {
+            total_frames: 6,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = GatedTarget {
+            inner: RecordingTarget::new(),
+            allow_reset: true,
+            gate_acquired: 0,
+            gate_released: 0,
+            reset_target: None,
+            reset_completion: None,
+            fail_reset_publication: true,
+        };
+        assert!(matches!(
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect_err("publication failure"),
+            FrankenError::BusyRecovery
+        ));
+        assert_eq!(wal.frame_count(), 0, "physical reset already completed");
+        let (sequence, salts, truncate) = target.reset_target.expect("exact retained target");
+        assert_eq!(sequence, wal.header().checkpoint_seq);
+        assert_eq!(salts, wal.header().salts);
+        assert!(truncate);
+        assert_eq!(target.gate_acquired, 1);
+        assert_eq!(
+            target.gate_released, 0,
+            "failed publication keeps the reader gate"
+        );
+        target.fail_reset_publication = false;
+        target
+            .finish_wal_reset(&cx)
+            .expect("retry exact publication");
+        target
+            .release_wal_reset_gate(&cx)
+            .expect("terminal release");
+        assert!(!target.wal_reset_pending());
+        assert_eq!(target.gate_released, 1);
+        assert_eq!(
+            wal.header().salts,
+            salts,
+            "retry never picks another generation"
+        );
     }
 
     #[test]
@@ -990,25 +1386,167 @@ mod tests {
 
     // ── Empty / edge case tests ──
 
+    fn checkpoint_file_bytes(file: &impl VfsFile, cx: &Cx) -> Vec<u8> {
+        let size = usize::try_from(file.file_size(cx).expect("file size")).unwrap();
+        let mut bytes = vec![0; size];
+        assert_eq!(
+            file.read(cx, &mut bytes, 0).expect("complete file read"),
+            size
+        );
+        bytes
+    }
+
     #[test]
-    fn test_checkpoint_empty_wal_is_noop() {
+    fn test_checkpoint_empty_wal_non_truncating_modes_are_noop() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let header = *wal.header();
 
         let state = CheckpointState {
             total_frames: 0,
             backfilled_frames: 0,
             oldest_reader_frame: None,
         };
-        let mut target = RecordingTarget::new();
-        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Passive, state, &mut target)
-            .expect("checkpoint");
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+        ] {
+            let mut target = RecordingTarget::new();
+            let result =
+                execute_checkpoint(&cx, &mut wal, mode, state, &mut target).expect("checkpoint");
 
-        assert_eq!(result.frames_backfilled, 0);
-        assert!(target.pages.is_empty());
+            assert_eq!(result.frames_backfilled, 0);
+            assert!(!result.wal_was_reset);
+            assert!(target.pages.is_empty());
+            assert_eq!(target.truncate_to, None);
+            assert_eq!(target.sync_count, 0);
+            assert_eq!(*wal.header(), header);
+        }
+    }
+
+    #[test]
+    fn test_empty_truncate_removes_restart_tail_after_reader_gate_retry() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+        let populated_size = wal.file().file_size(&cx).unwrap();
+        let mut backfill = ReadbackTarget::new(&vfs, &cx);
+        let restart = execute_checkpoint(
+            &cx,
+            &mut wal,
+            CheckpointMode::Restart,
+            CheckpointState {
+                total_frames: 3,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            },
+            &mut backfill,
+        )
+        .expect("restart after actual database backfill");
+        assert!(restart.wal_was_reset);
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.file().file_size(&cx).unwrap(), populated_size);
+        let stale_wal = checkpoint_file_bytes(wal.file(), &cx);
+        let database = checkpoint_file_bytes(&backfill.file, &cx);
+        assert_eq!(database.len(), usize::try_from(3 * PAGE_SIZE).unwrap());
+        assert!(stale_wal.len() > crate::checksum::WAL_HEADER_SIZE);
+
+        // A fresh pass has no database mutations. This gate is synthetic;
+        // the backing WAL and database byte-preservation checks are actual I/O.
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        target.allow_reset = false;
+        let state = CheckpointState {
+            total_frames: 0,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let refused =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("reader defers empty truncate");
+        assert!(refused.reset_deferred_by_readers());
+        assert!(!refused.wal_was_reset);
+        assert_eq!((target.gate_acquired, target.gate_released), (0, 0));
         assert_eq!(target.sync_count, 0);
+        assert_eq!(checkpoint_file_bytes(wal.file(), &cx), stale_wal);
+        assert_eq!(checkpoint_file_bytes(&target.file, &cx), database);
+
+        target.allow_reset = true;
+        let truncated =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("truncate stale bytes after reader release");
+        assert!(truncated.wal_was_reset);
+        assert_eq!(truncated.frames_backfilled, 0);
+        assert_eq!(truncated.db_size_pages, None);
+        assert_eq!((target.gate_acquired, target.gate_released), (1, 1));
+        assert_eq!(target.sync_count, 1);
+        assert!(target.written_pages.is_empty());
+        assert!(
+            target.read_pages.is_empty(),
+            "no prior-prefix readback claim"
+        );
+        assert_eq!(target.truncate_to, None);
+        assert_eq!(
+            wal.file().file_size(&cx).unwrap(),
+            u64::try_from(crate::checksum::WAL_HEADER_SIZE).unwrap()
+        );
+        assert_eq!(checkpoint_file_bytes(&target.file, &cx), database);
+    }
+
+    #[test]
+    fn test_empty_truncate_retains_exact_reset_when_publication_fails() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let state = CheckpointState {
+            total_frames: 0,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let mut target = GatedTarget {
+            inner: RecordingTarget::new(),
+            allow_reset: true,
+            gate_acquired: 0,
+            gate_released: 0,
+            reset_target: None,
+            reset_completion: None,
+            fail_reset_publication: true,
+        };
+        assert!(matches!(
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect_err("synthetic publication failure after physical reset"),
+            FrankenError::BusyRecovery
+        ));
+        let reset_header = *wal.header();
+        let retained = target.reset_target.expect("retain exact empty reset");
+        assert_eq!(
+            retained,
+            (reset_header.checkpoint_seq, reset_header.salts, true)
+        );
+        assert_eq!(
+            target.reset_completion.as_ref().unwrap().state(),
+            fsqlite_vfs::VfsWriteCompletionState::Success
+        );
+        assert!(target.wal_reset_pending());
+        assert_eq!((target.gate_acquired, target.gate_released), (1, 0));
+        assert!(target.inner.pages.is_empty());
+        assert_eq!(target.inner.truncate_to, None);
+        assert_eq!(target.inner.sync_count, 1);
+        target.fail_reset_publication = false;
+        target
+            .finish_wal_reset(&cx)
+            .expect("retry same publication");
+        target
+            .release_wal_reset_gate(&cx)
+            .expect("release exact gate");
+        assert!(!target.wal_reset_pending());
+        assert_eq!(target.gate_released, 1);
+        assert_eq!(*wal.header(), reset_header);
     }
 
     #[test]
@@ -1086,6 +1624,433 @@ mod tests {
 
         assert_eq!(result.db_size_pages, Some(3));
         assert_eq!(target.truncate_to, Some(3));
+    }
+
+    #[test]
+    fn test_checkpoint_shrink_verifies_only_surviving_pages_before_reset() {
+        for mode in [CheckpointMode::Restart, CheckpointMode::Truncate] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+            wal.append_frame(&cx, 4, &sample_page(4), 4)
+                .expect("older large commit");
+            let final_page = sample_page(1);
+            wal.append_frame(&cx, 1, &final_page, 2)
+                .expect("newer shrinking commit");
+            let mut target = ReadbackTarget::new(&vfs, &cx);
+            let state = CheckpointState {
+                total_frames: 2,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            };
+            let result = execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
+                .expect("removed pages are outside the durable database extent");
+            assert_eq!(result.db_size_pages, Some(2));
+            assert_eq!(result.frames_backfilled, 2);
+            assert_eq!(target.truncate_to, Some(2));
+            assert_eq!(target.written_pages.len(), 2);
+            assert_eq!(
+                target.read_pages,
+                vec![PageNumber::ONE, PageNumber::ONE],
+                "verify before backfill publication and again before reset"
+            );
+            assert_eq!(target.published_prefixes, vec![2]);
+            assert_eq!(
+                target.file.file_size(&cx).expect("database length"),
+                2 * u64::from(PAGE_SIZE)
+            );
+            let mut observed = vec![0; final_page.len()];
+            target
+                .file
+                .read(&cx, &mut observed, 0)
+                .expect("surviving page");
+            assert_eq!(observed, final_page);
+            assert!(result.wal_was_reset);
+            assert_eq!(wal.frame_count(), 0);
+            assert_eq!(wal.header().checkpoint_seq, 1);
+            assert_eq!((target.gate_acquired, target.gate_released), (1, 1));
+        }
+    }
+
+    fn assert_checkpoint_readback_corruption_refuses_reset(byte: usize) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let page = PageNumber::new(2).expect("valid page");
+        let expected = sample_page(2);
+        wal.append_frame(&cx, page.get(), &expected, 2)
+            .expect("commit surviving page");
+        let before = wal.header().to_bytes().expect("old header");
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        target.corrupt_on_sync = Some((page, byte));
+        let state = CheckpointState {
+            total_frames: 1,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target).wait();
+        let mut observed = vec![0; expected.len()];
+        target
+            .file
+            .read(&cx, &mut observed, u64::from(PAGE_SIZE))
+            .expect("actual corrupted bytes");
+        assert_eq!(observed[byte], expected[byte] ^ 0x80);
+        let trailer_start = expected.len() - crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES;
+        if byte < trailer_start {
+            assert_eq!(observed[trailer_start..], expected[trailer_start..]);
+        }
+        assert!(matches!(
+            result.expect_err("readback mismatch must preserve the committed WAL"),
+            FrankenError::DatabaseCorrupt { .. }
+        ));
+        assert_eq!(target.read_pages, vec![page]);
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.header().to_bytes().expect("retained header"), before);
+        assert!(target.published_prefixes.is_empty());
+        assert_eq!(
+            (target.gate_acquired, target.gate_released),
+            (0, 0),
+            "early mismatch precedes reset-gate acquisition"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_readback_body_corruption_refuses_reset() {
+        // The actual page body changes at sync while its trailer stays equal.
+        assert_checkpoint_readback_corruption_refuses_reset(100);
+    }
+
+    #[test]
+    fn test_checkpoint_readback_in_range_trailer_corruption_refuses_reset() {
+        assert_checkpoint_readback_corruption_refuses_reset(
+            usize::try_from(PAGE_SIZE).expect("page size fits usize") - 1,
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_readback_rejects_changed_wal_source() {
+        for changed_byte in [4, WAL_FRAME_HEADER_SIZE + 100] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+            let page = PageNumber::new(2).expect("valid page");
+            let data = sample_page(2);
+            wal.append_frame(&cx, 2, &data, 2).expect("commit page");
+            let mut frame = vec![0; wal.frame_size()];
+            wal.read_frame_into(&cx, 0, &mut frame)
+                .expect("capture source");
+            let expected = [CheckpointPageExpectation {
+                page,
+                frame_index: 0,
+                source_checksum: Xxh3Checksum128::compute(&frame),
+            }];
+            let mut target = ReadbackTarget::new(&vfs, &cx);
+            target
+                .write_page(&cx, page, &data)
+                .expect("backfill source");
+            target.sync_db(&cx).expect("sync database");
+            let old_header = wal.header().to_bytes().expect("generation");
+            let offset = u64::try_from(crate::checksum::WAL_HEADER_SIZE + changed_byte)
+                .expect("frame offset fits u64");
+            wal.file()
+                .write(&cx, &[frame[changed_byte] ^ 0x80], offset)
+                .expect("mutate source header or body after backfill");
+            assert!(matches!(
+                verify_checkpoint_pages_via_target(&cx, &wal, &mut target, &expected)
+                    .expect_err("changed WAL bytes cannot become a new expected page"),
+                FrankenError::WalCorrupt { .. }
+            ));
+            assert_eq!(wal.frame_count(), 1);
+            assert_eq!(
+                wal.header().to_bytes().expect("retained generation"),
+                old_header
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_readback_accepts_exact_page1_patch_receipt() {
+        assert_checkpoint_page1_patch_readback(None);
+    }
+
+    #[test]
+    fn test_checkpoint_readback_refuses_corrupted_page1_stamp() {
+        for offset in [24, 28, 92] {
+            assert_checkpoint_page1_patch_readback(Some(offset));
+        }
+    }
+
+    fn assert_checkpoint_page1_patch_readback(corrupt_offset: Option<usize>) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let mut page = sample_page(1);
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[20] = 0; // Stock format: no reserved checksum bytes.
+        page[24..28].copy_from_slice(&3_u32.to_be_bytes());
+        page[28..32].copy_from_slice(&4_u32.to_be_bytes());
+        page[92..96].copy_from_slice(&3_u32.to_be_bytes());
+        wal.append_frame(&cx, 1, &page, 2).expect("commit page 1");
+        let old_header = wal.header().to_bytes().expect("old generation");
+        let mut patch = [0; 12];
+        patch[..4].copy_from_slice(&7_u32.to_be_bytes());
+        patch[4..8].copy_from_slice(&2_u32.to_be_bytes());
+        patch[8..].copy_from_slice(&7_u32.to_be_bytes());
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        target.apply_page1_patch_on_sync = Some(patch);
+        target.corrupt_on_sync = corrupt_offset.map(|offset| (PageNumber::ONE, offset));
+        let state = CheckpointState {
+            total_frames: 1,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target).wait();
+        assert_eq!(target.checkpoint_page1_header_patch(), Some(patch));
+        let expected_reads = if corrupt_offset.is_some() { 1 } else { 2 };
+        assert_eq!(target.read_pages, vec![PageNumber::ONE; expected_reads]);
+        let mut observed = vec![0; page.len()];
+        target
+            .file
+            .read(&cx, &mut observed, 0)
+            .expect("database bytes");
+        page[24..32].copy_from_slice(&patch[..8]);
+        page[92..96].copy_from_slice(&patch[8..]);
+        if let Some(offset) = corrupt_offset {
+            assert_eq!(observed[offset], page[offset] ^ 0x80);
+            assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+            assert_eq!(wal.frame_count(), 1);
+            assert_eq!(
+                wal.header().to_bytes().expect("retained generation"),
+                old_header
+            );
+            page[offset] ^= 0x80;
+        } else {
+            assert!(result.expect("exact intended page-1 patch").wal_was_reset);
+            assert_eq!(wal.frame_count(), 0);
+        }
+        assert_eq!(observed, page, "every unmodified byte must also match");
+        if corrupt_offset.is_some() {
+            assert!(target.published_prefixes.is_empty());
+            assert_eq!((target.gate_acquired, target.gate_released), (0, 0));
+        } else {
+            assert_eq!(target.published_prefixes, vec![1]);
+            assert_eq!((target.gate_acquired, target.gate_released), (1, 1));
+        }
+    }
+
+    #[test]
+    fn test_all_checkpoint_modes_refuse_backfill_publication_on_mismatch() {
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            assert_bad_backfill_is_not_published(mode, false);
+        }
+    }
+
+    #[test]
+    fn test_partial_checkpoint_refuses_backfill_publication_on_mismatch() {
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            assert_bad_backfill_is_not_published(mode, true);
+        }
+    }
+
+    fn checkpoint_test_wal_bytes(wal: &WalFile<impl VfsFile>, cx: &Cx) -> Vec<u8> {
+        let size = usize::try_from(wal.file().file_size(cx).expect("WAL length"))
+            .expect("WAL fits test memory");
+        let mut bytes = vec![0; size];
+        assert_eq!(wal.file().read(cx, &mut bytes, 0).expect("WAL bytes"), size);
+        bytes
+    }
+
+    fn assert_bad_backfill_is_not_published(mode: CheckpointMode, partial: bool) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let page = PageNumber::new(2).expect("valid page");
+        let page_data = sample_page(2);
+        wal.append_frame(&cx, 2, &page_data, 2)
+            .expect("first commit");
+        wal.append_frame(&cx, 3, &sample_page(3), 3)
+            .expect("later commit");
+        let original = checkpoint_test_wal_bytes(&wal, &cx);
+        let state = CheckpointState {
+            total_frames: 2,
+            backfilled_frames: 0,
+            oldest_reader_frame: partial.then_some(1),
+        };
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        target.corrupt_on_sync = Some((page, 100));
+        assert!(matches!(
+            execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
+                .expect_err("known-bad database prefix must not become reader-visible"),
+            FrankenError::DatabaseCorrupt { .. }
+        ));
+        assert!(
+            target.published_prefixes.is_empty(),
+            "no publication hook call"
+        );
+        assert_eq!((target.gate_acquired, target.gate_released), (0, 0));
+        assert_eq!(target.read_pages, vec![page]);
+        assert_eq!(checkpoint_test_wal_bytes(&wal, &cx), original);
+        assert_eq!(wal.frame_count(), 2);
+        let mut observed = vec![0; page_data.len()];
+        target
+            .file
+            .read(&cx, &mut observed, u64::from(PAGE_SIZE))
+            .expect("actual database mismatch");
+        assert_eq!(observed[100], page_data[100] ^ 0x80);
+        // The same untouched WAL and same target can redo the failed backfill.
+        // The injected corruption was consumed; actual page writes repair it.
+        let result = execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
+            .expect("retry copies the authoritative WAL before publication");
+        let expected_prefix = if partial { 1 } else { 2 };
+        assert_eq!(result.frames_backfilled, expected_prefix);
+        assert_eq!(target.published_prefixes, vec![expected_prefix]);
+        target
+            .file
+            .read(&cx, &mut observed, u64::from(PAGE_SIZE))
+            .expect("repaired database bytes");
+        assert_eq!(observed, page_data);
+        if partial {
+            assert!(!result.wal_was_reset);
+            assert_eq!(checkpoint_test_wal_bytes(&wal, &cx), original);
+        }
+    }
+
+    #[test]
+    fn test_reset_gate_refusal_publishes_verified_backfill_once() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let page = PageNumber::new(2).expect("valid page");
+        wal.append_frame(&cx, 2, &sample_page(2), 2)
+            .expect("commit page");
+        let original = checkpoint_test_wal_bytes(&wal, &cx);
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        target.allow_reset = false;
+        let state = CheckpointState {
+            total_frames: 1,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("verified backfill survives a refused reset gate");
+        assert!(result.reset_deferred_by_readers());
+        assert_eq!(target.read_pages, vec![page]);
+        assert_eq!(
+            target.sync_count, 2,
+            "no final reset sync after refused gate"
+        );
+        assert_eq!(target.published_prefixes, vec![1]);
+        assert_eq!((target.gate_acquired, target.gate_released), (0, 0));
+        assert_eq!(checkpoint_test_wal_bytes(&wal, &cx), original);
+    }
+
+    #[test]
+    fn test_reset_rechecks_pages_after_later_sync_corruption() {
+        assert_later_reset_fence_preserves_wal(false);
+    }
+
+    #[test]
+    fn test_reset_preserves_wal_on_later_sync_failure() {
+        assert_later_reset_fence_preserves_wal(true);
+    }
+
+    fn assert_later_reset_fence_preserves_wal(fail_sync: bool) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let page = PageNumber::new(2).expect("valid page");
+        wal.append_frame(&cx, 2, &sample_page(2), 2)
+            .expect("commit page");
+        let original = checkpoint_test_wal_bytes(&wal, &cx);
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        if fail_sync {
+            target.fail_sync_call = Some(3);
+        } else {
+            target.corrupt_on_sync = Some((page, 100));
+            target.corrupt_sync_call = 3;
+        }
+        let state = CheckpointState {
+            total_frames: 1,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        let error = execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+            .expect_err("later reset durability step must still protect the WAL");
+        if fail_sync {
+            assert!(error.to_string().contains("injected database sync failure"));
+            assert_eq!(target.read_pages, vec![page]);
+        } else {
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+            assert_eq!(target.read_pages, vec![page, page]);
+        }
+        assert!(
+            target.published_prefixes.is_empty(),
+            "reset-mode backfill publication waits for the final database check"
+        );
+        assert_eq!((target.gate_acquired, target.gate_released), (1, 1));
+        assert_eq!(checkpoint_test_wal_bytes(&wal, &cx), original);
+        assert_eq!(wal.frame_count(), 1);
+    }
+
+    #[test]
+    fn test_partial_checkpoint_keeps_pages_above_intermediate_commit_size() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        wal.append_frame(&cx, 4, &sample_page(4), 4)
+            .expect("older large commit");
+        wal.append_frame(&cx, 1, &sample_page(1), 2)
+            .expect("intermediate shrink");
+        wal.append_frame(&cx, 2, &sample_page(2), 2)
+            .expect("final commit");
+
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: Some(2),
+        };
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Restart, state, &mut target)
+            .expect("partial checkpoint");
+        assert_eq!(result.frames_backfilled, 2);
+        assert_eq!(result.db_size_pages, Some(2));
+        assert!(!result.plan.completes_checkpoint());
+        assert!(!result.wal_was_reset);
+        assert_eq!(target.truncate_to, None);
+        assert_eq!(
+            target.file.file_size(&cx).expect("untruncated database"),
+            4 * u64::from(PAGE_SIZE)
+        );
+        assert_eq!(
+            target.read_pages,
+            vec![PageNumber::ONE, PageNumber::new(4).expect("valid page")],
+            "partial backfill must verify its complete written extent"
+        );
+        assert_eq!(target.published_prefixes, vec![2]);
+        assert_eq!(wal.frame_count(), 3);
+        assert_eq!(wal.header().salts, test_salts());
+        assert_eq!((target.gate_acquired, target.gate_released), (0, 0));
     }
 
     #[test]

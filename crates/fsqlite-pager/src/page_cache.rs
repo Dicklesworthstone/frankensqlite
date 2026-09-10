@@ -20,7 +20,9 @@
 //! false sharing between adjacent shards.
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -357,6 +359,99 @@ struct S3FifoQueueSnapshot {
     small_capacity: usize,
 }
 
+/// Test-only work receipt for one queue-snapshot call. Counts cover the
+/// completion loop, including its final empty scan, not access-trace replay.
+/// Every supported call rebuilds; unsupported sets report zero work.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct S3FifoReconstructionWork {
+    cache_hit: bool,
+    model_built: bool,
+    completion_rounds: usize,
+    resident_keys_scanned: usize,
+    missing_page_insertions: usize,
+    /// The loop consumed its budget; this does not assert that its final
+    /// insertion left missing residents (there is no extra validation scan).
+    completion_budget_exhausted: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static S3_FIFO_QUEUE_WORK_CAPTURE: RefCell<Option<Vec<S3FifoReconstructionWork>>> =
+        const { RefCell::new(None) };
+    static S3_FIFO_QUEUE_WORK_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Scope receipt collection outside the measurement's elapsed interval.
+#[cfg(test)]
+struct S3FifoQueueWorkCapture;
+
+#[cfg(test)]
+impl S3FifoQueueWorkCapture {
+    fn start() -> Self {
+        S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
+            assert!(capture.is_none(), "queue work capture must not nest");
+            *capture = Some(Vec::with_capacity(1));
+        });
+        Self
+    }
+
+    fn finish(self) -> Vec<S3FifoReconstructionWork> {
+        S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
+            capture.take().expect("queue work capture remains installed")
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for S3FifoQueueWorkCapture {
+    fn drop(&mut self) {
+        S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
+            let _ = capture.take();
+        });
+    }
+}
+
+/// Attribute only the synchronous build_model call made by queue_snapshot.
+/// Other reconstruction callers cannot publish into the enabled capture.
+#[cfg(test)]
+struct S3FifoQueueWorkScope {
+    enabled: bool,
+    previous_active: bool,
+}
+
+#[cfg(test)]
+impl S3FifoQueueWorkScope {
+    fn enter() -> Self {
+        let enabled = S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow(Option::is_some);
+        let previous_active = enabled && S3_FIFO_QUEUE_WORK_ACTIVE.replace(true);
+        Self {
+            enabled,
+            previous_active,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for S3FifoQueueWorkScope {
+    fn drop(&mut self) {
+        if self.enabled {
+            S3_FIFO_QUEUE_WORK_ACTIVE.set(self.previous_active);
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_s3_fifo_queue_work(work: S3FifoReconstructionWork) {
+    if S3_FIFO_QUEUE_WORK_ACTIVE.get() {
+        S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
+            if let Some(receipts) = capture.as_mut() {
+                receipts.push(work);
+            }
+        });
+    }
+}
+
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS: usize = 4_096;
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES: usize = 8_192;
 
@@ -424,8 +519,31 @@ impl S3FifoEvictionTracker {
     }
 
     fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
+        #[cfg(test)]
+        let _work_scope = S3FifoQueueWorkScope::enter();
+        self.queue_snapshot_with_hasher(
+            resident_pages,
+            hashbrown::DefaultHashBuilder::default,
+        )
+    }
+
+    /// Preserve the original standard-hashing projection as a test oracle.
+    /// This helper always rebuilds with standard hashing.
+    #[cfg(test)]
+    fn queue_snapshot_uncached(
+        &self,
+        resident_pages: &[PageNumber],
+    ) -> Option<S3FifoQueueSnapshot> {
+        self.queue_snapshot_with_hasher(resident_pages, RandomState::new)
+    }
+
+    fn queue_snapshot_with_hasher<S: BuildHasher>(
+        &self,
+        resident_pages: &[PageNumber],
+        make_hasher: impl FnOnce() -> S,
+    ) -> Option<S3FifoQueueSnapshot> {
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
-        let model = self.build_model(resident_pages)?;
+        let model = self.build_model_with_hasher(resident_pages, make_hasher)?;
         Some(S3FifoQueueSnapshot {
             small_len: model
                 .small_pages()
@@ -471,9 +589,21 @@ impl S3FifoEvictionTracker {
     }
 
     fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
+        self.build_model_with_hasher(resident_pages, RandomState::new)
+    }
+
+    fn build_model_with_hasher<S: BuildHasher>(
+        &self,
+        resident_pages: &[PageNumber],
+        make_hasher: impl FnOnce() -> S,
+    ) -> Option<S3Fifo<S>> {
+        #[cfg(test)]
+        let mut work = S3FifoReconstructionWork::default();
         if resident_pages.is_empty()
             || resident_pages.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
         {
+            #[cfg(test)]
+            record_s3_fifo_queue_work(work);
             return None;
         }
 
@@ -481,7 +611,12 @@ impl S3FifoEvictionTracker {
         let mut resident_order = resident_pages.to_vec();
         resident_order.sort_unstable_by_key(|page_no| page_no.get());
 
-        let mut model = S3Fifo::with_config(self.scaled_config(resident_pages.len()));
+        // Construct hashing only after the original unsupported-input guard,
+        // so eviction bypasses retain their original allocation-free path.
+        let mut model = S3Fifo::with_config_and_hasher(
+            self.scaled_config(resident_pages.len()),
+            make_hasher(),
+        );
         model.set_adaptation_interval(self.adaptation_interval);
         let (min_bound, max_bound) = self.scaled_bounds(resident_pages.len());
         model.set_adaptive_bounds(min_bound, max_bound);
@@ -497,6 +632,11 @@ impl S3FifoEvictionTracker {
 
         let mut remaining_rounds = resident_order.len().saturating_mul(2).max(1);
         while remaining_rounds > 0 {
+            #[cfg(test)]
+            {
+                work.completion_rounds += 1;
+                work.resident_keys_scanned += resident_order.len();
+            }
             let missing: Vec<PageNumber> = resident_order
                 .iter()
                 .copied()
@@ -510,12 +650,22 @@ impl S3FifoEvictionTracker {
             if missing.is_empty() {
                 break;
             }
+            #[cfg(test)]
+            {
+                work.missing_page_insertions += missing.len();
+            }
             for page_no in missing {
                 let _ = model.insert(page_no);
             }
             remaining_rounds = remaining_rounds.saturating_sub(1);
         }
 
+        #[cfg(test)]
+        {
+            work.model_built = true;
+            work.completion_budget_exhausted = remaining_rounds == 0;
+            record_s3_fifo_queue_work(work);
+        }
         Some(model)
     }
 
@@ -4919,6 +5069,10 @@ mod tests {
     }
 
     impl VfsFile for ControlledReadFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
@@ -5020,7 +5174,15 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
 
@@ -5123,6 +5285,10 @@ mod tests {
     }
 
     impl VfsFile for ControlledWritebackFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn close(&mut self, _cx: &Cx) -> Result<()> {
             Ok(())
         }
@@ -5182,7 +5348,15 @@ mod tests {
             Ok(())
         }
 
+        fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+            Err(FrankenError::Unsupported)
+        }
+
         fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
             Err(FrankenError::Unsupported)
         }
 
@@ -7476,9 +7650,288 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_s3_fifo_queue_work_receipts_exclude_eviction_and_report_completion() {
+        let tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
+        let one = [PageNumber::new(1).unwrap()];
+        let four: Vec<_> = (1..=4).map(|raw| PageNumber::new(raw).unwrap()).collect();
+        let oversized: Vec<_> = (1..=S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 1)
+            .map(|raw| PageNumber::new(u32::try_from(raw).unwrap()).unwrap())
+            .collect();
+
+        let capture = S3FifoQueueWorkCapture::start();
+        assert!(tracker.choose_victim(&one).is_some());
+        assert_eq!(tracker.queue_assignments(&one).len(), 1);
+        assert!(capture.finish().is_empty(), "only queue_snapshot is attributed");
+
+        for (residents, expected_work) in [
+            (&[][..], S3FifoReconstructionWork::default()),
+            (oversized.as_slice(), S3FifoReconstructionWork::default()),
+            (
+                one.as_slice(),
+                S3FifoReconstructionWork {
+                    cache_hit: false,
+                    model_built: true,
+                    completion_rounds: 2,
+                    resident_keys_scanned: 2,
+                    missing_page_insertions: 1,
+                    completion_budget_exhausted: false,
+                },
+            ),
+            (
+                four.as_slice(),
+                S3FifoReconstructionWork {
+                    cache_hit: false,
+                    model_built: true,
+                    completion_rounds: 8,
+                    resident_keys_scanned: 32,
+                    missing_page_insertions: 25,
+                    completion_budget_exhausted: true,
+                },
+            ),
+        ] {
+            // Reference work remains outside the attributed call.
+            let expected_snapshot = tracker.queue_snapshot_uncached(residents);
+            for _ in 0..2 {
+                let capture = S3FifoQueueWorkCapture::start();
+                assert_eq!(tracker.queue_snapshot(residents), expected_snapshot);
+                assert_eq!(capture.finish(), vec![expected_work]);
+            }
+        }
+
+        // A dropped measurement must not leak capture state into the next one.
+        let capture = S3FifoQueueWorkCapture::start();
+        let _ = tracker.queue_snapshot(&one);
+        drop(capture);
+        assert!(S3FifoQueueWorkCapture::start().finish().is_empty());
+    }
+
+    /// Compare fresh statistics against the standard-hashing reconstruction.
+    /// Both calls must rebuild; reference work is outside receipt capture.
+    fn assert_s3_fifo_statistics_snapshot(
+        tracker: &S3FifoEvictionTracker,
+        residents: &[PageNumber],
+    ) -> Option<S3FifoQueueSnapshot> {
+        let expected = tracker.queue_snapshot_uncached(residents);
+        for _ in 0..2 {
+            let capture = S3FifoQueueWorkCapture::start();
+            let snapshot = tracker.queue_snapshot(residents);
+            let receipts = capture.finish();
+            assert_eq!(snapshot, expected, "hashing must preserve the projection");
+            assert_eq!(receipts.len(), 1, "one receipt per statistics call");
+            let work = receipts[0];
+            assert!(!work.cache_hit, "statistics-only hashing retains no result");
+            assert_eq!(work.model_built, expected.is_some());
+            if work.model_built {
+                assert!(work.completion_rounds > 0);
+                assert_eq!(
+                    work.resident_keys_scanned,
+                    work.completion_rounds * residents.len(),
+                );
+            } else {
+                assert_eq!(work, S3FifoReconstructionWork::default());
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn test_s3_fifo_queue_snapshot_preserves_trace_order_and_resident_multiset() {
+        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
+        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
+        for raw in [1, 1, 2, 2, 3, 3, 4, 4] {
+            tracker.record_access(PageNumber::new(raw).unwrap());
+        }
+        let hot = assert_s3_fifo_statistics_snapshot(&tracker, &residents).unwrap();
+
+        // Equivalent logical traces may have different VecDeque storage splits.
+        let trace: Vec<_> = tracker.access_trace.iter().copied().collect();
+        let half = trace.len() / 2;
+        let mut wrapped = VecDeque::with_capacity(trace.len());
+        let padding = wrapped.capacity() - half;
+        for _ in 0..padding {
+            wrapped.push_back(PageNumber::ONE);
+        }
+        wrapped.extend(trace[..half].iter().copied());
+        for _ in 0..padding {
+            let _ = wrapped.pop_front();
+        }
+        wrapped.extend(trace[half..].iter().copied());
+        assert!(!wrapped.as_slices().1.is_empty(), "fixture must wrap");
+        assert!(wrapped.iter().eq(trace.iter()));
+        tracker.access_trace = wrapped;
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
+            Some(hot),
+        );
+
+        let reordered = [residents[3], residents[1], residents[0], residents[2]];
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&tracker, &reordered),
+            Some(hot),
+        );
+        let changed = [residents[0], residents[1], residents[1], residents[3]];
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &changed);
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        let duplicate = [
+            residents[0],
+            residents[1],
+            residents[2],
+            residents[3],
+            residents[3],
+        ];
+        let duplicate_snapshot = assert_s3_fifo_statistics_snapshot(&tracker, &duplicate);
+        let duplicate_reordered = [
+            residents[3],
+            residents[2],
+            residents[3],
+            residents[0],
+            residents[1],
+        ];
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&tracker, &duplicate_reordered),
+            duplicate_snapshot,
+        );
+
+        // Same trace length and multiplicities, but different access order.
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
+            Some(hot),
+        );
+        tracker.clear_history();
+        for raw in [1, 2, 3, 4, 1, 2, 3, 4] {
+            tracker.record_access(PageNumber::new(raw).unwrap());
+        }
+        let cold = assert_s3_fifo_statistics_snapshot(&tracker, &residents).unwrap();
+        assert_ne!(hot, cold, "the uncached oracle must distinguish the traces");
+    }
+
+    #[test]
+    fn test_s3_fifo_queue_snapshot_tracks_config_and_bounded_history() {
+        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
+        let original = S3FifoConfig::with_limits(16, 4, 4, 2);
+        for config in [
+            S3FifoConfig::with_limits(32, 4, 4, 2),
+            S3FifoConfig::with_limits(16, 8, 4, 2),
+            S3FifoConfig::with_limits(16, 4, 8, 2),
+            S3FifoConfig::with_limits(16, 4, 4, 3),
+        ] {
+            let mut tracker = S3FifoEvictionTracker::new(original);
+            let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+            tracker.config = config;
+            let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        }
+
+        let mut tracker = S3FifoEvictionTracker::new(original);
+        tracker.max_trace_entries = 4;
+        for raw in [1, 1, 2, 2] {
+            tracker.record_access(PageNumber::new(raw).unwrap());
+        }
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.adaptation_interval = 2;
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.adaptive_bounds = (4, 8);
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.record_admit(residents[2]);
+        assert_eq!(
+            tracker.access_trace.len(),
+            4,
+            "bounded trace length is unchanged",
+        );
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.forget(residents[1]);
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.clear_history();
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        tracker.clear_history();
+        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+    }
+
+    #[test]
+    fn test_s3_fifo_queue_snapshot_bounds_and_bypasses_skip_hasher_construction() {
+        let limit = S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS;
+        let residents: Vec<_> = (1..=limit)
+            .map(|raw| PageNumber::new(u32::try_from(raw).unwrap()).unwrap())
+            .collect();
+        // Keep this boundary control cheap: every page fits in SMALL, so
+        // the fixture does not exercise the separate exhausted-loop workload.
+        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::with_limits(limit, limit, 1, 2));
+        tracker.adaptive_bounds = (limit, limit);
+        for &page in &residents {
+            tracker.record_access(page);
+            tracker.record_access(page);
+        }
+        assert_eq!(
+            tracker.access_trace.len(),
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES,
+        );
+        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &residents).is_some());
+        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &[]).is_none());
+        let mut oversized = residents;
+        oversized.push(PageNumber::new(u32::try_from(limit + 1).unwrap()).unwrap());
+        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &oversized).is_none());
+        let constructions = Cell::new(0);
+        for unsupported in [&[][..], oversized.as_slice()] {
+            assert!(
+                tracker
+                    .build_model_with_hasher(unsupported, || {
+                        constructions.set(constructions.get() + 1);
+                        hashbrown::DefaultHashBuilder::default()
+                    })
+                    .is_none(),
+            );
+        }
+        assert_eq!(
+            constructions.get(),
+            0,
+            "bypasses never construct a model hasher",
+        );
+    }
+
+    #[test]
+    fn test_s3_fifo_queue_snapshot_does_not_steer_eviction_or_clone_history() {
+        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
+        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
+        for &page in &residents {
+            tracker.record_access(page);
+            tracker.record_access(page);
+        }
+        let reference = tracker.clone();
+        let victim = reference.choose_victim(&residents);
+        let assignments = reference.queue_assignments(&residents);
+        let snapshot = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
+        let capture = S3FifoQueueWorkCapture::start();
+        assert_eq!(tracker.choose_victim(&residents), victim);
+        assert_eq!(tracker.queue_assignments(&residents), assignments);
+        assert!(
+            capture.finish().is_empty(),
+            "eviction callers are not statistics",
+        );
+
+        let mut cloned = tracker.clone();
+        assert_eq!(cloned.access_trace, tracker.access_trace);
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&cloned, &residents),
+            snapshot,
+        );
+        cloned.record_access(residents[0]);
+        assert_ne!(cloned.access_trace, tracker.access_trace);
+        let _ = assert_s3_fifo_statistics_snapshot(&cloned, &residents);
+        assert_eq!(tracker.access_trace, reference.access_trace);
+        assert_eq!(
+            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
+            snapshot,
+        );
+    }
+
     /// Isolate GH402's statistics cost from SQL, WAL I/O and connection open.
-    /// Keep the first call, three warmups and ten measured calls; timings are
-    /// observations, while unchanged counters and page contents are required.
+    /// Keep all 13 samples: sample zero is the first call and part of the three
+    /// warmups; samples 3..12 are ten measured repeated calls. Every nonempty
+    /// call rebuilds with the statistics hasher, including repeated calls.
+    /// Timings include fresh reconstruction and test-only work receipts,
+    /// and are not directly comparable to older uninstrumented observations.
+    /// Capture allocation, receipt consumption and formatting stay outside the
+    /// elapsed time. All existing counter, snapshot and page oracles remain.
     #[test]
     #[ignore = "GH402 cache statistics measurement; run explicitly with --nocapture"]
     fn gh402_measure_cache_metrics_reconstruction() {
@@ -7517,9 +7970,49 @@ mod tests {
                         let counters_before = cache.metrics_lightweight_snapshot();
                         let mut expected = None;
                         for sample in 0..13 {
+                            let capture = S3FifoQueueWorkCapture::start();
                             let started = Instant::now();
                             let snapshot = cache.metrics_snapshot();
                             let elapsed_ns = started.elapsed().as_nanos();
+                            let receipts = capture.finish();
+                            assert_eq!(receipts.len(), 1, "one queue snapshot per metrics call");
+                            let work = receipts[0];
+                            assert_eq!(work.model_built, resident_count != 0);
+                            assert!(!work.cache_hit, "statistics-only hashing retains no result");
+                            if !work.model_built {
+                                assert_eq!(
+                                    work,
+                                    S3FifoReconstructionWork {
+                                        cache_hit: work.cache_hit,
+                                        ..S3FifoReconstructionWork::default()
+                                    },
+                                    "empty bypasses perform no reconstruction",
+                                );
+                            }
+                            assert_eq!(
+                                work.resident_keys_scanned,
+                                work.completion_rounds * resident_count,
+                            );
+                            assert!(work.missing_page_insertions <= work.resident_keys_scanned);
+                            println!(
+                                "[gh402-cache-work] {}",
+                                json!({
+                                    "residents": resident_count,
+                                    "fast_path": fast_path,
+                                    "adaptive": adaptive,
+                                    "hot_trace": hot_trace,
+                                    "sample": sample,
+                                    "warmup": sample < 3,
+                                    "timing_kind": "instrumented_statistics_hasher",
+                                    "queue_snapshot_calls": receipts.len(),
+                                    "cache_hit": work.cache_hit,
+                                    "model_built": work.model_built,
+                                    "completion_rounds": work.completion_rounds,
+                                    "resident_keys_scanned": work.resident_keys_scanned,
+                                    "missing_page_insertions": work.missing_page_insertions,
+                                    "completion_budget_exhausted": work.completion_budget_exhausted,
+                                }),
+                            );
                             assert_eq!(snapshot.cached_pages, resident_count);
                             assert_eq!(snapshot.dirty_ratio_pct, 0);
                             assert_eq!(cache.metrics_lightweight_snapshot(), counters_before);

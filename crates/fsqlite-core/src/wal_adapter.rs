@@ -16,20 +16,27 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
     PreparedWalChecksumSeed, PreparedWalFinalizationState, PreparedWalFrameBatch,
     PreparedWalFrameMeta, WalFrameRef, WalFuture, WalLogicalReadSnapshot,
+    WalNativeReadBinding, WalNativeReadOutcome, WalNativeReadToken, WalNativeRecoveryReason,
 };
 use fsqlite_pager::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, ParallelWalCommitReconciliation,
-    WalBackend, WalPublicationSnapshot,
+    WalBackend, WalIndexShmSource, WalPublicationSnapshot,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{CommitSeq, PageNumber, PageSize};
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::DatabaseNamespaceBinding;
-use fsqlite_vfs::{SyncKind, Vfs, VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::{SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState};
 use fsqlite_wal::checkpoint_executor::CheckpointTargetFuture;
 use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
+use fsqlite_wal::wal_index::{
+    SharedWalIndexResetPlan, WalIndexHdr, publish_shared_wal_index_backfill,
+    read_shared_wal_index_backfill,
+    SharedWalIndexAppendPlan, WalIndexFrameLocation, read_shared_wal_index_header,
+    validate_shared_wal_index_wal_binding,
+};
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
     PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC, PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE,
@@ -242,6 +249,32 @@ struct PendingPublicationFrame {
     is_commit: bool,
 }
 
+/// Owns one append even when its caller returns an error or drops its future.
+/// Candidate metadata stays in `pending_publication_frames`; only successful
+/// append completion or exact certificate reconciliation may accept it.
+struct PendingWalAppendAttempt {
+    generation: WalGenerationIdentity,
+    previous_native_publication: Option<SharedWalIndexAppendPlan>,
+    start_frame_index: usize,
+    previous_running_checksum: SqliteWalChecksum,
+    end_frame_count: usize,
+    previous_pending_len: usize,
+    previous_pending_commit: Option<usize>,
+    previous_pending_generation: Option<WalGenerationIdentity>,
+    previous_refresh_before_append: bool,
+    completion: VfsWriteCompletion,
+    authorized: bool,
+}
+
+/// Validated updates for one publication scan, bounded by admitted page keys.
+/// No published lookup state changes until the entire scan succeeds.
+#[derive(Debug, Default)]
+struct WalPublicationDelta {
+    page_index_updates: HashMap<u32, usize>,
+    commit_count: u64,
+    index_is_partial: bool,
+}
+
 /// One-pass index of the PHYSICAL appended tail (`0..frame_count`), built on
 /// demand by [`WalBackend::read_page_at_appended_tail`] and reused while the
 /// tail is provably unchanged: same generation identity, same frame count and
@@ -256,6 +289,26 @@ struct AppendedTailIndex {
     tail_checksum: SqliteWalChecksum,
     /// Newest frame index per page within the appended tail.
     latest_frame_by_page: HashMap<u32, usize>,
+}
+
+struct NativeCheckpointView<F: VfsFile> {
+    source: Arc<WalIndexShmSource<F>>,
+    region: fsqlite_vfs::ShmRegion,
+    header: WalIndexHdr,
+    backfilled_frames: u32,
+}
+
+/// The adapter, rather than the executor future, owns every reset obligation.
+struct PendingCheckpointReset<F: VfsFile> {
+    old_header: WalHeader,
+    target_header: WalHeader,
+    truncate: bool,
+    completion: VfsWriteCompletion,
+    physical_complete: bool,
+    shared_complete: bool,
+    native: Option<SharedWalIndexResetPlan>,
+    // Keep the exact attachment alive through async writes and publication.
+    _source: Option<Arc<WalIndexShmSource<F>>>,
 }
 
 pub struct WalBackendAdapter<F: VfsFile> {
@@ -281,6 +334,17 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Publication is refused if the generation moves before the sync lands,
     /// because a checkpoint or restart invalidates the staged frame indices.
     pending_publication_generation: Option<WalGenerationIdentity>,
+    /// Physical append outcome not yet accepted by its caller or reconciler.
+    pending_append_attempt: Option<PendingWalAppendAttempt>,
+    pending_checkpoint_reset: Option<PendingCheckpointReset<F>>,
+    /// Mapping capability for this pager's exact native main-file attachment.
+    wal_index_shm_source: Option<Arc<WalIndexShmSource<F>>>,
+    /// Shared publication remains owned after the physical append succeeds.
+    native_publication: Option<SharedWalIndexAppendPlan>,
+    /// Exact reader token and bounds; its physical owner lives in the pager.
+    native_read_binding: Option<WalNativeReadBinding>,
+    /// Observation made before staging, retained until gated recovery succeeds.
+    native_recovery_requested: Option<WalNativeRecoveryReason>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_hook: Option<FecCommitHook>,
@@ -336,6 +400,12 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             pending_publication_frames: Vec::new(),
             pending_publication_commit: None,
             pending_publication_generation: None,
+            pending_append_attempt: None,
+            pending_checkpoint_reset: None,
+            wal_index_shm_source: None,
+            native_publication: None,
+            native_read_binding: None,
+            native_recovery_requested: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_hook: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -364,6 +434,12 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             pending_publication_frames: Vec::new(),
             pending_publication_commit: None,
             pending_publication_generation: None,
+            pending_append_attempt: None,
+            pending_checkpoint_reset: None,
+            wal_index_shm_source: None,
+            native_publication: None,
+            native_read_binding: None,
+            native_recovery_requested: None,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
             checkpoint_retired_salts: None,
@@ -386,7 +462,31 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// (GH #187).
     #[must_use]
     pub fn has_pending_publication(&self) -> bool {
-        self.pending_publication_commit.is_some() || !self.pending_publication_frames.is_empty()
+        self.pending_append_attempt.is_some()
+            || self.pending_checkpoint_reset.is_some()
+            || self.native_publication.is_some()
+            || self.pending_publication_commit.is_some()
+            || !self.pending_publication_frames.is_empty()
+    }
+
+    /// Attach publication to the pager's exact main-file SHM capability.
+    ///
+    /// This performs no mapping, reader admission, recovery, or publication.
+    /// Before appending, the caller must establish an initialized shared
+    /// header bound to this WAL and retain the exact external WRITE owner
+    /// through append, sync/deferred publication, and any reconciliation.
+    /// Recovery and reader ownership remain separate prerequisites. Production
+    /// constructors select native Unix backends explicitly.
+    #[cfg(all(feature = "native", unix))]
+    pub fn attach_wal_index_shm_source(
+        &mut self,
+        source: Arc<WalIndexShmSource<F>>,
+    ) -> Result<()> {
+        if self.has_pending_publication() || self.wal_index_shm_source.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        self.wal_index_shm_source = Some(source);
+        Ok(())
     }
 
     /// Consume the adapter and return the inner [`WalFile`].
@@ -396,11 +496,14 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// be rewrapped by an adapter that would then publish those frames without
     /// knowing whether they were ever published or fsynced (GH #187). Drain the
     /// batch with a successful commit sync first.
-    /// Returns [`FrankenError::Busy`]: this is a retryable ordering condition,
-    /// not database corruption.
-    pub fn into_inner(self) -> Result<WalFile<F>> {
-        if self.has_pending_publication() {
-            return Err(FrankenError::Busy);
+    /// On refusal, returns the same adapter with its publication metadata and
+    /// append completion owner intact. The caller can reconcile or sync it,
+    /// then retry extraction without reconstructing lost state.
+    pub fn into_inner(self) -> std::result::Result<WalFile<F>, Box<Self>> {
+        if self.has_pending_publication() || self.native_read_binding.is_some()
+            || self.native_recovery_requested.is_some()
+        {
+            return Err(Box::new(self));
         }
         Ok(self.wal)
     }
@@ -420,7 +523,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// and could expose frames that were never fsynced. Drain the batch with a
     /// successful sync first.
     pub fn inner_mut(&mut self) -> Result<&mut WalFile<F>> {
-        if self.has_pending_publication() {
+        if self.has_pending_publication() || self.native_read_binding.is_some()
+            || self.native_recovery_requested.is_some()
+        {
             return Err(FrankenError::Busy);
         }
         self.invalidate_publication();
@@ -448,6 +553,15 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Refresh this handle from disk and republish the latest committed WAL
     /// visibility summary without pinning a read transaction.
     pub async fn refresh_published_snapshot(&mut self, cx: &Cx) -> Result<WalPublicationSnapshot> {
+        if self.native_read_binding.is_some() || self.native_recovery_requested.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        self.assert_no_pending_append_attempt()?;
+        if self.native_publication.is_some() {
+            // A refresh can trim an owned uncommitted suffix or bypass a
+            // failed native publication after fsync. Finish that owner first.
+            return Err(FrankenError::BusyRecovery);
+        }
         self.wal.refresh(cx).await?;
         self.publish_latest_committed_snapshot(cx, "refresh_published_snapshot")
             .await?;
@@ -484,23 +598,17 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
         let previous_generation = self.published_snapshot.generation;
         let previous_last_commit = self.published_snapshot.last_commit_frame;
-        let previous_commit_count = if previous_generation == generation {
-            self.published_snapshot.commit_count
-        } else {
-            0
-        };
-        let mut page_index = if previous_generation == generation {
-            std::mem::replace(
-                &mut self.published_snapshot.page_index,
-                Arc::new(HashMap::new()),
-            )
-        } else {
-            Arc::new(HashMap::new())
-        };
-        let mut index_is_partial = if previous_generation == generation {
-            self.published_snapshot.index_is_partial
-        } else {
-            false
+        let (start, base_commit_count, extend_previous) = match (
+            previous_generation == generation,
+            previous_last_commit,
+            last_commit_frame,
+        ) {
+            (true, Some(previous), Some(current)) if previous < current => (
+                previous.saturating_add(1),
+                self.published_snapshot.commit_count,
+                true,
+            ),
+            _ => (0, 0, false),
         };
 
         let frame_delta_count = match (previous_last_commit, last_commit_frame) {
@@ -510,57 +618,32 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             (None, None) => 0,
         };
 
-        let scan_result = match last_commit_frame {
-            None => {
-                Arc::make_mut(&mut page_index).clear();
-                index_is_partial = false;
-                Ok(0)
+        // Header reads can fail or be cancelled after a tracked page has been
+        // encountered. Stage only admitted keys; preserve the entire prior
+        // snapshot, including its Arc, until every read has succeeded.
+        let delta = match last_commit_frame {
+            Some(end) => {
+                self.scan_publication_delta(cx, extend_previous, start, end)
+                    .await?
             }
-            Some(current_last_commit) => {
-                let (start, base_commit_count) =
-                    match (previous_generation == generation, previous_last_commit) {
-                        (true, Some(previous_last_commit))
-                            if previous_last_commit < current_last_commit =>
-                        {
-                            (
-                                previous_last_commit.saturating_add(1),
-                                previous_commit_count,
-                            )
-                        }
-                        (true, Some(previous_last_commit))
-                            if previous_last_commit == current_last_commit =>
-                        {
-                            (current_last_commit.saturating_add(1), previous_commit_count)
-                        }
-                        _ => {
-                            Arc::make_mut(&mut page_index).clear();
-                            index_is_partial = false;
-                            (0, 0)
-                        }
-                    };
-                if start <= current_last_commit {
-                    self.index_range_and_count_commits(
-                        cx,
-                        Arc::make_mut(&mut page_index),
-                        &mut index_is_partial,
-                        start,
-                        current_last_commit,
-                    )
-                    .await
-                    .map(|delta| base_commit_count.saturating_add(delta))
-                } else {
-                    Ok(base_commit_count)
-                }
-            }
+            None => WalPublicationDelta::default(),
         };
-        let commit_count = match scan_result {
-            Ok(commit_count) => commit_count,
-            Err(error) => {
-                if previous_generation == generation {
-                    self.published_snapshot.page_index = page_index;
-                }
-                return Err(error);
+        let commit_count = base_commit_count.saturating_add(delta.commit_count);
+        let index_is_partial = delta.index_is_partial;
+        // There is no fallible I/O or await after taking the published map.
+        // An unpinned map remains uniquely owned, so applying the delta does
+        // not clone the full index. Pinned readers retain their prior Arc.
+        let page_index = if extend_previous {
+            let mut page_index = std::mem::replace(
+                &mut self.published_snapshot.page_index,
+                Arc::new(HashMap::new()),
+            );
+            if !delta.page_index_updates.is_empty() {
+                Arc::make_mut(&mut page_index).extend(delta.page_index_updates);
             }
+            page_index
+        } else {
+            Arc::new(delta.page_index_updates)
         };
 
         let publication_seq = self.next_publication_seq;
@@ -631,43 +714,42 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         }
     }
 
-    /// Scan frame headers from `start..=end` (inclusive), populate the page index,
-    /// and count commit frames in the same pass.
+    /// Validate `start..=end` without mutating the published page index.
     ///
-    /// Since we scan forward, later frames naturally overwrite earlier entries
-    /// for the same page number, ensuring "newest frame wins" semantics.
-    async fn index_range_and_count_commits(
+    /// Admit new keys in scan order, retain updates to already admitted keys
+    /// at capacity, and count every commit marker even when its page is dropped.
+    /// The delta stores at most one latest frame per admitted key, never one
+    /// entry per frame or a clone of the full published map.
+    async fn scan_publication_delta(
         &self,
         cx: &Cx,
-        page_index: &mut HashMap<u32, usize>,
-        index_is_partial: &mut bool,
+        extend_previous: bool,
         start: usize,
         end: usize,
-    ) -> Result<u64> {
-        if start > end {
-            return Ok(0);
-        }
-
-        let mut commit_count = 0_u64;
+    ) -> Result<WalPublicationDelta> {
+        let base_index = extend_previous.then_some(self.published_snapshot.page_index.as_ref());
+        let mut admitted_page_count = base_index.map_or(0, HashMap::len);
+        let mut delta = WalPublicationDelta {
+            index_is_partial: extend_previous && self.published_snapshot.index_is_partial,
+            ..WalPublicationDelta::default()
+        };
         for frame_index in start..=end {
             let header = self.wal.read_frame_header(cx, frame_index).await?;
-            // Only insert if we haven't hit the capacity cap, or if this page
-            // is already tracked (update is free).
-            if page_index.len() < self.page_index_cap
-                || page_index.contains_key(&header.page_number)
-            {
-                page_index.insert(header.page_number, frame_index);
+            let already_admitted = delta.page_index_updates.contains_key(&header.page_number)
+                || base_index.is_some_and(|index| index.contains_key(&header.page_number));
+            if already_admitted || admitted_page_count < self.page_index_cap {
+                if !already_admitted {
+                    admitted_page_count += 1;
+                }
+                delta.page_index_updates.insert(header.page_number, frame_index);
             } else {
-                // A page was dropped because the index is full -- mark it as
-                // partial so that `read_page` knows a HashMap miss cannot be
-                // trusted and must fall back to a linear scan.
-                *index_is_partial = true;
+                delta.index_is_partial = true;
             }
             if header.is_commit() {
-                commit_count = commit_count.saturating_add(1);
+                delta.commit_count = delta.commit_count.saturating_add(1);
             }
         }
-        Ok(commit_count)
+        Ok(delta)
     }
 
     /// Backwards linear scan of committed frames to find a page that was not
@@ -917,6 +999,17 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         cx: &Cx,
         scenario_id: &'static str,
     ) -> Result<()> {
+        self.assert_no_pending_append_attempt()?;
+        if let Some(plan) = &self.native_publication {
+            if plan.generation() != self.wal.generation_identity()
+                || self.published_snapshot.generation != plan.generation()
+            {
+                return Err(FrankenError::BusyRecovery);
+            }
+            // Only the native-before-private commit hooks may advance this
+            // owner's visibility, even if its WAL fsync already succeeded.
+            return Ok(());
+        }
         let last_commit_frame = self.wal.last_commit_frame(cx)?;
         // While a local batch is staged, the WAL's own commit horizon includes
         // frames this handle appended but has not yet fsynced. Refresh and
@@ -942,6 +1035,20 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 frame
                     .checked_add(1)
                     .is_some_and(|frame_count| frame_count <= durable_frames)
+            }).or_else(|| {
+                // A newer staged marker cannot revoke an earlier publication.
+                // Preserve its exact horizon only while it still belongs to
+                // this live generation. That publication may have deferred
+                // sync authority, so its visibility does not require a local
+                // fsync watermark. Never infer a marker from durable_frames.
+                let published = &self.published_snapshot;
+                if published.generation != self.wal.generation_identity() {
+                    return None;
+                }
+                published.last_commit_frame.filter(|previous| {
+                    *previous < self.wal.frame_count()
+                        && last_commit_frame.is_some_and(|latest| *previous <= latest)
+                })
             })
         } else {
             last_commit_frame
@@ -965,6 +1072,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         if self.has_pending_publication() {
             return Err(FrankenError::Busy);
         }
+        if self.wal_index_shm_source.is_some() {
+            return self.preflight_native_append(cx).await;
+        }
         self.wal.refresh(cx).await?;
         self.discard_pending_publication();
         self.publish_latest_committed_snapshot(cx, scenario_id)
@@ -976,6 +1086,602 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         self.pending_publication_frames.clear();
         self.pending_publication_commit = None;
         self.pending_publication_generation = None;
+    }
+
+    /// Refuse mutation or publication while an append still needs reconciliation.
+    fn assert_no_pending_append_attempt(&self) -> Result<()> {
+        if self.pending_append_attempt.is_some() || self.pending_checkpoint_reset.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
+    fn validate_append_page(&self, page_data: &[u8]) -> Result<()> {
+        if page_data.len() != self.wal.page_size() {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "page data size mismatch: expected {}, got {}",
+                    self.wal.page_size(), page_data.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate public prepared metadata before it can become a recovery owner.
+    fn validate_prepared_frame_metadata(&self, prepared: &PreparedWalFrameBatch) -> Result<()> {
+        let expected_bytes = prepared.frame_count().checked_mul(self.wal.frame_size())
+            .ok_or(FrankenError::DatabaseFull)?;
+        if prepared.frame_size != self.wal.frame_size()
+            || prepared.page_data_offset != WAL_FRAME_HEADER_SIZE
+            || prepared.big_endian_checksum != self.wal.big_endian_checksum()
+            || prepared.checksum_transforms.len() != prepared.frame_count()
+            || prepared.frame_bytes.len() != expected_bytes
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared WAL batch layout does not match its frame metadata".to_owned(),
+            });
+        }
+        let mut last_commit = None;
+        for (index, (meta, bytes)) in prepared.frame_metas.iter()
+            .zip(prepared.frame_bytes.chunks_exact(self.wal.frame_size())).enumerate()
+        {
+            if bytes[..4] != meta.page_number.to_be_bytes()
+                || bytes[4..8] != meta.db_size_if_commit.to_be_bytes()
+            {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "prepared WAL frame bytes disagree with publication metadata".to_owned(),
+                });
+            }
+            if meta.db_size_if_commit != 0 {
+                last_commit = Some(index);
+            }
+        }
+        if last_commit != prepared.last_commit_frame_offset {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared commit offset does not identify the final commit marker".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Finalization may refresh salts; check the resulting bytes before arming.
+    fn validate_finalized_prepared_generation(&self, prepared: &PreparedWalFrameBatch) -> Result<()> {
+        let salts = self.wal.generation_identity().salts;
+        let checksum = Self::finalized_running_checksum(prepared)?;
+        let tail = prepared.frame_bytes.chunks_exact(self.wal.frame_size()).next_back()
+            .ok_or_else(|| FrankenError::internal("nonempty prepared append lost its tail"))?;
+        if tail[16..20] != checksum.s1.to_be_bytes() || tail[20..24] != checksum.s2.to_be_bytes() {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared WAL tail checksum differs from finalized metadata".to_owned(),
+            });
+        }
+        if prepared.frame_bytes.chunks_exact(self.wal.frame_size()).any(|bytes| {
+            bytes[8..12] != salts.salt1.to_be_bytes() || bytes[12..16] != salts.salt2.to_be_bytes()
+        }) {
+            return Err(FrankenError::WalCorrupt {
+                detail: "prepared WAL frame salts do not match the append generation".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stage exact candidate metadata before ownership reaches physical I/O.
+    async fn stage_append_attempt<I>(
+        &mut self,
+        cx: &Cx,
+        frames: I,
+        completion: VfsWriteCompletion,
+    ) -> Result<()>
+    where
+        I: ExactSizeIterator<Item = (u32, u32)> + Clone,
+    {
+        self.assert_no_pending_append_attempt()?;
+        if completion.state() != VfsWriteCompletionState::Pending {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL append completion token was already terminal".to_owned(),
+            });
+        }
+        frames.len().checked_mul(self.wal.frame_size()).ok_or(FrankenError::DatabaseFull)?;
+        let start_frame_index = self.wal.frame_count();
+        let end_frame_count = start_frame_index
+            .checked_add(frames.len())
+            .ok_or(FrankenError::DatabaseFull)?;
+        if end_frame_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+        let generation = self.wal.generation_identity();
+        if self.pending_publication_generation.is_some_and(|old| old != generation) {
+            return Err(FrankenError::WalCorrupt {
+                detail: "cannot append across an unresolved publication generation".to_owned(),
+            });
+        }
+        let prepared_native_publication = self.prepare_native_publication(cx, frames.clone()).await?;
+        self.pending_append_attempt = Some(PendingWalAppendAttempt {
+            previous_native_publication: std::mem::replace(
+                &mut self.native_publication,
+                prepared_native_publication,
+            ),
+            generation,
+            start_frame_index,
+            previous_running_checksum: self.wal.running_checksum(),
+            end_frame_count,
+            previous_pending_len: self.pending_publication_frames.len(),
+            previous_pending_commit: self.pending_publication_commit,
+            previous_pending_generation: self.pending_publication_generation,
+            previous_refresh_before_append: self.refresh_before_append,
+            completion,
+            authorized: false,
+        });
+        let last_commit = self.record_appended_frames(start_frame_index, frames);
+        self.pending_publication_generation = Some(generation);
+        self.refresh_before_append = false;
+        if let Some(last_commit) = last_commit {
+            self.stage_pending_commit_publication(last_commit)?;
+        }
+        Ok(())
+    }
+
+    /// Record only a complete orphan observed under this exact fresh WRITE.
+    /// The old reader pin remains untouched; recovery occurs after unwind.
+    async fn classify_unpublished_native_tail(
+        &mut self,
+        cx: &Cx,
+        baseline: fsqlite_wal::wal_index::WalIndexHdr,
+        start: u32,
+    ) -> Result<()> {
+        if baseline.mx_frame >= start { return Ok(()); }
+        if self.has_pending_publication() { return Err(FrankenError::BusyRecovery); }
+        let (index, committed) = self.wal.last_commit_frame_header()
+            .ok_or(FrankenError::BusyRecovery)?;
+        let committed_count = u32::try_from(index).ok().and_then(|index| index.checked_add(1))
+            .ok_or(FrankenError::DatabaseFull)?;
+        if committed_count <= baseline.mx_frame || committed_count > start || !committed.is_commit()
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let observed = self.wal.read_frame_header(cx, index).await?;
+        if observed != committed || observed.salts != self.wal.header().salts {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let source = self.wal_index_shm_source.as_ref().ok_or(FrankenError::Unsupported)?;
+        if !source.owns_external_wal_append_write(cx).await? {
+            return Err(FrankenError::BusyRecovery);
+        }
+        // No fallible work or await separates the ownership query from this
+        // retained observation. It is not an append/publication candidate.
+        self.native_recovery_requested = Some(WalNativeRecoveryReason::UnpublishedWalTail);
+        tracing::debug!(
+            target: "fsqlite.wal.recovery",
+            shared_frame = baseline.mx_frame,
+            committed_frame = committed_count,
+            "fresh native append owner observed an unadvertised committed WAL tail"
+        );
+        Err(FrankenError::BusyRecovery)
+    }
+
+    /// Inspect the live native prefix before conflict checks or candidate staging.
+    async fn native_append_baseline(&mut self, cx: &Cx) -> Result<fsqlite_wal::wal_index::WalIndexHdr> {
+        if self.has_pending_publication() || self.native_recovery_requested.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let source = self.wal_index_shm_source.clone().ok_or(FrankenError::Unsupported)?;
+        let region = source.map_region(cx, 0, false).await?;
+        let baseline = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
+        self.wal.refresh(cx).await?;
+        let start = u32::try_from(self.wal.frame_count()).map_err(|_| FrankenError::DatabaseFull)?;
+        if baseline.mx_frame > start { return Err(FrankenError::BusyRecovery); }
+        let terminal = if baseline.mx_frame == 0 {
+            None
+        } else {
+            let index = usize::try_from(baseline.mx_frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
+            Some((baseline.mx_frame, self.wal.read_frame_header(cx, index).await?))
+        };
+        validate_shared_wal_index_wal_binding(&baseline, self.wal.header(), terminal)?;
+        self.classify_unpublished_native_tail(cx, baseline, start).await?;
+        Ok(baseline)
+    }
+
+    /// Map and validate everything needed by the later synchronous publisher.
+    /// Live index entries and both shared header copies remain unchanged.
+    async fn prepare_native_publication<I>(
+        &mut self,
+        cx: &Cx,
+        frames: I,
+    ) -> Result<Option<SharedWalIndexAppendPlan>>
+    where
+        I: ExactSizeIterator<Item = (u32, u32)>,
+    {
+        let Some(source) = self.wal_index_shm_source.clone() else {
+            return Ok(None);
+        };
+        if self.native_recovery_requested.is_some() { return Err(FrankenError::BusyRecovery); }
+        if self.native_publication.as_ref().is_some_and(|plan| !plan.can_extend()) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let region_zero = source.map_region(cx, 0, false).await?;
+        let baseline = read_shared_wal_index_header(&region_zero)?
+            .ok_or(FrankenError::BusyRecovery)?;
+        let generation = self.wal.generation_identity();
+        let start = u32::try_from(self.wal.frame_count()).map_err(|_| FrankenError::DatabaseFull)?;
+        if baseline.mx_frame > start {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if let Some(previous) = &self.native_publication {
+            if previous.baseline() != baseline || previous.generation() != generation {
+                return Err(FrankenError::BusyRecovery);
+            }
+        } else if !self.pending_publication_frames.is_empty() {
+            // An unexplained physical suffix is not ours to certify. Shared
+            // initialization/recovery belongs to the separate recovery owner.
+            return Err(FrankenError::BusyRecovery);
+        }
+        let terminal = if baseline.mx_frame == 0 {
+            None
+        } else {
+            let index = usize::try_from(baseline.mx_frame - 1)
+                .map_err(|_| FrankenError::DatabaseFull)?;
+            let header = match self.wal.last_commit_frame_header() {
+                Some((cached_index, header)) if cached_index == index => header,
+                _ => self.wal.read_frame_header(cx, index).await?,
+            };
+            Some((baseline.mx_frame, header))
+        };
+        validate_shared_wal_index_wal_binding(&baseline, self.wal.header(), terminal)?;
+        if self.native_publication.is_none() {
+            self.classify_unpublished_native_tail(cx, baseline, start).await?;
+        }
+        let capacity = self.pending_publication_frames.len().checked_add(frames.len())
+            .ok_or(FrankenError::DatabaseFull)?;
+        let mut entries = Vec::with_capacity(capacity);
+        let mut previous = baseline.mx_frame;
+        for frame in &self.pending_publication_frames {
+            let number = u32::try_from(frame.frame_index)
+                .ok().and_then(|index| index.checked_add(1))
+                .ok_or(FrankenError::DatabaseFull)?;
+            if previous.checked_add(1) != Some(number) {
+                return Err(FrankenError::BusyRecovery);
+            }
+            entries.push((number, frame.page_number, frame.is_commit));
+            previous = number;
+        }
+        if previous != start {
+            return Err(FrankenError::BusyRecovery);
+        }
+        for (page, db_size_if_commit) in frames {
+            previous = previous.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+            entries.push((previous, page, db_size_if_commit != 0));
+        }
+        let mut region_numbers = vec![0];
+        for &(frame, _, _) in &entries {
+            let number = WalIndexFrameLocation::new(frame)?.region;
+            if region_numbers.last() != Some(&number) {
+                region_numbers.push(number);
+            }
+        }
+        let mut regions = Vec::with_capacity(region_numbers.len());
+        regions.push((0, region_zero));
+        for number in region_numbers.into_iter().skip(1) {
+            regions.push((number, source.map_region(cx, number, true).await?));
+        }
+        SharedWalIndexAppendPlan::prepare(baseline, generation, regions, entries).map(Some)
+    }
+
+    fn publish_native_pending(&mut self, last_commit_frame: usize) -> Result<()> {
+        if self.wal_index_shm_source.is_none() {
+            return Ok(());
+        }
+        let plan = self.native_publication.as_mut().ok_or(FrankenError::BusyRecovery)?;
+        let (index, marker) = self.wal.last_commit_frame_header()
+            .ok_or(FrankenError::BusyRecovery)?;
+        if index != last_commit_frame || plan.generation() != self.wal.generation_identity() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let mut target = plan.baseline();
+        target.mx_frame = u32::try_from(index).ok().and_then(|frame| frame.checked_add(1))
+            .ok_or(FrankenError::DatabaseFull)?;
+        target.n_page = marker.db_size;
+        target.a_frame_cksum = [marker.checksum.s1, marker.checksum.s2];
+        target.i_change = plan.publication_change(target.mx_frame)?;
+        target.update_checksum()?;
+        validate_shared_wal_index_wal_binding(
+            &target, self.wal.header(), Some((target.mx_frame, marker)),
+        )?;
+        plan.publish(target)
+    }
+
+    fn finish_native_publication(&mut self) {
+        if self.native_publication.as_mut()
+            .is_some_and(|plan| !plan.finish_private_publication())
+        {
+            self.native_publication = None;
+        }
+    }
+
+    /// Validate the native publication before maintenance reads or DB backfill.
+    /// A newer physical commit is not silently checkpointed under an older SHM header.
+    async fn native_checkpoint_view(&mut self, cx: &Cx) -> Result<Option<NativeCheckpointView<F>>> {
+        if self.has_pending_publication() || self.native_read_binding.is_some()
+            || self.native_recovery_requested.is_some()
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let Some(source) = self.wal_index_shm_source.clone() else { return Ok(None); };
+        let region = source.map_region(cx, 0, false).await?;
+        let header = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
+        self.wal.refresh(cx).await?;
+        if usize::try_from(header.mx_frame).ok() != Some(self.wal.frame_count()) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let terminal = if header.mx_frame == 0 { None } else {
+            let index = usize::try_from(header.mx_frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
+            Some((header.mx_frame, self.wal.read_frame_header(cx, index).await?))
+        };
+        validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)?;
+        let backfilled_frames = read_shared_wal_index_backfill(&region, &header)?;
+        Ok(Some(NativeCheckpointView { source, region, header, backfilled_frames }))
+    }
+
+    /// Commit private reset state only after the physical and shared phases succeeded.
+    fn finish_checkpoint_reset(&mut self) -> Result<()> {
+        let Some(reset) = &self.pending_checkpoint_reset else { return Ok(()); };
+        if !reset.physical_complete || !reset.shared_complete
+            || self.wal.header() != &reset.target_header || self.wal.frame_count() != 0
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let reset = self.pending_checkpoint_reset.take().expect("validated reset owner");
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            self.checkpoint_retired_salts = Some(reset.old_header.salts);
+            self.fec_pending.clear();
+            self.fec_discard();
+        }
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+        let _ = reset;
+        self.invalidate_publication();
+        self.published_snapshot = WalPublishedSnapshot::empty(self.next_publication_seq, self.wal.generation_identity());
+        self.next_publication_seq = self.next_publication_seq.saturating_add(1);
+        self.appended_tail_index = None;
+        self.checkpoint_backfill_watermark = None;
+        self.refresh_before_append = true;
+        self.native_recovery_requested = None;
+        Ok(())
+    }
+
+    /// Construct the exact recovery publication from the fully validated WAL.
+    fn native_recovery_header(&self) -> Result<fsqlite_wal::wal_index::WalIndexHdr> {
+        use fsqlite_wal::wal_index::{WAL_INDEX_VERSION, WalIndexHdr};
+
+        let wal_header = self.wal.header();
+        let mut target = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 0,
+            is_init: 1,
+            big_end_cksum: u8::from(wal_header.big_endian_checksum()),
+            sz_page: if wal_header.page_size == 65_536 {
+                1
+            } else {
+                u16::try_from(wal_header.page_size).map_err(|_| FrankenError::DatabaseFull)?
+            },
+            mx_frame: u32::try_from(self.wal.frame_count()).map_err(|_| FrankenError::DatabaseFull)?,
+            n_page: 0,
+            a_frame_cksum: [0, 0],
+            a_salt: [wal_header.salts.salt1, wal_header.salts.salt2],
+            a_cksum: [0, 0],
+        };
+        let terminal = if let Some((index, marker)) = self.wal.last_commit_frame_header() {
+            let number = u32::try_from(index).ok().and_then(|index| index.checked_add(1))
+                .ok_or(FrankenError::DatabaseFull)?;
+            target.n_page = marker.db_size;
+            target.a_frame_cksum = [marker.checksum.s1, marker.checksum.s2];
+            Some((number, marker))
+        } else {
+            None
+        };
+        target.update_checksum()?;
+        validate_shared_wal_index_wal_binding(&target, wal_header, terminal)?;
+        Ok(target)
+    }
+
+    /// Rebuild only native index metadata while the caller owns every recovery fence.
+    /// A failed or dropped rebuild leaves both advertised headers invalid.
+    async fn recover_native_index(&mut self, cx: &Cx) -> Result<()> {
+        use fsqlite_wal::wal_index::{
+            WAL_SHM_SEGMENT_BYTES, append_native_wal_index_entry, invalidate_shared_wal_index_header,
+            publish_shared_wal_index_header, replace_shared_wal_index_region,
+            reset_shared_wal_index_recovery_marks,
+        };
+
+        if self.has_pending_publication() || self.native_read_binding.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let source = self.wal_index_shm_source.clone().ok_or(FrankenError::Unsupported)?;
+        let region_zero = source.map_region(cx, 0, true).await?;
+        // A peer may have repaired the observed header before we obtained the
+        // canonical owner. Preserve its full header and checkpoint progress if
+        // it now names the complete committed tail of this WAL generation.
+        if let Some(header) = read_shared_wal_index_header(&region_zero)? {
+            self.wal.refresh(cx).await?;
+            if usize::try_from(header.mx_frame).ok() == Some(self.wal.frame_count()) {
+                let terminal = if header.mx_frame == 0 {
+                    Some(None)
+                } else {
+                    let index = usize::try_from(header.mx_frame - 1)
+                        .map_err(|_| FrankenError::DatabaseFull)?;
+                    match self.wal.read_frame_header(cx, index).await {
+                        Ok(marker) => Some(Some((header.mx_frame, marker))),
+                        Err(FrankenError::WalCorrupt { .. }) => None,
+                        Err(error) => return Err(error),
+                    }
+                };
+                if terminal.is_some_and(|terminal| {
+                    validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal).is_ok()
+                }) {
+                    self.native_recovery_requested = None;
+                    return Ok(());
+                }
+            }
+        }
+
+        // No await or mutation of index entries can precede this invalidation.
+        // The exact outer owner may then restore on every error/drop: a later
+        // admission observes an unaccepted header and re-enters full recovery.
+        invalidate_shared_wal_index_header(&region_zero)?;
+        self.invalidate_publication();
+        self.appended_tail_index = None;
+        self.checkpoint_backfill_watermark = None;
+        self.refresh_before_append = true;
+        self.wal.rebuild_state_from_file(cx).await?;
+
+        let target = self.native_recovery_header()?;
+        let maximum_frame = target.mx_frame;
+        let wal_header = *self.wal.header();
+        let last_region = if maximum_frame == 0 { 0 } else {
+            WalIndexFrameLocation::new(maximum_frame)?.region
+        };
+        let mut next_frame = 1_u64;
+        let mut scratch = vec![0; WAL_SHM_SEGMENT_BYTES];
+        for number in 0..=last_region {
+            scratch.fill(0);
+            while next_frame <= u64::from(maximum_frame) {
+                let frame = u32::try_from(next_frame).map_err(|_| FrankenError::DatabaseFull)?;
+                if WalIndexFrameLocation::new(frame)?.region != number {
+                    break;
+                }
+                let index = usize::try_from(frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
+                let marker = self.wal.read_frame_header(cx, index).await?;
+                if marker.page_number == 0 || marker.salts != wal_header.salts {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: "validated recovery frame changed under the canonical owner".to_owned(),
+                    });
+                }
+                if frame == maximum_frame {
+                    validate_shared_wal_index_wal_binding(&target, &wal_header, Some((frame, marker)))?;
+                }
+                append_native_wal_index_entry(&mut scratch, frame, marker.page_number)?;
+                next_frame += 1;
+            }
+            let region = if number == 0 { region_zero.share() } else {
+                source.map_region(cx, number, true).await?
+            };
+            replace_shared_wal_index_region(&region, number, &scratch)?;
+        }
+        reset_shared_wal_index_recovery_marks(&region_zero, maximum_frame)?;
+        publish_shared_wal_index_header(&region_zero, &target)?;
+        self.native_recovery_requested = None;
+        Ok(())
+    }
+
+    fn finish_successful_append_attempt(&mut self) -> Result<()> {
+        let attempt = self.pending_append_attempt.as_ref().ok_or_else(|| {
+            FrankenError::internal("successful WAL append lost its retained attempt")
+        })?;
+        if attempt.completion.state() != VfsWriteCompletionState::Success
+            || attempt.generation != self.wal.generation_identity()
+            || attempt.end_frame_count != self.wal.frame_count()
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "successful WAL append does not match its retained interval".to_owned(),
+            });
+        }
+        self.pending_append_attempt = None;
+        Ok(())
+    }
+
+    /// Validate the exact one-based recovery interval before refreshing any WAL state.
+    fn validate_append_reconciliation(&self, start: u64, end: u64) -> Result<()> {
+        if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
+        let Some(attempt) = &self.pending_append_attempt else {
+            // A successful append can be followed by a certificate/sync error.
+            return Ok(());
+        };
+        if attempt.completion.state() == VfsWriteCompletionState::Pending {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let expected_start = u64::try_from(attempt.start_frame_index)
+            .ok()
+            .and_then(|index| index.checked_add(1));
+        if attempt.generation != self.wal.generation_identity()
+            || expected_start != Some(start)
+            || u64::try_from(attempt.end_frame_count).ok() != Some(end)
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL reconciliation does not match the retained append generation/interval"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn authorize_append_reconciliation(&mut self) {
+        if let Some(attempt) = &mut self.pending_append_attempt {
+            attempt.authorized = true;
+        }
+    }
+
+    /// Complete private publication only after the certificate proof authorizes it.
+    /// The caller retains the external append owner through this entire operation.
+    fn publish_reconciled_append(&mut self, cx: &Cx, synced: bool) -> Result<()> {
+        if let Some(attempt) = &self.pending_append_attempt {
+            if !attempt.authorized {
+                return Err(FrankenError::BusyRecovery);
+            }
+            if attempt.generation != self.wal.generation_identity()
+                || self.pending_publication_generation != Some(attempt.generation)
+                || self.pending_publication_commit != attempt.end_frame_count.checked_sub(1)
+                || self.pending_publication_frames.last().is_none_or(|frame| {
+                    !frame.is_commit || frame.frame_index.checked_add(1) != Some(attempt.end_frame_count)
+                })
+            {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "authorized WAL append lost its exact final publication marker".to_owned(),
+                });
+            }
+        }
+        if let Some(last_commit_frame) = self.pending_publication_commit {
+            if synced {
+                self.assert_publish_safe(cx, last_commit_frame)?;
+            } else {
+                self.assert_pending_horizon_matches_wal(cx, last_commit_frame)?;
+            }
+            self.publish_native_pending(last_commit_frame)?;
+            self.publish_pending_commit_snapshot(cx, last_commit_frame, "reconciled_append");
+            self.finish_native_publication();
+            self.pending_publication_commit = None;
+            if self.pending_publication_frames.is_empty() {
+                self.pending_publication_generation = None;
+            }
+        }
+        self.pending_append_attempt = None;
+        if !self.has_pending_publication() {
+            self.refresh_before_append = true;
+        }
+        Ok(())
+    }
+
+    /// Trim only this attempt after exact absence, tail repair, and requested sync.
+    fn discard_reconciled_append(&mut self) -> Result<()> {
+        let Some(attempt) = &self.pending_append_attempt else {
+            return Ok(());
+        };
+        if attempt.authorized
+            || attempt.generation != self.wal.generation_identity()
+            || self.wal.frame_count() != attempt.start_frame_index
+            || self.pending_publication_frames.len() < attempt.previous_pending_len
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "absent WAL append does not match its retained cleanup boundary".to_owned(),
+            });
+        }
+        self.pending_publication_frames.truncate(attempt.previous_pending_len);
+        self.pending_publication_commit = attempt.previous_pending_commit;
+        self.pending_publication_generation = attempt.previous_pending_generation;
+        self.refresh_before_append = attempt.previous_refresh_before_append;
+        let attempt = self.pending_append_attempt.take().expect("retained append cleanup owner");
+        self.native_publication = attempt.previous_native_publication;
+        Ok(())
     }
 
     /// Stage a commit horizon for publication without advancing visibility.
@@ -1085,13 +1791,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// tracked write completions are terminal. A failed-sync path never reaches
     /// this hook, so its pending horizon remains fail-closed for a later retry.
     fn publish_authorized_deferred_commit(&mut self, cx: &Cx) -> Result<()> {
+        self.assert_no_pending_append_attempt()?;
         let Some(last_commit_frame) = self.pending_publication_commit else {
             return Ok(());
         };
         self.assert_pending_horizon_matches_wal(cx, last_commit_frame)?;
+        self.publish_native_pending(last_commit_frame)?;
         self.publish_pending_commit_snapshot(cx, last_commit_frame, "authorized_deferred_commit");
+        self.finish_native_publication();
         self.pending_publication_commit = None;
-        self.pending_publication_generation = None;
+        if self.pending_publication_frames.is_empty() {
+            self.pending_publication_generation = None;
+        }
         Ok(())
     }
 
@@ -1102,13 +1813,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// required. On refusal or failure the pending state is preserved verbatim
     /// so the next successful sync retries the identical batch.
     fn publish_pending_after_sync(&mut self, cx: &Cx) -> Result<()> {
+        self.assert_no_pending_append_attempt()?;
         let Some(last_commit_frame) = self.pending_publication_commit else {
             return Ok(());
         };
         self.assert_publish_safe(cx, last_commit_frame)?;
+        self.publish_native_pending(last_commit_frame)?;
         self.publish_pending_commit_snapshot(cx, last_commit_frame, "sync_publish_commit");
+        self.finish_native_publication();
         self.pending_publication_commit = None;
-        self.pending_publication_generation = None;
+        if self.pending_publication_frames.is_empty() {
+            self.pending_publication_generation = None;
+        }
         Ok(())
     }
 
@@ -1209,7 +1925,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             if can_extend_previous {
                 self.published_snapshot.page_index = page_index;
             }
-            self.pending_publication_frames.clear();
+            self.pending_publication_frames
+                .retain(|frame| frame.frame_index > last_commit_frame);
             return;
         }
 
@@ -1224,7 +1941,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             page_index,
             index_is_partial,
         };
-        self.pending_publication_frames.clear();
+        // A batch may end with uncommitted frames after its last marker.
+        // Preserve that suffix for a later commit, including an intermediate
+        // sync; clearing it loses page mappings and incorrectly rearms refresh.
+        self.pending_publication_frames
+            .retain(|frame| frame.frame_index > last_commit_frame);
 
         tracing::trace!(
             target: "fsqlite.wal_publication",
@@ -1260,8 +1981,146 @@ fn to_wal_mode(mode: CheckpointMode) -> WalCheckpointMode {
 }
 
 impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
+    fn checkpoint_recovery_pending(&self) -> bool {
+        self.pending_checkpoint_reset.is_some()
+    }
+
+    fn reconcile_checkpoint_reset<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(reset) = self.pending_checkpoint_reset.as_mut() else { return Ok(()); };
+            if self.wal.header() != &reset.old_header && self.wal.header() != &reset.target_header {
+                return Err(FrankenError::BusyRecovery);
+            }
+            if !reset.physical_complete {
+                // The old write can outlive its dropped caller. Do not issue
+                // another header write until that exact source is terminal.
+                reset.completion.wait().await;
+                let target = reset.target_header;
+                let truncate = reset.truncate;
+                let completion = VfsWriteCompletion::new();
+                reset.completion = completion.clone();
+                self.wal.reset_tracked(cx, target.checkpoint_seq, target.salts, truncate, completion).await?;
+                let reset = self.pending_checkpoint_reset.as_mut().expect("reset owner survives physical retry");
+                if self.wal.header() != &reset.target_header {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                reset.physical_complete = true;
+            }
+            let reset = self.pending_checkpoint_reset.as_mut().expect("reset owner survives publication retry");
+            if !reset.shared_complete {
+                if let Some(native) = &mut reset.native { native.publish()?; }
+                reset.shared_complete = true;
+            }
+            self.finish_checkpoint_reset()
+        })
+    }
+
+    fn native_recovery_required(&self) -> Option<WalNativeRecoveryReason> {
+        self.native_recovery_requested
+    }
+
+    fn preflight_native_append<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if self.wal_index_shm_source.is_none() {
+                return self.refresh_published_snapshot(cx).await.map(|_| ());
+            }
+            let baseline = self.native_append_baseline(cx).await?;
+            let horizon = usize::try_from(baseline.mx_frame).map_err(|_| FrankenError::DatabaseFull)?
+                .checked_sub(1);
+            // Advance the current shared conflict horizon, while the older
+            // read_snapshot and exact native token stay pinned unchanged.
+            self.publish_visible_snapshot(cx, horizon, "native_append_preflight").await
+        })
+    }
+
+    fn native_reader_required(&self) -> bool {
+        self.wal_index_shm_source.is_some()
+    }
+
+    fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
+        self.native_read_binding.clone()
+    }
+
+    fn begin_native_read<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        binding: WalNativeReadBinding,
+    ) -> WalFuture<'a, WalNativeReadOutcome> {
+        Box::pin(async move {
+            if self.has_pending_publication() || self.native_read_binding.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            if let Some(reason) = self.native_recovery_requested {
+                return Ok(WalNativeReadOutcome::RecoveryRequired(reason));
+            }
+            let source = self.wal_index_shm_source.as_ref().ok_or(FrankenError::Unsupported)?;
+            if !source.validates_reader_binding(&binding) || binding.boundary().database_only {
+                return Err(FrankenError::BusyRecovery);
+            }
+            let header = binding.header();
+            header.validate()?;
+            if header.mx_frame != binding.boundary().maximum_wal_frame {
+                return Err(FrankenError::BusyRecovery);
+            }
+            self.wal.refresh(cx).await?;
+            let wal_header = self.wal.header();
+            if header.page_size()? != wal_header.page_size
+                || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+                || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+            {
+                return Ok(WalNativeReadOutcome::RecoveryRequired(
+                    WalNativeRecoveryReason::WalGenerationMismatch,
+                ));
+            }
+            let frame_count = usize::try_from(header.mx_frame)
+                .map_err(|_| FrankenError::BusyRecovery)?;
+            if frame_count > self.wal.frame_count() {
+                return Ok(WalNativeReadOutcome::RecoveryRequired(
+                    WalNativeRecoveryReason::WalTerminalMismatch,
+                ));
+            }
+            let terminal = match frame_count.checked_sub(1) {
+                Some(index) => Some((header.mx_frame, self.wal.read_frame_header(cx, index).await?)),
+                None => None,
+            };
+            if validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal).is_err() {
+                return Ok(WalNativeReadOutcome::RecoveryRequired(
+                    WalNativeRecoveryReason::WalTerminalMismatch,
+                ));
+            }
+            self.publish_visible_snapshot(cx, frame_count.checked_sub(1), "begin_native_read").await?;
+            self.read_snapshot = Some(self.published_snapshot.clone());
+            self.native_read_binding = Some(binding);
+            self.refresh_before_append = true;
+            Ok(WalNativeReadOutcome::Ready)
+        })
+    }
+
+    fn end_native_read(&mut self, token: &WalNativeReadToken) -> Result<()> {
+        if let Some(binding) = &self.native_read_binding {
+            if !binding.token().matches(token) {
+                return Err(FrankenError::BusyRecovery);
+            }
+            self.read_snapshot = None;
+            self.native_read_binding = None;
+        }
+        Ok(())
+    }
+
+    fn recover_native_read_state<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        _reason: fsqlite_pager::traits::WalNativeRecoveryReason,
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move { self.recover_native_index(cx).await })
+    }
+
     fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            if self.native_read_binding.is_some() || self.native_recovery_requested.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
             // Reject at the earliest illegal transition: before `wal.refresh`,
             // before pinning `read_snapshot`, and before re-arming
             // `refresh_before_append`. Beginning a transaction on top of staged,
@@ -1269,6 +2128,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             // only symptom is a later append failure.
             if self.has_pending_publication() {
                 return Err(FrankenError::Busy);
+            }
+            if self.native_reader_required() {
+                self.native_checkpoint_view(cx).await?;
             }
             // Establish a transaction-bounded snapshot once, instead of doing an
             // expensive refresh for every page read.
@@ -1308,6 +2170,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         db_size_if_commit: u32,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.assert_no_pending_append_attempt()?;
+            let completion = VfsWriteCompletion::new();
+            let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
+            self.validate_append_page(page_data)?;
             if self.refresh_before_append {
                 // Refresh and synchronize the published base snapshot once before
                 // the commit batch starts, then publish local frame deltas directly
@@ -1315,13 +2181,16 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 self.synchronize_publication_before_append(cx, "append_frame_pre_refresh")
                     .await?;
             }
-            let start_frame_index = self.wal.frame_count();
-            self.wal
-                .append_frame(cx, page_number, page_data, db_size_if_commit)
-                .await?;
-            self.refresh_before_append = false;
-            let last_commit_frame =
-                self.record_appended_frames(start_frame_index, [(page_number, db_size_if_commit)]);
+            self.stage_append_attempt(
+                cx,
+                std::iter::once((page_number, db_size_if_commit)),
+                completion.clone(),
+            ).await?;
+            let frames = [WalAppendFrameRef { page_number, page_data, db_size_if_commit }];
+            preflight.hand_off();
+            drop(preflight);
+            self.wal.append_frames_tracked(cx, &frames, completion).await?;
+            self.finish_successful_append_attempt()?;
 
             // Feed the frame to the FEC hook.  On commit, it encodes repair
             // symbols and stores them for later sidecar persistence.
@@ -1345,12 +2214,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
             }
 
-            if let Some(last_commit_frame) = last_commit_frame {
-                // Stage only: the frames are not durable until `sync`, so
-                // publishing here would expose a commit a crash could erase.
-                self.stage_pending_commit_publication(last_commit_frame)?;
-            }
-
             Ok(())
         })
     }
@@ -1364,29 +2227,35 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             if frames.is_empty() {
                 return Ok(());
             }
+            self.assert_no_pending_append_attempt()?;
+            let completion = VfsWriteCompletion::new();
+            let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
 
             if self.refresh_before_append {
                 self.synchronize_publication_before_append(cx, "append_frames_pre_refresh")
                     .await?;
             }
 
-            let start_frame_index = self.wal.frame_count();
             let mut wal_frames = Vec::with_capacity(frames.len());
             for frame in frames {
+                self.validate_append_page(frame.page_data)?;
                 wal_frames.push(WalAppendFrameRef {
                     page_number: frame.page_number,
                     page_data: frame.page_data,
                     db_size_if_commit: frame.db_size_if_commit,
                 });
             }
-            self.wal.append_frames(cx, &wal_frames).await?;
-            self.refresh_before_append = false;
-            let last_commit_frame = self.record_appended_frames(
-                start_frame_index,
+            self.stage_append_attempt(
+                cx,
                 frames
                     .iter()
                     .map(|frame| (frame.page_number, frame.db_size_if_commit)),
-            );
+                completion.clone(),
+            ).await?;
+            preflight.hand_off();
+            drop(preflight);
+            self.wal.append_frames_tracked(cx, &wal_frames, completion).await?;
+            self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
@@ -1415,11 +2284,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                         }
                     }
                 }
-            }
-
-            if let Some(last_commit_frame) = last_commit_frame {
-                // Stage only: publication is deferred to the durability barrier.
-                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1439,33 +2303,33 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 preflight.hand_off();
                 return Ok(());
             }
+            self.assert_no_pending_append_attempt()?;
 
             if self.refresh_before_append {
                 self.synchronize_publication_before_append(cx, "append_frames_pre_refresh")
                     .await?;
             }
 
-            let start_frame_index = self.wal.frame_count();
             let mut wal_frames = Vec::with_capacity(frames.len());
             for frame in frames {
+                self.validate_append_page(frame.page_data)?;
                 wal_frames.push(WalAppendFrameRef {
                     page_number: frame.page_number,
                     page_data: frame.page_data,
                     db_size_if_commit: frame.db_size_if_commit,
                 });
             }
+            self.stage_append_attempt(
+                cx,
+                frames.iter().map(|frame| (frame.page_number, frame.db_size_if_commit)),
+                completion.clone(),
+            ).await?;
             preflight.hand_off();
             drop(preflight);
             self.wal
                 .append_frames_tracked(cx, &wal_frames, completion)
                 .await?;
-            self.refresh_before_append = false;
-            let last_commit_frame = self.record_appended_frames(
-                start_frame_index,
-                frames
-                    .iter()
-                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
-            );
+            self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
@@ -1496,11 +2360,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
             }
 
-            if let Some(last_commit_frame) = last_commit_frame {
-                // Stage only: publication is deferred to the durability barrier.
-                self.stage_pending_commit_publication(last_commit_frame)?;
-            }
-
             Ok(())
         })
     }
@@ -1509,6 +2368,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         &self,
         frames: &[WalFrameRef<'_>],
     ) -> Result<Option<PreparedWalFrameBatch>> {
+        if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
         if frames.is_empty() {
             return Ok(None);
         }
@@ -1551,6 +2411,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         _cx: &Cx,
         prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {
+        if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
         if prepared.frame_count() == 0 {
             return Ok(());
         }
@@ -1566,9 +2427,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         prepared: &'a mut PreparedWalFrameBatch,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.validate_prepared_frame_metadata(prepared)?;
             if prepared.frame_count() == 0 {
                 return Ok(());
             }
+            self.assert_no_pending_append_attempt()?;
+            let completion = VfsWriteCompletion::new();
+            let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
 
             let can_reuse_prelock_finalize = self.refresh_before_append
                 && self.prepared_batch_matches_current_state(prepared)
@@ -1582,24 +2447,27 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 self.finalize_prepared_batch_against_current_state(prepared)?;
             }
 
-            let start_frame_index = self.wal.frame_count();
+            let final_running_checksum = Self::finalized_running_checksum(prepared)?;
+            self.validate_finalized_prepared_generation(prepared)?;
+            self.stage_append_attempt(
+                cx,
+                prepared.frame_metas.iter()
+                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
+                completion.clone(),
+            ).await?;
+            preflight.hand_off();
+            drop(preflight);
             self.wal
-                .append_finalized_prepared_frame_bytes(
+                .append_finalized_prepared_frame_bytes_tracked(
                     cx,
                     &prepared.frame_bytes,
                     prepared.frame_count(),
-                    Self::finalized_running_checksum(prepared)?,
+                    final_running_checksum,
                     prepared.last_commit_frame_offset,
+                    completion,
                 )
                 .await?;
-            self.refresh_before_append = false;
-            let last_commit_frame = self.record_appended_frames(
-                start_frame_index,
-                prepared
-                    .frame_metas
-                    .iter()
-                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
-            );
+            self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
@@ -1628,11 +2496,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                         }
                     }
                 }
-            }
-
-            if let Some(last_commit_frame) = last_commit_frame {
-                // Stage only: publication is deferred to the durability barrier.
-                self.stage_pending_commit_publication(last_commit_frame)?;
             }
 
             Ok(())
@@ -1647,11 +2510,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
+            self.validate_prepared_frame_metadata(prepared)?;
             if prepared.frame_count() == 0 {
                 completion.complete_success();
                 preflight.hand_off();
                 return Ok(());
             }
+            self.assert_no_pending_append_attempt()?;
 
             let can_reuse_prelock_finalize = self.refresh_before_append
                 && self.prepared_batch_matches_current_state(prepared)
@@ -1665,8 +2530,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 self.finalize_prepared_batch_against_current_state(prepared)?;
             }
 
-            let start_frame_index = self.wal.frame_count();
             let final_running_checksum = Self::finalized_running_checksum(prepared)?;
+            self.validate_finalized_prepared_generation(prepared)?;
+            self.stage_append_attempt(
+                cx,
+                prepared.frame_metas.iter()
+                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
+                completion.clone(),
+            ).await?;
             preflight.hand_off();
             drop(preflight);
             self.wal
@@ -1679,14 +2550,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     completion,
                 )
                 .await?;
-            self.refresh_before_append = false;
-            let last_commit_frame = self.record_appended_frames(
-                start_frame_index,
-                prepared
-                    .frame_metas
-                    .iter()
-                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
-            );
+            self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if let Some(hook) = &mut self.fec_hook {
@@ -1717,17 +2581,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
             }
 
-            if let Some(last_commit_frame) = last_commit_frame {
-                // Stage only: publication is deferred to the durability barrier.
-                self.stage_pending_commit_publication(last_commit_frame)?;
-            }
-
             Ok(())
         })
     }
 
     fn read_page<'a>(&'a mut self, cx: &'a Cx, page_number: u32) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
+            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
             let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
                 snapshot
             } else {
@@ -1827,6 +2687,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_number: u32,
     ) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
+            self.assert_no_pending_append_attempt()?;
             let frame_count = self.wal.frame_count();
             let Some(tail_frame) = frame_count.checked_sub(1) else {
                 return Ok(None);
@@ -1866,6 +2727,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_number: u32,
     ) -> WalFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
+            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
             let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
                 FrankenError::internal(
                     "read_page_pinned called without a pinned read snapshot; \
@@ -1928,6 +2790,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_number: u32,
     ) -> WalFuture<'a, u64> {
         Box::pin(async move {
+            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
             let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
                 snapshot
             } else {
@@ -2013,9 +2876,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 return Ok(Vec::new());
             }
 
-            self.wal.refresh(cx).await?;
-            self.publish_latest_committed_snapshot(cx, "conflicting_pages_since_snapshot")
-                .await?;
+            self.assert_no_pending_append_attempt()?;
+            if self.native_reader_required() {
+                self.preflight_native_append(cx).await?;
+            } else {
+                self.wal.refresh(cx).await?;
+                self.publish_latest_committed_snapshot(cx, "conflicting_pages_since_snapshot")
+                    .await?;
+            }
             let latest = self.published_snapshot();
 
             let mut conflicts = HashSet::<u32>::new();
@@ -2113,6 +2981,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn committed_txn_count<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, u64> {
         Box::pin(async move {
+            if self.pending_checkpoint_reset.is_some() { return Err(FrankenError::BusyRecovery); }
             let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
                 snapshot
             } else {
@@ -2125,6 +2994,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
+        self.assert_no_pending_append_attempt()?;
         // Durability first. Only once the frames are on stable storage may the
         // staged commit horizon become visible to readers.
         //
@@ -2170,12 +3040,24 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            if self.has_pending_publication() {
+            if self.has_pending_publication() || self.native_read_binding.is_some() {
                 return Err(FrankenError::Busy);
             }
-            // A prior truncate may have succeeded before its sync failed.
-            // Only an already-empty handle can retry that terminal sync.
-            if self.wal.file().file_size(cx)? != 0 || self.wal.frame_count() != 0 {
+            if self.native_recovery_requested.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            // A peer may have retired this exact physical file while this
+            // idle adapter still caches the old frames. The caller owns the
+            // whole-image maintenance fence; zero bytes need no WAL-header
+            // refresh. Path adapters separately prove the exact path identity.
+            if self.wal.file().file_size(cx)? == 0 {
+                return Ok(());
+            }
+            // Retrying a mode change after BusyRecovery must not turn an
+            // invalid native publication into permission to discard its WAL.
+            if self.native_reader_required() {
+                self.native_checkpoint_view(cx).await?;
+            } else {
                 self.wal.refresh(cx).await?;
             }
             if self.wal.frame_count() != 0 {
@@ -2204,6 +3086,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         oldest_reader_frame: Option<u32>,
     ) -> WalFuture<'a, CheckpointResult> {
         Box::pin(async move {
+            if self.native_read_binding.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
             // Fail closed BEFORE `wal.refresh` or any writer mutation. Checkpoint
             // backfills and may reset the WAL, and its inner paths can call
             // `invalidate_publication`, which discards the staged batch. Running
@@ -2221,8 +3106,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             {
                 self.checkpoint_retired_salts = None;
             }
-            // Refresh so planner state reflects the latest on-disk WAL shape.
-            self.wal.refresh(cx).await?;
+            // Native maintenance must match the shared generation and entire
+            // committed prefix before any page write or physical reset.
+            let native = self.native_checkpoint_view(cx).await?;
+            if native.is_none() { self.wal.refresh(cx).await?; }
             self.refresh_before_append = true;
             let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
 
@@ -2237,7 +3124,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 Some((tagged_generation, frames)) if tagged_generation == generation => frames,
                 _ => 0,
             };
-            let effective_backfilled = backfilled_frames.max(tracked_backfilled).min(total_frames);
+            let effective_backfilled = native.as_ref().map_or_else(
+                || backfilled_frames.max(tracked_backfilled).min(total_frames),
+                |view| view.backfilled_frames,
+            );
 
             // Build checkpoint state for the planner.
             let state = CheckpointState {
@@ -2247,12 +3137,20 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             };
 
             // Wrap the CheckpointPageWriter in a CheckpointTargetAdapter.
-            let mut target = CheckpointTargetAdapterRef { writer };
+            let mut target = CheckpointResetTarget {
+                delegate: CheckpointTargetAdapterRef { writer },
+                pending: &mut self.pending_checkpoint_reset,
+                previous_header: *self.wal.header(),
+                native,
+            };
 
             // Execute the checkpoint.
             let result =
                 execute_checkpoint(cx, &mut self.wal, to_wal_mode(mode), state, &mut target)
-                    .await?;
+                    .await;
+            drop(target);
+            let result = result?;
+            if result.wal_was_reset { self.finish_checkpoint_reset()?; }
 
             // Checkpoint-aware FEC lifecycle: once frames are backfilled to the
             // database file, their FEC symbols are no longer needed.  Clear
@@ -2270,16 +3168,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
             }
 
-            // If the WAL was fully reset, also discard any buffered FEC pages
-            // and invalidate the page index (salts changed).
-            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-            if result.wal_was_reset {
-                self.checkpoint_retired_salts = Some(generation.salts);
-                self.fec_discard();
-            }
-            if result.wal_was_reset {
-                self.invalidate_publication();
-            }
+            // A completed reset already retired its private/FEC generation
+            // through finish_checkpoint_reset, also used by reconciliation.
 
             // GH#402: advance (or reset) the backfill watermark. Frames
             // [effective_backfilled .. effective_backfilled + frames_backfilled)
@@ -2659,6 +3549,18 @@ where
         self.inner
     }
 
+    /// Attach the inner adapter to an initialized index on the exact main file.
+    ///
+    /// The caller owns the external WRITE interval and its reconciliation;
+    /// see [`WalBackendAdapter::attach_wal_index_shm_source`] for prerequisites.
+    #[cfg(all(feature = "native", unix))]
+    pub fn attach_wal_index_shm_source(
+        &mut self,
+        source: Arc<WalIndexShmSource<V::File>>,
+    ) -> Result<()> {
+        self.inner.attach_wal_index_shm_source(source)
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn pending_fec_range(&mut self, cx: &Cx) -> Result<Option<fsqlite_wal::wal_fec::WalFecCommittedRange>> {
         let Some(producer) = &self.fec_producer else { return Ok(None) };
@@ -2687,9 +3589,12 @@ where
     }
 
     /// Shared durability boundary for ordinary publication and in-doubt
-    /// reconciliation. Reconciliation deliberately does not publish staged
-    /// adapter metadata; its existing certificate protocol owns that decision.
+    /// reconciliation. Recovery sync leaves staged metadata intact until its
+    /// exact certificate proof permits the separate publication step.
     fn sync_with_fec(&mut self, cx: &Cx, publish_pending: bool) -> Result<()> {
+        if publish_pending {
+            self.inner.assert_no_pending_append_attempt()?;
+        }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         let range = self.pending_fec_range(cx)?;
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -2728,13 +3633,16 @@ where
     /// they were never fsynced (GH #187). A successful sync must drain the batch
     /// before a path-visible replacement can proceed.
     fn replace_inner(&mut self, cx: &Cx, wal: WalFile<V::File>) -> Result<()> {
-        if self.inner.has_pending_publication() {
+        if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
             let cleanup_cx = cx.create_child();
             let _cleanup_mask = cleanup_cx.masked();
             let _ = wal.close(&cleanup_cx);
             return Err(FrankenError::Busy);
         }
-        let old = std::mem::replace(&mut self.inner, WalBackendAdapter::new(wal));
+        let mut replacement = WalBackendAdapter::new(wal);
+        replacement.wal_index_shm_source.clone_from(&self.inner.wal_index_shm_source);
+        replacement.native_recovery_requested = self.inner.native_recovery_requested;
+        let old = std::mem::replace(&mut self.inner, replacement);
         // bd-smxhz: the WAL generation changed, so the -wal-cert sidecar is
         // reset for the new generation and the cached certificate descriptor is
         // stale — drop it so the next read re-opens.
@@ -2746,12 +3654,17 @@ where
         {
             let _ = stale.close(cx);
         }
-        let old_wal = old.into_inner()?;
+        // The pre-replacement guard above proved this adapter has no pending
+        // owner; no suspension occurs between that guard and the swap.
+        let old_wal = old.wal;
         let _ = old_wal.close(cx);
         Ok(())
     }
 
     async fn create_replacement_wal(&self, cx: &Cx) -> Result<WalFile<V::File>> {
+        if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
+            return Err(FrankenError::Busy);
+        }
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (file, _) = self.vfs.open(cx, Some(&self.wal_path), flags)?;
         // Random salts (GH #201): the replacement WAL must reject frames
@@ -2791,6 +3704,11 @@ where
         cx: &Cx,
         path_file: &V::File,
     ) -> Result<bool> {
+        if let (Some(path_identity), Some(current_identity)) = (
+            path_file.file_identity()?, self.inner.wal.file().file_identity()?,
+        ) && path_identity != current_identity {
+            return Ok(false);
+        }
         let mut header_buf = [0_u8; WAL_HEADER_SIZE];
         let bytes_read = path_file.read(cx, &mut header_buf, 0).await?;
         if bytes_read < WAL_HEADER_SIZE {
@@ -3051,7 +3969,162 @@ where
         conflicts
     }
 
+    /// Read admission never creates or truncates a WAL to satisfy its binding.
+    async fn ensure_current_wal_path_for_native_read(
+        &mut self, cx: &Cx,
+    ) -> Result<WalNativeReadOutcome> {
+        if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
+        self.ensure_db_file_identity_captured(cx).await;
+        let opened = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL);
+        let opened = match opened {
+            Err(_) if !self.create_missing => {
+                self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READONLY | VfsOpenFlags::WAL)
+            }
+            result => result,
+        };
+        let (mut file, _) = match opened {
+            Ok(opened) => opened,
+            Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::WalGenerationMismatch));
+            }
+            Err(error) => return Err(error),
+        };
+        let size = match file.file_size(cx) {
+            Ok(size) => size,
+            Err(error) => { let _ = file.close(cx); return Err(error); }
+        };
+        if size < u64::try_from(WAL_HEADER_SIZE).expect("WAL header size fits u64") {
+            file.close(cx)?;
+            return Ok(WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::WalGenerationMismatch));
+        }
+        let same = self.path_header_matches_current_handle(cx, &file).await;
+        match same {
+            Ok(true) => file.close(cx)?,
+            Ok(false) => {
+                let wal = self.open_replacement_wal(cx, file).await?;
+                self.replace_inner(cx, wal)?;
+            }
+            Err(error) => { let _ = file.close(cx); return Err(error); }
+        }
+        Ok(WalNativeReadOutcome::Ready)
+    }
+
+    /// Validate an attached native descriptor without creating or replacing it.
+    /// Existing-path rebinding belongs to fresh read/recovery admission only.
+    async fn validate_current_native_wal_path(&mut self, cx: &Cx) -> Result<()> {
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
+        self.ensure_db_file_identity_captured(cx).await;
+        let (mut file, _) = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)?;
+        let validation = self.path_header_matches_current_handle(cx, &file).await;
+        let cleanup_cx = cx.create_child();
+        let _cleanup_mask = cleanup_cx.masked();
+        let close = file.close(&cleanup_cx);
+        match (validation, close) {
+            (Ok(true), Ok(())) => Ok(()),
+            (Ok(false), Ok(())) => Err(FrankenError::BusyRecovery),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
+                "native WAL path validation and close failed: validation={validation}; close={close}"
+            ))),
+        }
+    }
+
+    /// Recheck an already-retired native WAL only for whole-image retirement.
+    /// This never creates, replaces, or rebinds a WAL descriptor.
+    async fn validate_native_wal_retirement_path(&mut self, cx: &Cx) -> Result<()> {
+        if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
+            return Err(FrankenError::Busy);
+        }
+        if self.inner.native_recovery_requested.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
+        let (mut file, _) = self.vfs.open(
+            cx,
+            Some(&self.wal_path),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+        )?;
+        let validation = async {
+            let current = self.inner.wal.file();
+            if file.file_size(cx)? == 0 && current.file_size(cx)? == 0 {
+                match (file.file_identity()?, current.file_identity()?) {
+                    (Some(path_identity), Some(current_identity))
+                        if path_identity == current_identity => {}
+                    _ => return Err(FrankenError::BusyRecovery),
+                }
+                // Zero bytes alone do not prove a peer completed its mode
+                // transition. Read the persisted rollback format through a
+                // retained VFS descriptor under the caller's whole-image
+                // fence; never admit unexplained truncation in WAL mode.
+                if self.cached_verification_db.is_none() {
+                    let (main, _) = self.vfs.open(
+                        cx,
+                        Some(&self.db_path),
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                    )?;
+                    self.cached_verification_db = Some(main);
+                }
+                let main = self
+                    .cached_verification_db
+                    .as_ref()
+                    .ok_or(FrankenError::BusyRecovery)?;
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                if let Some(binding) = &self.namespace_binding
+                    && main.file_identity()? != Some(binding.identity())
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                let mut bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
+                if main.read(cx, &mut bytes, 0).await? != bytes.len() {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                let header = fsqlite_types::DatabaseHeader::from_bytes(&bytes)
+                    .map_err(|_| FrankenError::BusyRecovery)?;
+                if header.read_version != 1
+                    || header.write_version != 1
+                    || header.page_size.get() != self.page_size
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                if let Some(binding) = &self.namespace_binding {
+                    binding.validate_path_identity()?;
+                }
+                return Ok(());
+            }
+            if self.path_header_matches_current_handle(cx, &file).await? {
+                Ok(())
+            } else {
+                Err(FrankenError::BusyRecovery)
+            }
+        }
+        .await;
+        let cleanup_cx = cx.create_child();
+        let _cleanup_mask = cleanup_cx.masked();
+        let close = file.close(&cleanup_cx);
+        match (validation, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
+                "native WAL retirement path validation and close failed: validation={validation}; close={close}"
+            ))),
+        }
+    }
+
     async fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
+        if self.inner.native_reader_required() {
+            return self.validate_current_native_wal_path(cx).await;
+        }
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding {
             binding.validate_path_identity()?;
@@ -3062,6 +4135,9 @@ where
         // main-db page 1 is not yet readable on the very first probe.
         self.ensure_db_file_identity_captured(cx).await;
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
+            if self.inner.has_pending_publication() {
+                return Err(FrankenError::Busy);
+            }
             if self.create_missing {
                 return self.replace_with_created_wal(cx).await;
             }
@@ -3073,6 +4149,9 @@ where
         let path_size = path_file.file_size(cx)?;
         if path_size < u64::try_from(WAL_HEADER_SIZE).unwrap_or(32) {
             let _ = path_file.close(cx);
+            if self.inner.has_pending_publication() {
+                return Err(FrankenError::Busy);
+            }
             if self.create_missing {
                 return self.replace_with_created_wal(cx).await;
             }
@@ -3095,6 +4174,10 @@ where
             false
         };
         if !path_matches_current {
+            if self.inner.has_pending_publication() {
+                let _ = path_file.close(cx);
+                return Err(FrankenError::Busy);
+            }
             let wal = self.open_replacement_wal(cx, path_file).await?;
             self.replace_inner(cx, wal)?;
         } else {
@@ -3526,6 +4609,42 @@ where
         )
     }
 
+    async fn reconcile_absent_append(
+        &mut self,
+        cx: &Cx,
+        expected_record: &ParallelWalDurableCertificateRecord,
+        valid_frame_count: u64,
+        sync: bool,
+    ) -> Result<ParallelWalCommitReconciliation> {
+        let start = expected_record.wal_frame_start;
+        let end = expected_record.wal_frame_end;
+        let prefix = start.checked_sub(1).ok_or_else(|| FrankenError::WalCorrupt {
+            detail: "parallel WAL recovery interval starts at frame zero".to_owned(),
+        })?;
+        if valid_frame_count != prefix {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "in-doubt WAL interval {start}..={end} has unexpected committed prefix {valid_frame_count}"
+                ),
+            });
+        }
+        if self.inner.pending_append_attempt.as_ref().is_some_and(|attempt| attempt.authorized) {
+            return Err(FrankenError::WalCorrupt {
+                detail: "previously authorized WAL append disappeared before publication".to_owned(),
+            });
+        }
+        // Exact absence precedes every sidecar/tail mutation. Errors preserve
+        // the candidate metadata and owner for the same reconciliation retry.
+        self.reconcile_certificate_sidecar_record(cx, expected_record, true, sync).await?;
+        self.inner.wal.repair_uncommitted_tail(cx)?;
+        if sync {
+            self.sync_with_fec(cx, false)?;
+            self.vfs.sync_parent_directory(cx, &self.wal_path)?;
+        }
+        self.inner.discard_reconciled_append()?;
+        Ok(ParallelWalCommitReconciliation::NotCommitted)
+    }
+
     async fn reconcile_certificate_sidecar_record(
         &self,
         cx: &Cx,
@@ -3805,6 +4924,7 @@ where
     async fn latest_authorized_durable_certificate_record(
         &self,
         cx: &Cx,
+        read_horizon: Option<WalPublicationSnapshot>,
     ) -> Result<Option<ParallelWalDurableCertificateRecord>> {
         let certificate_path = self.certificate_sidecar_path();
         // bd-smxhz: reuse a held read-only descriptor when the cache is warm;
@@ -4012,8 +5132,16 @@ where
                 }
             }
 
-            let valid_frame_count = u64::try_from(self.inner.frame_count()).unwrap_or(u64::MAX);
+            let physical_frame_count = u64::try_from(self.inner.frame_count()).unwrap_or(u64::MAX);
             let wal_generation = self.inner.inner().generation_identity();
+            if read_horizon.is_some_and(|horizon| horizon.generation != wal_generation) {
+                return Ok(None);
+            }
+            let valid_frame_count = read_horizon.map_or(physical_frame_count, |horizon| {
+                horizon.last_commit_frame.map_or(0, |end| {
+                    u64::try_from(end).unwrap_or(u64::MAX).saturating_add(1)
+                }).min(physical_frame_count)
+            });
             let (mut record_start, mut record) = newest.ok_or_else(|| {
                 FrankenError::WalCorrupt {
                     detail: "parallel WAL certificate recovery produced no record".to_owned(),
@@ -4048,7 +5176,8 @@ where
                                 .to_owned(),
                         }
                     })?;
-                let commit_marker_frame = if frame_index < self.inner.frame_count()
+                let commit_marker_frame = if record.wal_frame_end <= valid_frame_count
+                    && frame_index < self.inner.frame_count()
                     && self
                         .inner
                         .inner()
@@ -4166,6 +5295,114 @@ where
     V: Vfs + 'static,
     V::File: Send + Sync + 'static,
 {
+    fn checkpoint_recovery_pending(&self) -> bool {
+        self.inner.checkpoint_recovery_pending()
+    }
+
+    fn reconcile_checkpoint_reset<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.inner.checkpoint_recovery_pending() { return Ok(()); }
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
+            // The retained WAL header may be torn: compare descriptor identity,
+            // never parse/reopen it as a new generation or create its path.
+            let (mut current, _) = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)?;
+            let identity = (|| {
+                match (current.file_identity()?, self.inner.wal.file().file_identity()?) {
+                    (Some(current), Some(owned)) if current == owned => Ok(()),
+                    (Some(_), Some(_)) => Err(FrankenError::BusyRecovery),
+                    _ => Err(FrankenError::Unsupported),
+                }
+            })();
+            let cleanup_cx = cx.create_child();
+            let _cleanup_mask = cleanup_cx.masked();
+            let close = current.close(&cleanup_cx);
+            match (identity, close) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                (Err(identity), Err(close)) => return Err(FrankenError::internal(format!(
+                    "checkpoint reset path and close failed: identity={identity}; close={close}"
+                ))),
+            }
+            self.inner.reconcile_checkpoint_reset(cx).await?;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            {
+                if let Some(salts) = self.inner.checkpoint_retired_salts
+                    && !self.pending_fec_reclamation.contains(&salts)
+                {
+                    self.pending_fec_reclamation.push(salts);
+                }
+                self.fec_admitted = None;
+                self.fec_inspected_generation = None;
+            }
+            if let Some(mut stale) = self.cached_certificate_read.get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            { let _ = stale.close(&cleanup_cx); }
+            Ok(())
+        })
+    }
+
+    fn native_recovery_required(&self) -> Option<WalNativeRecoveryReason> {
+        self.inner.native_recovery_required()
+    }
+
+    fn preflight_native_append<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.inner.native_reader_required() {
+                return self.refresh_published_snapshot(cx).await.map(|_| ());
+            }
+            if self.inner.has_pending_publication() || self.inner.native_recovery_requested.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            self.validate_current_native_wal_path(cx).await?;
+            self.inner.preflight_native_append(cx).await
+        })
+    }
+
+    fn native_reader_required(&self) -> bool {
+        self.inner.native_reader_required()
+    }
+
+    fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
+        self.inner.native_read_binding()
+    }
+
+    fn begin_native_read<'a>(
+        &'a mut self, cx: &'a Cx, binding: WalNativeReadBinding,
+    ) -> WalFuture<'a, WalNativeReadOutcome> {
+        Box::pin(async move {
+            match self.ensure_current_wal_path_for_native_read(cx).await? {
+                WalNativeReadOutcome::Ready => self.inner.begin_native_read(cx, binding).await,
+                outcome => Ok(outcome),
+            }
+        })
+    }
+
+    fn end_native_read(&mut self, token: &WalNativeReadToken) -> Result<()> {
+        self.inner.end_native_read(token)
+    }
+
+    fn recover_native_read_state<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        reason: fsqlite_pager::traits::WalNativeRecoveryReason,
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            match self.ensure_current_wal_path_for_native_read(cx).await? {
+                fsqlite_pager::traits::WalNativeReadOutcome::Ready => {}
+                fsqlite_pager::traits::WalNativeReadOutcome::RecoveryRequired(_) => {
+                    // Creating/resetting the physical WAL requires its own
+                    // retained owner; index-only recovery cannot authorize it.
+                    return Err(FrankenError::BusyRecovery);
+                }
+            }
+            self.inner.recover_native_read_state(cx, reason).await
+        })
+    }
+
     fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.ensure_current_wal_path(cx).await?;
@@ -4193,7 +5430,7 @@ where
                 return Ok(None);
             };
             let Some(record) = self
-                .latest_authorized_durable_certificate_record(cx)
+                .latest_authorized_durable_certificate_record(cx, Some(pinned))
                 .await?
             else {
                 return Ok(None);
@@ -4265,6 +5502,7 @@ where
         cx: &'a Cx,
     ) -> WalFuture<'a, Option<WalPublicationSnapshot>> {
         Box::pin(async move {
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             self.inner.refresh_published_snapshot(cx).await.map(Some)
         })
@@ -4272,14 +5510,18 @@ where
 
     fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
+            if self.inner.native_reader_required() {
+                self.validate_native_wal_retirement_path(cx).await?;
+            } else {
+                self.ensure_current_wal_path(cx).await?;
+            }
             self.inner.validate_empty_wal_for_retirement(cx).await
         })
     }
 
     fn retire_empty_wal<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
+            self.validate_empty_wal_for_retirement(cx).await?;
             self.inner.retire_empty_wal(cx).await
         })
     }
@@ -4296,6 +5538,7 @@ where
         db_size_if_commit: u32,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             self.inner
                 .append_frame(cx, page_number, page_data, db_size_if_commit)
@@ -4309,6 +5552,7 @@ where
         frames: &'a [WalFrameRef<'a>],
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             self.inner.append_frames(cx, frames).await
         })
@@ -4322,6 +5566,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             preflight.hand_off();
             drop(preflight);
@@ -4352,6 +5597,7 @@ where
         prepared: &'a mut PreparedWalFrameBatch,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             self.inner.append_prepared_frames(cx, prepared).await
         })
@@ -4365,6 +5611,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             preflight.hand_off();
             drop(preflight);
@@ -4383,6 +5630,7 @@ where
         sync: bool,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             self.append_durable_certificate_record(
                 cx,
@@ -4406,6 +5654,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
+            self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path(cx).await?;
             preflight.hand_off();
             drop(preflight);
@@ -4430,8 +5679,17 @@ where
         sync: bool,
     ) -> WalFuture<'a, ParallelWalCommitReconciliation> {
         Box::pin(async move {
+            self.inner.validate_append_reconciliation(wal_frame_start, wal_frame_end)?;
             self.ensure_current_wal_path(cx).await?;
-            self.inner.wal.refresh(cx).await?;
+            self.inner.validate_append_reconciliation(wal_frame_start, wal_frame_end)?;
+            if let Some(attempt) = &self.inner.pending_append_attempt {
+                self.inner.wal.refresh_preserving_append_prefix(
+                    cx, attempt.generation, attempt.start_frame_index, attempt.previous_running_checksum,
+                ).await?;
+            } else {
+                self.inner.wal.refresh(cx).await?;
+            }
+            self.inner.validate_append_reconciliation(wal_frame_start, wal_frame_end)?;
             let wal_generation = self.inner.wal.generation_identity();
             let expected_record = ParallelWalDurableCertificateRecord::new(
                 wal_generation,
@@ -4498,38 +5756,16 @@ where
                         ),
                     });
                 }
+                self.inner.authorize_append_reconciliation();
                 if sync {
                     self.sync_with_fec(cx, false)?;
                     self.vfs.sync_parent_directory(cx, &self.wal_path)?;
                 }
+                self.inner.publish_reconciled_append(cx, sync)?;
                 return Ok(ParallelWalCommitReconciliation::Authorized);
             }
 
-            let committed_prefix_before =
-                wal_frame_start
-                    .checked_sub(1)
-                    .ok_or_else(|| FrankenError::WalCorrupt {
-                        detail: "parallel WAL recovery interval starts at frame zero".to_owned(),
-                    })?;
-            if valid_frame_count != committed_prefix_before {
-                return Err(FrankenError::WalCorrupt {
-                    detail: format!(
-                        "in-doubt WAL interval {wal_frame_start}..={wal_frame_end} has unexpected committed prefix {valid_frame_count}"
-                    ),
-                });
-            }
-            // Only after the live WAL shape is classified as the exact
-            // pre-interval prefix may reconciliation repair torn sidecar bytes
-            // or remove the matching orphan certificate. Unexpected WAL state
-            // preserves all durable evidence for diagnosis and retry.
-            self.reconcile_certificate_sidecar_record(cx, &expected_record, true, sync)
-                .await?;
-            self.inner.wal.repair_uncommitted_tail(cx)?;
-            if sync {
-                self.sync_with_fec(cx, false)?;
-                self.vfs.sync_parent_directory(cx, &self.wal_path)?;
-            }
-            Ok(ParallelWalCommitReconciliation::NotCommitted)
+            self.reconcile_absent_append(cx, &expected_record, valid_frame_count, sync).await
         })
     }
 
@@ -4540,7 +5776,7 @@ where
         Box::pin(async move {
             self.ensure_current_wal_path(cx).await?;
             if let Some(record) = self
-                .latest_authorized_durable_certificate_record(cx)
+                .latest_authorized_durable_certificate_record(cx, None)
                 .await?
             {
                 return Ok(Some(record.certificate));
@@ -4554,8 +5790,13 @@ where
         cx: &'a Cx,
     ) -> WalFuture<'a, Option<u32>> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
-            let current = self.inner.refresh_published_snapshot(cx).await?;
+            let current = if self.inner.native_reader_required() {
+                self.preflight_native_append(cx).await?;
+                self.inner.published_snapshot()
+            } else {
+                self.ensure_current_wal_path(cx).await?;
+                self.inner.refresh_published_snapshot(cx).await?
+            };
             let Some(current_commit_frame) = current.last_commit_frame else {
                 return Ok(None);
             };
@@ -4575,7 +5816,7 @@ where
                 });
             }
             let authorized = self
-                .latest_authorized_durable_certificate_record(cx)
+                .latest_authorized_durable_certificate_record(cx, None)
                 .await?;
             if let Some(record) = authorized
                 && current.generation == record.wal_generation
@@ -4647,8 +5888,13 @@ where
         page_baselines: &'a [TransactionConflictPageBaseline],
     ) -> WalFuture<'a, Vec<u32>> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
-            let latest = self.inner.refresh_published_snapshot(cx).await?;
+            let latest = if self.inner.native_reader_required() {
+                self.preflight_native_append(cx).await?;
+                self.inner.published_snapshot()
+            } else {
+                self.ensure_current_wal_path(cx).await?;
+                self.inner.refresh_published_snapshot(cx).await?
+            };
             if latest.generation != snapshot.generation {
                 return Ok(self
                     .conflicts_after_generation_change(cx, page_numbers, page_baselines)
@@ -4681,6 +5927,7 @@ where
         cx: &Cx,
         producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
     ) -> Result<()> {
+        self.inner.assert_no_pending_append_attempt()?;
         self.fec_producer = producer;
         if let Some(producer) = &self.fec_producer {
             let header = WalHeader::from_bytes(&self.inner.wal.header().to_bytes()?)?;
@@ -4735,9 +5982,13 @@ where
         oldest_reader_frame: Option<u32>,
     ) -> WalFuture<'a, CheckpointResult> {
         Box::pin(async move {
+            if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some()
+                || self.inner.native_recovery_requested.is_some()
+            { return Err(FrankenError::BusyRecovery); }
             self.ensure_current_wal_path(cx).await?;
+            if self.inner.native_reader_required() { self.inner.native_checkpoint_view(cx).await?; }
             let checkpoint_handoff = self
-                .latest_authorized_durable_certificate_record(cx)
+                .latest_authorized_durable_certificate_record(cx, None)
                 .await?;
             if let Some(record) = checkpoint_handoff.as_ref() {
                 // Fence the certificate clock before the checkpoint is
@@ -4760,6 +6011,11 @@ where
                 self.pending_fec_reclamation.push(salts);
             }
             let result = checkpoint_result?;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            if result.wal_was_reset {
+                self.fec_admitted = None;
+                self.fec_inspected_generation = None;
+            }
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             if !self.pending_fec_reclamation.is_empty() {
                 let sidecar_path = fsqlite_wal::wal_fec_path_for_wal(&self.wal_path);
@@ -4813,6 +6069,16 @@ struct CheckpointTargetAdapterRef<'a> {
 }
 
 impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
+    fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
+        self.writer.checkpoint_page1_header_patch()
+    }
+
+    fn read_page_if_supported<'a>(
+        &'a mut self, cx: &'a Cx, page_no: PageNumber, buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
+        self.writer.read_page_if_supported(cx, page_no, buf)
+    }
+
     fn write_page<'a>(
         &'a mut self,
         cx: &'a Cx,
@@ -4836,6 +6102,88 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 
     fn release_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
         Box::pin(async move { self.writer.release_wal_reset_gate(cx).await })
+    }
+}
+
+/// Bridges the writer while retaining reset state in the adapter across Drop.
+struct CheckpointResetTarget<'a, F: VfsFile> {
+    delegate: CheckpointTargetAdapterRef<'a>,
+    pending: &'a mut Option<PendingCheckpointReset<F>>,
+    previous_header: WalHeader,
+    native: Option<NativeCheckpointView<F>>,
+}
+
+impl<F: VfsFile> CheckpointTarget for CheckpointResetTarget<'_, F> {
+    fn checkpoint_page1_header_patch(&self) -> Option<[u8; 12]> {
+        self.delegate.checkpoint_page1_header_patch()
+    }
+
+    fn write_page<'a>(&'a mut self, cx: &'a Cx, page_no: PageNumber, data: &'a [u8]) -> CheckpointTargetFuture<'a, ()> {
+        self.delegate.write_page(cx, page_no, data)
+    }
+    fn truncate_db<'a>(&'a mut self, cx: &'a Cx, pages: u32) -> CheckpointTargetFuture<'a, ()> {
+        self.delegate.truncate_db(cx, pages)
+    }
+    fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        self.delegate.sync_db(cx)
+    }
+    fn read_page_if_supported<'a>(&'a mut self, cx: &'a Cx, page_no: PageNumber, buf: &'a mut [u8]) -> CheckpointTargetFuture<'a, Option<usize>> {
+        self.delegate.read_page_if_supported(cx, page_no, buf)
+    }
+    fn acquire_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, bool> {
+        self.delegate.acquire_wal_reset_gate(cx)
+    }
+    fn release_wal_reset_gate<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        self.delegate.release_wal_reset_gate(cx)
+    }
+    fn publish_backfill<'a>(&'a mut self, _cx: &'a Cx, header: &'a WalHeader, frames: u32) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            if header != &self.previous_header { return Err(FrankenError::BusyRecovery); }
+            if let Some(native) = &self.native {
+                publish_shared_wal_index_backfill(&native.region, &native.header, frames)?;
+            }
+            Ok(())
+        })
+    }
+    fn prepare_wal_reset<'a>(
+        &'a mut self, _cx: &'a Cx, header: &'a WalHeader, new_checkpoint_seq: u32,
+        new_salts: WalSalts, truncate: bool,
+    ) -> CheckpointTargetFuture<'a, Option<VfsWriteCompletion>> {
+        Box::pin(async move {
+            if self.pending.is_some() || header != &self.previous_header { return Err(FrankenError::BusyRecovery); }
+            let target = WalHeader { checkpoint_seq: new_checkpoint_seq, salts: new_salts,
+                checksum: SqliteWalChecksum::default(), ..*header };
+            let target_header = WalHeader::from_bytes(&target.to_bytes()?)?;
+            let (native, source) = if let Some(view) = &self.native {
+                let mut target = view.header;
+                target.mx_frame = 0;
+                target.n_page = 0;
+                target.a_frame_cksum = [0, 0];
+                target.a_salt = [new_salts.salt1, new_salts.salt2];
+                target.update_checksum()?;
+                validate_shared_wal_index_wal_binding(&target, &target_header, None)?;
+                (Some(SharedWalIndexResetPlan::prepare(view.region.share(), view.header, target)?), Some(Arc::clone(&view.source)))
+            } else { (None, None) };
+            let completion = VfsWriteCompletion::new();
+            *self.pending = Some(PendingCheckpointReset {
+                old_header: *header, target_header, truncate, completion: completion.clone(),
+                physical_complete: false, shared_complete: false, native, _source: source,
+            });
+            Ok(Some(completion))
+        })
+    }
+    fn finish_wal_reset<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            let reset = self.pending.as_mut().ok_or(FrankenError::BusyRecovery)?;
+            if reset.completion.state() != VfsWriteCompletionState::Success { return Err(FrankenError::BusyRecovery); }
+            reset.physical_complete = true;
+            if let Some(native) = &mut reset.native { native.publish()?; }
+            reset.shared_complete = true;
+            Ok(())
+        })
+    }
+    fn wal_reset_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|reset| !reset.shared_complete)
     }
 }
 
@@ -4873,11 +6221,34 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "independent fault controls can be armed together"
+    )]
     struct CheckpointHandoffFaultState {
         next_write: Option<CheckpointHandoffWriteFault>,
         fail_next_sync: bool,
         /// Fail the next sync on a non-handoff (i.e. WAL) file.
         fail_next_wal_sync: bool,
+        #[cfg(feature = "fault-injection")]
+        pause_after_wal_write: bool,
+        #[cfg(feature = "fault-injection")]
+        next_wal_write_prefix: Option<usize>,
+        #[cfg(feature = "fault-injection")]
+        pend_next_reset_write: bool,
+        #[cfg(feature = "fault-injection")]
+        pending_reset_write: Option<(Vec<u8>, u64, VfsWriteCompletion)>,
+        #[cfg(feature = "fault-injection")]
+        reset_headers: Vec<Vec<u8>>,
+        #[cfg(feature = "fault-injection")]
+        reset_header_written: bool,
+        #[cfg(feature = "fault-injection")]
+        reset_sync_failures_remaining: usize,
+        #[cfg(feature = "fault-injection")]
+        reset_shared_header_after_sync: Option<(fsqlite_vfs::ShmRegion, fsqlite_wal::wal_index::WalIndexHdr)>,
+        fail_index_maps: bool,
+        wal_header_reads_before_failure: Option<usize>,
+        wal_header_reads_completed: usize,
         sync_observations: Vec<CertificateSyncObservation>,
     }
 
@@ -4924,6 +6295,45 @@ mod tests {
                 .fail_next_wal_sync = true;
         }
 
+        #[cfg(feature = "fault-injection")]
+        fn pause_after_next_wal_write(&self) {
+            self.faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pause_after_wal_write = true;
+        }
+
+        #[cfg(feature = "fault-injection")]
+        fn fail_next_wal_write_after_prefix(&self, prefix_bytes: usize) {
+            self.faults.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_wal_write_prefix = Some(prefix_bytes);
+        }
+
+        #[cfg(feature = "fault-injection")]
+        fn pend_next_reset_write(&self) {
+            self.faults.lock().unwrap().pend_next_reset_write = true;
+        }
+
+        #[cfg(feature = "fault-injection")]
+        fn fail_next_reset_sync(&self) {
+            let mut faults = self.faults.lock().unwrap();
+            faults.reset_sync_failures_remaining = 1;
+            faults.reset_header_written = false;
+        }
+
+        /// The retained synthetic source owns the write after caller Drop.
+        /// Only the real MemoryFile write terminalizes its original token.
+        #[cfg(feature = "fault-injection")]
+        async fn complete_pending_reset_write(&self, cx: &Cx) -> Result<()> {
+            let (bytes, offset, completion) = self.faults.lock().unwrap()
+                .pending_reset_write.take().expect("source owns a pending reset write");
+            let (mut file, _) = self.inner.open(cx, Some(Path::new("test.db-wal")), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)?;
+            let result = file.write_tracked(cx, &bytes, offset, completion).await;
+            if result.is_ok() { self.faults.lock().unwrap().reset_header_written = true; }
+            let close = file.close(cx);
+            result.and(close)
+        }
+
         fn take_sync_observations(&self) -> Vec<CertificateSyncObservation> {
             std::mem::take(
                 &mut self
@@ -4932,6 +6342,15 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .sync_observations,
             )
+        }
+
+        fn fail_wal_frame_header_read_after(&self, successful_reads: usize) {
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            faults.wal_header_reads_before_failure = Some(successful_reads);
+            faults.wal_header_reads_completed = 0;
         }
     }
 
@@ -5004,6 +6423,10 @@ mod tests {
     }
 
     impl VfsFile for CheckpointHandoffFaultFile {
+        fn wal_reader_mark_exclusive_acquire(&mut self, cx: &Cx, reader_slot: u32) -> Result<()> {
+            self.inner.wal_reader_mark_exclusive_acquire(cx, reader_slot)
+        }
+
         fn close(&mut self, cx: &Cx) -> Result<()> {
             self.inner.close(cx)
         }
@@ -5012,13 +6435,46 @@ mod tests {
             self.inner.file_identity()
         }
 
-        fn read<'a>(
+        async fn read<'a>(
             &'a self,
             cx: &'a Cx,
             buf: &'a mut [u8],
             offset: u64,
-        ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
-            self.inner.read(cx, buf, offset)
+        ) -> Result<usize> {
+            // Full-frame WAL recovery and 32-byte WAL header reads must finish
+            // before this opt-in publication header scan fault can fire.
+            let observe_header = if self.path.as_deref() == Some(Path::new("test.db-wal"))
+                && buf.len() == WAL_FRAME_HEADER_SIZE
+                && offset >= u64::try_from(WAL_HEADER_SIZE).expect("WAL header fits u64")
+            {
+                let mut faults = self
+                    .faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match faults.wal_header_reads_before_failure {
+                    Some(0) => {
+                        faults.wal_header_reads_before_failure = None;
+                        return Err(FrankenError::Io(std::io::Error::other(
+                            "injected WAL publication header read failure",
+                        )));
+                    }
+                    Some(remaining) => {
+                        faults.wal_header_reads_before_failure = Some(remaining - 1);
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let bytes_read = self.inner.read(cx, buf, offset).await?;
+            if observe_header && bytes_read == WAL_FRAME_HEADER_SIZE {
+                self.faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .wal_header_reads_completed += 1;
+            }
+            Ok(bytes_read)
         }
 
         async fn write<'a>(&'a self, cx: &'a Cx, buf: &'a [u8], offset: u64) -> Result<()> {
@@ -5042,6 +6498,64 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "fault-injection")]
+        async fn write_tracked<'a>(
+            &'a self,
+            cx: &'a Cx,
+            buf: &'a [u8],
+            offset: u64,
+            completion: VfsWriteCompletion,
+        ) -> Result<()> {
+            let is_reset = self.path.as_deref() == Some(Path::new("test.db-wal"))
+                && offset == 0 && buf.len() == WAL_HEADER_SIZE;
+            let pend_reset = if is_reset {
+                let mut faults = self.faults.lock().unwrap();
+                faults.reset_headers.push(buf.to_vec());
+                std::mem::take(&mut faults.pend_next_reset_write)
+            } else { false };
+            if pend_reset {
+                self.faults.lock().unwrap().pending_reset_write = Some((buf.to_vec(), offset, completion));
+                return std::future::pending::<Result<()>>().await;
+            }
+            let prefix = if self.path.as_deref() == Some(Path::new("test.db-wal")) {
+                self.faults.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .next_wal_write_prefix.take()
+            } else {
+                None
+            };
+            if let Some(prefix) = prefix {
+                assert!(prefix < buf.len(), "fixture must leave an incomplete candidate");
+                self.inner.write_tracked(cx, &buf[..prefix], offset, completion.error_mapped_child())
+                    .await?;
+                return Err(FrankenError::Io(std::io::Error::other("injected partial WAL write")));
+            }
+            let pause = self.path.as_deref() == Some(Path::new("test.db-wal"))
+                && std::mem::take(
+                    &mut self
+                        .faults
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pause_after_wal_write,
+                );
+            if pause {
+                // MemoryFile owns the actual write and terminal token. Pause
+                // only after that source succeeds, before WalFile observes it.
+                self.inner.write_tracked(cx, buf, offset, completion).await?;
+                if is_reset { self.faults.lock().unwrap().reset_header_written = true; }
+                return std::future::pending::<Result<()>>().await;
+            }
+            // Preserve this fixture's existing handoff faults and the trait's
+            // conservative default completion semantics for every other write.
+            let result = self.write(cx, buf, offset).await;
+            if result.is_ok() {
+                if is_reset { self.faults.lock().unwrap().reset_header_written = true; }
+                completion.complete_success();
+            } else {
+                completion.complete_error();
+            }
+            result
+        }
+
         fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
             self.inner.truncate(cx, size)
         }
@@ -5051,6 +6565,16 @@ mod tests {
                 .faults
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(feature = "fault-injection")]
+            let is_reset_sync = self.path.as_deref() == Some(Path::new("test.db-wal")) && faults.reset_header_written;
+            #[cfg(feature = "fault-injection")]
+            if is_reset_sync {
+                if faults.reset_sync_failures_remaining > 0 {
+                    faults.reset_sync_failures_remaining -= 1;
+                    return Err(FrankenError::Io(std::io::Error::other("injected exact reset header sync failure")));
+                }
+                faults.reset_header_written = false;
+            }
             if let Some(path) = self.path.as_ref().filter(|path| {
                 path.as_path() == Path::new(CERTIFICATE_PATH)
                     || path.as_path() == Path::new(CHECKPOINT_HANDOFF_PATH)
@@ -5063,7 +6587,7 @@ mod tests {
             let fail_wal =
                 !self.is_checkpoint_handoff && std::mem::take(&mut faults.fail_next_wal_sync);
             drop(faults);
-            if fail {
+            let result = if fail {
                 Err(FrankenError::Io(std::io::Error::other(
                     "injected checkpoint handoff sync failure",
                 )))
@@ -5073,7 +6597,15 @@ mod tests {
                 )))
             } else {
                 self.inner.sync(cx, flags)
+            };
+            #[cfg(feature = "fault-injection")]
+            if result.is_ok() && is_reset_sync {
+                let intervention = self.faults.lock().unwrap().reset_shared_header_after_sync.take();
+                if let Some((region, header)) = intervention {
+                    fsqlite_wal::wal_index::publish_shared_wal_index_header(&region, &header)?;
+                }
             }
+            result
         }
 
         fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
@@ -5120,6 +6652,10 @@ mod tests {
             self.inner.restore_external_shared_snapshot_attempt(cx)
         }
 
+        fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+            self.inner.owns_external_wal_append_write(cx)
+        }
+
         fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
             self.inner.lock_external_wal_append(cx)
         }
@@ -5130,6 +6666,10 @@ mod tests {
 
         fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
             self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+
+        fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_recovery(cx)
         }
 
         fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
@@ -5155,6 +6695,9 @@ mod tests {
             size: u32,
             extend: bool,
         ) -> Result<fsqlite_vfs::ShmRegion> {
+            if self.faults.lock().unwrap().fail_index_maps {
+                return Err(FrankenError::Io(std::io::Error::other("injected native index mapping refusal")));
+            }
             self.inner.shm_map(cx, region, size, extend)
         }
 
@@ -5631,7 +7174,7 @@ mod tests {
         adapter.sync(cx).expect("sync replacement WAL page");
         adapter
             .into_inner()
-            .expect("sync drained the staged frames")
+            .unwrap_or_else(|_| panic!("sync drained the staged frames"))
             .close(cx)
             .expect("close replacement WAL");
     }
@@ -6594,7 +8137,7 @@ mod tests {
         );
 
         let record = backend
-            .latest_authorized_durable_certificate_record(&cx)
+            .latest_authorized_durable_certificate_record(&cx, None)
             .wait()
             .expect("read authorized certificate record")
             .expect("authorized certificate record must exist");
@@ -6970,6 +8513,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pinned_logical_reader_skips_newer_authorized_certificate() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, old_certificate) = make_authorized_certificate_backend(&vfs, &cx);
+        backend.begin_transaction(&cx).expect("pin older certificate horizon");
+        let old_pinned = backend.pinned_read_snapshot().unwrap();
+        let old_page = backend.read_page_pinned(&cx, 1).expect("capture old page");
+        let page = sample_page(0x65);
+        let mut newer = sample_certificate(2, 2, vec![1]);
+        newer.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 2);
+        newer.certificate_crc32c = newer.computed_crc32c();
+        backend.persist_parallel_wal_commit_certificate(&cx, &newer, 2, 2, true)
+            .expect("persist newer certificate");
+        backend.append_frame(&cx, 1, &page, 2).expect("append newer certified commit");
+        backend.sync(&cx).expect("publish newer certified commit");
+        assert_eq!(backend.pinned_read_snapshot(), Some(old_pinned));
+        let logical = backend.pinned_logical_read_snapshot(&cx)
+            .expect("walk past newer certificate without widening reader")
+            .expect("older certificate is still authoritative for this pin");
+        assert_eq!(logical.last_commit_frame, old_pinned.last_commit_frame);
+        assert_eq!(logical.visible_commit_seq, old_certificate.commit_seq_hi);
+        assert_eq!(backend.read_page_pinned(&cx, 1).expect("old pinned page persists"), old_page);
+        backend.begin_transaction(&cx).expect("next transaction may capture newer commit");
+        let next = backend.pinned_logical_read_snapshot(&cx).expect("new logical horizon").unwrap();
+        assert_eq!(next.visible_commit_seq, newer.commit_seq_hi);
+        assert_eq!(next.last_commit_frame, Some(1));
+    }
+
     fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (file, _) = vfs
@@ -6998,6 +8570,815 @@ mod tests {
     }
 
     // -- WalBackendAdapter tests --
+
+    /// Heap-backed transport fixture: exercises the actual adapter and fault
+    /// VFS, but supplies an initialized index explicitly. This does not prove
+    /// stock SQLite interoperability, filesystem durability, or native locks.
+    #[cfg(all(feature = "native", unix))]
+    struct SyntheticSharedPublication {
+        _pager: fsqlite_pager::SimplePager<CheckpointHandoffFaultVfs>,
+        adapter: WalBackendAdapter<<CheckpointHandoffFaultVfs as Vfs>::File>,
+        region: fsqlite_vfs::ShmRegion,
+        baseline: fsqlite_wal::wal_index::WalIndexHdr,
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn synthetic_shared_publication(vfs: &CheckpointHandoffFaultVfs, cx: &Cx) -> SyntheticSharedPublication {
+        use fsqlite_wal::wal_index::{WAL_INDEX_VERSION, publish_shared_wal_index_header};
+
+        let pager = fsqlite_pager::SimplePager::open_with_cx(
+            cx, vfs.clone(), Path::new("test.db"), fsqlite_types::PageSize::DEFAULT,
+        ).expect("open fixture pager");
+        let mut adapter = make_fault_adapter(vfs, cx);
+        let source = pager.wal_index_shm_source().expect("exact pager SHM source");
+        let region = source.map_region(cx, 0, true).expect("map fixture index");
+        let wal_header = adapter.wal.header();
+        let mut baseline = fsqlite_wal::wal_index::WalIndexHdr {
+            i_version: WAL_INDEX_VERSION, unused: 0, i_change: u32::MAX,
+            is_init: 1, big_end_cksum: u8::from(wal_header.big_endian_checksum()),
+            sz_page: u16::try_from(PAGE_SIZE).expect("fixture page size fits"),
+            mx_frame: 0, n_page: 1, a_frame_cksum: [0, 0],
+            a_salt: [wal_header.salts.salt1, wal_header.salts.salt2], a_cksum: [0, 0],
+        };
+        baseline.update_checksum().expect("fixture header checksum");
+        publish_shared_wal_index_header(&region, &baseline).expect("seed fixture index");
+        for offset in (96..136).step_by(4) {
+            region.atomic_store_u32_ne(offset, 0x5678_1234, std::sync::atomic::Ordering::Release)
+                .expect("seed unrelated reader/checkpoint bytes");
+        }
+        adapter.attach_wal_index_shm_source(source).expect("explicit synthetic transport attachment");
+        SyntheticSharedPublication { _pager: pager, adapter, region, baseline }
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn native_recovery_stock_child(path: &Path) {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "wal_adapter::tests::test_native_recovery_first_begin_repairs_missing_torn_stale_and_terminal_index", "--nocapture"])
+            .env("FSQLITE_NATIVE_RECOVERY_STOCK_CHILD", path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().expect("start independent stock reader");
+        let start = std::time::Instant::now();
+        loop {
+            if child.try_wait().expect("poll stock child").is_some() { break; }
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                child.kill().expect("stop timed-out stock child");
+                child.wait().expect("reap timed-out stock child");
+                panic!("stock reader did not finish within 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("collect stock child output");
+        assert!(output.status.success(), "stock child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("native-recovery-stock-row-sum=30"));
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_recovery_first_begin_repairs_missing_torn_stale_and_terminal_index() {
+        use fsqlite_pager::{JournalMode, MvccPager, SimplePager, TransactionHandle, TransactionMode};
+        use fsqlite_vfs::UnixVfs;
+        use fsqlite_wal::wal_index::WalIndexHdr;
+
+        if let Some(path) = std::env::var_os("FSQLITE_NATIVE_RECOVERY_STOCK_CHILD") {
+            let stock = rusqlite::Connection::open_with_flags(Path::new(&path),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect("stock opens recovered database");
+            stock.busy_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let sum: i64 = stock.query_row("SELECT sum(n) FROM recovery_rows", [], |row| row.get(0))
+                .expect("stock resolves recovered page/hash mappings");
+            assert_eq!(sum, 30);
+            println!("native-recovery-stock-row-sum={sum}");
+            return;
+        }
+        let cx = test_cx();
+        let directory = tempfile::tempdir().expect("native recovery directory");
+        let seed = directory.path().join("seed.db");
+        let stock = rusqlite::Connection::open(&seed).expect("stock creates seed");
+        stock.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE recovery_rows(n INTEGER); INSERT INTO recovery_rows VALUES(10),(20);")
+            .expect("stock commits seed rows while retaining its attachment");
+        let main_bytes = std::fs::read(&seed).unwrap();
+        let wal_bytes = std::fs::read(seed.with_file_name("seed.db-wal")).unwrap();
+        let shared_bytes = std::fs::read(seed.with_file_name("seed.db-shm")).unwrap();
+        for kind in ["missing", "torn", "stale", "terminal"] {
+            let path = directory.path().join(format!("{kind}.db"));
+            let wal_path = directory.path().join(format!("{kind}.db-wal"));
+            let shared_path = directory.path().join(format!("{kind}.db-shm"));
+            std::fs::write(&path, &main_bytes).unwrap();
+            std::fs::write(&wal_path, &wal_bytes).unwrap();
+            if kind != "missing" {
+                let mut bytes = shared_bytes.clone();
+                if kind == "torn" { bytes[0] ^= 1; } else {
+                    let mut header = WalIndexHdr::from_bytes(&bytes).unwrap();
+                    if kind == "stale" {
+                        header.a_salt[0] ^= 1;
+                    } else {
+                        header.a_frame_cksum[0] ^= 1;
+                    }
+                    header.update_checksum().unwrap();
+                    bytes[..48].copy_from_slice(&header.to_bytes());
+                    bytes[48..96].copy_from_slice(&header.to_bytes());
+                }
+                std::fs::write(&shared_path, &bytes).unwrap();
+            }
+            let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+                .expect("open copied native database");
+            assert_eq!(pager.journal_mode(), JournalMode::Wal);
+            let source = pager.wal_index_shm_source().unwrap();
+            let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)
+                .expect("open existing copied WAL without creating it");
+            let wal = WalFile::open(&cx, file).expect("validate stock WAL");
+            let (last_index, last_marker) = wal.last_commit_frame_header().expect("stock final marker");
+            let mut adapter = WalBackendAdapter::new(wal);
+            adapter.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+            assert!(pager.set_wal_backend_owned(adapter).is_ok());
+            let mut transaction = pager.begin(&cx, TransactionMode::ReadOnly)
+                .expect("first begin performs canonical recovery before page reads");
+            transaction.get_page(&cx, PageNumber::ONE).expect("read bound recovered page one");
+            let region = source.map_region(&cx, 0, false).expect("recovery supplied the native index");
+            let header = read_shared_wal_index_header(&region).unwrap().unwrap();
+            assert_eq!(usize::try_from(header.mx_frame).unwrap(), last_index + 1);
+            assert_eq!((header.n_page, header.a_frame_cksum),
+                (last_marker.db_size, [last_marker.checksum.s1, last_marker.checksum.s2]));
+            assert_eq!(std::fs::read(&path).unwrap(), main_bytes, "index recovery never rewrites main bytes");
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes, "index recovery never rewrites WAL bytes");
+            native_recovery_stock_child(&path);
+            transaction.rollback(&cx).expect("release recovered native reader");
+        }
+        drop(stock);
+    }
+
+    /// Copy an old stock index beside a later complete stock WAL commit. The
+    /// seed connection owns different inodes and never attaches to the copy.
+    #[cfg(all(feature = "native", unix))]
+    fn native_orphan_tail_database(directory: &Path, trailing_noncommit: bool) -> (PathBuf, Vec<u8>, fsqlite_wal::wal_index::WalIndexHdr) {
+        let seed = directory.join("orphan-seed.db");
+        let stock = rusqlite::Connection::open(&seed).expect("create stock seed");
+        stock.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE recovery_rows(n INTEGER); INSERT INTO recovery_rows VALUES(10),(20);")
+            .expect("commit old stock prefix");
+        let main = std::fs::read(&seed).unwrap();
+        let shared = std::fs::read(directory.join("orphan-seed.db-shm")).unwrap();
+        let header = fsqlite_wal::wal_index::WalIndexHdr::from_bytes(&shared).unwrap();
+        stock.execute_batch("UPDATE recovery_rows SET n=n+10;").expect("commit later page two");
+        let mut wal = std::fs::read(directory.join("orphan-seed.db-wal")).unwrap();
+        let path = directory.join("orphan.db");
+        std::fs::write(&path, main).unwrap();
+        std::fs::write(directory.join("orphan.db-wal"), &wal).unwrap();
+        std::fs::write(directory.join("orphan.db-shm"), shared).unwrap();
+        if trailing_noncommit {
+            // Fixture setup has no live target attachment. Supply a complete,
+            // checksum-valid noncommit suffix after the orphaned stock commit.
+            let cx = test_cx();
+            let (file, _) = fsqlite_vfs::UnixVfs::new().open(&cx, Some(&directory.join("orphan.db-wal")), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+            let mut tail = WalFile::open(&cx, file).expect("validate fixture WAL before extra suffix");
+            tail.append_frame(&cx, 2, &sample_page(0xA6), 0).expect("append valid noncommit fixture suffix");
+            tail.sync(&cx, SyncFlags::NORMAL).unwrap();
+            tail.close(&cx).unwrap();
+            wal = std::fs::read(directory.join("orphan.db-wal")).unwrap();
+        }
+        (path, wal, header)
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_orphan_tail_refuses_absent_or_unrelated_append_authority() {
+        use fsqlite_pager::SimplePager;
+        use fsqlite_vfs::UnixVfs;
+
+        let cx = test_cx();
+        let directory = tempfile::tempdir().unwrap();
+        let (path, wal_bytes, baseline) = native_orphan_tail_database(directory.path(), false);
+        let wal_path = directory.path().join("orphan.db-wal");
+        let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+            .expect("open native orphan fixture");
+        let source = pager.wal_index_shm_source().unwrap();
+        let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+        let wal = WalFile::open(&cx, file).expect("open validated orphan WAL");
+        let mut adapter = WalBackendAdapter::new(wal);
+        adapter.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+        let mut lease = source.acquire_reader(&cx).expect("capture still-valid older shared horizon");
+        let binding = lease.binding().unwrap();
+        let token = binding.token().clone();
+        assert_eq!(adapter.begin_native_read(&cx, binding).expect("older reader remains valid"), WalNativeReadOutcome::Ready);
+        let pinned = adapter.pinned_read_snapshot().unwrap();
+        let old_page = adapter.read_page_pinned(&cx, 2).expect("read old table page");
+        assert_eq!(adapter.native_recovery_required(), None, "a newer physical tail alone does not widen a reader");
+        assert!(matches!(adapter.preflight_native_append(&cx).expect_err("no WRITE owner"), FrankenError::BusyRecovery));
+        assert_eq!(adapter.native_recovery_required(), None);
+
+        let (mut unrelated, _) = UnixVfs::new().open(&cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+        unrelated.lock_external_wal_append(&cx).expect("different real handle owns WRITE");
+        assert!(unrelated.owns_external_wal_append_write(&cx).unwrap());
+        assert!(!source.owns_external_wal_append_write(&cx).expect("query exact source"));
+        assert!(matches!(adapter.preflight_native_append(&cx).expect_err("another handle is not this source's append owner"), FrankenError::BusyRecovery));
+        assert_eq!(adapter.native_recovery_required(), None);
+        assert!(!adapter.has_pending_publication());
+        assert_eq!(adapter.pinned_read_snapshot(), Some(pinned));
+        assert_eq!(adapter.read_page_pinned(&cx, 2).expect("same reader after refusals"), old_page);
+        let region = source.map_region(&cx, 0, false).expect("existing index");
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+        unrelated.restore_external_wal_append_attempt(&cx).unwrap();
+        unrelated.close(&cx).unwrap();
+        adapter.end_native_read(&token).unwrap();
+        lease.release().expect("release exact old reader");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_orphan_tail_requests_recovery_before_conflicts_and_fresh_writer_progress() {
+        use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
+        use fsqlite_vfs::UnixVfs;
+
+        const CHILD_ENV: &str = "FSQLITE_NATIVE_ORPHAN_TAIL_STOCK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let stock = rusqlite::Connection::open_with_flags(Path::new(&path), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("stock opens recovered and newly published index");
+            stock.busy_timeout(std::time::Duration::from_secs(1)).unwrap();
+            let sum: i64 = stock.query_row("SELECT sum(n) FROM recovery_rows", [], |row| row.get(0)).unwrap();
+            assert_eq!(sum, 50);
+            println!("native-orphan-tail-stock-row-sum={sum}");
+            return;
+        }
+        let cx = test_cx();
+        for trailing_noncommit in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, wal_bytes, baseline) = native_orphan_tail_database(directory.path(), trailing_noncommit);
+        let main_bytes = std::fs::read(&path).unwrap();
+        let wal_path = directory.path().join("orphan.db-wal");
+        let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+            .expect("open native orphan fixture");
+        let source = pager.wal_index_shm_source().unwrap();
+        let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+        let wal = WalFile::open(&cx, file).expect("open validated orphan WAL");
+        let complete_frames = u32::try_from(wal.frame_count()).unwrap();
+        let (_, last_marker) = wal.last_commit_frame_header().expect("last committed marker excludes noncommit suffix");
+        assert!(complete_frames > baseline.mx_frame);
+        let physical_frames = (wal_bytes.len() - WAL_HEADER_SIZE) / wal.frame_size();
+        assert_eq!(physical_frames, usize::try_from(complete_frames).unwrap() + usize::from(trailing_noncommit));
+        let mut backend = PathRefreshingWalBackend::new(UnixVfs::new(), &path, &wal_path, PAGE_SIZE, wal, false, None);
+        backend.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+        assert!(pager.set_wal_backend_owned(backend).is_ok());
+        let table_page = PageNumber::new(2).unwrap();
+        let mut first = pager.begin(&cx, TransactionMode::Concurrent).expect("old published prefix remains readable");
+        let old_page = first.get_page(&cx, table_page).expect("old table page").into_vec();
+        first.write_page(&cx, table_page, &old_page).expect("same page touched by the unadvertised commit");
+        let error = first.commit(&cx).expect_err("fresh WRITE owner requests recovery before stale-page conflicts");
+        assert!(matches!(error, FrankenError::BusyRecovery), "unexpected first append error: {error}");
+        let region = source.map_region(&cx, 0, false).expect("same native index");
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes, "classification has no physical append side effect");
+        assert_eq!(std::fs::read(&path).unwrap(), main_bytes);
+        first.rollback(&cx).expect("unwind the entire old reader and append attempt");
+        assert!(!source.owns_external_wal_append_write(&cx).expect("append authority retired"));
+
+        let foreign_pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+            .expect("independent old-reader attachment");
+        let foreign_source = foreign_pager.wal_index_shm_source().unwrap();
+        let mut foreign_reader = foreign_source.acquire_reader(&cx).expect("hold real old reader slot across recovery refusal");
+        assert_eq!(foreign_reader.header().unwrap(), baseline);
+        assert!(!foreign_reader.boundary().unwrap().database_only);
+        assert!(matches!(pager.begin(&cx, TransactionMode::Concurrent).wait(), Err(FrankenError::Busy | FrankenError::BusyRecovery)), "canonical recovery must respect a foreign old reader");
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+        foreign_reader.release().expect("release foreign reader before canonical retry");
+        drop(foreign_source);
+        drop(foreign_pager);
+
+        let mut retry = pager.begin(&cx, TransactionMode::Concurrent).expect("retained request performs canonical recovery at fresh admission");
+        let recovered = read_shared_wal_index_header(&region).unwrap().unwrap();
+        assert_eq!(recovered.mx_frame, complete_frames);
+        assert_eq!((recovered.n_page, recovered.a_frame_cksum), (last_marker.db_size, [last_marker.checksum.s1, last_marker.checksum.s2]));
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes, "index recovery preserves every WAL byte");
+        assert_eq!(std::fs::read(&path).unwrap(), main_bytes, "index recovery preserves every main-file byte");
+        let current_page = retry.get_page(&cx, table_page).expect("recovered table page").into_vec();
+        assert_ne!(current_page, old_page, "fresh admission sees the recovered stock update");
+        retry.write_page(&cx, table_page, &current_page).expect("preserve valid stock B-tree bytes in a new native commit");
+        retry.commit(&cx).expect("aligned native prefix passes Path conflict and database-size guards");
+        let published = read_shared_wal_index_header(&region).unwrap().unwrap();
+        assert!(published.mx_frame > complete_frames);
+        assert_eq!(published.i_change, recovered.i_change.wrapping_add(1));
+        assert!(!source.owns_external_wal_append_write(&cx).expect("successful append authority retired"));
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "wal_adapter::tests::test_native_orphan_tail_requests_recovery_before_conflicts_and_fresh_writer_progress", "--nocapture"])
+            .env(CHILD_ENV, &path).stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().expect("independent stock reader of recovered and newly published WAL");
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() { break; }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                child.kill().expect("stop timed-out stock child");
+                child.wait().expect("reap timed-out stock child");
+                panic!("stock reader did not finish within 30 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "stock child failed: stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("native-orphan-tail-stock-row-sum=50"));
+        }
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_orphan_preflight_never_creates_or_rebinds_invalid_wal_paths() {
+        use fsqlite_pager::SimplePager;
+        use fsqlite_vfs::UnixVfs;
+
+        let cx = test_cx();
+        for kind in ["missing", "short", "replaced"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, wal_bytes, _) = native_orphan_tail_database(directory.path(), false);
+            let wal_path = directory.path().join("orphan.db-wal");
+            let preserved_path = directory.path().join("preserved-orphan.wal");
+            let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+                .expect("open native fixture");
+            let source = pager.wal_index_shm_source().unwrap();
+            let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+            let wal = WalFile::open(&cx, file).expect("open original WAL descriptor");
+            let mut backend = PathRefreshingWalBackend::new(UnixVfs::new(), &path, &wal_path, PAGE_SIZE, wal, true, None);
+            backend.attach_wal_index_shm_source(source).unwrap();
+            std::fs::rename(&wal_path, &preserved_path).expect("preserve the original inode while perturbing its path");
+            let replacement = match kind {
+                "short" => Some(b"short".to_vec()),
+                "replaced" => Some(wal_bytes.clone()),
+                _ => None,
+            };
+            if let Some(bytes) = &replacement { std::fs::write(&wal_path, bytes).unwrap(); }
+            // Exercise the direct wrapper, not only the pager's outer gate.
+            backend.append_frame(&cx, 2, &sample_page(0x41), 2)
+                .expect_err("native path validation refuses creation and same-header inode replacement");
+            assert_eq!(backend.native_recovery_required(), None);
+            assert!(!backend.inner.has_pending_publication());
+            if let Some(bytes) = replacement {
+                assert_eq!(std::fs::read(&wal_path).unwrap(), bytes);
+            } else {
+                assert!(!wal_path.exists(), "native append never creates a missing path");
+            }
+            assert_eq!(std::fs::read(&preserved_path).unwrap(), wal_bytes);
+        }
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_orphan_preflight_preserves_live_local_publication() {
+        // Heap transport proves only the retained candidate state machine.
+        // Real exact WRITE ownership is covered by the Unix and pager controls.
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        fixture.adapter.append_frame(&cx, 1, &sample_page(0x35), 1).expect("stage local publisher");
+        let pending = fixture.adapter.pending_publication_frames.iter()
+            .map(|frame| (frame.page_number, frame.frame_index, frame.is_commit)).collect::<Vec<_>>();
+        let before = fixture.adapter.published_snapshot();
+        assert!(matches!(fixture.adapter.preflight_native_append(&cx).expect_err("live candidate is not abandoned"), FrankenError::BusyRecovery));
+        assert_eq!(fixture.adapter.native_recovery_required(), None);
+        assert_eq!(fixture.adapter.pending_publication_frames.iter()
+            .map(|frame| (frame.page_number, frame.frame_index, frame.is_commit)).collect::<Vec<_>>(), pending);
+        assert!(fixture.adapter.native_publication.is_some());
+        assert_eq!(fixture.adapter.published_snapshot(), before);
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap(), Some(fixture.baseline));
+        fixture.adapter.sync(&cx).expect("same retained publisher still completes");
+        assert_eq!(fixture.adapter.native_recovery_required(), None);
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().mx_frame, 1);
+    }
+
+    /// Synthetic transport control: the native gate itself is covered by the
+    /// VFS recovery tests; this keeper exercises the actual index data plane.
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_recovery_rebuilds_exact_commit_and_preserves_physical_tail() {
+        use fsqlite_wal::wal_index::{invalidate_shared_wal_index_header, lookup_native_wal_index_frame};
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let page = sample_page(0x53);
+        // Bypass publication to supply a pre-existing physical WAL, as a
+        // different process would leave it before this recovery owner exists.
+        fixture.adapter.wal.append_frame(&cx, 1, &page, 1).expect("first physical commit");
+        fixture.adapter.wal.append_frame(&cx, 2, &page, 2).expect("final physical commit");
+        let marker = fixture.adapter.wal.last_commit_frame_header().unwrap().1;
+        fixture.adapter.wal.append_frame(&cx, 3, &page, 0).expect("uncommitted physical suffix");
+        let size = fixture.adapter.wal.file().file_size(&cx).unwrap();
+        let mut before = vec![0; usize::try_from(size).unwrap()];
+        fixture.adapter.wal.file().read(&cx, &mut before, 0).expect("capture complete physical WAL");
+        let shared_before = fixture.region.lock().to_vec();
+        invalidate_shared_wal_index_header(&fixture.region).unwrap();
+        fixture.adapter.recover_native_index(&cx).expect("rebuild native index");
+        let header = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        assert_eq!((header.mx_frame, header.n_page, header.i_change), (2, 2, 0));
+        assert_eq!(header.a_frame_cksum, [marker.checksum.s1, marker.checksum.s2]);
+        assert_eq!(fixture.adapter.wal.frame_count(), 2);
+        assert_eq!(fixture.adapter.wal.last_fsynced_frame_count(), 0, "recovery grants no new fsync authority");
+        let shared_after = fixture.region.lock().to_vec();
+        assert_eq!(lookup_native_wal_index_frame(&shared_after, 0, 1, header.mx_frame).unwrap(), Some(1));
+        assert_eq!(lookup_native_wal_index_frame(&shared_after, 0, 2, header.mx_frame).unwrap(), Some(2));
+        assert_eq!(lookup_native_wal_index_frame(&shared_after, 0, 3, header.mx_frame).unwrap(), None);
+        assert_eq!(&shared_after[120..128], &shared_before[120..128]);
+        assert_eq!(&shared_after[132..136], &shared_before[132..136]);
+        assert_eq!(fixture.region.atomic_load_u32_ne(96, std::sync::atomic::Ordering::Acquire).unwrap(), 0);
+        assert_eq!(fixture.region.atomic_load_u32_ne(128, std::sync::atomic::Ordering::Acquire).unwrap(), 0);
+        assert_eq!(fixture.region.atomic_load_u32_ne(104, std::sync::atomic::Ordering::Acquire).unwrap(), 2);
+        let mut after = vec![0; before.len()];
+        fixture.adapter.wal.file().read(&cx, &mut after, 0).expect("capture unchanged physical WAL");
+        assert_eq!(after, before);
+        assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), size);
+        fixture.adapter.recover_native_index(&cx).expect("coherent peer repair is idempotent");
+        assert_eq!(fixture.region.lock().to_vec(), shared_after);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_recovery_scan_error_leaves_header_invalid_and_exact_retry() {
+        use fsqlite_wal::wal_index::invalidate_shared_wal_index_header;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let page = sample_page(0x63);
+        fixture.adapter.wal.append_frame(&cx, 1, &page, 1).expect("first physical commit");
+        fixture.adapter.wal.append_frame(&cx, 2, &page, 2).expect("second physical commit");
+        let size = fixture.adapter.wal.file().file_size(&cx).unwrap();
+        invalidate_shared_wal_index_header(&fixture.region).unwrap();
+        vfs.fail_wal_frame_header_read_after(1);
+        assert!(matches!(fixture.adapter.recover_native_index(&cx).wait(), Err(FrankenError::Io(_))));
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap(), None);
+        assert_eq!(fixture.adapter.published_snapshot.last_commit_frame, None);
+        assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), size);
+        assert_eq!(vfs.faults.lock().unwrap().wal_header_reads_completed, 1,
+            "fault occurs after full-frame validation, during mapping metadata scan");
+        fixture.adapter.recover_native_index(&cx).expect("retry after partial scan failure");
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().mx_frame, 2);
+        assert!(!fixture.adapter.has_pending_publication());
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_recovery_empty_wal_and_retained_publisher_refusal() {
+        use fsqlite_wal::wal_index::invalidate_shared_wal_index_header;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        invalidate_shared_wal_index_header(&fixture.region).unwrap();
+        fixture.adapter.recover_native_index(&cx).expect("recover empty native generation");
+        let header = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        assert_eq!((header.mx_frame, header.n_page, header.a_frame_cksum), (0, 0, [0, 0]));
+        assert_eq!(header.a_salt, fixture.baseline.a_salt);
+        assert_eq!(fixture.region.atomic_load_u32_ne(104, std::sync::atomic::Ordering::Acquire).unwrap(), 0);
+        let page = sample_page(0x73);
+        fixture.adapter.append_frame(&cx, 1, &page, 1).expect("stage an owned publication");
+        let before = fixture.region.lock().to_vec();
+        let size = fixture.adapter.wal.file().file_size(&cx).unwrap();
+        assert!(matches!(fixture.adapter.recover_native_index(&cx).wait(), Err(FrankenError::BusyRecovery)));
+        assert_eq!(fixture.region.lock().to_vec(), before);
+        assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), size);
+        assert!(fixture.adapter.has_pending_publication());
+        fixture.adapter.sync(&cx).expect("original publication owner remains usable");
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().mx_frame, 1);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_publication_transport_failed_sync_two_markers_and_suffix_retry() {
+        use fsqlite_wal::wal_index::lookup_native_wal_index_frame;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let before = fixture.region.lock().to_vec();
+        let page = sample_page(0x67);
+        let frames = [
+            WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 },
+            WalFrameRef { page_number: 2, page_data: &page, db_size_if_commit: 2 },
+            WalFrameRef { page_number: 3, page_data: &page, db_size_if_commit: 0 },
+        ];
+        fixture.adapter.append_frames(&cx, &frames).expect("append two markers and suffix");
+        assert_eq!(fixture.region.lock().to_vec(), before, "append only stages shared publication");
+        assert!(fixture.adapter.pending_append_attempt.is_none());
+        assert!(fixture.adapter.native_publication.is_some());
+        vfs.fail_next_wal_sync();
+        fixture.adapter.sync(&cx).expect_err("injected physical sync refusal");
+        assert_eq!(fixture.region.lock().to_vec(), before);
+        assert_eq!(fixture.adapter.published_snapshot.last_commit_frame, None);
+        fixture.adapter.refresh_published_snapshot(&cx)
+            .expect_err("refresh cannot trim the owned uncommitted suffix");
+        assert_eq!(fixture.adapter.wal.frame_count(), 3);
+        fixture.adapter.sync(&cx).expect("publish after successful retry");
+        let first = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        assert_eq!((first.mx_frame, first.i_change, first.n_page), (2, 1, 2));
+        let (marker_index, marker) = fixture.adapter.wal.last_commit_frame_header().unwrap();
+        assert_eq!(marker_index, 1);
+        assert_eq!(first.a_frame_cksum, [marker.checksum.s1, marker.checksum.s2]);
+        assert_ne!(marker.checksum, fixture.adapter.wal.running_checksum(), "physical suffix has a later checksum");
+        assert_eq!(fixture.adapter.published_snapshot.commit_count, 2);
+        assert_eq!(fixture.adapter.pending_publication_frames.len(), 1);
+        let published = fixture.region.lock().to_vec();
+        assert_eq!(&published[96..136], &before[96..136]);
+        assert_eq!(lookup_native_wal_index_frame(&published, 0, 3, 3).unwrap(), None);
+        fixture.adapter.sync(&cx).expect("no marker means no second publication");
+        assert_eq!(fixture.region.lock().to_vec(), published);
+        fixture.adapter.append_frame(&cx, 4, &page, 4).expect("extend retained suffix");
+        fixture.adapter.publish_authorized_deferred_commit(&cx).expect("explicit deferred authority");
+        let next = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        assert_eq!((next.mx_frame, next.i_change), (4, 2));
+        let completed = fixture.region.lock().to_vec();
+        assert_eq!(&completed[96..136], &before[96..136]);
+        assert_eq!(lookup_native_wal_index_frame(&completed, 0, 3, next.mx_frame).unwrap(), Some(3));
+        assert_eq!(lookup_native_wal_index_frame(&completed, 0, 4, next.mx_frame).unwrap(), Some(4));
+        assert!(!fixture.adapter.has_pending_publication());
+        fixture.adapter.sync(&cx).expect("durability after deferred publication");
+        assert_eq!(fixture.region.lock().to_vec(), completed);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_publication_transport_refuses_invalid_baseline_before_raw_or_prepared_write() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+
+        for prepared in [false, true] {
+            for missing in [false, true] {
+                let cx = test_cx();
+                let vfs = CheckpointHandoffFaultVfs::new();
+                let mut fixture = synthetic_shared_publication(&vfs, &cx);
+                if missing {
+                    fixture.region.atomic_store_u32_ne(0, 0, std::sync::atomic::Ordering::Release)
+                        .expect("simulate an uninitialized/torn header");
+                } else {
+                    let mut changed = fixture.baseline;
+                    changed.a_salt[0] ^= 1;
+                    changed.update_checksum().unwrap();
+                    publish_shared_wal_index_header(&fixture.region, &changed).unwrap();
+                }
+                let before = fixture.region.lock().to_vec();
+                let mut wal_before = [0; WAL_HEADER_SIZE];
+                fixture.adapter.wal.file().read(&cx, &mut wal_before, 0).expect("capture WAL bytes");
+                let page = sample_page(0x78);
+                let frames = [WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 }];
+                let completion = VfsWriteCompletion::new();
+                if prepared {
+                    let mut batch = fixture.adapter.prepare_append_frames(&frames).unwrap().unwrap();
+                    fixture.adapter.append_prepared_frames_tracked(&cx, &mut batch, completion.clone())
+                        .expect_err("invalid native baseline refuses prepared append");
+                } else {
+                    fixture.adapter.append_frames_tracked(&cx, &frames, completion.clone())
+                        .expect_err("invalid native baseline refuses raw append");
+                }
+                assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                assert!(!fixture.adapter.has_pending_publication());
+                assert_eq!(fixture.adapter.wal.frame_count(), 0);
+                assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), u64::try_from(WAL_HEADER_SIZE).unwrap());
+                let mut wal_after = [0; WAL_HEADER_SIZE];
+                fixture.adapter.wal.file().read(&cx, &mut wal_after, 0).expect("reread WAL bytes");
+                assert_eq!(wal_after, wal_before);
+                assert_eq!(fixture.region.lock().to_vec(), before);
+                publish_shared_wal_index_header(&fixture.region, &fixture.baseline).unwrap();
+                fixture.adapter.append_frames(&cx, &frames).expect("retry from a valid baseline");
+                fixture.adapter.sync(&cx).expect("publish retry");
+                assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().mx_frame, 1);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_shared_publication_transport_refused_header_keeps_private_horizon() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let page = sample_page(0x81);
+        fixture.adapter.append_frame(&cx, 1, &page, 1).expect("stage commit");
+        let mut changed = fixture.baseline;
+        changed.i_change = 27;
+        changed.update_checksum().unwrap();
+        publish_shared_wal_index_header(&fixture.region, &changed).unwrap();
+        let changed_bytes = fixture.region.lock().to_vec();
+        fixture.adapter.sync(&cx).expect_err("foreign header prevents native publication");
+        assert_eq!(fixture.adapter.wal.last_fsynced_frame_count(), 1);
+        assert!(fixture.adapter.has_pending_publication());
+        assert_eq!(fixture.adapter.published_snapshot.last_commit_frame, None);
+        assert_eq!(fixture.adapter.read_page(&cx, 1).expect("retain prior private horizon"), None);
+        assert_eq!(fixture.region.lock().to_vec(), changed_bytes);
+        assert_eq!(fixture.adapter.published_snapshot.last_commit_frame, None);
+        publish_shared_wal_index_header(&fixture.region, &fixture.baseline).unwrap();
+        fixture.adapter.sync(&cx).expect("retry identical retained target");
+        assert_eq!(fixture.adapter.read_page(&cx, 1).expect("published page"), Some(page));
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().i_change, 0);
+        assert!(!fixture.adapter.has_pending_publication());
+    }
+
+    #[cfg(all(feature = "native", unix, feature = "fault-injection"))]
+    #[test]
+    fn test_shared_publication_transport_absent_append_restores_prior_uncommitted_plan() {
+        use fsqlite_wal::wal_index::lookup_native_wal_index_frame;
+
+        let _fault_session = fsqlite_wal::fault_hooks::FaultInjectionSessionLock::new().lock().unwrap();
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let page = sample_page(0x89);
+        fixture.adapter.append_frame(&cx, 1, &page, 0).expect("stage prior uncommitted frame");
+        let before = fixture.region.lock().to_vec();
+        let wal_size = fixture.adapter.wal.file().file_size(&cx).unwrap();
+        vfs.fail_next_wal_write_after_prefix(0);
+        fixture.adapter.append_frame(&cx, 2, &page, 2).expect_err("no-byte append failure");
+        assert!(fixture.adapter.pending_append_attempt.is_some());
+        assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), wal_size);
+        assert_eq!(fixture.adapter.wal.frame_count(), 1);
+        assert_eq!(fixture.region.lock().to_vec(), before);
+        // The injected zero-byte outcome supplies the exact absence control.
+        // Certificate reconciliation itself is covered by the owning keepers.
+        fixture.adapter.discard_reconciled_append().expect("restore the prior publication owner");
+        assert!(fixture.adapter.pending_append_attempt.is_none());
+        assert_eq!(fixture.adapter.pending_publication_frames.len(), 1);
+        assert_eq!(fixture.adapter.native_publication.as_ref().unwrap().baseline(), fixture.baseline);
+        fixture.adapter.append_frame(&cx, 2, &page, 2).expect("retry commit after exact absence");
+        fixture.adapter.sync(&cx).expect("publish prior frame and retry");
+        let bytes = fixture.region.lock().to_vec();
+        assert_eq!(lookup_native_wal_index_frame(&bytes, 0, 1, 2).unwrap(), Some(1));
+        assert_eq!(lookup_native_wal_index_frame(&bytes, 0, 2, 2).unwrap(), Some(2));
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap().unwrap().i_change, 0);
+    }
+
+    #[cfg(all(feature = "native", unix, feature = "fault-injection"))]
+    #[test]
+    fn test_shared_publication_transport_dropped_append_reconciles_native_header_once() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+
+        let _fault_session = fsqlite_wal::fault_hooks::FaultInjectionSessionLock::new().lock().unwrap();
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let SyntheticSharedPublication { _pager: pager, adapter, region, baseline } =
+            synthetic_shared_publication(&vfs, &cx);
+        let wal = match adapter.into_inner() {
+            Ok(wal) => wal,
+            Err(retained) => panic!(
+                "fresh synthetic fixture retained state: publication={}, reader={}, recovery={}",
+                retained.has_pending_publication(),
+                retained.native_read_binding.is_some(),
+                retained.native_recovery_requested.is_some(),
+            ),
+        };
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(), Path::new("test.db"), Path::new("test.db-wal"), PAGE_SIZE, wal, true, None,
+        );
+        backend.attach_wal_index_shm_source(pager.wal_index_shm_source().unwrap()).unwrap();
+        let page = sample_page(0x91);
+        let mut certificate = sample_certificate(1, 1, vec![1]);
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .expect("persist exact authority before append");
+        let frames = [WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 }];
+        let completion = VfsWriteCompletion::new();
+        vfs.pause_after_next_wal_write();
+        {
+            let mut future = backend.append_frames_tracked(&cx, &frames, completion.clone());
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                std::future::Future::poll(future.as_mut(), &mut task_cx),
+                std::task::Poll::Pending,
+            ));
+            assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+        }
+        assert_eq!(backend.inner.wal.frame_count(), 0);
+        assert!(backend.inner.pending_append_attempt.is_some());
+        assert!(backend.inner.native_publication.is_some());
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+        let mut changed = baseline;
+        changed.i_change = 19;
+        changed.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &changed).unwrap();
+        backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+            .expect_err("native header refusal after exact content proof and fsync");
+        assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 1);
+        assert!(backend.inner.pending_append_attempt.as_ref().unwrap().authorized);
+        assert_eq!(backend.inner.published_snapshot.last_commit_frame, None);
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(changed));
+        publish_shared_wal_index_header(&region, &baseline).unwrap();
+        assert_eq!(
+            backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+                .expect("retry exact native and private publication"),
+            ParallelWalCommitReconciliation::Authorized,
+        );
+        assert!(!backend.inner.has_pending_publication());
+        assert_eq!(backend.inner.published_snapshot.commit_count, 1);
+        let published = region.lock().to_vec();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap().unwrap().i_change, 0);
+        backend.sync(&cx).expect("ordinary sync after exact reconciliation");
+        assert_eq!(region.lock().to_vec(), published);
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_read_binding_keeps_captured_prefix_and_exact_token() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+        use std::sync::atomic::Ordering;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let old_page = sample_page(0x31);
+        fixture.adapter.append_frame(&cx, 1, &old_page, 1).expect("old commit");
+        fixture.adapter.sync(&cx).expect("publish old commit");
+        let old_header = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        // Seed a usable reader mark: this heap fixture tests binding metadata,
+        // not native lock acquisition or interprocess exclusion.
+        fixture.region.atomic_store_u32_ne(96, 0, Ordering::Release).unwrap();
+        fixture.region.atomic_store_u32_ne(104, 1, Ordering::Release).unwrap();
+        let source = Arc::clone(fixture.adapter.wal_index_shm_source.as_ref().unwrap());
+        let mut lease = source.acquire_reader(&cx).expect("capture old shared prefix");
+        let mut sibling = source.acquire_reader(&cx).expect("different owner, same prefix");
+        let binding = lease.binding().unwrap();
+        let token = binding.token().clone();
+        let sibling_token = sibling.binding().unwrap().token().clone();
+        assert!(!token.matches(&sibling_token));
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(Path::new("test.db-wal")), flags).unwrap();
+        let mut peer = WalFile::open(&cx, file).expect("independent physical WAL handle");
+        let new_page = sample_page(0x72);
+        peer.append_frame(&cx, 1, &new_page, 0).expect("newer uncommitted page");
+        peer.append_frame(&cx, 2, &new_page, 2).expect("newer commit");
+        peer.sync(&cx, SyncFlags::NORMAL).unwrap();
+        let (_, terminal) = peer.last_commit_frame_header().unwrap();
+        let mut newer_header = old_header;
+        newer_header.mx_frame = 3;
+        newer_header.n_page = 2;
+        newer_header.i_change = newer_header.i_change.wrapping_add(1);
+        newer_header.a_frame_cksum = [terminal.checksum.s1, terminal.checksum.s2];
+        newer_header.update_checksum().unwrap();
+        publish_shared_wal_index_header(&fixture.region, &newer_header).unwrap();
+
+        assert_eq!(
+            fixture.adapter.begin_native_read(&cx, binding).expect("bind old native horizon"),
+            WalNativeReadOutcome::Ready,
+        );
+        assert_eq!(fixture.adapter.wal.frame_count(), 3, "physical refresh saw the newer commit");
+        let pinned = fixture.adapter.pinned_read_snapshot().unwrap();
+        assert_eq!(pinned.last_commit_frame, Some(0));
+        assert_eq!(fixture.adapter.native_read_binding().unwrap().header().n_page, 1);
+        assert_eq!(fixture.adapter.read_page_pinned(&cx, 1).expect("old pinned page"), Some(old_page));
+        assert_eq!(fixture.adapter.read_page_pinned(&cx, 2).expect("new page stays hidden"), None);
+        assert_eq!(fixture.adapter.native_recovery_required(), None);
+        fixture.adapter.preflight_native_append(&cx).expect("aligned shared prefix advances only the conflict view");
+        assert_eq!(fixture.adapter.published_snapshot().last_commit_frame, Some(2));
+        assert_eq!(fixture.adapter.pinned_read_snapshot(), Some(pinned));
+        assert!(fixture.adapter.native_read_binding().unwrap().token().matches(&token));
+        assert_eq!(fixture.adapter.read_page_pinned(&cx, 2).expect("preflight preserves old read horizon"), None);
+        assert_eq!(fixture.adapter.native_recovery_required(), None);
+        assert!(matches!(fixture.adapter.end_native_read(&sibling_token), Err(FrankenError::BusyRecovery)));
+        assert_eq!(fixture.adapter.pinned_read_snapshot(), Some(pinned));
+        assert!(fixture.adapter.native_read_binding().unwrap().token().matches(&token));
+        assert!(matches!(fixture.adapter.inner_mut(), Err(FrankenError::Busy)));
+        fixture.adapter.refresh_published_snapshot(&cx).expect_err("live pin refuses unbound refresh");
+        assert_eq!(fixture.adapter.pinned_read_snapshot(), Some(pinned));
+        fixture.adapter.end_native_read(&token).unwrap();
+        fixture.adapter.end_native_read(&token).expect("same-token retirement is idempotent");
+        assert!(fixture.adapter.pinned_read_snapshot().is_none());
+        lease.release().expect("physical release follows exact backend retirement");
+        sibling.release().expect("release sibling claim");
+        fixture.region.atomic_store_u32_ne(104, 3, Ordering::Release).unwrap();
+        let mut next = source.acquire_reader(&cx).expect("capture newer publication");
+        let next_binding = next.binding().unwrap();
+        let next_token = next_binding.token().clone();
+        fixture.adapter.begin_native_read(&cx, next_binding).expect("bind next transaction");
+        assert_eq!(fixture.adapter.pinned_read_snapshot().unwrap().last_commit_frame, Some(2));
+        assert_eq!(fixture.adapter.read_page_pinned(&cx, 1).expect("new pinned page"), Some(new_page));
+        fixture.adapter.end_native_read(&next_token).unwrap();
+        next.release().expect("release next claim");
+        peer.close(&cx).unwrap();
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_read_binding_refuses_database_only_lease_without_changing_pin() {
+        use std::sync::atomic::Ordering;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        fixture.region.atomic_store_u32_ne(96, 0, Ordering::Release).unwrap();
+        let source = Arc::clone(fixture.adapter.wal_index_shm_source.as_ref().unwrap());
+        let mut lease = source.acquire_reader(&cx).expect("database-only lease");
+        assert!(lease.boundary().unwrap().database_only);
+        let before = fixture.adapter.published_snapshot();
+        assert!(matches!(
+            fixture.adapter.begin_native_read(&cx, lease.binding().unwrap()).expect_err("slot zero cannot bind WAL bytes"),
+            FrankenError::BusyRecovery,
+        ));
+        assert_eq!(fixture.adapter.published_snapshot(), before);
+        assert!(fixture.adapter.native_read_binding().is_none());
+        assert!(fixture.adapter.pinned_read_snapshot().is_none());
+        lease.release().expect("release database-only claim");
+    }
 
     #[test]
     fn test_adapter_append_and_frame_count() {
@@ -7806,10 +10187,16 @@ mod tests {
         staged
             .append_frame(&cx, 1, &sample_page(0), 1)
             .expect("append");
-        assert!(
-            matches!(staged.into_inner(), Err(FrankenError::Busy)),
-            "an unsynced commit must prevent consuming the adapter"
-        );
+        let mut retained = match staged.into_inner() {
+            Ok(_) => panic!("unsynced extraction must return its adapter"),
+            Err(retained) => retained,
+        };
+        assert_eq!(retained.pending_publication_commit, Some(0));
+        assert_eq!(retained.pending_publication_frames.len(), 1);
+        retained.sync(&cx).expect("retry on the same returned adapter");
+        let retained_wal = (*retained).into_inner()
+            .unwrap_or_else(|_| panic!("retry drained the same adapter"));
+        assert_eq!(retained_wal.frame_count(), 1);
 
         let synced_vfs = MemoryVfs::new();
         let mut synced = make_adapter(&synced_vfs, &cx);
@@ -7820,7 +10207,8 @@ mod tests {
 
         assert_eq!(synced.inner().frame_count(), 1);
 
-        let wal = synced.into_inner().expect("sync drained the staged frames");
+        let wal = synced.into_inner()
+            .unwrap_or_else(|_| panic!("sync drained the staged frames"));
         assert_eq!(wal.frame_count(), 1);
     }
 
@@ -8084,6 +10472,197 @@ mod tests {
     }
 
     #[test]
+    fn test_publication_scan_io_failure_preserves_exact_prior_snapshot_and_retries() {
+        for pin_reader in [false, true] {
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let mut writer = make_fault_adapter(&vfs, &cx);
+            let old_page = sample_page(0x41);
+            let updated_page = sample_page(0x42);
+            let added_page = sample_page(0x43);
+            writer
+                .append_frame(&cx, 1, &old_page, 1)
+                .expect("seed commit");
+            writer.sync(&cx).expect("publish seed commit");
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("test.db-wal")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+                )
+                .expect("open peer reader WAL");
+            let mut reader =
+                WalBackendAdapter::new(WalFile::open(&cx, file).expect("open WAL"));
+            reader
+                .refresh_published_snapshot(&cx)
+                .expect("publish old prefix");
+            if pin_reader {
+                reader.begin_transaction(&cx).expect("pin old prefix");
+            }
+            let before = reader.published_snapshot();
+            let before_map = reader.published_snapshot.page_index.as_ref().clone();
+            let before_map_address = Arc::as_ptr(&reader.published_snapshot.page_index);
+            let before_next_sequence = reader.next_publication_seq;
+            assert_eq!(before.last_commit_frame, Some(0));
+            assert_eq!(before.commit_count, 1);
+            assert_eq!(before_map, HashMap::from([(1, 0)]));
+
+            writer
+                .append_frame(&cx, 1, &updated_page, 0)
+                .expect("overwrite tracked page");
+            writer
+                .append_frame(&cx, 2, &added_page, 2)
+                .expect("append peer commit");
+            writer.sync(&cx).expect("publish peer commit");
+            vfs.fail_wal_frame_header_read_after(1);
+            let error = reader
+                .refresh_published_snapshot(&cx)
+                .expect_err("second publication header read must fail");
+            assert!(matches!(&error, FrankenError::Io(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected WAL publication header read failure")
+            );
+            {
+                let faults = vfs
+                    .faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(faults.wal_header_reads_completed, 1);
+                assert_eq!(faults.wal_header_reads_before_failure, None);
+            }
+            assert_eq!(
+                reader.wal.frame_count(),
+                3,
+                "physical refresh completed before the fault"
+            );
+            assert_eq!(
+                reader.published_snapshot(),
+                before,
+                "all publication metadata must survive"
+            );
+            assert_eq!(reader.published_snapshot.page_index.as_ref(), &before_map);
+            assert_eq!(
+                Arc::as_ptr(&reader.published_snapshot.page_index),
+                before_map_address
+            );
+            assert_eq!(reader.next_publication_seq, before_next_sequence);
+            assert_eq!(reader.pinned_read_snapshot(), pin_reader.then_some(before));
+            assert_eq!(
+                reader
+                    .resolve_visible_frame(&cx, &reader.published_snapshot, 1)
+                    .expect("old lookup"),
+                WalPageLookupResolution::AuthoritativeHit { frame_index: 0 },
+                "a failed scan must not point an old horizon at a newer frame"
+            );
+
+            let retried = reader
+                .refresh_published_snapshot(&cx)
+                .expect("retry publication scan");
+            assert_eq!(retried.generation, before.generation);
+            assert_eq!(retried.publication_seq, before_next_sequence);
+            assert_eq!(retried.last_commit_frame, Some(2));
+            assert_eq!(retried.commit_count, 2);
+            assert_eq!(reader.next_publication_seq, before_next_sequence + 1);
+            assert_eq!(
+                reader.published_snapshot.page_index.as_ref(),
+                &HashMap::from([(1, 1), (2, 2)])
+            );
+            if pin_reader {
+                assert_eq!(
+                    reader.read_page(&cx, 1).expect("pinned old page"),
+                    Some(old_page)
+                );
+                assert_eq!(reader.read_page(&cx, 2).expect("pinned absence"), None);
+                reader.begin_transaction(&cx).expect("pin refreshed prefix");
+            }
+            assert_eq!(
+                reader.read_page(&cx, 1).expect("updated page after retry"),
+                Some(updated_page)
+            );
+            assert_eq!(
+                reader.read_page(&cx, 2).expect("added page after retry"),
+                Some(added_page)
+            );
+        }
+    }
+
+    #[test]
+    fn test_publication_scan_preserves_capacity_admission_updates_and_commit_count() {
+        for cap in [0, 1, 2] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let mut writer = make_adapter(&vfs, &cx);
+            writer
+                .append_frame(&cx, 1, &sample_page(0x10), 1)
+                .expect("seed commit");
+            writer.sync(&cx).expect("publish seed commit");
+            let wal = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("open peer WAL");
+            let mut reader = WalBackendAdapter::new(wal);
+            reader.set_page_index_cap(cap);
+            reader
+                .refresh_published_snapshot(&cx)
+                .expect("publish seed prefix");
+
+            // Page 2 is the first new key. Page 3 carries a commit marker even
+            // when dropped. Repeated page 2 and old page 1 must update at cap.
+            for (page_number, byte) in [(2, 0x20_u8), (3, 0x30), (2, 0x21), (1, 0x11)] {
+                writer
+                    .append_frame(&cx, page_number, &sample_page(byte), 3)
+                    .expect("append commit");
+            }
+            writer.sync(&cx).expect("publish all four new commits");
+            let refreshed = reader
+                .refresh_published_snapshot(&cx)
+                .expect("scan peer commits");
+            let mut expected_index = HashMap::new();
+            if cap >= 1 {
+                expected_index.insert(1, 4);
+            }
+            if cap >= 2 {
+                expected_index.insert(2, 3);
+            }
+            assert_eq!(reader.published_snapshot.page_index.as_ref(), &expected_index);
+            assert!(refreshed.latest_frame_entries <= cap);
+            assert_eq!(refreshed.last_commit_frame, Some(4));
+            assert_eq!(
+                refreshed.commit_count,
+                5,
+                "dropped pages still carry commit markers"
+            );
+            assert!(refreshed.index_is_partial);
+            for (page_number, byte) in [(1, 0x11_u8), (2, 0x21), (3, 0x30)] {
+                assert_eq!(
+                    reader
+                        .read_page(&cx, page_number)
+                        .expect("indexed or fallback lookup"),
+                    Some(sample_page(byte))
+                );
+            }
+
+            // A later scan touching only a tracked key must retain the partial
+            // flag established when an earlier scan dropped another page.
+            writer
+                .append_frame(&cx, 1, &sample_page(0x12), 3)
+                .expect("update old key again");
+            writer.sync(&cx).expect("publish later update");
+            let later = reader
+                .refresh_published_snapshot(&cx)
+                .expect("scan later update");
+            assert_eq!(later.commit_count, 6);
+            assert!(later.index_is_partial);
+            assert!(later.latest_frame_entries <= cap);
+            assert_eq!(
+                reader
+                    .read_page(&cx, 1)
+                    .expect("latest tracked or fallback page"),
+                Some(sample_page(0x12))
+            );
+        }
+    }
+
+    #[test]
     fn test_page_index_incremental_extend_after_durable_sync() {
         // Verify that the index extends incrementally once each commit crosses
         // the durable-sync publication barrier.
@@ -8160,6 +10739,611 @@ mod tests {
             Some(1),
             "append_frame must stage the commit horizon for a later sync"
         );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    mod postwrite_append_faults {
+        use fsqlite_vfs::VfsWriteCompletionState;
+        use fsqlite_wal::fault_hooks::{
+            self, CrashBoundary, FaultHookArm, FaultInjectionSessionLock,
+        };
+
+        use super::*;
+
+        #[derive(Clone, Copy, Debug)]
+        enum AppendPath {
+            Raw,
+            RawTracked,
+            Prepared,
+            PreparedTracked,
+        }
+
+        impl AppendPath {
+            fn append(
+                self,
+                adapter: &mut WalBackendAdapter<<MemoryVfs as Vfs>::File>,
+                cx: &Cx,
+                frames: &[WalFrameRef<'_>],
+                completion: VfsWriteCompletion,
+            ) -> Result<()> {
+                match self {
+                    Self::Raw => adapter.append_frames(cx, frames).wait(),
+                    Self::RawTracked => adapter
+                        .append_frames_tracked(cx, frames, completion)
+                        .wait(),
+                    Self::Prepared | Self::PreparedTracked => {
+                        let mut prepared = adapter
+                            .prepare_append_frames(frames)?
+                            .expect("nonempty prepared batch");
+                        if matches!(self, Self::PreparedTracked) {
+                            adapter
+                                .append_prepared_frames_tracked(cx, &mut prepared, completion)
+                                .wait()
+                        } else {
+                            adapter.append_prepared_frames(cx, &mut prepared).wait()
+                        }
+                    }
+                }
+            }
+        }
+
+        fn inject_append_boundary(
+            path: AppendPath,
+            adapter: &mut WalBackendAdapter<<MemoryVfs as Vfs>::File>,
+            cx: &Cx,
+            frames: &[WalFrameRef<'_>],
+            boundary: CrashBoundary,
+        ) {
+            let scenario = format!("postwrite-publication-owner-{path:?}-{boundary}");
+            fault_hooks::arm_crash_boundary(
+                boundary,
+                FaultHookArm::new("bd-zywqc.22", &scenario, "publication-ownership"),
+            );
+            let completion = VfsWriteCompletion::new();
+            let error = path
+                .append(adapter, cx, frames, completion.clone())
+                .expect_err("the injected append error must remain an error");
+            assert!(matches!(&error, FrankenError::Io(_)));
+            assert!(error.to_string().contains(boundary.as_str()), "{error}");
+            let records = fault_hooks::take_records();
+            assert_eq!(records.len(), 1, "the intended boundary must fire exactly once");
+            assert_eq!(records[0].point, boundary.as_str());
+            assert_eq!(records[0].scenario_id, scenario);
+            if matches!(path, AppendPath::RawTracked | AppendPath::PreparedTracked) {
+                let expected = if boundary == CrashBoundary::BeforeWalFrameAppend {
+                    VfsWriteCompletionState::Error
+                } else {
+                    VfsWriteCompletionState::Success
+                };
+                assert_eq!(completion.state(), expected);
+                // Neither preflight failure nor source success may be relabeled
+                // to turn the append API's error into an accepted commit.
+                assert!(!completion.complete_success());
+                assert!(!completion.complete_error());
+            }
+        }
+
+        fn assert_prewrite_refusal(path: AppendPath, cx: &Cx, frames: &[WalFrameRef<'_>]) {
+            let vfs = MemoryVfs::new();
+            let mut adapter = make_adapter(&vfs, cx);
+            let initial_checksum = adapter.wal.running_checksum();
+            let mut header_bytes = [0; WAL_HEADER_SIZE];
+            assert_eq!(
+                adapter.wal.file().read(cx, &mut header_bytes, 0).expect("capture WAL"),
+                WAL_HEADER_SIZE
+            );
+
+            // Causal control: the same append path refuses before its write.
+            inject_append_boundary(
+                path,
+                &mut adapter,
+                cx,
+                frames,
+                CrashBoundary::BeforeWalFrameAppend,
+            );
+            assert_eq!(adapter.wal.frame_count(), 0);
+            assert_eq!(adapter.wal.running_checksum(), initial_checksum);
+            assert_eq!(
+                adapter.wal.file().file_size(cx).unwrap(),
+                u64::try_from(WAL_HEADER_SIZE).unwrap()
+            );
+            let mut after_refusal = [0; WAL_HEADER_SIZE];
+            assert_eq!(
+                adapter.wal.file().read(cx, &mut after_refusal, 0).expect("verify no write"),
+                WAL_HEADER_SIZE
+            );
+            assert_eq!(after_refusal, header_bytes);
+            assert_publication_unchanged(&adapter, "pre-write refusal");
+            // Error alone is not a no-write proof. The control permits a
+            // conservative retained owner pending exact interval inspection.
+        }
+
+        fn assert_postwrite_owner(path: AppendPath) {
+            let _fault_session = FaultInjectionSessionLock::new().lock().unwrap();
+            let cx = test_cx();
+            let (p1, p1_new) = commit_batch_pages();
+            let tail = sample_page(0x73);
+            let frames = [
+                WalFrameRef {
+                    page_number: 1,
+                    page_data: &p1,
+                    db_size_if_commit: 0,
+                },
+                WalFrameRef {
+                    page_number: 1,
+                    page_data: &p1_new,
+                    db_size_if_commit: 2,
+                },
+                WalFrameRef {
+                    page_number: 2,
+                    page_data: &tail,
+                    db_size_if_commit: 0,
+                },
+            ];
+            assert_prewrite_refusal(path, &cx, &frames);
+            let vfs = MemoryVfs::new();
+            let mut adapter = make_adapter(&vfs, &cx);
+            let generation = adapter.wal.generation_identity();
+
+            inject_append_boundary(
+                path,
+                &mut adapter,
+                &cx,
+                &frames,
+                CrashBoundary::AfterWalFrameAppendBeforeFsync,
+            );
+            // Physical proof precedes the keeper assertions. The marker is in
+            // the middle: neither a latest-page map nor the tail checksum is
+            // enough metadata to publish this exact frame prefix and suffix.
+            assert_eq!(adapter.wal.frame_count(), 3);
+            assert_eq!(adapter.wal.last_commit_frame(&cx).unwrap(), Some(1));
+            assert_eq!(adapter.wal.last_fsynced_frame_count(), 0);
+            assert_eq!(
+                adapter.wal.file().file_size(&cx).unwrap(),
+                u64::try_from(WAL_HEADER_SIZE + frames.len() * adapter.wal.frame_size()).unwrap()
+            );
+            for (index, frame) in frames.iter().enumerate() {
+                let (header, page) = adapter
+                    .wal
+                    .read_frame(&cx, index)
+                    .expect("read physical frame");
+                assert_eq!(header.page_number, frame.page_number);
+                assert_eq!(header.db_size, frame.db_size_if_commit);
+                assert_eq!(header.salts, generation.salts);
+                assert_eq!(page.as_slice(), frame.page_data);
+            }
+            let commit = adapter.wal.read_frame_header(&cx, 1).expect("commit header");
+            assert_ne!(commit.checksum, adapter.wal.running_checksum());
+            assert_publication_unchanged(&adapter, "post-write error before reconciliation");
+
+            let retained = adapter
+                .pending_publication_frames
+                .iter()
+                .map(|frame| (frame.page_number, frame.frame_index, frame.is_commit))
+                .collect::<Vec<_>>();
+            assert!(
+                adapter.has_pending_publication(),
+                "{path:?}: frames 0..3 exist after Err without an owner; retained={retained:?}"
+            );
+            assert_eq!(retained, [(1, 0, false), (1, 1, true), (2, 2, false)]);
+            assert_eq!(adapter.pending_publication_commit, Some(1));
+            assert_eq!(adapter.pending_publication_generation, Some(generation));
+            assert!(!adapter.refresh_before_append);
+            let attempt = adapter.pending_append_attempt.as_ref().expect("retained attempt");
+            assert_eq!(attempt.generation, generation);
+            assert_eq!(attempt.start_frame_index, 0);
+            assert_eq!(attempt.end_frame_count, 3);
+            assert_eq!(attempt.completion.state(), VfsWriteCompletionState::Success);
+            assert!(!attempt.authorized);
+            assert_recovery_guards(&mut adapter, &cx, &p1);
+            assert!(matches!(adapter.inner_mut(), Err(FrankenError::Busy)));
+            assert!(matches!(
+                adapter.begin_transaction(&cx).wait(),
+                Err(FrankenError::Busy)
+            ));
+            assert_publication_unchanged(&adapter, "retained owner after guarded mutations");
+            // No sync or logical publication is authorized by this API error.
+            // The retained recovery owner must resolve the exact interval first.
+        }
+
+        fn assert_recovery_guards<F: VfsFile>(
+            adapter: &mut WalBackendAdapter<F>,
+            cx: &Cx,
+            page: &[u8],
+        ) {
+            let published = adapter.published_snapshot();
+            let frame_count = adapter.wal.frame_count();
+            let snapshot = TransactionConflictSnapshot {
+                generation: published.generation,
+                last_commit_frame: published.last_commit_frame,
+                commit_count: published.commit_count,
+                snapshot_db_size: 0,
+            };
+            assert!(matches!(adapter.sync(cx), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                adapter.publish_authorized_deferred_commit(cx),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                adapter.refresh_published_snapshot(cx).wait(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(adapter.read_page(cx, 1).wait(), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                adapter.read_page_at_appended_tail(cx, 1).wait(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                adapter.conflicting_pages_since_snapshot(cx, snapshot, &[1], &[]).wait(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                adapter.append_frame(cx, 1, page, 1).wait(),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(adapter.wal.frame_count(), frame_count, "guard precedes WAL refresh");
+            assert_eq!(adapter.published_snapshot(), published);
+        }
+
+        #[test]
+        fn malformed_raw_append_refuses_without_retaining_an_attempt() {
+            let cx = test_cx();
+            for path in [AppendPath::Raw, AppendPath::RawTracked] {
+                let vfs = MemoryVfs::new();
+                let mut adapter = make_adapter(&vfs, &cx);
+                let page = sample_page(0x70);
+                let malformed = [WalFrameRef {
+                    page_number: 1, page_data: &page[..page.len() - 1], db_size_if_commit: 1,
+                }];
+                let completion = VfsWriteCompletion::new();
+                assert_wal_corrupt(
+                    path.append(&mut adapter, &cx, &malformed, completion.clone()),
+                    "raw page length is validated before physical ownership",
+                );
+                assert!(adapter.pending_append_attempt.is_none());
+                assert!(!adapter.has_pending_publication());
+                assert_eq!(adapter.wal.frame_count(), 0);
+                assert_eq!(adapter.wal.file().file_size(&cx).unwrap(), 32);
+                if matches!(path, AppendPath::RawTracked) {
+                    assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                }
+                assert_wal_corrupt(
+                    adapter.append_frame(&cx, 1, &page[..page.len() - 1], 1).wait(),
+                    "single page length is validated before physical ownership",
+                );
+                assert!(adapter.pending_append_attempt.is_none());
+                adapter.append_frame(&cx, 1, &page, 1).expect("retry valid input");
+                adapter.sync(&cx).expect("publish valid retry");
+                assert_eq!(adapter.read_page(&cx, 1).expect("valid page"), Some(page));
+            }
+        }
+
+        #[test]
+        fn malformed_prepared_append_refuses_without_retaining_an_attempt() {
+            let cx = test_cx();
+            for malformed_case in 0..6 {
+                let vfs = MemoryVfs::new();
+                let mut adapter = make_adapter(&vfs, &cx);
+                let page = sample_page(0x71);
+                let frames = [
+                    WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 },
+                    WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 },
+                ];
+                let mut prepared = adapter.prepare_append_frames(&frames).unwrap().unwrap();
+                adapter.finalize_prepared_frames(&cx, &mut prepared).unwrap();
+                match malformed_case {
+                    0 => { prepared.frame_bytes.pop(); }
+                    1 => prepared.frame_metas[0].page_number = 2,
+                    2 => prepared.last_commit_frame_offset = None,
+                    3 => prepared.last_commit_frame_offset = Some(0),
+                    4 => prepared.frame_bytes[8] ^= 1,
+                    5 => prepared.finalized_running_checksum.as_mut().unwrap().s1 ^= 1,
+                    _ => unreachable!(),
+                }
+                let completion = VfsWriteCompletion::new();
+                assert_wal_corrupt(
+                    adapter.append_prepared_frames_tracked(&cx, &mut prepared, completion.clone()).wait(),
+                    "prepared layout/markers/salts are validated before physical ownership",
+                );
+                assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                assert!(adapter.pending_append_attempt.is_none());
+                assert!(!adapter.has_pending_publication());
+                assert_eq!(adapter.wal.frame_count(), 0);
+                assert_eq!(adapter.wal.file().file_size(&cx).unwrap(), 32);
+                assert_wal_corrupt(
+                    adapter.append_prepared_frames(&cx, &mut prepared).wait(),
+                    "untracked prepared path also refuses before ownership",
+                );
+                assert!(adapter.pending_append_attempt.is_none());
+                let mut valid = adapter.prepare_append_frames(&frames).unwrap().unwrap();
+                adapter.append_prepared_frames(&cx, &mut valid).expect("valid retry");
+                adapter.sync(&cx).expect("publish valid retry");
+                assert_eq!(adapter.read_page(&cx, 1).expect("valid page"), Some(page));
+            }
+        }
+
+        #[test]
+        fn postwrite_append_error_single_retains_publication_owner() {
+            let _fault_session = FaultInjectionSessionLock::new().lock().unwrap();
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let mut adapter = make_adapter(&vfs, &cx);
+            let page = sample_page(0x74);
+            let generation = adapter.wal.generation_identity();
+            let boundary = CrashBoundary::AfterWalFrameAppendBeforeFsync;
+            fault_hooks::arm_crash_boundary(
+                boundary,
+                FaultHookArm::new("bd-zywqc.22", "single-postwrite", "publication-ownership"),
+            );
+            let error = adapter.append_frame(&cx, 1, &page, 1).wait().unwrap_err();
+            assert!(matches!(&error, FrankenError::Io(_)));
+            assert!(error.to_string().contains(boundary.as_str()));
+            let records = fault_hooks::take_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].point, boundary.as_str());
+            assert_eq!(adapter.wal.frame_count(), 1);
+            assert_eq!(adapter.wal.last_fsynced_frame_count(), 0);
+            let (header, written_page) = adapter.wal.read_frame(&cx, 0).expect("physical frame");
+            assert_eq!(written_page, page);
+            assert_eq!(header.db_size, 1);
+            let attempt = adapter.pending_append_attempt.as_ref().expect("single owner");
+            assert_eq!(attempt.generation, generation);
+            assert_eq!((attempt.start_frame_index, attempt.end_frame_count), (0, 1));
+            assert_eq!(attempt.completion.state(), VfsWriteCompletionState::Success);
+            assert_eq!(adapter.pending_publication_commit, Some(0));
+            assert_eq!(adapter.pending_publication_generation, Some(generation));
+            assert_eq!(adapter.pending_publication_frames.len(), 1);
+            assert_recovery_guards(&mut adapter, &cx, &page);
+            assert_publication_unchanged(&adapter, "single post-write error");
+        }
+
+        fn drop_after_source_success(
+            backend: &mut PathRefreshingWalBackend<CheckpointHandoffFaultVfs>,
+            vfs: &CheckpointHandoffFaultVfs,
+            cx: &Cx,
+            page: &[u8],
+        ) -> VfsWriteCompletion {
+            let completion = VfsWriteCompletion::new();
+            let frames = [WalFrameRef { page_number: 1, page_data: page, db_size_if_commit: 1 }];
+            vfs.pause_after_next_wal_write();
+            {
+                let mut append = backend.append_frames_tracked(cx, &frames, completion.clone());
+                let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(matches!(
+                    std::future::Future::poll(append.as_mut(), &mut task_cx),
+                    std::task::Poll::Pending
+                ));
+                assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+            }
+            assert_eq!(backend.inner.wal.frame_count(), 0, "caller never observed write success");
+            assert_eq!(
+                backend.inner.wal.file().file_size(cx).unwrap(),
+                u64::try_from(WAL_HEADER_SIZE + backend.inner.wal.frame_size()).unwrap()
+            );
+            let attempt = backend.inner.pending_append_attempt.as_ref().expect("drop owner");
+            assert_eq!(attempt.completion.state(), VfsWriteCompletionState::Success);
+            assert_eq!((attempt.start_frame_index, attempt.end_frame_count), (0, 1));
+            assert_eq!(backend.inner.pending_publication_commit, Some(0));
+            assert_eq!(backend.inner.pending_publication_frames.len(), 1);
+            assert_recovery_guards(&mut backend.inner, cx, page);
+            completion
+        }
+
+        #[test]
+        fn dropped_append_after_source_success_reconciles_once_after_failed_sync() {
+            let _fault_session = FaultInjectionSessionLock::new().lock().unwrap();
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let wal = make_fault_adapter(&vfs, &cx).wal;
+            let mut backend = PathRefreshingWalBackend::new(
+                vfs.clone(), Path::new("test.db"), Path::new("test.db-wal"), PAGE_SIZE, wal, true,
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                None,
+            );
+            let page = sample_page(0x75);
+            let mut certificate = sample_certificate(1, 1, vec![1]);
+            certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+            certificate.certificate_crc32c = certificate.computed_crc32c();
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+                .expect("persist exact certificate before append");
+            let sidecar = read_certificate_sidecar(&vfs.inner, &cx);
+            let completion = drop_after_source_success(&mut backend, &vfs, &cx, &page);
+            let retained = match backend.inner.into_inner() {
+                Ok(_) => panic!("extraction must return the retained append owner"),
+                Err(retained) => retained,
+            };
+            assert_eq!(retained.pending_publication_commit, Some(0));
+            assert_eq!(retained.pending_publication_frames.len(), 1);
+            assert_eq!(retained.pending_append_attempt.as_ref().unwrap().completion.state(),
+                VfsWriteCompletionState::Success);
+            backend.inner = *retained;
+            let published = backend.inner.published_snapshot();
+            assert_wal_corrupt(
+                backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 2, true).wait(),
+                "wrong interval must not refresh or repair retained append",
+            );
+            assert_eq!(backend.inner.wal.frame_count(), 0);
+            assert_eq!(read_certificate_sidecar(&vfs.inner, &cx), sidecar);
+            vfs.fail_next_wal_sync();
+            let error = backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+                .wait().unwrap_err();
+            assert!(error.to_string().contains("injected WAL sync failure"));
+            let attempt = backend.inner.pending_append_attempt.as_ref().expect("retry owner");
+            assert!(attempt.authorized, "content and certificate proof precedes failed fsync");
+            assert_eq!(attempt.completion.state(), VfsWriteCompletionState::Success);
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(backend.inner.published_snapshot(), published);
+            assert_eq!(backend.inner.pending_publication_commit, Some(0));
+            assert_eq!(read_certificate_sidecar(&vfs.inner, &cx), sidecar);
+            assert_recovery_guards(&mut backend.inner, &cx, &page);
+            assert_eq!(
+                backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+                    .wait().expect("retry exact authorization and publication"),
+                ParallelWalCommitReconciliation::Authorized
+            );
+            assert!(backend.inner.pending_append_attempt.is_none());
+            assert!(!backend.inner.has_pending_publication());
+            let accepted = backend.inner.published_snapshot();
+            assert_eq!(accepted.last_commit_frame, Some(0));
+            assert_eq!(accepted.commit_count, 1);
+            assert_eq!(accepted.latest_frame_entries, 1);
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 1);
+            assert_eq!(backend.read_page(&cx, 1).expect("published page"), Some(page));
+            backend.sync(&cx).expect("ordinary sync after reconciliation");
+            assert_eq!(backend.inner.published_snapshot(), accepted, "publish only once");
+            assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+            assert!(!completion.complete_error(), "drop cannot rewrite source success");
+        }
+
+        #[test]
+        fn absent_append_restores_only_its_suffix_and_prior_pending_commit() {
+            let _fault_session = FaultInjectionSessionLock::new().lock().unwrap();
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let mut backend = make_path_refreshing_backend(&vfs, &cx);
+            let prior_page = sample_page(0x76);
+            backend.append_frame(&cx, 1, &prior_page, 1).expect("prior accepted append");
+            let prior_generation = backend.inner.pending_publication_generation;
+            let prior_refresh = backend.inner.refresh_before_append;
+            let prior_snapshot = backend.inner.published_snapshot();
+            assert_eq!(backend.inner.pending_publication_commit, Some(0));
+            assert_eq!(backend.inner.pending_publication_frames.len(), 1);
+            let page = sample_page(0x77);
+            let mut certificate = sample_certificate(2, 2, vec![1]);
+            certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+            certificate.certificate_crc32c = certificate.computed_crc32c();
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2, true)
+                .expect("persist certificate for next interval");
+            let boundary = CrashBoundary::BeforeWalFrameAppend;
+            fault_hooks::arm_crash_boundary(
+                boundary,
+                FaultHookArm::new("bd-zywqc.22", "absent-own-suffix", "publication-ownership"),
+            );
+            let error = backend.append_frame(&cx, 1, &page, 1).wait().unwrap_err();
+            assert!(error.to_string().contains(boundary.as_str()));
+            let records = fault_hooks::take_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].point, boundary.as_str());
+            let attempt = backend.inner.pending_append_attempt.as_ref().expect("absence owner");
+            assert_eq!(attempt.completion.state(), VfsWriteCompletionState::Error);
+            assert_eq!((attempt.start_frame_index, attempt.end_frame_count), (1, 2));
+            assert_eq!(backend.inner.pending_publication_commit, Some(1));
+            assert_eq!(backend.inner.pending_publication_frames.len(), 2);
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(
+                backend.reconcile_parallel_wal_commit(&cx, &certificate, 2, 2, true)
+                    .wait().expect("prove exact absence and repair own suffix"),
+                ParallelWalCommitReconciliation::NotCommitted
+            );
+            assert!(backend.inner.pending_append_attempt.is_none());
+            assert_eq!(backend.inner.pending_publication_commit, Some(0));
+            assert_eq!(backend.inner.pending_publication_generation, prior_generation);
+            assert_eq!(backend.inner.refresh_before_append, prior_refresh);
+            let pending = &backend.inner.pending_publication_frames;
+            assert_eq!(pending.len(), 1);
+            assert_eq!((pending[0].page_number, pending[0].frame_index, pending[0].is_commit), (1, 0, true));
+            assert_eq!(backend.inner.published_snapshot(), prior_snapshot);
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 1);
+            assert!(read_certificate_sidecar(&vfs, &cx).is_empty());
+            backend.sync(&cx).expect("prior successful append remains publishable");
+            assert_eq!(backend.read_page(&cx, 1).expect("prior page"), Some(prior_page));
+            assert_eq!(backend.inner.published_snapshot().commit_count, 1);
+        }
+
+        #[test]
+        fn partial_append_reconciliation_preserves_prior_uncommitted_suffix() {
+            let _fault_session = FaultInjectionSessionLock::new().lock().unwrap();
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let wal = make_fault_adapter(&vfs, &cx).wal;
+            let mut backend = PathRefreshingWalBackend::new(
+                vfs.clone(), Path::new("test.db"), Path::new("test.db-wal"), PAGE_SIZE, wal, true,
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                None,
+            );
+            let prior = sample_page(0x78);
+            backend.append_frame(&cx, 1, &prior, 0).expect("prior accepted noncommit");
+            let prior_checksum = backend.inner.wal.running_checksum();
+            let prior_generation = backend.inner.pending_publication_generation;
+            let candidate = sample_page(0x79);
+            let frames = [
+                WalFrameRef { page_number: 2, page_data: &candidate, db_size_if_commit: 0 },
+                WalFrameRef { page_number: 3, page_data: &candidate, db_size_if_commit: 3 },
+            ];
+            let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+            digest.update(PageNumber::new(2).unwrap(), 0, &candidate);
+            digest.update(PageNumber::new(3).unwrap(), 3, &candidate);
+            let mut certificate = sample_certificate(1, 1, vec![2]);
+            certificate.wal_frame_payload_digest = digest.finalize();
+            certificate.db_size_pages = 3;
+            certificate.page_set_size = 2;
+            certificate.certificate_crc32c = certificate.computed_crc32c();
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 3, true)
+                .expect("persist exact candidate certificate");
+            let frame_size = backend.inner.wal.frame_size();
+            vfs.fail_next_wal_write_after_prefix(frame_size);
+            let completion = VfsWriteCompletion::new();
+            let error = backend.append_frames_tracked(&cx, &frames, completion.clone())
+                .wait().unwrap_err();
+            assert!(error.to_string().contains("injected partial WAL write"));
+            assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(),
+                u64::try_from(WAL_HEADER_SIZE + 2 * frame_size).unwrap());
+            assert_eq!(backend.inner.pending_publication_frames.len(), 3);
+            assert_eq!(backend.inner.pending_publication_commit, Some(2));
+            vfs.fail_next_wal_sync();
+            let error = backend.reconcile_parallel_wal_commit(&cx, &certificate, 2, 3, true)
+                .wait().unwrap_err();
+            assert!(error.to_string().contains("injected WAL sync failure"));
+            assert!(backend.inner.pending_append_attempt.is_some());
+            assert_eq!(backend.inner.pending_publication_frames.len(), 3);
+            assert_recovery_guards(&mut backend.inner, &cx, &prior);
+            assert_eq!(
+                backend.reconcile_parallel_wal_commit(&cx, &certificate, 2, 3, true)
+                    .wait().expect("retry exact absence after tail repair and failed sync"),
+                ParallelWalCommitReconciliation::NotCommitted
+            );
+            assert!(backend.inner.pending_append_attempt.is_none());
+            assert_eq!(backend.inner.wal.frame_count(), 1);
+            assert_eq!(backend.inner.wal.running_checksum(), prior_checksum);
+            assert_eq!(backend.inner.pending_publication_generation, prior_generation);
+            assert_eq!(backend.inner.pending_publication_commit, None);
+            assert_eq!(backend.inner.pending_publication_frames.len(), 1);
+            assert!(!backend.inner.refresh_before_append);
+            assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(),
+                u64::try_from(WAL_HEADER_SIZE + frame_size).unwrap());
+            assert_eq!(backend.inner.wal.read_frame(&cx, 0).expect("prior bytes").1, prior);
+            let retry = sample_page(0x7A);
+            backend.append_frame(&cx, 2, &retry, 2).expect("complete prior transaction");
+            backend.sync(&cx).expect("publish retained prefix and successful retry");
+            assert_eq!(backend.read_page(&cx, 1).expect("prior published page"), Some(prior));
+            assert_eq!(backend.read_page(&cx, 2).expect("retry published page"), Some(retry));
+            assert_eq!(backend.read_page(&cx, 3).expect("aborted marker absent"), None);
+            assert_eq!(backend.inner.published_snapshot().commit_count, 1);
+        }
+
+        #[test]
+        fn postwrite_append_error_raw_retains_publication_owner() {
+            assert_postwrite_owner(AppendPath::Raw);
+        }
+
+        #[test]
+        fn postwrite_append_error_raw_tracked_retains_publication_owner() {
+            assert_postwrite_owner(AppendPath::RawTracked);
+        }
+
+        #[test]
+        fn postwrite_append_error_prepared_retains_publication_owner() {
+            assert_postwrite_owner(AppendPath::Prepared);
+        }
+
+        #[test]
+        fn postwrite_append_error_prepared_tracked_retains_publication_owner() {
+            assert_postwrite_owner(AppendPath::PreparedTracked);
+        }
     }
 
     #[test]
@@ -8723,6 +11907,113 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_prefix_sync_preserves_raw_and_prepared_uncommitted_suffix() {
+        for prepared in [false, true] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let mut adapter = make_adapter(&vfs, &cx);
+            let pages = [sample_page(1), sample_page(2), sample_page(3)];
+            let frames = [
+                WalFrameRef {
+                    page_number: 1,
+                    page_data: &pages[0],
+                    db_size_if_commit: 0,
+                },
+                WalFrameRef {
+                    page_number: 2,
+                    page_data: &pages[1],
+                    db_size_if_commit: 2,
+                },
+                WalFrameRef {
+                    page_number: 3,
+                    page_data: &pages[2],
+                    db_size_if_commit: 0,
+                },
+            ];
+            if prepared {
+                let mut batch = adapter
+                    .prepare_append_frames(&frames)
+                    .expect("prepare append")
+                    .expect("prepared batch");
+                adapter
+                    .append_prepared_frames(&cx, &mut batch)
+                    .expect("append prepared prefix and suffix");
+            } else {
+                adapter.append_frames(&cx, &frames).expect("append raw prefix and suffix");
+            }
+            let committed = adapter.wal.read_frame_header(&cx, 1).expect("commit header");
+            assert_eq!(adapter.wal.last_commit_frame_header(), Some((1, committed)));
+            assert_ne!(committed.checksum, adapter.wal.running_checksum());
+
+            adapter.sync(&cx).expect("publish committed prefix");
+            assert_eq!(adapter.published_snapshot.last_commit_frame, Some(1));
+            assert_eq!(adapter.published_snapshot.commit_count, 1);
+            assert_eq!(adapter.pending_publication_commit, None);
+            assert_eq!(adapter.pending_publication_frames.len(), 1);
+            assert_eq!(adapter.pending_publication_frames[0].frame_index, 2);
+            assert_eq!(
+                adapter.pending_publication_generation,
+                Some(adapter.wal.generation_identity())
+            );
+            assert!(!adapter.refresh_before_append);
+            assert!(adapter.has_pending_publication());
+            assert!(matches!(adapter.inner_mut(), Err(FrankenError::Busy)));
+            assert_eq!(adapter.read_page(&cx, 3).expect("hide suffix"), None);
+
+            adapter.sync(&cx).expect("intermediate suffix sync");
+            assert_eq!(adapter.pending_publication_frames.len(), 1);
+            assert_eq!(adapter.wal.last_commit_frame_header(), Some((1, committed)));
+            adapter.append_frame(&cx, 4, &sample_page(4), 4).expect("commit suffix");
+            adapter.sync(&cx).expect("publish suffix");
+            assert_eq!(adapter.published_snapshot.last_commit_frame, Some(3));
+            assert_eq!(adapter.published_snapshot.commit_count, 2);
+            assert_eq!(adapter.published_snapshot.page_index.get(&3), Some(&2));
+            assert_eq!(adapter.read_page(&cx, 3).expect("read suffix"), Some(pages[2].clone()));
+            assert!(!adapter.has_pending_publication());
+            assert_eq!(adapter.pending_publication_generation, None);
+            assert!(adapter.refresh_before_append);
+        }
+    }
+
+    #[test]
+    fn test_deferred_commit_prefix_preserves_uncommitted_suffix() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+        let pages = [sample_page(1), sample_page(2)];
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &pages[0],
+                db_size_if_commit: 1,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &pages[1],
+                db_size_if_commit: 0,
+            },
+        ];
+        adapter.append_frames(&cx, &frames).expect("append prefix and suffix");
+        adapter.publish_authorized_deferred_commit(&cx).expect("authorize prefix");
+        assert_eq!(adapter.wal.last_fsynced_frame_count(), 0);
+        assert_eq!(adapter.published_snapshot.last_commit_frame, Some(0));
+        assert_eq!(adapter.pending_publication_frames.len(), 1);
+        assert_eq!(adapter.pending_publication_frames[0].frame_index, 1);
+        assert_eq!(
+            adapter.pending_publication_generation,
+            Some(adapter.wal.generation_identity())
+        );
+        assert!(!adapter.refresh_before_append);
+        adapter.append_frame(&cx, 3, &sample_page(3), 3).expect("commit suffix");
+        adapter.publish_authorized_deferred_commit(&cx).expect("authorize suffix");
+        assert_eq!(adapter.wal.last_fsynced_frame_count(), 0);
+        assert_eq!(adapter.published_snapshot.page_index.get(&2), Some(&1));
+        assert_eq!(adapter.read_page(&cx, 2).expect("read suffix"), Some(pages[1].clone()));
+        assert!(!adapter.has_pending_publication());
+        assert_eq!(adapter.pending_publication_generation, None);
+    }
+
+    #[test]
     fn test_inner_mut_fails_closed_while_batch_is_staged() {
         let cx = test_cx();
         let vfs = CheckpointHandoffFaultVfs::new();
@@ -8790,6 +12081,45 @@ mod tests {
     }
 
     #[test]
+    fn test_unpinned_refresh_preserves_published_prefix_with_new_staged_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+        let old_page = sample_page(0x51);
+        let new_page = sample_page(0xA2);
+        adapter.append_frame(&cx, 1, &old_page, 1).expect("append old commit");
+        adapter.sync(&cx).expect("publish old commit");
+        let published = adapter.published_snapshot();
+        assert_eq!(published.last_commit_frame, Some(0));
+        assert_eq!(published.commit_count, 1);
+
+        adapter.append_frame(&cx, 2, &new_page, 2).expect("stage new commit");
+        let staged_generation = adapter.pending_publication_generation;
+        assert_eq!(adapter.pending_publication_frames.len(), 1);
+        assert_eq!(adapter.pending_publication_commit, Some(1));
+        assert_eq!(adapter.wal.last_fsynced_frame_count(), 1);
+
+        for _ in 0..2 {
+            let refreshed = adapter.refresh_published_snapshot(&cx).expect("refresh");
+            assert_eq!(refreshed, published, "refresh must preserve the published prefix");
+            assert_eq!(adapter.read_page(&cx, 1).expect("old page"), Some(old_page.clone()));
+            assert_eq!(adapter.read_page(&cx, 2).expect("staged page"), None);
+            assert_eq!(adapter.pending_publication_commit, Some(1));
+            assert_eq!(adapter.pending_publication_generation, staged_generation);
+            assert_eq!(adapter.pending_publication_frames.len(), 1);
+            assert_eq!(adapter.pending_publication_frames[0].frame_index, 1);
+            assert!(adapter.has_pending_publication());
+        }
+
+        adapter.sync(&cx).expect("publish staged commit");
+        assert!(!adapter.has_pending_publication());
+        assert_eq!(adapter.published_snapshot().last_commit_frame, Some(1));
+        assert_eq!(adapter.published_snapshot().commit_count, 2);
+        assert_eq!(adapter.read_page(&cx, 1).expect("retained old page"), Some(old_page));
+        assert_eq!(adapter.read_page(&cx, 2).expect("published new page"), Some(new_page));
+    }
+
+    #[test]
     fn test_authorized_deferred_commit_publishes_without_claiming_fsync() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
@@ -8822,6 +12152,20 @@ mod tests {
             fsynced_before,
             "deferred authorization must not claim or force an fsync"
         );
+        let published = adapter.published_snapshot();
+        let next_page = sample_page(0xC3);
+        adapter.append_frame(&cx, 3, &next_page, 3).expect("stage after deferred commit");
+        assert_eq!(
+            adapter.refresh_published_snapshot(&cx).expect("refresh deferred prefix"),
+            published,
+            "a prior deferred publication retains authority without an fsync"
+        );
+        assert_eq!(adapter.read_page(&cx, 1).expect("deferred old page"), Some(p1));
+        assert_eq!(adapter.read_page(&cx, 3).expect("new staged page"), None);
+        assert!(adapter.has_pending_publication());
+        adapter.publish_authorized_deferred_commit(&cx).expect("authorize next commit");
+        assert_eq!(adapter.wal.last_fsynced_frame_count(), fsynced_before);
+        assert_eq!(adapter.read_page(&cx, 3).expect("next published page"), Some(next_page));
         adapter
             .begin_transaction(&cx)
             .expect("the next transaction must not see a stale Busy");
@@ -9495,6 +12839,503 @@ mod tests {
             .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[99], &[])
             .expect("unrelated page should stay conflict-free");
         assert!(unrelated.is_empty());
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn checkpoint_reset_fixture(vfs: &CheckpointHandoffFaultVfs, cx: &Cx) -> SyntheticSharedPublication {
+        let mut fixture = synthetic_shared_publication(vfs, cx);
+        fixture.adapter.append_frame(cx, 1, &sample_page(0x5A), 1).expect("fixture commit");
+        fixture.adapter.sync(cx).expect("publish fixture commit");
+        for offset in [96, 128] {
+            fixture.region.atomic_store_u32_ne(offset, 0, std::sync::atomic::Ordering::Release).unwrap();
+        }
+        fixture
+    }
+
+    /// Synthetic state-validation control; the public peer-transition keeper
+    /// separately proves durable rollback publication and real native fences.
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_zero_wal_retirement_requires_rollback_header_and_no_recovery_owner() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let SyntheticSharedPublication {
+            _pager: pager,
+            adapter,
+            region,
+            ..
+        } = checkpoint_reset_fixture(&vfs, &cx);
+        let wal = match adapter.into_inner() {
+            Ok(wal) => wal,
+            Err(retained) => panic!(
+                "published fixture retained state: publication={}, reader={}, recovery={}",
+                retained.has_pending_publication(),
+                retained.native_read_binding.is_some(),
+                retained.native_recovery_requested.is_some(),
+            ),
+        };
+        // SimplePager opens the normalized key; MemoryVfs::open itself
+        // preserves the supplied path rather than normalizing it again.
+        let db_path = pager.db_path();
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            db_path,
+            "test.db-wal",
+            PAGE_SIZE,
+            wal,
+            true,
+            None,
+        );
+        backend
+            .attach_wal_index_shm_source(pager.wal_index_shm_source().unwrap())
+            .unwrap();
+        let (mut main, _) = vfs
+            .open(
+                &cx,
+                Some(db_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        assert_eq!(
+            main.file_identity().unwrap(),
+            pager.file_identity(&cx).wait().unwrap(),
+            "the main header belongs to the fixture pager"
+        );
+        let header = fsqlite_types::DatabaseHeader {
+            read_version: 2,
+            write_version: 2,
+            page_count: 1,
+            ..fsqlite_types::DatabaseHeader::default()
+        };
+        let mut main_image = sample_page(0xA5);
+        main_image[..fsqlite_types::DATABASE_HEADER_SIZE]
+            .copy_from_slice(&header.to_bytes().unwrap());
+        main.write(&cx, &main_image, 0)
+            .expect("seed explicit WAL-mode main header");
+        main.sync(&cx, SyncFlags::FULL).unwrap();
+        let wal_identity = backend.inner.wal.file().file_identity().unwrap();
+        assert!(wal_identity.is_some());
+        assert_eq!(backend.inner.wal.frame_count(), 1);
+        // Deliberate external truncation keeps the same MemoryFile identity
+        // and stale private frame count. It does not prove a peer checkpoint.
+        backend.inner.wal.file_mut().truncate(&cx, 0).unwrap();
+        let shared_before = region.lock().to_vec();
+        let published_before = backend.inner.published_snapshot();
+        assert!(!backend.inner.has_pending_publication());
+        assert!(
+            matches!(
+                backend.begin_transaction(&cx).wait(),
+                Err(FrankenError::BusyRecovery)
+            ),
+            "ordinary native admission must not recreate the retired WAL"
+        );
+
+        for refusal in ["wal_header", "recovery_owner"] {
+            if refusal == "recovery_owner" {
+                main_image[18..20].copy_from_slice(&[1, 1]);
+                main.write(&cx, &main_image, 0)
+                    .expect("publish controlled rollback header");
+                main.sync(&cx, SyncFlags::FULL).unwrap();
+                // Explicit retained-request intervention exercises the guard;
+                // canonical recovery itself is covered by separate keepers.
+                backend.inner.native_recovery_requested =
+                    Some(fsqlite_pager::traits::WalNativeRecoveryReason::WalGenerationMismatch);
+            }
+            for retire in [false, true] {
+                let result = if retire {
+                    backend.retire_empty_wal(&cx).wait()
+                } else {
+                    backend.validate_empty_wal_for_retirement(&cx).wait()
+                };
+                assert!(
+                    matches!(result, Err(FrankenError::BusyRecovery)),
+                    "{refusal}: zero length cannot bypass retirement proof"
+                );
+                let mut observed = vec![0; main_image.len()];
+                assert_eq!(
+                    main.read(&cx, &mut observed, 0).expect("read retained main"),
+                    main_image.len()
+                );
+                assert_eq!(observed, main_image);
+                assert_eq!(region.lock().to_vec(), shared_before);
+                assert_eq!(backend.inner.published_snapshot(), published_before);
+                assert_eq!(backend.inner.wal.frame_count(), 1);
+                assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(), 0);
+                assert_eq!(
+                    backend.inner.wal.file().file_identity().unwrap(),
+                    wal_identity
+                );
+                assert_eq!(
+                    backend.inner.native_recovery_requested.is_some(),
+                    refusal == "recovery_owner"
+                );
+                assert!(!backend.inner.has_pending_publication());
+            }
+        }
+
+        // Clear only the deliberately injected request. Retirement still
+        // requires the exact path inode and persisted rollback header.
+        backend.inner.native_recovery_requested = None;
+        assert!(
+            matches!(
+                backend.begin_transaction(&cx).wait(),
+                Err(FrankenError::BusyRecovery)
+            ),
+            "rollback proof authorizes retirement only, never ordinary native reads"
+        );
+        backend
+            .validate_empty_wal_for_retirement(&cx)
+            .expect("same-inode zero WAL with rollback header");
+        backend
+            .retire_empty_wal(&cx)
+            .expect("finish proven zero retirement despite stale cached frames");
+        assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(), 0);
+        assert_eq!(backend.inner.wal.file().file_identity().unwrap(), wal_identity);
+        assert_eq!(region.lock().to_vec(), shared_before);
+        let mut observed = vec![0; main_image.len()];
+        assert_eq!(
+            main.read(&cx, &mut observed, 0).expect("read retired main"),
+            main_image.len()
+        );
+        assert_eq!(observed, main_image);
+        assert!(!backend.inner.has_pending_publication());
+        assert!(backend.inner.native_recovery_requested.is_none());
+        assert_eq!(
+            backend
+                .cached_verification_db
+                .as_ref()
+                .unwrap()
+                .file_identity()
+                .unwrap(),
+            main.file_identity().unwrap(),
+            "validation retains the exact main descriptor"
+        );
+        main.close(&cx).unwrap();
+    }
+
+    /// Synthetic transport + real MemoryFile write-source controls. The pager
+    /// native test below supplies the separate actual OS-gate/DB durability path.
+    #[cfg(all(feature = "fault-injection", feature = "native", unix))]
+    #[test]
+    fn test_checkpoint_reset_retains_exact_target_through_partial_sync_and_dropped_source() {
+        use std::task::{Context, Poll, Waker};
+
+        let cx = test_cx();
+        for native in [false, true] {
+            for fault in ["partial", "sync", "drop_after_write", "source_pending"] {
+                let vfs = CheckpointHandoffFaultVfs::new();
+                let mut fixture = checkpoint_reset_fixture(&vfs, &cx);
+                if !native { fixture.adapter.wal_index_shm_source = None; }
+                fixture.adapter.begin_transaction(&cx).expect("maintenance snapshot before checkpoint");
+                let before = fixture.adapter.published_snapshot();
+                match fault {
+                    "partial" => vfs.fail_next_wal_write_after_prefix(15),
+                    "sync" => vfs.fail_next_reset_sync(),
+                    "drop_after_write" => vfs.pause_after_next_wal_write(),
+                    _ => vfs.pend_next_reset_write(),
+                }
+                let mut writer = MockCheckpointPageWriter;
+                if matches!(fault, "drop_after_write" | "source_pending") {
+                    let mut future = fixture.adapter.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None);
+                    assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+                    drop(future);
+                } else {
+                    fixture.adapter.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+                        .expect_err("injected physical reset failure");
+                }
+                assert!(fixture.adapter.checkpoint_recovery_pending());
+                let reset = fixture.adapter.pending_checkpoint_reset.as_ref().unwrap();
+                let expected = reset.target_header;
+                let completion = reset.completion.clone();
+                assert!(!reset.physical_complete && !reset.shared_complete);
+                let state = match fault {
+                    "partial" => VfsWriteCompletionState::Error,
+                    "source_pending" => VfsWriteCompletionState::Pending,
+                    _ => VfsWriteCompletionState::Success,
+                };
+                assert_eq!(completion.state(), state);
+                assert_eq!(fixture.adapter.published_snapshot(), before, "no private reset publication before physical/shared completion");
+                fixture.adapter.read_page(&cx, 1).expect_err("retained reset excludes mutable reads");
+                fixture.adapter.read_page_pinned(&cx, 1).expect_err("retained reset excludes old pinned reads");
+                fixture.adapter.begin_transaction(&cx).expect_err("retained reset excludes admission");
+                fixture.adapter.append_frame(&cx, 1, &sample_page(0x6B), 1).expect_err("retained reset excludes append");
+                fixture.adapter.sync(&cx).expect_err("ordinary sync cannot consume reset ownership");
+                assert!(fixture.adapter.inner_mut().is_err());
+                fixture.adapter.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+                    .expect_err("new checkpoint cannot replace fixed reset salts");
+                if fault == "source_pending" {
+                    let headers = vfs.faults.lock().unwrap().reset_headers.len();
+                    let mut retry = fixture.adapter.reconcile_checkpoint_reset(&cx);
+                    assert!(matches!(retry.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+                    drop(retry);
+                    assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+                    assert_eq!(vfs.faults.lock().unwrap().reset_headers.len(), headers, "no second write while old source can execute");
+                    vfs.complete_pending_reset_write(&cx).expect("actual source finishes after caller and waiter drop");
+                    assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+                }
+                fixture.adapter.reconcile_checkpoint_reset(&cx).expect("retry exactly the retained reset target");
+                assert!(!fixture.adapter.checkpoint_recovery_pending());
+                assert!(!fixture.adapter.has_pending_publication());
+                assert_eq!(*fixture.adapter.wal.header(), expected);
+                assert_eq!(fixture.adapter.wal.frame_count(), 0);
+                assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), u64::try_from(WAL_HEADER_SIZE).unwrap());
+                assert_eq!(fixture.adapter.published_snapshot().generation, fixture.adapter.wal.generation_identity());
+                assert_eq!(fixture.adapter.published_snapshot().last_commit_frame, None);
+                assert!(fixture.adapter.pinned_read_snapshot().is_none());
+                if native {
+                    let shared = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+                    assert_eq!((shared.mx_frame, shared.n_page, shared.a_frame_cksum), (0, 0, [0, 0]));
+                    assert_eq!(shared.a_salt, [expected.salts.salt1, expected.salts.salt2]);
+                    assert_eq!(read_shared_wal_index_backfill(&fixture.region, &shared).unwrap(), 0);
+                }
+                let headers = vfs.faults.lock().unwrap().reset_headers.clone();
+                assert_eq!(headers.len(), 2);
+                let expected_bytes = expected.to_bytes().unwrap();
+                assert!(headers.iter().all(|bytes| bytes.as_slice() == expected_bytes.as_slice()));
+                fixture.adapter.reconcile_checkpoint_reset(&cx).expect("terminal reset retry is idempotent");
+                assert_eq!(vfs.faults.lock().unwrap().reset_headers, headers);
+                fixture.adapter.append_frame(&cx, 1, &sample_page(0x6C), 1).expect("new generation remains writable");
+                fixture.adapter.sync(&cx).expect("publish new generation commit");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "fault-injection", feature = "native", unix))]
+    #[test]
+    fn test_checkpoint_reset_shared_refusal_retries_publication_without_rewriting_durable_header() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = checkpoint_reset_fixture(&vfs, &cx);
+        let baseline = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        let mut foreign = baseline;
+        foreign.i_change = foreign.i_change.wrapping_add(1);
+        foreign.update_checksum().unwrap();
+        // Controlled competing-header intervention at the completed physical
+        // sync boundary, not a claim of spontaneous OS shared-memory failure.
+        vfs.faults.lock().unwrap().reset_shared_header_after_sync = Some((fixture.region.share(), foreign));
+        let mut writer = MockCheckpointPageWriter;
+        fixture.adapter.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+            .expect_err("shared publication refuses changed baseline after WAL durability");
+        let reset = fixture.adapter.pending_checkpoint_reset.as_ref().unwrap();
+        assert!(reset.physical_complete && !reset.shared_complete);
+        let target = reset.target_header;
+        assert_eq!(*fixture.adapter.wal.header(), target);
+        assert_eq!(read_shared_wal_index_header(&fixture.region).unwrap(), Some(foreign));
+        assert_eq!(vfs.faults.lock().unwrap().reset_headers.len(), 1);
+        fixture.adapter.reconcile_checkpoint_reset(&cx).expect_err("foreign header remains a refusal");
+        assert!(fixture.adapter.checkpoint_recovery_pending());
+        assert_eq!(vfs.faults.lock().unwrap().reset_headers.len(), 1);
+        publish_shared_wal_index_header(&fixture.region, &baseline).unwrap();
+        fixture.adapter.reconcile_checkpoint_reset(&cx).expect("complete the same retained shared publication");
+        assert!(!fixture.adapter.checkpoint_recovery_pending());
+        assert_eq!(vfs.faults.lock().unwrap().reset_headers.len(), 1, "durable physical reset is never repeated for shared-only retry");
+        assert_eq!(*fixture.adapter.wal.header(), target);
+        let shared = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        assert_eq!(shared.mx_frame, 0);
+        assert_eq!(shared.i_change, baseline.i_change, "reset is not a commit marker");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_checkpoint_refuses_unpublished_generation_and_terminal_horizons_before_backfill() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+
+        let cx = test_cx();
+        for kind in ["orphan", "generation", "terminal", "map_error"] {
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let mut fixture = checkpoint_reset_fixture(&vfs, &cx);
+            if kind == "orphan" {
+                fixture.adapter.wal.append_frame(&cx, 1, &sample_page(0x7D), 1).expect("fixture unadvertised complete commit");
+                fixture.adapter.wal.sync(&cx, SyncFlags::NORMAL).unwrap();
+            } else if kind == "map_error" {
+                vfs.faults.lock().unwrap().fail_index_maps = true;
+            } else {
+                let mut header = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+                if kind == "generation" { header.a_salt[0] ^= 1; } else { header.a_frame_cksum[0] ^= 1; }
+                header.update_checksum().unwrap();
+                publish_shared_wal_index_header(&fixture.region, &header).unwrap();
+            }
+            let before = fixture.adapter.published_snapshot();
+            let header = *fixture.adapter.wal.header();
+            let size = fixture.adapter.wal.file().file_size(&cx).unwrap();
+            let shared = fixture.region.lock().to_vec();
+            fixture.adapter.begin_transaction(&cx).expect_err("maintenance probe cannot widen an invalid native horizon");
+            let mut writer = MockCheckpointPageWriter;
+            fixture.adapter.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+                .expect_err("native mismatch refuses before backfill/reset");
+            assert!(!fixture.adapter.checkpoint_recovery_pending(), "prewrite validation never arms physical reset");
+            assert_eq!(fixture.adapter.published_snapshot(), before);
+            assert_eq!(*fixture.adapter.wal.header(), header);
+            assert_eq!(fixture.adapter.wal.file().file_size(&cx).unwrap(), size);
+            assert_eq!(fixture.region.lock().to_vec(), shared);
+        }
+    }
+
+    #[cfg(all(feature = "fault-injection", feature = "native", unix))]
+    #[test]
+    fn test_path_checkpoint_pending_source_excludes_append_reconciliation_and_retains_handoff() {
+        use std::task::{Context, Poll, Waker};
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, certificate, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+        vfs.pend_next_reset_write();
+        let mut writer = MockCheckpointPageWriter;
+        let mut checkpoint = backend.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None);
+        assert!(matches!(checkpoint.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+        drop(checkpoint);
+        assert!(backend.checkpoint_recovery_pending());
+        let completion = backend.inner.pending_checkpoint_reset.as_ref().unwrap().completion.clone();
+        let target = backend.inner.pending_checkpoint_reset.as_ref().unwrap().target_header;
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        let wal_before = backend.inner.wal.file().file_size(&cx).unwrap();
+        let handoff_before = backend.checkpoint_certificate_handoff(&cx).expect("handoff already durable before physical reset");
+        assert_eq!(handoff_before, Some(certificate.clone()));
+        backend.reconcile_parallel_wal_commit(&cx, &certificate, 1, 1, true)
+            .expect_err("append reconciliation cannot race pending reset header source");
+        backend.set_wal_fec_producer(&cx, None).expect_err("producer mutation cannot race pending reset source");
+        backend.begin_transaction(&cx).expect_err("ordinary admission cannot race pending reset source");
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(), wal_before);
+        assert_eq!(vfs.faults.lock().unwrap().reset_headers.len(), 1);
+        vfs.complete_pending_reset_write(&cx).expect("complete actual old source");
+        backend.reconcile_checkpoint_reset(&cx).expect("Path retries fixed target with intact certificate handoff");
+        assert!(!backend.checkpoint_recovery_pending());
+        assert_eq!(*backend.inner.wal.header(), target);
+        assert_eq!(backend.checkpoint_certificate_handoff(&cx).expect("read preserved handoff"), handoff_before);
+        assert_eq!(backend.latest_authorized_parallel_wal_commit_certificate(&cx).expect("clock survives generation reset"), Some(certificate));
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_checkpoint_live_reader_refuses_before_certificate_handoff_or_database_mutation() {
+        use fsqlite_wal::wal_index::{WAL_INDEX_VERSION, publish_shared_wal_index_header};
+        use std::sync::atomic::Ordering;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, _, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+        let pager = fsqlite_pager::SimplePager::open_with_cx(
+            &cx, vfs.clone(), Path::new("test.db"), PageSize::DEFAULT,
+        ).expect("heap transport pager");
+        let source = pager.wal_index_shm_source().unwrap();
+        let region = source.map_region(&cx, 0, true).expect("explicit initialized fixture index");
+        let wal_header = backend.inner.wal.header();
+        let (_, terminal) = backend.inner.wal.last_commit_frame_header().unwrap();
+        let mut header = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION, unused: 0, i_change: 1, is_init: 1,
+            big_end_cksum: u8::from(wal_header.big_endian_checksum()),
+            sz_page: u16::try_from(PAGE_SIZE).unwrap(), mx_frame: 1, n_page: 1,
+            a_frame_cksum: [terminal.checksum.s1, terminal.checksum.s2],
+            a_salt: [wal_header.salts.salt1, wal_header.salts.salt2], a_cksum: [0, 0],
+        };
+        header.update_checksum().unwrap();
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        region.atomic_store_u32_ne(104, 1, Ordering::Release).unwrap();
+        backend.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+        let mut lease = source.acquire_reader(&cx).expect("synthetic claim metadata");
+        let binding = lease.binding().unwrap();
+        let token = binding.token().clone();
+        assert_eq!(backend.begin_native_read(&cx, binding).expect("bind exact fixture reader"), WalNativeReadOutcome::Ready);
+        let pinned = backend.inner.pinned_read_snapshot();
+        let wal_before = read_fault_injected_wal(&vfs, &cx);
+        let shared_before = region.lock().to_vec();
+        assert_eq!(backend.checkpoint_certificate_handoff(&cx).expect("handoff initially absent"), None);
+        let _ = vfs.take_sync_observations();
+        let mut writer = MockCheckpointPageWriter;
+        backend.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+            .expect_err("Path refuses before certificate persistence");
+        backend.inner.checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+            .expect_err("base adapter independently refuses before backfill");
+        assert!(!backend.checkpoint_recovery_pending());
+        assert_eq!(backend.inner.pinned_read_snapshot(), pinned);
+        assert!(backend.native_read_binding().unwrap().token().matches(&token));
+        assert_eq!(read_fault_injected_wal(&vfs, &cx), wal_before);
+        assert_eq!(region.lock().to_vec(), shared_before);
+        assert_eq!(backend.checkpoint_certificate_handoff(&cx).expect("handoff remains absent"), None);
+        assert!(vfs.take_sync_observations().is_empty());
+        backend.end_native_read(&token).unwrap();
+        lease.release().expect("release claim after backend retirement");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_checkpoint_backfill_reset_reader_gate_and_stock_reopen() {
+        use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
+        use fsqlite_vfs::UnixVfs;
+
+        let cx = test_cx();
+        let directory = tempfile::tempdir().unwrap();
+        let seed = directory.path().join("checkpoint-seed.db");
+        let stock = rusqlite::Connection::open(&seed).unwrap();
+        stock.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE recovery_rows(n INTEGER); INSERT INTO recovery_rows VALUES(10),(20);").unwrap();
+        let path = directory.path().join("checkpoint.db");
+        let wal_path = directory.path().join("checkpoint.db-wal");
+        std::fs::write(&path, std::fs::read(&seed).unwrap()).unwrap();
+        std::fs::write(&wal_path, std::fs::read(directory.path().join("checkpoint-seed.db-wal")).unwrap()).unwrap();
+        std::fs::write(directory.path().join("checkpoint.db-shm"), std::fs::read(directory.path().join("checkpoint-seed.db-shm")).unwrap()).unwrap();
+        let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, PageSize::DEFAULT).expect("native checkpoint pager");
+        let source = pager.wal_index_shm_source().unwrap();
+        let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+        let wal = WalFile::open(&cx, file).expect("validate stock WAL");
+        let old_generation = wal.generation_identity();
+        let mut backend = PathRefreshingWalBackend::new(UnixVfs::new(), &path, &wal_path, PAGE_SIZE, wal, false, None);
+        backend.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+        assert!(pager.set_wal_backend_owned(backend).is_ok());
+        let region = source.map_region(&cx, 0, false).expect("existing stock index");
+        let before = read_shared_wal_index_header(&region).unwrap().unwrap();
+        let foreign_pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, PageSize::DEFAULT).expect("independent native reader attachment");
+        let foreign_source = foreign_pager.wal_index_shm_source().unwrap();
+        let mut foreign = foreign_source.acquire_reader(&cx).expect("retain nonzero WAL reader before backfill");
+        assert!(!foreign.boundary().unwrap().database_only);
+        assert_eq!(foreign.header().unwrap(), before);
+        let full = pager.checkpoint(&cx, CheckpointMode::Full).expect("durable native backfill with exact reader horizon");
+        assert!(!full.wal_was_reset);
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(before));
+        assert_eq!(read_shared_wal_index_backfill(&region, &before).unwrap(), before.mx_frame);
+        let deferred = pager.checkpoint(&cx, CheckpointMode::Restart).expect("foreign reader defers reset");
+        assert!(!deferred.wal_was_reset);
+        assert_eq!(deferred.effective_mode, CheckpointMode::Full);
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(before));
+        foreign.release().expect("retire actual foreign reader before reset");
+        drop(foreign_source);
+        drop(foreign_pager);
+        let reset = pager.checkpoint(&cx, CheckpointMode::Restart).expect("reset publishes shared header before reader exclusion ends");
+        assert!(reset.wal_was_reset);
+        let after = read_shared_wal_index_header(&region).unwrap().unwrap();
+        assert_eq!((after.mx_frame, after.n_page, after.a_frame_cksum), (0, 0, [0, 0]));
+        assert_ne!(after.a_salt, [old_generation.salts.salt1, old_generation.salts.salt2]);
+        assert_eq!(after.i_change, before.i_change);
+        assert_eq!(read_shared_wal_index_backfill(&region, &after).unwrap(), 0);
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).expect("fresh native reader binds zero-frame generation");
+        reader.get_page(&cx, PageNumber::new(2).unwrap()).expect("read checkpointed B-tree page from durable main file");
+        reader.rollback(&cx).expect("release native zero-frame reader");
+        native_recovery_stock_child(&path);
+        // Read through the VFS's registered descriptor lifetime. Opening and
+        // closing a plain std::fs descriptor here could release this process's
+        // classic POSIX claims behind the native reader's ownership ledger.
+        let (mut main_observer, _) = UnixVfs::new().open(
+            &cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+        ).expect("registered main-file observer");
+        let mut database_before = vec![0; usize::try_from(main_observer.file_size(&cx).unwrap()).unwrap()];
+        assert_eq!(main_observer.read(&cx, &mut database_before, 0).expect("database before empty truncate"), database_before.len());
+        let mut database_only = source.acquire_reader(&cx).expect("retain real slot-zero reader through empty truncate");
+        assert!(database_only.boundary().unwrap().database_only);
+        let truncated = pager.checkpoint(&cx, CheckpointMode::Truncate).expect("truncate already-empty native generation");
+        assert!(truncated.wal_was_reset);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), u64::try_from(WAL_HEADER_SIZE).unwrap());
+        let mut database_after = vec![0; usize::try_from(main_observer.file_size(&cx).unwrap()).unwrap()];
+        assert_eq!(main_observer.read(&cx, &mut database_after, 0).expect("database after empty truncate"), database_after.len());
+        assert_eq!(database_after, database_before, "empty truncate never patches or truncates a slot-zero reader's database");
+        database_only.release().expect("retire database-only reader after byte preservation");
+        main_observer.close(&cx).expect("close registered observer");
+        let final_header = read_shared_wal_index_header(&region).unwrap().unwrap();
+        assert_eq!(final_header.mx_frame, 0);
+        assert_eq!(final_header.i_change, before.i_change);
+        native_recovery_stock_child(&path);
+        drop(stock);
     }
 
     // -- CheckpointTargetAdapterRef tests --

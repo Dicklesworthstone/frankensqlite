@@ -806,7 +806,11 @@ automatic corruption repair or a measured end-to-end performance guarantee.
 
 ### How WAL Mode Works
 
-In WAL mode, writes append to a separate log file instead of modifying the database directly. In the live compatibility runtime, readers normally use an adapter-local published page map, built from committed WAL frames, to find the newest visible frame for each page; this is not a shared `-shm` O(1) hash index. If the map is deliberately partial because of a configured entry cap, the adapter falls back to a backward per-frame scan, and pages absent from the visible WAL generation fall back to the database file. Since GH#399, Unix readers do publish their pinned read positions to the shared `-shm` read-mark slots (`aReadMark`/`WAL_READ_LOCK`), so cross-process checkpoints respect the reader horizon and defer WAL resets while a peer pins the generation — but the page-lookup index itself remains adapter-local.
+In WAL mode, writes append to a separate log file instead of modifying the database directly. In the live compatibility runtime, readers normally use an adapter-local published page map, built from committed WAL frames, to find the newest visible frame for each page. If a configured entry cap leaves that map partial, the adapter falls back to a backward per-frame scan. Pages absent from the visible WAL generation come from the database file.
+
+File-backed Unix writers also publish the standard shared `-shm` frame/hash entries and dual WAL-index headers, and maintain shared checkpoint and reset state. Before serving pages, Unix readers validate the shared generation and retain a matching read-mark claim (`aReadMark`/`WAL_READ_LOCK`). Stock SQLite processes can therefore observe native publication, while checkpoints respect pinned reader horizons. FrankenSQLite's own page lookup still uses its adapter-local map. The public process regressions live in [`wal_reset_with_foreign_reader.rs`](crates/fsqlite-core/tests/wal_reset_with_foreign_reader.rs); full cross-process MVCC conflict coordination remains the separate partial design below.
+
+The September 10, 2026 public-process runs cover Linux x86_64. Native macOS validation remains open in [#19](https://github.com/Dicklesworthstone/frankensqlite/issues/19).
 
 ### Frame Format
 
@@ -1709,7 +1713,7 @@ Its query-latency impact is not yet quantified.
 
 ## Multi-Process MVCC (Design / Partial Implementation)
 
-The design below extends MVCC coordination across OS processes via a shared-memory file (`foo.db.fsqlite-shm`), analogous to SQLite's WAL-index but extended for full MVCC. It is target architecture, not the complete live runtime: today, cross-process coordination happens through the standard SQLite `-shm` WAL-index locks and read-mark slots (including the GH#399 reader-registration/checkpoint-horizon protocol on Unix) plus the external lock/namespace sidecars, while MVCC conflict state — including the live GC horizon — is coordinated in process-local shared session state (`ConcurrentRegistry`).
+The design below extends MVCC coordination across OS processes via a shared-memory file (`foo.db.fsqlite-shm`), analogous to SQLite's WAL-index but extended for full MVCC. It is target architecture, not the complete live runtime: today, Unix compatibility connections publish and validate the standard SQLite `-shm` WAL-index headers, frame/hash entries, checkpoint watermarks, locks and read marks, alongside the external lock/namespace sidecars. MVCC conflict state, including the live GC horizon, remains coordinated in process-local shared session state (`ConcurrentRegistry`).
 
 ### Shared Memory Layout
 
@@ -2617,9 +2621,9 @@ suppression, and SQLite's no-rollback boundary remain release blockers.
 
 Triggers interact with MVCC: a BEFORE trigger that reads other tables establishes rw-dependencies tracked by the SireadTable for SSI validation. A trigger that writes to other tables extends the transaction's write set and page lock set.
 
-### WAL Index Hash Table (C SQLite's design; not the live lookup path)
+### Shared WAL Index Hash Table and Local Page Lookup
 
-In C SQLite, the WAL index (the `-shm` file) contains a hash table that maps page numbers to WAL frame offsets, allowing O(1) lookup of the most recent version of any page in the WAL. FrankenSQLite maintains the `-shm` sidecar for interoperability and (since GH#399, on Unix) publishes reader marks into it, but its own readers resolve pages through the adapter-local published page map described in the WAL section above — not this shared hash table.
+The standard SQLite WAL index (`-shm`) contains a hash table mapping page numbers to WAL frame offsets. FrankenSQLite's Unix writer path publishes these entries and their committed header for stock SQLite interoperability, preserving live reader marks during append and coordinating generation changes during recovery and reset. Its own readers validate the shared publication boundary, then resolve pages through the adapter-local published page map described in the WAL section above. The shared format is implemented in [`wal_index.rs`](crates/fsqlite-wal/src/wal_index.rs).
 
 ```
 Structure:

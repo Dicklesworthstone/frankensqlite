@@ -304,6 +304,10 @@ fn test_pure_compute_exclusion_scalar_call_cpu_only_no_cx() {
 struct DummyFile;
 
 impl VfsFile for DummyFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
@@ -344,6 +348,9 @@ impl VfsFile for DummyFile {
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
+    fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+        Err(FrankenError::Unsupported)
+    }
     fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
@@ -351,6 +358,9 @@ impl VfsFile for DummyFile {
         Ok(())
     }
     fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+    fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
     fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
@@ -728,6 +738,10 @@ impl Vfs for RecordingVfs {
 }
 
 impl VfsFile for RecordingFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         self.log.push("close");
         Ok(())
@@ -822,6 +836,10 @@ impl VfsFile for RecordingFile {
         Ok(())
     }
 
+    fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
@@ -831,6 +849,10 @@ impl VfsFile for RecordingFile {
     }
 
     fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
 

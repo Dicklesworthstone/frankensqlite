@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -1217,6 +1217,16 @@ pub trait VfsFile: Send + Sync {
     /// through [`Self::restore_external_wal_append_attempt`].
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Whether this handle owns a complete, fresh physical append WRITE claim.
+    ///
+    /// This query never acquires a lock, maps SHM, or creates a file. True
+    /// requires the exact append attempt to have newly acquired native WRITE
+    /// and completed its main-file fence, with the live ownership ledger still
+    /// naming this handle. Preowned WRITE, partial acquisition, restoration in
+    /// progress, and cleanup-only descriptor transfer are not append authority.
+    /// Unsupported backends must explicitly refuse this native capability.
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool>;
+
     /// Restore an append attempt without releasing its enclosing snapshot.
     ///
     /// This must be idempotent before acquisition and after success or failure.
@@ -1262,6 +1272,24 @@ pub trait VfsFile: Send + Sync {
         self.lock_external_maintenance(cx, true)
     }
 
+    /// Acquire the exclusive surfaces needed to rebuild a WAL index.
+    ///
+    /// Establish the checkpoint WRITE/CKPT and main-file appender fence,
+    /// then RECOVER and every reader slot, including the database-only slot.
+    /// Record an exact maintenance attempt before the first lock side effect.
+    /// Preserve pre-existing main and SHM claims; only newly acquired claims
+    /// belong to this attempt. Refuse overlapping maintenance, append, or
+    /// shared-snapshot attempts instead of nesting another owner.
+    ///
+    /// Restore every outcome through
+    /// [`Self::restore_external_maintenance_attempt`]. A backend unable to
+    /// establish these surfaces must return an error without claiming success.
+    /// This operation grants lock ownership only; it neither rebuilds nor
+    /// publishes a WAL index. Callers must settle protected WAL-index mutations
+    /// before restoring; this owner tracks locks, not publication completion.
+    /// SHM must not be unmapped while the attempt is armed.
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()>;
+
     /// Restore the exact baseline of an external maintenance acquisition
     /// attempt.
     ///
@@ -1270,9 +1298,14 @@ pub trait VfsFile: Send + Sync {
     /// surfaces participated; callers cannot supply a second, possibly stale
     /// mode. Restoration must be idempotent before acquisition, after clean or
     /// partial failure, after success, and across retries. Every retained
-    /// surface is attempted even if another restoration fails. Each
-    /// successfully restored surface is forgotten only after its raw unlock
-    /// succeeds.
+    /// independent surface is attempted even if another restoration fails.
+    /// WAL maintenance has an inner phase: record and restore newly acquired
+    /// RECOVER, backfill, reset, and temporary reader-horizon claims before
+    /// the outer checkpoint and main-file fences. Failure in
+    /// that inner phase retains every outer fence for retry; once it drains,
+    /// the outer surfaces again restore independently. Each successfully
+    /// restored claim is forgotten only after its raw unlock or downgrade
+    /// succeeds, preserving any pre-existing ownership.
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()>;
 
     /// Check if another process holds a reserved lock.
@@ -1354,6 +1387,20 @@ pub trait VfsFile: Send + Sync {
     // reset is never blocked. Only backends with a real shared `*-shm`
     // table (Unix) override them; the memory VFS has no peer processes and
     // the Windows `-shm` protocol is tracked separately (#395).
+
+    /// Claim a reader-mark slot exclusively only when it has no existing owner.
+    ///
+    /// `reader_slot` is a logical reader index in `1..WAL_NREADER`, not a raw
+    /// SHM lock byte. The caller must already retain the SHM attachment. Every
+    /// shared holder, including this handle, and every exclusive owner makes
+    /// the claim fail with `Busy`; this operation must never upgrade or reuse
+    /// an existing claim. An error acquires no new claim and changes no mark.
+    /// After success, the caller owns exactly one EXCLUSIVE reader claim and
+    /// must retain its cleanup owner until the matching raw EXCLUSIVE unlock
+    /// at `WAL_READ_LOCK_BASE + reader_slot` succeeds.
+    fn wal_reader_mark_exclusive_acquire(&mut self, _cx: &Cx, _reader_slot: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
 
     /// Register this handle as a WAL reader whose pinned snapshot ends at
     /// `mx_frame` (the number of WAL frames visible to it — SQLite
@@ -1459,6 +1506,10 @@ mod tests {
     fn vfs_file_defaults() {
         struct DummyFile;
         impl VfsFile for DummyFile {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _cx: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1490,6 +1541,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -1538,6 +1595,12 @@ mod tests {
         ));
         file.restore_external_maintenance_attempt(&cx)
             .expect("restoring an unsupported maintenance attempt is idempotent");
+        assert!(matches!(
+            file.lock_external_wal_recovery(&cx),
+            Err(fsqlite_error::FrankenError::Unsupported)
+        ));
+        file.restore_external_maintenance_attempt(&cx)
+            .expect("restoring unsupported recovery is idempotent");
     }
 
     /// Verify that VfsFile trait defaults are what we expect.
@@ -1545,6 +1608,10 @@ mod tests {
     fn vfs_file_sector_size_default_is_4096() {
         struct Stub;
         impl VfsFile for Stub {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1576,6 +1643,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -1686,6 +1759,10 @@ mod tests {
     fn vfs_file_set_busy_timeout_is_noop() {
         struct Stub;
         impl VfsFile for Stub {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1717,6 +1794,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -1756,6 +1839,10 @@ mod tests {
 
         struct CountingFile;
         impl VfsFile for CountingFile {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1788,6 +1875,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -1856,6 +1949,10 @@ mod tests {
     fn vfs_write_page_batch_empty_is_noop() {
         struct Stub;
         impl VfsFile for Stub {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1887,6 +1984,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -1954,6 +2057,10 @@ mod tests {
 
         struct FailOnSecond;
         impl VfsFile for FailOnSecond {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -1991,6 +2098,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -2035,6 +2148,10 @@ mod tests {
     fn vfs_file_defaults_can_be_overridden() {
         struct CustomFile;
         impl VfsFile for CustomFile {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -2066,6 +2183,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {
@@ -2142,6 +2265,10 @@ mod tests {
 
         struct RecordingFile;
         impl VfsFile for RecordingFile {
+            fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+                Err(FrankenError::Unsupported)
+            }
+
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
@@ -2174,6 +2301,12 @@ mod tests {
                 Ok(())
             }
             fn lock_external_wal_append(&mut self, _: &Cx) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn owns_external_wal_append_write(&self, _: &Cx) -> Result<bool> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn lock_external_wal_recovery(&mut self, _: &Cx) -> Result<()> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn restore_external_wal_append_attempt(&mut self, _: &Cx) -> Result<()> {

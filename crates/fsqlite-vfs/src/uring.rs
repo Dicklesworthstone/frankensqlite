@@ -1199,6 +1199,11 @@ impl Vfs for IoUringVfs {
 }
 
 impl VfsFile for IoUringFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, cx: &Cx, reader_slot: u32) -> Result<()> {
+        self.inner
+            .wal_reader_mark_exclusive_acquire(cx, reader_slot)
+    }
+
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.inner.close(cx)
     }
@@ -1271,6 +1276,10 @@ impl VfsFile for IoUringFile {
         self.inner.restore_external_shared_snapshot_attempt(cx)
     }
 
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        self.inner.owns_external_wal_append_write(cx)
+    }
+
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         self.inner.lock_external_wal_append(cx)
     }
@@ -1285,6 +1294,10 @@ impl VfsFile for IoUringFile {
 
     fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
         self.inner.lock_external_wal_checkpoint(cx)
+    }
+
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_wal_recovery(cx)
     }
 
     fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
