@@ -12,6 +12,60 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-10 - REJECTED: statistics-only hashing plus snapshot memo (GH#402, bd-sde05.3)
+
+- Target: the unchanged 18-case `gh402_measure_residual_schema_matrix`, with
+  50/150/300 tables, file/memory storage, sequential/batch/transaction DDL,
+  INSERT windows and separate statistics, reopen and first-statement samples.
+  `page_cache.rs` memoized exact statistics inputs and output, retaining up to
+  48 KiB of trace/resident values plus allocation overhead per populated memo.
+  A generic hasher seam in `s3_fifo.rs` selected the existing fast hasher only
+  for statistics reconstruction; default constructors and eviction retained
+  standard `RandomState`. Queue transitions and completion bounds were unchanged.
+- Strict RCH on Linux x86_64 vmi1149989, shared worker, Cargo test profile,
+  native/json/fts5 features, September 10. Baseline 25548 and candidate 25553
+  each passed four selected SQL tests and all 18 cases. Their 1,615 tracked
+  Rust/manifest inputs have identical paths and differ only in the two pager
+  files. Candidate hashes: `page_cache.rs`
+  `bbae6a983afebdf6d0bb854191dc968c319ca8f24f94e8bba0454aa4eaf94a44`,
+  `s3_fifo.rs`
+  `10e25b70ad0d0f3a80b1dc758f31b461833219b4c2ca26d5c6a34101f531a743`.
+  Focused job 25552 also passed 71 tests, all 32 original semantic goldens,
+  and standard/fast/colliding-hasher differential controls.
+- Paired jobs `30004650170125554` and `30004650170125555` each passed 26 full
+  matrices: three warmups and ten measured matrices per arm, alternating order
+  and reversing the initial order in campaign two. All 12 required actual
+  500-resident statistics groups pass the 1.5x median target in both campaigns.
+  First-call groups improve 3.906-4.232x and 4.208-4.716x, respectively;
+  repeated calls benefit from memo hits. Inner statistics sample zero remains
+  part of acceptance. Sparse actual-residency groups remain unmeasured
+  (120 in campaign one, 111 in campaign two).
+- The no-regression gate fails: six non-statistics groups and one DDL window
+  exceed 10% median growth in both campaigns. File sequential 300-table first
+  statement, sample 2, grows 11.37% then 13.15%; file sequential 150-table DDL's
+  first 50-table window grows 30.15% then 11.19%. Five recurring reopen groups
+  grow 13.15%-146.79% across the two campaigns. The shared worker and large
+  spreads do not establish the memo or hasher as their cause, but these results
+  do not satisfy the keep gate. Overall matrix speed cannot substitute.
+- Raw logs: `/tmp/frankensqlite-gh402-stats-hasher-paired1-rch-20260910.log`
+  (SHA256 `c86058aef5fed57a112b31b8498f7a9c0d325dedef8b10b28c8e29e013f9d713`)
+  and `/tmp/frankensqlite-gh402-stats-hasher-paired2-rch-20260910.log`
+  (SHA256 `a236e4bce6b6b75de86037b771b6f3adf76e4d5cc6d5deacf80bddf1a3235b68`).
+  Corresponding `paired1-analysis` and `paired2-analysis` JSON artifacts retain
+  all raw groups, medians, tails, pair identities and recurring comparisons.
+  Timestamped baseline source receipt is
+  `/tmp/frankensqlite-gh402-exact-memo-sql-baseline-source-20260910T1058.sha256`;
+  candidate receipt is
+  `/tmp/frankensqlite-gh402-stats-hasher-source-20260910.sha256`.
+- Both executables are retained outside target pools on vmi1149989 as
+  `/tmp/frankensqlite-gh402-exact-memo-{baseline,candidate}-20260910`, with
+  SHA256 `6adf01fe29e21dbf294c5c13bcc326857f1fe902352426d8b4b99b8dddb0093c`
+  and `f2502724405acabba20ba99b0d72ff78f66370ed83f0dd8293c54c804136fcba`.
+  Do not publish this combination as a performance fix. A bounded follow-up
+  may remove memo retention/layout cost while preserving statistics-only
+  hashing, then rerun the same first-call and non-statistics gates. Such an
+  isolation is a hypothesis, not a causal explanation or accepted improvement.
+
 ## 2026-09-10 - UNMEASURED: Track C competing-writer median stall reduction (bd-db300.3.2.3)
 
 - Target: the 1/7/31 dirty-page cases in
