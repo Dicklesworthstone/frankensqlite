@@ -12,6 +12,119 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-10 - REJECTED: exact cold completion with a fixed MAIN partition (GH#402, bd-sde05.3)
+
+- Target and gate: the unchanged 18-case public SQL matrix and acceptance below,
+  including all 12 actual 500-page statistics groups, first calls, and every
+  DDL/INSERT window. Each campaign retains three warmup and ten measured
+  matrices per arm; the second reverses the initial arm order.
+- Files: `crates/fsqlite-pager/src/s3_fifo.rs` and `page_cache.rs`. This extends
+  the empty-MAIN recognizer to a validated fixed MAIN partition. It projects
+  U = R minus MAIN, applies the strict cold/ghost bound to U, advances epochs
+  by the actual cold insertion count, and preserves MAIN order, access bits,
+  reinsertion state, posterior and the original 2N completion budget. Failed
+  recognition falls back without changing logical state. It does not promise
+  identical allocator or hash-table bucket state.
+- Correctness: RCH 25743 passes 66 pager tests, with all 32 raw semantic goldens
+  and 416 raw work records identical to the empty-MAIN candidate. Two new
+  controls cover the fixed partition, original-budget endpoint, hidden-state
+  preservation and atomic refusals. Workspace check 25744, warnings-denied
+  Clippy 25748, configured formatting 25766 and public SQL 25751 all pass.
+  Formatting retains core/pager/VDBE exclusions; the public run is four tests
+  including the matrix and three existing keepers. WAL-FEC blocking-pool
+  warnings remain; this is not caller-runtime FEC acceptance.
+  The passing formatter log is
+  `/tmp/frankensqlite-gh402-fixed-main-fmt-job-rch-20260910.log`; the earlier
+  `fixed-main-fmt-rch-20260910.log` records a refused non-job invocation.
+- Result: strict RCH 25759 and 25768 on Linux x86_64 vmi1264463 each complete
+  all 26 matrices with stock-result parity. Every required statistics group
+  passes, with median baseline/candidate ratios 60.5186–203.4176x and
+  63.8619–206.2584x. These are shared-worker test-profile observations, not
+  release-profile or overall-throughput claims. The first campaign flags 22
+  non-statistics groups and 18 windows; the reversed campaign flags 22 and 17.
+  Seven non-statistics groups and three windows exceed 10% median growth in
+  both campaigns, so the unchanged keep gate rejects the candidate:
+
+  | Measurement | First campaign | Reversed campaign |
+  |---|---:|---:|
+  | file / batch / 300 / reopen sample 0 | +13.73% | +53.06% |
+  | file / batch / 300 / first statement sample 1 | +15.78% | +15.16% |
+  | file / batch / 50 / reopen sample 1 | +12.17% | +27.18% |
+  | file / batch / 50 / schema total | +21.00% | +12.36% |
+  | file / seq / 150 / reopen sample 2 | +78.97% | +31.99% |
+  | file / txn / 50 / first statement sample 1 | +28.29% | +14.44% |
+  | file / txn / 50 / reopen sample 1 | +112.03% | +16.98% |
+  | file / batch / 50 / DDL window ending 50 | +21.40% | +12.17% |
+  | file / seq / 300 / DDL window ending 50 | +41.39% | +28.31% |
+  | memory / batch / 50 / nontransactional INSERT | +50.00% | +12.50% |
+
+  All raw samples, p95/p99 and outliers remain in the reports. The 138/147
+  unmatched actual-residency groups remain unmeasured. No overall-matrix time
+  or pooled residency comparison replaces the original acceptance.
+- Independent isolated negative: chronological instrumented runs 25732/25743
+  have identical work receipts, but 195/416 elapsed samples are slower in the
+  fixed-MAIN run, 126 above 10%. Seventeen measured case medians regress, nine
+  above 10%; 18 p95 and 18 p99 values regress. These separate shared-worker
+  observations are not paired SQL evidence or attribution of the cause.
+- Source: S3 SHA256
+  `ee84004f4e6e2f5210fa4e0b0da183a0dead0ff4c7a3c28b27181760544bf25d`,
+  page cache `57c4b27e64c53e207a9cbccd652ffd37396a51b7206d04fdaf6a0bfcb16f577c`.
+  The 1,615-input manifest
+  `/tmp/frankensqlite-gh402-fixed-main-source-20260910.sha256` hashes to
+  `81c12d83cddba0224233aefea18103cae3eec4404e191e868140936e36233606`.
+  Full two-file patch against `8f6b2d51`:
+  `/tmp/frankensqlite-gh402-fixed-main-source-patch-20260910.patch`, SHA256
+  `9d06fc90bdc59927da32254404a0a892d5f3d40d910ed499499b0e979e7f95d3`.
+  Candidate retained on vmi1264463 at
+  `/tmp/frankensqlite-gh402-fixed-main-candidate-20260910`, SHA256
+  `626287b3aca9f3425e783074649d6f25532c65772d626e396e7338864e7d77dc`;
+  original non-memo, standard-hasher baseline remains `6adf01fe…` below.
+  Both hashes pass before and after both campaigns. Current fingerprint
+  `/tmp/frankensqlite-gh402-fixed-main-integration-fingerprint-20260910T220522.json`
+  (`25c72e99…`) and review
+  `/tmp/frankensqlite-gh402-fixed-main-provenance-review-20260910T220522.md`
+  (`663aef7a…`) distinguish observed features,
+  Rust nightly 908501772/LLVM 23.1/glibc 2.43 and ELF metadata from inferred
+  current compiler options. No live rustc argv was captured for job 25751;
+  matching configuration and historical argv do not prove equal environments.
+- Artifacts under `/tmp/frankensqlite-gh402-fixed-main-`:
+  `paired1-rch-20260910.log`, SHA256
+  `1750cb26676f6bf5c196c88c65017b2fd241c03a66088e3b6b9af3d23f175564`;
+  `paired1-analysis-20260910.json`, SHA256
+  `ea3f030dd2c78c5354f49e327797d2aec24c4886d8377a953f5f36a5efec2cbd`;
+  `paired2-rch-20260910.log`, SHA256
+  `2d46396884e515e068c4f82b21028067af6e1a4bdc7626a7916d1347396f0889`;
+  `paired2-analysis-20260910.json`, SHA256
+  `d6d2a0b5e3a857a21cb93d98acd9f0ee74e2092020c03f52dd5176f00766ed43`;
+  `crosscampaign-20260910.json`, SHA256
+  `7688d5fec3886fc7d3ae8dca1ce5ff718ff3328bf43c495b9a78c777facc596d`.
+  Remote execution took 607984/622006 ms. Runner `5af6768d…` changes only
+  title/path from the executed predecessor; analyzer `6a728068…` is unchanged.
+- Attribution and retry condition: do not repeat this candidate unchanged or
+  dismiss its non-statistics regressions as noise. Source review finds that
+  normal clean-buffer reclamation and periodic telemetry bypass reconstruction;
+  statistics, explicit policy eviction and diagnostics can reach it. Projection
+  may allocate before a later refusal. Existing per-model work counters are
+  `cfg(test)` and absent in the public SQL dependency, so neither reachability
+  nor the first statistics call's position before reopen establishes causality.
+  Before another candidate, use a separate diagnostic run of the same matrix
+  to count attempts, projected keys/allocations, late refusals and accepted
+  rounds by caller and SQL phase. Then address a demonstrated cause and repeat
+  the original gate. Preserve the independent pre-candidate hand controls;
+  withdraw the rejected production shortcut and helper-dependent tests.
+- Disposition: manually applied the independently reviewed complete withdrawal
+  `558d890e…`. Page cache is exactly the prior HEAD `681ab131…`; S3-FIFO is
+  `d42e169c…`, original production plus the two standalone hand-derived
+  controls. All 1,615 inputs match the earlier causal baseline `2b0cf196…`.
+  Final focused RCH 25782 passes 61 pager tests; workspace check 25781 and
+  configured formatting 25790 pass. Warnings-denied Clippy 25791 passes at
+  2026-09-10 22:48:56 UTC, with 633305 ms remote execution; its raw log
+  `/tmp/frankensqlite-gh402-withdrawn-clippy-rch-20260910.log` hashes to
+  `71227a5362f3f77ee4a33e2a3b29012af8875fc5a0107492eb246d3bd53f5e5a`.
+  All 1,615 inputs still match after the terminal. The 32 raw semantic goldens
+  and 416 raw work records exactly match the original baselines. These gates
+  validate the restoration and retained controls, not a performance fix.
+
 ## 2026-09-10 - REJECTED: cold completion shortcut requiring empty MAIN (GH#402, bd-sde05.3)
 
 - Target: the original 18-case `gh402_measure_residual_schema_matrix`, with

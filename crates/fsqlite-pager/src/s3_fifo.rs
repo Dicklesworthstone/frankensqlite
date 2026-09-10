@@ -852,6 +852,167 @@ mod tests {
     }
 
     #[test]
+    fn cold_completion_cycles_advance_hidden_state_and_preserve_victim() {
+        use S3FifoEvent::{EvictedFromSmallToGhost, GhostTrimmed, Inserted};
+
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(4, 1, 1, 1));
+        fifo.set_adaptation_interval(usize::MAX);
+        assert_eq!(fifo.insert(pg(1)), vec![Inserted(pg(1))]);
+        assert_eq!(
+            fifo.insert(pg(2)),
+            vec![Inserted(pg(2)), EvictedFromSmallToGhost(pg(1))]
+        );
+        assert_eq!(
+            fifo.insert(pg(3)),
+            vec![
+                Inserted(pg(3)),
+                EvictedFromSmallToGhost(pg(2)),
+                GhostTrimmed(pg(1))
+            ]
+        );
+        assert_eq!(
+            fifo.insert(pg(4)),
+            vec![
+                Inserted(pg(4)),
+                EvictedFromSmallToGhost(pg(3)),
+                GhostTrimmed(pg(2))
+            ]
+        );
+        assert_eq!(fifo.ghost, VecDeque::from([(pg(3), 3)]));
+
+        // Hand-derived missing batches, not output from build_model. Every
+        // round evicts three cold pages; only the visible queue IDs repeat.
+        for (batch, old_small, old_ghost, epoch) in [
+            ([1, 2, 3], 4, 3, 6_u64),
+            ([1, 2, 4], 3, 2, 9),
+            ([1, 2, 3], 4, 2, 12),
+            ([1, 2, 4], 3, 2, 15),
+            ([1, 2, 3], 4, 2, 18),
+            ([1, 2, 4], 3, 2, 21),
+            ([1, 2, 3], 4, 2, 24),
+            ([1, 2, 4], 3, 2, 27),
+        ] {
+            assert_eq!(fifo.small_pages(), vec![pg(old_small)]);
+            for page in batch {
+                assert!(
+                    !matches!(fifo.lookup(pg(page)), Some(location) if location.kind != QueueKind::Ghost)
+                );
+            }
+            for (page, evicted, trimmed) in [
+                (batch[0], old_small, old_ghost),
+                (batch[1], batch[0], old_small),
+                (batch[2], batch[1], batch[0]),
+            ] {
+                assert_eq!(
+                    fifo.insert(pg(page)),
+                    vec![
+                        Inserted(pg(page)),
+                        EvictedFromSmallToGhost(pg(evicted)),
+                        GhostTrimmed(pg(trimmed))
+                    ]
+                );
+            }
+            assert_eq!(fifo.small_pages(), vec![pg(batch[2])]);
+            assert!(fifo.main.is_empty());
+            assert_eq!(fifo.ghost, VecDeque::from([(pg(2), epoch)]));
+            assert_eq!(fifo.ghost_epoch, epoch);
+            assert_eq!(fifo.evictions_since_adapt, usize::try_from(epoch).unwrap());
+            assert_eq!(fifo.index.len(), 2);
+            assert_eq!(fifo.index.get(&pg(2)), Some(&EntryState::Ghost(epoch)));
+            assert_eq!(
+                fifo.index.get(&pg(batch[2])),
+                Some(&EntryState::Resident(ResidentState {
+                    queue: QueueKind::Small,
+                    accessed: false,
+                    reinsert_count: 0,
+                }))
+            );
+            assert_eq!(
+                [
+                    fifo.ghost_hits_since_adapt,
+                    fifo.small_hits_since_adapt,
+                    fifo.main_hits_since_adapt,
+                    fifo.main_pressure_since_adapt
+                ],
+                [0; 4]
+            );
+            assert_eq!((fifo.posterior_alpha, fifo.posterior_beta), (1, 1));
+            assert_eq!(fifo.config(), S3FifoConfig::with_limits(4, 1, 1, 1));
+        }
+        assert_eq!(fifo.lookup(pg(1)), None);
+        assert_eq!(fifo.lookup(pg(3)), None);
+        let miss = pg(u32::MAX - 1);
+        assert_eq!(
+            fifo.insert(miss),
+            vec![
+                Inserted(miss),
+                EvictedFromSmallToGhost(pg(4)),
+                GhostTrimmed(pg(2))
+            ]
+        );
+        assert_eq!(fifo.ghost, VecDeque::from([(pg(4), 28)]));
+        assert_eq!(fifo.evictions_since_adapt, 28);
+    }
+
+    #[test]
+    fn adjacent_hits_fill_main_and_change_completion_victim() {
+        use S3FifoEvent::{EvictedFromMain, Inserted, PromotedToMain};
+
+        let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(4, 1, 1, 1));
+        fifo.set_adaptation_interval(usize::MAX);
+        assert_eq!(fifo.insert(pg(1)), vec![Inserted(pg(1))]);
+        assert!(fifo.access(pg(1)));
+        for (page, promoted) in [(2, 1), (3, 2), (4, 3)] {
+            assert_eq!(
+                fifo.insert(pg(page)),
+                vec![Inserted(pg(page)), PromotedToMain(pg(promoted))]
+            );
+            assert!(fifo.access(pg(page)));
+        }
+        assert_eq!(fifo.small_pages(), vec![pg(4)]);
+        assert_eq!(fifo.main_pages(), vec![pg(1), pg(2), pg(3)]);
+        assert!(fifo.ghost.is_empty());
+        assert_eq!(fifo.ghost_epoch, 0);
+        assert_eq!(fifo.evictions_since_adapt, 3);
+        assert_eq!(fifo.index.len(), 4);
+        for page in 1..=4 {
+            assert_eq!(
+                fifo.index.get(&pg(page)),
+                Some(&EntryState::Resident(ResidentState {
+                    queue: if page == 4 {
+                        QueueKind::Small
+                    } else {
+                        QueueKind::Main
+                    },
+                    accessed: page == 4,
+                    reinsert_count: 0,
+                }))
+            );
+        }
+        assert_eq!(
+            [
+                fifo.ghost_hits_since_adapt,
+                fifo.small_hits_since_adapt,
+                fifo.main_hits_since_adapt,
+                fifo.main_pressure_since_adapt
+            ],
+            [0, 4, 0, 0]
+        );
+        assert_eq!((fifo.posterior_alpha, fifo.posterior_beta), (1, 1));
+        let miss = pg(u32::MAX - 1);
+        assert_eq!(
+            fifo.insert(miss),
+            vec![Inserted(miss), PromotedToMain(pg(4)), EvictedFromMain(pg(1))]
+        );
+        assert_eq!(fifo.small_pages(), vec![miss]);
+        assert_eq!(fifo.main_pages(), vec![pg(2), pg(3), pg(4)]);
+        assert!(fifo.ghost.is_empty());
+        assert_eq!(fifo.ghost_epoch, 0);
+        assert_eq!(fifo.evictions_since_adapt, 5);
+        assert_eq!(fifo.lookup(pg(1)), None);
+    }
+
+    #[test]
     fn access_sets_flag_without_reordering_small() {
         let mut fifo = S3Fifo::with_config(S3FifoConfig::with_limits(4, 2, 2, 1));
         let _ = fifo.insert(pg(1));
