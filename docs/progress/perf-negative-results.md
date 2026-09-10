@@ -12,6 +12,65 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-10 - UNMEASURED: Track C competing-writer median stall reduction (bd-db300.3.2.3)
+
+- Target: the 1/7/31 dirty-page cases in
+  `pager::tests::wal_publish_window_shrink_benchmark_report`, using the existing
+  blocking-memory VFS wrapper. The corrected instrumentation in
+  `crates/fsqlite-pager/src/pager.rs` measures a synthetic WAL critical section
+  and counts only time actually blocked by another owner. Uncontended attempts
+  contribute zero; the benchmark does not enable the test-only rendezvous.
+  OS and main-file lock windows remain unmeasured.
+- September 10, Linux vmi1264463, shared worker, Cargo test profile via strict
+  RCH: one benchmark test passed at 02:45:04 UTC. The captured base is b9ad861dd
+  plus the three typed-chunk corrections subsequently committed as 86a9b4aed;
+  30 scoped source hashes matched remote readback. This is not a quiet-host
+  release-perf comparison or an isolated production optimization estimate.
+- All six baseline/candidate competing-writer wait medians are zero, so median
+  wait improvement is unmeasured. Synthetic hold medians, baseline to candidate,
+  are 14,813 to 14,542 ns, 87,682 to 88,714 ns and 502,814 to 476,044 ns. The
+  seven-page median grew approximately 1.18%; the all-cases hold-improvement
+  gate also fails. Do not reuse the old bead closure's 53%/74%/73% hold and
+  78%/99%/99% stall claims
+  as current evidence after correcting the measurement definition.
+- The wrapper exited 1 because one Cargo launch diagnostic was interleaved into
+  JSON. Originals are preserved in
+  `/tmp/frankensqlite-track-c-wrapper-20260910T0230/`. The separately labeled
+  `/tmp/frankensqlite-track-c-wrapper-20260910T0230-forensic.json` removes only
+  that exact line; the adjacent `-forensic-receipt.json` records its bytes,
+  line number and hashes. This recovered artifact is not acceptance proof.
+  Full log: `/tmp/frankensqlite-track-c-wrapper-rch-20260910.log`.
+- Keep the corrected measurement and causal contention controls. Retry a
+  performance claim only with an actual workload that establishes contention and
+  passes the stated gates. Do not manufacture benchmark contention with the
+  deterministic test rendezvous or weaken the zero-wait refusal.
+- The actual stream-aware wrapper replay on September 10 at 06:18:15 UTC
+  (RCH job `30004650170125236`) passed its one benchmark test remotely on
+  vmi1264463 and then exited 1 on the
+  unchanged acceptance gate, preserving a complete report and summary under
+  `/tmp/frankensqlite-track-c-stream-retry-20260910/bd-db300.3.2.3-20260910T061735Z-34233/`.
+  All 32 scoped hashes matched remote readback; script SHA256 was
+  `2dc5a3cc69b9fca6a8f6155b21aacb545891054ed435c666afea32107a2842b8`.
+  Git HEAD `86a9b4aed` identifies the base, with uncommitted Rust changes in
+  the tested source. Exact scoped source receipts are
+  `/tmp/frankensqlite-track-c-stream-retry-source-20260910.sha256` and
+  `/tmp/frankensqlite-track-c-stream-retry-remote-source-20260910.sha256`.
+  Hold medians for 1/7/31 pages were 16,315 to 17,676 ns, 99,088 to 86,168 ns,
+  and 491,117 to 480,168 ns. All three baseline wait medians and the first two
+  candidate wait medians were 0; the 31-page candidate wait median was 844,675 ns.
+  This does not establish competing-writer stall reduction, and the one-page
+  hold median also fails the all-cases improvement gate. Shared-host/test-profile
+  limits above still apply.
+- The preceding 06:12:14 UTC benchmark (RCH job `30004650170125234`) also
+  passed, but its wrapper rejected
+  framing because RCH routed the entire report to stderr and stdout was empty.
+  Both raw streams remain under
+  `/tmp/frankensqlite-track-c-corrected-20260910/bd-db300.3.2.3-20260910T060540Z-74625/`.
+  The revised selector accepts exactly one complete report from either stream,
+  records the source stream and rejects duplicated or split reports. Seventeen
+  consumer-only cases and bash syntax validation passed before the actual replay;
+  those constructed controls are not benchmark measurements.
+
 ## 2026-09-09 - REJECTED: broad S3-FIFO membership-map replacement (GH#402, bd-sde05.3)
 
 - Target: `gh402_measure_residual_schema_matrix`, 50/150/300 empty tables plus
