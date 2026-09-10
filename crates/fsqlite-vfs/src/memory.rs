@@ -432,6 +432,7 @@ impl Vfs for MemoryVfs {
             storage,
             lock_level: LockLevel::None,
             external_shared_snapshot_prior_level: None,
+            external_wal_append_prior_level: None,
             external_maintenance_attempt: None,
             // SQLite temp opens pass a null path and expect delete-on-close semantics.
             delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_anonymous_temp,
@@ -562,6 +563,7 @@ pub struct MemoryFile {
     storage: Arc<Mutex<FileStorage>>,
     lock_level: LockLevel,
     external_shared_snapshot_prior_level: Option<LockLevel>,
+    external_wal_append_prior_level: Option<LockLevel>,
     external_maintenance_attempt: Option<MemoryExternalMaintenanceAttempt>,
     delete_on_close: bool,
     vfs: Arc<Mutex<MemoryVfsInner>>,
@@ -923,6 +925,8 @@ impl Drop for MemoryFile {
 
 impl VfsFile for MemoryFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
+        self.restore_external_wal_append_attempt(cx)?;
+        self.restore_external_shared_snapshot_attempt(cx)?;
         // Release any file locks.
         self.unlock(cx, LockLevel::None)?;
 
@@ -1129,6 +1133,11 @@ impl VfsFile for MemoryFile {
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_wal_append_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a MemoryVfs shared snapshot during a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_prior_level.is_some() {
             return Err(FrankenError::internal(
                 "MemoryVfs external shared-snapshot attempt is already active",
@@ -1148,6 +1157,11 @@ impl VfsFile for MemoryFile {
     }
 
     fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_wal_append_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "cannot restore a MemoryVfs shared snapshot before its WAL append attempt",
+            ));
+        }
         let Some(prior_level) = self.external_shared_snapshot_prior_level else {
             return Ok(());
         };
@@ -1159,7 +1173,40 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if self.external_wal_append_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "MemoryVfs WAL append attempt is already active",
+            ));
+        }
+        if self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a MemoryVfs WAL append attempt during external maintenance",
+            ));
+        }
+
+        // This is bookkeeping only. In-memory MVCC writers must remain free
+        // to overlap: do not acquire a SHM slot or introduce a file-level gate.
+        self.external_wal_append_prior_level = Some(self.lock_level);
+        self.lock(cx, LockLevel::Reserved)
+    }
+
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some(prior_level) = self.external_wal_append_prior_level else {
+            return Ok(());
+        };
+        self.restore_external_lock_level(cx, prior_level)?;
+        self.external_wal_append_prior_level = None;
+        Ok(())
+    }
+
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.external_wal_append_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire MemoryVfs external maintenance during a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_prior_level.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire MemoryVfs external maintenance during a shared snapshot",
@@ -1376,6 +1423,11 @@ impl VfsFile for MemoryFile {
     fn shm_barrier(&self) {}
 
     fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+        if self.external_wal_append_prior_level.is_some() {
+            return Err(FrankenError::internal(
+                "cannot unmap MemoryVfs SHM during a WAL append attempt",
+            ));
+        }
         checkpoint_or_abort(cx)?;
         self.release_shm_owner_state(delete)
     }
@@ -2521,6 +2573,123 @@ mod tests {
         assert_eq!(file.lock_level, LockLevel::Shared);
         file.restore_external_shared_snapshot_attempt(&cx).unwrap();
         assert_eq!(file.lock_level, LockLevel::None);
+    }
+
+    #[test]
+    fn external_wal_append_does_not_serialize_memory_writers() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("append_non_serializing.db");
+        let (mut first, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut second, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut slot_owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        slot_owner
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+
+        first.lock_external_wal_append(&cx).unwrap();
+        second.lock_external_wal_append(&cx).unwrap();
+        assert_eq!(first.lock_level, LockLevel::Reserved);
+        assert_eq!(second.lock_level, LockLevel::Reserved);
+        assert!(first.shm_info.is_none());
+        assert!(second.shm_info.is_none());
+        assert!(!first.check_reserved_lock(&cx).unwrap());
+        assert!(!second.check_reserved_lock(&cx).unwrap());
+
+        first.restore_external_wal_append_attempt(&cx).unwrap();
+        second.restore_external_wal_append_attempt(&cx).unwrap();
+        slot_owner
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+        assert_eq!(first.lock_level, LockLevel::None);
+        assert_eq!(second.lock_level, LockLevel::None);
+    }
+
+    #[test]
+    fn external_wal_append_restores_exact_baseline_and_outer_snapshot() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("append_baselines.db")), flags)
+            .unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.shm_info.is_none());
+
+        for baseline in [
+            LockLevel::None,
+            LockLevel::Shared,
+            LockLevel::Reserved,
+            LockLevel::Pending,
+            LockLevel::Exclusive,
+        ] {
+            file.lock(&cx, baseline).unwrap();
+            file.lock_external_wal_append(&cx).unwrap();
+            assert_eq!(file.external_wal_append_prior_level, Some(baseline));
+            file.restore_external_wal_append_attempt(&cx).unwrap();
+            file.restore_external_wal_append_attempt(&cx).unwrap();
+            assert_eq!(file.lock_level, baseline);
+            file.unlock(&cx, LockLevel::None).unwrap();
+        }
+
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert!(file.lock_external_shared_snapshot(&cx).is_err());
+        assert!(file.lock_external_maintenance(&cx, true).is_err());
+        assert!(file.shm_unmap(&cx, false).is_err());
+        assert!(file.shm_unmap(&cx, true).is_err());
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        assert_eq!(
+            file.external_shared_snapshot_prior_level,
+            Some(LockLevel::None)
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        file.close(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_wal_append_prior_level.is_none());
+        assert!(file.external_shared_snapshot_prior_level.is_none());
+    }
+
+    #[test]
+    fn external_wal_append_refuses_cancelled_or_maintenance_attempts() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("append_refusal.db")), flags)
+            .unwrap();
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(file.lock_external_wal_append(&cancelled).is_err());
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert!(file.external_wal_append_prior_level.is_none());
+        assert!(file.shm_info.is_none());
+
+        file.lock_external_maintenance(&cx, false).unwrap();
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert_eq!(file.lock_level, LockLevel::Exclusive);
+        assert!(file.external_wal_append_prior_level.is_none());
+        file.restore_external_maintenance_attempt(&cx).unwrap();
     }
 
     #[test]

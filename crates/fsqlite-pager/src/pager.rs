@@ -4290,6 +4290,8 @@ impl GroupCommitExternalLockOwner {
 enum PendingExternalUnlockTarget {
     /// Restore the ordinary SQLite lock state while other transactions remain.
     LockLevel(LockLevel),
+    /// Restore the physical appender's exact native WRITE/main-file attempt.
+    ExternalWalAppend,
     /// Release the last transaction's external snapshot fence. This is
     /// distinct from `LockLevel::None` on VFSes that track the fence's prior
     /// lock level separately.
@@ -4303,6 +4305,7 @@ impl PendingExternalUnlockTarget {
     fn restore<F: VfsFile>(self, file: &mut F, cx: &Cx) -> Result<()> {
         match self {
             Self::LockLevel(level) => file.unlock(cx, level),
+            Self::ExternalWalAppend => file.restore_external_wal_append_attempt(cx),
             Self::ExternalSnapshot => file.restore_external_shared_snapshot_attempt(cx),
             Self::ExternalMaintenance => file.restore_external_maintenance_attempt(cx),
         }
@@ -4431,6 +4434,7 @@ impl<F: VfsFile + 'static> Drop for BeginExternalLockState<F> {
             cleanup_cx: self.cleanup_cx.clone(),
             restore_target,
             restored: Arc::clone(&restored),
+            _epoch_consumer: None,
         };
         let mut pending = PendingExternalUnlock {
             sequence: None,
@@ -4462,6 +4466,9 @@ struct SharedDbPendingExternalUnlock<F: VfsFile> {
     cleanup_cx: Cx,
     restore_target: PendingExternalUnlockTarget,
     restored: Arc<AtomicBool>,
+    /// Keep terminal epoch evidence until both exact restoration and the
+    /// queued epoch transition finish, including failures before WAL I/O.
+    _epoch_consumer: Option<Arc<GroupCommitEpochConsumer>>,
 }
 
 impl<F: VfsFile> SharedDbPendingExternalUnlock<F> {
@@ -4865,9 +4872,10 @@ fn insert_pending_external_unlock_by_sequence(
 struct GroupCommitDbLockObligation<F: VfsFile + 'static> {
     queue: Arc<GroupCommitQueue>,
     epoch: u64,
+    epoch_consumer: Arc<GroupCommitEpochConsumer>,
     db_file: SharedDbFile<F>,
     cleanup_cx: Cx,
-    restore_lock_level: LockLevel,
+    restore_target: PendingExternalUnlockTarget,
     durability_started: Arc<AtomicBool>,
     durable_io_completed: Arc<AtomicBool>,
     restored: Arc<AtomicBool>,
@@ -4886,7 +4894,7 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
         epoch: u64,
         db_file: &SharedDbFile<F>,
         cx: &Cx,
-        restore_lock_level: LockLevel,
+        restore_target: PendingExternalUnlockTarget,
         durability_started: Arc<AtomicBool>,
         durable_io_completed: Arc<AtomicBool>,
         restored: Arc<AtomicBool>,
@@ -4896,9 +4904,10 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
         Self {
             queue: Arc::clone(queue),
             epoch,
+            epoch_consumer: queue.register_epoch_consumer(epoch),
             db_file: Arc::clone(db_file),
             cleanup_cx: cleanup_child_cx(cx),
-            restore_lock_level,
+            restore_target,
             durability_started,
             durable_io_completed,
             restored,
@@ -4915,7 +4924,8 @@ impl<F: VfsFile + 'static> GroupCommitDbLockObligation<F> {
     async fn restore(&mut self) -> Result<()> {
         let restore_result = {
             let _cleanup_mask = self.cleanup_cx.masked();
-            shared_db_unlock(&self.db_file, &self.cleanup_cx, self.restore_lock_level).await
+            let mut file = shared_db_file_write(&self.db_file, &self.cleanup_cx).await?;
+            self.restore_target.restore(&mut *file, &self.cleanup_cx)
         };
         if restore_result.is_ok() {
             self.restored.store(true, AtomicOrdering::Release);
@@ -4931,12 +4941,12 @@ impl<F: VfsFile + 'static> Drop for GroupCommitDbLockObligation<F> {
         if !self.armed {
             return;
         }
-        let restore_target = PendingExternalUnlockTarget::LockLevel(self.restore_lock_level);
         let operation = SharedDbPendingExternalUnlock {
             db_file: Arc::clone(&self.db_file),
             cleanup_cx: self.cleanup_cx.clone(),
-            restore_target,
+            restore_target: self.restore_target,
             restored: Arc::clone(&self.restored),
+            _epoch_consumer: Some(Arc::clone(&self.epoch_consumer)),
         };
         let mut pending = PendingExternalUnlock {
             sequence: None,
@@ -5013,6 +5023,35 @@ type WalBackendHandle = Arc<AsyncRwLock<Box<dyn WalBackend>>>;
 pub type SharedWalBackend = Arc<std::sync::RwLock<Option<WalBackendHandle>>>;
 type SharedDbFile<F> = Arc<AsyncRwLock<F>>;
 type LocalPagerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+/// WAL-index mappings obtained through the pager's exact main-file handle.
+///
+/// Retains only the shared file handle, so a WAL adapter can own this source
+/// without retaining the pager or opening a second database descriptor.
+#[derive(Debug)]
+pub struct WalIndexShmSource<F: VfsFile> {
+    db_file: SharedDbFile<F>,
+}
+
+impl<F: VfsFile> WalIndexShmSource<F> {
+    /// Map a 32 KiB WAL-index region and release the file guard before returning.
+    ///
+    /// The returned region aliases the VFS mapping. Acquisition preserves the
+    /// caller's cancellation and masking behavior through the pager lock helper.
+    pub async fn map_region(
+        &self,
+        cx: &Cx,
+        region: u32,
+        extend: bool,
+    ) -> Result<fsqlite_vfs::ShmRegion> {
+        shared_db_file_write(&self.db_file, cx).await?.shm_map(
+            cx,
+            region,
+            fsqlite_vfs::shm::SHM_SEGMENT_SIZE,
+            extend,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SharedDbFileKey(usize);
@@ -14584,6 +14623,18 @@ where
         Arc::clone(&self.vfs)
     }
 
+    /// Obtain a WAL-index mapping source bound to the existing main-file handle.
+    pub fn wal_index_shm_source(&self) -> Result<Arc<WalIndexShmSource<V::File>>> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        Ok(Arc::new(WalIndexShmSource { db_file }))
+    }
+
     /// Return the identity of the already-open main database file.
     ///
     /// The VFS implementation determines whether a stable descriptor identity
@@ -22410,51 +22461,42 @@ where
                         cx,
                     )
                     .await?;
-                    let (restore_lock_level, initial_visible_commit_seq, checkpoint_active) = {
+                    let (initial_visible_commit_seq, checkpoint_active) = {
                         #[cfg(test)]
                         record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                         let inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
                         inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
-                        (
-                            if inner.writer_active {
-                                // Immediate/exclusive transactions enter commit
-                                // already owning RESERVED. If WAL append fails,
-                                // the caller must keep that writer lock so a
-                                // retry or rollback cannot be interleaved by a
-                                // different writer.
-                                LockLevel::Reserved
-                            } else {
-                                LockLevel::Shared
-                            },
-                            inner.commit_seq,
-                            inner.checkpoint_active,
-                        )
+                        (inner.commit_seq, inner.checkpoint_active)
                     };
                     flush_result = async {
                         let t_excl_start = phase_timing.then(Instant::now);
-                        // WAL appends need a cross-process writer gate, but
-                        // they must not wait for every concurrent reader or
-                        // writer transaction that already holds SHARED on the
-                        // main database file. SQLite's RESERVED byte is the
-                        // narrow lock for this: one appender at a time, while
-                        // peer SHARED holders keep running.
-                        shared_db_lock(&db_file, cx, LockLevel::Reserved).await?;
+                        // Arm cleanup before acquiring either native WRITE or
+                        // the main-file appender fence. The backend captures
+                        // the exact baseline, including a pre-existing RESERVED
+                        // claim from an explicit Immediate transaction. Neither
+                        // fence is held during concurrent MVCC preparation.
                         let mut db_lock_obligation = GroupCommitDbLockObligation::new(
                             queue,
                             flush_epoch,
                             &db_file,
                             cx,
-                            restore_lock_level,
+                            PendingExternalUnlockTarget::ExternalWalAppend,
                             flush_obligation.durability_started_signal(),
                             flush_obligation.durable_io_signal(),
                             flush_obligation.external_lock_state(),
                             physical_lock_window,
                         );
-                        exclusive_lock_us = elapsed_profile_us(t_excl_start);
-
                         let flush_io_result = async {
+                            // Acquisition errors use the same awaited cleanup
+                            // and error merge as append errors below. Otherwise
+                            // a Busy plus failed Drop restore could retry while
+                            // its own queued cleanup still owns this window.
+                            shared_db_file_write(&db_file, cx)
+                                .await?
+                                .lock_external_wal_append(cx)?;
+                            exclusive_lock_us = elapsed_profile_us(t_excl_start);
                             let backend = wal_backend_handle(wal_backend)?;
                             #[cfg(test)]
                             record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendWrite);
@@ -22615,19 +22657,15 @@ where
                                         });
                                     }
                                 }
-                                // bd-9inpb allocator-race hunt: env-gated
-                                // guard→append TOCTOU-window amplifier. Every
-                                // freelist guard above validated against the
-                                // physical WAL tail under PER-CONNECTION locks
-                                // only (backend rwlock + per-connection-key
-                                // physical_lock_window); cross-connection
-                                // serialization happens INSIDE
-                                // prepare_persisted_epoch below. A sleep here
-                                // holds no cross-connection lock, so it widens
-                                // the window in which a concurrent peer epoch
-                                // validates against the SAME pre-append tail
-                                // and both grant the same freelist page. Inert
-                                // unless FSQLITE_RACE_AMPLIFY_US is set.
+                                // bd-9inpb allocator-race probe. Native append
+                                // attempts now retain WAL_WRITE and the main
+                                // RESERVED fence across these guards and the
+                                // append. This delay stretches that held
+                                // interval; it no longer opens the historical
+                                // native guard-to-append race. Nonlocking test
+                                // VFS backends do not supply that physical
+                                // exclusion. Inert unless
+                                // FSQLITE_RACE_AMPLIFY_US is set.
                                 if let Some(us) = race_amplify_window_us() {
                                     std::thread::sleep(std::time::Duration::from_micros(us));
                                 }
@@ -22750,7 +22788,7 @@ where
                                 let wal_completion =
                                     Arc::new(Mutex::new(None::<VfsWriteCompletion>));
                                 let recovery_epoch_consumer =
-                                    queue.register_epoch_consumer(flush_epoch);
+                                    Arc::clone(&db_lock_obligation.epoch_consumer);
                                 let recovery =
                                     Arc::new(PendingGroupCommitRecovery::<V::File> {
                                         queue: Arc::downgrade(queue),
@@ -22902,7 +22940,7 @@ where
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
                             (Err(flush_error), Err(restore_error)) => {
                                 Err(FrankenError::internal(format!(
-                                    "flush failed and could not restore SHARED lock: flush={flush_error}; restore={restore_error}"
+                                    "flush failed and could not restore external append locks: flush={flush_error}; restore={restore_error}"
                                 )))
                             }
                         }
@@ -29861,6 +29899,8 @@ mod tests {
         memory_fast_path: Arc<AtomicBool>,
         external_snapshot_acquire_failures: Arc<AtomicUsize>,
         external_maintenance_acquire_failures: Arc<AtomicUsize>,
+        external_append_acquire_failures: Arc<AtomicUsize>,
+        external_append_restore_failures: Arc<AtomicUsize>,
         external_restore_failures: Arc<AtomicUsize>,
         external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
         external_restore_checkpoint_observations: Arc<Mutex<Vec<bool>>>,
@@ -29876,6 +29916,8 @@ mod tests {
                 memory_fast_path: Arc::new(AtomicBool::new(true)),
                 external_snapshot_acquire_failures: Arc::new(AtomicUsize::new(0)),
                 external_maintenance_acquire_failures: Arc::new(AtomicUsize::new(0)),
+                external_append_acquire_failures: Arc::new(AtomicUsize::new(0)),
+                external_append_restore_failures: Arc::new(AtomicUsize::new(0)),
                 external_restore_failures: Arc::new(AtomicUsize::new(0)),
                 external_restore_publication_probe: Arc::new(Mutex::new(None)),
                 external_restore_checkpoint_observations: Arc::new(Mutex::new(Vec::new())),
@@ -29942,8 +29984,11 @@ mod tests {
         fail_unlock_on_checkpoint_error: bool,
         external_snapshot_prior_level: Option<LockLevel>,
         external_maintenance_prior_level: Option<LockLevel>,
+        external_append_prior_level: Option<LockLevel>,
         external_snapshot_acquire_failures: Arc<AtomicUsize>,
         external_maintenance_acquire_failures: Arc<AtomicUsize>,
+        external_append_acquire_failures: Arc<AtomicUsize>,
+        external_append_restore_failures: Arc<AtomicUsize>,
         external_restore_failures: Arc<AtomicUsize>,
         external_restore_publication_probe: Arc<Mutex<Option<Weak<PublishedPagerState>>>>,
         external_restore_checkpoint_observations: Arc<Mutex<Vec<bool>>>,
@@ -29999,11 +30044,18 @@ mod tests {
                     fail_unlock_on_checkpoint_error: self.fail_unlock_on_checkpoint_error,
                     external_snapshot_prior_level: None,
                     external_maintenance_prior_level: None,
+                    external_append_prior_level: None,
                     external_snapshot_acquire_failures: Arc::clone(
                         &self.external_snapshot_acquire_failures,
                     ),
                     external_maintenance_acquire_failures: Arc::clone(
                         &self.external_maintenance_acquire_failures,
+                    ),
+                    external_append_acquire_failures: Arc::clone(
+                        &self.external_append_acquire_failures,
+                    ),
+                    external_append_restore_failures: Arc::clone(
+                        &self.external_append_restore_failures,
                     ),
                     external_restore_failures: Arc::clone(&self.external_restore_failures),
                     external_restore_publication_probe: Arc::clone(
@@ -30100,6 +30152,52 @@ mod tests {
             if self.observe_lock_state {
                 *self.observed_lock_level.lock().unwrap() = level;
             }
+            Ok(())
+        }
+
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            if !self.observe_lock_state {
+                return self.inner.lock_external_wal_append(cx);
+            }
+            if self.external_append_prior_level.is_some() {
+                return Err(FrankenError::internal("observed append already active"));
+            }
+            let prior_level = *self.observed_lock_level.lock().unwrap();
+            self.external_append_prior_level = Some(prior_level);
+            self.inner.lock_external_wal_append(cx)?;
+            *self.observed_lock_level.lock().unwrap() = prior_level.max(LockLevel::Reserved);
+            if consume_observed_lock_failure(&self.external_append_acquire_failures) {
+                return Err(FrankenError::Busy);
+            }
+            Ok(())
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            if !self.observe_lock_state {
+                return self.inner.restore_external_wal_append_attempt(cx);
+            }
+            let Some(prior_level) = self.external_append_prior_level else {
+                return self.inner.restore_external_wal_append_attempt(cx);
+            };
+            // Preserve the original physical-unlock observation and cancellation
+            // injection at the new production seam. Snapshot/maintenance-only
+            // failure counters remain attached to their original operations.
+            self.observed_unlock_trace_ids
+                .lock()
+                .unwrap()
+                .push(cx.trace_id());
+            if self.fail_unlock_on_checkpoint_error {
+                cx.checkpoint()
+                    .map_err(|err| FrankenError::internal(err.to_string()))?;
+            }
+            if consume_observed_lock_failure(&self.external_append_restore_failures) {
+                return Err(FrankenError::internal(
+                    "injected append restoration failure",
+                ));
+            }
+            self.inner.restore_external_wal_append_attempt(cx)?;
+            *self.observed_lock_level.lock().unwrap() = prior_level;
+            self.external_append_prior_level = None;
             Ok(())
         }
 
@@ -30261,11 +30359,17 @@ mod tests {
         (pager, observed_lock_level, observed_unlock_trace_ids)
     }
 
+    const SYNTHETIC_WAL_LOCK_WAIT_BUDGET: Duration = Duration::from_secs(10);
+
+    // These metrics observe the test backend's synthetic WAL-file critical
+    // section, not the production main-file append gate or an OS lock.
     #[derive(Debug, Default)]
     struct ExclusiveLockMetrics {
         owner: Option<u64>,
         acquired_at: Option<Instant>,
         acquisition_count: usize,
+        blocked_acquisition_count: usize,
+        first_owner_rendezvous: Option<Duration>,
         hold_samples_ns: Vec<u64>,
         wait_samples_ns: Vec<u64>,
     }
@@ -30304,12 +30408,35 @@ mod tests {
             Arc::clone(&self.observed_lock_level)
         }
 
-        fn wait_for_exclusive_acquisitions(&self, target: usize) {
+        fn wait_for_exclusive_acquisitions(&self, target: usize) -> Result<()> {
             let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
-            let mut metrics = metrics_lock.lock().unwrap();
-            while metrics.acquisition_count < target {
-                metrics = metrics_ready.wait(metrics).unwrap();
+            let metrics = metrics_lock.lock().unwrap();
+            let (metrics, _) = metrics_ready
+                .wait_timeout_while(metrics, SYNTHETIC_WAL_LOCK_WAIT_BUDGET, |metrics| {
+                    metrics.acquisition_count < target
+                })
+                .unwrap();
+            if metrics.acquisition_count < target {
+                return Err(FrankenError::internal(format!(
+                    "synthetic WAL lock acquisition timed out: expected {target}, observed {}",
+                    metrics.acquisition_count
+                )));
             }
+            Ok(())
+        }
+
+        fn hold_first_exclusive_owner_until_contended(&self, timeout: Duration) {
+            let (metrics_lock, _) = &*self.exclusive_metrics;
+            let mut metrics = metrics_lock.lock().unwrap();
+            assert!(metrics.owner.is_none());
+            assert_eq!(metrics.acquisition_count, 0);
+            assert_eq!(metrics.blocked_acquisition_count, 0);
+            metrics.first_owner_rendezvous = Some(timeout);
+        }
+
+        fn blocked_exclusive_acquisitions(&self) -> usize {
+            let (metrics_lock, _) = &*self.exclusive_metrics;
+            metrics_lock.lock().unwrap().blocked_acquisition_count
         }
 
         fn exclusive_hold_samples_ns(&self) -> Vec<u64> {
@@ -30337,23 +30464,60 @@ mod tests {
         exclusive_metrics: StdArc<(StdMutex<ExclusiveLockMetrics>, StdCondvar)>,
         external_snapshot_prior_level: Option<LockLevel>,
         external_maintenance_prior_level: Option<LockLevel>,
+        external_append_prior_level: Option<LockLevel>,
     }
 
     impl BlockingObservedLockFile {
-        fn acquire_exclusive_hold(&self) {
-            let wait_started = Instant::now();
+        fn acquire_exclusive_hold(&self) -> Result<()> {
             let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
             let mut metrics = metrics_lock.lock().unwrap();
-            while metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
-                metrics = metrics_ready.wait(metrics).unwrap();
-            }
-            metrics
-                .wait_samples_ns
-                .push(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let wait_ns = if metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
+                let wait_started = Instant::now();
+                metrics.blocked_acquisition_count =
+                    metrics.blocked_acquisition_count.saturating_add(1);
+                metrics_ready.notify_all();
+                let (next_metrics, _) = metrics_ready
+                    .wait_timeout_while(metrics, SYNTHETIC_WAL_LOCK_WAIT_BUDGET, |metrics| {
+                        metrics.owner.is_some() && metrics.owner != Some(self.handle_id)
+                    })
+                    .unwrap();
+                metrics = next_metrics;
+                if metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
+                    return Err(FrankenError::internal(
+                        "synthetic WAL lock timed out waiting for another owner to release",
+                    ));
+                }
+                u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            } else {
+                // Mutex and clock overhead is not evidence of contention.
+                0
+            };
+            metrics.wait_samples_ns.push(wait_ns);
             metrics.owner = Some(self.handle_id);
             metrics.acquired_at = Some(Instant::now());
             metrics.acquisition_count = metrics.acquisition_count.saturating_add(1);
             metrics_ready.notify_all();
+            if metrics.acquisition_count == 1
+                && let Some(timeout) = metrics.first_owner_rendezvous.take()
+            {
+                // Only correctness keepers opt in. Benchmarks retain their
+                // natural scheduling and never measure this injected delay.
+                let (next_metrics, _) = metrics_ready
+                    .wait_timeout_while(metrics, timeout, |metrics| {
+                        metrics.blocked_acquisition_count == 0
+                    })
+                    .unwrap();
+                metrics = next_metrics;
+                if metrics.blocked_acquisition_count == 0 {
+                    metrics.owner = None;
+                    metrics.acquired_at = None;
+                    metrics_ready.notify_all();
+                    return Err(FrankenError::internal(
+                        "synthetic WAL lock rendezvous timed out: no competing writer reached the held lock",
+                    ));
+                }
+            }
+            Ok(())
         }
 
         fn release_exclusive_hold(&self) {
@@ -30394,6 +30558,7 @@ mod tests {
                     exclusive_metrics: StdArc::clone(&self.exclusive_metrics),
                     external_snapshot_prior_level: None,
                     external_maintenance_prior_level: None,
+                    external_append_prior_level: None,
                 },
                 actual_flags,
             ))
@@ -30458,11 +30623,18 @@ mod tests {
         }
 
         fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-            if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
-                self.acquire_exclusive_hold();
+            let acquired_exclusive =
+                self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive;
+            if acquired_exclusive {
+                self.acquire_exclusive_hold()?;
             }
 
-            self.inner.lock(cx, level)?;
+            if let Err(error) = self.inner.lock(cx, level) {
+                if acquired_exclusive {
+                    self.release_exclusive_hold();
+                }
+                return Err(error);
+            }
             if self.lock_level < level {
                 self.lock_level = level;
             }
@@ -30480,6 +30652,28 @@ mod tests {
                 self.lock_level = level;
             }
             *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            if self.external_append_prior_level.is_some() {
+                return Err(FrankenError::internal("blocking observed append already active"));
+            }
+            self.external_append_prior_level = Some(self.lock_level);
+            self.inner.lock_external_wal_append(cx)?;
+            self.lock_level = self.lock_level.max(LockLevel::Reserved);
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            let Some(prior_level) = self.external_append_prior_level else {
+                return self.inner.restore_external_wal_append_attempt(cx);
+            };
+            self.inner.restore_external_wal_append_attempt(cx)?;
+            self.lock_level = prior_level;
+            *self.observed_lock_level.lock().unwrap() = prior_level;
+            self.external_append_prior_level = None;
             Ok(())
         }
 
@@ -30504,6 +30698,11 @@ mod tests {
                 return self.inner.restore_external_shared_snapshot_attempt(cx);
             };
             self.inner.restore_external_shared_snapshot_attempt(cx)?;
+            // Rollback commit may upgrade this snapshot through lock(Exclusive).
+            // Exact VFS restoration bypasses this wrapper's unlock method.
+            if self.lock_level >= LockLevel::Exclusive && prior_level < LockLevel::Exclusive {
+                self.release_exclusive_hold();
+            }
             self.lock_level = prior_level;
             *self.observed_lock_level.lock().unwrap() = self.lock_level;
             self.external_snapshot_prior_level = None;
@@ -30521,7 +30720,7 @@ mod tests {
             let prior_level = self.lock_level;
             self.external_maintenance_prior_level = Some(prior_level);
             if prior_level < LockLevel::Exclusive {
-                self.acquire_exclusive_hold();
+                self.acquire_exclusive_hold()?;
             }
             self.inner.lock_external_maintenance(cx, wal_mode)?;
             self.lock_level = LockLevel::Exclusive;
@@ -30850,6 +31049,14 @@ mod tests {
             self.inner.restore_external_shared_snapshot_attempt(cx)
         }
 
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
+        }
+
         fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
             self.inner.lock_external_maintenance(cx, wal_mode)
         }
@@ -31120,6 +31327,14 @@ mod tests {
 
         fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
             self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
         }
 
         fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
@@ -37489,6 +37704,10 @@ mod tests {
 
         let seed_pager = vfs.open_file_backed_pager(&db_path).await.unwrap();
         track_c_seed_existing_pages_blocking(&seed_pager, &cx, dirty_pages).await;
+        assert!(
+            vfs.exclusive_metrics.0.lock().unwrap().owner.is_none(),
+            "seed transaction must release its synthetic exclusive owner"
+        );
         drop(seed_pager);
 
         let pager = vfs.open_file_backed_pager(&db_path).await.unwrap();
@@ -37548,6 +37767,10 @@ mod tests {
         let seed_pager = vfs.open_file_backed_pager(&db_path).await.unwrap();
         track_c_seed_existing_pages_blocking(&seed_pager, &seed_cx, dirty_pages.saturating_mul(2))
             .await;
+        assert!(
+            vfs.exclusive_metrics.0.lock().unwrap().owner.is_none(),
+            "seed transaction must release its synthetic exclusive owner before reopening"
+        );
         drop(seed_pager);
 
         let pager_a = vfs.open_file_backed_pager(&db_path).await.unwrap();
@@ -37598,7 +37821,8 @@ mod tests {
                 });
             });
 
-            vfs.wait_for_exclusive_acquisitions(1);
+            vfs.wait_for_exclusive_acquisitions(1)
+                .expect("benchmark writer must reach the synthetic WAL lock");
 
             let cx_b = Cx::new();
             let mut txn_b = pager_b
@@ -39061,6 +39285,14 @@ mod tests {
 
         fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
             self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
         }
 
         fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
@@ -40557,6 +40789,130 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_append_acquisition_and_restore_failure_does_not_retry_own_window() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let observed_lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/append-acquisition-cleanup-retry.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, _begin_calls, batch_calls, sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let baseline = *observed_lock_level.lock().unwrap();
+            let queue = Arc::clone(&pager.group_commit_queue);
+            let page = PageNumber::new(2).unwrap();
+            let mut write_set = HashMap::new();
+            write_set.insert(
+                page,
+                StagedPage::from_bytes(&pager.pool, &vec![0x55; PageSize::DEFAULT.as_usize()])
+                    .unwrap(),
+            );
+
+            // Refuse acquisition after taking the fence, then fail both the
+            // awaited restoration and Drop's immediate retry. The queued owner
+            // must survive, but the flusher must return instead of awaiting its
+            // own still-held physical window on a Busy retry.
+            vfs.external_append_acquire_failures
+                .store(1, AtomicOrdering::Release);
+            vfs.external_append_restore_failures
+                .store(2, AtomicOrdering::Release);
+            let error = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(4),
+                SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                    &cx,
+                    &pager.wal_backend,
+                    &pager.inner,
+                    &write_set,
+                    &[page],
+                    &[],
+                    &queue,
+                ),
+            )
+            .await
+            .expect("failed append acquisition must not wait on its own cleanup")
+            .expect_err("acquisition and restoration failure must surface");
+            assert!(
+                error.to_string().contains("injected append restoration failure")
+            );
+            assert!(!matches!(
+                error,
+                FrankenError::Busy | FrankenError::BusyRecovery
+            ));
+            assert!(frames.lock().unwrap().is_empty());
+            assert_eq!(*batch_calls.lock().unwrap(), 0);
+            assert_eq!(*sync_calls.lock().unwrap(), 0);
+            assert_eq!(
+                vfs.external_append_acquire_failures.load(AtomicOrdering::Acquire),
+                0
+            );
+            assert_eq!(
+                vfs.external_append_restore_failures.load(AtomicOrdering::Acquire),
+                0
+            );
+            assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Reserved);
+            assert_eq!(queue.pending_external_unlocks.lock().unwrap().len(), 1);
+            let pending_epoch = queue.pending_external_unlocks.lock().unwrap()[0]
+                .epoch
+                .expect("physical cleanup must retain its exact epoch");
+            assert_eq!(
+                queue.epoch_consumer_counts.lock().unwrap().get(&pending_epoch),
+                Some(&1),
+                "physical cleanup must own the failure evidence after the caller returns"
+            );
+            assert!(queue.failed_epochs.lock().unwrap().contains_key(&pending_epoch));
+            assert_eq!(
+                queue
+                    .external_lock_coordination
+                    .lock()
+                    .unwrap()
+                    .physical_lock_windows
+                    .len(),
+                1,
+                "failed cleanup must retain exactly one physical owner"
+            );
+
+            assert!(queue.resolve_one_pending_external_unlock().await.unwrap());
+            assert_eq!(*observed_lock_level.lock().unwrap(), baseline);
+            assert!(queue.pending_external_unlocks.lock().unwrap().is_empty());
+            assert!(!queue.epoch_consumer_counts.lock().unwrap().contains_key(&pending_epoch));
+            assert!(!queue.failed_epochs.lock().unwrap().contains_key(&pending_epoch));
+            assert!(
+                queue
+                    .external_lock_coordination
+                    .lock()
+                    .unwrap()
+                    .physical_lock_windows
+                    .is_empty()
+            );
+            assert_eq!(
+                queue.rooted_finalization_attempts.load(AtomicOrdering::Acquire),
+                0
+            );
+
+            SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                &cx,
+                &pager.wal_backend,
+                &pager.inner,
+                &write_set,
+                &[page],
+                &[],
+                &queue,
+            )
+            .await
+            .expect("a fresh physical commit must succeed after exact cleanup");
+            assert_eq!(frames.lock().unwrap().len(), 1);
+            assert_eq!(*batch_calls.lock().unwrap(), 1);
+            assert_eq!(*sync_calls.lock().unwrap(), 1);
+            assert_eq!(*observed_lock_level.lock().unwrap(), baseline);
+        });
+    }
+
+    #[test]
     fn test_group_commit_prewrite_error_separates_physical_and_logical_unlocks() {
         asupersync::test_utils::run_test(|| async {
             let vfs = ObservedLockVfs::new();
@@ -41898,7 +42254,70 @@ mod tests {
                 hold_samples[0] > 0,
                 "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=hold_sample_positive"
             );
+            assert_eq!(vfs.blocked_exclusive_acquisitions(), 0);
+            assert_eq!(
+                vfs.exclusive_wait_samples_ns(),
+                [0],
+                "uncontended acquisition overhead must not be reported as writer wait"
+            );
         });
+    }
+
+    #[test]
+    fn test_publish_window_snapshot_restore_releases_only_its_exclusive_upgrade() {
+        for baseline in [LockLevel::None, LockLevel::Exclusive] {
+            let cx = Cx::new();
+            let vfs = BlockingObservedLockVfs::new();
+            let (mut file, _) = vfs
+                .open(
+                    &cx,
+                    Some(Path::new("/publish-window-snapshot-restore.db")),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+                )
+                .unwrap();
+            file.lock(&cx, baseline).unwrap();
+            file.lock_external_shared_snapshot(&cx).unwrap();
+            file.lock(&cx, LockLevel::Exclusive).unwrap();
+            file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+            file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+            assert_eq!(file.lock_level, baseline);
+            let expected_owner = (baseline == LockLevel::Exclusive).then_some(file.handle_id);
+            assert_eq!(vfs.exclusive_metrics.0.lock().unwrap().owner, expected_owner);
+            assert_eq!(
+                vfs.exclusive_hold_samples_ns().len(),
+                usize::from(baseline != LockLevel::Exclusive)
+            );
+            file.unlock(&cx, LockLevel::None).unwrap();
+            assert!(vfs.exclusive_metrics.0.lock().unwrap().owner.is_none());
+            assert_eq!(vfs.exclusive_hold_samples_ns().len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_publish_window_contention_rendezvous_times_out_without_contender() {
+        let cx = Cx::new();
+        let vfs = BlockingObservedLockVfs::new();
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("/publish-window-rendezvous-timeout.db-wal")),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .unwrap();
+        vfs.hold_first_exclusive_owner_until_contended(Duration::ZERO);
+
+        let error = file
+            .lock(&cx, LockLevel::Exclusive)
+            .expect_err("a missing contender must fail instead of hanging");
+        assert!(error.to_string().contains("no competing writer reached"));
+        assert_eq!(file.lock_level, LockLevel::None);
+        assert_eq!(vfs.blocked_exclusive_acquisitions(), 0);
+        assert!(vfs.exclusive_metrics.0.lock().unwrap().owner.is_none());
+
+        file.lock(&cx, LockLevel::Exclusive)
+            .expect("timed-out rendezvous must release its synthetic owner");
+        file.unlock(&cx, LockLevel::None).unwrap();
+        assert_eq!(vfs.exclusive_hold_samples_ns().len(), 1);
     }
 
     #[test]
@@ -41906,6 +42325,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let (vfs, pager_a, pager_b) =
                 track_c_open_contending_pagers(TrackCPublishWindowMode::PreparedCandidate, 7).await;
+            vfs.hold_first_exclusive_owner_until_contended(SYNTHETIC_WAL_LOCK_WAIT_BUDGET);
             let writer_a = std::thread::spawn(move || {
                 asupersync::test_utils::run_test(|| async {
                     let cx = Cx::new();
@@ -41918,7 +42338,8 @@ mod tests {
                 });
             });
 
-            vfs.wait_for_exclusive_acquisitions(1);
+            vfs.wait_for_exclusive_acquisitions(1)
+                .expect("writer A must reach the synthetic WAL lock");
 
             let cx_b = Cx::new();
             let mut txn_b = pager_b
@@ -41929,14 +42350,21 @@ mod tests {
             txn_b.commit(&cx_b).await.unwrap();
             writer_a.join().unwrap();
 
+            assert_eq!(
+                vfs.blocked_exclusive_acquisitions(),
+                1,
+                "writer B must reach writer A's still-held synthetic WAL lock"
+            );
+            assert_eq!(vfs.exclusive_hold_samples_ns().len(), 2);
             let wait_samples = vfs.exclusive_wait_samples_ns();
             assert_eq!(
                 wait_samples.len(),
                 2,
                 "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=wait_sample_count"
             );
+            assert_eq!(wait_samples[0], 0, "writer A was uncontended");
             assert!(
-                wait_samples.iter().copied().max().unwrap_or(0) > 0,
+                wait_samples[1] > 0,
                 "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=contending_writer_wait_positive"
             );
         });
@@ -44421,7 +44849,7 @@ mod tests {
                 flush_epoch,
                 &db_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 flush_obligation.durability_started_signal(),
                 flush_obligation.durable_io_signal(),
                 flush_obligation.external_lock_state(),
@@ -44469,7 +44897,7 @@ mod tests {
                 flush_epoch,
                 &global_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 flush_obligation.durability_started_signal(),
                 flush_obligation.durable_io_signal(),
                 flush_obligation.external_lock_state(),
@@ -44496,6 +44924,7 @@ mod tests {
                     cleanup_cx: cleanup_child_cx(&cx),
                     restore_target: PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                     restored: Arc::new(AtomicBool::new(false)),
+                    _epoch_consumer: None,
                 }),
             });
 
@@ -44576,6 +45005,7 @@ mod tests {
                         cleanup_cx: cleanup_child_cx(&cx),
                         restore_target: PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                         restored: Arc::new(AtomicBool::new(false)),
+                        _epoch_consumer: None,
                     }),
                 });
             };
@@ -45615,7 +46045,7 @@ mod tests {
                 flush_epoch,
                 &db_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 flush_obligation.durability_started_signal(),
                 flush_obligation.durable_io_signal(),
                 flush_obligation.external_lock_state(),
@@ -45897,7 +46327,7 @@ mod tests {
                 flush_epoch,
                 &db_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 flush_obligation.durability_started_signal(),
                 flush_obligation.durable_io_signal(),
                 flush_obligation.external_lock_state(),
@@ -46354,7 +46784,7 @@ mod tests {
                 flush_epoch,
                 &db_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 Arc::clone(&durability_started),
                 Arc::clone(&durable_io_completed),
                 flush_obligation.external_lock_state(),
@@ -46464,7 +46894,7 @@ mod tests {
                 flush_epoch,
                 &db_file,
                 &cx,
-                LockLevel::Shared,
+                PendingExternalUnlockTarget::LockLevel(LockLevel::Shared),
                 durability_started,
                 durable_io_completed,
                 flush_obligation.external_lock_state(),
@@ -47713,10 +48143,10 @@ mod tests {
                 cases.push(json!({
                     "scenario_id": scenario_id,
                     "dirty_pages": dirty_pages,
-                    "exclusive_window_hold_baseline": baseline_hold_summary,
-                    "exclusive_window_hold_candidate": candidate_hold_summary,
-                    "contending_writer_stall_baseline": baseline_stall_summary,
-                    "contending_writer_stall_candidate": candidate_stall_summary,
+                    "synthetic_wal_lock_hold_baseline": baseline_hold_summary,
+                    "synthetic_wal_lock_hold_candidate": candidate_hold_summary,
+                    "synthetic_wal_lock_contended_wait_baseline": baseline_stall_summary,
+                    "synthetic_wal_lock_contended_wait_candidate": candidate_stall_summary,
                     "hold_reduction_ratio_median": if baseline_hold_median == 0 {
                         0.0
                     } else {
@@ -47732,7 +48162,9 @@ mod tests {
                     } else {
                         "inline_prepare_baseline"
                     },
-                    "faster_variant_by_stall_median": if candidate_stall_median <= baseline_stall_median {
+                    "faster_variant_by_stall_median": if baseline_stall_median == 0 && candidate_stall_median == 0 {
+                        "no_median_contended_wait_observed"
+                    } else if candidate_stall_median <= baseline_stall_median {
                         "prepared_candidate"
                     } else {
                         "inline_prepare_baseline"
@@ -47741,15 +48173,17 @@ mod tests {
             }
 
             let report = json!({
-                "schema_version": "fsqlite.track_c.publish_window_benchmark.v1",
+                "schema_version": "fsqlite.track_c.publish_window_benchmark.v2",
                 "bead_id": TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID,
                 "parent_bead_id": "bd-db300.3.2",
-                "measured_operation": "pager_commit_wal_publish_window",
+                "measured_operation": "synthetic_wal_append_critical_section",
                 "warmup_iterations": TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS,
                 "measurement_iterations": TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS,
                 "vfs": "blocking_memory_vfs",
-                "baseline_variant": "inline_prepare_under_exclusive_lock",
-                "candidate_variant": "prepared_batch_before_exclusive_lock",
+                "wait_measurement": "blocked_on_other_owner_only; uncontended acquisitions contribute zero",
+                "rendezvous_enabled": false,
+                "baseline_variant": "inline_prepare_under_synthetic_wal_lock",
+                "candidate_variant": "prepared_batch_before_synthetic_wal_lock",
                 "cases": cases,
             });
 
@@ -57121,6 +57555,14 @@ mod tests {
 
         fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
             self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
         }
 
         fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {

@@ -372,3 +372,228 @@ fn commit_survives_foreign_canonical_reader_pinning_a_snapshot() {
         }
     });
 }
+
+/// Validate the codec against headers actually emitted by bundled stock
+/// SQLite. This is format evidence; it does not exercise FrankenSQLite's
+/// still-pending native shared-index publication path.
+#[test]
+fn gh19_wal_index_codec_accepts_stock_headers_and_commit_counters() {
+    use fsqlite_wal::wal_index::{WAL_INDEX_HDR_BYTES, WalIndexHdr, parse_shm_header};
+    use fsqlite_wal::{WalFrameHeader, WalHeader};
+
+    for page_size in [512_u32, 4096, 65_536] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("stock-wal-index.db");
+        let stock = rusqlite::Connection::open(&db).expect("stock open");
+        stock
+            .execute_batch(&format!(
+                "PRAGMA page_size={page_size}; PRAGMA journal_mode=WAL; \
+                 PRAGMA wal_autocheckpoint=0; CREATE TABLE t(id INTEGER PRIMARY KEY); \
+                 INSERT INTO t VALUES(1);"
+            ))
+            .expect("stock fixture");
+        let before_bytes = std::fs::read(sidecar(&db, "-shm")).expect("stock SHM");
+        let (before, _) = parse_shm_header(&before_bytes)
+            .expect("parse stock SHM")
+            .expect("stock publishes valid matching headers");
+        let schema_before: u32 = stock
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .expect("schema cookie");
+
+        stock.execute("INSERT INTO t VALUES(2)", []).expect("commit");
+        let bytes = std::fs::read(sidecar(&db, "-shm")).expect("new stock SHM");
+        let (header, _) = parse_shm_header(&bytes)
+            .expect("parse stock SHM")
+            .expect("published stock header");
+        assert_eq!(header.i_change, before.i_change.wrapping_add(1));
+        assert!(header.mx_frame > before.mx_frame);
+        let schema_after: u32 = stock
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .expect("schema cookie after data-only commit");
+        assert_eq!(schema_before, schema_after, "iChange is not the schema cookie");
+        assert_eq!(header.page_size().expect("page-size decode"), page_size);
+        if page_size == 65_536 {
+            assert_eq!(header.sz_page, 1);
+        }
+
+        let wal = std::fs::read(sidecar(&db, "-wal")).expect("stock WAL");
+        let wal_header = WalHeader::from_bytes(&wal).expect("WAL header");
+        assert_eq!(
+            header.a_salt,
+            [wal_header.salts.salt1, wal_header.salts.salt2]
+        );
+        assert_eq!(&bytes[32..40], &wal[16..24], "salt bytes are copied verbatim");
+        assert_eq!(header.big_end_cksum, u8::from(wal_header.big_endian_checksum()));
+        let frame_offset = 32
+            + usize::try_from(header.mx_frame - 1).expect("frame index")
+                * (24 + usize::try_from(page_size).expect("page size"));
+        let frame = WalFrameHeader::from_bytes(&wal[frame_offset..]).expect("commit frame");
+        assert_eq!(header.n_page, frame.db_size);
+        assert_eq!(header.a_frame_cksum, [frame.checksum.s1, frame.checksum.s2]);
+        let mut checksummed = header;
+        checksummed.a_cksum = [0; 2];
+        checksummed.update_checksum().expect("native checksum");
+        assert_eq!(checksummed.a_cksum, header.a_cksum, "stock checksum oracle");
+        assert_eq!(header.to_bytes(), bytes[..WAL_INDEX_HDR_BYTES]);
+
+        let mut damaged = bytes;
+        damaged[16] ^= 1;
+        damaged[WAL_INDEX_HDR_BYTES + 16] ^= 1;
+        assert!(parse_shm_header(&damaged).expect("parse damaged").is_none());
+        assert!(
+            WalIndexHdr::from_bytes(&damaged)
+                .expect("decode damaged")
+                .validate()
+                .is_err()
+        );
+        eprintln!(
+            "GH19 stock codec: page_size={page_size} mxFrame={} iChange={}->{}",
+            header.mx_frame, before.i_change, header.i_change
+        );
+    }
+}
+
+#[test]
+fn gh19_native_hash_bytes_match_stock_across_segment_boundaries() {
+    use fsqlite_wal::WalFrameHeader;
+    use fsqlite_wal::wal_index::{
+        WAL_SHM_FIRST_HEADER_BYTES, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation,
+        append_native_wal_index_entry, lookup_native_wal_index_frame, parse_shm_header,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("stock-wal-hash.db");
+    let stock = rusqlite::Connection::open(&db).expect("stock open");
+    // This checks live byte layout, not crash durability. Avoid 9000 fsyncs
+    // in the stock fixture; the FrankenSQLite durability keepers are separate.
+    stock
+        .execute_batch(
+            "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; \
+             PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=OFF; \
+             CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(0);",
+        )
+        .expect("stock fixture");
+    let mut update = stock.prepare("UPDATE t SET n=n+1").expect("prepare");
+    for _ in 0..9000 {
+        assert_eq!(update.execute([]).expect("stock append"), 1);
+    }
+    drop(update);
+    let bytes = std::fs::read(sidecar(&db, "-shm")).expect("stock SHM");
+    let (header, _) = parse_shm_header(&bytes)
+        .expect("parse")
+        .expect("published stock header");
+    assert!(header.mx_frame > 8159, "exercise first and subsequent boundaries");
+    let last = WalIndexFrameLocation::new(header.mx_frame).expect("last frame");
+    let region_count = usize::try_from(last.region).expect("region") + 1;
+    let mut rebuilt = vec![vec![0; WAL_SHM_SEGMENT_BYTES]; region_count];
+    rebuilt[0][..WAL_SHM_FIRST_HEADER_BYTES]
+        .copy_from_slice(&bytes[..WAL_SHM_FIRST_HEADER_BYTES]);
+    let wal = std::fs::read(sidecar(&db, "-wal")).expect("stock WAL");
+    let mut pages = Vec::new();
+    for frame_no in 1..=header.mx_frame {
+        let offset = 32 + usize::try_from(frame_no - 1).expect("frame") * (24 + 4096);
+        let frame = WalFrameHeader::from_bytes(&wal[offset..]).expect("frame header");
+        let location = WalIndexFrameLocation::new(frame_no).expect("frame location");
+        let region = usize::try_from(location.region).expect("region");
+        append_native_wal_index_entry(&mut rebuilt[region], frame_no, frame.page_number)
+            .expect("reconstruct from actual WAL frames");
+        pages.push(frame.page_number);
+    }
+    for (region, reconstructed) in rebuilt.iter().enumerate() {
+        let offset = region * WAL_SHM_SEGMENT_BYTES;
+        assert_eq!(
+            reconstructed.as_slice(),
+            &bytes[offset..offset + WAL_SHM_SEGMENT_BYTES],
+            "native region {region} must match stock byte for byte"
+        );
+    }
+    for horizon in [0, 1, 4061, 4062, 4063, 8158, 8159, header.mx_frame] {
+        for page in [1, 2, 8199] {
+            let expected = pages[..usize::try_from(horizon).expect("horizon")]
+                .iter()
+                .rposition(|&candidate| candidate == page)
+                .map(|index| u32::try_from(index + 1).expect("frame number"));
+            let actual = rebuilt.iter().enumerate().rev().find_map(|(region, _)| {
+                let offset = region * WAL_SHM_SEGMENT_BYTES;
+                lookup_native_wal_index_frame(
+                    &bytes[offset..offset + WAL_SHM_SEGMENT_BYTES],
+                    u32::try_from(region).expect("region"),
+                    page,
+                    horizon,
+                )
+                .expect("lookup in stock bytes")
+            });
+            assert_eq!(actual, expected, "page={page} horizon={horizon}");
+        }
+    }
+    eprintln!(
+        "GH19 native hash oracle: mxFrame={} regions={region_count} boundary=4062/4096",
+        header.mx_frame
+    );
+}
+
+/// The public commit path must own the same physical WRITE gate as a stock
+/// process. This does not establish shared-index publication after commit.
+#[test]
+fn gh19_physical_append_refuses_foreign_stock_writer_and_retries() {
+    const CHILD_PATH: &str = "FSQLITE_GH19_STOCK_WRITER_DB";
+    const TEST: &str = "gh19_physical_append_refuses_foreign_stock_writer_and_retries";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let writer = rusqlite::Connection::open(Path::new(&path)).expect("stock writer");
+        writer.execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE; UPDATE t SET k='uncommitted';")
+            .expect("stock owns WRITE with an uncommitted update");
+        println!("stock-writer-owns-write");
+        std::io::stdout().flush().unwrap();
+        expect_line("release");
+        writer.execute_batch("ROLLBACK;").expect("release stock WRITE");
+        println!("stock-writer-released");
+        std::io::stdout().flush().unwrap();
+        expect_line("exit");
+        return;
+    }
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("gh19-stock-writer.db");
+        let conn = Connection::open(db.to_str().unwrap()).await.expect("native writer");
+        conn.execute("PRAGMA wal_autocheckpoint=0;").await.unwrap();
+        conn.execute("PRAGMA busy_timeout=1;").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES(1,'baseline');").await.unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--nocapture"])
+            .env(CHILD_PATH, &db)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut wait_for = |expected: &str| {
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0, "child exited before {expected}");
+                if line.trim() == expected {
+                    break;
+                }
+            }
+        };
+        wait_for("stock-writer-owns-write");
+        // The stock peer has initialized the shared index before we pin a
+        // native snapshot. Concurrent preparation must remain admitted even
+        // though that peer already owns the physical WRITE gate.
+        conn.execute("BEGIN;").await.unwrap();
+        conn.execute("INSERT INTO t VALUES(2,'native');").await.unwrap();
+        let before = std::fs::read(sidecar(&db, "-wal")).expect("WAL before refused append");
+        let error = conn.execute("COMMIT;").await.expect_err("stock WRITE must exclude native append");
+        assert!(matches!(error, fsqlite_error::FrankenError::Busy), "exact physical contention: {error:?}");
+        assert_eq!(std::fs::read(sidecar(&db, "-wal")).unwrap(), before,
+            "refused physical append must not change WAL bytes");
+        conn.execute("ROLLBACK;").await.expect("rollback refused transaction");
+        signal_child(&mut child, "release");
+        wait_for("stock-writer-released");
+        conn.execute("BEGIN;").await.unwrap();
+        conn.execute("INSERT INTO t VALUES(2,'native');").await.unwrap();
+        conn.execute("COMMIT;").await.expect("retry after stock releases WRITE");
+        assert_eq!(scalar_i64(&conn.query("SELECT COUNT(*) FROM t;").await.unwrap()), 2);
+        signal_child(&mut child, "exit");
+        assert!(child.wait().unwrap().success());
+        conn.close().await.expect("close native writer");
+        assert_eq!(canonical_count(&db), 2, "stock reopen sees the acknowledged retry");
+    });
+}

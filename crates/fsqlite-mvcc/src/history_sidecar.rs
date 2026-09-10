@@ -2102,6 +2102,14 @@ mod tests {
             self.inner.restore_external_shared_snapshot_attempt(cx)
         }
 
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<(), FrankenError> {
+            self.inner.lock_external_wal_append(cx)
+        }
+
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<(), FrankenError> {
+            self.inner.restore_external_wal_append_attempt(cx)
+        }
+
         fn lock_external_maintenance(
             &mut self,
             cx: &Cx,

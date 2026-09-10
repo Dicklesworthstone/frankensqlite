@@ -1129,7 +1129,9 @@ impl ShmInfo {
         }
         let mut marks = [0u32; WAL_NREADER_USIZE];
         for (i, mark) in marks.iter_mut().enumerate() {
-            let Ok(value) = region_0.read_u32_ne(SHM_READ_MARK_OFFSET + i * 4) else {
+            let Ok(value) =
+                region_0.atomic_load_u32_ne(SHM_READ_MARK_OFFSET + i * 4, Ordering::Acquire)
+            else {
                 return [0; WAL_NREADER_USIZE];
             };
             *mark = value;
@@ -1385,6 +1387,7 @@ impl Vfs for UnixVfs {
             transient_shared_pending_gate: false,
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
+            external_append_attempt: None,
             delete_on_close,
             closed: false,
             inode_key,
@@ -1508,6 +1511,14 @@ struct UnixExternalSharedSnapshotAttempt {
     prior_main_level: LockLevel,
 }
 
+/// Exact ownership of the physical append's WRITE and main-file fences.
+#[derive(Debug, Clone, Copy)]
+struct UnixExternalAppendAttempt {
+    prior_main_level: LockLevel,
+    main_restore_pending: bool,
+    write_acquired: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UnixExternalMaintenanceAttempt {
     prior_main_level: LockLevel,
@@ -1558,6 +1569,7 @@ pub struct UnixFile {
     transient_shared_pending_gate: bool,
     external_shared_snapshot_attempt: Option<UnixExternalSharedSnapshotAttempt>,
     external_maintenance_attempt: Option<UnixExternalMaintenanceAttempt>,
+    external_append_attempt: Option<UnixExternalAppendAttempt>,
     delete_on_close: bool,
     closed: bool,
     inode_key: InodeKey,
@@ -1813,6 +1825,11 @@ impl UnixFile {
         wal_mode: bool,
         main_level: LockLevel,
     ) -> Result<()> {
+        if self.external_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire Unix maintenance during a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_attempt.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire Unix external maintenance during a shared-snapshot attempt",
@@ -2396,7 +2413,7 @@ impl UnixFile {
 
         let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
         let shm_offset = SHM_READ_MARK_OFFSET + slot_idx * 4;
-        let current_mark = region_0.read_u32_ne(shm_offset)?;
+        let current_mark = region_0.atomic_load_u32_ne(shm_offset, Ordering::Acquire)?;
 
         if current_mark == snapshot_mark {
             self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
@@ -2405,7 +2422,7 @@ impl UnixFile {
 
         // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
-        region_0.write_u32_ne(shm_offset, snapshot_mark)?;
+        region_0.atomic_store_u32_ne(shm_offset, snapshot_mark, Ordering::Release)?;
         self.shm_barrier();
         self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
@@ -2603,6 +2620,7 @@ impl UnixFile {
             transient_shared_pending_gate: self.transient_shared_pending_gate,
             external_shared_snapshot_attempt: self.external_shared_snapshot_attempt.take(),
             external_maintenance_attempt: self.external_maintenance_attempt.take(),
+            external_append_attempt: self.external_append_attempt.take(),
             delete_on_close: self.delete_on_close,
             closed: false,
             inode_key: self.inode_key,
@@ -2658,6 +2676,11 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
+        // The append baseline can be the enclosing snapshot's SHARED claim.
+        // Releasing that outer claim first would invalidate retry ownership.
+        if self.external_append_attempt.is_some() {
+            self.restore_external_wal_append_attempt(cx)?;
+        }
         if self.external_shared_snapshot_attempt.is_some() {
             self.restore_external_shared_snapshot_attempt(cx)?;
         }
@@ -2666,6 +2689,7 @@ impl VfsFile for UnixFile {
         }
         if self.external_shared_snapshot_attempt.is_some()
             || self.external_maintenance_attempt.is_some()
+            || self.external_append_attempt.is_some()
         {
             return Err(FrankenError::internal(
                 "Unix close retained an external lock-attempt obligation",
@@ -3219,6 +3243,11 @@ impl VfsFile for UnixFile {
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a Unix snapshot inside a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_attempt.is_some() {
             return Err(FrankenError::internal(
                 "Unix external shared-snapshot attempt is already armed",
@@ -3238,6 +3267,11 @@ impl VfsFile for UnixFile {
     }
 
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        if self.external_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "restore the Unix WAL append attempt before its enclosing snapshot",
+            ));
+        }
         let Some(attempt) = self.external_shared_snapshot_attempt else {
             return Ok(());
         };
@@ -3253,6 +3287,76 @@ impl VfsFile for UnixFile {
         )?;
         self.external_shared_snapshot_attempt = None;
         Ok(())
+    }
+
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if self.external_append_attempt.is_some() || self.external_maintenance_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "Unix WAL append cannot overlap another append or maintenance attempt",
+            ));
+        }
+        // Opening SHM can itself acquire the WAL attachment's lifetime claim.
+        // Publish the attempt before that operation or any raw lock change.
+        self.external_append_attempt = Some(UnixExternalAppendAttempt {
+            prior_main_level: self.lock_level,
+            main_restore_pending: true,
+            write_acquired: false,
+        });
+        if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
+            && let Some(attempt) = self.external_append_attempt.as_mut()
+        {
+            attempt.write_acquired = true;
+        }
+        self.lock(cx, LockLevel::Reserved)
+    }
+
+    fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        let Some(attempt) = self.external_append_attempt else {
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        if attempt.main_restore_pending {
+            let inode_info = Arc::clone(self.inode_info_ref());
+            let mut info = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match Self::rollback_main_lock_state(
+                &mut info,
+                &mut self.lock_level,
+                &mut self.transient_shared_pending_gate,
+                attempt.prior_main_level,
+            ) {
+                Ok(()) => {
+                    if let Some(current) = self.external_append_attempt.as_mut() {
+                        current.main_restore_pending = false;
+                    }
+                }
+                Err(error) => errors.push(format!("main lock prefix: {error}")),
+            }
+        }
+        if attempt.write_acquired {
+            match self.release_external_wal_slot(WAL_WRITE_LOCK) {
+                Ok(()) => {
+                    if let Some(current) = self.external_append_attempt.as_mut() {
+                        current.write_acquired = false;
+                    }
+                }
+                Err(error) => errors.push(format!("WAL WRITE: {error}")),
+            }
+        }
+        let restored = self
+            .external_append_attempt
+            .is_some_and(|current| !current.main_restore_pending && !current.write_acquired);
+        if errors.is_empty() && restored {
+            self.external_append_attempt = None;
+            Ok(())
+        } else {
+            Err(FrankenError::internal(format!(
+                "Unix WAL append retained retryable restore obligations: {}",
+                errors.join(", ")
+            )))
+        }
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
@@ -3572,6 +3676,11 @@ impl VfsFile for UnixFile {
     }
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
+        if self.external_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot unmap Unix SHM while a WAL append attempt owns its writer fence",
+            ));
+        }
         self.release_shm_owner_state(delete)?;
         self.release_wal_lifetime_claim()
     }
@@ -3712,11 +3821,11 @@ fn wal_read_mark_offset(index: u32) -> usize {
 }
 
 fn read_wal_read_mark(region_0: &ShmRegion, index: u32) -> Result<u32> {
-    region_0.read_u32_ne(wal_read_mark_offset(index))
+    region_0.atomic_load_u32_ne(wal_read_mark_offset(index), Ordering::Acquire)
 }
 
 fn write_wal_read_mark(region_0: &ShmRegion, index: u32, mark: u32) -> Result<()> {
-    region_0.write_u32_ne(wal_read_mark_offset(index), mark)
+    region_0.atomic_store_u32_ne(wal_read_mark_offset(index), mark, Ordering::Release)
 }
 
 impl UnixFile {
@@ -4417,6 +4526,284 @@ mod tests {
         assert!(child.wait().unwrap().success());
         appender.close(&cx).unwrap();
         checkpointer.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn wal_append_attempt_preserves_snapshot_and_preowned_write() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("wal-append-baseline.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert!(file.lock_external_maintenance(&cx, true).is_err());
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        assert!(file.shm_unmap(&cx, false).is_err());
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert!(file.external_shared_snapshot_attempt.is_some());
+
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        assert!(!file.external_append_attempt.unwrap().write_acquired);
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(
+            file.lock_level,
+            LockLevel::Reserved,
+            "preserve prior Immediate ownership"
+        );
+        let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        assert!(matches!(
+            peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE
+            ),
+            Err(FrankenError::Busy)
+        ));
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        file.unlock(&cx, LockLevel::Shared).unwrap();
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+        peer.close(&cx).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn wal_append_partial_acquisition_and_deferred_close_preserve_owners() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("wal-append-partial.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(matches!(
+            file.lock_external_wal_append(&cancelled),
+            Err(FrankenError::Abort)
+        ));
+        assert!(file.external_append_attempt.is_none());
+        assert!(file.shm_info.is_none());
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        let refused = file
+            .external_append_attempt
+            .expect("retain refused attempt");
+        assert!(!refused.write_acquired);
+        assert_eq!(refused.prior_main_level, LockLevel::Shared);
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.external_append_attempt.is_none());
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert!(file.external_shared_snapshot_attempt.is_some());
+        assert!(matches!(
+            file.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE
+            ),
+            Err(FrankenError::Busy)
+        ));
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+
+        peer.lock(&cx, LockLevel::Reserved).unwrap();
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(file.external_append_attempt.unwrap().write_acquired);
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert_eq!(peer.lock_level, LockLevel::Reserved);
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("failed append released only its newly acquired WRITE");
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        peer.unlock(&cx, LockLevel::None).unwrap();
+        peer.close(&cx).unwrap();
+        file.lock_external_wal_append(&cx)
+            .expect("retry after blocker leaves");
+
+        let inode = Arc::clone(file.inode_info_ref());
+        let mut deferred = file.take_for_deferred_cleanup();
+        assert!(file.closed);
+        assert!(file.external_append_attempt.is_none());
+        assert!(deferred.external_append_attempt.is_some());
+        assert!(deferred.external_shared_snapshot_attempt.is_some());
+        deferred
+            .close(&cx)
+            .expect("close restores inner append before outer snapshot");
+        assert!(deferred.external_append_attempt.is_none());
+        assert!(deferred.external_shared_snapshot_attempt.is_none());
+        assert!(!inode.lock().unwrap().has_lock_claims());
+    }
+
+    #[test]
+    fn wal_append_restore_retries_main_failure_without_retaining_write() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("wal-append-restore-retry.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        // Isolate independent restoration scheduling using the existing VFS
+        // test technique: raw locks/counters remain intact while the published
+        // prefix temporarily disagrees. This is not an OS syscall fault.
+        file.lock_level = LockLevel::None;
+        assert!(file.restore_external_wal_append_attempt(&cx).is_err());
+        let retained = file
+            .external_append_attempt
+            .expect("retain failed main surface");
+        assert!(retained.main_restore_pending);
+        assert!(!retained.write_acquired);
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .expect("WRITE restoration is independent of failed main restoration");
+        peer.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        file.lock_level = LockLevel::Reserved;
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        peer.close(&cx).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn wal_append_fence_excludes_foreign_write_without_taking_reader_locks() {
+        const CHILD_PATH: &str = "FSQLITE_VFS_APPEND_FENCE_CHILD";
+        const TEST: &str =
+            "unix::tests::wal_append_fence_excludes_foreign_write_without_taking_reader_locks";
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let (mut peer, _) = vfs
+                .open(&cx, Some(Path::new(&path)), open_flags_create())
+                .unwrap();
+            assert!(matches!(
+                peer.shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE
+                ),
+                Err(FrankenError::Busy)
+            ));
+            let slot = peer.wal_reader_slot_acquire(&cx, 17).unwrap().unwrap();
+            println!("append-child-write-blocked-reader-pinned");
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "restored");
+            peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .expect("native WRITE released while parent snapshot remains");
+            peer.lock(&cx, LockLevel::Reserved)
+                .expect("native appender also resumes");
+            peer.unlock(&cx, LockLevel::None).unwrap();
+            peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+            peer.wal_reader_slot_release(&cx, slot).unwrap();
+            peer.close(&cx).unwrap();
+            return;
+        }
+        let (_dir, path) = make_temp_path("wal-append-foreign.db");
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let mut file = crate::metrics::TracingFile::new(file, path.to_string_lossy().into_owned());
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited before lock witness"
+            );
+            if line.trim() == "append-child-write-blocked-reader-pinned" {
+                break;
+            }
+        }
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        writeln!(child.stdin.as_mut().unwrap(), "restored").unwrap();
+        assert!(child.wait().unwrap().success());
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        file.close(&cx).unwrap();
     }
 
     #[test]

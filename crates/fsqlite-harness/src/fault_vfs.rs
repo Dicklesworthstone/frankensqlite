@@ -758,6 +758,14 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         self.inner.restore_external_shared_snapshot_attempt(cx)
     }
 
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_wal_append(cx)
+    }
+
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_wal_append_attempt(cx)
+    }
+
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
         self.inner.lock_external_maintenance(cx, wal_mode)
     }

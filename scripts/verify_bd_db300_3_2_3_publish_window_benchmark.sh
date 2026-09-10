@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify_bd_db300_3_2_3_publish_window_benchmark.sh
 #
-# Runs the Track C / C2.3 publish-window shrink benchmark through rch and emits
+# Runs the Track C / C2.3 synthetic WAL critical section benchmark through rch and emits
 # artifact-grade evidence under artifacts/perf/bd-db300.3.2.3/.
 
 set -euo pipefail
@@ -33,10 +33,10 @@ log_event() {
         >> "${LOG_FILE}"
 }
 
-log_event "INFO" "start" "starting Track C publish-window shrink benchmark evidence pass"
+log_event "INFO" "start" "starting Track C synthetic WAL critical section benchmark evidence pass"
 
 if ! eval "${TEST_COMMAND}" 2>&1 | tee "${RAW_OUTPUT}"; then
-    log_event "ERROR" "benchmark" "rch-offloaded pager publish-window benchmark test failed"
+    log_event "ERROR" "benchmark" "rch-offloaded pager synthetic WAL critical section benchmark test failed"
     echo "ERROR: benchmark command failed: ${TEST_COMMAND}" >&2
     exit 1
 fi
@@ -48,36 +48,62 @@ awk '
 ' "${RAW_OUTPUT}" > "${BENCHMARK_JSON}"
 
 if [[ ! -s "${BENCHMARK_JSON}" ]]; then
-    log_event "ERROR" "artifact" "missing extracted publish-window benchmark JSON payload"
+    log_event "ERROR" "artifact" "missing extracted synthetic WAL critical section benchmark JSON payload"
     echo "ERROR: failed to extract benchmark JSON from ${RAW_OUTPUT}" >&2
     exit 1
 fi
 
-jq -e '
-    .schema_version == "fsqlite.track_c.publish_window_benchmark.v1"
+if ! jq -e '
+    .schema_version == "fsqlite.track_c.publish_window_benchmark.v2"
     and .bead_id == "bd-db300.3.2.3"
-    and (.cases | length) >= 1
-' "${BENCHMARK_JSON}" >/dev/null
-
-ALL_HOLD_MEDIAN_SHRUNK="$(jq -r '[.cases[] | (.exclusive_window_hold_candidate.median_ns < .exclusive_window_hold_baseline.median_ns)] | all' "${BENCHMARK_JSON}")"
-ALL_STALL_MEDIAN_SHRUNK="$(jq -r '[.cases[] | (.contending_writer_stall_candidate.median_ns < .contending_writer_stall_baseline.median_ns)] | all' "${BENCHMARK_JSON}")"
-ALL_HOLD_P95_SHRUNK="$(jq -r '[.cases[] | (.exclusive_window_hold_candidate.p95_ns <= .exclusive_window_hold_baseline.p95_ns)] | all' "${BENCHMARK_JSON}")"
-ALL_STALL_P95_SHRUNK="$(jq -r '[.cases[] | (.contending_writer_stall_candidate.p95_ns <= .contending_writer_stall_baseline.p95_ns)] | all' "${BENCHMARK_JSON}")"
-
-if [[ "${ALL_HOLD_MEDIAN_SHRUNK}" != "true" ]]; then
-    log_event "ERROR" "acceptance" "candidate did not shrink exclusive-window median in every case"
-    echo "ERROR: candidate did not shrink exclusive-window median in every case" >&2
+    and .measured_operation == "synthetic_wal_append_critical_section"
+    and (.cases | type == "array" and length >= 1)
+    and all(.cases[];
+        all([
+            .synthetic_wal_lock_hold_baseline,
+            .synthetic_wal_lock_hold_candidate,
+            .synthetic_wal_lock_contended_wait_baseline,
+            .synthetic_wal_lock_contended_wait_candidate
+        ][]; all([.median_ns, .p95_ns][]; type == "number" and . >= 0))
+    )
+' "${BENCHMARK_JSON}" >/dev/null; then
+    log_event "ERROR" "artifact" "invalid v2 synthetic WAL critical section benchmark schema or timing fields"
+    echo "ERROR: invalid v2 synthetic WAL critical section benchmark schema or timing fields" >&2
     exit 1
 fi
 
-if [[ "${ALL_STALL_MEDIAN_SHRUNK}" != "true" ]]; then
-    log_event "ERROR" "acceptance" "candidate did not shrink competing-writer stall median in every case"
-    echo "ERROR: candidate did not shrink competing-writer stall median in every case" >&2
+if ! jq -e '
+    all(.cases[];
+        all([
+            .synthetic_wal_lock_contended_wait_baseline,
+            .synthetic_wal_lock_contended_wait_candidate
+        ][]; .median_ns > 0 and .p95_ns > 0)
+    )
+' "${BENCHMARK_JSON}" >/dev/null; then
+    log_event "ERROR" "acceptance" "synthetic WAL critical section wait improvement is unmeasured: baseline or candidate contended wait is zero"
+    echo "ERROR: synthetic WAL critical section wait improvement is unmeasured: baseline or candidate contended wait is zero; acceptance remains unmet" >&2
+    exit 1
+fi
+
+ALL_HOLD_MEDIAN_SHRUNK="$(jq -r '[.cases[] | (.synthetic_wal_lock_hold_candidate.median_ns < .synthetic_wal_lock_hold_baseline.median_ns)] | all' "${BENCHMARK_JSON}")"
+ALL_WAIT_MEDIAN_SHRUNK="$(jq -r '[.cases[] | (.synthetic_wal_lock_contended_wait_candidate.median_ns < .synthetic_wal_lock_contended_wait_baseline.median_ns)] | all' "${BENCHMARK_JSON}")"
+ALL_HOLD_P95_SHRUNK="$(jq -r '[.cases[] | (.synthetic_wal_lock_hold_candidate.p95_ns <= .synthetic_wal_lock_hold_baseline.p95_ns)] | all' "${BENCHMARK_JSON}")"
+ALL_WAIT_P95_SHRUNK="$(jq -r '[.cases[] | (.synthetic_wal_lock_contended_wait_candidate.p95_ns <= .synthetic_wal_lock_contended_wait_baseline.p95_ns)] | all' "${BENCHMARK_JSON}")"
+
+if [[ "${ALL_HOLD_MEDIAN_SHRUNK}" != "true" ]]; then
+    log_event "ERROR" "acceptance" "candidate did not shrink synthetic WAL critical section hold median in every case"
+    echo "ERROR: candidate did not shrink synthetic WAL critical section hold median in every case" >&2
+    exit 1
+fi
+
+if [[ "${ALL_WAIT_MEDIAN_SHRUNK}" != "true" ]]; then
+    log_event "ERROR" "acceptance" "candidate did not shrink synthetic WAL critical section contended wait median in every case"
+    echo "ERROR: candidate did not shrink synthetic WAL critical section contended wait median in every case" >&2
     exit 1
 fi
 
 jq -n \
-    --arg schema_version "fsqlite.perf.publish-window-shrink-report.v1" \
+    --arg schema_version "fsqlite.perf.publish-window-shrink-report.v2" \
     --arg bead_id "${BEAD_ID}" \
     --arg parent_bead_id "${PARENT_BEAD_ID}" \
     --arg run_id "${RUN_ID}" \
@@ -91,9 +117,9 @@ jq -n \
     --arg report_json "${REPORT_JSON}" \
     --slurpfile benchmark "${BENCHMARK_JSON}" \
     --argjson all_hold_median_shrunk "${ALL_HOLD_MEDIAN_SHRUNK}" \
-    --argjson all_stall_median_shrunk "${ALL_STALL_MEDIAN_SHRUNK}" \
+    --argjson all_wait_median_shrunk "${ALL_WAIT_MEDIAN_SHRUNK}" \
     --argjson all_hold_p95_shrunk "${ALL_HOLD_P95_SHRUNK}" \
-    --argjson all_stall_p95_shrunk "${ALL_STALL_P95_SHRUNK}" \
+    --argjson all_wait_p95_shrunk "${ALL_WAIT_P95_SHRUNK}" \
     '
     {
         schema_version: $schema_version,
@@ -104,11 +130,13 @@ jq -n \
         git_sha: $git_sha,
         replay_command: $replay_command,
         benchmark_command: $benchmark_command,
+        measured_operation: $benchmark[0].measured_operation,
         acceptance: {
-            candidate_shrinks_hold_median_in_all_cases: $all_hold_median_shrunk,
-            candidate_shrinks_stall_median_in_all_cases: $all_stall_median_shrunk,
-            candidate_shrinks_or_matches_hold_p95_in_all_cases: $all_hold_p95_shrunk,
-            candidate_shrinks_or_matches_stall_p95_in_all_cases: $all_stall_p95_shrunk
+            synthetic_wal_lock_contended_wait_measured_in_all_cases: true,
+            candidate_shrinks_synthetic_wal_lock_hold_median_in_all_cases: $all_hold_median_shrunk,
+            candidate_shrinks_synthetic_wal_lock_contended_wait_median_in_all_cases: $all_wait_median_shrunk,
+            candidate_shrinks_or_matches_synthetic_wal_lock_hold_p95_in_all_cases: $all_hold_p95_shrunk,
+            candidate_shrinks_or_matches_synthetic_wal_lock_contended_wait_p95_in_all_cases: $all_wait_p95_shrunk
         },
         artifacts: {
             raw_output: $raw_output,
@@ -121,24 +149,24 @@ jq -n \
     ' > "${REPORT_JSON}"
 
 {
-    echo "# ${BEAD_ID} Publish Window Shrink Benchmark Summary"
+    echo "# ${BEAD_ID} Synthetic WAL Critical Section Benchmark Summary"
     echo
     echo "- run_id: \`${RUN_ID}\`"
     echo "- git_sha: \`${GIT_SHA}\`"
     echo "- replay_command: \`${REPLAY_COMMAND}\`"
     echo "- benchmark_command: \`${TEST_COMMAND}\`"
-    echo "- candidate_shrinks_hold_median_in_all_cases: \`${ALL_HOLD_MEDIAN_SHRUNK}\`"
-    echo "- candidate_shrinks_stall_median_in_all_cases: \`${ALL_STALL_MEDIAN_SHRUNK}\`"
-    echo "- candidate_shrinks_or_matches_hold_p95_in_all_cases: \`${ALL_HOLD_P95_SHRUNK}\`"
-    echo "- candidate_shrinks_or_matches_stall_p95_in_all_cases: \`${ALL_STALL_P95_SHRUNK}\`"
+    echo "- candidate_shrinks_synthetic_wal_lock_hold_median_in_all_cases: \`${ALL_HOLD_MEDIAN_SHRUNK}\`"
+    echo "- candidate_shrinks_synthetic_wal_lock_contended_wait_median_in_all_cases: \`${ALL_WAIT_MEDIAN_SHRUNK}\`"
+    echo "- candidate_shrinks_or_matches_synthetic_wal_lock_hold_p95_in_all_cases: \`${ALL_HOLD_P95_SHRUNK}\`"
+    echo "- candidate_shrinks_or_matches_synthetic_wal_lock_contended_wait_p95_in_all_cases: \`${ALL_WAIT_P95_SHRUNK}\`"
     echo
-    echo "The benchmark uses the existing `blocking_memory_vfs` harness in `crates/fsqlite-pager/src/pager.rs` so the pager's exclusive window and competing-writer stall can be measured deterministically in-process."
+    echo 'The benchmark uses `blocking_memory_vfs` in `crates/fsqlite-pager/src/pager.rs` to measure a synthetic WAL critical section in-process. Hold time covers the synthetic WAL lock; contended wait counts only time blocked by another owner, with uncontended acquisitions contributing zero. OS and main-file lock windows are unmeasured.'
     echo
-    echo "| Scenario | Dirty Pages | Hold Baseline Median (ns) | Hold Candidate Median (ns) | Hold Reduction | Stall Baseline Median (ns) | Stall Candidate Median (ns) | Stall Reduction |"
+    echo "| Scenario | Dirty Pages | Synthetic WAL Hold Baseline Median (ns) | Synthetic WAL Hold Candidate Median (ns) | Hold Reduction | Synthetic WAL Wait Baseline Median (ns) | Synthetic WAL Wait Candidate Median (ns) | Wait Reduction |"
     echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     jq -r '
         .benchmark.cases[]
-        | "| \(.scenario_id) | \(.dirty_pages) | \(.exclusive_window_hold_baseline.median_ns) | \(.exclusive_window_hold_candidate.median_ns) | \(.hold_reduction_ratio_median | tostring) | \(.contending_writer_stall_baseline.median_ns) | \(.contending_writer_stall_candidate.median_ns) | \(.stall_reduction_ratio_median | tostring) |"
+        | "| \(.scenario_id) | \(.dirty_pages) | \(.synthetic_wal_lock_hold_baseline.median_ns) | \(.synthetic_wal_lock_hold_candidate.median_ns) | \(.hold_reduction_ratio_median | tostring) | \(.synthetic_wal_lock_contended_wait_baseline.median_ns) | \(.synthetic_wal_lock_contended_wait_candidate.median_ns) | \(.stall_reduction_ratio_median | tostring) |"
     ' "${REPORT_JSON}"
     echo
     echo "Artifacts:"
@@ -147,5 +175,5 @@ jq -n \
     echo "- report_json: \`${REPORT_JSON}\`"
 } > "${SUMMARY_MD}"
 
-log_event "INFO" "complete" "Track C publish-window shrink benchmark evidence completed"
-echo "Wrote Track C publish-window artifacts to ${OUTPUT_DIR}"
+log_event "INFO" "complete" "Track C synthetic WAL critical section benchmark evidence completed"
+echo "Wrote Track C synthetic WAL critical section artifacts to ${OUTPUT_DIR}"

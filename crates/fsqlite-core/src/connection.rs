@@ -201432,6 +201432,17 @@ mod tests {
             Ok(())
         }
 
+        fn lock_external_wal_append(&mut self, _cx: &Cx) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::Unsupported)
+        }
+
+        fn restore_external_wal_append_attempt(
+            &mut self,
+            _cx: &Cx,
+        ) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
         fn lock_external_maintenance(
             &mut self,
             _cx: &Cx,

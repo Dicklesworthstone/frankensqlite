@@ -1225,6 +1225,29 @@ impl WindowsExternalMaintenanceLocks {
     }
 }
 
+/// Exact ownership added by one physical WAL append interval. The surrounding
+/// snapshot, if any, keeps its main-file SHARED ownership throughout retries.
+#[derive(Debug)]
+struct WindowsExternalWalAppendAttempt {
+    prior_main_level: LockLevel,
+    main_restore_pending: bool,
+    wal_write_acquired: bool,
+}
+
+impl WindowsExternalWalAppendAttempt {
+    const fn new(prior_main_level: LockLevel) -> Self {
+        Self {
+            prior_main_level,
+            main_restore_pending: true,
+            wal_write_acquired: false,
+        }
+    }
+
+    const fn restoration_complete(&self) -> bool {
+        !self.main_restore_pending && !self.wal_write_acquired
+    }
+}
+
 impl Vfs for WindowsVfs {
     type File = WindowsFile;
 
@@ -1344,6 +1367,7 @@ impl Vfs for WindowsVfs {
                 #[cfg(test)]
                 fail_next_stock_main_clone: false,
                 external_shared_snapshot_prior_level: None,
+                external_wal_append_attempt: None,
                 external_maintenance_locks: None,
                 owner_id,
                 lock_level: LockLevel::None,
@@ -1504,6 +1528,7 @@ impl Vfs for WindowsVfs {
                 #[cfg(test)]
                 fail_next_stock_main_clone: false,
                 external_shared_snapshot_prior_level: None,
+                external_wal_append_attempt: None,
                 external_maintenance_locks: None,
                 owner_id,
                 lock_level: LockLevel::None,
@@ -1579,6 +1604,7 @@ pub struct WindowsFile {
     #[cfg(test)]
     fail_next_stock_main_clone: bool,
     external_shared_snapshot_prior_level: Option<LockLevel>,
+    external_wal_append_attempt: Option<WindowsExternalWalAppendAttempt>,
     external_maintenance_locks: Option<WindowsExternalMaintenanceLocks>,
     owner_id: u64,
     lock_level: LockLevel,
@@ -1972,6 +1998,33 @@ impl WindowsFile {
         self.rollback_ordinary_locks_to(level)
     }
 
+    fn restore_wal_append_main_lock_level(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        // Unlike ordinary acquisition rollback, this must not close the stock
+        // handle on error: its preexisting SHARED range belongs to the outer
+        // snapshot. Each surface keeps failed raw unlocks in its own ledger.
+        let stock_result = self
+            .stock_main_locks_mut()
+            .and_then(|locks| locks.restore_to_exact(level));
+        let cooperative_result = self
+            .os_locks_mut()
+            .and_then(|locks| locks.restore_to_exact(level));
+        match (stock_result, cooperative_result) {
+            (Ok(()), Ok(())) => {
+                if !self.ordinary_locks_are_exactly_at(level) {
+                    return Err(FrankenError::internal(format!(
+                        "Windows WAL append restoration did not prove exact {level:?} ownership"
+                    )));
+                }
+                self.lock_level = level;
+                Ok(())
+            }
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(stock_error), Err(cooperative_error)) => Err(FrankenError::internal(format!(
+                "Windows WAL append main restoration failed on both surfaces: stock={stock_error}; cooperative={cooperative_error}"
+            ))),
+        }
+    }
+
     fn acquire_cooperative_wal_maintenance_locks(
         &mut self,
         cx: &Cx,
@@ -2355,11 +2408,13 @@ impl VfsFile for WindowsFile {
             return Ok(());
         }
 
-        let mut first_error = if self.external_shared_snapshot_prior_level.is_some() {
-            self.restore_external_shared_snapshot_attempt(cx).err()
-        } else {
-            None
-        };
+        let mut first_error = self.restore_external_wal_append_attempt(cx).err();
+        if self.external_shared_snapshot_prior_level.is_some()
+            && let Err(error) = self.restore_external_shared_snapshot_attempt(cx)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if self.external_maintenance_locks.is_some()
             && let Err(error) = self.restore_external_maintenance_attempt(cx)
             && first_error.is_none()
@@ -2387,6 +2442,7 @@ impl VfsFile for WindowsFile {
         // fallback even if an explicit UnlockFileEx call above failed.
         drop(self.stock_main_locks.take());
         self.external_shared_snapshot_prior_level = None;
+        let _ = self.external_wal_append_attempt.take();
         let _ = self.external_maintenance_locks.take();
         drop(self.os_locks.take());
         drop(self.file.take());
@@ -2524,6 +2580,11 @@ impl VfsFile for WindowsFile {
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_wal_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a Windows shared snapshot during a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_prior_level.is_some() {
             return Err(FrankenError::internal(
                 "Windows external shared-snapshot fence is already held",
@@ -2546,6 +2607,11 @@ impl VfsFile for WindowsFile {
     }
 
     fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        if self.external_wal_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot restore a Windows shared snapshot before its WAL append attempt",
+            ));
+        }
         let Some(prior_level) = self.external_shared_snapshot_prior_level else {
             return Ok(());
         };
@@ -2554,7 +2620,127 @@ impl VfsFile for WindowsFile {
         Ok(())
     }
 
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        self.ensure_open()?;
+        if self.external_wal_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "Windows WAL append attempt is already active",
+            ));
+        }
+        if self.external_maintenance_locks.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire a Windows WAL append attempt during external maintenance",
+            ));
+        }
+
+        self.ensure_os_locks()?;
+        self.ensure_stock_main_locks()?;
+        if !self.ordinary_locks_are_exactly_at(self.lock_level) {
+            return Err(FrankenError::internal(
+                "Windows WAL append requires an exact main-lock baseline",
+            ));
+        }
+        let write_preheld = self.owns_exclusive_shm_slot(WAL_WRITE_LOCK)?;
+        self.external_wal_append_attempt =
+            Some(WindowsExternalWalAppendAttempt::new(self.lock_level));
+
+        // Arm ownership before the raw call. A single-slot acquisition either
+        // succeeds with an exact slot owner or fails without adding an owner;
+        // poisoned SHM recovery remains retained by the shared state itself.
+        self.external_wal_append_attempt
+            .as_mut()
+            .ok_or_else(|| FrankenError::internal("Windows WAL append lost its attempt marker"))?
+            .wal_write_acquired = !write_preheld;
+        let write_result = self.shm_lock(
+            cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        );
+        if write_result.is_err()
+            && let Some(attempt) = self.external_wal_append_attempt.as_mut()
+        {
+            attempt.wal_write_acquired = false;
+        }
+        write_result?;
+
+        // The pager uses this only around physical append/publication. Do not
+        // retain CKPT, PENDING, EXCLUSIVE, or any reader slot. Keep partial
+        // ordinary acquisition in this attempt rather than dropping a handle
+        // that also owns the surrounding snapshot's SHARED lock.
+        while self.lock_level < LockLevel::Reserved {
+            let next = next_lock_level(self.lock_level)
+                .ok_or_else(|| FrankenError::internal("invalid WAL append lock escalation"))?;
+            self.os_locks_mut()?.try_lock_level(next)?;
+            self.stock_main_locks_mut()?.try_lock_level(next)?;
+            self.lock_level = next;
+        }
+        Ok(())
+    }
+
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        let Some((prior_level, main_pending, write_acquired)) =
+            self.external_wal_append_attempt.as_ref().map(|attempt| {
+                (
+                    attempt.prior_main_level,
+                    attempt.main_restore_pending,
+                    attempt.wal_write_acquired,
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+        if main_pending {
+            match self.restore_wal_append_main_lock_level(cx, prior_level) {
+                Ok(()) => {
+                    if let Some(attempt) = self.external_wal_append_attempt.as_mut() {
+                        attempt.main_restore_pending = false;
+                    }
+                }
+                Err(error) => failures.push(format!("main lock level: {error}")),
+            }
+        }
+        if write_acquired {
+            match self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            ) {
+                Ok(()) => {
+                    if let Some(attempt) = self.external_wal_append_attempt.as_mut() {
+                        attempt.wal_write_acquired = false;
+                    }
+                }
+                Err(error) => failures.push(format!("WAL write slot: {error}")),
+            }
+        }
+        if failures.is_empty()
+            && self
+                .external_wal_append_attempt
+                .as_ref()
+                .is_some_and(WindowsExternalWalAppendAttempt::restoration_complete)
+        {
+            let _ = self.external_wal_append_attempt.take();
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(FrankenError::internal(format!(
+                "Windows WAL append restoration was incomplete: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.external_wal_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot acquire Windows external maintenance during a WAL append attempt",
+            ));
+        }
         if self.external_shared_snapshot_prior_level.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire Windows external maintenance while a shared-snapshot fence is held",
@@ -2962,6 +3148,11 @@ impl VfsFile for WindowsFile {
     }
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
+        if self.external_wal_append_attempt.is_some() {
+            return Err(FrankenError::internal(
+                "cannot unmap Windows SHM during a WAL append attempt",
+            ));
+        }
         self.ensure_open()?;
         self.release_shm_owner_state(delete)
     }
@@ -3894,14 +4085,295 @@ mod tests {
             .expect("snapshot restoration before acquisition");
         file.restore_external_maintenance_attempt(&cx)
             .expect("maintenance restoration before acquisition");
+        file.restore_external_wal_append_attempt(&cx)
+            .expect("append restoration before acquisition");
 
         assert_eq!(file.lock_level, LockLevel::None);
         assert!(file.external_shared_snapshot_prior_level.is_none());
         assert!(file.external_maintenance_locks.is_none());
+        assert!(file.external_wal_append_attempt.is_none());
         assert!(
             file.shm_state.is_none(),
             "a restoration before acquisition must not create SHM state"
         );
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_fences_write_without_excluding_readers() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_shared_snapshot.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let main_probe = open_stock_shm_probe(&path);
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        let shm_probe = open_stock_shm_probe(&file.shm_path);
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&shm_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&main_probe, STOCK_SQLITE_RESERVED_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        try_lock_stock_sqlite_shared_range(
+            &main_probe,
+            STOCK_SQLITE_SHARED_FIRST,
+            STOCK_SQLITE_SHARED_SIZE,
+        )
+        .expect("ordinary reader remains admissible during physical append");
+        unlock_stock_sqlite_range_strict(
+            &main_probe,
+            STOCK_SQLITE_SHARED_FIRST,
+            STOCK_SQLITE_SHARED_SIZE,
+        )
+        .unwrap();
+        try_lock_stock_sqlite_range(&shm_probe, STOCK_SQLITE_WAL_CKPT_BYTE, 1)
+            .expect("append does not acquire checkpoint ownership");
+        unlock_stock_sqlite_range_strict(&shm_probe, STOCK_SQLITE_WAL_CKPT_BYTE, 1).unwrap();
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert!(file.lock_external_shared_snapshot(&cx).is_err());
+        assert!(file.lock_external_maintenance(&cx, true).is_err());
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        assert!(file.shm_unmap(&cx, false).is_err());
+        assert!(file.shm_unmap(&cx, true).is_err());
+        assert!(file.owns_exclusive_shm_slot(WAL_WRITE_LOCK).unwrap());
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        try_lock_stock_sqlite_range(&shm_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        unlock_stock_sqlite_range_strict(&shm_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        assert!(matches!(
+            try_lock_stock_sqlite_range(
+                &main_probe,
+                STOCK_SQLITE_SHARED_FIRST,
+                STOCK_SQLITE_SHARED_SIZE,
+            ),
+            Err(FrankenError::Busy)
+        ));
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::None));
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        file.close(&cx)
+            .expect("close restores inner append before outer snapshot");
+        assert!(file.external_wal_append_attempt.is_none());
+        assert!(file.external_shared_snapshot_prior_level.is_none());
+        try_lock_stock_sqlite_range(&shm_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        unlock_stock_sqlite_range_strict(&shm_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_preserves_preowned_write_and_reserved() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_preowned.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        assert!(
+            file.external_wal_append_attempt
+                .as_ref()
+                .is_some_and(|attempt| !attempt.wal_write_acquired)
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Reserved));
+        assert!(file.owns_exclusive_shm_slot(WAL_WRITE_LOCK).unwrap());
+        let probe = open_stock_shm_probe(&file.shm_path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_refusals_leave_exact_baseline() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_refusals.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(file.lock_external_wal_append(&cancelled).is_err());
+        assert!(file.external_wal_append_attempt.is_none());
+        assert!(file.shm_state.is_none());
+        file.fail_next_stock_main_clone = true;
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert!(file.external_wal_append_attempt.is_none());
+        assert!(file.shm_state.is_none());
+
+        file.lock_external_maintenance(&cx, false).unwrap();
+        assert!(file.lock_external_wal_append(&cx).is_err());
+        assert!(file.external_wal_append_attempt.is_none());
+        file.restore_external_maintenance_attempt(&cx).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        let blocker = open_stock_shm_probe(&file.shm_path);
+        try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            file.external_wal_append_attempt
+                .as_ref()
+                .is_some_and(|attempt| !attempt.wal_write_acquired)
+        );
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        let probe = open_stock_shm_probe(&file.shm_path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        unlock_stock_sqlite_range_strict(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_partial_main_acquisition_is_restorable() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_partial_main.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        let blocker = open_stock_shm_probe(&path);
+        try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_RESERVED_BYTE, 1).unwrap();
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert!(
+            file.external_wal_append_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.wal_write_acquired)
+        );
+        assert!(
+            file.os_locks
+                .as_ref()
+                .is_some_and(|locks| locks.is_exactly_at(LockLevel::Reserved))
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        assert!(!file.owns_exclusive_shm_slot(WAL_WRITE_LOCK).unwrap());
+        let main_probe = open_stock_shm_probe(&path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&main_probe, STOCK_SQLITE_RESERVED_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        unlock_stock_sqlite_range_strict(&blocker, STOCK_SQLITE_RESERVED_BYTE, 1).unwrap();
+        file.lock_external_wal_append(&cx)
+            .expect("retry after releasing blocker");
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_retry_keeps_outer_snapshot_fenced() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_restore_retry.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        file.os_locks.as_mut().unwrap().fail_next_unlock = true;
+        let error = file.restore_external_wal_append_attempt(&cx).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cooperative ordinary-lock unlock failure")
+        );
+        assert!(
+            file.external_wal_append_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.main_restore_pending && !attempt.wal_write_acquired)
+        );
+        assert!(
+            file.stock_main_locks
+                .as_ref()
+                .is_some_and(|locks| locks.is_exactly_at(LockLevel::Shared))
+        );
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        let probe = open_stock_shm_probe(&path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(
+                &probe,
+                STOCK_SQLITE_SHARED_FIRST,
+                STOCK_SQLITE_SHARED_SIZE,
+            ),
+            Err(FrankenError::Busy)
+        ));
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        file.restore_external_shared_snapshot_attempt(&cx).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_external_wal_append_failed_write_unlock_retains_attempt() {
+        let cx = Cx::new();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append_write_unlock_failure.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock_external_shared_snapshot(&cx).unwrap();
+        file.lock_external_wal_append(&cx).unwrap();
+        let state = inject_missing_stock_shm_range(&file, WAL_WRITE_LOCK);
+        assert!(file.restore_external_wal_append_attempt(&cx).is_err());
+        assert!(
+            file.external_wal_append_attempt
+                .as_ref()
+                .is_some_and(|attempt| !attempt.main_restore_pending && attempt.wal_write_acquired)
+        );
+        assert!(state.lock().unwrap().poisoned.is_some());
+        assert!(file.restore_external_shared_snapshot_attempt(&cx).is_err());
+        let probe = open_stock_shm_probe(&file.shm_path);
+        assert!(matches!(
+            try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
+            Err(FrankenError::Busy)
+        ));
+        assert!(file.restore_external_wal_append_attempt(&cx).is_err());
+        assert!(file.close(&cx).is_err());
+        assert!(file.is_closed());
+        assert!(file.external_wal_append_attempt.is_none());
+        try_lock_stock_sqlite_range(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("final poisoned owner closes the retained raw fence");
+        unlock_stock_sqlite_range_strict(&probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
         file.close(&cx).unwrap();
     }
 
