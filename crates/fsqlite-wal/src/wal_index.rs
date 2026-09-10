@@ -397,7 +397,7 @@ fn validate_shared_segment(region: &ShmRegion) -> Result<()> {
 
 fn read_shared_header_copy(region: &ShmRegion, offset: usize) -> Result<[u8; WAL_INDEX_HDR_BYTES]> {
     let mut bytes = [0_u8; WAL_INDEX_HDR_BYTES];
-    for (index, word) in bytes.chunks_exact_mut(4).enumerate() {
+    for (index, word) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         word.copy_from_slice(
             &region
                 .atomic_load_u32_ne(offset + index * 4, Ordering::Acquire)?
@@ -412,7 +412,7 @@ fn write_shared_header_copy(
     offset: usize,
     bytes: &[u8; WAL_INDEX_HDR_BYTES],
 ) -> Result<()> {
-    for (index, word) in bytes.chunks_exact(4).enumerate() {
+    for (index, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
         region.atomic_store_u32_ne(
             offset + index * 4,
             u32::from_ne_bytes([word[0], word[1], word[2], word[3]]),
@@ -520,7 +520,10 @@ pub fn clear_native_wal_index_tail(segment: &mut [u8], region: u32, mx_frame: u3
     let retained = usize::try_from(retained)
         .map_err(|_| FrankenError::internal("WAL-index prefix exceeds usize"))?
         .min(capacity);
-    for slot in segment[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES].chunks_exact_mut(2) {
+    for slot in segment[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES]
+        .as_chunks_mut::<2>()
+        .0
+    {
         if usize::from(u16::from_ne_bytes([slot[0], slot[1]])) > retained {
             slot.fill(0);
         }
