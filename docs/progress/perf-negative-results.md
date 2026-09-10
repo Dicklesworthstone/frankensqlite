@@ -12,6 +12,89 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-10 - REJECTED: statistics-only hashing without memo retention (GH#402, bd-sde05.3)
+
+- Target: the same 18-case `gh402_measure_residual_schema_matrix` and original
+  acceptance used below. This isolation removed the memo, restored the original
+  tracker layout/constructor/clone, and selected the fast hasher only inside
+  statistics reconstruction. Default constructors, eviction, queue transitions,
+  completion bounds and the original 32 semantic/counter/page oracles remained
+  unchanged. Files: `crates/fsqlite-pager/src/page_cache.rs` and `s3_fifo.rs`.
+- Candidate source: page cache
+  `cb271f176268b02e10f9780cc1b3adf47c60c9bb10116f28a881c99892276102`,
+  S3-FIFO `10e25b70ad0d0f3a80b1dc758f31b461833219b4c2ca26d5c6a34101f531a743`,
+  preserved in commit `26babc3ebcda0b12d7018938bc9fd75323a94c34`.
+  The 1,615 tracked Rust/manifest inputs match receipt
+  `/tmp/frankensqlite-gh402-hasher-only-source-20260910.sha256`
+  (SHA256 `2206de70cb6ac3651f9ae8f2862e4420c404a9dee98c62d27f526178c68a101c`).
+  Only the two pager files differ from the timestamped 25548 baseline below.
+- Correctness: focused RCH 25557 passed 71 tests, including all 48 S3-FIFO
+  tests. All 416 work receipts and 32 semantic snapshots match the instrumented
+  standard baseline: 312 builds, zero hits and 104 empty bypasses. Full SQL
+  candidate 25558 passed four controls and all 18 cases. These successes do not
+  satisfy the performance gate.
+- Strict RCH paired jobs `30004650170125677` and `30004650170125685` ran both
+  retained executables on Linux x86_64 vmi1264463, Cargo test profile,
+  native/json/fts5 features, September 10. Each passed 26 full matrices:
+  three warmups plus ten measured matrices per arm, alternating and reversing
+  the initial order. Remote execution took 645970 ms and 713299 ms; terminal
+  times were 18:14:13 UTC and 18:26:29 UTC. Both ELF hashes passed before and
+  after each campaign. All 12 actual 500-resident groups pass the original
+  1.5x median gate: 3.628-4.627x and 3.866-4.710x, including sample zero.
+  Sparse unmatched residency groups remain unmeasured: 132 and 156.
+- **Rejected:** eight non-statistics groups and seven DDL/INSERT windows
+  exceed 10% median growth in both campaigns. Positive numbers below are
+  candidate slowdown percentages; all raw medians, p95/p99 and paired samples
+  remain in the analysis artifacts.
+
+  | Storage / mode / tables / measurement | Campaign 1 | Campaign 2 |
+  |---|---:|---:|
+  | file / batch / 150 / schema total | 25.51% | 34.57% |
+  | file / batch / 50 / reopen sample 1 | 15.07% | 32.32% |
+  | file / seq / 50 / reopen sample 0 | 39.58% | 63.14% |
+  | file / txn / 300 / reopen sample 0 | 52.44% | 44.68% |
+  | file / txn / 50 / first statement sample 0 | 55.40% | 15.88% |
+  | file / txn / 50 / reopen sample 0 | 139.13% | 71.59% |
+  | file / txn / 50 / first statement sample 2 | 21.98% | 63.62% |
+  | file / txn / 50 / reopen sample 2 | 10.68% | 14.73% |
+  | file / batch / 150 / DDL window ending 150 | 25.58% | 34.59% |
+  | file / batch / 150 / autocommit INSERT | 13.83% | 163.67% |
+  | file / seq / 150 / DDL window ending 50 | 46.68% | 15.43% |
+  | file / seq / 300 / DDL window ending 50 | 17.33% | 32.34% |
+  | file / txn / 300 / DDL window ending 50 | 14.89% | 84.91% |
+  | memory / txn / 150 / autocommit INSERT | 11.11% | 11.11% |
+  | memory / txn / 300 / DDL window ending 300 | 34.42% | 13.89% |
+
+- Provenance limits: this was a shared worker. The baseline was compiled on
+  vmi1149989, whose later admission refused disk pressure, then copied without
+  byte changes to vmi1264463. The candidate was compiled on vmi1264463. The
+  observed Rust/Cargo/LLVM and glibc versions match; this does not establish
+  identical compilation environments or quiet-host performance. These results
+  do not prove that hashing caused each slowdown. They do fail the unchanged
+  keep gate; overall matrix time or the statistics speedup cannot replace it.
+- Retained executables on vmi1264463:
+  `/tmp/frankensqlite-gh402-exact-memo-baseline-20260910`, SHA256
+  `6adf01fe29e21dbf294c5c13bcc326857f1fe902352426d8b4b99b8dddb0093c`, and
+  `/tmp/frankensqlite-gh402-hasher-only-candidate-20260910`, SHA256
+  `78ac5648f3e6d4e26c81a7c1948b52a900b132684e5abc192253286867f94d2d`.
+  Raw logs `/tmp/frankensqlite-gh402-hasher-only-paired1-rch-20260910.log`
+  (SHA256 `c9c08265a7f604702bb1feea112707d79bba47b53664f2572b0dffac777691fe`)
+  and `/tmp/frankensqlite-gh402-hasher-only-paired2-rch-20260910.log`
+  (SHA256 `222dffdf1e6c3c7a7499da02af390a694010b7dc5e2d8bbfc78525b056032ae4`)
+  have corresponding `paired1-analysis` and `paired2-analysis` JSON files,
+  SHA256 `490781192d4af68f9ce088513f2ca93171999cc060a122fb4cd1d1c72d2214d4`
+  and `848205c7974890e3002da8502be84144a5203dda366ffefa43b18f0c57a52c0a`.
+- Disposition: restore the original non-generic S3-FIFO implementation and
+  statistics reconstruction, preserving the work instrumentation and original
+  semantic/counter/page controls. The generic helper plumbing was introduced
+  solely for this rejected experiment and has no accepted production consumer;
+  switching only its factory back to standard hashing is not a complete
+  restoration. Experiment-specific tests remain in the preserved candidate
+  commits and artifacts, alongside their passing and rejected results.
+  Do not repeat another hashing/memo campaign without new causal evidence
+  addressing the recurring non-statistics costs and a controlled comparison
+  that satisfies the original first-call and no-regression requirements.
+
 ## 2026-09-10 - REJECTED: statistics-only hashing plus snapshot memo (GH#402, bd-sde05.3)
 
 - Target: the unchanged 18-case `gh402_measure_residual_schema_matrix`, with

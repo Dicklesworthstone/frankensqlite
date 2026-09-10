@@ -7085,7 +7085,7 @@ mod tests {
                 let reached_shared = std::cell::Cell::new(false);
                 assert!(matches!(
                     reader.compat_reader_acquire_wal_read_lock_with(&cx, reader_slot, 59, || {
-                        reached_shared.set(true)
+                        reached_shared.set(true);
                     },),
                     Err(FrankenError::Busy)
                 ));

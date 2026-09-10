@@ -20,9 +20,7 @@
 //! false sharing between adjacent shards.
 
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -359,13 +357,11 @@ struct S3FifoQueueSnapshot {
     small_capacity: usize,
 }
 
-/// Test-only work receipt for one queue-snapshot call. Counts cover the
-/// completion loop, including its final empty scan, not access-trace replay.
-/// Every supported call rebuilds; unsupported sets report zero work.
+/// Test-only work receipt for one queue-snapshot reconstruction. Counts cover
+/// the completion loop, including its final empty scan, not access-trace replay.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct S3FifoReconstructionWork {
-    cache_hit: bool,
     model_built: bool,
     completion_rounds: usize,
     resident_keys_scanned: usize,
@@ -397,9 +393,11 @@ impl S3FifoQueueWorkCapture {
     }
 
     fn finish(self) -> Vec<S3FifoReconstructionWork> {
-        S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
+        let receipts = S3_FIFO_QUEUE_WORK_CAPTURE.with_borrow_mut(|capture| {
             capture.take().expect("queue work capture remains installed")
-        })
+        });
+        drop(self);
+        receipts
     }
 }
 
@@ -521,29 +519,8 @@ impl S3FifoEvictionTracker {
     fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
         #[cfg(test)]
         let _work_scope = S3FifoQueueWorkScope::enter();
-        self.queue_snapshot_with_hasher(
-            resident_pages,
-            hashbrown::DefaultHashBuilder::default,
-        )
-    }
-
-    /// Preserve the original standard-hashing projection as a test oracle.
-    /// This helper always rebuilds with standard hashing.
-    #[cfg(test)]
-    fn queue_snapshot_uncached(
-        &self,
-        resident_pages: &[PageNumber],
-    ) -> Option<S3FifoQueueSnapshot> {
-        self.queue_snapshot_with_hasher(resident_pages, RandomState::new)
-    }
-
-    fn queue_snapshot_with_hasher<S: BuildHasher>(
-        &self,
-        resident_pages: &[PageNumber],
-        make_hasher: impl FnOnce() -> S,
-    ) -> Option<S3FifoQueueSnapshot> {
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
-        let model = self.build_model_with_hasher(resident_pages, make_hasher)?;
+        let model = self.build_model(resident_pages)?;
         Some(S3FifoQueueSnapshot {
             small_len: model
                 .small_pages()
@@ -589,14 +566,6 @@ impl S3FifoEvictionTracker {
     }
 
     fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
-        self.build_model_with_hasher(resident_pages, RandomState::new)
-    }
-
-    fn build_model_with_hasher<S: BuildHasher>(
-        &self,
-        resident_pages: &[PageNumber],
-        make_hasher: impl FnOnce() -> S,
-    ) -> Option<S3Fifo<S>> {
         #[cfg(test)]
         let mut work = S3FifoReconstructionWork::default();
         if resident_pages.is_empty()
@@ -611,12 +580,7 @@ impl S3FifoEvictionTracker {
         let mut resident_order = resident_pages.to_vec();
         resident_order.sort_unstable_by_key(|page_no| page_no.get());
 
-        // Construct hashing only after the original unsupported-input guard,
-        // so eviction bypasses retain their original allocation-free path.
-        let mut model = S3Fifo::with_config_and_hasher(
-            self.scaled_config(resident_pages.len()),
-            make_hasher(),
-        );
+        let mut model = S3Fifo::with_config(self.scaled_config(resident_pages.len()));
         model.set_adaptation_interval(self.adaptation_interval);
         let (min_bound, max_bound) = self.scaled_bounds(resident_pages.len());
         model.set_adaptive_bounds(min_bound, max_bound);
@@ -7670,7 +7634,6 @@ mod tests {
             (
                 one.as_slice(),
                 S3FifoReconstructionWork {
-                    cache_hit: false,
                     model_built: true,
                     completion_rounds: 2,
                     resident_keys_scanned: 2,
@@ -7681,7 +7644,6 @@ mod tests {
             (
                 four.as_slice(),
                 S3FifoReconstructionWork {
-                    cache_hit: false,
                     model_built: true,
                     completion_rounds: 8,
                     resident_keys_scanned: 32,
@@ -7690,13 +7652,10 @@ mod tests {
                 },
             ),
         ] {
-            // Reference work remains outside the attributed call.
-            let expected_snapshot = tracker.queue_snapshot_uncached(residents);
-            for _ in 0..2 {
-                let capture = S3FifoQueueWorkCapture::start();
-                assert_eq!(tracker.queue_snapshot(residents), expected_snapshot);
-                assert_eq!(capture.finish(), vec![expected_work]);
-            }
+            let expected_snapshot = tracker.queue_snapshot(residents);
+            let capture = S3FifoQueueWorkCapture::start();
+            assert_eq!(tracker.queue_snapshot(residents), expected_snapshot);
+            assert_eq!(capture.finish(), vec![expected_work]);
         }
 
         // A dropped measurement must not leak capture state into the next one.
@@ -7706,232 +7665,13 @@ mod tests {
         assert!(S3FifoQueueWorkCapture::start().finish().is_empty());
     }
 
-    /// Compare fresh statistics against the standard-hashing reconstruction.
-    /// Both calls must rebuild; reference work is outside receipt capture.
-    fn assert_s3_fifo_statistics_snapshot(
-        tracker: &S3FifoEvictionTracker,
-        residents: &[PageNumber],
-    ) -> Option<S3FifoQueueSnapshot> {
-        let expected = tracker.queue_snapshot_uncached(residents);
-        for _ in 0..2 {
-            let capture = S3FifoQueueWorkCapture::start();
-            let snapshot = tracker.queue_snapshot(residents);
-            let receipts = capture.finish();
-            assert_eq!(snapshot, expected, "hashing must preserve the projection");
-            assert_eq!(receipts.len(), 1, "one receipt per statistics call");
-            let work = receipts[0];
-            assert!(!work.cache_hit, "statistics-only hashing retains no result");
-            assert_eq!(work.model_built, expected.is_some());
-            if work.model_built {
-                assert!(work.completion_rounds > 0);
-                assert_eq!(
-                    work.resident_keys_scanned,
-                    work.completion_rounds * residents.len(),
-                );
-            } else {
-                assert_eq!(work, S3FifoReconstructionWork::default());
-            }
-        }
-        expected
-    }
-
-    #[test]
-    fn test_s3_fifo_queue_snapshot_preserves_trace_order_and_resident_multiset() {
-        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
-        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
-        for raw in [1, 1, 2, 2, 3, 3, 4, 4] {
-            tracker.record_access(PageNumber::new(raw).unwrap());
-        }
-        let hot = assert_s3_fifo_statistics_snapshot(&tracker, &residents).unwrap();
-
-        // Equivalent logical traces may have different VecDeque storage splits.
-        let trace: Vec<_> = tracker.access_trace.iter().copied().collect();
-        let half = trace.len() / 2;
-        let mut wrapped = VecDeque::with_capacity(trace.len());
-        let padding = wrapped.capacity() - half;
-        for _ in 0..padding {
-            wrapped.push_back(PageNumber::ONE);
-        }
-        wrapped.extend(trace[..half].iter().copied());
-        for _ in 0..padding {
-            let _ = wrapped.pop_front();
-        }
-        wrapped.extend(trace[half..].iter().copied());
-        assert!(!wrapped.as_slices().1.is_empty(), "fixture must wrap");
-        assert!(wrapped.iter().eq(trace.iter()));
-        tracker.access_trace = wrapped;
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
-            Some(hot),
-        );
-
-        let reordered = [residents[3], residents[1], residents[0], residents[2]];
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&tracker, &reordered),
-            Some(hot),
-        );
-        let changed = [residents[0], residents[1], residents[1], residents[3]];
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &changed);
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        let duplicate = [
-            residents[0],
-            residents[1],
-            residents[2],
-            residents[3],
-            residents[3],
-        ];
-        let duplicate_snapshot = assert_s3_fifo_statistics_snapshot(&tracker, &duplicate);
-        let duplicate_reordered = [
-            residents[3],
-            residents[2],
-            residents[3],
-            residents[0],
-            residents[1],
-        ];
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&tracker, &duplicate_reordered),
-            duplicate_snapshot,
-        );
-
-        // Same trace length and multiplicities, but different access order.
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
-            Some(hot),
-        );
-        tracker.clear_history();
-        for raw in [1, 2, 3, 4, 1, 2, 3, 4] {
-            tracker.record_access(PageNumber::new(raw).unwrap());
-        }
-        let cold = assert_s3_fifo_statistics_snapshot(&tracker, &residents).unwrap();
-        assert_ne!(hot, cold, "the uncached oracle must distinguish the traces");
-    }
-
-    #[test]
-    fn test_s3_fifo_queue_snapshot_tracks_config_and_bounded_history() {
-        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
-        let original = S3FifoConfig::with_limits(16, 4, 4, 2);
-        for config in [
-            S3FifoConfig::with_limits(32, 4, 4, 2),
-            S3FifoConfig::with_limits(16, 8, 4, 2),
-            S3FifoConfig::with_limits(16, 4, 8, 2),
-            S3FifoConfig::with_limits(16, 4, 4, 3),
-        ] {
-            let mut tracker = S3FifoEvictionTracker::new(original);
-            let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-            tracker.config = config;
-            let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        }
-
-        let mut tracker = S3FifoEvictionTracker::new(original);
-        tracker.max_trace_entries = 4;
-        for raw in [1, 1, 2, 2] {
-            tracker.record_access(PageNumber::new(raw).unwrap());
-        }
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.adaptation_interval = 2;
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.adaptive_bounds = (4, 8);
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.record_admit(residents[2]);
-        assert_eq!(
-            tracker.access_trace.len(),
-            4,
-            "bounded trace length is unchanged",
-        );
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.forget(residents[1]);
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.clear_history();
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        tracker.clear_history();
-        let _ = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-    }
-
-    #[test]
-    fn test_s3_fifo_queue_snapshot_bounds_and_bypasses_skip_hasher_construction() {
-        let limit = S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS;
-        let residents: Vec<_> = (1..=limit)
-            .map(|raw| PageNumber::new(u32::try_from(raw).unwrap()).unwrap())
-            .collect();
-        // Keep this boundary control cheap: every page fits in SMALL, so
-        // the fixture does not exercise the separate exhausted-loop workload.
-        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::with_limits(limit, limit, 1, 2));
-        tracker.adaptive_bounds = (limit, limit);
-        for &page in &residents {
-            tracker.record_access(page);
-            tracker.record_access(page);
-        }
-        assert_eq!(
-            tracker.access_trace.len(),
-            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES,
-        );
-        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &residents).is_some());
-        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &[]).is_none());
-        let mut oversized = residents;
-        oversized.push(PageNumber::new(u32::try_from(limit + 1).unwrap()).unwrap());
-        assert!(assert_s3_fifo_statistics_snapshot(&tracker, &oversized).is_none());
-        let constructions = Cell::new(0);
-        for unsupported in [&[][..], oversized.as_slice()] {
-            assert!(
-                tracker
-                    .build_model_with_hasher(unsupported, || {
-                        constructions.set(constructions.get() + 1);
-                        hashbrown::DefaultHashBuilder::default()
-                    })
-                    .is_none(),
-            );
-        }
-        assert_eq!(
-            constructions.get(),
-            0,
-            "bypasses never construct a model hasher",
-        );
-    }
-
-    #[test]
-    fn test_s3_fifo_queue_snapshot_does_not_steer_eviction_or_clone_history() {
-        let residents = [1, 2, 3, 4].map(|raw| PageNumber::new(raw).unwrap());
-        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
-        for &page in &residents {
-            tracker.record_access(page);
-            tracker.record_access(page);
-        }
-        let reference = tracker.clone();
-        let victim = reference.choose_victim(&residents);
-        let assignments = reference.queue_assignments(&residents);
-        let snapshot = assert_s3_fifo_statistics_snapshot(&tracker, &residents);
-        let capture = S3FifoQueueWorkCapture::start();
-        assert_eq!(tracker.choose_victim(&residents), victim);
-        assert_eq!(tracker.queue_assignments(&residents), assignments);
-        assert!(
-            capture.finish().is_empty(),
-            "eviction callers are not statistics",
-        );
-
-        let mut cloned = tracker.clone();
-        assert_eq!(cloned.access_trace, tracker.access_trace);
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&cloned, &residents),
-            snapshot,
-        );
-        cloned.record_access(residents[0]);
-        assert_ne!(cloned.access_trace, tracker.access_trace);
-        let _ = assert_s3_fifo_statistics_snapshot(&cloned, &residents);
-        assert_eq!(tracker.access_trace, reference.access_trace);
-        assert_eq!(
-            assert_s3_fifo_statistics_snapshot(&tracker, &residents),
-            snapshot,
-        );
-    }
-
     /// Isolate GH402's statistics cost from SQL, WAL I/O and connection open.
-    /// Keep all 13 samples: sample zero is the first call and part of the three
-    /// warmups; samples 3..12 are ten measured repeated calls. Every nonempty
-    /// call rebuilds with the statistics hasher, including repeated calls.
-    /// Timings include fresh reconstruction and test-only work receipts,
-    /// and are not directly comparable to older uninstrumented observations.
-    /// Capture allocation, receipt consumption and formatting stay outside the
-    /// elapsed time. All existing counter, snapshot and page oracles remain.
+    /// Keep the first call, three warmups and ten measured calls; timings are
+    /// observations, while unchanged counters and page contents are required.
+    /// Test-only completion counters run inside the timed reconstruction, so
+    /// these instrumented timings are not comparable to earlier uninstrumented
+    /// baselines. Capture allocation, receipt consumption and formatting stay
+    /// outside the elapsed time; counter updates and publication remain inside.
     #[test]
     #[ignore = "GH402 cache statistics measurement; run explicitly with --nocapture"]
     fn gh402_measure_cache_metrics_reconstruction() {
@@ -7978,17 +7718,6 @@ mod tests {
                             assert_eq!(receipts.len(), 1, "one queue snapshot per metrics call");
                             let work = receipts[0];
                             assert_eq!(work.model_built, resident_count != 0);
-                            assert!(!work.cache_hit, "statistics-only hashing retains no result");
-                            if !work.model_built {
-                                assert_eq!(
-                                    work,
-                                    S3FifoReconstructionWork {
-                                        cache_hit: work.cache_hit,
-                                        ..S3FifoReconstructionWork::default()
-                                    },
-                                    "empty bypasses perform no reconstruction",
-                                );
-                            }
                             assert_eq!(
                                 work.resident_keys_scanned,
                                 work.completion_rounds * resident_count,
@@ -8003,9 +7732,8 @@ mod tests {
                                     "hot_trace": hot_trace,
                                     "sample": sample,
                                     "warmup": sample < 3,
-                                    "timing_kind": "instrumented_statistics_hasher",
+                                    "timing_kind": "instrumented_reconstruction",
                                     "queue_snapshot_calls": receipts.len(),
-                                    "cache_hit": work.cache_hit,
                                     "model_built": work.model_built,
                                     "completion_rounds": work.completion_rounds,
                                     "resident_keys_scanned": work.resident_keys_scanned,
