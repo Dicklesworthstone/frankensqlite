@@ -2559,11 +2559,26 @@ impl UnixFile {
         Ok(())
     }
 
+    /// Pin an explicit compatibility mark, reporting whether it was written.
+    ///
+    /// This low-level fixture helper does not validate a WAL header or page
+    /// boundary. A changed mark refuses admission after releasing the new
+    /// claim; a failed release retains ownership for explicit unlock or close.
     pub fn compat_reader_acquire_wal_read_lock(
         &mut self,
         cx: &Cx,
         reader_slot: u32,
         snapshot_mark: u32,
+    ) -> Result<bool> {
+        self.compat_reader_acquire_wal_read_lock_with(cx, reader_slot, snapshot_mark, || {})
+    }
+
+    fn compat_reader_acquire_wal_read_lock_with(
+        &mut self,
+        cx: &Cx,
+        reader_slot: u32,
+        snapshot_mark: u32,
+        before_shared: impl FnOnce(),
     ) -> Result<bool> {
         let Some(slot) = wal_read_lock_slot(reader_slot) else {
             return Err(FrankenError::LockFailed {
@@ -2580,18 +2595,65 @@ impl UnixFile {
         let shm_offset = SHM_READ_MARK_OFFSET + slot_idx * 4;
         let current_mark = region_0.atomic_load_u32_ne(shm_offset, Ordering::Acquire)?;
 
-        if current_mark == snapshot_mark {
-            self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
-            return Ok(false);
+        let shm_info = Arc::clone(self.shm_info.as_ref().ok_or(FrankenError::BusyRecovery)?);
+        let updated = current_mark != snapshot_mark;
+        if updated {
+            checkpoint_or_abort(cx)?;
+            let mut info = shm_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = &info.slots[usize::try_from(slot).expect("reader lock slot fits usize")];
+            // Unlike a generic SHM upgrade, mark mutation must not repurpose
+            // any existing reader, including this handle's own claims. Keep
+            // explicit older marks and compatibility slot zero available when
+            // the slot is unowned; production reader admission is separate.
+            if state.exclusive_owner.is_some() || !state.shared_holders.is_empty() {
+                return Err(FrankenError::Busy);
+            }
+            self.acquire_shm_exclusive_slot(&mut info, slot)?;
+            let publish =
+                region_0.atomic_store_u32_ne(shm_offset, snapshot_mark, Ordering::Release);
+            self.shm_barrier();
+            // Cleanup does not consult cancellation. The raw-first release
+            // helper retains failed ownership for explicit retry or close.
+            let release = self.release_shm_exclusive_slot(&mut info, slot);
+            drop(info);
+            match (publish, release) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                (Err(publish), Err(release)) => {
+                    return Err(FrankenError::internal(format!(
+                        "compatibility reader mark publication and release failed: publish={publish}; release={release}"
+                    )));
+                }
+            }
         }
 
-        // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
-        self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
-        region_0.atomic_store_u32_ne(shm_offset, snapshot_mark, Ordering::Release)?;
+        before_shared();
+        checkpoint_or_abort(cx)?;
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let acquired = self.acquire_shm_shared_slot(&mut info, slot)?;
         self.shm_barrier();
-        self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
-        self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
-        Ok(true)
+        let validation = match region_0.atomic_load_u32_ne(shm_offset, Ordering::Acquire) {
+            Ok(mark) if mark == snapshot_mark => return Ok(updated),
+            Ok(_) => FrankenError::BusyRecovery,
+            Err(error) => error,
+        };
+        // Acquiring SHARED is a no-op under our preowned EXCLUSIVE claim.
+        // Otherwise exactly one new shared count belongs to this attempt.
+        if !acquired {
+            return Err(validation);
+        }
+        let release = self.release_shm_shared_slot(&mut info, slot);
+        drop(info);
+        match release {
+            Ok(()) => Err(validation),
+            Err(release) => Err(FrankenError::internal(format!(
+                "compatibility reader validation and shared release failed: validation={validation}; release={release}"
+            ))),
+        }
     }
 
     pub fn compat_writer_hold_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
@@ -6902,6 +6964,164 @@ mod tests {
         reader1
             .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
             .unwrap();
+    }
+
+    /// Deterministic same-process native-VFS interleaving. The peer obeys the
+    /// real exclusive-update protocol; this does not simulate full reader
+    /// admission or claim an independently scheduled foreign-process race.
+    fn compat_reader_replaced_mark_case(initial_mark: u32) {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for reader_slot in [0, 1, 4] {
+            let (_dir, path) = make_temp_path("compat-reader-mark-race.db");
+            let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let region = reader.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            write_wal_read_mark(&region, reader_slot, initial_mark).unwrap();
+            let slot = wal_read_lock_slot(reader_slot).unwrap();
+            let interleaved = std::cell::Cell::new(false);
+            let result =
+                reader.compat_reader_acquire_wal_read_lock_with(&cx, reader_slot, 41, || {
+                    assert_eq!(read_wal_read_mark(&region, reader_slot).unwrap(), 41);
+                    peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                        .expect("peer owns the unpinned mark before SHARED acquisition");
+                    write_wal_read_mark(&region, reader_slot, 59).unwrap();
+                    peer.shm_barrier();
+                    peer.shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                        .unwrap();
+                    interleaved.set(true);
+                });
+            assert!(
+                interleaved.get(),
+                "the peer reached the actual acquisition window"
+            );
+            assert!(
+                matches!(result, Err(FrankenError::BusyRecovery)),
+                "slot {reader_slot}: changed mark cannot certify the requested snapshot: {result:?}"
+            );
+            assert_eq!(read_wal_read_mark(&region, reader_slot).unwrap(), 59);
+            {
+                let info = reader.shm_info.as_ref().unwrap().lock().unwrap();
+                let state = &info.slots[usize::try_from(slot).unwrap()];
+                assert!(!state.shared_holders.contains_key(&reader.shm_owner_id));
+                assert!(state.exclusive_owner.is_none());
+            }
+            peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                .expect("failed admission released its exact new shared claim");
+            peer.shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                .unwrap();
+            assert!(
+                reader
+                    .compat_reader_acquire_wal_read_lock(&cx, reader_slot, 41)
+                    .unwrap(),
+                "an explicit retry may still pin an older mark, including slot zero"
+            );
+            assert_eq!(read_wal_read_mark(&region, reader_slot).unwrap(), 41);
+            assert!(matches!(
+                peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+                Err(FrankenError::Busy)
+            ));
+            reader
+                .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+                .unwrap();
+            peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                .unwrap();
+            peer.shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                .unwrap();
+            reader.close(&cx).unwrap();
+            peer.close(&cx).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compat_reader_rechecks_replaced_mark_before_shared_join() {
+        compat_reader_replaced_mark_case(41);
+    }
+
+    #[test]
+    fn test_compat_reader_rechecks_replaced_mark_after_exclusive_publish() {
+        compat_reader_replaced_mark_case(7);
+    }
+
+    #[test]
+    fn test_compat_reader_preserves_preowned_shared_and_exclusive_claims() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for reader_slot in [0, 1, 4] {
+            for mode in [SQLITE_SHM_SHARED, SQLITE_SHM_EXCLUSIVE] {
+                let (_dir, path) = make_temp_path("compat-reader-preowned.db");
+                let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+                let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+                let region = reader.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+                let slot = wal_read_lock_slot(reader_slot).unwrap();
+                write_wal_read_mark(&region, reader_slot, 41).unwrap();
+                let baseline_count = if mode == SQLITE_SHM_SHARED { 2 } else { 1 };
+                for _ in 0..baseline_count {
+                    reader
+                        .shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | mode)
+                        .unwrap();
+                }
+                assert!(
+                    !reader
+                        .compat_reader_acquire_wal_read_lock(&cx, reader_slot, 41)
+                        .unwrap()
+                );
+                {
+                    let info = reader.shm_info.as_ref().unwrap().lock().unwrap();
+                    let state = &info.slots[usize::try_from(slot).unwrap()];
+                    if mode == SQLITE_SHM_SHARED {
+                        assert_eq!(state.shared_holders.get(&reader.shm_owner_id), Some(&3));
+                        assert!(state.exclusive_owner.is_none());
+                    } else {
+                        assert_eq!(state.exclusive_owner, Some(reader.shm_owner_id));
+                        assert!(state.shared_holders.is_empty());
+                    }
+                }
+                if mode == SQLITE_SHM_SHARED {
+                    reader
+                        .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+                        .unwrap();
+                }
+                let reached_shared = std::cell::Cell::new(false);
+                assert!(matches!(
+                    reader.compat_reader_acquire_wal_read_lock_with(&cx, reader_slot, 59, || {
+                        reached_shared.set(true)
+                    },),
+                    Err(FrankenError::Busy)
+                ));
+                assert!(
+                    !reached_shared.get(),
+                    "a pinned mark must refuse mutation first"
+                );
+                assert_eq!(read_wal_read_mark(&region, reader_slot).unwrap(), 41);
+                {
+                    let info = reader.shm_info.as_ref().unwrap().lock().unwrap();
+                    let state = &info.slots[usize::try_from(slot).unwrap()];
+                    if mode == SQLITE_SHM_SHARED {
+                        assert_eq!(state.shared_holders.get(&reader.shm_owner_id), Some(&2));
+                        assert!(state.exclusive_owner.is_none());
+                    } else {
+                        assert_eq!(state.exclusive_owner, Some(reader.shm_owner_id));
+                        assert!(state.shared_holders.is_empty());
+                    }
+                }
+                for _ in 0..baseline_count {
+                    assert!(matches!(
+                        peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+                        Err(FrankenError::Busy)
+                    ));
+                    reader
+                        .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | mode)
+                        .unwrap();
+                }
+                peer.shm_lock(&cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                    .unwrap();
+                peer.shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                    .unwrap();
+                reader.close(&cx).unwrap();
+                peer.close(&cx).unwrap();
+            }
+        }
     }
 
     #[test]
