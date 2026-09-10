@@ -8,7 +8,9 @@
 //! The structure tracks queue membership in a hash map for O(1) queue-location
 //! lookup and performs deterministic transitions suitable for unit testing.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 
 use fsqlite_types::PageNumber;
 
@@ -331,12 +333,12 @@ impl S3FifoRolloutGate {
 
 /// Three-queue S3-FIFO state machine.
 #[derive(Debug)]
-pub struct S3Fifo {
+pub struct S3Fifo<S = RandomState> {
     config: S3FifoConfig,
     small: VecDeque<PageNumber>,
     main: VecDeque<PageNumber>,
     ghost: VecDeque<(PageNumber, u64)>,
-    index: HashMap<PageNumber, EntryState>,
+    index: HashMap<PageNumber, EntryState, S>,
     small_capacity_min: usize,
     small_capacity_max: usize,
     adapt_every_evictions: usize,
@@ -360,6 +362,14 @@ impl S3Fifo {
     /// Create with explicit configuration.
     #[must_use]
     pub fn with_config(config: S3FifoConfig) -> Self {
+        Self::with_config_and_hasher(config, RandomState::new())
+    }
+}
+
+impl<S: BuildHasher> S3Fifo<S> {
+    /// Select hashing for a reconstructed statistics model. Runtime eviction
+    /// uses the default constructors and keeps the standard randomized map.
+    pub(crate) fn with_config_and_hasher(config: S3FifoConfig, hasher: S) -> Self {
         let mut small_capacity_min =
             ceil_ratio(config.capacity, ADAPT_MIN_SMALL_PERCENT, ADAPT_PERCENT_DEN);
         if small_capacity_min == 0 {
@@ -380,7 +390,7 @@ impl S3Fifo {
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
-            index: HashMap::new(),
+            index: HashMap::with_hasher(hasher),
             small_capacity_min,
             small_capacity_max,
             adapt_every_evictions: DEFAULT_ADAPT_EVERY_EVICTIONS,
@@ -840,6 +850,273 @@ mod tests {
             Some(page) => page,
             None => panic!("page number must be non-zero"),
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct CollidingHasher;
+
+    impl std::hash::Hasher for CollidingHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        // Every page deliberately collides. The map must still compare keys.
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum HasherTraceOp {
+        Insert(PageNumber),
+        Access(PageNumber),
+        Interval(usize),
+        Bounds(usize, usize),
+    }
+
+    fn apply_hasher_trace_op<S: std::hash::BuildHasher>(
+        fifo: &mut S3Fifo<S>,
+        op: HasherTraceOp,
+    ) -> (Option<bool>, Vec<S3FifoEvent>) {
+        match op {
+            HasherTraceOp::Insert(page) => (None, fifo.insert(page)),
+            HasherTraceOp::Access(page) => (Some(fifo.access(page)), Vec::new()),
+            HasherTraceOp::Interval(interval) => {
+                fifo.set_adaptation_interval(interval);
+                (None, Vec::new())
+            }
+            HasherTraceOp::Bounds(min, max) => {
+                fifo.set_adaptive_bounds(min, max);
+                (None, Vec::new())
+            }
+        }
+    }
+
+    #[track_caller]
+    fn assert_hasher_trace_state<S: std::hash::BuildHasher>(
+        standard: &S3Fifo,
+        other: &S3Fifo<S>,
+        pages: &[PageNumber],
+    ) {
+        assert_eq!(standard.config(), other.config());
+        assert_eq!(standard.adaptive_bounds(), other.adaptive_bounds());
+        assert_eq!(standard.adaptation_interval(), other.adaptation_interval());
+        assert_eq!(standard.small, other.small);
+        assert_eq!(standard.main, other.main);
+        // Includes stale ghost epochs, not merely the filtered live pages.
+        assert_eq!(standard.ghost, other.ghost);
+        assert_eq!(standard.ghost_epoch, other.ghost_epoch);
+        assert_eq!(standard.small_pages(), other.small_pages());
+        assert_eq!(standard.main_pages(), other.main_pages());
+        assert_eq!(standard.ghost_pages(), other.ghost_pages());
+        assert_eq!(standard.resident_len(), other.resident_len());
+        assert_eq!(standard.ghost_len(), other.ghost_len());
+        assert_eq!(
+            (
+                standard.evictions_since_adapt,
+                standard.ghost_hits_since_adapt,
+                standard.small_hits_since_adapt,
+                standard.main_hits_since_adapt,
+                standard.main_pressure_since_adapt,
+                standard.posterior_alpha,
+                standard.posterior_beta,
+            ),
+            (
+                other.evictions_since_adapt,
+                other.ghost_hits_since_adapt,
+                other.small_hits_since_adapt,
+                other.main_hits_since_adapt,
+                other.main_pressure_since_adapt,
+                other.posterior_alpha,
+                other.posterior_beta,
+            ),
+        );
+        assert_eq!(standard.index.len(), other.index.len());
+        for &page in pages {
+            assert_eq!(standard.lookup(page), other.lookup(page), "page={page:?}");
+            // Preserve access bits/reinsertion counts and exact ghost epochs.
+            assert_eq!(standard.index.get(&page), other.index.get(&page));
+        }
+    }
+
+    fn compare_hasher_trace(
+        config: S3FifoConfig,
+        ops: &[HasherTraceOp],
+        pages: &[PageNumber],
+        observed: &mut std::collections::BTreeSet<&'static str>,
+    ) {
+        let mut standard = S3Fifo::with_config(config);
+        let mut fast = S3Fifo::with_config_and_hasher(
+            config,
+            hashbrown::DefaultHashBuilder::default(),
+        );
+        let mut colliding = S3Fifo::with_config_and_hasher(
+            config,
+            std::hash::BuildHasherDefault::<CollidingHasher>::default(),
+        );
+        assert_hasher_trace_state(&standard, &fast, pages);
+        assert_hasher_trace_state(&standard, &colliding, pages);
+        for (step, &op) in ops.iter().enumerate() {
+            let expected = apply_hasher_trace_op(&mut standard, op);
+            assert_eq!(
+                apply_hasher_trace_op(&mut fast, op),
+                expected,
+                "fast hasher: config={config:?} step={step} op={op:?}",
+            );
+            assert_eq!(
+                apply_hasher_trace_op(&mut colliding, op),
+                expected,
+                "constant hasher: config={config:?} step={step} op={op:?}",
+            );
+            assert_hasher_trace_state(&standard, &fast, pages);
+            assert_hasher_trace_state(&standard, &colliding, pages);
+            for event in expected.1 {
+                observed.insert(match event {
+                    S3FifoEvent::Inserted(_) => "inserted",
+                    S3FifoEvent::AlreadyResident { .. } => "already_resident",
+                    S3FifoEvent::GhostReadmission(_) => "ghost_readmission",
+                    S3FifoEvent::PromotedToMain(_) => "promoted",
+                    S3FifoEvent::EvictedFromSmallToGhost(_) => "small_eviction",
+                    S3FifoEvent::ReinsertedInMain { .. } => "main_reinsertion",
+                    S3FifoEvent::EvictedFromMain(_) => "main_eviction",
+                    S3FifoEvent::GhostTrimmed(_) => "ghost_trimmed",
+                    S3FifoEvent::AdaptiveSplitChanged { .. } => "adapted",
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn default_constructors_keep_standard_random_state() {
+        let mut default = S3Fifo::new(4);
+        let configured = S3Fifo::with_config(S3FifoConfig::with_limits(4, 1, 1, 1));
+        let _: &S3Fifo<std::collections::hash_map::RandomState> = &default;
+        let _: &S3Fifo<std::collections::hash_map::RandomState> = &configured;
+        let _: &std::collections::HashMap<
+            PageNumber,
+            EntryState,
+            std::collections::hash_map::RandomState,
+        > = &default.index;
+        let largest = pg(u32::MAX - 1);
+        assert_eq!(default.insert(largest), vec![S3FifoEvent::Inserted(largest)]);
+        assert_eq!(default.small_pages(), vec![largest]);
+    }
+
+    #[test]
+    fn hasher_variants_preserve_reinsertion_ghost_reuse_and_adaptation() {
+        use HasherTraceOp::{Access, Bounds, Insert, Interval};
+
+        let pages: Vec<_> = (1..=8).map(pg).chain([pg(u32::MAX - 1)]).collect();
+        let mut observed = std::collections::BTreeSet::new();
+        compare_hasher_trace(
+            S3FifoConfig::with_limits(2, 1, 1, 1),
+            &[
+                Insert(pg(1)),
+                Access(pg(1)),
+                Insert(pg(2)),
+                Access(pg(1)),
+                Insert(pg(3)),
+                Access(pg(3)),
+                Insert(pg(4)),
+                Access(pg(1)),
+                Access(pg(4)),
+                Insert(pg(5)),
+                Insert(pg(6)),
+                Insert(pg(6)),
+                Insert(pg(5)),
+                Access(pg(u32::MAX - 1)),
+            ],
+            &pages,
+            &mut observed,
+        );
+        compare_hasher_trace(
+            S3FifoConfig::new(10),
+            &[
+                Bounds(1, 3),
+                Interval(2),
+                Insert(pg(1)),
+                Insert(pg(2)),
+                Insert(pg(1)),
+                Insert(pg(3)),
+                Access(pg(2)),
+                Insert(pg(2)),
+                Insert(pg(4)),
+                Insert(pg(5)),
+                Insert(pg(1)),
+                Insert(pg(6)),
+            ],
+            &pages,
+            &mut observed,
+        );
+        assert_eq!(
+            observed,
+            std::collections::BTreeSet::from([
+                "adapted",
+                "already_resident",
+                "ghost_readmission",
+                "ghost_trimmed",
+                "inserted",
+                "main_eviction",
+                "main_reinsertion",
+                "promoted",
+                "small_eviction",
+            ]),
+            "curated traces must exercise every ordered transition kind",
+        );
+    }
+
+    #[test]
+    fn hasher_variants_preserve_mixed_traces_extreme_ids_and_full_state() {
+        use HasherTraceOp::{Access, Bounds, Insert, Interval};
+
+        let mut pages: Vec<_> = (1..=16).map(pg).collect();
+        pages.extend([
+            pg(65_536),
+            pg(1 << 31),
+            pg(u32::MAX - 2),
+            pg(u32::MAX - 1),
+        ]);
+        let domain = pages.len();
+        pages.push(pg(0xDEAD_BEEF)); // Always absent: verify misses stay misses.
+        let configs = [
+            S3FifoConfig::with_limits(1, 1, 0, 0),
+            S3FifoConfig::with_limits(2, 1, 1, 1),
+            S3FifoConfig::with_limits(4, 2, 2, 1),
+            S3FifoConfig::new(10),
+            S3FifoConfig::with_limits(17, 5, 7, 3),
+        ];
+        let mut observed = std::collections::BTreeSet::new();
+        for config in configs {
+            for interval in [0, 2, 7] {
+                for pattern in 0..3 {
+                    let mut ops = vec![Interval(interval), Bounds(0, usize::MAX)];
+                    for step in 0_usize..96 {
+                        let index = match pattern {
+                            0 => step % domain,
+                            1 if step % 16 < 12 => (step / 4) % 4,
+                            _ => (step * 7 + pattern * 3) % domain,
+                        };
+                        let page = pages[index];
+                        ops.push(if step.is_multiple_of(3) {
+                            Access(page)
+                        } else {
+                            Insert(page)
+                        });
+                        if step.is_multiple_of(11) {
+                            ops.push(Insert(page));
+                            ops.push(Access(page));
+                        }
+                        if step.is_multiple_of(23) {
+                            ops.push(Interval([0, 1, 5][(step / 23) % 3]));
+                        }
+                        if step.is_multiple_of(31) {
+                            ops.push(Bounds(1, config.capacity().div_ceil(2)));
+                        }
+                    }
+                    compare_hasher_trace(config, &ops, &pages, &mut observed);
+                }
+            }
+        }
+        assert!(observed.contains("adapted"));
+        assert!(observed.contains("ghost_readmission"));
     }
 
     #[test]
