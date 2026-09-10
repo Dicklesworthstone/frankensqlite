@@ -13,6 +13,10 @@ use fsqlite_vfs::{ShmRegion, Vfs, VfsFile};
 
 struct DemoFile;
 impl VfsFile for DemoFile {
+    fn wal_reader_mark_exclusive_acquire(&mut self, _: &Cx, _: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
@@ -53,6 +57,9 @@ impl VfsFile for DemoFile {
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
+    fn owns_external_wal_append_write(&self, _cx: &Cx) -> Result<bool> {
+        Err(FrankenError::Unsupported)
+    }
     fn lock_external_wal_append(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
@@ -60,6 +67,9 @@ impl VfsFile for DemoFile {
         Ok(())
     }
     fn lock_external_maintenance(&mut self, _cx: &Cx, _wal_mode: bool) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+    fn lock_external_wal_recovery(&mut self, _cx: &Cx) -> Result<()> {
         Err(FrankenError::Unsupported)
     }
     fn restore_external_maintenance_attempt(&mut self, _cx: &Cx) -> Result<()> {
