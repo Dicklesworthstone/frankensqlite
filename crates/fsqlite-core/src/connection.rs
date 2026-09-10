@@ -77575,10 +77575,24 @@ impl Connection {
                 // SQLite checkpoints outstanding WAL frames before leaving WAL
                 // mode so the main database stays self-contained for readers.
                 if self.pager.journal_mode() == JournalMode::Wal {
-                    let checkpoint = self
-                        .pager
-                        .checkpoint(&cx, CheckpointMode::Truncate)
-                        .await?;
+                    let checkpoint = match self.pager.checkpoint(&cx, CheckpointMode::Truncate).await {
+                        Ok(checkpoint) => checkpoint,
+                        Err(FrankenError::BusyRecovery)
+                            if cfg!(all(feature = "native", unix)) && !self.pager.is_memory() =>
+                        {
+                            // An idle peer can still cache WAL mode after a
+                            // completed peer transition retired its WAL file.
+                            // Recheck through the existing whole-image fence:
+                            // exact zero-byte retirement is accepted there;
+                            // pending owners and invalid/nonempty native WALs
+                            // remain refusals. Never rebuild or create a WAL
+                            // just to leave that already-published mode.
+                            self.pager.set_journal_mode(&cx, JournalMode::Delete).await?;
+                            self.pager.set_rollback_cleanup(cleanup)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if !checkpoint.completed
                         || checkpoint.effective_mode != CheckpointMode::Truncate
                     {

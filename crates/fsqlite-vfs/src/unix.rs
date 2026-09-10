@@ -1591,6 +1591,10 @@ enum WalLifetimeClaim {
 
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent file lifecycle, PENDING-byte, and DMS ownership flags"
+)]
 pub struct UnixFile {
     file: Option<Arc<File>>,
     path: PathBuf,
@@ -3781,7 +3785,7 @@ impl VfsFile for UnixFile {
                         }
                     }
                     Err(error) => {
-                        restore_errors.push(format!("WAL supplemental slot {slot}: {error}"))
+                        restore_errors.push(format!("WAL supplemental slot {slot}: {error}"));
                     }
                 }
             }

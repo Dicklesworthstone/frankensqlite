@@ -2183,7 +2183,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
             self.stage_append_attempt(
                 cx,
-                [(page_number, db_size_if_commit)].into_iter(),
+                std::iter::once((page_number, db_size_if_commit)),
                 completion.clone(),
             ).await?;
             let frames = [WalAppendFrameRef { page_number, page_data, db_size_if_commit }];
@@ -3043,9 +3043,21 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             if self.has_pending_publication() || self.native_read_binding.is_some() {
                 return Err(FrankenError::Busy);
             }
-            // A prior truncate may have succeeded before its sync failed.
-            // Only an already-empty handle can retry that terminal sync.
-            if self.wal.file().file_size(cx)? != 0 || self.wal.frame_count() != 0 {
+            if self.native_recovery_requested.is_some() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            // A peer may have retired this exact physical file while this
+            // idle adapter still caches the old frames. The caller owns the
+            // whole-image maintenance fence; zero bytes need no WAL-header
+            // refresh. Path adapters separately prove the exact path identity.
+            if self.wal.file().file_size(cx)? == 0 {
+                return Ok(());
+            }
+            // Retrying a mode change after BusyRecovery must not turn an
+            // invalid native publication into permission to discard its WAL.
+            if self.native_reader_required() {
+                self.native_checkpoint_view(cx).await?;
+            } else {
                 self.wal.refresh(cx).await?;
             }
             if self.wal.frame_count() != 0 {
@@ -3628,7 +3640,7 @@ where
             return Err(FrankenError::Busy);
         }
         let mut replacement = WalBackendAdapter::new(wal);
-        replacement.wal_index_shm_source = self.inner.wal_index_shm_source.clone();
+        replacement.wal_index_shm_source.clone_from(&self.inner.wal_index_shm_source);
         replacement.native_recovery_requested = self.inner.native_recovery_requested;
         let old = std::mem::replace(&mut self.inner, replacement);
         // bd-smxhz: the WAL generation changed, so the -wal-cert sidecar is
@@ -4020,6 +4032,91 @@ where
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
                 "native WAL path validation and close failed: validation={validation}; close={close}"
+            ))),
+        }
+    }
+
+    /// Recheck an already-retired native WAL only for whole-image retirement.
+    /// This never creates, replaces, or rebinds a WAL descriptor.
+    async fn validate_native_wal_retirement_path(&mut self, cx: &Cx) -> Result<()> {
+        if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
+            return Err(FrankenError::Busy);
+        }
+        if self.inner.native_recovery_requested.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
+        let (mut file, _) = self.vfs.open(
+            cx,
+            Some(&self.wal_path),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+        )?;
+        let validation = async {
+            let current = self.inner.wal.file();
+            if file.file_size(cx)? == 0 && current.file_size(cx)? == 0 {
+                match (file.file_identity()?, current.file_identity()?) {
+                    (Some(path_identity), Some(current_identity))
+                        if path_identity == current_identity => {}
+                    _ => return Err(FrankenError::BusyRecovery),
+                }
+                // Zero bytes alone do not prove a peer completed its mode
+                // transition. Read the persisted rollback format through a
+                // retained VFS descriptor under the caller's whole-image
+                // fence; never admit unexplained truncation in WAL mode.
+                if self.cached_verification_db.is_none() {
+                    let (main, _) = self.vfs.open(
+                        cx,
+                        Some(&self.db_path),
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                    )?;
+                    self.cached_verification_db = Some(main);
+                }
+                let main = self
+                    .cached_verification_db
+                    .as_ref()
+                    .ok_or(FrankenError::BusyRecovery)?;
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                if let Some(binding) = &self.namespace_binding
+                    && main.file_identity()? != Some(binding.identity())
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                let mut bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
+                if main.read(cx, &mut bytes, 0).await? != bytes.len() {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                let header = fsqlite_types::DatabaseHeader::from_bytes(&bytes)
+                    .map_err(|_| FrankenError::BusyRecovery)?;
+                if header.read_version != 1
+                    || header.write_version != 1
+                    || header.page_size.get() != self.page_size
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                if let Some(binding) = &self.namespace_binding {
+                    binding.validate_path_identity()?;
+                }
+                return Ok(());
+            }
+            if self.path_header_matches_current_handle(cx, &file).await? {
+                Ok(())
+            } else {
+                Err(FrankenError::BusyRecovery)
+            }
+        }
+        .await;
+        let cleanup_cx = cx.create_child();
+        let _cleanup_mask = cleanup_cx.masked();
+        let close = file.close(&cleanup_cx);
+        match (validation, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(validation), Err(close)) => Err(FrankenError::internal(format!(
+                "native WAL retirement path validation and close failed: validation={validation}; close={close}"
             ))),
         }
     }
@@ -5413,14 +5510,18 @@ where
 
     fn validate_empty_wal_for_retirement<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
+            if self.inner.native_reader_required() {
+                self.validate_native_wal_retirement_path(cx).await?;
+            } else {
+                self.ensure_current_wal_path(cx).await?;
+            }
             self.inner.validate_empty_wal_for_retirement(cx).await
         })
     }
 
     fn retire_empty_wal<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            self.ensure_current_wal_path(cx).await?;
+            self.validate_empty_wal_for_retirement(cx).await?;
             self.inner.retire_empty_wal(cx).await
         })
     }
@@ -6120,6 +6221,10 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "independent fault controls can be armed together"
+    )]
     struct CheckpointHandoffFaultState {
         next_write: Option<CheckpointHandoffWriteFault>,
         fail_next_sync: bool,
@@ -9113,7 +9218,12 @@ mod tests {
             synthetic_shared_publication(&vfs, &cx);
         let wal = match adapter.into_inner() {
             Ok(wal) => wal,
-            Err(_) => panic!("fresh synthetic fixture has no pending append"),
+            Err(retained) => panic!(
+                "fresh synthetic fixture retained state: publication={}, reader={}, recovery={}",
+                retained.has_pending_publication(),
+                retained.native_read_binding.is_some(),
+                retained.native_recovery_requested.is_some(),
+            ),
         };
         let mut backend = PathRefreshingWalBackend::new(
             vfs.clone(), Path::new("test.db"), Path::new("test.db-wal"), PAGE_SIZE, wal, true, None,
@@ -12742,12 +12852,172 @@ mod tests {
         fixture
     }
 
+    /// Synthetic state-validation control; the public peer-transition keeper
+    /// separately proves durable rollback publication and real native fences.
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_zero_wal_retirement_requires_rollback_header_and_no_recovery_owner() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let SyntheticSharedPublication {
+            _pager: pager,
+            adapter,
+            region,
+            ..
+        } = checkpoint_reset_fixture(&vfs, &cx);
+        let wal = match adapter.into_inner() {
+            Ok(wal) => wal,
+            Err(retained) => panic!(
+                "published fixture retained state: publication={}, reader={}, recovery={}",
+                retained.has_pending_publication(),
+                retained.native_read_binding.is_some(),
+                retained.native_recovery_requested.is_some(),
+            ),
+        };
+        // SimplePager opens the normalized key; MemoryVfs::open itself
+        // preserves the supplied path rather than normalizing it again.
+        let db_path = pager.db_path();
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            db_path,
+            "test.db-wal",
+            PAGE_SIZE,
+            wal,
+            true,
+            None,
+        );
+        backend
+            .attach_wal_index_shm_source(pager.wal_index_shm_source().unwrap())
+            .unwrap();
+        let (mut main, _) = vfs
+            .open(
+                &cx,
+                Some(db_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        assert_eq!(
+            main.file_identity().unwrap(),
+            pager.file_identity(&cx).wait().unwrap(),
+            "the main header belongs to the fixture pager"
+        );
+        let header = fsqlite_types::DatabaseHeader {
+            read_version: 2,
+            write_version: 2,
+            page_count: 1,
+            ..fsqlite_types::DatabaseHeader::default()
+        };
+        let mut main_image = sample_page(0xA5);
+        main_image[..fsqlite_types::DATABASE_HEADER_SIZE]
+            .copy_from_slice(&header.to_bytes().unwrap());
+        main.write(&cx, &main_image, 0)
+            .expect("seed explicit WAL-mode main header");
+        main.sync(&cx, SyncFlags::FULL).unwrap();
+        let wal_identity = backend.inner.wal.file().file_identity().unwrap();
+        assert!(wal_identity.is_some());
+        assert_eq!(backend.inner.wal.frame_count(), 1);
+        // Deliberate external truncation keeps the same MemoryFile identity
+        // and stale private frame count. It does not prove a peer checkpoint.
+        backend.inner.wal.file_mut().truncate(&cx, 0).unwrap();
+        let shared_before = region.lock().to_vec();
+        let published_before = backend.inner.published_snapshot();
+        assert!(!backend.inner.has_pending_publication());
+        assert!(
+            matches!(
+                backend.begin_transaction(&cx).wait(),
+                Err(FrankenError::BusyRecovery)
+            ),
+            "ordinary native admission must not recreate the retired WAL"
+        );
+
+        for refusal in ["wal_header", "recovery_owner"] {
+            if refusal == "recovery_owner" {
+                main_image[18..20].copy_from_slice(&[1, 1]);
+                main.write(&cx, &main_image, 0)
+                    .expect("publish controlled rollback header");
+                main.sync(&cx, SyncFlags::FULL).unwrap();
+                // Explicit retained-request intervention exercises the guard;
+                // canonical recovery itself is covered by separate keepers.
+                backend.inner.native_recovery_requested =
+                    Some(fsqlite_pager::traits::WalNativeRecoveryReason::WalGenerationMismatch);
+            }
+            for retire in [false, true] {
+                let result = if retire {
+                    backend.retire_empty_wal(&cx).wait()
+                } else {
+                    backend.validate_empty_wal_for_retirement(&cx).wait()
+                };
+                assert!(
+                    matches!(result, Err(FrankenError::BusyRecovery)),
+                    "{refusal}: zero length cannot bypass retirement proof"
+                );
+                let mut observed = vec![0; main_image.len()];
+                assert_eq!(
+                    main.read(&cx, &mut observed, 0).expect("read retained main"),
+                    main_image.len()
+                );
+                assert_eq!(observed, main_image);
+                assert_eq!(region.lock().to_vec(), shared_before);
+                assert_eq!(backend.inner.published_snapshot(), published_before);
+                assert_eq!(backend.inner.wal.frame_count(), 1);
+                assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(), 0);
+                assert_eq!(
+                    backend.inner.wal.file().file_identity().unwrap(),
+                    wal_identity
+                );
+                assert_eq!(
+                    backend.inner.native_recovery_requested.is_some(),
+                    refusal == "recovery_owner"
+                );
+                assert!(!backend.inner.has_pending_publication());
+            }
+        }
+
+        // Clear only the deliberately injected request. Retirement still
+        // requires the exact path inode and persisted rollback header.
+        backend.inner.native_recovery_requested = None;
+        assert!(
+            matches!(
+                backend.begin_transaction(&cx).wait(),
+                Err(FrankenError::BusyRecovery)
+            ),
+            "rollback proof authorizes retirement only, never ordinary native reads"
+        );
+        backend
+            .validate_empty_wal_for_retirement(&cx)
+            .expect("same-inode zero WAL with rollback header");
+        backend
+            .retire_empty_wal(&cx)
+            .expect("finish proven zero retirement despite stale cached frames");
+        assert_eq!(backend.inner.wal.file().file_size(&cx).unwrap(), 0);
+        assert_eq!(backend.inner.wal.file().file_identity().unwrap(), wal_identity);
+        assert_eq!(region.lock().to_vec(), shared_before);
+        let mut observed = vec![0; main_image.len()];
+        assert_eq!(
+            main.read(&cx, &mut observed, 0).expect("read retired main"),
+            main_image.len()
+        );
+        assert_eq!(observed, main_image);
+        assert!(!backend.inner.has_pending_publication());
+        assert!(backend.inner.native_recovery_requested.is_none());
+        assert_eq!(
+            backend
+                .cached_verification_db
+                .as_ref()
+                .unwrap()
+                .file_identity()
+                .unwrap(),
+            main.file_identity().unwrap(),
+            "validation retains the exact main descriptor"
+        );
+        main.close(&cx).unwrap();
+    }
+
     /// Synthetic transport + real MemoryFile write-source controls. The pager
     /// native test below supplies the separate actual OS-gate/DB durability path.
     #[cfg(all(feature = "fault-injection", feature = "native", unix))]
     #[test]
     fn test_checkpoint_reset_retains_exact_target_through_partial_sync_and_dropped_source() {
-        use std::future::Future;
         use std::task::{Context, Poll, Waker};
 
         let cx = test_cx();
@@ -12906,7 +13176,6 @@ mod tests {
     #[cfg(all(feature = "fault-injection", feature = "native", unix))]
     #[test]
     fn test_path_checkpoint_pending_source_excludes_append_reconciliation_and_retains_handoff() {
-        use std::future::Future;
         use std::task::{Context, Poll, Waker};
 
         let cx = test_cx();

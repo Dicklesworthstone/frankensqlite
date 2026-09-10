@@ -1415,8 +1415,8 @@ mod tests {
             CheckpointMode::Restart,
         ] {
             let mut target = RecordingTarget::new();
-            let result = execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
-                .expect("checkpoint");
+            let result =
+                execute_checkpoint(&cx, &mut wal, mode, state, &mut target).expect("checkpoint");
 
             assert_eq!(result.frames_backfilled, 0);
             assert!(!result.wal_was_reset);

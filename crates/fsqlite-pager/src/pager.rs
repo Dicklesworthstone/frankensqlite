@@ -16315,7 +16315,7 @@ where
         // operations either keeps this gate Busy or leaves WAL frames that the
         // fenced preflight below rejects.
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
-        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        let maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
         self.validate_namespace_binding()?;
         let (db_file, wal_handle) = {
             let inner = self
@@ -16336,59 +16336,91 @@ where
             };
             (Arc::clone(&inner.db_file), wal_handle)
         };
-        let mut export_state = (
-            Arc::clone(&self.vfs),
-            Self::journal_path(&self.db_path),
-            wal_handle,
-        );
-
-        with_main_shared_lock(
-            cx,
+        let mut admission = BeginAdmission::new(
             &self.group_commit_queue,
-            &db_file,
-            &mut export_state,
-            |cx, source_file, (vfs, journal_path, wal_handle)| {
-                Box::pin(async move {
-                    if let Some(wal_handle) = wal_handle.as_ref() {
-                        let mut wal = async_rwlock_write(wal_handle, cx, "WAL backend").await?;
-                        // Refresh from durable WAL while main-file SHARED pins
-                        // this exact image. Frames here mean a commit landed
-                        // after the optimistic truncate and before the fence.
-                        wal.begin_transaction(cx).await?;
-                        if wal.frame_count() != 0 {
-                            return Err(FrankenError::Busy);
+            Arc::clone(&self.inner),
+            Arc::clone(&db_file),
+            Arc::clone(&self.writer_idle),
+            maintenance_lease,
+            None,
+            cx,
+        );
+        let operation_result = async {
+            admission.external_lock.acquire_snapshot(cx).await?;
+            if let Some(wal_handle) = wal_handle.as_ref() {
+                let mut wal = async_rwlock_write(wal_handle, cx, "WAL backend").await?;
+                if wal.native_reader_required() {
+                    let source = self.wal_index_shm_source()?;
+                    match source
+                        .acquire_reader_into(cx, &mut admission.external_lock, false)
+                        .await?
+                    {
+                        traits::WalNativeReadOutcome::Ready => {}
+                        traits::WalNativeReadOutcome::RecoveryRequired(_) => {
+                            return Err(FrankenError::BusyRecovery);
                         }
                     }
-
-                    Self::verify_readonly_rollback_journal_state(cx, &**vfs, journal_path).await?;
-
-                    let file_size = source_file.file_size(cx)?;
-                    let output_len =
-                        usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
-                            what: "database export size".to_owned(),
-                            value: file_size.to_string(),
-                        })?;
-                    let mut bytes = vec![0_u8; output_len];
-                    let mut copied = 0_usize;
-                    while copied < output_len {
-                        let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
-                        let bytes_read = source_file
-                            .read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)
-                            .await?;
-                        if bytes_read == 0 {
-                            return Err(FrankenError::internal(
-                                "unexpected EOF while exporting database image",
-                            ));
-                        }
-                        copied = copied
-                            .checked_add(bytes_read)
-                            .ok_or_else(|| FrankenError::internal("export size overflow"))?;
+                    let binding = admission
+                        .external_lock
+                        .native_reader
+                        .as_ref()
+                        .and_then(|reader| reader.validated.as_ref())
+                        .ok_or(FrankenError::BusyRecovery)?;
+                    if !binding.boundary().database_only || binding.header().mx_frame != 0 {
+                        return Err(FrankenError::Busy);
                     }
-                    Ok(bytes)
-                })
-            },
-        )
-        .await
+                }
+                // The native preflight maps this exact main handle's SHM.
+                // Do it before taking its Rust read guard. The retained slot-0
+                // claim prevents foreign backfill from changing the main image;
+                // a later WAL append can leave this captured image unchanged.
+                wal.begin_transaction(cx).await?;
+                if wal.frame_count() != 0 {
+                    return Err(FrankenError::Busy);
+                }
+            }
+            let journal_path = Self::journal_path(&self.db_path);
+            Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path).await?;
+            let source_file = shared_db_file_read(&db_file, cx).await?;
+            let file_size = source_file.file_size(cx)?;
+            let output_len = usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
+                what: "database export size".to_owned(),
+                value: file_size.to_string(),
+            })?;
+            let mut bytes = vec![0_u8; output_len];
+            let mut copied = 0_usize;
+            while copied < output_len {
+                let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
+                let bytes_read = source_file
+                    .read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)
+                    .await?;
+                if bytes_read == 0 {
+                    return Err(FrankenError::internal(
+                        "unexpected EOF while exporting database image",
+                    ));
+                }
+                copied = copied
+                    .checked_add(bytes_read)
+                    .ok_or_else(|| FrankenError::internal("export size overflow"))?;
+            }
+            Ok(bytes)
+        }
+        .await;
+        let restore_result = admission.external_lock.restore().await;
+        if restore_result.is_ok() {
+            // The exact native claim and outer snapshot are gone. A failed or
+            // dropped restore instead transfers this lease with both claims
+            // through BeginAdmission's existing process-root cleanup owner.
+            drop(admission.maintenance_lease.take());
+            admission.completed = true;
+        }
+        match (operation_result, restore_result) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(operation_error), Err(restore_error)) => Err(FrankenError::internal(format!(
+                "database export and snapshot restoration failed: operation={operation_error}; restore={restore_error}"
+            ))),
+        }
     }
 
     /// Copy the pager's main database file to `target_path` via the active VFS.
@@ -17378,7 +17410,7 @@ where
     async fn try_bind_runtime_native_reader(
         &self,
         cx: &Cx,
-        inner: &mut PagerInner<V::File>,
+        inner: &PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
     ) -> Result<traits::WalNativeReadOutcome> {
         use traits::WalNativeReadOutcome;
@@ -59789,6 +59821,211 @@ mod tests {
 
             vfs.release_io();
             copy.await.unwrap();
+        });
+    }
+
+    /// An explicitly empty synthetic WAL isolates the export lock order.
+    /// Its preflight maps the actual pager-owned Unix main-file handle; the
+    /// main image, slot-0 claim, peer contention and cleanup remain real VFS I/O.
+    #[cfg(all(feature = "native", unix))]
+    struct NativeExportMappingProbe {
+        source: Arc<WalIndexShmSource<fsqlite_vfs::UnixFile>>,
+        begin_calls: Arc<AtomicUsize>,
+        checkpoint_calls: Arc<AtomicUsize>,
+        export_map_entered: Arc<AtomicBool>,
+        export_map_completed: Arc<AtomicBool>,
+        pause_export: Arc<AtomicBool>,
+        fail_export: Arc<AtomicBool>,
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    impl WalBackend for NativeExportMappingProbe {
+        fn native_reader_required(&self) -> bool { true }
+
+        fn begin_transaction<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+            Box::pin(async move {
+                self.begin_calls.fetch_add(1, AtomicOrdering::AcqRel);
+                let exporting = self.checkpoint_calls.load(AtomicOrdering::Acquire) > 0;
+                if exporting {
+                    self.export_map_entered.store(true, AtomicOrdering::Release);
+                }
+                let region = self.source.map_region(cx, 0, false).await?;
+                let header = fsqlite_wal::wal_index::read_shared_wal_index_header(&region)?
+                    .ok_or(FrankenError::BusyRecovery)?;
+                assert_eq!(header.mx_frame, 0, "fixture WAL stays empty");
+                if exporting {
+                    self.export_map_completed.store(true, AtomicOrdering::Release);
+                    if self.pause_export.load(AtomicOrdering::Acquire) {
+                        std::future::pending::<()>().await;
+                    }
+                    if self.fail_export.swap(false, AtomicOrdering::AcqRel) {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        fn append_frame<'a>(
+            &'a mut self, _cx: &'a Cx, _page_number: u32,
+            _page_data: &'a [u8], _db_size_if_commit: u32,
+        ) -> WalFuture<'a, ()> {
+            Box::pin(async { Err(FrankenError::Unsupported) })
+        }
+
+        fn read_page<'a>(
+            &'a mut self, _cx: &'a Cx, _page_number: u32,
+        ) -> WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> { Ok(()) }
+        fn frame_count(&self) -> usize { 0 }
+
+        fn checkpoint<'a>(
+            &'a mut self, _cx: &'a Cx, mode: traits::CheckpointMode,
+            _writer: &'a mut dyn traits::CheckpointPageWriter,
+            _backfilled_frames: u32, _oldest_reader_frame: Option<u32>,
+        ) -> WalFuture<'a, traits::CheckpointResult> {
+            Box::pin(async move {
+                self.checkpoint_calls.fetch_add(1, AtomicOrdering::AcqRel);
+                // No physical WAL exists in this probe, so it performs and
+                // claims no backfill or generation reset.
+                Ok(traits::CheckpointResult {
+                    total_frames: 0, frames_backfilled: 0, completed: true,
+                    wal_was_reset: false, requested_mode: mode, effective_mode: mode,
+                })
+            })
+        }
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn native_export_maps_before_file_read_and_retains_slot_zero_through_drop() {
+        asupersync::test_utils::run_test(|| async {
+            use fsqlite_wal::wal_index::{WalIndexHdr, WAL_INDEX_VERSION, publish_shared_wal_index_header};
+
+            for phase in ["complete", "error", "drop"] {
+                let cx = Cx::new();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("native-export-source.db");
+                let pager = SimplePager::open_with_cx(
+                    &cx, UnixVfs::new(), &path, PageSize::DEFAULT,
+                ).await.unwrap();
+                let mut transaction = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = transaction.allocate_page(&cx).await.unwrap();
+                transaction.write_page(&cx, page, &vec![0x6D; PageSize::DEFAULT.as_usize()]).await.unwrap();
+                transaction.commit(&cx).await.unwrap();
+                let source = pager.wal_index_shm_source().unwrap();
+                let begin_calls = Arc::new(AtomicUsize::new(0));
+                let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+                let export_map_entered = Arc::new(AtomicBool::new(false));
+                let export_map_completed = Arc::new(AtomicBool::new(false));
+                let pause_export = Arc::new(AtomicBool::new(phase == "drop"));
+                let fail_export = Arc::new(AtomicBool::new(phase == "error"));
+                pager.set_wal_backend(Box::new(NativeExportMappingProbe {
+                    source: Arc::clone(&source), begin_calls: Arc::clone(&begin_calls),
+                    checkpoint_calls: Arc::clone(&checkpoint_calls),
+                    export_map_entered: Arc::clone(&export_map_entered),
+                    export_map_completed: Arc::clone(&export_map_completed),
+                    pause_export: Arc::clone(&pause_export), fail_export: Arc::clone(&fail_export),
+                })).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let region = source.map_region(&cx, 0, true).await.unwrap();
+                let mut header = WalIndexHdr {
+                    i_version: WAL_INDEX_VERSION, unused: 0, i_change: 0, is_init: 1,
+                    big_end_cksum: 0, sz_page: 4096, mx_frame: 0, n_page: 0,
+                    a_frame_cksum: [0, 0], a_salt: [0, 0], a_cksum: [0, 0],
+                };
+                header.update_checksum().unwrap();
+                publish_shared_wal_index_header(&region, &header).unwrap();
+                let expected = {
+                    let file = shared_db_file_read(&source.db_file, &cx).await.unwrap();
+                    let size = usize::try_from(file.file_size(&cx).unwrap()).unwrap();
+                    let mut bytes = vec![0; size];
+                    assert_eq!(file.read(&cx, &mut bytes, 0).await.unwrap(), size);
+                    bytes
+                };
+                let mut export = Box::pin(pager.export_database_bytes(&cx));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let result = std::future::poll_fn(|task_cx| {
+                    assert!(std::time::Instant::now() < deadline,
+                        "{phase}: export cannot map SHM while retaining its own main-file READ guard; entered={} completed={}",
+                        export_map_entered.load(AtomicOrdering::Acquire),
+                        export_map_completed.load(AtomicOrdering::Acquire));
+                    match export.as_mut().poll(task_cx) {
+                        std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                        std::task::Poll::Pending if phase == "drop"
+                            && export_map_completed.load(AtomicOrdering::Acquire) => {
+                                std::task::Poll::Ready(None)
+                            }
+                        std::task::Poll::Pending => {
+                            task_cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }
+                }).await;
+                assert!(export_map_entered.load(AtomicOrdering::Acquire));
+                assert!(export_map_completed.load(AtomicOrdering::Acquire));
+                assert!(begin_calls.load(AtomicOrdering::Acquire) >= 2);
+                assert_eq!(checkpoint_calls.load(AtomicOrdering::Acquire), 1);
+                let (mut peer, _) = UnixVfs::new().open(
+                    &cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                ).unwrap();
+                if phase == "drop" {
+                    assert!(result.is_none());
+                    assert!(!peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap(),
+                        "export owns actual reader slot zero after native mapping");
+                    let held_file = shared_db_file_read(&source.db_file, &cx).await.unwrap();
+                    drop(export);
+                    assert!(pager.group_commit_queue.has_process_root_finalization_attempt());
+                    {
+                        let state = pager.maintenance_gate.state.lock().unwrap();
+                        assert!(state.maintenance_active, "pending slot-zero cleanup retains export admission");
+                        assert_eq!((state.active_openers, state.active_transactions), (0, 0));
+                    }
+                    assert!(!peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap(),
+                        "caller Drop cannot release the native fence before exact cleanup");
+                    drop(held_file);
+                    settle_pending_group_commit_finalization(&pager.group_commit_queue).await.unwrap();
+                } else {
+                    drop(export);
+                    let result = result.expect("unpaused export finishes within its deadline");
+                    if phase == "error" {
+                        assert!(matches!(result, Err(FrankenError::Busy)));
+                        assert!(!fail_export.load(AtomicOrdering::Acquire), "failure reached post-map boundary");
+                    } else {
+                        assert_eq!(result.unwrap(), expected, "copy preserves the exact main image");
+                    }
+                }
+                assert!(!pager.group_commit_queue.has_process_root_finalization_attempt());
+                {
+                    let state = pager.maintenance_gate.state.lock().unwrap();
+                    assert!(!state.maintenance_active);
+                    assert_eq!((state.active_openers, state.active_transactions), (0, 0));
+                }
+                assert!(peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap(),
+                    "returned or reconciled export releases its actual slot-zero claim");
+                peer.wal_checkpoint_backfill_gate_release(&cx).unwrap();
+                pause_export.store(false, AtomicOrdering::Release);
+                let mut retry = Box::pin(pager.export_database_bytes(&cx));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let bytes = std::future::poll_fn(|task_cx| {
+                    assert!(std::time::Instant::now() < deadline, "{phase}: export retry remains live after cleanup");
+                    match retry.as_mut().poll(task_cx) {
+                        std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+                        std::task::Poll::Pending => {
+                            task_cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }
+                }).await.unwrap();
+                drop(retry);
+                assert_eq!(bytes, expected, "cleanup permits another exact export");
+                assert!(peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap());
+                peer.wal_checkpoint_backfill_gate_release(&cx).unwrap();
+                peer.close(&cx).unwrap();
+            }
         });
     }
 

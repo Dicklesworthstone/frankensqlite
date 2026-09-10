@@ -252,6 +252,22 @@ fn gh19_public_connections_publish_pinned_and_fresh_stock_views() {
     const CHILD_KIND: &str = "FSQLITE_GH19_PUBLIC_READER_KIND";
     if let Some(path) = std::env::var_os(CHILD_DB) {
         #[cfg(all(unix, feature = "native"))]
+        match std::env::var(CHILD_KIND).unwrap().as_str() {
+            "segment-writer" => {
+                run_as_segment_writer(Path::new(&path));
+                return;
+            }
+            "segment-stock" => {
+                run_as_segment_stock_reader(Path::new(&path));
+                return;
+            }
+            "segment-native" => {
+                run_as_segment_native_reader(Path::new(&path));
+                return;
+            }
+            _ => {}
+        }
+        #[cfg(all(unix, feature = "native"))]
         if std::env::var(CHILD_KIND).unwrap() == "export" {
             run_as_public_export(Path::new(&path));
             return;
@@ -494,6 +510,302 @@ fn gh19_public_export_bytes_preserves_committed_rows_and_writer_progress() {
     assert_eq!(integrity, "ok");
 }
 
+#[cfg(all(unix, feature = "native"))]
+fn segment_payload(id: i64) -> Vec<u8> {
+    let (length, salt) = match id {
+        0 => (128, 0x19_u8),
+        1 => (2_200_000, 0x3D_u8),
+        2 => (2_200_000, 0xB7_u8),
+        _ => panic!("unexpected segment fixture row {id}"),
+    };
+    (0..length)
+        .map(|index| {
+            u8::try_from(index % 251)
+                .unwrap()
+                .wrapping_mul(17)
+                .wrapping_add(salt)
+        })
+        .collect()
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn assert_segment_stock_rows(connection: &rusqlite::Connection, last_id: i64) {
+    let mut statement = connection.prepare("SELECT id, payload FROM t ORDER BY id").unwrap();
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), usize::try_from(last_id + 1).unwrap());
+    for (expected_id, (id, payload)) in (0..=last_id).zip(rows) {
+        assert_eq!(id, expected_id);
+        assert!(payload == segment_payload(id), "exact stock payload for row {id}");
+    }
+}
+
+#[cfg(all(unix, feature = "native"))]
+async fn assert_segment_native_rows(connection: &Connection, last_id: i64) {
+    let rows = connection.query("SELECT id, payload FROM t ORDER BY id").await.unwrap();
+    assert_eq!(rows.len(), usize::try_from(last_id + 1).unwrap());
+    for (id, row) in (0..=last_id).zip(rows) {
+        assert_eq!(row.values().len(), 2);
+        assert_eq!(row.values()[0], SqliteValue::Integer(id));
+        let SqliteValue::Blob(payload) = &row.values()[1] else {
+            panic!("native row {id} must contain a BLOB");
+        };
+        assert!(
+            payload.as_ref() == segment_payload(id).as_slice(),
+            "exact native payload for row {id}",
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn run_as_segment_writer(path: &Path) {
+    asupersync::test_utils::run_test(|| async {
+        let writer = Connection::open(path.to_str().unwrap()).await.unwrap();
+        assert!(writer.is_concurrent_mode_default());
+        assert_eq!(scalar_i64(&writer.query("PRAGMA page_size").await.unwrap()), 512);
+        assert_eq!(
+            writer.query_row("PRAGMA journal_mode=WAL").await.unwrap().values(),
+            &[SqliteValue::Text("wal".into())],
+        );
+        writer.execute("PRAGMA synchronous=FULL").await.unwrap();
+        writer.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
+        assert_eq!(
+            writer.query_row("PRAGMA synchronous").await.unwrap().values(),
+            &[SqliteValue::Integer(2)],
+        );
+        writer.execute_with_params(
+            "INSERT INTO t VALUES(?1, ?2)",
+            &[SqliteValue::Integer(0), SqliteValue::Blob(segment_payload(0).into())],
+        ).await.unwrap();
+        println!("segments-writer-ready");
+        std::io::stdout().flush().unwrap();
+        for (id, command, witness) in [
+            (1, "first", "segments-written-first"),
+            (2, "second", "segments-written-second"),
+        ] {
+            expect_line(command);
+            writer.execute_with_params(
+                "INSERT INTO t VALUES(?1, ?2)",
+                &[SqliteValue::Integer(id), SqliteValue::Blob(segment_payload(id).into())],
+            ).await.expect("FULL native commit crosses the next SHM segment");
+            assert!(writer.is_concurrent_mode_default());
+            println!("{witness}");
+            std::io::stdout().flush().unwrap();
+        }
+        expect_line("exit");
+        writer.close().await.unwrap();
+    });
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn run_as_segment_stock_reader(path: &Path) {
+    let reader = rusqlite::Connection::open(path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    assert_segment_stock_rows(&reader, 0);
+    println!("segments-reader-ready");
+    std::io::stdout().flush().unwrap();
+    for (id, phase) in [(1, "first"), (2, "second")] {
+        expect_line(&format!("{phase}-pinned"));
+        assert_segment_stock_rows(&reader, id - 1);
+        println!("segments-pinned-{phase}");
+        std::io::stdout().flush().unwrap();
+        expect_line(&format!("{phase}-renew"));
+        reader.execute_batch("ROLLBACK; BEGIN").unwrap();
+        assert_segment_stock_rows(&reader, id);
+        println!("segments-renewed-{phase}");
+        std::io::stdout().flush().unwrap();
+    }
+    expect_line("exit");
+    reader.execute_batch("ROLLBACK").unwrap();
+    let integrity: String = reader.query_row("PRAGMA integrity_check", [], |row| row.get(0)).unwrap();
+    assert_eq!(integrity, "ok");
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn run_as_segment_native_reader(path: &Path) {
+    asupersync::test_utils::run_test(|| async {
+        let reader = Connection::open(path.to_str().unwrap()).await.unwrap();
+        reader.execute("BEGIN").await.unwrap();
+        assert_segment_native_rows(&reader, 0).await;
+        println!("segments-reader-ready");
+        std::io::stdout().flush().unwrap();
+        for (id, phase) in [(1, "first"), (2, "second")] {
+            expect_line(&format!("{phase}-pinned"));
+            assert_segment_native_rows(&reader, id - 1).await;
+            println!("segments-pinned-{phase}");
+            std::io::stdout().flush().unwrap();
+            expect_line(&format!("{phase}-renew"));
+            reader.execute("ROLLBACK").await.unwrap();
+            reader.execute("BEGIN").await.unwrap();
+            assert_segment_native_rows(&reader, id).await;
+            println!("segments-renewed-{phase}");
+            std::io::stdout().flush().unwrap();
+        }
+        expect_line("exit");
+        reader.execute("ROLLBACK").await.unwrap();
+        reader.close().await.unwrap();
+    });
+}
+
+#[cfg(all(unix, feature = "native"))]
+struct NativeSegmentPublication {
+    header: fsqlite_wal::wal_index::WalIndexHdr,
+    shared: Vec<u8>,
+    wal: Vec<u8>,
+}
+
+/// Only the diagnostic parent calls this: it holds no original-inode SQL or
+/// VFS handle. All children are waiting at explicit witnesses, so these are
+/// stable bytes published by the native writer before any stock refresh.
+#[cfg(all(unix, feature = "native"))]
+fn read_native_segment_publication(path: &Path) -> NativeSegmentPublication {
+    use fsqlite_wal::wal_index::{
+        WAL_SHM_FIRST_HEADER_BYTES, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation,
+        lookup_native_wal_index_frame, parse_shm_header,
+    };
+    use fsqlite_wal::{WalFrameHeader, WalHeader, validate_wal_header_checksum};
+
+    let wal = std::fs::read(sidecar(path, "-wal")).unwrap();
+    let shared = std::fs::read(sidecar(path, "-shm")).unwrap();
+    let wal_header = WalHeader::from_bytes(&wal).unwrap();
+    assert_eq!(wal_header.page_size, 512);
+    assert!(validate_wal_header_checksum(&wal, wal_header.big_endian_checksum()).unwrap());
+    let frame_size = 24 + usize::try_from(wal_header.page_size).unwrap();
+    assert_eq!((wal.len() - 32) % frame_size, 0, "no partial physical WAL frame");
+    let frame_count = u32::try_from((wal.len() - 32) / frame_size).unwrap();
+    assert!(frame_count > 0);
+    let (header, checkpoint) = parse_shm_header(&shared)
+        .unwrap()
+        .expect("native writer published matching initialized dual headers");
+    assert_eq!(header.mx_frame, frame_count, "publication precedes stock recovery");
+    assert_eq!(header.page_size().unwrap(), 512);
+    assert_eq!(header.a_salt, [wal_header.salts.salt1, wal_header.salts.salt2]);
+    assert_eq!(header.big_end_cksum, u8::from(wal_header.big_endian_checksum()));
+    assert_eq!(checkpoint.n_backfill, 0, "autocheckpoint remains disabled");
+    let last = WalIndexFrameLocation::new(frame_count).unwrap();
+    let region_count = usize::try_from(last.region).unwrap() + 1;
+    assert!(shared.len() >= region_count * WAL_SHM_SEGMENT_BYTES);
+    for frame_no in 1..=frame_count {
+        let offset = 32 + usize::try_from(frame_no - 1).unwrap() * frame_size;
+        let frame = WalFrameHeader::from_bytes(&wal[offset..]).unwrap();
+        assert_eq!(frame.salts, wal_header.salts);
+        let location = WalIndexFrameLocation::new(frame_no).unwrap();
+        let region_start = usize::try_from(location.region).unwrap() * WAL_SHM_SEGMENT_BYTES;
+        let segment = &shared[region_start..region_start + WAL_SHM_SEGMENT_BYTES];
+        let header_bytes = if location.region == 0 { WAL_SHM_FIRST_HEADER_BYTES } else { 0 };
+        let page_offset = header_bytes + (usize::from(location.entry) - 1) * 4;
+        assert_eq!(
+            u32::from_ne_bytes(segment[page_offset..page_offset + 4].try_into().unwrap()),
+            frame.page_number,
+            "native page-array entry for physical frame {frame_no}",
+        );
+        assert_eq!(
+            lookup_native_wal_index_frame(segment, location.region, frame.page_number, frame_no)
+                .unwrap(),
+            Some(frame_no),
+            "native hash entry for physical frame {frame_no}",
+        );
+        if frame_no == frame_count {
+            assert!(frame.is_commit());
+            assert_eq!(header.n_page, frame.db_size);
+            assert_eq!(header.a_frame_cksum, [frame.checksum.s1, frame.checksum.s2]);
+        }
+    }
+    eprintln!(
+        "GH19 live native FULL publication: frames={frame_count} regions={region_count} shm_bytes={}",
+        shared.len(),
+    );
+    NativeSegmentPublication { header, shared, wal }
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn assert_native_segment_prefix(prior: &NativeSegmentPublication, next: &NativeSegmentPublication) {
+    use fsqlite_wal::wal_index::{
+        WAL_SHM_FIRST_HEADER_BYTES, WAL_SHM_PAGE_ARRAY_BYTES, WAL_SHM_SEGMENT_BYTES,
+    };
+
+    assert_eq!(next.header.a_salt, prior.header.a_salt, "no reset between native commits");
+    assert_eq!(next.header.i_change, prior.header.i_change.wrapping_add(1));
+    assert_eq!(&next.wal[..prior.wal.len()], prior.wal, "retain the committed WAL prefix");
+    for (index, segment) in prior.shared.as_chunks::<WAL_SHM_SEGMENT_BYTES>().0.iter().enumerate() {
+        let next_segment =
+            &next.shared[index * WAL_SHM_SEGMENT_BYTES..(index + 1) * WAL_SHM_SEGMENT_BYTES];
+        let header_bytes = if index == 0 { WAL_SHM_FIRST_HEADER_BYTES } else { 0 };
+        for offset in (header_bytes..WAL_SHM_PAGE_ARRAY_BYTES).step_by(4) {
+            if segment[offset..offset + 4] != [0; 4] {
+                assert_eq!(&next_segment[offset..offset + 4], &segment[offset..offset + 4]);
+            }
+        }
+        for offset in (WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES).step_by(2) {
+            if segment[offset..offset + 2] != [0; 2] {
+                assert_eq!(&next_segment[offset..offset + 2], &segment[offset..offset + 2]);
+            }
+        }
+    }
+}
+
+/// Exercise real native mmap growth at both hash-segment boundaries, with
+/// FULL commits and independent readers retaining exact old payloads. This
+/// exercises the native producer path; the stock-only codec fixture stays separate.
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn gh19_public_native_full_commits_grow_shared_segments_before_stock_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native-segment-growth.db");
+    {
+        let seed = rusqlite::Connection::open(&path).unwrap();
+        seed.execute_batch(
+            "PRAGMA page_size=512; CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
+        ).unwrap();
+    }
+    // Every original-inode connection lives in a child from this point on.
+    // The parent can inspect SHM without closing a descriptor behind a live
+    // same-process native/stock POSIX lock owner.
+    let mut writer = PublicReaderProcess::spawn(&path, "segment-writer");
+    writer.witness("segments-writer-ready");
+    let mut prior = read_native_segment_publication(&path);
+    assert!(prior.header.mx_frame <= 4062);
+    assert_eq!(prior.shared.len(), 32_768, "baseline maps only region zero");
+    let mut readers = [
+        PublicReaderProcess::spawn(&path, "segment-stock"),
+        PublicReaderProcess::spawn(&path, "segment-native"),
+    ];
+    for reader in &readers {
+        reader.witness("segments-reader-ready");
+    }
+    for (phase, lower, upper) in [("first", 4062, 8158), ("second", 8158, u32::MAX)] {
+        writer.signal(phase);
+        writer.witness(&format!("segments-written-{phase}"));
+        // No reader is released to query/renew before these physical oracles.
+        let published = read_native_segment_publication(&path);
+        assert!(published.header.mx_frame > lower && published.header.mx_frame <= upper);
+        assert!(published.shared.len() > prior.shared.len(), "native commit grows another mmap region");
+        assert_native_segment_prefix(&prior, &published);
+        for reader in &mut readers {
+            reader.signal(&format!("{phase}-pinned"));
+            reader.witness(&format!("segments-pinned-{phase}"));
+        }
+        for reader in &mut readers {
+            reader.signal(&format!("{phase}-renew"));
+            reader.witness(&format!("segments-renewed-{phase}"));
+        }
+        prior = published;
+    }
+    for reader in &mut readers {
+        reader.signal("exit");
+        reader.wait_success();
+    }
+    writer.signal("exit");
+    writer.wait_success();
+    let reopened = rusqlite::Connection::open(&path).unwrap();
+    assert_segment_stock_rows(&reopened, 2);
+    let integrity: String = reopened.query_row("PRAGMA integrity_check", [], |row| row.get(0)).unwrap();
+    assert_eq!(integrity, "ok");
+}
+
 /// Stock owns separate seed inodes throughout the copied-file constructor tests.
 /// Capture its nonzero reader mark before any native target handle is opened.
 #[cfg(all(unix, feature = "native"))]
@@ -708,12 +1020,10 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
     });
 }
 
-/// Explicit investigation of the remaining attachment-lifetime boundary when
+/// Preserve the attachment-lifetime boundary when
 /// the writer closes before the pinned stock reader releases its snapshot.
-/// This must pass before GH411 can claim reverse-close-order durability;
-/// it is separate from the unchanged original regression below.
+/// Keep both close orders in the default regression suite.
 #[test]
-#[ignore = "GH411 reverse-close-order investigation; run explicitly before issue closure"]
 fn committed_row_survives_writer_close_before_foreign_reader_exit() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");

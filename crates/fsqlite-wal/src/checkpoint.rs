@@ -160,13 +160,12 @@ pub fn plan_checkpoint(mode: CheckpointMode, state: CheckpointState) -> Checkpoi
             // RESTART can leave old-generation bytes behind a valid empty
             // header. TRUNCATE still owes physical truncation in that state;
             // the executor retains the ordinary reader gate and reset owner.
-            let post_action = if matches!(progress, CheckpointProgress::Complete)
-                && !has_active_reader
-            {
-                CheckpointPostAction::TruncateWal
-            } else {
-                CheckpointPostAction::None
-            };
+            let post_action =
+                if matches!(progress, CheckpointProgress::Complete) && !has_active_reader {
+                    CheckpointPostAction::TruncateWal
+                } else {
+                    CheckpointPostAction::None
+                };
             CheckpointPlan {
                 mode,
                 frames_to_backfill,

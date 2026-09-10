@@ -444,6 +444,9 @@ pub fn validate_shared_wal_index_wal_binding(
             detail: "shared WAL-index header does not match the WAL generation format".to_owned(),
         });
     }
+    // The WAL-index calls the committed database page count `n_page`, while
+    // the terminal WAL frame calls the same quantity `db_size`.
+    let committed_database_pages = header.n_page;
     match (header.mx_frame, terminal) {
         (0, None) => Ok(()),
         (frame, Some((number, marker)))
@@ -451,7 +454,7 @@ pub fn validate_shared_wal_index_wal_binding(
                 && number == frame
                 && marker.is_commit()
                 && marker.salts == wal_header.salts
-                && marker.db_size == header.n_page
+                && marker.db_size == committed_database_pages
                 && [marker.checksum.s1, marker.checksum.s2] == header.a_frame_cksum =>
         {
             Ok(())
