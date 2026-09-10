@@ -12,6 +12,100 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-10 - REJECTED: cold completion shortcut requiring empty MAIN (GH#402, bd-sde05.3)
+
+- Target: the original 18-case `gh402_measure_residual_schema_matrix`, with
+  50/150/300 tables, memory/file storage, sequential/batch/transaction DDL,
+  INSERT windows, reopen, first statement and three statistics samples. The
+  original gate requires at least 1.5x median improvement in all 12 actual
+  500-resident statistics groups, including sample zero, and no unexplained
+  recurring non-statistics or DDL/INSERT median regressions above 10%.
+- Files: `crates/fsqlite-pager/src/s3_fifo.rs` and `page_cache.rs`. The candidate
+  recognizes an exact cold completion state with empty MAIN and advances the
+  discarded rounds by parity, including ghost epochs and adaptation counters.
+  It preserves logical model state; it does not claim identical allocator or
+  hash-table bucket state. Original transitions, hashing and the 2N logical
+  completion budget remain unchanged. Failed recognition leaves the model
+  untouched and executes the original loop.
+- Correctness: focused RCH 25732 passed 64 pager tests, including independent
+  hand-derived transitions, full-state differential checks and atomic refusal
+  controls. All 32 original semantic/counter/page goldens remain exact. Across
+  the 416 instrumented cold reconstruction records, executed insertions fall
+  from 66,291,264 to 84,968; skipped logical rounds are counted separately.
+  Recognition overhead remains inside elapsed time. Workspace check 25736,
+  warnings-denied Clippy 25733 and configured formatting 25738 pass; formatting
+  retains the existing pager/core/VDBE exclusions. Public SQL 25737 passes all
+  four selected tests, including the full matrix and three correctness guards.
+- **Rejected by the first complete paired campaign:** strict RCH
+  `30004650170125740` on Linux x86_64 vmi1264463 completed 26 full matrices,
+  three warmups and ten measured matrices per arm, alternating baseline first.
+  All 12 required 500-resident groups have ten paired observations, but every
+  group misses 1.5x: baseline/candidate median ratios are 0.929169–1.119282.
+  Nineteen non-statistics groups and ten DDL/INSERT windows exceed 10% median
+  growth in this campaign. Reversed-order RCH `30004650170125742` also passes
+  26 matrices but misses 1.5x in all 12 groups: ratios 0.804612–1.109918.
+  It flags fourteen non-statistics groups and ten windows. Three non-statistics
+  groups and one DDL window exceed 10% median growth in both campaigns:
+
+  | Measurement | First campaign | Reversed campaign |
+  |---|---:|---:|
+  | file / batch / 300 / reopen sample 2 | +47.86% | +40.93% |
+  | file / seq / 300 / schema total | +13.99% | +17.26% |
+  | file / txn / 150 / reopen sample 0 | +32.34% | +51.73% |
+  | file / seq / 150 / DDL window ending 50 | +18.22% | +71.94% |
+
+  Tail changes are mixed, not uniformly regressions. No overall-matrix result
+  substitutes for the original gate, and these comparisons do not establish
+  which code change caused each slowdown. The 135/138 sparse or unmatched
+  primary groups remain unmeasured; all samples and p95/p99 tails are retained.
+- Independent isolated-run negative: comparing chronological instrumented
+  runs 25724 and 25732 yields 59 slower samples out of 416, 56 above 10%, all
+  empty-cache cases. The four empty fast-path measured medians rise from
+  290.5/300/300/295.5 ns to 1192/1217/1252.5/1237 ns, respectively. No nonempty
+  sample or median regresses in those runs. These are separate instrumented
+  executions, not paired public-SQL acceptance or causal proof of the empty
+  timing change. Do not dismiss these observations as noise without evidence.
+- Source and executable receipts: candidate S3-FIFO SHA256
+  `a72eea8b42c24a85963a0a176ca7e7c0b9d15911e4ab30974cb367a4bdb56bb9`,
+  page cache `57c4b27e64c53e207a9cbccd652ffd37396a51b7206d04fdaf6a0bfcb16f577c`.
+  The 1,615 tracked Rust/TOML/root-lock inputs match
+  `/tmp/frankensqlite-gh402-cold-completion-final-source-20260910.sha256`,
+  SHA256 `31d91d630e48aaca7cb8a44aded5200c176346f3d423c9446af7e2893abcd9e3`.
+  The complete two-file patch against `3a669f98e` is retained in
+  `/tmp/frankensqlite-gh402-cold-completion-source-patch-20260910.patch`, SHA256
+  `660c58b49b9a070800c3b902dc77168331914ddacf6bd68b11e6f931d3a2d2fb`.
+  Retained candidate ELF on vmi1264463:
+  `/tmp/frankensqlite-gh402-cold-completion-candidate-20260910`, SHA256
+  `df7bdb652f290336dd42b25d7374673cb98a5869932aa50086ebfe5632b6044e`;
+  the baseline remains the standard-hasher, non-memo ELF `6adf01fe…` below.
+  Both hashes pass before and after the campaign. Actual compiler/ELF records
+  identify Rust nightly 908501772, LLVM 23.1.0, glibc 2.43, native/json/fts5,
+  Cargo test opt-level 1 with debug assertions. Build hosts differ; the shared
+  worker run does not establish identical build environments or quiet timing.
+- First paired raw log:
+  `/tmp/frankensqlite-gh402-cold-completion-paired1-rch-20260910.log`, SHA256
+  `d8ab350dc98197d971f9d14b3dac555751e20f3d9576cbf77f4723d7e894f536`;
+  analysis `/tmp/frankensqlite-gh402-cold-completion-paired1-analysis-20260910.json`,
+  SHA256 `7928b720a1400823919c777922646d00e29dbbe401fc17f35091606503d89cef`.
+  Reversed log `/tmp/frankensqlite-gh402-cold-completion-paired2-rch-20260910.log`,
+  SHA256 `4e306c12c09b2edb225c08e708ce17aa5815933184571bbeced5293f72ac1742`;
+  analysis `/tmp/frankensqlite-gh402-cold-completion-paired2-analysis-20260910.json`,
+  SHA256 `4bd516770e42bb5085b64f8e18f3baad5e9f1e3ff231459c602014b239196909`.
+  Remote execution took 650823/696588 ms. Independent review reproduces both
+  full analyses from raw observations. The unchanged analyzer validates all run
+  identities, ordering, 126 primary measurements and 82 windows per matrix,
+  retained hashes and raw summaries.
+- Retry condition: do not repeat the empty-MAIN candidate or promote the
+  isolated cold-sweep work reduction to a public SQL speedup. Real SQL repeats
+  writes and table/catalog reads that can leave MAIN populated; existing public
+  logs do not measure recognition counts, so this is a structural explanation
+  to test, not measured per-case attribution. Two independent reviews support
+  a bounded extension that preserves a validated fixed MAIN partition and
+  applies the cold proof to the remaining residents. That extension must check
+  the projected count against the ghost-safety bound, advance by its actual
+  insertion count, preserve the original 2N budget and hidden state, and pass
+  fresh correctness and both unchanged paired campaigns before acceptance.
+
 ## 2026-09-10 - REJECTED: statistics-only hashing without memo retention (GH#402, bd-sde05.3)
 
 - Target: the same 18-case `gh402_measure_residual_schema_matrix` and original
