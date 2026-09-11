@@ -14,6 +14,8 @@ use fsqlite::{Connection, SqliteValue};
 use fsqlite_core::connection::{
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
+#[cfg(feature = "bench-internals")]
+use fsqlite_pager::{PagerCommitProfileSnapshot, pager_commit_profile_snapshot};
 use std::path::Path;
 use std::time::Instant;
 
@@ -308,6 +310,8 @@ struct Deltas {
     wal_frames_written: u64,
     checkpoint_frames_backfilled: u64,
     checkpoint_duration_us: u64,
+    #[cfg(feature = "bench-internals")]
+    pager_commit: PagerCommitProfileSnapshot,
 }
 
 fn snapshot_deltas() -> Deltas {
@@ -333,7 +337,63 @@ fn snapshot_deltas() -> Deltas {
         wal_frames_written: wal.frames_written_total,
         checkpoint_frames_backfilled: wal.checkpoint_frames_backfilled_total,
         checkpoint_duration_us: wal.checkpoint_duration_us_total,
+        #[cfg(feature = "bench-internals")]
+        pager_commit: snap.pager_commit,
     }
+}
+
+/// Reports existing process-global selected-path counters, not a complete
+/// commit decomposition. `commit_calls` counts full write-path entries, including
+/// failed attempts; read-only, clean and reconciliation early exits bypass it.
+/// Phase A includes preparation and waiting. WAL time surrounds the group-commit
+/// call; the current WAL path finishes through an unprofiled authorization tail
+/// before the non-WAL phase-C counters. Zero phase-C time does not prove no work.
+/// Phase-C metadata includes file-size and unlock time. The connection commit
+/// timer contains these selected pager intervals; maintenance and checkpointing
+/// happen later. Durations include waits, are not CPU self time, and must not be
+/// summed across overlapping metadata subintervals or their enclosing timers.
+///
+/// The public integration harness enables these counters through its existing
+/// hot-path profile switch and resets them before each schema case. Samples are
+/// individual relaxed atomic loads, not an atomic or caller-owned snapshot; use
+/// the existing serial diagnostic invocation. A counter decrease, such as a reset
+/// or wrap, fails subtraction instead of fabricating zero work. This adds no reset
+/// or engine instrumentation and stays outside paired performance acceptance.
+#[cfg(feature = "bench-internals")]
+fn pager_commit_report(
+    label: &str,
+    phase: &str,
+    sample: Option<usize>,
+    boundary: &str,
+    before: &PagerCommitProfileSnapshot,
+    after: &PagerCommitProfileSnapshot,
+) {
+    let sample = sample.map_or_else(|| "none".to_owned(), |value| value.to_string());
+    let delta = |after: u64, before: u64| {
+        after
+            .checked_sub(before)
+            .expect("pager commit profile reset or wrapped within a reported interval")
+    };
+    println!(
+        "[gh402-pager-commit] {label} phase={phase} sample={sample} boundary={boundary} \
+         scope=process_global coverage=selected_paths \
+         commit_calls={} phase_a_time_ns={} wal_commit_time_ns={} \
+         memory_flush_time_ns={} journal_commit_time_ns={} phase_c_metadata_time_ns={} \
+         file_size_time_ns={} unlock_time_ns={} publish_time_ns={} cache_finish_time_ns={}",
+        delta(after.commit_calls, before.commit_calls),
+        delta(after.phase_a_time_ns, before.phase_a_time_ns),
+        delta(after.wal_commit_time_ns, before.wal_commit_time_ns),
+        delta(after.memory_flush_time_ns, before.memory_flush_time_ns),
+        delta(after.journal_commit_time_ns, before.journal_commit_time_ns),
+        delta(
+            after.phase_c_metadata_time_ns,
+            before.phase_c_metadata_time_ns
+        ),
+        delta(after.file_size_time_ns, before.file_size_time_ns),
+        delta(after.unlock_time_ns, before.unlock_time_ns),
+        delta(after.publish_time_ns, before.publish_time_ns),
+        delta(after.cache_finish_time_ns, before.cache_finish_time_ns),
+    );
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -344,6 +404,7 @@ fn window_report(
     before: &Deltas,
     after: &Deltas,
     db_path: &Path,
+    #[cfg(feature = "bench-internals")] pager_phase: (&str, Option<usize>),
 ) {
     let ms = |a: u64, b: u64| (a - b) / 1_000_000;
     let wal = db_path.with_extension("db-wal");
@@ -382,6 +443,15 @@ fn window_report(
         after.checkpoint_frames_backfilled - before.checkpoint_frames_backfilled,
         after.checkpoint_duration_us - before.checkpoint_duration_us,
     );
+    #[cfg(feature = "bench-internals")]
+    pager_commit_report(
+        &format!("{label} window_tables={window_tables}"),
+        pager_phase.0,
+        pager_phase.1,
+        "window",
+        &before.pager_commit,
+        &after.pager_commit,
+    );
 }
 
 async fn create_schema_autocommit(
@@ -407,7 +477,16 @@ async fn create_schema_autocommit(
         if (i + 1) % WINDOW == 0 {
             let elapsed = window_start.elapsed().as_millis();
             let after = snapshot_deltas();
-            window_report(label, i + 1, elapsed, &before, &after, db_path);
+            window_report(
+                label,
+                i + 1,
+                elapsed,
+                &before,
+                &after,
+                db_path,
+                #[cfg(feature = "bench-internals")]
+                (&format!("ddl_window_{}", i + 1), None),
+            );
             let parses_after = conn.schema_reload_parse_count();
             println!(
                 "[gh402] {label} tables={} stored_schema_parse_delta={}",
@@ -472,6 +551,8 @@ fn gh402_measure_autocommit_schema_scaling() {
             &before,
             &after,
             &path,
+            #[cfg(feature = "bench-internals")]
+            ("inserts_txn_false", None),
         );
 
         // Same 20 INSERTs inside one transaction.
@@ -492,6 +573,8 @@ fn gh402_measure_autocommit_schema_scaling() {
             &before,
             &after,
             &path,
+            #[cfg(feature = "bench-internals")]
+            ("inserts_txn_true", None),
         );
 
         // Reopen + first statement.
@@ -563,6 +646,8 @@ fn gh402_measure_residual_schema_matrix() {
                             &before,
                             &snapshot_deltas(),
                             &path,
+                            #[cfg(feature = "bench-internals")]
+                            ("ddl_batch", None),
                         );
                         #[cfg(feature = "bench-internals")]
                         cost.report(&label, "ddl_batch", None);
@@ -577,9 +662,17 @@ fn gh402_measure_residual_schema_matrix() {
                         )
                         .await;
                     }
+                    // The final DDL window ends before an explicit COMMIT.
+                    // Capture that call separately; do not charge it to the
+                    // last window or invent missing executor/frame deltas.
+                    #[cfg(feature = "bench-internals")]
+                    let ddl_commit_before = (ddl_mode == "txn").then(pager_commit_profile_snapshot);
                     if ddl_mode == "txn" {
                         conn.execute("COMMIT;").await.expect("commit DDL");
                     }
+                    #[cfg(feature = "bench-internals")]
+                    let ddl_commit_profile =
+                        ddl_commit_before.map(|before| (before, pager_commit_profile_snapshot()));
                     println!(
                         "[gh402] {label} schema_total_us={} stored_schema_parses={}",
                         started.elapsed().as_micros(),
@@ -603,6 +696,19 @@ fn gh402_measure_residual_schema_matrix() {
                             inserts * (inserts - 1) / 2,
                             "actual catalog visits for a fresh table/index-pair schema"
                         );
+                        if let Some((before, after)) = ddl_commit_profile {
+                            // Print after the existing elapsed read and phase
+                            // reports. This is the COMMIT subset of ddl_complete;
+                            // it does not include BEGIN or reporting overhead.
+                            pager_commit_report(
+                                &label,
+                                "ddl_complete",
+                                None,
+                                "explicit_commit",
+                                &before,
+                                &after,
+                            );
+                        }
                     }
 
                     let stock = rusqlite::Connection::open_in_memory().unwrap();
@@ -637,6 +743,8 @@ fn gh402_measure_residual_schema_matrix() {
                             &before,
                             &snapshot_deltas(),
                             &path,
+                            #[cfg(feature = "bench-internals")]
+                            (&format!("inserts_txn_{in_transaction}"), None),
                         );
                         #[cfg(feature = "bench-internals")]
                         cost.report(&label, &format!("inserts_txn_{in_transaction}"), None);
@@ -719,6 +827,8 @@ fn gh402_measure_residual_schema_matrix() {
                                 &before,
                                 &snapshot_deltas(),
                                 &path,
+                                #[cfg(feature = "bench-internals")]
+                                ("reopen_and_first_statement", Some(sample)),
                             );
                             peer.close().await.expect("close peer");
                             #[cfg(feature = "bench-internals")]

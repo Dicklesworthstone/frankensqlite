@@ -12,6 +12,29 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-11 - Not implemented: dropping the WAL adapter read pin at publication (GH#402, bd-sde05.3)
+
+- Target: growing page-index copy work during sequential table/index DDL in
+  `WalBackendAdapter::publish_pending_commit_snapshot`. Its `Arc::make_mut`
+  can clone the accumulated map while `read_snapshot` retains an alias.
+- Proposed shortcut: release that adapter-owned alias at successful publication
+  so a single connection might mutate the previous index in place. No code was
+  changed and no candidate benchmark or new runtime test was run.
+- Rejected on the existing visibility contract, inspected at `8c6daafd6544`:
+  `pinned_logical_reader_skips_newer_authorized_certificate` in
+  `crates/fsqlite-core/src/wal_adapter.rs` requires the same adapter to retain
+  its old metadata, certificate horizon and page bytes after appending and
+  syncing a newer commit. Only the next transaction advances the pin. Native
+  reads additionally require exact-token retirement; the pager can share the
+  backend pin across its entire nonzero active-transaction window. Successful
+  WAL publication also precedes authorized finalization and transaction exit.
+- This differs from the rejected May 5 `Arc::make_mut` hoist below. Neither
+  inspection proves this copy dominates GH402 timing. Revisit only with a
+  representation that preserves every live old view, exact reader retirement,
+  retained commits and failed/ambiguous publication, then measure the original
+  end-to-end acceptance matrix. Adapter ownership alone does not prove exclusive
+  ownership by the committing transaction.
+
 ## 2026-09-10 - REJECTED: exact cold completion with a fixed MAIN partition (GH#402, bd-sde05.3)
 
 - Target and gate: the unchanged 18-case public SQL matrix and acceptance below,
