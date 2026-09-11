@@ -121,6 +121,10 @@ mod offsets {
 /// Magic bytes identifying a valid FrankenSQLite SHM header.
 const MAGIC: [u8; 8] = *b"FSQLSHM\0";
 
+/// A claimed but not yet published header. A dead initializer leaves this
+/// marker in place: attaching code must not reset an authority it cannot fence.
+const INITIALIZING_MAGIC: u64 = u64::from_le_bytes(*b"FSQLINI\0");
+
 /// Current layout version.
 const LAYOUT_VERSION: u32 = 1;
 
@@ -401,9 +405,11 @@ impl SharedMemoryLayout {
         }
     }
 
-    /// Deserialize a `SharedMemoryLayout` from a byte buffer.
+    /// Deserialize a `SharedMemoryLayout` from a frozen byte buffer.
     ///
     /// Validates magic, version, page size, and checksum.
+    /// Live shared mappings must use [`open_region`](Self::open_region), whose
+    /// accesses cannot race another process's atomic updates as byte reads.
     ///
     /// # Errors
     ///
@@ -501,15 +507,40 @@ impl SharedMemoryLayout {
     ///
     /// The immutable header is validated once, after which all dynamic fields
     /// are read and written directly through the shared region.
+    /// Every header access uses aligned atomic u64 words, including the packed
+    /// immutable u32 fields. The process-local region mutex alone cannot protect
+    /// byte reads from concurrent writers through independent mappings.
     ///
     /// # Errors
     ///
-    /// Propagates the same validation failures as [`open`](Self::open).
+    /// Propagates the same validation failures as [`open`](Self::open), or
+    /// returns [`MvccError::ShmInitializing`] while an initializer owns the header.
     pub fn open_region(region: ShmRegion) -> Result<Self, MvccError> {
-        let mut layout = {
-            let guard = region.lock();
-            Self::open(&guard[..])?
-        };
+        if region.len() < Self::HEADER_SIZE {
+            return Err(MvccError::ShmTooSmall);
+        }
+        let magic = region
+            .atomic_load_u64_le(offsets::MAGIC, Ordering::Acquire)
+            .map_err(|_| MvccError::ShmTooSmall)?;
+        if magic == INITIALIZING_MAGIC {
+            return Err(MvccError::ShmInitializing);
+        }
+        if magic != u64::from_le_bytes(MAGIC) {
+            return Err(MvccError::ShmBadMagic);
+        }
+
+        // Acquire of the published magic precedes every immutable-field read.
+        // Dynamic copies only seed the unused local fallback atomics; they are
+        // not a coherent snapshot. All live operations below use mapped_region.
+        let mut bytes = [0_u8; Self::HEADER_SIZE];
+        write_u64(&mut bytes, offsets::MAGIC, magic);
+        for offset in (8..Self::HEADER_SIZE).step_by(8) {
+            let value = region
+                .atomic_load_u64_le(offset, Ordering::Acquire)
+                .map_err(|_| MvccError::ShmTooSmall)?;
+            write_u64(&mut bytes, offset, value);
+        }
+        let mut layout = Self::open(&bytes)?;
         layout.mapped_region = Some(region);
         Ok(layout)
     }
@@ -518,10 +549,17 @@ impl SharedMemoryLayout {
     ///
     /// This keeps the header bytes resident in the mapped region so later
     /// loads/stores remain visible across handles and processes.
+    /// One compare-exchange claims the zero magic word; the winner publishes
+    /// the ready magic only after initializing every other word. Contenders
+    /// return immediately and leave retry deadlines to the caller. A process
+    /// dying during initialization requires externally fenced recovery; this
+    /// method never steals its marker or resets existing counters.
     ///
     /// # Errors
     ///
-    /// Returns the same validation errors as [`open_region`](Self::open_region).
+    /// Returns the same validation errors as [`open_region`](Self::open_region),
+    /// or [`MvccError::ShmConfigurationMismatch`] if an existing layout has a
+    /// different page size or transaction-slot count.
     pub fn open_or_initialize_region(
         region: ShmRegion,
         page_size: PageSize,
@@ -531,16 +569,57 @@ impl SharedMemoryLayout {
             return Err(MvccError::ShmTooSmall);
         }
 
+        match region
+            .atomic_compare_exchange_u64_le(
+                offsets::MAGIC,
+                0,
+                INITIALIZING_MAGIC,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| MvccError::ShmTooSmall)?
         {
-            let mut guard = region.lock();
-            let magic = &guard[offsets::MAGIC..offsets::MAGIC + offsets::MAGIC_LEN];
-            if magic.iter().all(|byte| *byte == 0) {
+            Ok(_) => {
+                // Zero magic is not permission to discard an old authority's
+                // remaining state. A malformed/partially cleared header needs
+                // externally fenced recovery, just like a dead initializer.
+                for offset in (8..Self::HEADER_SIZE).step_by(8) {
+                    if region
+                        .atomic_load_u64_le(offset, Ordering::Acquire)
+                        .map_err(|_| MvccError::ShmTooSmall)?
+                        != 0
+                    {
+                        return Err(MvccError::ShmBadMagic);
+                    }
+                }
                 let seed = Self::new(page_size, max_txn_slots).to_bytes();
-                guard[..Self::HEADER_SIZE].copy_from_slice(&seed);
+                for offset in (8..Self::HEADER_SIZE).step_by(8) {
+                    region
+                        .atomic_store_u64_le(offset, read_u64(&seed, offset), Ordering::Relaxed)
+                        .map_err(|_| MvccError::ShmTooSmall)?;
+                }
+                region
+                    .atomic_store_u64_le(
+                        offsets::MAGIC,
+                        u64::from_le_bytes(MAGIC),
+                        Ordering::Release,
+                    )
+                    .map_err(|_| MvccError::ShmTooSmall)?;
             }
+            Err(INITIALIZING_MAGIC) => return Err(MvccError::ShmInitializing),
+            Err(_) => {}
         }
 
-        Self::open_region(region)
+        let layout = Self::open_region(region)?;
+        let max_txn_slots = if max_txn_slots == 0 {
+            DEFAULT_MAX_TXN_SLOTS
+        } else {
+            max_txn_slots
+        };
+        if layout.page_size != page_size || layout.max_txn_slots != max_txn_slots {
+            return Err(MvccError::ShmConfigurationMismatch);
+        }
+        Ok(layout)
     }
 
     /// Serialize the entire header to a 216-byte `Vec<u8>`.
@@ -2548,6 +2627,269 @@ mod tests {
         assert_eq!(layout_b.check_serialized_writer().unwrap().get(), 77);
         assert!(layout_b.release_serialized_writer(77));
         assert!(layout_a.check_serialized_writer().is_none());
+    }
+
+    #[test]
+    fn test_region_initialization_in_progress_never_resets_owner_state() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        region
+            .atomic_store_u64_le(offsets::MAGIC, INITIALIZING_MAGIC, Ordering::Release)
+            .unwrap();
+        region
+            .atomic_store_u64_le(offsets::NEXT_TXN_ID, 37, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            SharedMemoryLayout::open_region(region.share()).unwrap_err(),
+            MvccError::ShmInitializing
+        );
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 64)
+                .unwrap_err(),
+            MvccError::ShmInitializing
+        );
+        assert_eq!(
+            region
+                .atomic_load_u64_le(offsets::MAGIC, Ordering::Acquire)
+                .unwrap(),
+            INITIALIZING_MAGIC
+        );
+        assert_eq!(
+            region
+                .atomic_load_u64_le(offsets::NEXT_TXN_ID, Ordering::Acquire)
+                .unwrap(),
+            37
+        );
+    }
+
+    #[test]
+    fn test_region_configuration_mismatch_preserves_live_counter() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        let layout =
+            SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 64)
+                .unwrap();
+        assert_eq!(layout.alloc_txn_id().unwrap().get(), 1);
+        for (page_size, slots) in [(PageSize::new(8192).unwrap(), 64), (PageSize::DEFAULT, 65)] {
+            assert_eq!(
+                SharedMemoryLayout::open_or_initialize_region(region.share(), page_size, slots)
+                    .unwrap_err(),
+                MvccError::ShmConfigurationMismatch
+            );
+        }
+        let attached = SharedMemoryLayout::open_region(region).unwrap();
+        assert_eq!(attached.alloc_txn_id().unwrap().get(), 2);
+        assert_eq!(layout.alloc_txn_id().unwrap().get(), 3);
+    }
+
+    #[test]
+    fn test_region_zero_magic_does_not_discard_remaining_authority_state() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        region
+            .atomic_store_u64_le(offsets::NEXT_TXN_ID, 37, Ordering::Release)
+            .unwrap();
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 64)
+                .unwrap_err(),
+            MvccError::ShmBadMagic
+        );
+        assert_eq!(
+            region
+                .atomic_load_u64_le(offsets::NEXT_TXN_ID, Ordering::Acquire)
+                .unwrap(),
+            37
+        );
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(region, PageSize::DEFAULT, 64)
+                .unwrap_err(),
+            MvccError::ShmInitializing,
+            "a later opener must not retry by discarding the retained state"
+        );
+    }
+
+    #[test]
+    fn test_region_default_slots_and_invalid_headers() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 0)
+            .unwrap();
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(
+                region,
+                PageSize::DEFAULT,
+                DEFAULT_MAX_TXN_SLOTS,
+            )
+            .unwrap()
+            .max_txn_slots(),
+            DEFAULT_MAX_TXN_SLOTS
+        );
+        let short = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE - 1);
+        assert_eq!(
+            SharedMemoryLayout::open_region(short.share()).unwrap_err(),
+            MvccError::ShmTooSmall
+        );
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(short, PageSize::DEFAULT, 64)
+                .unwrap_err(),
+            MvccError::ShmTooSmall
+        );
+        let mut bytes = SharedMemoryLayout::new(PageSize::DEFAULT, 64).to_bytes();
+        bytes[0] = b'X';
+        let corrupt = ShmRegion::from_vec(bytes.clone());
+        assert_eq!(
+            SharedMemoryLayout::open_or_initialize_region(corrupt.share(), PageSize::DEFAULT, 64)
+                .unwrap_err(),
+            MvccError::ShmBadMagic
+        );
+        assert_eq!(&*corrupt.lock(), bytes.as_slice());
+    }
+
+    // This exercises the header primitive over real independent mappings. It
+    // does not exercise public Connection or claim a shared MVCC registry.
+    #[cfg(all(feature = "native", unix))]
+    mod native_header_tests {
+        use super::*;
+        use fsqlite_types::{cx::Cx, flags::VfsOpenFlags};
+        use fsqlite_vfs::{UnixVfs, Vfs, VfsFile, shm::SHM_SEGMENT_SIZE};
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        const READY: usize = 256;
+        const START: usize = 264;
+        const IDS: usize = 272;
+        const COUNT: usize = 128;
+        const CHILD_TEST: &str =
+            "shm::tests::native_header_tests::test_region_independent_process_child";
+
+        struct Children(Vec<Child>);
+
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    // Retain the cleanup obligation even if a parent assertion
+                    // fails before the normal bounded wait finishes.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        #[test]
+        fn test_region_independent_process_child() {
+            let Some(path) = std::env::var_os("FSQLITE_HEADER_TEST_PATH") else {
+                return;
+            };
+            let ordinal: usize = std::env::var("FSQLITE_HEADER_TEST_ORDINAL")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(ordinal < 2);
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+            let (mut file, _) = UnixVfs::new()
+                .open(&cx, Some(path.as_ref()), flags)
+                .unwrap();
+            let region = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false).unwrap();
+            assert!(region.is_mmap_backed());
+            let deadline = Instant::now() + Duration::from_secs(20);
+            region
+                .atomic_fetch_add_u64_le(READY, 1, Ordering::AcqRel)
+                .unwrap();
+            while region.atomic_load_u64_le(START, Ordering::Acquire).unwrap() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "parent did not release header openers"
+                );
+                thread::yield_now();
+            }
+            let mut layout = loop {
+                match SharedMemoryLayout::open_or_initialize_region(
+                    region.share(),
+                    PageSize::DEFAULT,
+                    64,
+                ) {
+                    Ok(layout) => break layout,
+                    Err(MvccError::ShmInitializing) => {
+                        assert!(Instant::now() < deadline, "initializer did not publish");
+                        thread::yield_now();
+                    }
+                    Err(error) => panic!("independent header attachment failed: {error}"),
+                }
+            };
+            for index in 0..COUNT {
+                if index % 8 == 0 {
+                    layout = SharedMemoryLayout::open_region(region.share()).unwrap();
+                }
+                let txn_id = layout.alloc_txn_id().unwrap().get();
+                region
+                    .atomic_store_u64_le(
+                        IDS + (ordinal * COUNT + index) * 8,
+                        txn_id,
+                        Ordering::Release,
+                    )
+                    .unwrap();
+            }
+        }
+
+        #[test]
+        fn test_region_independent_process_initialization_and_allocation() {
+            let dir = tempfile::tempdir().unwrap();
+            // A scratch VFS file, not a SQLite database or live WAL index.
+            let path = dir.path().join("header-primitive.db");
+            let cx = Cx::new();
+            let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+            let (mut file, _) = UnixVfs::new().open(&cx, Some(&path), flags).unwrap();
+            let region = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            assert!(region.is_mmap_backed());
+            let mut children = Children(Vec::new());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            for ordinal in 0..2 {
+                children.0.push(
+                    Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", CHILD_TEST, "--nocapture"])
+                        .env("FSQLITE_HEADER_TEST_PATH", &path)
+                        .env("FSQLITE_HEADER_TEST_ORDINAL", ordinal.to_string())
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            while region.atomic_load_u64_le(READY, Ordering::Acquire).unwrap() != 2 {
+                assert!(Instant::now() < deadline, "children did not map the header");
+                for child in &mut children.0 {
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "child exited before ready"
+                    );
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            region
+                .atomic_store_u64_le(START, 1, Ordering::Release)
+                .unwrap();
+            for child in &mut children.0 {
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        assert!(status.success(), "header child failed: {status}");
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "header child exceeded shared deadline"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            for index in 0..2 * COUNT {
+                let id = region
+                    .atomic_load_u64_le(IDS + index * 8, Ordering::Acquire)
+                    .unwrap();
+                assert!(
+                    id != 0 && ids.insert(id),
+                    "missing or duplicate transaction ID {id}"
+                );
+            }
+            assert_eq!(ids, (1..=2 * COUNT as u64).collect());
+            let layout = SharedMemoryLayout::open_region(region).unwrap();
+            assert_eq!(layout.alloc_txn_id().unwrap().get(), 2 * COUNT as u64 + 1);
+        }
     }
 
     #[test]

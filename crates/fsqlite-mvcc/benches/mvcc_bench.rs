@@ -478,7 +478,6 @@ fn bench_fcw_clean(c: &mut Criterion) {
                             fsqlite_mvcc::concurrent_write_page(
                                 &mut handle,
                                 &lock_table,
-                                session_id,
                                 page(i),
                                 data,
                             )
@@ -526,7 +525,6 @@ fn bench_fcw_conflict(c: &mut Criterion) {
                             fsqlite_mvcc::concurrent_write_page(
                                 &mut handle,
                                 &lock_table,
-                                session_id,
                                 page(i),
                                 data,
                             )
@@ -761,7 +759,6 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
                             let _ = fsqlite_mvcc::concurrent_write_page(
                                 &mut handle,
                                 &lock_table,
-                                session_id,
                                 page(i),
                                 data,
                             );
@@ -775,7 +772,6 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
                             let _ = fsqlite_mvcc::concurrent_write_page(
                                 &mut handle,
                                 &lock_table,
-                                session_id,
                                 page(base + i),
                                 data,
                             );
@@ -801,7 +797,7 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
                     // Abort all (cleanup locks).
                     for &session_id in &session_ids {
                         let mut handle = registry.get_mut(session_id).unwrap();
-                        fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table, session_id);
+                        fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table);
                     }
                 },
                 BatchSize::SmallInput,
@@ -858,7 +854,6 @@ fn bench_hotspot_contention(c: &mut Criterion) {
                                 let _ = fsqlite_mvcc::concurrent_write_page(
                                     &mut handle,
                                     &lock_table,
-                                    session_id,
                                     page(i),
                                     data,
                                 );
@@ -878,7 +873,7 @@ fn bench_hotspot_contention(c: &mut Criterion) {
                         // Cleanup.
                         for &session_id in &session_ids {
                             let mut handle = registry.get_mut(session_id).unwrap();
-                            fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table, session_id);
+                            fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table);
                         }
                     },
                     BatchSize::SmallInput,

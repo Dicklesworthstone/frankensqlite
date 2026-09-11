@@ -1,21 +1,25 @@
-//! Cross-process shared-memory page lock table with rolling rebuild (§5.6.3).
+//! Mapped page ownership and the heap-backed rolling-rebuild model (§5.6.3).
 //!
-//! The [`SharedPageLockTable`] is a fixed-capacity open-addressing hash table
-//! using linear probing and atomic CAS operations, designed for cross-process
-//! page-level exclusive write locks. It supports a rolling rebuild protocol
-//! (§5.6.3.1) that rotates between two physical tables without abort storms.
+//! [`MappedPageLockTable`] operates on actual shared mmap bytes. Its fixed
+//! table retains page keys and never resets or rebuilds a live mapping.
+//! [`SharedPageLockTable`] is the separate heap-backed model of a rolling
+//! rebuild protocol (§5.6.3.1); its vectors are not cross-process authority.
 //!
 //! Key design invariants:
 //! - `page_number == 0` means empty slot
 //! - `owner_txn == 0` means unlocked
 //! - Keys (`page_number`) are NEVER deleted during normal `release()` — only
 //!   cleared during rebuild under lock-quiescence (§5.6.3)
-//! - Maximum load factor: 0.70 (Knuth Vol. 3 analysis for linear probing)
+//! - The heap model's rebuild threshold is 0.70; mapped admission is bounded by
+//!   the fixed number of stable keys and reports explicit capacity exhaustion.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use fsqlite_error::{FrankenError, Result as FsqliteResult};
 use fsqlite_types::sync_primitives::{Instant, SystemTime};
+use fsqlite_types::{PageNumber, TxnId};
+use fsqlite_vfs::ShmRegion;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -392,6 +396,308 @@ impl AcquireResult {
     }
 }
 
+/// Fixed-capacity page ownership in a native shared mapping.
+///
+/// The descriptor occupies two aligned little-endian atomic `u64` words:
+/// format/version, then capacity. Each slot occupies two more: page number,
+/// then owner transaction id. Zero denotes an unused key or an unlocked owner.
+/// Page keys never change once installed, including after release.
+///
+/// The caller must supply globally unique, non-reused transaction ids within
+/// the fenced database generation owning this mapping. This table does not
+/// establish database identity, transaction leases, FCW/SSI, or crash recovery.
+/// It cannot be rebound or reset underneath attached users. Heap-backed regions
+/// are refused, including heap regions shared between threads.
+#[derive(Debug, Clone)]
+pub struct MappedPageLockTable {
+    region: ShmRegion,
+    base: usize,
+    capacity: u32,
+}
+
+impl MappedPageLockTable {
+    const FORMAT: u64 = u64::from_le_bytes(*b"FSQLPL\x01\0");
+    const INITIALIZING: u64 = u64::from_le_bytes(*b"FSQLPL\0\0");
+    const DESCRIPTOR_BYTES: usize = 16;
+    const SLOT_BYTES: usize = 16;
+
+    /// Bytes occupied by the descriptor and a power-of-two slot array.
+    ///
+    /// # Errors
+    /// Refuses zero/non-power-of-two capacity and address-space overflow.
+    pub fn required_bytes(capacity: u32) -> FsqliteResult<usize> {
+        if !capacity.is_power_of_two() {
+            return Err(Self::corrupt("invalid mapped page-lock capacity"));
+        }
+        usize::try_from(capacity)
+            .ok()
+            .and_then(|count| count.checked_mul(Self::SLOT_BYTES))
+            .and_then(|bytes| bytes.checked_add(Self::DESCRIPTOR_BYTES))
+            .ok_or_else(|| Self::corrupt("mapped page-lock size overflow"))
+    }
+
+    /// Publish a table in fresh zero storage, or validate an existing table.
+    ///
+    /// The database-generation bootstrap owns the surrounding mapping. This
+    /// method only claims a zero format word and verifies every remaining word
+    /// is zero before publishing capacity and finally the ready format. It
+    /// never clears a key or owner. Failure after claiming initialization leaves
+    /// the marker intact; another opener refuses that incomplete publication.
+    ///
+    /// # Errors
+    /// Refuses heap backing, invalid bounds/configuration, nonzero initial
+    /// storage, a foreign format, or an unfinished initializer (`BusyRecovery`).
+    pub fn initialize(region: ShmRegion, base: usize, capacity: u32) -> FsqliteResult<Self> {
+        let table = Self::checked_view(region, base, capacity)?;
+        match table.region.atomic_compare_exchange_u64_le(
+            base,
+            0,
+            Self::INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )? {
+            Ok(_) => {}
+            Err(Self::FORMAT) => {
+                table.validate_descriptor()?;
+                return Ok(table);
+            }
+            Err(Self::INITIALIZING) => return Err(FrankenError::BusyRecovery),
+            Err(_) => return Err(Self::corrupt("unknown mapped page-lock format")),
+        }
+        let end = base + Self::required_bytes(capacity)?;
+        for offset in (base + 8..end).step_by(8) {
+            if table.region.atomic_load_u64_le(offset, Ordering::Acquire)? != 0 {
+                return Err(Self::corrupt(
+                    "mapped page-lock initialization requires zero storage",
+                ));
+            }
+        }
+        table
+            .region
+            .atomic_store_u64_le(base + 8, u64::from(capacity), Ordering::Release)?;
+        table
+            .region
+            .atomic_store_u64_le(base, Self::FORMAT, Ordering::Release)?;
+        Ok(table)
+    }
+
+    /// Attach to a published table without changing any shared bytes.
+    ///
+    /// # Errors
+    /// Refuses heap backing, invalid bounds, an unfinished initializer, or a
+    /// descriptor whose version/capacity differs from the requested layout.
+    pub fn open(region: ShmRegion, base: usize, capacity: u32) -> FsqliteResult<Self> {
+        let table = Self::checked_view(region, base, capacity)?;
+        table.validate_descriptor()?;
+        Ok(table)
+    }
+
+    fn checked_view(region: ShmRegion, base: usize, capacity: u32) -> FsqliteResult<Self> {
+        if !region.is_mmap_backed() {
+            return Err(FrankenError::Unsupported);
+        }
+        let bytes = Self::required_bytes(capacity)?;
+        if !base.is_multiple_of(8) || base.checked_add(bytes).is_none_or(|end| end > region.len()) {
+            return Err(Self::corrupt(
+                "mapped page-lock bounds or alignment invalid",
+            ));
+        }
+        Ok(Self {
+            region,
+            base,
+            capacity,
+        })
+    }
+
+    fn validate_descriptor(&self) -> FsqliteResult<()> {
+        match self
+            .region
+            .atomic_load_u64_le(self.base, Ordering::Acquire)?
+        {
+            Self::FORMAT => {}
+            Self::INITIALIZING => return Err(FrankenError::BusyRecovery),
+            _ => return Err(Self::corrupt("unknown mapped page-lock format")),
+        }
+        if self
+            .region
+            .atomic_load_u64_le(self.base + 8, Ordering::Acquire)?
+            != u64::from(self.capacity)
+        {
+            return Err(Self::corrupt("mapped page-lock capacity mismatch"));
+        }
+        Ok(())
+    }
+
+    /// Try once to acquire ownership, probing at most `capacity` slots.
+    ///
+    /// `Busy.holder` is the owner observed by the failed compare-exchange itself,
+    /// even if that owner releases or a successor acquires before this returns.
+    /// Existing keys remain usable when the stable-key array is full.
+    ///
+    /// # Errors
+    /// Refuses malformed caller or shared keys/owners and changed configuration.
+    pub fn try_acquire(&self, page: PageNumber, owner: TxnId) -> FsqliteResult<AcquireResult> {
+        let owner = Self::validate_owner(owner.get())?;
+        let wanted = Self::validate_key(u64::from(page.get()))?;
+        self.validate_descriptor()?;
+        for probe in 0..self.capacity {
+            let offset = self.slot_offset(page, probe);
+            let mut key = self.load_key(offset)?;
+            if key == 0 {
+                key = match self.region.atomic_compare_exchange_u64_le(
+                    offset,
+                    0,
+                    wanted,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )? {
+                    Ok(_) => wanted,
+                    Err(actual) => Self::validate_key(actual)?,
+                };
+            }
+            if key == wanted {
+                return match self.region.atomic_compare_exchange_u64_le(
+                    offset + 8,
+                    0,
+                    owner.get(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )? {
+                    Ok(_) => Ok(AcquireResult::Acquired),
+                    Err(actual) => {
+                        let holder = Self::validate_owner(actual)?;
+                        #[cfg(test)]
+                        fire_mapped_acquire_failure_hook();
+                        Ok(if holder == owner {
+                            AcquireResult::AlreadyHeld
+                        } else {
+                            AcquireResult::Busy {
+                                holder: holder.get(),
+                            }
+                        })
+                    }
+                };
+            }
+        }
+        Ok(AcquireResult::CapacityExhausted)
+    }
+
+    /// Release only the exact requesting owner, retaining the stable page key.
+    ///
+    /// # Errors
+    /// Refuses malformed caller or shared keys/owners and changed configuration.
+    pub fn release(&self, page: PageNumber, owner: TxnId) -> FsqliteResult<bool> {
+        let owner = Self::validate_owner(owner.get())?;
+        Self::validate_key(u64::from(page.get()))?;
+        self.validate_descriptor()?;
+        let Some(offset) = self.find_slot(page)? else {
+            return Ok(false);
+        };
+        match self.region.atomic_compare_exchange_u64_le(
+            offset + 8,
+            owner.get(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )? {
+            Ok(_) => Ok(true),
+            Err(0) => Ok(false),
+            Err(actual) => {
+                Self::validate_owner(actual)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Observe an owner; this observation grants no acquisition authority.
+    ///
+    /// # Errors
+    /// Refuses malformed caller or shared keys/owners and changed configuration.
+    pub fn holder(&self, page: PageNumber) -> FsqliteResult<Option<TxnId>> {
+        Self::validate_key(u64::from(page.get()))?;
+        self.validate_descriptor()?;
+        let Some(offset) = self.find_slot(page)? else {
+            return Ok(None);
+        };
+        match self
+            .region
+            .atomic_load_u64_le(offset + 8, Ordering::Acquire)?
+        {
+            0 => Ok(None),
+            actual => Self::validate_owner(actual).map(Some),
+        }
+    }
+
+    fn find_slot(&self, page: PageNumber) -> FsqliteResult<Option<usize>> {
+        for probe in 0..self.capacity {
+            let offset = self.slot_offset(page, probe);
+            match self.load_key(offset)? {
+                0 => return Ok(None),
+                key if key == u64::from(page.get()) => return Ok(Some(offset)),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn slot_offset(&self, page: PageNumber, probe: u32) -> usize {
+        let index =
+            page.get().wrapping_mul(2_654_435_769).wrapping_add(probe) & (self.capacity - 1);
+        // checked_view proved that every index fits the mapping/address space.
+        self.base + Self::DESCRIPTOR_BYTES + index as usize * Self::SLOT_BYTES
+    }
+
+    fn load_key(&self, offset: usize) -> FsqliteResult<u64> {
+        let mut key = self.region.atomic_load_u64_le(offset, Ordering::Acquire)?;
+        if key == 0
+            && self
+                .region
+                .atomic_load_u64_le(offset + 8, Ordering::Acquire)?
+                != 0
+        {
+            // A concurrent inserter can publish key then owner after our first
+            // key load. Recheck before diagnosing an owned empty slot.
+            key = self.region.atomic_load_u64_le(offset, Ordering::Acquire)?;
+            if key == 0 {
+                return Err(Self::corrupt("mapped page-lock owner has no page key"));
+            }
+        }
+        Self::validate_key(key)
+    }
+
+    fn validate_key(key: u64) -> FsqliteResult<u64> {
+        if key != 0 && u32::try_from(key).ok().and_then(PageNumber::new).is_none() {
+            return Err(Self::corrupt("mapped page-lock key is not a page number"));
+        }
+        Ok(key)
+    }
+
+    fn validate_owner(owner: u64) -> FsqliteResult<TxnId> {
+        TxnId::new(owner)
+            .ok_or_else(|| Self::corrupt("mapped page-lock owner is not a transaction id"))
+    }
+
+    fn corrupt(detail: &str) -> FrankenError {
+        FrankenError::DatabaseCorrupt {
+            detail: detail.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MAPPED_ACQUIRE_FAILURE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fire_mapped_acquire_failure_hook() {
+    let hook = MAPPED_ACQUIRE_FAILURE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Error from rebuild lease operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebuildLeaseError {
@@ -426,12 +732,13 @@ impl std::error::Error for RebuildLeaseError {}
 // SharedPageLockTable
 // ---------------------------------------------------------------------------
 
-/// Cross-process page lock table with two physical tables and rolling rebuild.
+/// Heap-backed page-lock model with two tables and rolling rebuild.
 ///
 /// Uses open addressing with linear probing and atomic CAS operations.
 /// The table supports a rolling rebuild protocol (§5.6.3.1) where one table
 /// is active (new acquisitions) while the other drains without aborting
-/// active transactions.
+/// active transactions. Its heap allocations are shared only by Rust owners
+/// in one process; use [`MappedPageLockTable`] for actual mapped page ownership.
 pub struct SharedPageLockTable {
     /// Per-table capacity (power-of-2).
     capacity: u32,
@@ -1389,6 +1696,502 @@ mod tests {
 
     /// Small capacity for tests to exercise the hash table mechanics.
     const TEST_CAP: u32 = 64;
+
+    #[test]
+    fn mapped_table_rejects_heap_and_invalid_capacity() {
+        assert_eq!(MappedPageLockTable::required_bytes(1).unwrap(), 32);
+        assert_eq!(MappedPageLockTable::required_bytes(8).unwrap(), 144);
+        assert!(MappedPageLockTable::required_bytes(0).is_err());
+        assert!(MappedPageLockTable::required_bytes(3).is_err());
+        let heap = ShmRegion::new(4096);
+        assert!(matches!(
+            MappedPageLockTable::initialize(heap.share(), 0, 8),
+            Err(FrankenError::Unsupported)
+        ));
+        assert!(matches!(
+            MappedPageLockTable::open(heap.share(), 0, 8),
+            Err(FrankenError::Unsupported)
+        ));
+        assert_eq!(heap.atomic_load_u64_le(0, Ordering::Acquire).unwrap(), 0);
+        assert!(TxnId::new(0).is_none());
+        assert!(PageNumber::new(0).is_none());
+        assert!(serde_json::from_str::<PageNumber>("4294967295").is_err());
+    }
+
+    // These controls use the dedicated native MVCC mapping. They establish
+    // mapped page ownership, not public Connection/FCW/SSI or crash recovery.
+    #[cfg(all(feature = "native", unix))]
+    mod mapped_tests {
+        use super::*;
+        use fsqlite_types::{cx::Cx, flags::VfsOpenFlags};
+        use fsqlite_vfs::{
+            DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, UnixFile, UnixVfs,
+            Vfs, VfsFile,
+        };
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+
+        const PAYLOAD_BYTES: u64 = 4096;
+        const BASE: usize = 64;
+        const CAPACITY: u32 = 8;
+        const START: usize = 0;
+        const CHILD_RESULT: usize = 8;
+        const RELEASE: usize = 16;
+        const READY: usize = 24;
+        const CHILD_ENV: &str = "FSQLITE_MAPPED_PAGE_LOCK_CHILD";
+        const CHILD_TEST: &str =
+            "shared_lock_table::tests::mapped_tests::mapped_table_independent_process_exclusion";
+
+        struct Fixture {
+            region: ShmRegion,
+            _file: UnixFile,
+            _namespace: Arc<DatabaseNamespaceBinding>,
+            path: PathBuf,
+            _directory: tempfile::TempDir,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let requested = directory.path().join("mapped-page-locks.db");
+                // Materialize before native descriptors acquire any locks.
+                std::fs::write(&requested, [0x53_u8; 4096]).unwrap();
+                let path = std::fs::canonicalize(requested).unwrap();
+                let cx = Cx::new();
+                let (mut file, _) = UnixVfs::new()
+                    .open(
+                        &cx,
+                        Some(&path),
+                        VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+                    )
+                    .unwrap();
+                let namespace = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared)
+                    .unwrap()
+                    .bind(file.file_identity().unwrap().unwrap())
+                    .unwrap();
+                namespace.finish_bootstrap().unwrap();
+                let region = file.mvcc_shm_map(&cx, PAYLOAD_BYTES, true).unwrap();
+                assert!(region.is_mmap_backed());
+                Self {
+                    region,
+                    _file: file,
+                    _namespace: namespace,
+                    path,
+                    _directory: directory,
+                }
+            }
+
+            fn table(&self, capacity: u32) -> MappedPageLockTable {
+                MappedPageLockTable::initialize(self.region.share(), BASE, capacity).unwrap()
+            }
+
+            fn peer(&self) -> (UnixFile, ShmRegion) {
+                let cx = Cx::new();
+                let (mut file, _) = UnixVfs::new()
+                    .open(
+                        &cx,
+                        Some(&self.path),
+                        VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+                    )
+                    .unwrap();
+                let region = file.mvcc_shm_map(&cx, PAYLOAD_BYTES, false).unwrap();
+                assert!(region.is_mmap_backed());
+                (file, region)
+            }
+        }
+
+        fn page(raw: u32) -> PageNumber {
+            PageNumber::new(raw).unwrap()
+        }
+
+        fn owner(raw: u64) -> TxnId {
+            TxnId::new(raw).unwrap()
+        }
+
+        fn words(region: &ShmRegion) -> Vec<u64> {
+            (0..region.len())
+                .step_by(8)
+                .map(|offset| {
+                    region
+                        .atomic_load_u64_le(offset, Ordering::Acquire)
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        #[test]
+        fn mapped_table_independent_views_exact_owner_and_distinct_pages() {
+            let fixture = Fixture::new();
+            let first = fixture.table(CAPACITY);
+            let (_peer_file, peer_region) = fixture.peer();
+            let peer = MappedPageLockTable::open(peer_region, BASE, CAPACITY).unwrap();
+            assert_eq!(
+                first.try_acquire(page(1), owner(101)).unwrap(),
+                AcquireResult::Acquired
+            );
+            assert_eq!(peer.holder(page(1)).unwrap(), Some(owner(101)));
+            assert_eq!(
+                peer.try_acquire(page(1), owner(202)).unwrap(),
+                AcquireResult::Busy { holder: 101 }
+            );
+            assert!(!peer.release(page(1), owner(202)).unwrap());
+            assert_eq!(
+                peer.try_acquire(page(1), owner(101)).unwrap(),
+                AcquireResult::AlreadyHeld
+            );
+            // Same initial hash bucket, distinct page ownership.
+            assert_eq!(
+                peer.try_acquire(page(9), owner(202)).unwrap(),
+                AcquireResult::Acquired
+            );
+            assert_eq!(first.holder(page(9)).unwrap(), Some(owner(202)));
+            assert!(first.release(page(1), owner(101)).unwrap());
+            assert!(!first.release(page(1), owner(101)).unwrap());
+            assert_eq!(
+                peer.try_acquire(page(1), owner(303)).unwrap(),
+                AcquireResult::Acquired
+            );
+            assert!(!first.release(page(1), owner(101)).unwrap());
+            assert_eq!(first.holder(page(1)).unwrap(), Some(owner(303)));
+            assert!(peer.release(page(1), owner(303)).unwrap());
+            assert!(peer.release(page(9), owner(202)).unwrap());
+            assert!(!first.release(page(17), owner(101)).unwrap());
+            assert_eq!(peer.holder(page(17)).unwrap(), None);
+        }
+
+        #[test]
+        fn mapped_table_busy_reports_failed_cas_owner_after_handoff() {
+            let fixture = Fixture::new();
+            let table = fixture.table(CAPACITY);
+            let (_peer_file, peer_region) = fixture.peer();
+            let peer = MappedPageLockTable::open(peer_region, BASE, CAPACITY).unwrap();
+            assert_eq!(
+                table.try_acquire(page(1), owner(101)).unwrap(),
+                AcquireResult::Acquired
+            );
+            MAPPED_ACQUIRE_FAILURE_HOOK.with(|slot| {
+                assert!(
+                    slot.borrow_mut()
+                        .replace(Box::new(move || {
+                            assert!(peer.release(page(1), owner(101)).unwrap());
+                            assert_eq!(
+                                peer.try_acquire(page(1), owner(303)).unwrap(),
+                                AcquireResult::Acquired
+                            );
+                        }))
+                        .is_none()
+                );
+            });
+            let result = table.try_acquire(page(1), owner(202));
+            MAPPED_ACQUIRE_FAILURE_HOOK.with(|slot| slot.borrow_mut().take());
+            assert_eq!(result.unwrap(), AcquireResult::Busy { holder: 101 });
+            assert_eq!(table.holder(page(1)).unwrap(), Some(owner(303)));
+            assert!(!table.release(page(1), owner(101)).unwrap());
+            assert!(table.release(page(1), owner(303)).unwrap());
+        }
+
+        #[test]
+        fn mapped_table_capacity_exhaustion_retains_stable_keys() {
+            let fixture = Fixture::new();
+            let table = fixture.table(1);
+            let largest_page = page(u32::MAX - 1);
+            assert_eq!(
+                table
+                    .try_acquire(largest_page, owner(TxnId::MAX_RAW))
+                    .unwrap(),
+                AcquireResult::Acquired
+            );
+            assert!(table.release(largest_page, owner(TxnId::MAX_RAW)).unwrap());
+            let before = words(&fixture.region);
+            assert_eq!(
+                table.try_acquire(page(1), owner(1)).unwrap(),
+                AcquireResult::CapacityExhausted
+            );
+            assert_eq!(words(&fixture.region), before);
+            let reopened = fixture.table(1);
+            assert_eq!(
+                words(&fixture.region),
+                before,
+                "initialize must not reset a full table"
+            );
+            assert_eq!(
+                reopened.try_acquire(largest_page, owner(1)).unwrap(),
+                AcquireResult::Acquired
+            );
+            assert_eq!(table.holder(largest_page).unwrap(), Some(owner(1)));
+            assert!(reopened.release(largest_page, owner(1)).unwrap());
+        }
+
+        #[test]
+        fn mapped_table_bounds_and_descriptor_corruption_refuse_without_mutation() {
+            let fixture = Fixture::new();
+            let empty = words(&fixture.region);
+            for (base, capacity) in [
+                (1, 8),
+                (usize::MAX - 7, 8),
+                (4096, 8),
+                (BASE, 1024),
+                (BASE, 0),
+                (BASE, 3),
+            ] {
+                assert!(
+                    MappedPageLockTable::initialize(fixture.region.share(), base, capacity)
+                        .is_err()
+                );
+                assert_eq!(words(&fixture.region), empty);
+            }
+            assert!(MappedPageLockTable::open(fixture.region.share(), BASE, CAPACITY).is_err());
+            assert_eq!(words(&fixture.region), empty);
+            let table = fixture.table(CAPACITY);
+            assert_eq!(
+                table.try_acquire(page(1), owner(101)).unwrap(),
+                AcquireResult::Acquired
+            );
+            let ready = words(&fixture.region);
+            assert!(MappedPageLockTable::open(fixture.region.share(), BASE, 4).is_err());
+            assert!(MappedPageLockTable::initialize(fixture.region.share(), BASE, 4).is_err());
+            assert_eq!(words(&fixture.region), ready);
+            for (offset, corrupt) in [(BASE, MappedPageLockTable::FORMAT ^ 0x100), (BASE + 8, 3)] {
+                let previous = fixture
+                    .region
+                    .atomic_load_u64_le(offset, Ordering::Acquire)
+                    .unwrap();
+                fixture
+                    .region
+                    .atomic_store_u64_le(offset, corrupt, Ordering::Release)
+                    .unwrap();
+                let before = words(&fixture.region);
+                assert!(MappedPageLockTable::open(fixture.region.share(), BASE, CAPACITY).is_err());
+                assert!(
+                    MappedPageLockTable::initialize(fixture.region.share(), BASE, CAPACITY)
+                        .is_err()
+                );
+                assert!(table.try_acquire(page(1), owner(202)).is_err());
+                assert!(table.release(page(1), owner(101)).is_err());
+                assert!(table.holder(page(1)).is_err());
+                assert_eq!(words(&fixture.region), before);
+                fixture
+                    .region
+                    .atomic_store_u64_le(offset, previous, Ordering::Release)
+                    .unwrap();
+            }
+            assert_eq!(table.holder(page(1)).unwrap(), Some(owner(101)));
+            assert!(table.release(page(1), owner(101)).unwrap());
+        }
+
+        #[test]
+        fn mapped_table_partial_initialization_never_clears_nonzero_storage() {
+            for tainted in [BASE + 8, BASE + 16, BASE + 24] {
+                let fixture = Fixture::new();
+                fixture
+                    .region
+                    .atomic_store_u64_le(tainted, 101, Ordering::Release)
+                    .unwrap();
+                assert!(matches!(
+                    MappedPageLockTable::initialize(fixture.region.share(), BASE, CAPACITY),
+                    Err(FrankenError::DatabaseCorrupt { .. })
+                ));
+                assert_eq!(
+                    fixture
+                        .region
+                        .atomic_load_u64_le(tainted, Ordering::Acquire)
+                        .unwrap(),
+                    101
+                );
+                assert_eq!(
+                    fixture
+                        .region
+                        .atomic_load_u64_le(BASE, Ordering::Acquire)
+                        .unwrap(),
+                    MappedPageLockTable::INITIALIZING
+                );
+                let before = words(&fixture.region);
+                assert!(matches!(
+                    MappedPageLockTable::initialize(fixture.region.share(), BASE, CAPACITY),
+                    Err(FrankenError::BusyRecovery)
+                ));
+                assert!(matches!(
+                    MappedPageLockTable::open(fixture.region.share(), BASE, CAPACITY),
+                    Err(FrankenError::BusyRecovery)
+                ));
+                assert_eq!(words(&fixture.region), before);
+            }
+        }
+
+        #[test]
+        fn mapped_table_malformed_key_and_owner_are_not_acquired_or_released() {
+            for (key, holder) in [
+                (u64::MAX, 101),
+                (u64::from(u32::MAX), 101),
+                (1, TxnId::MAX_RAW + 1),
+                (0, 101),
+            ] {
+                let fixture = Fixture::new();
+                let table = fixture.table(1);
+                fixture
+                    .region
+                    .atomic_store_u64_le(BASE + 16, key, Ordering::Release)
+                    .unwrap();
+                fixture
+                    .region
+                    .atomic_store_u64_le(BASE + 24, holder, Ordering::Release)
+                    .unwrap();
+                let before = words(&fixture.region);
+                assert!(table.try_acquire(page(1), owner(202)).is_err());
+                assert!(table.release(page(1), owner(101)).is_err());
+                assert!(table.holder(page(1)).is_err());
+                assert_eq!(words(&fixture.region), before);
+            }
+        }
+
+        #[test]
+        fn mapped_table_malformed_requester_cannot_install_or_release_an_owner() {
+            let fixture = Fixture::new();
+            let table = fixture.table(CAPACITY);
+            let malformed = serde_json::from_str::<TxnId>("18446744073709551615").unwrap();
+            assert!(TxnId::new(malformed.get()).is_none());
+            let before = words(&fixture.region);
+            assert!(table.try_acquire(page(1), malformed).is_err());
+            assert!(table.release(page(1), malformed).is_err());
+            assert_eq!(words(&fixture.region), before);
+            assert_eq!(table.holder(page(1)).unwrap(), None);
+            assert_eq!(
+                table.try_acquire(page(1), owner(101)).unwrap(),
+                AcquireResult::Acquired
+            );
+            let owned = words(&fixture.region);
+            assert!(table.release(page(1), malformed).is_err());
+            assert_eq!(words(&fixture.region), owned);
+            assert!(table.release(page(1), owner(101)).unwrap());
+        }
+
+        struct NativeChild(Child);
+
+        impl Drop for NativeChild {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        fn wait_for_word(region: &ShmRegion, offset: usize) -> u64 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let value = region
+                    .atomic_load_u64_le(offset, Ordering::Acquire)
+                    .unwrap();
+                if value != 0 {
+                    return value;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "mapped peer did not publish offset {offset}"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        fn run_native_child(path: &Path) {
+            let cx = Cx::new();
+            let (mut file, _) = UnixVfs::new()
+                .open(
+                    &cx,
+                    Some(path),
+                    VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+                )
+                .unwrap();
+            let region = file.mvcc_shm_map(&cx, PAYLOAD_BYTES, false).unwrap();
+            let table = MappedPageLockTable::open(region.share(), BASE, CAPACITY).unwrap();
+            region
+                .atomic_store_u64_le(READY, 1, Ordering::Release)
+                .unwrap();
+            wait_for_word(&region, START);
+            let acquired = match table.try_acquire(page(1), owner(202)).unwrap() {
+                AcquireResult::Acquired => true,
+                AcquireResult::Busy { holder: 101 } => false,
+                other => panic!("unexpected child acquisition: {other:?}"),
+            };
+            assert_eq!(
+                table.try_acquire(page(9), owner(202)).unwrap(),
+                AcquireResult::Acquired
+            );
+            region
+                .atomic_store_u64_le(
+                    CHILD_RESULT,
+                    if acquired { 202 } else { 101 },
+                    Ordering::Release,
+                )
+                .unwrap();
+            wait_for_word(&region, RELEASE);
+            assert_eq!(table.release(page(1), owner(202)).unwrap(), acquired);
+            assert!(table.release(page(9), owner(202)).unwrap());
+            println!(
+                "mapped_page_lock_child: acquired={acquired} exact_owner=202 release=terminal"
+            );
+        }
+
+        #[test]
+        fn mapped_table_independent_process_exclusion() {
+            if let Some(path) = std::env::var_os(CHILD_ENV) {
+                run_native_child(Path::new(&path));
+                return;
+            }
+            let fixture = Fixture::new();
+            let table = fixture.table(CAPACITY);
+            let mut child = NativeChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([CHILD_TEST, "--exact", "--nocapture"])
+                    .env(CHILD_ENV, &fixture.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap(),
+            );
+            wait_for_word(&fixture.region, READY);
+            fixture
+                .region
+                .atomic_store_u64_le(START, 1, Ordering::Release)
+                .unwrap();
+            let acquired = match table.try_acquire(page(1), owner(101)).unwrap() {
+                AcquireResult::Acquired => true,
+                AcquireResult::Busy { holder: 202 } => false,
+                other => panic!("unexpected parent acquisition: {other:?}"),
+            };
+            let winner = wait_for_word(&fixture.region, CHILD_RESULT);
+            assert_eq!(winner, if acquired { 101 } else { 202 });
+            assert_eq!(table.holder(page(1)).unwrap(), Some(owner(winner)));
+            assert_eq!(table.holder(page(9)).unwrap(), Some(owner(202)));
+            assert_eq!(
+                table.try_acquire(page(17), owner(101)).unwrap(),
+                AcquireResult::Acquired
+            );
+            let loser = if acquired { 202 } else { 101 };
+            assert!(!table.release(page(1), owner(loser)).unwrap());
+            fixture
+                .region
+                .atomic_store_u64_le(RELEASE, 1, Ordering::Release)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "mapped child failed: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "mapped child failed to exit");
+                std::thread::yield_now();
+            }
+            assert_eq!(table.release(page(1), owner(101)).unwrap(), acquired);
+            assert!(table.release(page(17), owner(101)).unwrap());
+            assert_eq!(table.holder(page(1)).unwrap(), None);
+            assert_eq!(table.holder(page(9)).unwrap(), None);
+            println!(
+                "mapped_page_lock_parent: winner={winner} loser={loser} parent_acquired={acquired}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
