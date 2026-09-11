@@ -15148,6 +15148,29 @@ where
         }))
     }
 
+    /// Map the separate MVCC companion through the admitted main-file handle.
+    ///
+    /// Call after [`Self::finish_namespace_bootstrap`]. The returned mapping
+    /// retains its native file and namespace ownership independently of this
+    /// pager. This transport alone does not admit an MVCC transaction or
+    /// reconcile authority with WAL publication.
+    pub async fn mvcc_shm_map(
+        &self,
+        cx: &Cx,
+        payload_bytes: u64,
+        create: bool,
+    ) -> Result<fsqlite_vfs::ShmRegion> {
+        let db_file = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            Arc::clone(&inner.db_file)
+        };
+        let mut file = shared_db_file_write(&db_file, cx).await?;
+        file.mvcc_shm_map(cx, payload_bytes, create)
+    }
+
     /// Return the identity of the already-open main database file.
     ///
     /// The VFS implementation determines whether a stable descriptor identity
@@ -29195,6 +29218,63 @@ mod tests {
             .await
             .unwrap();
         (pager, path)
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn native_mvcc_mapping_releases_inner_before_wait_and_outlives_pager() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let directory = tempfile::tempdir().expect("MVCC attachment directory");
+            let path = directory.path().join("mvcc-attachment.db");
+            let companion = directory.path().join("mvcc-attachment.db.fsqlite-shm");
+            let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .expect("open native pager");
+            pager.finish_namespace_bootstrap().unwrap();
+
+            let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+            let guard = shared_db_file_read(&db_file, &cx).await.unwrap();
+            let mut mapping = Box::pin(pager.mvcc_shm_map(&cx, 4096, true));
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(mapping.as_mut().poll(&mut task_cx).is_pending());
+            assert!(pager.inner.try_lock().is_ok(), "mapping wait must release pager state");
+            assert!(!companion.exists(), "waiting must not create the companion");
+            drop(mapping);
+            drop(guard);
+            drop(db_file);
+
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(pager.mvcc_shm_map(&cancelled, 4096, true).await, Err(FrankenError::Abort)));
+            assert!(!companion.exists(), "cancelled attachment must remain byte-neutral");
+
+            let first = pager.mvcc_shm_map(&cx, 4096, true).await.unwrap();
+            assert!(first.is_mmap_backed());
+            first.atomic_store_u64_le(0, 41, AtomicOrdering::Release).unwrap();
+            let peer = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, PageSize::DEFAULT)
+                .await
+                .expect("open peer pager while mapping remains live");
+            peer.finish_namespace_bootstrap().unwrap();
+            let second = peer.mvcc_shm_map(&cx, 4096, false).await.unwrap();
+            assert_eq!(second.atomic_load_u64_le(0, AtomicOrdering::Acquire).unwrap(), 41);
+            // Exercise the actual native checkpoint fence while both mmap
+            // lifetimes retain SHARED main-file claims. No WAL backfill is
+            // attempted by this transport test.
+            let (mut checkpointer, _) = UnixVfs::new()
+                .open(&cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB)
+                .unwrap();
+            checkpointer.lock_external_wal_checkpoint(&cx).unwrap();
+            checkpointer.restore_external_maintenance_attempt(&cx).unwrap();
+            checkpointer.close(&cx).unwrap();
+            drop(pager);
+            drop(first);
+            second.atomic_store_u64_le(0, 42, AtomicOrdering::Release).unwrap();
+            let alias = peer.mvcc_shm_map(&cx, 4096, false).await.unwrap();
+            assert_eq!(alias.atomic_load_u64_le(0, AtomicOrdering::Acquire).unwrap(), 42);
+            drop(peer);
+            assert_eq!(second.atomic_load_u64_le(0, AtomicOrdering::Acquire).unwrap(), 42);
+        });
     }
 
     #[cfg(all(feature = "native", unix))]

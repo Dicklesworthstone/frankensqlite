@@ -4381,6 +4381,24 @@ impl PagerBackend {
         }
     }
 
+    /// Attach the dedicated MVCC companion after namespace bootstrap completes.
+    pub async fn mvcc_shm_map(
+        &self,
+        cx: &Cx,
+        payload_bytes: u64,
+        create: bool,
+    ) -> Result<fsqlite_vfs::ShmRegion> {
+        match self {
+            Self::Memory(p) => p.mvcc_shm_map(cx, payload_bytes, create).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.mvcc_shm_map(cx, payload_bytes, create).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.mvcc_shm_map(cx, payload_bytes, create).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.mvcc_shm_map(cx, payload_bytes, create).await,
+        }
+    }
+
     #[cfg(all(feature = "native", target_os = "linux"))]
     fn io_uring_status(&self) -> Option<IoUringRuntimeStatus> {
         match self {

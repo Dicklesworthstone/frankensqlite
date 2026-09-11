@@ -2773,7 +2773,7 @@ pub fn validate_reserved_database_artifacts(
     pre_open_lock_sidecars: Option<&PreOpenLockSidecars>,
 ) -> Result<()> {
     validate_stable_path(database_path)?;
-    for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+    for suffix in ["-journal", "-wal", "-wal-fec", "-shm", ".fsqlite-shm"] {
         reject_existing_entry(database_path, &sidecar_path(database_path, suffix))?;
     }
 
@@ -5689,6 +5689,30 @@ mod tests {
             ),
             Err(FrankenError::CannotOpen { .. })
         ));
+    }
+
+    #[test]
+    fn artifact_validation_preserves_existing_mvcc_authority() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("mvcc-reserved.db");
+        create_database(&database, b"");
+        validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll, None)
+            .expect("empty reservation without an authority");
+
+        let companion = sidecar_path(&database, ".fsqlite-shm");
+        let authority = b"existing generation and live ownership";
+        fs::write(&companion, authority).expect("seed existing authority");
+        for policy in [
+            WindowsLockSidecarPolicy::RejectAll,
+            WindowsLockSidecarPolicy::AllowExpected,
+        ] {
+            assert!(matches!(
+                validate_reserved_database_artifacts(&database, policy, None),
+                Err(FrankenError::CannotOpen { .. })
+            ));
+            assert_eq!(fs::read(&companion).unwrap(), authority);
+            assert_eq!(fs::read(&database).unwrap(), b"");
+        }
     }
 
     #[cfg(unix)]
