@@ -280,7 +280,8 @@ pub struct ConcurrentHandle {
     write_index: PageMap<smallvec::SmallVec<[WitnessKey; 4]>>,
     /// Global write witnesses.
     global_write_witnesses: Vec<WitnessKey>,
-    /// Transaction token for SSI tracking.
+    /// Transaction token for SSI tracking and physical page-lock ownership.
+    /// Its id is independent of the registry's local session key.
     txn_token: TxnToken,
     /// Whether this transaction has an incoming rw-antidependency edge (SSI).
     has_in_rw: Cell<bool>,
@@ -953,6 +954,12 @@ impl ConcurrentSavepoint {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerAllocationDomain {
+    Local,
+    External,
+}
+
 /// Registry tracking all active concurrent writers for a database.
 ///
 /// Enforces the soft limit on concurrent writers and provides the shared
@@ -989,9 +996,15 @@ pub struct ConcurrentRegistry {
     /// Detached handles kept for reuse so hot autocommit loops do not hit the
     /// general allocator for a fresh handle every statement.
     recycled_handles: Vec<SharedConcurrentHandle>,
-    /// Next session id to assign.
+    /// Next local registry key to assign; not a physical page-lock owner.
     next_session_id: u64,
-    /// Epoch counter for TxnToken generation (increments on each session).
+    /// Largest owner id admitted here in the selected allocation domain.
+    /// Keeping a high-water mark rejects reuse without an unbounded history.
+    last_owner_id: u64,
+    /// The first successful admission fixes this registry's allocation domain.
+    /// Local IDs must never consume IDs belonging to an external authority.
+    owner_allocation_domain: Option<OwnerAllocationDomain>,
+    /// Epoch counter for locally allocated transaction tokens.
     epoch_counter: u32,
 }
 
@@ -1015,6 +1028,8 @@ impl ConcurrentRegistry {
             committed_writers_with_global_keys: Vec::new(),
             recycled_handles: Vec::new(),
             next_session_id: 1,
+            last_owner_id: 0,
+            owner_allocation_domain: None,
             epoch_counter: 0,
         }
     }
@@ -1041,6 +1056,9 @@ impl ConcurrentRegistry {
     /// policy: `serializable = true` validates with Page-SSI at commit,
     /// `false` with first-committer-wins only (GH#390). Recycled handles are
     /// reset with the new policy every session.
+    ///
+    /// Refuses registries that have admitted an externally allocated token;
+    /// local allocation cannot reserve IDs from that external authority.
     pub fn begin_concurrent_with_isolation(
         &mut self,
         snapshot: Snapshot,
@@ -1049,13 +1067,83 @@ impl ConcurrentRegistry {
         if self.active.len() >= MAX_CONCURRENT_WRITERS {
             return Err(MvccError::Busy);
         }
-        let session_id = self.next_session_id;
-        self.next_session_id = self.next_session_id.wrapping_add(1);
-        self.epoch_counter = self.epoch_counter.wrapping_add(1);
+        if self.owner_allocation_domain == Some(OwnerAllocationDomain::External) {
+            return Err(MvccError::InvalidState);
+        }
+        let txn_id = self
+            .last_owner_id
+            .checked_add(1)
+            .and_then(TxnId::new)
+            .ok_or(MvccError::TxnIdExhausted)?;
+        // Owner ids are never reused, so epoch wrap cannot repeat a token.
+        let epoch = self.epoch_counter.wrapping_add(1);
+        let session_id = self.register_concurrent_token(
+            snapshot,
+            serializable,
+            TxnToken::new(txn_id, TxnEpoch::new(epoch)),
+            OwnerAllocationDomain::Local,
+        )?;
+        self.epoch_counter = epoch;
+        Ok(session_id)
+    }
 
-        // Create TxnToken for SSI tracking.
-        let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
-        let txn_token = TxnToken::new(txn_id, TxnEpoch::new(self.epoch_counter));
+    /// Register a transaction using an already allocated owner token.
+    ///
+    /// The returned session id is only a local registry key. Page ownership
+    /// follows `txn_token.id`, and SSI retains the supplied epoch unchanged.
+    /// Owner ids must be in-domain and strictly increase within this registry;
+    /// repeated ids are rejected even with a different epoch or after removal.
+    /// The first successful admission fixes this registry's allocation domain
+    /// for its lifetime: external tokens and local allocation cannot mix,
+    /// including after every active handle has been removed.
+    ///
+    /// A future shared authority must allocate its token while holding this
+    /// registry's existing lock, immediately before admission, so local threads
+    /// cannot reorder allocations. An older token fails closed and needs a
+    /// fresh allocation. This API does not establish cross-process uniqueness,
+    /// database identity, generation fencing, or shared transaction-slot claims.
+    /// Those remain obligations of the authority supplying the token.
+    ///
+    /// Refusal leaves the registry and its allocation counters unchanged.
+    pub fn begin_concurrent_with_token(
+        &mut self,
+        snapshot: Snapshot,
+        serializable: bool,
+        txn_token: TxnToken,
+    ) -> Result<u64, MvccError> {
+        self.register_concurrent_token(
+            snapshot,
+            serializable,
+            txn_token,
+            OwnerAllocationDomain::External,
+        )
+    }
+
+    fn register_concurrent_token(
+        &mut self,
+        snapshot: Snapshot,
+        serializable: bool,
+        txn_token: TxnToken,
+        allocation_domain: OwnerAllocationDomain,
+    ) -> Result<u64, MvccError> {
+        if self.active.len() >= MAX_CONCURRENT_WRITERS {
+            return Err(MvccError::Busy);
+        }
+        if self
+            .owner_allocation_domain
+            .is_some_and(|selected| selected != allocation_domain)
+        {
+            return Err(MvccError::InvalidState);
+        }
+        let owner_id = txn_token.id.get();
+        if TxnId::new(owner_id).is_none() || owner_id <= self.last_owner_id {
+            return Err(MvccError::InvalidState);
+        }
+        let session_id = self.next_session_id;
+        if session_id == 0 || self.active.contains_key(&session_id) {
+            return Err(MvccError::InvalidState);
+        }
+        let next_session_id = session_id.checked_add(1).ok_or(MvccError::TxnIdExhausted)?;
 
         let handle = if let Some(handle) = self.recycled_handles.pop() {
             handle.lock().reset_for_new_transaction_with_isolation(
@@ -1071,6 +1159,9 @@ impl ConcurrentRegistry {
                 serializable,
             )))
         };
+        self.next_session_id = next_session_id;
+        self.last_owner_id = owner_id;
+        self.owner_allocation_domain = Some(allocation_domain);
         let newly_registered = self.active.insert(session_id, handle).is_none();
         self.active_snapshot_highs.insert(session_id, snapshot.high);
         self.increment_gc_horizon_count(snapshot.high);
@@ -1561,10 +1652,10 @@ impl Drop for ConcurrentRegistry {
 /// Acquires a page-level lock if not already held, then records the page
 /// data in the write set.  Returns an error if the lock is held by another
 /// concurrent transaction.
+/// Ownership always comes from the handle's token, never its local session key.
 pub fn concurrent_prepare_write_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
@@ -1601,7 +1692,7 @@ pub fn concurrent_prepare_write_page(
 
     let already_tracked = handle.tracks_write_conflict_page(page);
     if !holds_lock {
-        let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+        let txn_id = handle.txn_token().id;
         if lock_table.try_acquire(page, txn_id).is_err() {
             handle.remove_page_state_if_empty(page);
             return Err(MvccError::Busy);
@@ -1678,11 +1769,10 @@ pub fn concurrent_stage_prepared_write_marker(
 pub fn concurrent_write_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
     data: PageData,
 ) -> Result<(), MvccError> {
-    concurrent_prepare_write_page(handle, lock_table, session_id, page)?;
+    concurrent_prepare_write_page(handle, lock_table, page)?;
     concurrent_stage_prepared_write_page(handle, page, data)
 }
 
@@ -1719,13 +1809,12 @@ pub fn concurrent_page_is_synthetic_conflict_only(
 pub fn concurrent_restore_page_state(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     state: &ConcurrentPageState,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let txn_id = handle.txn_token().id;
 
     {
         let restored = handle.ensure_page_state(state.page);
@@ -1751,13 +1840,12 @@ pub fn concurrent_restore_page_state(
 pub fn concurrent_clear_page_state(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let txn_id = handle.txn_token().id;
 
     if let Some(state) = handle.page_state(page)
         && state.held_lock
@@ -1774,7 +1862,6 @@ pub fn concurrent_clear_page_state(
 pub fn concurrent_track_write_conflict_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
@@ -1800,7 +1887,7 @@ pub fn concurrent_track_write_conflict_page(
         return Ok(());
     }
 
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let txn_id = handle.txn_token().id;
     if lock_table.try_acquire(page, txn_id).is_err() {
         handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
@@ -1823,7 +1910,6 @@ pub fn concurrent_track_write_conflict_page(
 pub fn concurrent_free_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
@@ -1855,7 +1941,7 @@ pub fn concurrent_free_page(
         return Ok(());
     }
 
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let txn_id = handle.txn_token().id;
     let already_tracked = handle.tracks_write_conflict_page(page);
     if lock_table.try_acquire(page, txn_id).is_err() {
         handle.remove_page_state_if_empty(page);
@@ -1972,11 +2058,10 @@ pub fn concurrent_is_metadata_exempt(handle: &ConcurrentHandle, page: PageNumber
 pub fn concurrent_write_metadata_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     page: PageNumber,
     data: PageData,
 ) -> Result<(), MvccError> {
-    concurrent_write_page(handle, lock_table, session_id, page, data)?;
+    concurrent_write_page(handle, lock_table, page, data)?;
     concurrent_mark_metadata_exempt(handle, page);
     Ok(())
 }
@@ -2961,13 +3046,12 @@ pub fn concurrent_commit(
     handle: &mut ConcurrentHandle,
     commit_index: &CommitIndex,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     assign_commit_seq: CommitSeq,
 ) -> Result<CommitSeq, (MvccError, FcwResult)> {
     if !handle.is_active() {
         return Err((MvccError::InvalidState, FcwResult::Clean));
     }
-    let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
+    let txn_id = handle.txn_token().id;
 
     // Step 1: First-committer-wins validation.
     let fcw_result = validate_first_committer_wins(handle, commit_index);
@@ -3071,9 +3155,7 @@ pub fn prepare_concurrent_commit_with_ssi(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
-
-    let commit_view = {
+    let (txn_id, commit_view) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
@@ -3084,7 +3166,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         // Step 1: First-committer-wins validation.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
         record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
-        if !matches!(fcw_result, FcwResult::Clean) {
+        let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
             Ok((
@@ -3094,7 +3176,8 @@ pub fn prepare_concurrent_commit_with_ssi(
                 handle.held_lock_pages(),
                 handle.is_marked_for_abort(),
             ))
-        }
+        };
+        (handle.txn_token().id, view)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -3522,9 +3605,7 @@ pub fn prepare_concurrent_commit_fcw_only(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
-
-    let commit_view = {
+    let (txn_id, commit_view) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
@@ -3535,7 +3616,7 @@ pub fn prepare_concurrent_commit_fcw_only(
         // FCW (Step 1) — mandatory for MVCC write-write invariants.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
         record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
-        if !matches!(fcw_result, FcwResult::Clean) {
+        let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
             Ok((
@@ -3545,7 +3626,8 @@ pub fn prepare_concurrent_commit_fcw_only(
                 handle.held_lock_pages(),
                 handle.is_marked_for_abort(),
             ))
-        }
+        };
+        (handle.txn_token().id, view)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -3642,9 +3724,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.write_set_pages.len(),
     );
 
-    let Some(txn_id) = TxnId::new(prepared.session_id) else {
-        return;
-    };
+    let txn_id = prepared.txn_token.id;
 
     if prepared.used_uncontended_prepare_fast_path()
         && registry.can_use_uncontended_finalize_fast_path(prepared.session_id, prepared.begin_seq)
@@ -3992,7 +4072,7 @@ pub fn concurrent_commit_with_ssi(
             if let Some(shared_handle) = registry.remove(session_id) {
                 {
                     let mut handle = shared_handle.lock();
-                    concurrent_abort(&mut handle, lock_table, session_id);
+                    concurrent_abort(&mut handle, lock_table);
                 }
                 registry.recycle_handle(shared_handle);
             }
@@ -4010,14 +4090,8 @@ pub fn concurrent_commit_with_ssi(
 }
 
 /// Abort a concurrent transaction, releasing all page locks.
-pub fn concurrent_abort(
-    handle: &mut ConcurrentHandle,
-    lock_table: &InProcessPageLockTable,
-    session_id: u64,
-) {
-    if let Some(txn_id) = TxnId::new(session_id) {
-        release_tracked_page_locks(lock_table, handle, txn_id);
-    }
+pub fn concurrent_abort(handle: &mut ConcurrentHandle, lock_table: &InProcessPageLockTable) {
+    release_tracked_page_locks(lock_table, handle, handle.txn_token().id);
     handle.mark_aborted();
 }
 
@@ -4030,15 +4104,12 @@ pub fn concurrent_abort(
 pub fn concurrent_commit_read_only(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
 ) {
     debug_assert!(
         handle.write_set_pages().is_empty(),
         "read-only concurrent commit cannot finalize tracked write/conflict pages"
     );
-    if let Some(txn_id) = TxnId::new(session_id) {
-        release_tracked_page_locks(lock_table, handle, txn_id);
-    }
+    release_tracked_page_locks(lock_table, handle, handle.txn_token().id);
     handle.mark_committed();
 }
 
@@ -4072,13 +4143,12 @@ pub fn concurrent_savepoint(
 pub fn concurrent_rollback_to_savepoint(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
-    session_id: u64,
     savepoint: &ConcurrentSavepoint,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let txn_id = handle.txn_token().id;
     let mut reacquired_pages = Vec::new();
     for &page in savepoint.page_states_snapshot.keys() {
         if !handle.page_state(page).is_some_and(|state| state.held_lock) {
@@ -4163,10 +4233,10 @@ mod tests {
 
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
-        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
-        concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
-        concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
-        concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, OwnerAllocationDomain,
+        concurrent_abort, concurrent_clear_page_state, concurrent_commit,
+        concurrent_commit_read_only, concurrent_commit_with_ssi, concurrent_free_page,
+        concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
         concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
         concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
         concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
@@ -4199,6 +4269,475 @@ mod tests {
             TxnId::new(id).expect("test transaction id"),
             TxnEpoch::new(id as u32 + 1),
         )
+    }
+
+    #[test]
+    fn external_token_registration_preserves_epoch_and_rejects_reuse() {
+        let mut registry = ConcurrentRegistry::new();
+        let token = TxnToken::new(TxnId::new(700).unwrap(), TxnEpoch::new(41));
+        let session = registry
+            .begin_concurrent_with_token(test_snapshot(10), false, token)
+            .unwrap();
+        assert_eq!(session, 1);
+        assert_ne!(session, token.id.get());
+        {
+            let handle = registry.get(session).unwrap();
+            assert_eq!(handle.txn_token(), token);
+            assert!(!handle.serializable());
+        }
+        for refused in [
+            token,
+            TxnToken::new(token.id, TxnEpoch::new(42)),
+            test_token(699),
+        ] {
+            assert_eq!(
+                registry.begin_concurrent_with_token(test_snapshot(99), true, refused),
+                Err(MvccError::InvalidState)
+            );
+            assert_eq!(registry.next_session_id, 2);
+            assert_eq!(registry.last_owner_id, 700);
+            assert_eq!(registry.epoch_counter, 0);
+            assert_eq!(registry.active_count(), 1);
+            assert_eq!(registry.gc_horizon(), Some(CommitSeq::new(10)));
+            assert_eq!(registry.get(session).unwrap().txn_token(), token);
+        }
+        assert!(registry.remove_and_recycle(session));
+        assert_eq!(registry.recycled_handles.len(), 1);
+        assert_eq!(
+            registry.begin_concurrent_with_token(test_snapshot(20), true, token),
+            Err(MvccError::InvalidState),
+            "removing a session must not make its owner reusable"
+        );
+        assert_eq!(registry.recycled_handles.len(), 1);
+
+        let next_token = TxnToken::new(TxnId::new(900).unwrap(), TxnEpoch::new(u32::MAX));
+        let next = registry
+            .begin_concurrent_with_token(test_snapshot(20), true, next_token)
+            .unwrap();
+        assert_eq!(next, 2);
+        assert!(registry.recycled_handles.is_empty());
+        assert_eq!(registry.get(next).unwrap().txn_token(), next_token);
+        assert!(registry.get(next).unwrap().serializable());
+        let last_token = TxnToken::new(TxnId::new(901).unwrap(), TxnEpoch::new(1));
+        let last = registry
+            .begin_concurrent_with_token(test_snapshot(30), true, last_token)
+            .unwrap();
+        assert_eq!(last, 3);
+        assert_eq!(registry.get(last).unwrap().txn_token(), last_token);
+        assert_eq!(registry.epoch_counter, 0);
+    }
+
+    #[test]
+    fn owner_allocation_domain_refuses_mixing_and_survives_recycling() {
+        let state = |registry: &ConcurrentRegistry| {
+            (
+                registry.owner_allocation_domain,
+                registry.next_session_id,
+                registry.last_owner_id,
+                registry.epoch_counter,
+                registry.active_count(),
+                registry.active_snapshot_highs.clone(),
+                registry.gc_horizon_counts.clone(),
+                registry.recycled_handles.len(),
+            )
+        };
+        for external_first in [true, false] {
+            let mut registry = ConcurrentRegistry::new();
+            let locks = InProcessPageLockTable::new();
+            let first = if external_first {
+                registry.begin_concurrent_with_token(test_snapshot(10), false, test_token(700))
+            } else {
+                registry.begin_concurrent_with_isolation(test_snapshot(10), false)
+            }
+            .unwrap();
+            let token = registry.get(first).unwrap().txn_token();
+            let page = test_page(11);
+            {
+                let mut handle = registry.get_mut(first).unwrap();
+                concurrent_write_page(&mut handle, &locks, page, test_data()).unwrap();
+            }
+            for retired in [false, true] {
+                if retired {
+                    concurrent_abort(&mut registry.get_mut(first).unwrap(), &locks);
+                    assert!(registry.remove_and_recycle(first));
+                    assert_eq!(registry.recycled_handles.len(), 1);
+                }
+                let before = state(&registry);
+                let refused = if external_first {
+                    registry.begin_concurrent(test_snapshot(99))
+                } else {
+                    registry.begin_concurrent_with_token(test_snapshot(99), true, test_token(700))
+                };
+                assert_eq!(refused, Err(MvccError::InvalidState));
+                assert_eq!(state(&registry), before);
+                if retired {
+                    assert_eq!(locks.holder(page), None);
+                    assert_eq!(registry.recycled_handles[0].lock().txn_token(), token);
+                } else {
+                    let handle = registry.get(first).unwrap();
+                    assert_eq!(handle.txn_token(), token);
+                    assert!(!handle.serializable());
+                    assert_eq!(locks.holder(page), Some(token.id));
+                    assert_eq!(concurrent_read_page(&handle, page), Some(&test_data()));
+                }
+            }
+            let next = if external_first {
+                registry.begin_concurrent_with_token(test_snapshot(20), true, test_token(701))
+            } else {
+                registry.begin_concurrent(test_snapshot(20))
+            }
+            .unwrap();
+            assert_eq!(next, 2);
+            assert!(registry.recycled_handles.is_empty());
+            assert_eq!(
+                registry.get(next).unwrap().txn_token().id.get(),
+                if external_first { 701 } else { 2 },
+                "a refused mixed admission must not consume the next valid owner"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_first_admission_does_not_select_an_allocation_domain() {
+        let mut registry = ConcurrentRegistry::new();
+        registry.next_session_id = u64::MAX;
+        assert_eq!(
+            registry.begin_concurrent(test_snapshot(10)),
+            Err(MvccError::TxnIdExhausted)
+        );
+        assert_eq!(registry.owner_allocation_domain, None);
+        assert_eq!(registry.last_owner_id, 0);
+        assert_eq!(registry.epoch_counter, 0);
+        assert_eq!(registry.next_session_id, u64::MAX);
+        assert_eq!(registry.active_count(), 0);
+        assert!(registry.active_snapshot_highs.is_empty());
+        assert!(registry.gc_horizon_counts.is_empty());
+        assert!(registry.recycled_handles.is_empty());
+        registry.next_session_id = 1;
+        let token = test_token(700);
+        let session = registry
+            .begin_concurrent_with_token(test_snapshot(20), true, token)
+            .unwrap();
+        assert_eq!(session, 1);
+        assert_eq!(registry.get(session).unwrap().txn_token(), token);
+        assert_eq!(
+            registry.owner_allocation_domain,
+            Some(OwnerAllocationDomain::External)
+        );
+    }
+
+    #[test]
+    fn external_token_registration_exhaustion_and_capacity_leave_state_unchanged() {
+        // Deserialization can supply a nonzero value in the sentinel domain;
+        // admission must enforce TxnId's stricter 62-bit owner range as well.
+        let decoded = serde_json::from_str::<TxnId>(&u64::MAX.to_string()).unwrap();
+        let mut invalid = ConcurrentRegistry::new();
+        assert_eq!(
+            invalid.begin_concurrent_with_token(
+                test_snapshot(10),
+                true,
+                TxnToken::new(decoded, TxnEpoch::new(1)),
+            ),
+            Err(MvccError::InvalidState)
+        );
+        assert_eq!(invalid.active_count(), 0);
+        assert_eq!(invalid.next_session_id, 1);
+        assert_eq!(invalid.last_owner_id, 0);
+        assert_eq!(invalid.epoch_counter, 0);
+        assert_eq!(invalid.owner_allocation_domain, None);
+        assert!(invalid.active_snapshot_highs.is_empty());
+        assert!(invalid.gc_horizon_counts.is_empty());
+        let local = invalid.begin_concurrent(test_snapshot(20)).unwrap();
+        assert_eq!(local, 1);
+        assert_eq!(invalid.get(local).unwrap().txn_token().id.get(), 1);
+        assert_eq!(
+            invalid.owner_allocation_domain,
+            Some(OwnerAllocationDomain::Local)
+        );
+
+        let mut registry = ConcurrentRegistry::new();
+        let maximum = TxnToken::new(TxnId::new(TxnId::MAX_RAW).unwrap(), TxnEpoch::new(7));
+        let session = registry
+            .begin_concurrent_with_token(test_snapshot(10), true, maximum)
+            .unwrap();
+        assert_eq!(session, 1);
+        assert_eq!(
+            registry.begin_concurrent_with_token(test_snapshot(20), true, maximum),
+            Err(MvccError::InvalidState)
+        );
+        assert_eq!(registry.next_session_id, 2);
+        assert_eq!(registry.last_owner_id, TxnId::MAX_RAW);
+        assert_eq!(registry.epoch_counter, 0);
+        assert_eq!(registry.get(session).unwrap().txn_token(), maximum);
+
+        let mut local_limit = ConcurrentRegistry::new();
+        local_limit.last_owner_id = TxnId::MAX_RAW - 1;
+        let local_max = local_limit.begin_concurrent(test_snapshot(10)).unwrap();
+        assert_eq!(
+            local_limit.get(local_max).unwrap().txn_token().id.get(),
+            TxnId::MAX_RAW
+        );
+        assert_eq!(
+            local_limit.begin_concurrent(test_snapshot(20)),
+            Err(MvccError::TxnIdExhausted)
+        );
+        assert_eq!(local_limit.last_owner_id, TxnId::MAX_RAW);
+        assert_eq!(local_limit.next_session_id, 2);
+        assert_eq!(local_limit.epoch_counter, 1);
+        assert_eq!(local_limit.active_count(), 1);
+        assert_eq!(local_limit.gc_horizon(), Some(CommitSeq::new(10)));
+
+        let mut exhausted = ConcurrentRegistry::new();
+        exhausted.next_session_id = u64::MAX;
+        assert_eq!(
+            exhausted.begin_concurrent_with_token(test_snapshot(10), true, test_token(700)),
+            Err(MvccError::TxnIdExhausted)
+        );
+        assert_eq!(exhausted.next_session_id, u64::MAX);
+        assert_eq!(exhausted.last_owner_id, 0);
+        assert_eq!(exhausted.active_count(), 0);
+        assert_eq!(exhausted.owner_allocation_domain, None);
+        exhausted.next_session_id = 1;
+        exhausted.epoch_counter = u32::MAX;
+        let wrapped = exhausted.begin_concurrent(test_snapshot(10)).unwrap();
+        assert_eq!(exhausted.next_session_id, 2);
+        assert_eq!(exhausted.last_owner_id, 1);
+        assert_eq!(exhausted.epoch_counter, 0);
+        assert_eq!(
+            exhausted.owner_allocation_domain,
+            Some(OwnerAllocationDomain::Local)
+        );
+        assert_eq!(
+            exhausted.get(wrapped).unwrap().txn_token(),
+            TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0))
+        );
+
+        let mut full = ConcurrentRegistry::new();
+        for _ in 0..MAX_CONCURRENT_WRITERS {
+            full.begin_concurrent(test_snapshot(10)).unwrap();
+        }
+        let before = (full.next_session_id, full.last_owner_id, full.epoch_counter);
+        assert_eq!(
+            full.begin_concurrent_with_token(test_snapshot(99), false, test_token(700)),
+            Err(MvccError::Busy)
+        );
+        assert_eq!(
+            (full.next_session_id, full.last_owner_id, full.epoch_counter),
+            before
+        );
+        assert_eq!(full.active_count(), MAX_CONCURRENT_WRITERS);
+        assert_eq!(full.gc_horizon(), Some(CommitSeq::new(10)));
+    }
+
+    #[test]
+    fn distinct_session_owner_controls_page_acquisition_and_cleanup() {
+        let mut registry = ConcurrentRegistry::new();
+        let locks = InProcessPageLockTable::new();
+        let token = test_token(700);
+        let session = registry
+            .begin_concurrent_with_token(test_snapshot(10), true, token)
+            .unwrap();
+        let wrong_owner = TxnId::new(session).unwrap();
+        let mut handle = registry.get_mut(session).unwrap();
+        let written = test_page(11);
+        concurrent_write_page(&mut handle, &locks, written, test_data()).unwrap();
+        assert_eq!(locks.holder(written), Some(token.id));
+        assert!(!locks.release(written, wrong_owner));
+        assert_eq!(locks.holder(written), Some(token.id));
+
+        let prepared_page = test_page(12);
+        let empty = concurrent_page_state(&handle, prepared_page);
+        concurrent_prepare_write_page(&mut handle, &locks, prepared_page).unwrap();
+        assert_eq!(locks.holder(prepared_page), Some(token.id));
+        concurrent_restore_page_state(&mut handle, &locks, &empty).unwrap();
+        assert_eq!(locks.holder(prepared_page), None);
+        let preowned = concurrent_page_state(&handle, written);
+        concurrent_free_page(&mut handle, &locks, written).unwrap();
+        concurrent_restore_page_state(&mut handle, &locks, &preowned).unwrap();
+        assert_eq!(locks.holder(written), Some(token.id));
+        assert!(concurrent_read_page(&handle, written).is_some());
+
+        let conflict = test_page(13);
+        concurrent_track_write_conflict_page(&mut handle, &locks, conflict).unwrap();
+        assert_eq!(locks.holder(conflict), Some(token.id));
+        concurrent_clear_page_state(&mut handle, &locks, conflict).unwrap();
+        assert_eq!(locks.holder(conflict), None);
+        let freed = test_page(14);
+        concurrent_free_page(&mut handle, &locks, freed).unwrap();
+        assert_eq!(locks.holder(freed), Some(token.id));
+
+        // This unrelated lock belongs to the numeric session key. Teardown
+        // must neither release it nor mistake it for this handle's owner.
+        let unrelated = test_page(15);
+        locks.try_acquire(unrelated, wrong_owner).unwrap();
+        concurrent_abort(&mut handle, &locks);
+        assert_eq!(locks.holder(written), None);
+        assert_eq!(locks.holder(freed), None);
+        assert_eq!(locks.holder(unrelated), Some(wrong_owner));
+        assert!(locks.release(unrelated, wrong_owner));
+    }
+
+    #[test]
+    fn distinct_session_owner_savepoint_reacquisition_and_read_only_release() {
+        let mut registry = ConcurrentRegistry::new();
+        let locks = InProcessPageLockTable::new();
+        let token = test_token(700);
+        let session = registry
+            .begin_concurrent_with_token(test_snapshot(10), true, token)
+            .unwrap();
+        let mut handle = registry.get_mut(session).unwrap();
+        let first = test_page(11);
+        let second = test_page(12);
+        let later = test_page(13);
+        for page in [first, second] {
+            concurrent_write_page(&mut handle, &locks, page, test_data()).unwrap();
+        }
+        let savepoint = concurrent_savepoint(&mut handle, "before_later").unwrap();
+        concurrent_write_page(&mut handle, &locks, later, test_data()).unwrap();
+        for page in [first, second] {
+            concurrent_clear_page_state(&mut handle, &locks, page).unwrap();
+        }
+        let peer = TxnId::new(800).unwrap();
+        // Block the final saved page so this attempt really reacquires an
+        // earlier page before failing, regardless of the map's iteration order.
+        let blocked = *savepoint.page_states_snapshot.keys().last().unwrap();
+        let reacquired = if blocked == first { second } else { first };
+        locks.try_acquire(blocked, peer).unwrap();
+        assert_eq!(
+            concurrent_rollback_to_savepoint(&mut handle, &locks, &savepoint),
+            Err(MvccError::Busy)
+        );
+        assert_eq!(locks.holder(reacquired), None);
+        assert_eq!(locks.holder(blocked), Some(peer));
+        assert_eq!(locks.holder(later), Some(token.id));
+        assert_eq!(handle.write_set_pages().as_slice(), &[later]);
+        assert!(locks.release(blocked, peer));
+
+        concurrent_rollback_to_savepoint(&mut handle, &locks, &savepoint).unwrap();
+        for page in [first, second, later] {
+            assert_eq!(locks.holder(page), Some(token.id));
+            assert!(handle.holds_page_lock(page));
+        }
+        assert!(concurrent_read_page(&handle, first).is_some());
+        assert!(concurrent_read_page(&handle, second).is_some());
+        assert!(concurrent_read_page(&handle, later).is_none());
+        for page in [first, second] {
+            concurrent_clear_page_state(&mut handle, &locks, page).unwrap();
+        }
+        assert!(handle.write_set_pages().is_empty());
+        assert_eq!(locks.holder(later), Some(token.id));
+        concurrent_commit_read_only(&mut handle, &locks);
+        assert_eq!(locks.holder(later), None);
+        assert_eq!(locks.lock_count(), 0);
+    }
+
+    #[test]
+    fn distinct_session_owner_commit_paths_preserve_prepared_ownership() {
+        for path in ["direct", "ssi", "fcw", "ssi_detached", "fcw_detached"] {
+            let mut registry = ConcurrentRegistry::new();
+            let locks = InProcessPageLockTable::new();
+            let index = CommitIndex::new();
+            let token = test_token(700);
+            let session = registry
+                .begin_concurrent_with_token(test_snapshot(10), true, token)
+                .unwrap();
+            let page = test_page(11);
+            {
+                let mut handle = registry.get_mut(session).unwrap();
+                concurrent_write_page(&mut handle, &locks, page, test_data()).unwrap();
+            }
+            assert_eq!(locks.holder(page), Some(token.id));
+            if path == "direct" {
+                let mut handle = registry.get_mut(session).unwrap();
+                concurrent_commit(&mut handle, &index, &locks, CommitSeq::new(11)).unwrap();
+            } else {
+                let prepared = if path.starts_with("fcw") {
+                    super::prepare_concurrent_commit_fcw_only(
+                        &mut registry,
+                        &index,
+                        &locks,
+                        session,
+                        CommitSeq::new(11),
+                    )
+                } else {
+                    prepare_concurrent_commit_with_ssi(
+                        &mut registry,
+                        &index,
+                        &locks,
+                        session,
+                        CommitSeq::new(11),
+                    )
+                }
+                .unwrap();
+                assert_eq!(prepared.session_id(), session);
+                assert_eq!(prepared.txn_token(), token);
+                assert_eq!(prepared.held_lock_pages(), &[page]);
+                if path.ends_with("detached") {
+                    assert!(registry.remove_and_recycle(session));
+                    let replacement = registry
+                        .begin_concurrent_with_token(test_snapshot(10), true, test_token(800))
+                        .unwrap();
+                    let mut handle = registry.get_mut(replacement).unwrap();
+                    concurrent_write_page(&mut handle, &locks, test_page(12), test_data()).unwrap();
+                }
+                finalize_prepared_concurrent_commit_with_ssi(
+                    &mut registry,
+                    &index,
+                    &locks,
+                    &prepared,
+                    CommitSeq::new(11),
+                );
+                if path.ends_with("detached") {
+                    assert_eq!(locks.holder(test_page(12)), Some(test_token(800).id));
+                    assert!(registry.get(2).unwrap().is_active());
+                    let mut handle = registry.get_mut(2).unwrap();
+                    concurrent_abort(&mut handle, &locks);
+                }
+            }
+            assert_eq!(index.latest(page), Some(CommitSeq::new(11)), "{path}");
+            assert_eq!(locks.holder(page), None, "{path}");
+            assert_eq!(locks.lock_count(), 0, "{path}");
+        }
+    }
+
+    #[test]
+    fn distinct_session_owner_prepare_rejection_releases_actual_owner() {
+        for fcw_only in [false, true] {
+            let mut registry = ConcurrentRegistry::new();
+            let locks = InProcessPageLockTable::new();
+            let index = CommitIndex::new();
+            let token = test_token(700);
+            let session = registry
+                .begin_concurrent_with_token(test_snapshot(10), !fcw_only, token)
+                .unwrap();
+            let page = test_page(11);
+            {
+                let mut handle = registry.get_mut(session).unwrap();
+                concurrent_write_page(&mut handle, &locks, page, test_data()).unwrap();
+            }
+            index.update(page, CommitSeq::new(11));
+            let rejected = if fcw_only {
+                super::prepare_concurrent_commit_fcw_only(
+                    &mut registry,
+                    &index,
+                    &locks,
+                    session,
+                    CommitSeq::new(12),
+                )
+            } else {
+                prepare_concurrent_commit_with_ssi(
+                    &mut registry,
+                    &index,
+                    &locks,
+                    session,
+                    CommitSeq::new(12),
+                )
+            };
+            assert_eq!(rejected.unwrap_err().0, MvccError::BusySnapshot);
+            assert_eq!(locks.holder(page), None);
+            assert_eq!(index.latest(page), Some(CommitSeq::new(11)));
+            assert!(!registry.get(session).unwrap().is_active());
+        }
     }
 
     #[test]
@@ -4274,19 +4813,14 @@ mod tests {
                 .get_mut(*session_id)
                 .ok_or_else(|| format!("missing session handle {session_id}"))?;
             let tag = u8::try_from(idx + 1).expect("proptest limits writers to <= 8");
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                *session_id,
-                *page,
-                tagged_test_data(tag),
-            )
-            .map_err(|err| {
-                format!(
-                    "write page {} in session {session_id} failed: {err:?}",
-                    page.get()
-                )
-            })?;
+            concurrent_write_page(&mut handle, &lock_table, *page, tagged_test_data(tag)).map_err(
+                |err| {
+                    format!(
+                        "write page {} in session {session_id} failed: {err:?}",
+                        page.get()
+                    )
+                },
+            )?;
         }
 
         for (order_idx, writer_idx) in commit_order.iter().copied().enumerate() {
@@ -4298,16 +4832,13 @@ mod tests {
                 .get_mut(session_id)
                 .ok_or_else(|| format!("missing session handle {session_id}"))?;
             let commit_seq = CommitSeq::new(11 + order_idx as u64);
-            concurrent_commit(
-                &mut handle,
-                &commit_index,
-                &lock_table,
-                session_id,
-                commit_seq,
-            )
-            .map_err(|(err, fcw)| {
-                format!("commit writer {writer_idx} session {session_id} failed: {err:?} {fcw:?}")
-            })?;
+            concurrent_commit(&mut handle, &commit_index, &lock_table, commit_seq).map_err(
+                |(err, fcw)| {
+                    format!(
+                        "commit writer {writer_idx} session {session_id} failed: {err:?} {fcw:?}"
+                    )
+                },
+            )?;
         }
 
         if lock_table.lock_count() != 0 {
@@ -4374,13 +4905,14 @@ mod tests {
         for (idx, page) in pages.iter().enumerate() {
             let tag = u8::try_from(idx + 1)
                 .map_err(|err| format!("tag conversion for page {} failed: {err}", page.get()))?;
-            concurrent_write_page(handle, lock_table, session_id, *page, tagged_test_data(tag))
-                .map_err(|err| {
+            concurrent_write_page(handle, lock_table, *page, tagged_test_data(tag)).map_err(
+                |err| {
                     format!(
                         "write page {} in session {session_id} failed: {err:?}",
                         page.get()
                     )
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -4404,14 +4936,8 @@ mod tests {
                 .get_mut(first_session)
                 .ok_or_else(|| "missing first handle".to_string())?;
             stage_tagged_pages(&mut first, &lock_table, first_session, first_pages)?;
-            concurrent_commit(
-                &mut first,
-                &commit_index,
-                &lock_table,
-                first_session,
-                CommitSeq::new(11),
-            )
-            .map_err(|(err, fcw)| format!("first commit failed: {err:?} {fcw:?}"))?;
+            concurrent_commit(&mut first, &commit_index, &lock_table, CommitSeq::new(11))
+                .map_err(|(err, fcw)| format!("first commit failed: {err:?} {fcw:?}"))?;
         }
 
         let conflict_pages = {
@@ -4419,13 +4945,7 @@ mod tests {
                 .get_mut(second_session)
                 .ok_or_else(|| "missing second handle".to_string())?;
             stage_tagged_pages(&mut second, &lock_table, second_session, second_pages)?;
-            match concurrent_commit(
-                &mut second,
-                &commit_index,
-                &lock_table,
-                second_session,
-                CommitSeq::new(12),
-            ) {
+            match concurrent_commit(&mut second, &commit_index, &lock_table, CommitSeq::new(12)) {
                 Err((
                     MvccError::BusySnapshot,
                     FcwResult::Conflict {
@@ -4532,7 +5052,6 @@ mod tests {
                     concurrent_write_page(
                         &mut writer,
                         &lock_table,
-                        writer_session,
                         *page,
                         tagged_test_data(tag),
                     )
@@ -4560,7 +5079,7 @@ mod tests {
                 let mut writer = registry
                     .get_mut(writer_session)
                     .ok_or_else(|| TestCaseError::fail("missing writer handle"))?;
-                concurrent_abort(&mut writer, &lock_table, writer_session);
+                concurrent_abort(&mut writer, &lock_table);
             }
             prop_assert_eq!(lock_table.lock_count(), 0);
             prop_assert!(registry.remove_and_recycle(reader_session));
@@ -4638,31 +5157,29 @@ mod tests {
         // Session 1 writes page 5.
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data())
                 .expect("write page 5");
         }
 
         // Session 2 writes page 10 (different page => no conflict).
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data())
+            concurrent_write_page(&mut h2, &lock_table, test_page(10), test_data())
                 .expect("write page 10");
         }
 
         // Both commit successfully.
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            let seq1 =
-                concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
-                    .expect("commit 1");
+            let seq1 = concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11))
+                .expect("commit 1");
             assert_eq!(seq1, CommitSeq::new(11));
         }
 
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            let seq2 =
-                concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12))
-                    .expect("commit 2");
+            let seq2 = concurrent_commit(&mut h2, &commit_index, &lock_table, CommitSeq::new(12))
+                .expect("commit 2");
             assert_eq!(seq2, CommitSeq::new(12));
         }
     }
@@ -4688,14 +5205,14 @@ mod tests {
         // session_id as the lock holder.
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data())
                 .expect("s1 write page 5");
         }
 
         // s1 commits first (first-committer-wins).
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11))
                 .expect("s1 commits first");
         }
 
@@ -4703,14 +5220,13 @@ mod tests {
         // released by s1's commit, so s2 can acquire it.
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
+            concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data())
                 .expect("s2 write page 5");
         }
 
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            let result =
-                concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            let result = concurrent_commit(&mut h2, &commit_index, &lock_table, CommitSeq::new(12));
             assert!(result.is_err());
             let (err, fcw) = result.unwrap_err();
             assert_eq!(err, MvccError::BusySnapshot);
@@ -4734,13 +5250,13 @@ mod tests {
 
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_write_page(&mut h1, &lock_table, s1, page, tagged_test_data(1))
+            concurrent_write_page(&mut h1, &lock_table, page, tagged_test_data(1))
                 .expect("s1 write page");
         }
 
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            let result = concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2));
+            let result = concurrent_write_page(&mut h2, &lock_table, page, tagged_test_data(2));
             assert_eq!(result, Err(MvccError::Busy));
         }
 
@@ -4757,7 +5273,7 @@ mod tests {
 
         {
             let mut h2 = registry.get_mut(s2).expect("handle 2");
-            concurrent_write_page(&mut h2, &lock_table, s2, page, tagged_test_data(2))
+            concurrent_write_page(&mut h2, &lock_table, page, tagged_test_data(2))
                 .expect("s2 write page after s1 releases lock");
         }
 
@@ -4803,31 +5319,30 @@ mod tests {
         // s1 writes page 5, s3 writes page 10 (no overlap).
         {
             let mut h1 = registry.get_mut(s1).expect("h1");
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         {
             let mut h3 = registry.get_mut(s3).expect("h3");
-            concurrent_write_page(&mut h3, &lock_table, s3, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, test_page(10), test_data()).unwrap();
         }
 
         // s1 commits first on page 5.
         {
             let mut h1 = registry.get_mut(s1).expect("h1");
-            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11))
                 .expect("s1 commits");
         }
 
         // s2 now tries page 5 (same as s1, but s1 already committed).
         {
             let mut h2 = registry.get_mut(s2).expect("h2");
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         {
             let mut h2 = registry.get_mut(s2).expect("h2");
-            let result =
-                concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            let result = concurrent_commit(&mut h2, &commit_index, &lock_table, CommitSeq::new(12));
             assert!(result.is_err());
             let (err, _) = result.unwrap_err();
             assert_eq!(err, MvccError::BusySnapshot);
@@ -4836,9 +5351,8 @@ mod tests {
         // s3 commits on page 10 (no conflict with s1's page 5).
         {
             let mut h3 = registry.get_mut(s3).expect("h3");
-            let seq3 =
-                concurrent_commit(&mut h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
-                    .expect("s3 commits");
+            let seq3 = concurrent_commit(&mut h3, &commit_index, &lock_table, CommitSeq::new(13))
+                .expect("s3 commits");
             assert_eq!(seq3, CommitSeq::new(13));
         }
     }
@@ -4859,7 +5373,7 @@ mod tests {
         // Write page 1 (INSERT A).
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(1), test_data()).unwrap();
         }
 
         // Create savepoint.
@@ -4872,7 +5386,7 @@ mod tests {
         // Write page 2 (INSERT B).
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(2), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(2), test_data()).unwrap();
             assert_eq!(handle.write_set_len(), 2);
         }
 
@@ -4880,7 +5394,7 @@ mod tests {
         // but its lock should still be held.
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &sp).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &sp).unwrap();
             assert_eq!(handle.write_set_len(), 1);
             assert!(handle.held_locks().contains(&test_page(2))); // Lock preserved.
         }
@@ -4888,7 +5402,7 @@ mod tests {
         // Write page 3 (INSERT C).
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(3), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(3), test_data()).unwrap();
         }
 
         // Commit: pages 1 and 3 are in the write set (not page 2).
@@ -4901,21 +5415,15 @@ mod tests {
 
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_commit(
-                &mut handle,
-                &commit_index,
-                &lock_table,
-                s1,
-                CommitSeq::new(11),
-            )
-            .expect("commit succeeds");
+            concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(11))
+                .expect("commit succeeds");
         }
 
         let s2 = registry
             .begin_concurrent(test_snapshot(11))
             .expect("session 2");
         let mut handle2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(2), test_data())
+        concurrent_write_page(&mut handle2, &lock_table, test_page(2), test_data())
             .expect("savepoint-preserved lock must be released on commit");
     }
 
@@ -4928,7 +5436,7 @@ mod tests {
 
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(1), test_data()).unwrap();
         }
 
         let sp = {
@@ -4938,10 +5446,10 @@ mod tests {
 
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_free_page(&mut handle, &lock_table, s1, test_page(1)).unwrap();
+            concurrent_free_page(&mut handle, &lock_table, test_page(1)).unwrap();
             assert!(concurrent_page_is_freed(&handle, test_page(1)));
 
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &sp).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &sp).unwrap();
             assert!(!concurrent_page_is_freed(&handle, test_page(1)));
             assert!(concurrent_read_page(&handle, test_page(1)).is_some());
             assert_eq!(handle.write_set_pages().as_slice(), &[test_page(1)]);
@@ -4969,7 +5477,7 @@ mod tests {
         // After writing, local read returns the written data.
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         {
@@ -4991,7 +5499,7 @@ mod tests {
             .get_mut(session_id)
             .ok_or(MvccError::InvalidState)?;
 
-        concurrent_prepare_write_page(&mut handle, &lock_table, session_id, page)?;
+        concurrent_prepare_write_page(&mut handle, &lock_table, page)?;
         concurrent_stage_prepared_write_marker(&mut handle, page)?;
 
         assert_eq!(concurrent_page_read_status(&handle, page), (false, true));
@@ -5032,7 +5540,7 @@ mod tests {
             let mut handle = registry
                 .get_mut(session_id)
                 .ok_or(MvccError::InvalidState)?;
-            concurrent_prepare_write_page(&mut handle, &lock_table, session_id, page)?;
+            concurrent_prepare_write_page(&mut handle, &lock_table, page)?;
             concurrent_stage_prepared_write_marker(&mut handle, page)?;
             concurrent_savepoint(&mut handle, "sp1")?
         };
@@ -5041,11 +5549,11 @@ mod tests {
             let mut handle = registry
                 .get_mut(session_id)
                 .ok_or(MvccError::InvalidState)?;
-            concurrent_prepare_write_page(&mut handle, &lock_table, session_id, other_page)?;
+            concurrent_prepare_write_page(&mut handle, &lock_table, other_page)?;
             concurrent_stage_prepared_write_marker(&mut handle, other_page)?;
-            concurrent_free_page(&mut handle, &lock_table, session_id, page)?;
+            concurrent_free_page(&mut handle, &lock_table, page)?;
 
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, session_id, &savepoint)?;
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint)?;
 
             assert_eq!(concurrent_page_read_status(&handle, page), (false, true));
             assert!(concurrent_read_page(&handle, page).is_none());
@@ -5067,8 +5575,8 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
-        concurrent_free_page(&mut handle, &lock_table, s1, test_page(5)).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, test_page(5)).unwrap();
 
         assert!(concurrent_page_is_freed(&handle, test_page(5)));
         assert!(concurrent_read_page(&handle, test_page(5)).is_none());
@@ -5084,7 +5592,7 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_free_page(&mut handle, &lock_table, s1, test_page(5)).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, test_page(5)).unwrap();
 
         commit_index.update(test_page(5), CommitSeq::new(11));
         assert_eq!(
@@ -5105,10 +5613,10 @@ mod tests {
         let mut handle = registry.get_mut(s1).expect("handle");
         let saved = concurrent_page_state(&handle, test_page(8));
 
-        concurrent_free_page(&mut handle, &lock_table, s1, test_page(8)).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, test_page(8)).unwrap();
         assert!(concurrent_page_is_freed(&handle, test_page(8)));
 
-        concurrent_restore_page_state(&mut handle, &lock_table, s1, &saved).unwrap();
+        concurrent_restore_page_state(&mut handle, &lock_table, &saved).unwrap();
         assert!(!concurrent_page_is_freed(&handle, test_page(8)));
         assert!(concurrent_read_page(&handle, test_page(8)).is_none());
         assert!(!handle.held_locks().contains(&test_page(8)));
@@ -5128,8 +5636,7 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
-            .unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, PageNumber::ONE).unwrap();
 
         assert!(handle.tracks_write_conflict_page(PageNumber::ONE));
         assert!(handle.held_locks().contains(&PageNumber::ONE));
@@ -5138,7 +5645,7 @@ mod tests {
             "a conflict-only page with no staged data or free marker is synthetic"
         );
 
-        concurrent_clear_page_state(&mut handle, &lock_table, s1, PageNumber::ONE).unwrap();
+        concurrent_clear_page_state(&mut handle, &lock_table, PageNumber::ONE).unwrap();
 
         assert!(
             !handle.tracks_write_conflict_page(PageNumber::ONE),
@@ -5169,18 +5676,18 @@ mod tests {
 
         let savepoint = {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
+            concurrent_track_write_conflict_page(&mut handle, &lock_table, PageNumber::ONE)
                 .unwrap();
             concurrent_savepoint(&mut handle, "sp1").unwrap()
         };
 
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_clear_page_state(&mut handle, &lock_table, s1, PageNumber::ONE).unwrap();
+            concurrent_clear_page_state(&mut handle, &lock_table, PageNumber::ONE).unwrap();
             assert!(!handle.tracks_write_conflict_page(PageNumber::ONE));
             assert!(!handle.holds_page_lock(PageNumber::ONE));
 
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
             assert!(handle.tracks_write_conflict_page(PageNumber::ONE));
             assert!(handle.holds_page_lock(PageNumber::ONE));
         }
@@ -5200,16 +5707,10 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_free_page(&mut handle, &lock_table, s1, test_page(11)).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, test_page(11)).unwrap();
 
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s1,
-            CommitSeq::new(11),
-        )
-        .expect("commit should succeed");
+        concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(11))
+            .expect("commit should succeed");
 
         assert_eq!(commit_index.latest(test_page(11)), Some(CommitSeq::new(11)));
     }
@@ -5222,17 +5723,10 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
-            .unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, PageNumber::ONE).unwrap();
 
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s1,
-            CommitSeq::new(11),
-        )
-        .expect("commit should succeed");
+        concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(11))
+            .expect("commit should succeed");
 
         assert_eq!(
             commit_index.latest(PageNumber::ONE),
@@ -5249,8 +5743,8 @@ mod tests {
         let updated = PageData::from_vec(vec![0x7A; PageSize::DEFAULT.as_usize()]);
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, page, test_data()).unwrap();
-        concurrent_write_page(&mut handle, &lock_table, s1, page, updated.clone()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, test_data()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, updated.clone()).unwrap();
 
         assert_eq!(concurrent_read_page(&handle, page), Some(&updated));
         assert_eq!(handle.held_locks().len(), 1);
@@ -5274,8 +5768,8 @@ mod tests {
         let page = PageNumber::ONE;
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
-        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, page).unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, page).unwrap();
 
         assert!(handle.tracks_write_conflict_page(page));
         assert_eq!(handle.held_locks().len(), 1);
@@ -5299,21 +5793,14 @@ mod tests {
         let expected = test_data();
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, expected.clone()).unwrap();
         let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(12), test_data()).unwrap();
-        concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, test_page(12), test_data()).unwrap();
+        concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
         assert!(handle.held_locks().contains(&test_page(12)));
         assert!(!handle.tracks_write_conflict_page(test_page(12)));
 
-        concurrent_write_page(
-            &mut handle,
-            &lock_table,
-            s1,
-            test_page(12),
-            expected.clone(),
-        )
-        .unwrap();
+        concurrent_write_page(&mut handle, &lock_table, test_page(12), expected.clone()).unwrap();
         assert_eq!(
             concurrent_read_page(&handle, test_page(12)),
             Some(&expected)
@@ -5338,8 +5825,8 @@ mod tests {
         let expected = test_data();
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
-        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, page).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, expected.clone()).unwrap();
 
         assert_eq!(concurrent_read_page(&handle, page), Some(&expected));
         assert!(
@@ -5367,9 +5854,9 @@ mod tests {
         let expected = test_data();
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
-        concurrent_free_page(&mut handle, &lock_table, s1, page).unwrap();
-        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, expected.clone()).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, page).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, page, expected.clone()).unwrap();
 
         assert_eq!(concurrent_read_page(&handle, page), Some(&expected));
         assert!(!concurrent_page_is_freed(&handle, page));
@@ -5410,14 +5897,14 @@ mod tests {
             .expect("session");
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, test_page(6), test_data()).unwrap();
         assert_eq!(handle.held_locks().len(), 2);
         drop(handle);
 
         // Abort: locks released.
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_abort(&mut handle, &lock_table, s1);
+        concurrent_abort(&mut handle, &lock_table);
         assert!(!handle.is_active());
         drop(handle);
 
@@ -5426,7 +5913,7 @@ mod tests {
             .begin_concurrent(test_snapshot(10))
             .expect("session 2");
         let mut handle2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(5), test_data())
+        concurrent_write_page(&mut handle2, &lock_table, test_page(5), test_data())
             .expect("lock should be available after abort");
     }
 
@@ -5440,13 +5927,13 @@ mod tests {
             .expect("session");
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
             let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(6), test_data()).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
             assert!(handle.held_locks().contains(&test_page(6)));
             assert!(!handle.tracks_write_conflict_page(test_page(6)));
-            concurrent_abort(&mut handle, &lock_table, s1);
+            concurrent_abort(&mut handle, &lock_table);
             assert!(!handle.is_active());
         }
 
@@ -5454,7 +5941,7 @@ mod tests {
             .begin_concurrent(test_snapshot(10))
             .expect("session 2");
         let mut handle2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(6), test_data())
+        concurrent_write_page(&mut handle2, &lock_table, test_page(6), test_data())
             .expect("savepoint-preserved lock should be available after abort");
     }
 
@@ -5469,8 +5956,8 @@ mod tests {
         {
             let mut handle = registry.get_mut(s1).expect("handle");
             let savepoint = concurrent_savepoint(&mut handle, "sp1").unwrap();
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
-            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(6), test_data()).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
             assert!(
                 handle.write_set_pages().is_empty(),
                 "ROLLBACK TO removed every staged write/conflict page"
@@ -5479,7 +5966,7 @@ mod tests {
                 handle.held_locks().contains(&test_page(6)),
                 "ROLLBACK TO keeps post-savepoint page locks until transaction end"
             );
-            concurrent_commit_read_only(&mut handle, &lock_table, s1);
+            concurrent_commit_read_only(&mut handle, &lock_table);
             assert!(!handle.is_active());
         }
 
@@ -5487,7 +5974,7 @@ mod tests {
             .begin_concurrent(test_snapshot(10))
             .expect("session 2");
         let mut handle2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(6), test_data())
+        concurrent_write_page(&mut handle2, &lock_table, test_page(6), test_data())
             .expect("savepoint-preserved lock should be available after read-only commit");
     }
 
@@ -5611,7 +6098,6 @@ mod tests {
                     concurrent_write_page(
                         &mut registry.get_mut(winner).unwrap(),
                         &lock_table,
-                        winner,
                         test_page(page),
                         test_data(),
                     )
@@ -5635,7 +6121,6 @@ mod tests {
                     concurrent_write_page(
                         &mut registry.get_mut(loser).unwrap(),
                         &lock_table,
-                        loser,
                         test_page(page),
                         test_data(),
                     )
@@ -5743,14 +6228,8 @@ mod tests {
             for (session, read, write) in [(pivot, 10, 20), (peer, 20, 10), (reader, 20, 30)] {
                 let mut handle = registry.get_mut(session).unwrap();
                 handle.record_read(test_page(read));
-                concurrent_write_page(
-                    &mut handle,
-                    &lock_table,
-                    session,
-                    test_page(write),
-                    test_data(),
-                )
-                .unwrap();
+                concurrent_write_page(&mut handle, &lock_table, test_page(write), test_data())
+                    .unwrap();
             }
             let token = registry.get(pivot).unwrap().token();
             let result = concurrent_commit_with_ssi(
@@ -5838,14 +6317,8 @@ mod tests {
                 {
                     let mut handle = registry.get_mut(session).unwrap();
                     handle.record_read(test_page(read));
-                    concurrent_write_page(
-                        &mut handle,
-                        &lock_table,
-                        session,
-                        test_page(write),
-                        test_data(),
-                    )
-                    .unwrap();
+                    concurrent_write_page(&mut handle, &lock_table, test_page(write), test_data())
+                        .unwrap();
                 }
                 let token = registry.get(pivot).unwrap().token();
                 for (session, sequence) in [(downstream, 11), (upstream, 12)] {
@@ -5886,7 +6359,6 @@ mod tests {
                         &mut registry.get_mut(pivot).unwrap(),
                         &commit_index,
                         &lock_table,
-                        pivot,
                         CommitSeq::new(13),
                     )
                     .map(|_| ()),
@@ -5926,7 +6398,6 @@ mod tests {
                 concurrent_write_page(
                     &mut registry.get_mut(replacement).unwrap(),
                     &lock_table,
-                    replacement,
                     test_page(30),
                     test_data(),
                 )
@@ -5955,14 +6426,8 @@ mod tests {
             {
                 let mut handle = registry.get_mut(committed_reader).unwrap();
                 handle.record_read(test_page(10));
-                concurrent_write_page(
-                    &mut handle,
-                    &lock_table,
-                    committed_reader,
-                    test_page(20),
-                    test_data(),
-                )
-                .unwrap();
+                concurrent_write_page(&mut handle, &lock_table, test_page(20), test_data())
+                    .unwrap();
             }
             assert_eq!(
                 concurrent_commit_with_ssi(
@@ -5983,7 +6448,7 @@ mod tests {
                 if writer_reads {
                     handle.record_read(test_page(30));
                 }
-                concurrent_write_page(&mut handle, &lock_table, writer, test_page(10), test_data())
+                concurrent_write_page(&mut handle, &lock_table, test_page(10), test_data())
                     .unwrap();
             }
             let token = registry.get(writer).unwrap().token();
@@ -6036,7 +6501,7 @@ mod tests {
             .expect("session");
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         let handle = registry.get(s1).expect("handle");
@@ -6064,7 +6529,7 @@ mod tests {
             .expect("session");
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         let handle = registry.get(s1).expect("handle");
@@ -6280,14 +6745,7 @@ mod tests {
         {
             let mut seed = registry.get_mut(seed_session).unwrap();
             seed.record_read(test_page(3));
-            concurrent_write_page(
-                &mut seed,
-                &lock_table,
-                seed_session,
-                test_page(5),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut seed, &lock_table, test_page(5), test_data()).unwrap();
         }
         concurrent_commit_with_ssi(
             &mut registry,
@@ -6309,14 +6767,7 @@ mod tests {
         {
             let mut handle = registry.get_mut(session_id).unwrap();
             handle.record_read(test_page(7));
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                session_id,
-                test_page(9),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(9), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -6361,14 +6812,7 @@ mod tests {
         {
             let mut handle = registry.get_mut(session_id).unwrap();
             handle.record_read(test_page(7));
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                session_id,
-                test_page(9),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(9), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -6421,14 +6865,8 @@ mod tests {
 
         let next_session = registry.begin_concurrent(test_snapshot(12)).unwrap();
         let mut next_handle = registry.get_mut(next_session).unwrap();
-        concurrent_write_page(
-            &mut next_handle,
-            &lock_table,
-            next_session,
-            test_page(9),
-            test_data(),
-        )
-        .expect("uncontended finalize must still release the page lock");
+        concurrent_write_page(&mut next_handle, &lock_table, test_page(9), test_data())
+            .expect("uncontended finalize must still release the page lock");
     }
 
     #[test]
@@ -6441,14 +6879,7 @@ mod tests {
         {
             let mut handle = registry.get_mut(session_id).unwrap();
             handle.record_read(test_page(7));
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                session_id,
-                test_page(9),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(9), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -6506,7 +6937,7 @@ mod tests {
             .expect("session 1");
         {
             let mut h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data())
                 .expect("session 1 writes page 5");
         }
 
@@ -6543,7 +6974,7 @@ mod tests {
             .begin_concurrent(test_snapshot(11))
             .expect("session 2");
         let mut h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
+        concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data())
             .expect("page lock should be released during finalize");
     }
 
@@ -6557,7 +6988,7 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(7));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(9), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(9), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -6572,7 +7003,7 @@ mod tests {
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
             let mut h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(7), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(7), test_data()).unwrap();
         }
         concurrent_commit_with_ssi(
             &mut registry,
@@ -6615,7 +7046,7 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(3));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(9), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(9), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -6631,7 +7062,7 @@ mod tests {
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(9));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(11), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(11), test_data()).unwrap();
         }
         concurrent_commit_with_ssi(
             &mut registry,
@@ -7072,12 +7503,12 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(20));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
         }
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(30));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(20), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -7111,17 +7542,17 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(10));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(20), test_data()).unwrap();
         }
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(20));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(10), test_data()).unwrap();
         }
         {
             let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(20));
-            concurrent_write_page(&mut h3, &lock_table, s3, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, test_page(30), test_data()).unwrap();
         }
 
         let result = prepare_concurrent_commit_with_ssi(
@@ -7189,7 +7620,7 @@ mod tests {
             h1.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
             let (write_cell, _) = WitnessKey::for_point_write(root, b"key-a", leaf_a);
             h1.record_write_witness(write_cell);
-            concurrent_write_page(&mut h1, &lock_table, s1, leaf_a, test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, leaf_a, test_data()).unwrap();
         }
 
         {
@@ -7197,7 +7628,7 @@ mod tests {
             h2.record_read_witness(WitnessKey::for_cell_read(root, leaf_b, b"key-b"));
             let (write_cell, _) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
             h2.record_write_witness(write_cell);
-            concurrent_write_page(&mut h2, &lock_table, s2, leaf_b, test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, leaf_b, test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -7247,8 +7678,7 @@ mod tests {
             handle.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
             let (write_cell, _) = WitnessKey::for_point_write(root, b"key-a", leaf_a);
             handle.record_write_witness(write_cell);
-            concurrent_write_page(&mut handle, &lock_table, session_id, leaf_a, test_data())
-                .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, leaf_a, test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -7275,7 +7705,7 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
             let mut h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -7342,14 +7772,7 @@ mod tests {
 
         {
             let mut handle = registry.get_mut(session_id).unwrap();
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                session_id,
-                test_page(5),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
             lock_table.try_acquire(extra_lock_page, txn_id).unwrap();
             handle.ensure_page_state(extra_lock_page).held_lock = true;
         }
@@ -7379,14 +7802,7 @@ mod tests {
 
         {
             let mut handle = registry.get_mut(session_id).unwrap();
-            concurrent_write_page(
-                &mut handle,
-                &lock_table,
-                session_id,
-                test_page(7),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut handle, &lock_table, test_page(7), test_data()).unwrap();
             lock_table.try_acquire(extra_lock_page, txn_id).unwrap();
             handle.ensure_page_state(extra_lock_page).held_lock = true;
         }
@@ -7442,14 +7858,13 @@ mod tests {
         // Abort the handle.
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            concurrent_abort(&mut handle, &lock_table, s1);
+            concurrent_abort(&mut handle, &lock_table);
         }
 
         // Write should fail on aborted handle.
         {
             let mut handle = registry.get_mut(s1).expect("handle");
-            let result =
-                concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data());
+            let result = concurrent_write_page(&mut handle, &lock_table, test_page(1), test_data());
             assert_eq!(result.unwrap_err(), MvccError::InvalidState);
         }
 
@@ -7504,7 +7919,7 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
             // B
         }
 
@@ -7512,7 +7927,7 @@ mod tests {
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(20));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(30), test_data()).unwrap();
         }
 
         // Both should commit successfully.
@@ -7552,12 +7967,12 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
         }
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(10));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(20), test_data()).unwrap();
         }
 
         concurrent_commit_with_ssi(
@@ -7624,7 +8039,7 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5)); // A
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
             // B
         }
 
@@ -7632,7 +8047,7 @@ mod tests {
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(10)); // B
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data()).unwrap();
             // A
         }
 
@@ -7675,13 +8090,13 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
 
         // Manually mark for abort.
         h1.marked_for_abort.set(true);
 
         // Commit should fail.
-        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11));
         assert!(result.is_err());
         let (err, _) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
@@ -7697,14 +8112,14 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
 
         // Set only incoming edge (no outgoing).
         h1.has_in_rw.set(true);
         h1.has_out_rw.set(false);
 
         // Commit should succeed (not a pivot).
-        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11));
         assert!(result.is_ok(), "only incoming edge should allow commit");
     }
 
@@ -7718,14 +8133,14 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
 
         // Set only outgoing edge (no incoming).
         h1.has_in_rw.set(false);
         h1.has_out_rw.set(true);
 
         // Commit should succeed (not a pivot).
-        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11));
         assert!(result.is_ok(), "only outgoing edge should allow commit");
     }
 
@@ -7739,14 +8154,14 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
 
         // Set both edges → dangerous structure.
         h1.has_in_rw.set(true);
         h1.has_out_rw.set(true);
 
         // Commit should fail (pivot).
-        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11));
         assert!(result.is_err());
         let (err, _) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
@@ -7763,8 +8178,8 @@ mod tests {
         let mut h1 = registry.get_mut(s1).unwrap();
         h1.record_read(test_page(5));
         h1.record_read(test_page(10));
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(15), test_data()).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(15), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(20), test_data()).unwrap();
 
         let read_keys = h1.read_witness_keys();
         let write_keys = h1.write_witness_keys();
@@ -7826,19 +8241,19 @@ mod tests {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(10));
             h1.record_read(test_page(20));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(30), test_data()).unwrap();
         }
         // T2 operations.
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(50));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(10), test_data()).unwrap();
         }
         // T3 operations.
         {
             let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(30));
-            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, test_page(40), test_data()).unwrap();
         }
 
         // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
@@ -7957,19 +8372,19 @@ mod tests {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(10));
             h1.record_read(test_page(20));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(30), test_data()).unwrap();
         }
         // T2 operations.
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(50));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(10), test_data()).unwrap();
         }
         // T3 operations.
         {
             let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(30));
-            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, test_page(40), test_data()).unwrap();
         }
 
         // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
@@ -8063,12 +8478,12 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(100));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(200), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(200), test_data()).unwrap();
         }
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(200));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(300), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(300), test_data()).unwrap();
         }
 
         // Before any commit: both T1 and T2 have no SSI flags.
@@ -8142,7 +8557,7 @@ mod tests {
         // T1 writes page 42 and commits first.
         {
             let mut h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(42), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(42), test_data()).unwrap();
         }
         let result1 = concurrent_commit_with_ssi(
             &mut registry,
@@ -8157,7 +8572,7 @@ mod tests {
         // T2 now writes the same page.
         {
             let mut h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(42), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(42), test_data()).unwrap();
         }
 
         // T2 commits second — FCW detects page 42 was modified after
@@ -8204,14 +8619,8 @@ mod tests {
 
         {
             let mut winner_handle = registry.get_mut(winner_session).unwrap();
-            concurrent_write_page(
-                &mut winner_handle,
-                &lock_table,
-                winner_session,
-                test_page(77),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut winner_handle, &lock_table, test_page(77), test_data())
+                .unwrap();
         }
 
         // Same commit sequence for both contenders (simultaneous window).
@@ -8229,14 +8638,8 @@ mod tests {
 
         {
             let mut loser_handle = registry.get_mut(loser_session).unwrap();
-            concurrent_write_page(
-                &mut loser_handle,
-                &lock_table,
-                loser_session,
-                test_page(77),
-                test_data(),
-            )
-            .unwrap();
+            concurrent_write_page(&mut loser_handle, &lock_table, test_page(77), test_data())
+                .unwrap();
         }
 
         let loser = concurrent_commit_with_ssi(
@@ -8290,14 +8693,14 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(20));
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
         }
 
         // T2: reads C (30), writes B (20)
         {
             let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(30));
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(20), test_data()).unwrap();
         }
 
         // T1 commits and should carry had_out_rw=true due to T2 writing B.
@@ -8326,7 +8729,7 @@ mod tests {
         {
             let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(10));
-            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, test_page(40), test_data()).unwrap();
         }
 
         // T3 must abort due to outgoing edge to committed writer pivot T1.
@@ -8362,9 +8765,9 @@ mod tests {
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
             let mut h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_metadata_page(&mut h1, &lock_table, s1, test_page(1), test_data())
+            concurrent_write_metadata_page(&mut h1, &lock_table, test_page(1), test_data())
                 .unwrap();
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(5), test_data()).unwrap();
             assert!(concurrent_is_metadata_exempt(&h1, test_page(1)));
             assert!(!concurrent_is_metadata_exempt(&h1, test_page(5)));
         }
@@ -8372,7 +8775,7 @@ mod tests {
         // s1 commits.
         {
             let mut h1 = registry.get_mut(s1).expect("handle s1");
-            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            concurrent_commit(&mut h1, &commit_index, &lock_table, CommitSeq::new(11))
                 .expect("s1 commits");
         }
 
@@ -8380,17 +8783,16 @@ mod tests {
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
             let mut h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_metadata_page(&mut h2, &lock_table, s2, test_page(1), test_data())
+            concurrent_write_metadata_page(&mut h2, &lock_table, test_page(1), test_data())
                 .unwrap();
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(10), test_data()).unwrap();
         }
 
         // s2 should NOT conflict on page 1 (exempt), only page 10 is checked.
         // Since page 10 wasn't written by s1, s2 should commit successfully.
         {
             let mut h2 = registry.get_mut(s2).expect("handle s2");
-            let result =
-                concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            let result = concurrent_commit(&mut h2, &commit_index, &lock_table, CommitSeq::new(12));
             assert!(
                 result.is_ok(),
                 "s2 should commit: page 1 is metadata-exempt"
@@ -8407,7 +8809,7 @@ mod tests {
         {
             let mut h1 = registry.get_mut(s1).unwrap();
             // Write normally first.
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(1), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(1), test_data()).unwrap();
             assert!(!concurrent_is_metadata_exempt(&h1, test_page(1)));
 
             // Mark as metadata-exempt.
@@ -8532,14 +8934,7 @@ mod tests {
         {
             let mut handle = registry.get_mut(session_id).unwrap();
             for i in 1..=STAGED_PAGES {
-                concurrent_write_page(
-                    &mut handle,
-                    &lock_table,
-                    session_id,
-                    test_page(i),
-                    test_data(),
-                )
-                .unwrap();
+                concurrent_write_page(&mut handle, &lock_table, test_page(i), test_data()).unwrap();
             }
         }
 
@@ -8731,7 +9126,6 @@ mod tests {
                 concurrent_write_page(
                     &mut handle,
                     &lock_table,
-                    session_id,
                     test_page(READ_PAGES + i),
                     test_data(),
                 )

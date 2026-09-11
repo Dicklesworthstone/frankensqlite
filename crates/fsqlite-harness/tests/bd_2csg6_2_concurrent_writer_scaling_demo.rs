@@ -105,13 +105,7 @@ fn concurrent_writer_throughput(n_threads: u32, ops_per_writer: u32) -> (f64, u6
                     let write_ok = {
                         let r = reg.lock().unwrap();
                         let mut handle = r.get_mut(session_id).unwrap();
-                        concurrent_write_page(
-                            &mut handle,
-                            &lt,
-                            session_id,
-                            pgno,
-                            page_data((i & 0xFF) as u8),
-                        )
+                        concurrent_write_page(&mut handle, &lt, pgno, page_data((i & 0xFF) as u8))
                     };
 
                     if write_ok.is_err() {
@@ -125,7 +119,7 @@ fn concurrent_writer_throughput(n_threads: u32, ops_per_writer: u32) -> (f64, u6
                     let commit_result = {
                         let r = reg.lock().unwrap();
                         let mut handle = r.get_mut(session_id).unwrap();
-                        concurrent_commit(&mut handle, &ci, &lt, session_id, assign_seq)
+                        concurrent_commit(&mut handle, &ci, &lt, assign_seq)
                     };
 
                     {
@@ -170,20 +164,20 @@ fn test_basic_concurrent_writer_correctness() {
 
     {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(5), page_data(0xA1)).unwrap();
     }
     {
         let mut h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s2, page(10), page_data(0xB2)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(10), page_data(0xB2)).unwrap();
     }
 
     let seq1 = {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
+        concurrent_commit(&mut h, &commit_index, &lock_table, CommitSeq::new(101)).unwrap()
     };
     let seq2 = {
         let mut h = registry.get_mut(s2).unwrap();
-        concurrent_commit(&mut h, &commit_index, &lock_table, s2, CommitSeq::new(102)).unwrap()
+        concurrent_commit(&mut h, &commit_index, &lock_table, CommitSeq::new(102)).unwrap()
     };
 
     assert_eq!(
@@ -214,20 +208,20 @@ fn test_first_committer_wins_conflict() {
     // Both write to the SAME page.
     {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(5), page_data(0xA1)).unwrap();
     }
 
     // s2 tries to write to same page — should get Busy (lock contention).
     {
         let mut h = registry.get_mut(s2).unwrap();
-        let result = concurrent_write_page(&mut h, &lock_table, s2, page(5), page_data(0xB2));
+        let result = concurrent_write_page(&mut h, &lock_table, page(5), page_data(0xB2));
         assert!(result.is_err(), "bead_id={BEAD_ID} case=page_lock_conflict");
     }
 
     // s1 commits successfully.
     let seq1 = {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
+        concurrent_commit(&mut h, &commit_index, &lock_table, CommitSeq::new(101)).unwrap()
     };
     assert_eq!(
         seq1,
@@ -250,11 +244,11 @@ fn test_fcw_stale_snapshot_conflict() {
     let s1 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(5), page_data(0xA1)).unwrap();
     }
     {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, CommitSeq::new(101)).unwrap();
     }
     registry.remove(s1);
 
@@ -262,11 +256,11 @@ fn test_fcw_stale_snapshot_conflict() {
     let s2 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
         let mut h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s2, page(5), page_data(0xC3)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(5), page_data(0xC3)).unwrap();
     }
     let result = {
         let mut h = registry.get_mut(s2).unwrap();
-        concurrent_commit(&mut h, &commit_index, &lock_table, s2, CommitSeq::new(102))
+        concurrent_commit(&mut h, &commit_index, &lock_table, CommitSeq::new(102))
     };
 
     match result {
@@ -375,13 +369,7 @@ fn test_ssi_abort_rate_transparency() {
                     let write_ok = {
                         let r = reg.lock().unwrap();
                         let mut handle = r.get_mut(session_id).unwrap();
-                        concurrent_write_page(
-                            &mut handle,
-                            &lt,
-                            session_id,
-                            pgno,
-                            page_data((i & 0xFF) as u8),
-                        )
+                        concurrent_write_page(&mut handle, &lt, pgno, page_data((i & 0xFF) as u8))
                     };
 
                     if write_ok.is_err() {
@@ -395,7 +383,7 @@ fn test_ssi_abort_rate_transparency() {
                     let result = {
                         let r = reg.lock().unwrap();
                         let mut handle = r.get_mut(session_id).unwrap();
-                        concurrent_commit(&mut handle, &ci, &lt, session_id, assign)
+                        concurrent_commit(&mut handle, &ci, &lt, assign)
                     };
                     {
                         let mut r = reg.lock().unwrap();
@@ -540,19 +528,19 @@ fn test_conformance_summary() {
     let s2 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
         let mut h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s1, page(1), page_data(1)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(1), page_data(1)).unwrap();
     }
     {
         let mut h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s2, page(2), page_data(2)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(2), page_data(2)).unwrap();
     }
     let ok1 = {
         let mut c1 = registry.get_mut(s1).unwrap();
-        concurrent_commit(&mut c1, &commit_index, &lock_table, s1, CommitSeq::new(101)).is_ok()
+        concurrent_commit(&mut c1, &commit_index, &lock_table, CommitSeq::new(101)).is_ok()
     };
     let ok2 = {
         let mut c2 = registry.get_mut(s2).unwrap();
-        concurrent_commit(&mut c2, &commit_index, &lock_table, s2, CommitSeq::new(102)).is_ok()
+        concurrent_commit(&mut c2, &commit_index, &lock_table, CommitSeq::new(102)).is_ok()
     };
     let pass_correctness = ok1 && ok2;
     registry.remove(s1);
@@ -562,11 +550,11 @@ fn test_conformance_summary() {
     let s3 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
         let mut h = registry.get_mut(s3).unwrap();
-        concurrent_write_page(&mut h, &lock_table, s3, page(1), page_data(3)).unwrap();
+        concurrent_write_page(&mut h, &lock_table, page(1), page_data(3)).unwrap();
     }
     let pass_fcw = {
         let mut c3 = registry.get_mut(s3).unwrap();
-        concurrent_commit(&mut c3, &commit_index, &lock_table, s3, CommitSeq::new(103)).is_err()
+        concurrent_commit(&mut c3, &commit_index, &lock_table, CommitSeq::new(103)).is_err()
     }; // Should fail: page 1 already committed at seq 101.
     registry.remove(s3);
 
