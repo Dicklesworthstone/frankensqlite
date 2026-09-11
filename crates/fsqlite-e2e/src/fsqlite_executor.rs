@@ -1568,6 +1568,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
     });
 
     EngineRunReport {
+        wall_time_ns: duration_to_u64_ns(wall),
         wall_time_ms: wall_ms,
         ops_total,
         ops_per_sec,
@@ -1708,6 +1709,9 @@ async fn execute_batch_with_executor(
     executor: &mut PreparedOpExecutor<'_>,
     records: &[OpRecord],
     batch: BatchRange,
+    config: &FsqliteExecConfig,
+    stats: &mut WorkerStats,
+    attempt: &mut u32,
 ) -> Result<BatchOutcome, BatchError> {
     let mut timing = BatchTiming::default();
 
@@ -1733,17 +1737,13 @@ async fn execute_batch_with_executor(
                 timing.body_execution = timing
                     .body_execution
                     .saturating_add(duration_to_u64_ns(op_started.elapsed()));
-                let rollback_started = Instant::now();
-                rollback_active_batch(executor.conn)
+                rollback_active_batch(executor.conn, config, stats, attempt, &mut timing)
                     .await
                     .map_err(|rollback| BatchError::Fatal {
                         message: format!("{}; rollback failed: {rollback}", err.message()),
                         phase: BatchPhase::Rollback,
                         timing,
                     })?;
-                timing.rollback = timing
-                    .rollback
-                    .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
                 return Err(match err {
                     OpError::Busy(busy) => BatchError::Busy {
                         busy,
@@ -1782,17 +1782,13 @@ async fn execute_batch_with_executor(
             } else {
                 timing.rollback = duration_to_u64_ns(finalize_started.elapsed());
             }
-            let rollback_started = Instant::now();
-            rollback_active_batch(executor.conn)
+            rollback_active_batch(executor.conn, config, stats, attempt, &mut timing)
                 .await
                 .map_err(|rollback| BatchError::Fatal {
                     message: format!("{err}; rollback failed: {rollback}"),
                     phase: BatchPhase::Rollback,
                     timing,
                 })?;
-            timing.rollback = timing
-                .rollback
-                .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
             let finalize_phase = if batch.commit {
                 BatchPhase::Commit
             } else {
@@ -1834,9 +1830,16 @@ fn run_records_with_retry(
         let mut attempt: u32 = 0;
         loop {
             // bd-zavyn: exactly one runtime entry per batch attempt. The
-            // busy backoff below stays a sync `thread::sleep` outside the
-            // runtime so retries re-enter rather than parking a future.
-            match crate::block_on(execute_batch_with_executor(&mut executor, records, batch)) {
+            // Batch backoff below stays outside the runtime. Cleanup retries
+            // await their backoff inside this entry before a batch can restart.
+            match crate::block_on(execute_batch_with_executor(
+                &mut executor,
+                records,
+                batch,
+                config,
+                &mut stats,
+                &mut attempt,
+            )) {
                 Ok(outcome) => {
                     stats.ops_ok += outcome.ok;
                     stats.ops_err += outcome.err;
@@ -1873,14 +1876,14 @@ fn run_records_with_retry(
                         .begin_boundary_time_ns
                         .saturating_add(timing.begin_boundary);
                     stats.rollback_time_ns = stats.rollback_time_ns.saturating_add(timing.rollback);
-                    attempt = attempt.saturating_add(1);
-                    if attempt > config.max_busy_retries {
+                    if attempt >= config.max_busy_retries {
                         stats.error = Some(format!(
                             "worker {worker_id}: exceeded max_busy_retries={} (last={})",
                             config.max_busy_retries, busy.message
                         ));
                         break;
                     }
+                    attempt += 1;
                     let backoff = backoff_duration(config, attempt);
                     stats.retry_backoff_time_ns = stats
                         .retry_backoff_time_ns
@@ -1912,11 +1915,64 @@ fn run_records_with_retry(
     stats
 }
 
-async fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
-    match conn.rollback_transaction().await {
-        Ok(()) | Err(FrankenError::NoActiveTransaction) => Ok(()),
-        Err(err) => Err(err.to_string()),
+/// Finish cleanup before the caller retries the original transaction batch.
+/// Rollback contention consumes the same retry budget as the batch itself.
+async fn rollback_active_batch(
+    conn: &Connection,
+    config: &FsqliteExecConfig,
+    stats: &mut WorkerStats,
+    attempt: &mut u32,
+    timing: &mut BatchTiming,
+) -> Result<(), String> {
+    loop {
+        // A failed statement, commit, or preceding rollback can already have
+        // ended the transaction. Do not issue another ROLLBACK in that case.
+        if !conn.in_transaction() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let result = conn.rollback_transaction().await;
+        timing.rollback = timing
+            .rollback
+            .saturating_add(duration_to_u64_ns(started.elapsed()));
+        match result {
+            Ok(()) | Err(FrankenError::NoActiveTransaction) => return Ok(()),
+            Err(err) => {
+                let backoff = record_rollback_retry(err, config, stats, attempt)?;
+                // This wait remains inside the batch's single runtime entry.
+                // Attribute it to backoff, not engine rollback execution time.
+                asupersync::time::sleep(asupersync::time::wall_now(), backoff).await;
+            }
+        }
     }
+}
+
+fn record_rollback_retry(
+    err: FrankenError,
+    config: &FsqliteExecConfig,
+    stats: &mut WorkerStats,
+    attempt: &mut u32,
+) -> Result<Duration, String> {
+    // A snapshot conflict is not a retryable rollback result. Preserve all
+    // non-transient failures rather than treating them as completed cleanup.
+    if !matches!(err, FrankenError::Busy | FrankenError::BusyRecovery) {
+        return Err(err.to_string());
+    }
+    let busy = classify_retryable_busy(err)?;
+    stats.retries = stats.retries.saturating_add(1);
+    stats.record_busy(&busy, BatchPhase::Rollback, attempt.saturating_add(1));
+    if *attempt >= config.max_busy_retries {
+        return Err(format!(
+            "rollback exceeded max_busy_retries={} (last={})",
+            config.max_busy_retries, busy.message
+        ));
+    }
+    *attempt += 1;
+    let backoff = backoff_duration(config, *attempt);
+    stats.retry_backoff_time_ns = stats
+        .retry_backoff_time_ns
+        .saturating_add(duration_to_u64_ns(backoff));
+    Ok(backoff)
 }
 
 // ── Operation dispatch ────────────────────────────────────────────────────
@@ -4777,6 +4833,125 @@ mod tests {
             classify_fsqlite_error_as_batch(err),
             BatchError::Busy { .. }
         ));
+    }
+
+    #[test]
+    fn rollback_retry_shares_batch_budget_and_records_phase() {
+        let config = FsqliteExecConfig {
+            max_busy_retries: 3,
+            ..FsqliteExecConfig::default()
+        };
+        let mut stats = WorkerStats::default();
+        let mut attempt = 1;
+        assert_eq!(
+            record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
+                .expect("first cleanup retry"),
+            Duration::from_millis(4)
+        );
+        assert_eq!(
+            record_rollback_retry(
+                FrankenError::BusyRecovery,
+                &config,
+                &mut stats,
+                &mut attempt
+            )
+            .expect("second cleanup retry"),
+            Duration::from_millis(8)
+        );
+        let exhausted =
+            record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
+                .expect_err("cleanup must not receive a fresh batch budget");
+        assert!(exhausted.contains("max_busy_retries=3"));
+        assert_eq!(attempt, 3);
+        assert_eq!(stats.retries, 3);
+        assert_eq!(stats.rollback_busy_retries, 3);
+        assert_eq!(stats.busy_retries, 2);
+        assert_eq!(stats.busy_recovery_retries, 1);
+        assert_eq!(stats.aborts, 0);
+        assert_eq!(stats.retry_backoff_time_ns, 12_000_000);
+    }
+
+    #[test]
+    fn rollback_active_batch_discards_changes_and_accepts_finished_cleanup() {
+        crate::block_on(async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE cleanup_probe (id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            conn.begin_transaction().await.unwrap();
+            conn.execute("INSERT INTO cleanup_probe VALUES (1);")
+                .await
+                .unwrap();
+            assert!(conn.in_transaction());
+
+            let config = FsqliteExecConfig::default();
+            let mut stats = WorkerStats::default();
+            let mut attempt = 0;
+            let mut timing = BatchTiming::default();
+            rollback_active_batch(&conn, &config, &mut stats, &mut attempt, &mut timing)
+                .await
+                .unwrap();
+            assert!(!conn.in_transaction());
+            let row = conn
+                .query_row("SELECT count(*) FROM cleanup_probe;")
+                .await
+                .unwrap();
+            assert_eq!(row.get(0), Some(&SqliteValue::Integer(0)));
+
+            rollback_active_batch(&conn, &config, &mut stats, &mut attempt, &mut timing)
+                .await
+                .unwrap();
+            assert!(!conn.in_transaction());
+            assert_eq!(attempt, 0);
+            assert_eq!(stats.retries, 0);
+        });
+    }
+
+    #[test]
+    fn rollback_retry_preserves_fatal_and_snapshot_errors() {
+        for err in [
+            FrankenError::Abort,
+            FrankenError::Internal("rollback I/O failed".to_owned()),
+            FrankenError::BusySnapshot {
+                conflicting_pages: "7".to_owned(),
+            },
+        ] {
+            let expected = err.to_string();
+            let mut stats = WorkerStats::default();
+            let mut attempt = 2;
+            assert_eq!(
+                record_rollback_retry(
+                    err,
+                    &FsqliteExecConfig::default(),
+                    &mut stats,
+                    &mut attempt,
+                )
+                .expect_err("only rollback Busy and BusyRecovery may retry"),
+                expected
+            );
+            assert_eq!(attempt, 2);
+            assert_eq!(stats.retries, 0);
+            assert_eq!(stats.rollback_busy_retries, 0);
+            assert_eq!(stats.retry_backoff_time_ns, 0);
+        }
+    }
+
+    #[test]
+    fn rollback_retry_budget_exhaustion_never_wraps() {
+        for max_busy_retries in [0, u32::MAX] {
+            let config = FsqliteExecConfig {
+                max_busy_retries,
+                ..FsqliteExecConfig::default()
+            };
+            let mut stats = WorkerStats::default();
+            let mut attempt = max_busy_retries;
+            assert!(
+                record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
+                    .is_err()
+            );
+            assert_eq!(attempt, max_busy_retries);
+            assert_eq!(stats.retry_backoff_time_ns, 0);
+        }
     }
 
     #[test]

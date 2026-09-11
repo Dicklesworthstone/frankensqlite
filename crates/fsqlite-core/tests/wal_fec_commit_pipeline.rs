@@ -411,7 +411,8 @@ fn assert_process_crash_recovery(crash_during_append: bool) {
         }
         #[cfg(not(target_os = "linux"))]
         panic!("the RLIMIT_FSIZE crash keeper requires Linux");
-    } else {
+    }
+    if !crash_during_append {
         assert_eq!(status.code(), Some(DURABLE_EXIT), "child did not reach the intended exit: {log}");
     }
     assert!(log.lines().any(|line| line == PHASE_MARKER), "missing durable phase receipt: {log}");

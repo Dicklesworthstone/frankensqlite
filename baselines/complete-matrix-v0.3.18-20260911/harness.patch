@@ -1,0 +1,822 @@
+diff --git a/crates/fsqlite-e2e/src/bench_summary.rs b/crates/fsqlite-e2e/src/bench_summary.rs
+index fed0f2b59..3865a713b 100644
+--- a/crates/fsqlite-e2e/src/bench_summary.rs
++++ b/crates/fsqlite-e2e/src/bench_summary.rs
+@@ -264,6 +264,7 @@ mod tests {
+     ) -> EngineRunReport {
+         EngineRunReport {
+             wall_time_ms: wall_ms,
++            wall_time_ns: wall_ms.saturating_mul(1_000_000),
+             ops_total: 100,
+             ops_per_sec: ops_sec,
+             retries,
+diff --git a/crates/fsqlite-e2e/src/benchmark.rs b/crates/fsqlite-e2e/src/benchmark.rs
+index b145c5dc7..37d2d7060 100644
+--- a/crates/fsqlite-e2e/src/benchmark.rs
++++ b/crates/fsqlite-e2e/src/benchmark.rs
+@@ -1268,6 +1268,8 @@ pub struct ThroughputStats {
+ pub struct IterationRecord {
+     /// 0-based index within the measurement phase (excludes warmup).
+     pub iteration: u32,
++    /// Exact measured engine wall time; used for submillisecond statistics.
++    pub wall_time_ns: u64,
+     /// Wall time in milliseconds.
+     pub wall_time_ms: u64,
+     /// Operations per second.
+@@ -1331,6 +1333,7 @@ where
+                 }
+                 IterationRecord {
+                     iteration: measurement_idx,
++                    wall_time_ns: report.wall_time_ns,
+                     wall_time_ms: report.wall_time_ms,
+                     ops_per_sec: report.ops_per_sec,
+                     ops_total: report.ops_total,
+@@ -1341,6 +1344,7 @@ where
+             }
+             Err(e) => IterationRecord {
+                 iteration: measurement_idx,
++                wall_time_ns: u64::try_from(iter_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                 wall_time_ms: duration_to_u64_ms(iter_elapsed),
+                 ops_per_sec: 0.0,
+                 ops_total: 0,
+@@ -1363,7 +1367,10 @@ where
+     let total_measurement_ms = duration_to_u64_ms(measurement_start.elapsed());
+ 
+     // ── Compute statistics ─────────────────────────────────────────
+-    let wall_times: Vec<f64> = iterations.iter().map(|r| r.wall_time_ms as f64).collect();
++    let wall_times: Vec<f64> = iterations
++        .iter()
++        .map(|r| r.wall_time_ns as f64 / 1_000_000.0)
++        .collect();
+     let throughputs: Vec<f64> = iterations.iter().map(|r| r.ops_per_sec).collect();
+ 
+     let latency = compute_latency_stats(&wall_times);
+@@ -1515,6 +1522,7 @@ mod tests {
+             0.0
+         };
+         EngineRunReport {
++            wall_time_ns: wall_ms.saturating_mul(1_000_000),
+             wall_time_ms: wall_ms,
+             ops_total: ops,
+             ops_per_sec,
+@@ -1557,6 +1565,35 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn submillisecond_latency_preserves_engine_timing_and_raw_samples() {
++        let config = BenchmarkConfig {
++            warmup_iterations: 0,
++            min_iterations: 5,
++            measurement_time_secs: 0,
++        };
++        let summary = run_benchmark(&config, &test_meta(), |_| {
++            let mut report = dummy_report(0, 100);
++            report.wall_time_ns = 250_000;
++            report.ops_per_sec = 400_000.0;
++            Ok::<_, String>(report)
++        });
++        assert_eq!(summary.measurement_count, 5);
++        for sample in &summary.iterations {
++            assert_eq!(sample.wall_time_ns, 250_000);
++            assert_eq!(sample.wall_time_ms, 0);
++        }
++        assert_eq!(summary.latency.min_ms, 0.25);
++        assert_eq!(summary.latency.median_ms, 0.25);
++        assert_eq!(summary.latency.p95_ms, 0.25);
++        assert_eq!(summary.latency.p99_ms, 0.25);
++        let roundtrip: BenchmarkSummary =
++            serde_json::from_str(&summary.to_jsonl().expect("serialize precise samples"))
++                .expect("deserialize precise samples");
++        assert_eq!(roundtrip.iterations[0].wall_time_ns, 250_000);
++        assert_eq!(roundtrip.latency.p95_ms, 0.25);
++    }
++
+     fn scorecard_summary(
+         mode_id: &str,
+         wall_ms: u64,
+diff --git a/crates/fsqlite-e2e/src/bin/e2e_viewer.rs b/crates/fsqlite-e2e/src/bin/e2e_viewer.rs
+index ced0fb0bf..89715f57a 100644
+--- a/crates/fsqlite-e2e/src/bin/e2e_viewer.rs
++++ b/crates/fsqlite-e2e/src/bin/e2e_viewer.rs
+@@ -1082,6 +1082,7 @@ mod tests {
+             ops_count: 10_000,
+             report: EngineRunReport {
+                 wall_time_ms: 1234,
++                wall_time_ns: 1234_u64.saturating_mul(1_000_000),
+                 ops_total: 10_000,
+                 ops_per_sec: 8_103.7,
+                 retries: 0,
+diff --git a/crates/fsqlite-e2e/src/bin/realdb_e2e.rs b/crates/fsqlite-e2e/src/bin/realdb_e2e.rs
+index 13cb2b9a7..c1271fbcf 100644
+--- a/crates/fsqlite-e2e/src/bin/realdb_e2e.rs
++++ b/crates/fsqlite-e2e/src/bin/realdb_e2e.rs
+@@ -49,7 +49,7 @@ use fsqlite_e2e::fixture_select::{
+ };
+ use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+ use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
+-use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
++use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta, compiled_cargo_profile};
+ use fsqlite_e2e::oplog::{self, OpLog};
+ #[cfg(test)]
+ use fsqlite_e2e::overlay_honesty_gate::{
+@@ -879,7 +879,7 @@ fn try_build_canonical_bench_context(
+         beads_data_hash,
+         command_entrypoint: format!("realdb-e2e {subcommand}"),
+         command_line: benchmark_command_line(subcommand, argv),
+-        rerun_command: benchmark_rerun_command(subcommand, argv, cargo_profile_name()),
++        rerun_command: benchmark_rerun_command(subcommand, argv, compiled_cargo_profile()),
+         retention_class,
+         tool_versions: benchmark_tool_versions(),
+     })
+@@ -2245,8 +2245,7 @@ fn resolve_hot_path_microarchitectural_context(
+ 
+ fn current_hot_path_cargo_profile() -> String {
+     hot_path_override_env(HOT_PATH_CARGO_PROFILE_ENV)
+-        .or_else(|| std::env::var("PROFILE").ok())
+-        .unwrap_or_else(|| "unknown".to_owned())
++        .unwrap_or_else(|| compiled_cargo_profile().to_owned())
+ }
+ 
+ fn resolve_hot_path_workspace_root(
+@@ -4998,7 +4997,7 @@ fn run_sqlite3_engine(
+         ..SqliteExecConfig::default()
+     };
+     let sqlite_version = rusqlite::version().to_owned();
+-    let environment = run_mode.environment(cargo_profile_name());
++    let environment = run_mode.environment(compiled_cargo_profile());
+ 
+     let golden_sha256 = match sha256_file(&golden_path) {
+         Ok(h) => Some(h),
+@@ -5151,7 +5150,7 @@ fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
+         collect_hot_path_profile: run_mode.hot_path_profile,
+         ..FsqliteExecConfig::default()
+     };
+-    let environment = run_mode.environment(cargo_profile_name());
++    let environment = run_mode.environment(compiled_cargo_profile());
+ 
+     let mut results: Vec<RunAgg> = Vec::new();
+     let mut any_error = false;
+@@ -5627,7 +5626,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
+         }
+     };
+ 
+-    let cargo_profile = cargo_profile_name();
++    let cargo_profile = compiled_cargo_profile();
+     let canonical_context = selection
+         .workspace_root
+         .as_deref()
+@@ -5904,7 +5903,7 @@ fn cmd_evidence_pack(argv: &[String]) -> i32 {
+     }
+ 
+     let lanes = benchmark_all_mode_lanes();
+-    let cargo_profile = cargo_profile_name();
++    let cargo_profile = compiled_cargo_profile();
+     let execution = match execute_benchmark_matrix(&BenchMatrixRequest {
+         selection: &selection,
+         lanes: &lanes,
+@@ -7363,24 +7362,6 @@ fn quote_ident(name: &str) -> String {
+     format!("\"{escaped}\"")
+ }
+ 
+-fn cargo_profile_name() -> &'static str {
+-    if let Some(profile) = option_env!("PROFILE") {
+-        return match profile {
+-            "debug" => "dev",
+-            other => other,
+-        };
+-    }
+-    if cfg!(debug_assertions) {
+-        return "dev";
+-    }
+-    if option_env!("OPT_LEVEL") == Some("3") {
+-        // release-perf inherits release but sets opt-level = 3.
+-        // Plain release uses opt-level = "z".
+-        return "release-perf";
+-    }
+-    "release"
+-}
+-
+ fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
+     let s = raw.trim();
+     if s.is_empty() {
+@@ -7968,6 +7949,7 @@ mod tests {
+ 
+     fn sample_engine_report() -> EngineRunReport {
+         EngineRunReport {
++            wall_time_ns: 0,
+             wall_time_ms: 0,
+             ops_total: 0,
+             ops_per_sec: 0.0,
+@@ -8566,6 +8548,7 @@ mod tests {
+             aggregated_hot_path: None,
+             iterations: vec![IterationRecord {
+                 iteration: 0,
++                wall_time_ns: wall_time_ms.saturating_mul(1_000_000),
+                 wall_time_ms,
+                 ops_per_sec: 100.0,
+                 ops_total: 100,
+@@ -8657,6 +8640,7 @@ mod tests {
+             aggregated_hot_path: None,
+             iterations: vec![IterationRecord {
+                 iteration: 0,
++                wall_time_ns: 10_000_000,
+                 wall_time_ms: 10,
+                 ops_per_sec: median_ops_per_sec,
+                 ops_total: 100,
+diff --git a/crates/fsqlite-e2e/src/concurrency_showcase.rs b/crates/fsqlite-e2e/src/concurrency_showcase.rs
+index 7a6ea48d2..2a4b30807 100644
+--- a/crates/fsqlite-e2e/src/concurrency_showcase.rs
++++ b/crates/fsqlite-e2e/src/concurrency_showcase.rs
+@@ -662,6 +662,7 @@ mod tests {
+                 IterationRecord {
+                     iteration: 0,
+                     wall_time_ms: 100,
++                    wall_time_ns: 100_000_000,
+                     ops_per_sec,
+                     ops_total: 1000,
+                     retries,
+@@ -671,6 +672,7 @@ mod tests {
+                 IterationRecord {
+                     iteration: 1,
+                     wall_time_ms: 100,
++                    wall_time_ns: 100_000_000,
+                     ops_per_sec,
+                     ops_total: 1000,
+                     retries,
+@@ -680,6 +682,7 @@ mod tests {
+                 IterationRecord {
+                     iteration: 2,
+                     wall_time_ms: 100,
++                    wall_time_ns: 100_000_000,
+                     ops_per_sec,
+                     ops_total: 1000,
+                     retries,
+diff --git a/crates/fsqlite-e2e/src/fsqlite_executor.rs b/crates/fsqlite-e2e/src/fsqlite_executor.rs
+index 19ce0c45d..2bb443a32 100644
+--- a/crates/fsqlite-e2e/src/fsqlite_executor.rs
++++ b/crates/fsqlite-e2e/src/fsqlite_executor.rs
+@@ -1568,6 +1568,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
+     });
+ 
+     EngineRunReport {
++        wall_time_ns: duration_to_u64_ns(wall),
+         wall_time_ms: wall_ms,
+         ops_total,
+         ops_per_sec,
+@@ -1708,6 +1709,9 @@ async fn execute_batch_with_executor(
+     executor: &mut PreparedOpExecutor<'_>,
+     records: &[OpRecord],
+     batch: BatchRange,
++    config: &FsqliteExecConfig,
++    stats: &mut WorkerStats,
++    attempt: &mut u32,
+ ) -> Result<BatchOutcome, BatchError> {
+     let mut timing = BatchTiming::default();
+ 
+@@ -1733,17 +1737,13 @@ async fn execute_batch_with_executor(
+                 timing.body_execution = timing
+                     .body_execution
+                     .saturating_add(duration_to_u64_ns(op_started.elapsed()));
+-                let rollback_started = Instant::now();
+-                rollback_active_batch(executor.conn)
++                rollback_active_batch(executor.conn, config, stats, attempt, &mut timing)
+                     .await
+                     .map_err(|rollback| BatchError::Fatal {
+                         message: format!("{}; rollback failed: {rollback}", err.message()),
+                         phase: BatchPhase::Rollback,
+                         timing,
+                     })?;
+-                timing.rollback = timing
+-                    .rollback
+-                    .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
+                 return Err(match err {
+                     OpError::Busy(busy) => BatchError::Busy {
+                         busy,
+@@ -1782,17 +1782,13 @@ async fn execute_batch_with_executor(
+             } else {
+                 timing.rollback = duration_to_u64_ns(finalize_started.elapsed());
+             }
+-            let rollback_started = Instant::now();
+-            rollback_active_batch(executor.conn)
++            rollback_active_batch(executor.conn, config, stats, attempt, &mut timing)
+                 .await
+                 .map_err(|rollback| BatchError::Fatal {
+                     message: format!("{err}; rollback failed: {rollback}"),
+                     phase: BatchPhase::Rollback,
+                     timing,
+                 })?;
+-            timing.rollback = timing
+-                .rollback
+-                .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
+             let finalize_phase = if batch.commit {
+                 BatchPhase::Commit
+             } else {
+@@ -1834,9 +1830,16 @@ fn run_records_with_retry(
+         let mut attempt: u32 = 0;
+         loop {
+             // bd-zavyn: exactly one runtime entry per batch attempt. The
+-            // busy backoff below stays a sync `thread::sleep` outside the
+-            // runtime so retries re-enter rather than parking a future.
+-            match crate::block_on(execute_batch_with_executor(&mut executor, records, batch)) {
++            // Batch backoff below stays outside the runtime. Cleanup retries
++            // await their backoff inside this entry before a batch can restart.
++            match crate::block_on(execute_batch_with_executor(
++                &mut executor,
++                records,
++                batch,
++                config,
++                &mut stats,
++                &mut attempt,
++            )) {
+                 Ok(outcome) => {
+                     stats.ops_ok += outcome.ok;
+                     stats.ops_err += outcome.err;
+@@ -1873,14 +1876,14 @@ fn run_records_with_retry(
+                         .begin_boundary_time_ns
+                         .saturating_add(timing.begin_boundary);
+                     stats.rollback_time_ns = stats.rollback_time_ns.saturating_add(timing.rollback);
+-                    attempt = attempt.saturating_add(1);
+-                    if attempt > config.max_busy_retries {
++                    if attempt >= config.max_busy_retries {
+                         stats.error = Some(format!(
+                             "worker {worker_id}: exceeded max_busy_retries={} (last={})",
+                             config.max_busy_retries, busy.message
+                         ));
+                         break;
+                     }
++                    attempt += 1;
+                     let backoff = backoff_duration(config, attempt);
+                     stats.retry_backoff_time_ns = stats
+                         .retry_backoff_time_ns
+@@ -1912,13 +1915,66 @@ fn run_records_with_retry(
+     stats
+ }
+ 
+-async fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
+-    match conn.rollback_transaction().await {
+-        Ok(()) | Err(FrankenError::NoActiveTransaction) => Ok(()),
+-        Err(err) => Err(err.to_string()),
++/// Finish cleanup before the caller retries the original transaction batch.
++/// Rollback contention consumes the same retry budget as the batch itself.
++async fn rollback_active_batch(
++    conn: &Connection,
++    config: &FsqliteExecConfig,
++    stats: &mut WorkerStats,
++    attempt: &mut u32,
++    timing: &mut BatchTiming,
++) -> Result<(), String> {
++    loop {
++        // A failed statement, commit, or preceding rollback can already have
++        // ended the transaction. Do not issue another ROLLBACK in that case.
++        if !conn.in_transaction() {
++            return Ok(());
++        }
++        let started = Instant::now();
++        let result = conn.rollback_transaction().await;
++        timing.rollback = timing
++            .rollback
++            .saturating_add(duration_to_u64_ns(started.elapsed()));
++        match result {
++            Ok(()) | Err(FrankenError::NoActiveTransaction) => return Ok(()),
++            Err(err) => {
++                let backoff = record_rollback_retry(err, config, stats, attempt)?;
++                // This wait remains inside the batch's single runtime entry.
++                // Attribute it to backoff, not engine rollback execution time.
++                asupersync::time::sleep(asupersync::time::wall_now(), backoff).await;
++            }
++        }
+     }
+ }
+ 
++fn record_rollback_retry(
++    err: FrankenError,
++    config: &FsqliteExecConfig,
++    stats: &mut WorkerStats,
++    attempt: &mut u32,
++) -> Result<Duration, String> {
++    // A snapshot conflict is not a retryable rollback result. Preserve all
++    // non-transient failures rather than treating them as completed cleanup.
++    if !matches!(err, FrankenError::Busy | FrankenError::BusyRecovery) {
++        return Err(err.to_string());
++    }
++    let busy = classify_retryable_busy(err)?;
++    stats.retries = stats.retries.saturating_add(1);
++    stats.record_busy(&busy, BatchPhase::Rollback, attempt.saturating_add(1));
++    if *attempt >= config.max_busy_retries {
++        return Err(format!(
++            "rollback exceeded max_busy_retries={} (last={})",
++            config.max_busy_retries, busy.message
++        ));
++    }
++    *attempt += 1;
++    let backoff = backoff_duration(config, *attempt);
++    stats.retry_backoff_time_ns = stats
++        .retry_backoff_time_ns
++        .saturating_add(duration_to_u64_ns(backoff));
++    Ok(backoff)
++}
++
+ // ── Operation dispatch ────────────────────────────────────────────────────
+ 
+ struct PreparedOpExecutor<'conn> {
+@@ -4779,6 +4835,125 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn rollback_retry_shares_batch_budget_and_records_phase() {
++        let config = FsqliteExecConfig {
++            max_busy_retries: 3,
++            ..FsqliteExecConfig::default()
++        };
++        let mut stats = WorkerStats::default();
++        let mut attempt = 1;
++        assert_eq!(
++            record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
++                .expect("first cleanup retry"),
++            Duration::from_millis(4)
++        );
++        assert_eq!(
++            record_rollback_retry(
++                FrankenError::BusyRecovery,
++                &config,
++                &mut stats,
++                &mut attempt
++            )
++            .expect("second cleanup retry"),
++            Duration::from_millis(8)
++        );
++        let exhausted =
++            record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
++                .expect_err("cleanup must not receive a fresh batch budget");
++        assert!(exhausted.contains("max_busy_retries=3"));
++        assert_eq!(attempt, 3);
++        assert_eq!(stats.retries, 3);
++        assert_eq!(stats.rollback_busy_retries, 3);
++        assert_eq!(stats.busy_retries, 2);
++        assert_eq!(stats.busy_recovery_retries, 1);
++        assert_eq!(stats.aborts, 0);
++        assert_eq!(stats.retry_backoff_time_ns, 12_000_000);
++    }
++
++    #[test]
++    fn rollback_active_batch_discards_changes_and_accepts_finished_cleanup() {
++        crate::block_on(async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            conn.execute("CREATE TABLE cleanup_probe (id INTEGER PRIMARY KEY);")
++                .await
++                .unwrap();
++            conn.begin_transaction().await.unwrap();
++            conn.execute("INSERT INTO cleanup_probe VALUES (1);")
++                .await
++                .unwrap();
++            assert!(conn.in_transaction());
++
++            let config = FsqliteExecConfig::default();
++            let mut stats = WorkerStats::default();
++            let mut attempt = 0;
++            let mut timing = BatchTiming::default();
++            rollback_active_batch(&conn, &config, &mut stats, &mut attempt, &mut timing)
++                .await
++                .unwrap();
++            assert!(!conn.in_transaction());
++            let row = conn
++                .query_row("SELECT count(*) FROM cleanup_probe;")
++                .await
++                .unwrap();
++            assert_eq!(row.get(0), Some(&SqliteValue::Integer(0)));
++
++            rollback_active_batch(&conn, &config, &mut stats, &mut attempt, &mut timing)
++                .await
++                .unwrap();
++            assert!(!conn.in_transaction());
++            assert_eq!(attempt, 0);
++            assert_eq!(stats.retries, 0);
++        });
++    }
++
++    #[test]
++    fn rollback_retry_preserves_fatal_and_snapshot_errors() {
++        for err in [
++            FrankenError::Abort,
++            FrankenError::Internal("rollback I/O failed".to_owned()),
++            FrankenError::BusySnapshot {
++                conflicting_pages: "7".to_owned(),
++            },
++        ] {
++            let expected = err.to_string();
++            let mut stats = WorkerStats::default();
++            let mut attempt = 2;
++            assert_eq!(
++                record_rollback_retry(
++                    err,
++                    &FsqliteExecConfig::default(),
++                    &mut stats,
++                    &mut attempt,
++                )
++                .expect_err("only rollback Busy and BusyRecovery may retry"),
++                expected
++            );
++            assert_eq!(attempt, 2);
++            assert_eq!(stats.retries, 0);
++            assert_eq!(stats.rollback_busy_retries, 0);
++            assert_eq!(stats.retry_backoff_time_ns, 0);
++        }
++    }
++
++    #[test]
++    fn rollback_retry_budget_exhaustion_never_wraps() {
++        for max_busy_retries in [0, u32::MAX] {
++            let config = FsqliteExecConfig {
++                max_busy_retries,
++                ..FsqliteExecConfig::default()
++            };
++            let mut stats = WorkerStats::default();
++            let mut attempt = max_busy_retries;
++            assert!(
++                record_rollback_retry(FrankenError::Busy, &config, &mut stats, &mut attempt)
++                    .is_err()
++            );
++            assert_eq!(attempt, max_busy_retries);
++            assert_eq!(stats.retry_backoff_time_ns, 0);
++        }
++    }
++
+     #[test]
+     fn classify_op_busy_snapshot_preserves_taxonomy_and_pages() {
+         let err = FrankenError::BusySnapshot {
+diff --git a/crates/fsqlite-e2e/src/methodology.rs b/crates/fsqlite-e2e/src/methodology.rs
+index 82b9a2846..283338bdf 100644
+--- a/crates/fsqlite-e2e/src/methodology.rs
++++ b/crates/fsqlite-e2e/src/methodology.rs
+@@ -55,6 +55,19 @@ pub const MEASUREMENT_TIME_SECS: u64 = 10;
+ /// Canonical cargo profile for authoritative throughput measurements.
+ pub const AUTHORITATIVE_PERF_CARGO_PROFILE: &str = "release-perf";
+ 
++/// Cargo profile recorded by the build script from Cargo's output directory.
++///
++/// Cargo exposes `PROFILE` and `OPT_LEVEL` to build scripts, not directly to
++/// crate compilation. Preserve custom profile names instead of inferring them
++/// from optimization or debug assertions.
++#[must_use]
++pub fn compiled_cargo_profile() -> &'static str {
++    match env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE") {
++        "debug" => "dev",
++        profile => profile,
++    }
++}
++
+ /// Methodology metadata embedded in every benchmark report.
+ ///
+ /// This record is serialized into the report JSON so that consumers can
+@@ -151,8 +164,11 @@ impl BuildHygieneMeta {
+             profile_contract_expectations(cargo_profile);
+         Self {
+             authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
+-            matches_authoritative_profile: cargo_profile == AUTHORITATIVE_PERF_CARGO_PROFILE,
+-            opt_level: option_env!("OPT_LEVEL").unwrap_or("unknown").to_owned(),
++            matches_authoritative_profile: cargo_profile == AUTHORITATIVE_PERF_CARGO_PROFILE
++                && compiled_cargo_profile() == AUTHORITATIVE_PERF_CARGO_PROFILE
++                && env!("FSQLITE_BENCH_BUILD_OPT_LEVEL") == "3"
++                && !cfg!(debug_assertions),
++            opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
+             debug_assertions: cfg!(debug_assertions),
+             panic_strategy: if cfg!(panic = "abort") {
+                 "abort"
+@@ -187,8 +203,9 @@ fn profile_contract_expectations(
+     cargo_profile: &str,
+ ) -> (Option<bool>, Option<u32>, Option<bool>, Option<bool>) {
+     match cargo_profile {
+-        "release" => (Some(true), Some(1), Some(true), Some(false)),
+-        AUTHORITATIVE_PERF_CARGO_PROFILE => (Some(true), Some(1), Some(false), Some(true)),
++        "release" | AUTHORITATIVE_PERF_CARGO_PROFILE => {
++            (Some(true), Some(1), Some(false), Some(true))
++        }
+         _ => (None, None, None, None),
+     }
+ }
+@@ -367,7 +384,38 @@ mod tests {
+             AUTHORITATIVE_PERF_CARGO_PROFILE
+         );
+         assert_eq!(env.build_hygiene.debug_assertions, cfg!(debug_assertions));
+-        assert!(!env.build_hygiene.opt_level.is_empty());
++        assert_eq!(
++            env.build_hygiene.opt_level,
++            env!("FSQLITE_BENCH_BUILD_OPT_LEVEL")
++        );
++        assert_ne!(env.build_hygiene.opt_level, "unknown");
++    }
++
++    #[test]
++    fn build_hygiene_does_not_certify_a_caller_supplied_profile_label() {
++        let claimed = BuildHygieneMeta::capture(AUTHORITATIVE_PERF_CARGO_PROFILE);
++        let actual_profile = compiled_cargo_profile();
++        assert_eq!(
++            claimed.matches_authoritative_profile,
++            actual_profile == AUTHORITATIVE_PERF_CARGO_PROFILE
++                && env!("FSQLITE_BENCH_BUILD_OPT_LEVEL") == "3"
++                && !cfg!(debug_assertions)
++        );
++        for other in ["dev", "release", "test", "unknown", ""] {
++            assert!(!BuildHygieneMeta::capture(other).matches_authoritative_profile);
++        }
++        if cfg!(debug_assertions) {
++            assert!(!claimed.matches_authoritative_profile);
++        }
++    }
++
++    #[test]
++    fn release_profile_contract_uses_stripped_binaries_without_debug_symbols() {
++        for profile in ["release", AUTHORITATIVE_PERF_CARGO_PROFILE] {
++            let captured = BuildHygieneMeta::capture(profile);
++            assert_eq!(captured.profile_debug_symbols, Some(false));
++            assert_eq!(captured.profile_strip, Some(true));
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/fsqlite-e2e/src/overlay_honesty_gate.rs b/crates/fsqlite-e2e/src/overlay_honesty_gate.rs
+index 05e8d434f..e2558e515 100644
+--- a/crates/fsqlite-e2e/src/overlay_honesty_gate.rs
++++ b/crates/fsqlite-e2e/src/overlay_honesty_gate.rs
+@@ -1772,6 +1772,7 @@ mod tests {
+             |_| {
+                 Ok::<_, String>(crate::report::EngineRunReport {
+                     wall_time_ms: wall_ms,
++                    wall_time_ns: wall_ms.saturating_mul(1_000_000),
+                     ops_total,
+                     ops_per_sec: ops_total as f64 / (wall_ms as f64 / 1000.0),
+                     retries: 0,
+@@ -1836,6 +1837,7 @@ mod tests {
+             iterations: vec![IterationRecord {
+                 iteration: 0,
+                 wall_time_ms: 10,
++                wall_time_ns: 10_000_000,
+                 ops_per_sec: throughput_ops_per_sec,
+                 ops_total: 100,
+                 retries: 0,
+diff --git a/crates/fsqlite-e2e/src/perf_runner.rs b/crates/fsqlite-e2e/src/perf_runner.rs
+index afae71554..29aa8cccf 100644
+--- a/crates/fsqlite-e2e/src/perf_runner.rs
++++ b/crates/fsqlite-e2e/src/perf_runner.rs
+@@ -3198,7 +3198,7 @@ fn build_hot_path_baseline_waste_ledger(
+         .engine_report
+         .runtime_phase_timing
+         .unwrap_or_default();
+-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
++    let wall_time_ns = report.engine_report.wall_time_ns;
+     let parser_time_ns = report
+         .parser
+         .parse_time_ns
+@@ -3565,7 +3565,7 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
+ fn build_hot_path_wall_time_components(
+     report: &HotPathProfileReport,
+ ) -> Vec<HotPathWallTimeComponentEntry> {
+-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
++    let wall_time_ns = report.engine_report.wall_time_ns;
+     let allocator_copy_time_ns = report
+         .row_materialization
+         .result_row_materialization_time_ns_total;
+@@ -3715,7 +3715,7 @@ fn build_hot_path_causal_classification(
+     HotPathCausalClassificationSummary,
+     Vec<HotPathCausalBucketEntry>,
+ ) {
+-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
++    let wall_time_ns = report.engine_report.wall_time_ns;
+     let runtime_phase_timing = report
+         .engine_report
+         .runtime_phase_timing
+@@ -4820,6 +4820,7 @@ mod tests {
+     fn sample_engine_report() -> EngineRunReport {
+         EngineRunReport {
+             wall_time_ms: 42,
++            wall_time_ns: 42_u64.saturating_mul(1_000_000),
+             ops_total: 17,
+             ops_per_sec: 404.0,
+             retries: 0,
+@@ -4854,6 +4855,7 @@ mod tests {
+         };
+         let engine_report = EngineRunReport {
+             wall_time_ms: 42,
++            wall_time_ns: 42_u64.saturating_mul(1_000_000),
+             ops_total: 17,
+             ops_per_sec: 404.0,
+             retries: 0,
+diff --git a/crates/fsqlite-e2e/src/report.rs b/crates/fsqlite-e2e/src/report.rs
+index 12a02f27b..ea81b94d6 100644
+--- a/crates/fsqlite-e2e/src/report.rs
++++ b/crates/fsqlite-e2e/src/report.rs
+@@ -588,6 +588,8 @@ pub struct StorageWiringReport {
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct EngineRunReport {
++    /// Exact measured engine wall time, before conversion to display units.
++    pub wall_time_ns: u64,
+     pub wall_time_ms: u64,
+     pub ops_total: u64,
+     pub ops_per_sec: f64,
+@@ -805,6 +807,7 @@ mod tests {
+     #[test]
+     fn run_record_jsonl_roundtrip() {
+         let report = EngineRunReport {
++            wall_time_ns: 123_000_000,
+             wall_time_ms: 123,
+             ops_total: 7,
+             ops_per_sec: 3.5_f64,
+@@ -870,6 +873,7 @@ mod tests {
+     #[test]
+     fn run_record_marks_profile_only_equivalent_behavior_explicitly() {
+         let report = EngineRunReport {
++            wall_time_ns: 42_000_000,
+             wall_time_ms: 42,
+             ops_total: 7,
+             ops_per_sec: 3.5_f64,
+@@ -918,6 +922,7 @@ mod tests {
+     #[test]
+     fn hot_path_profile_jsonl_roundtrip() {
+         let report = EngineRunReport {
++            wall_time_ns: 123_000_000,
+             wall_time_ms: 123,
+             ops_total: 7,
+             ops_per_sec: 3.5_f64,
+diff --git a/crates/fsqlite-e2e/src/report_render.rs b/crates/fsqlite-e2e/src/report_render.rs
+index 38297850c..dbc41b83c 100644
+--- a/crates/fsqlite-e2e/src/report_render.rs
++++ b/crates/fsqlite-e2e/src/report_render.rs
+@@ -1167,6 +1167,7 @@ mod tests {
+         };
+         EngineRunReport {
+             wall_time_ms: wall_ms,
++            wall_time_ns: wall_ms.saturating_mul(1_000_000),
+             ops_total: ops,
+             ops_per_sec,
+             retries: 2,
+diff --git a/crates/fsqlite-e2e/src/sqlite_executor.rs b/crates/fsqlite-e2e/src/sqlite_executor.rs
+index 68181a858..fad4d880f 100644
+--- a/crates/fsqlite-e2e/src/sqlite_executor.rs
++++ b/crates/fsqlite-e2e/src/sqlite_executor.rs
+@@ -195,6 +195,7 @@ pub fn run_oplog_sqlite(
+     };
+ 
+     Ok(EngineRunReport {
++        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
+         wall_time_ms: wall_ms,
+         ops_total,
+         ops_per_sec,
+@@ -285,6 +286,7 @@ fn run_oplog_sqlite_in_memory(
+     };
+ 
+     Ok(EngineRunReport {
++        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
+         wall_time_ms: wall_ms,
+         ops_total,
+         ops_per_sec,
+diff --git a/crates/fsqlite-e2e/tests/bd_db300_7_1_2_counter_schema_alignment.rs b/crates/fsqlite-e2e/tests/bd_db300_7_1_2_counter_schema_alignment.rs
+index 864f1954c..29b3975fd 100644
+--- a/crates/fsqlite-e2e/tests/bd_db300_7_1_2_counter_schema_alignment.rs
++++ b/crates/fsqlite-e2e/tests/bd_db300_7_1_2_counter_schema_alignment.rs
+@@ -82,6 +82,7 @@ fn make_iteration(idx: u32, wall_time_ms: u64, ops: u64) -> IterationRecord {
+     IterationRecord {
+         iteration: idx,
+         wall_time_ms,
++        wall_time_ns: wall_time_ms.saturating_mul(1_000_000),
+         ops_per_sec: if wall_time_ms > 0 {
+             (ops as f64) / (wall_time_ms as f64 / 1000.0)
+         } else {
+diff --git a/crates/fsqlite-e2e/tests/bd_db300_7_1_3_representative_matrix_proof.rs b/crates/fsqlite-e2e/tests/bd_db300_7_1_3_representative_matrix_proof.rs
+index 1c980f35a..c8699a30b 100644
+--- a/crates/fsqlite-e2e/tests/bd_db300_7_1_3_representative_matrix_proof.rs
++++ b/crates/fsqlite-e2e/tests/bd_db300_7_1_3_representative_matrix_proof.rs
+@@ -91,6 +91,7 @@ fn make_iterations(count: u32, base_wall_ms: u64, ops_per_iter: u64) -> Vec<Iter
+             IterationRecord {
+                 iteration: i,
+                 wall_time_ms: wall_ms,
++                wall_time_ns: wall_ms.saturating_mul(1_000_000),
+                 ops_per_sec: if wall_ms > 0 {
+                     (ops_per_iter as f64) / (wall_ms as f64 / 1000.0)
+                 } else {
+diff --git a/crates/fsqlite-e2e/tests/complete_benchmark_matrix.rs b/crates/fsqlite-e2e/tests/complete_benchmark_matrix.rs
+index 916846304..8af5cf11b 100644
+--- a/crates/fsqlite-e2e/tests/complete_benchmark_matrix.rs
++++ b/crates/fsqlite-e2e/tests/complete_benchmark_matrix.rs
+@@ -590,6 +590,7 @@ fn sample_benchmark_summary(
+         aggregated_hot_path: None,
+         iterations: vec![IterationRecord {
+             iteration: 0,
++            wall_time_ns: 10_000_000,
+             wall_time_ms: 10,
+             ops_per_sec: throughput_ops_per_sec,
+             ops_total: 100,
+diff --git a/crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs b/crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs
+index a8294dbdd..b37fa627d 100644
+--- a/crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs
++++ b/crates/fsqlite-e2e/tests/mvcc_concurrent_writers.rs
+@@ -219,6 +219,7 @@ async fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
+ 
+     EngineRunReport {
+         wall_time_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
++        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
+         ops_total: ops_ok,
+         ops_per_sec,
+         retries: 0,
