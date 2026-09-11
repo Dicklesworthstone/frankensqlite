@@ -929,6 +929,240 @@ impl Drop for CatalogRowidScanRecord {
     }
 }
 
+/// Current-thread observations of automatic checkpoint scheduling and its
+/// complete pager await. Elapsed time includes suspension, not just CPU time.
+///
+/// Function completion and pager completion are independent. A returned pager
+/// result remains recorded if the surrounding function later fails to finish.
+/// After all observed futures finish or drop, `entered_calls` equals
+/// `completed_calls + incomplete_calls`, and `pager_attempts` equals the sum of
+/// `pager_complete`, `pager_partial`, `pager_busy`, `pager_errors` and `pager_incomplete`.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutocheckpointSnapshot {
+    pub entered_calls: u64,
+    pub completed_calls: u64,
+    pub incomplete_calls: u64,
+    pub elapsed_ns: u64,
+    pub skipped_non_wal: u64,
+    pub skipped_private_memory: u64,
+    pub skipped_active_concurrent: u64,
+    pub skipped_disabled: u64,
+    pub skipped_below_threshold: u64,
+    pub skipped_write_pressure: u64,
+    pub context_refusals: u64,
+    pub returned_after_pager: u64,
+    pub pager_attempts: u64,
+    /// Successful pager returns with `completed=true`; this does not imply reset.
+    pub pager_complete: u64,
+    /// Successful pager returns with `completed=false`.
+    pub pager_partial: u64,
+    /// Only the exact `Busy` error; other Busy variants are `pager_errors`.
+    pub pager_busy: u64,
+    pub pager_errors: u64,
+    pub pager_incomplete: u64,
+    pub pager_elapsed_ns: u64,
+}
+
+#[cfg(feature = "bench-internals")]
+thread_local! {
+    static AUTOCHECKPOINT_CAPTURE: RefCell<Option<Rc<Cell<AutocheckpointSnapshot>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Observe automatic checkpoints on this thread without changing their policy.
+///
+/// This guard is neither `Send` nor `Sync`. Poll observed futures on its thread,
+/// and await or drop them before taking the final snapshot. In-flight records
+/// retain their original capture if this guard is dropped. Diagnostic timing
+/// overhead can affect time-based scheduling, so these observations must stay
+/// separate from uninstrumented performance acceptance.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub struct AutocheckpointCapture {
+    state: Rc<Cell<AutocheckpointSnapshot>>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl AutocheckpointCapture {
+    /// Start an empty capture without disturbing an existing one.
+    ///
+    /// # Errors
+    /// Returns an error when this thread already has an active capture.
+    pub fn start() -> Result<Self> {
+        AUTOCHECKPOINT_CAPTURE.with_borrow_mut(|active| {
+            if active.is_some() {
+                return Err(FrankenError::internal(
+                    "autocheckpoint capture is already active on this thread",
+                ));
+            }
+            let state = Rc::new(Cell::new(AutocheckpointSnapshot::default()));
+            *active = Some(Rc::clone(&state));
+            Ok(Self { state })
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> AutocheckpointSnapshot {
+        self.state.get()
+    }
+
+    #[must_use]
+    pub fn finish(self) -> AutocheckpointSnapshot {
+        let snapshot = self.snapshot();
+        drop(self);
+        snapshot
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for AutocheckpointCapture {
+    fn drop(&mut self) {
+        AUTOCHECKPOINT_CAPTURE.with_borrow_mut(|active| {
+            if active
+                .as_ref()
+                .is_some_and(|state| Rc::ptr_eq(state, &self.state))
+            {
+                *active = None;
+            }
+        });
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+#[derive(Clone, Copy)]
+enum AutocheckpointTerminal {
+    NonWal,
+    PrivateMemory,
+    ActiveConcurrent,
+    Disabled,
+    BelowThreshold,
+    WritePressure,
+    ContextRefused,
+    PagerReturned,
+}
+
+#[cfg(feature = "bench-internals")]
+#[derive(Clone, Copy)]
+enum AutocheckpointPagerOutcome {
+    Complete,
+    Partial,
+    Busy,
+    Error,
+}
+
+#[cfg(feature = "bench-internals")]
+#[derive(Clone, Copy)]
+enum AutocheckpointPagerInterval {
+    NotStarted,
+    Pending(Instant),
+    Returned {
+        outcome: AutocheckpointPagerOutcome,
+        elapsed_ns: u64,
+    },
+}
+
+#[cfg(feature = "bench-internals")]
+struct AutocheckpointRecord {
+    state: Rc<Cell<AutocheckpointSnapshot>>,
+    started: Instant,
+    terminal: Option<AutocheckpointTerminal>,
+    pager: AutocheckpointPagerInterval,
+}
+
+#[cfg(feature = "bench-internals")]
+impl AutocheckpointRecord {
+    fn start() -> Option<Self> {
+        let state = AUTOCHECKPOINT_CAPTURE.with_borrow(Clone::clone)?;
+        let mut snapshot = state.get();
+        snapshot.entered_calls = snapshot.entered_calls.saturating_add(1);
+        state.set(snapshot);
+        Some(Self {
+            state,
+            started: Instant::now(),
+            terminal: None,
+            pager: AutocheckpointPagerInterval::NotStarted,
+        })
+    }
+
+    fn start_pager(&mut self) {
+        assert!(matches!(self.pager, AutocheckpointPagerInterval::NotStarted));
+        let mut snapshot = self.state.get();
+        snapshot.pager_attempts = snapshot.pager_attempts.saturating_add(1);
+        self.state.set(snapshot);
+        self.pager = AutocheckpointPagerInterval::Pending(Instant::now());
+    }
+
+    fn returned_from_pager(&mut self, outcome: AutocheckpointPagerOutcome) {
+        let AutocheckpointPagerInterval::Pending(started) = self.pager else {
+            panic!("autocheckpoint pager interval is not pending");
+        };
+        self.pager = AutocheckpointPagerInterval::Returned {
+            outcome,
+            elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        };
+    }
+
+    fn finish(mut self, terminal: AutocheckpointTerminal) {
+        self.terminal = Some(terminal);
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for AutocheckpointRecord {
+    fn drop(&mut self) {
+        let finished_at = Instant::now();
+        let mut snapshot = self.state.get();
+        let elapsed_ns = u64::try_from(
+            finished_at.saturating_duration_since(self.started).as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        snapshot.elapsed_ns = snapshot.elapsed_ns.saturating_add(elapsed_ns);
+        if let Some(terminal) = self.terminal {
+            snapshot.completed_calls = snapshot.completed_calls.saturating_add(1);
+            let count = match terminal {
+                AutocheckpointTerminal::NonWal => &mut snapshot.skipped_non_wal,
+                AutocheckpointTerminal::PrivateMemory => &mut snapshot.skipped_private_memory,
+                AutocheckpointTerminal::ActiveConcurrent => &mut snapshot.skipped_active_concurrent,
+                AutocheckpointTerminal::Disabled => &mut snapshot.skipped_disabled,
+                AutocheckpointTerminal::BelowThreshold => &mut snapshot.skipped_below_threshold,
+                AutocheckpointTerminal::WritePressure => &mut snapshot.skipped_write_pressure,
+                AutocheckpointTerminal::ContextRefused => &mut snapshot.context_refusals,
+                AutocheckpointTerminal::PagerReturned => &mut snapshot.returned_after_pager,
+            };
+            *count = count.saturating_add(1);
+        } else {
+            snapshot.incomplete_calls = snapshot.incomplete_calls.saturating_add(1);
+        }
+        match self.pager {
+            AutocheckpointPagerInterval::NotStarted => {}
+            AutocheckpointPagerInterval::Pending(started) => {
+                snapshot.pager_incomplete = snapshot.pager_incomplete.saturating_add(1);
+                let elapsed_ns = u64::try_from(
+                    finished_at.saturating_duration_since(started).as_nanos(),
+                )
+                .unwrap_or(u64::MAX);
+                snapshot.pager_elapsed_ns = snapshot.pager_elapsed_ns.saturating_add(elapsed_ns);
+            }
+            AutocheckpointPagerInterval::Returned {
+                outcome,
+                elapsed_ns,
+            } => {
+                let count = match outcome {
+                    AutocheckpointPagerOutcome::Complete => &mut snapshot.pager_complete,
+                    AutocheckpointPagerOutcome::Partial => &mut snapshot.pager_partial,
+                    AutocheckpointPagerOutcome::Busy => &mut snapshot.pager_busy,
+                    AutocheckpointPagerOutcome::Error => &mut snapshot.pager_errors,
+                };
+                *count = count.saturating_add(1);
+                snapshot.pager_elapsed_ns = snapshot.pager_elapsed_ns.saturating_add(elapsed_ns);
+            }
+        }
+        self.state.set(snapshot);
+    }
+}
+
 /// Opt-in for the per-column INSERT preserialize sub-timers.
 ///
 /// The insert preserialize path times up to seven nested regions per row
@@ -56114,13 +56348,23 @@ impl Connection {
     }
 
     async fn maybe_run_adaptive_autocheckpoint(&self) {
+        #[cfg(feature = "bench-internals")]
+        let mut autocheckpoint_record = AutocheckpointRecord::start();
         if self.pager.journal_mode() != JournalMode::Wal {
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::NonWal);
+            }
             return;
         }
         // Private `:memory:` databases do not need post-commit WAL backfill; the
         // WAL exists only inside the process and auto-checkpointing adds pure
         // write-path tax to hot autocommit loops.
         if self.path == ":memory:" {
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::PrivateMemory);
+            }
             return;
         }
         if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
@@ -56131,11 +56375,19 @@ impl Connection {
                 active_concurrent_txn_count = self.active_concurrent_txn_count(),
                 "auto-checkpoint skipped because another concurrent transaction is active"
             );
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::ActiveConcurrent);
+            }
             return;
         }
 
         let snapshot = self.checkpoint_runtime_snapshot().await;
         if snapshot.wal_autocheckpoint_pages == 0 {
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::Disabled);
+            }
             return;
         }
 
@@ -56149,6 +56401,10 @@ impl Connection {
         if snapshot.wal_unbackfilled_frames_estimate < adaptive_target
             && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold.max(1)
         {
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::BelowThreshold);
+            }
             return;
         }
 
@@ -56163,6 +56419,10 @@ impl Connection {
                 write_pressure_frames_per_sec = snapshot.write_pressure_frames_per_sec,
                 "auto-checkpoint delayed due to write pressure"
             );
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = autocheckpoint_record {
+                record.finish(AutocheckpointTerminal::WritePressure);
+            }
             return;
         }
 
@@ -56189,12 +56449,36 @@ impl Connection {
         }
         let cx = match self.op_cx() {
             Ok(cx) => cx,
-            Err(_) => return,
+            Err(_) => {
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record {
+                    record.finish(AutocheckpointTerminal::ContextRefused);
+                }
+                return;
+            }
         };
         let checkpoint_metrics_before = fsqlite_wal::GLOBAL_WAL_METRICS.snapshot();
+        #[cfg(feature = "bench-internals")]
+        if let Some(record) = autocheckpoint_record.as_mut() {
+            record.start_pager();
+        }
         let result = match self.pager.checkpoint(&cx, mode).await {
-            Ok(result) => result,
+            Ok(result) => {
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record.as_mut() {
+                    record.returned_from_pager(if result.completed {
+                        AutocheckpointPagerOutcome::Complete
+                    } else {
+                        AutocheckpointPagerOutcome::Partial
+                    });
+                }
+                result
+            }
             Err(FrankenError::Busy) => {
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record.as_mut() {
+                    record.returned_from_pager(AutocheckpointPagerOutcome::Busy);
+                }
                 tracing::debug!(
                     trace_id = next_trace_id(),
                     run_id = "auto-checkpoint",
@@ -56203,9 +56487,17 @@ impl Connection {
                     adaptive_target,
                     "auto-checkpoint skipped because pager is busy"
                 );
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record {
+                    record.finish(AutocheckpointTerminal::PagerReturned);
+                }
                 return;
             }
             Err(error) => {
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record.as_mut() {
+                    record.returned_from_pager(AutocheckpointPagerOutcome::Error);
+                }
                 tracing::warn!(
                     trace_id = next_trace_id(),
                     run_id = "auto-checkpoint",
@@ -56216,6 +56508,10 @@ impl Connection {
                     %error,
                     "auto-checkpoint failed"
                 );
+                #[cfg(feature = "bench-internals")]
+                if let Some(record) = autocheckpoint_record {
+                    record.finish(AutocheckpointTerminal::PagerReturned);
+                }
                 return;
             }
         };
@@ -56224,6 +56520,10 @@ impl Connection {
             .checkpoint_duration_us_total
             .saturating_sub(checkpoint_metrics_before.checkpoint_duration_us_total);
         self.checkpoint_advisor_note_checkpoint(mode, &result, checkpoint_duration_us);
+        #[cfg(feature = "bench-internals")]
+        if let Some(record) = autocheckpoint_record {
+            record.finish(AutocheckpointTerminal::PagerReturned);
+        }
     }
 
     fn checkpoint_advisor_note_checkpoint(
@@ -217209,6 +217509,186 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(old_state.get().completed_scans, 0);
         assert_eq!(old_state.get().rowid_visits, 5);
         assert_eq!(replacement.finish(), CatalogRowidScanSnapshot::default());
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_autocheckpoint_capture_records_decisions_and_resets() {
+        // Diagnostic accounting controls; these do not execute SQL branches.
+        assert!(AutocheckpointRecord::start().is_none());
+        let capture = AutocheckpointCapture::start().unwrap();
+        let mut expected_decisions = [0_u64; 7];
+        for (index, terminal) in [
+            AutocheckpointTerminal::NonWal,
+            AutocheckpointTerminal::PrivateMemory,
+            AutocheckpointTerminal::ActiveConcurrent,
+            AutocheckpointTerminal::Disabled,
+            AutocheckpointTerminal::BelowThreshold,
+            AutocheckpointTerminal::WritePressure,
+            AutocheckpointTerminal::ContextRefused,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            AutocheckpointRecord::start().unwrap().finish(terminal);
+            expected_decisions[index] = 1;
+            let count = u64::try_from(index + 1).unwrap();
+            let observed = capture.snapshot();
+            assert_eq!(
+                observed,
+                AutocheckpointSnapshot {
+                    entered_calls: count,
+                    completed_calls: count,
+                    elapsed_ns: observed.elapsed_ns,
+                    skipped_non_wal: expected_decisions[0],
+                    skipped_private_memory: expected_decisions[1],
+                    skipped_active_concurrent: expected_decisions[2],
+                    skipped_disabled: expected_decisions[3],
+                    skipped_below_threshold: expected_decisions[4],
+                    skipped_write_pressure: expected_decisions[5],
+                    context_refusals: expected_decisions[6],
+                    ..AutocheckpointSnapshot::default()
+                }
+            );
+        }
+        let before = capture.snapshot();
+        assert!(AutocheckpointCapture::start().is_err());
+        assert_eq!(capture.snapshot(), before);
+        let snapshot = capture.finish();
+        assert_eq!(
+            snapshot,
+            AutocheckpointSnapshot {
+                entered_calls: 7,
+                completed_calls: 7,
+                elapsed_ns: snapshot.elapsed_ns,
+                skipped_non_wal: 1,
+                skipped_private_memory: 1,
+                skipped_active_concurrent: 1,
+                skipped_disabled: 1,
+                skipped_below_threshold: 1,
+                skipped_write_pressure: 1,
+                context_refusals: 1,
+                ..AutocheckpointSnapshot::default()
+            }
+        );
+        assert!(AutocheckpointRecord::start().is_none());
+        let replacement = AutocheckpointCapture::start().unwrap();
+        assert_eq!(replacement.snapshot(), AutocheckpointSnapshot::default());
+        drop(replacement);
+        assert_eq!(
+            AutocheckpointCapture::start().unwrap().finish(),
+            AutocheckpointSnapshot::default()
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_autocheckpoint_capture_keeps_pager_outcomes_independent_of_function_drop() {
+        // Feed record outcomes directly: no pager or cancelled-I/O proof.
+        let capture = AutocheckpointCapture::start().unwrap();
+        let mut expected_outcomes = [0_u64; 4];
+        for (index, outcome) in [
+            AutocheckpointPagerOutcome::Complete,
+            AutocheckpointPagerOutcome::Partial,
+            AutocheckpointPagerOutcome::Busy,
+            AutocheckpointPagerOutcome::Error,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = AutocheckpointRecord::start().unwrap();
+            record.start_pager();
+            record.returned_from_pager(outcome);
+            record.finish(AutocheckpointTerminal::PagerReturned);
+            expected_outcomes[index] = 1;
+            let count = u64::try_from(index + 1).unwrap();
+            let observed = capture.snapshot();
+            assert_eq!(
+                observed,
+                AutocheckpointSnapshot {
+                    entered_calls: count,
+                    completed_calls: count,
+                    elapsed_ns: observed.elapsed_ns,
+                    returned_after_pager: count,
+                    pager_attempts: count,
+                    pager_complete: expected_outcomes[0],
+                    pager_partial: expected_outcomes[1],
+                    pager_busy: expected_outcomes[2],
+                    pager_errors: expected_outcomes[3],
+                    pager_elapsed_ns: observed.pager_elapsed_ns,
+                    ..AutocheckpointSnapshot::default()
+                }
+            );
+            assert!(observed.elapsed_ns >= observed.pager_elapsed_ns);
+        }
+        let completed = capture.snapshot();
+        assert_eq!(completed.entered_calls, 4);
+        assert_eq!(completed.completed_calls, 4);
+        assert_eq!(completed.returned_after_pager, 4);
+        assert_eq!(completed.pager_attempts, 4);
+        assert_eq!(completed.pager_complete, 1);
+        assert_eq!(completed.pager_partial, 1);
+        assert_eq!(completed.pager_busy, 1);
+        assert_eq!(completed.pager_errors, 1);
+        assert_eq!(completed.pager_incomplete, 0);
+        assert!(completed.elapsed_ns >= completed.pager_elapsed_ns);
+
+        let mut record = AutocheckpointRecord::start().unwrap();
+        record.start_pager();
+        record.returned_from_pager(AutocheckpointPagerOutcome::Partial);
+        drop(record);
+        let snapshot = capture.finish();
+        assert_eq!(snapshot.entered_calls, 5);
+        assert_eq!(snapshot.completed_calls, 4);
+        assert_eq!(snapshot.incomplete_calls, 1);
+        assert_eq!(snapshot.returned_after_pager, 4);
+        assert_eq!(snapshot.pager_attempts, 5);
+        assert_eq!(snapshot.pager_complete, 1);
+        assert_eq!(snapshot.pager_partial, 2);
+        assert_eq!(snapshot.pager_busy, 1);
+        assert_eq!(snapshot.pager_errors, 1);
+        assert_eq!(snapshot.pager_incomplete, 0);
+        assert!(snapshot.elapsed_ns >= snapshot.pager_elapsed_ns);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_autocheckpoint_capture_drop_accounts_pending_interval_to_exact_owner() {
+        // This drops a live diagnostic interval, not an actual pager future.
+        let capture = AutocheckpointCapture::start().unwrap();
+        drop(AutocheckpointRecord::start().unwrap());
+        let before = capture.snapshot();
+        assert_eq!(before.entered_calls, 1);
+        assert_eq!(before.incomplete_calls, 1);
+        assert_eq!(before.pager_attempts, 0);
+        assert_eq!(before.pager_incomplete, 0);
+
+        let mut record = AutocheckpointRecord::start().unwrap();
+        record.start_pager();
+        let old_state = Rc::clone(&capture.state);
+        assert_eq!(capture.snapshot().entered_calls, 2);
+        assert_eq!(capture.snapshot().pager_attempts, 1);
+        drop(capture);
+        let replacement = AutocheckpointCapture::start().unwrap();
+        let AutocheckpointPagerInterval::Pending(pager_started) = record.pager else {
+            panic!("diagnostic pager interval must still be pending");
+        };
+        let elapsed_before_drop =
+            u64::try_from(pager_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        drop(record);
+        let snapshot = old_state.get();
+        assert_eq!(snapshot.entered_calls, 2);
+        assert_eq!(snapshot.completed_calls, 0);
+        assert_eq!(snapshot.incomplete_calls, 2);
+        assert_eq!(snapshot.pager_attempts, 1);
+        assert_eq!(snapshot.pager_incomplete, 1);
+        assert_eq!(snapshot.pager_complete, 0);
+        assert_eq!(snapshot.pager_partial, 0);
+        assert_eq!(snapshot.pager_busy, 0);
+        assert_eq!(snapshot.pager_errors, 0);
+        assert!(snapshot.pager_elapsed_ns >= elapsed_before_drop);
+        assert!(snapshot.elapsed_ns >= snapshot.pager_elapsed_ns);
+        assert_eq!(replacement.finish(), AutocheckpointSnapshot::default());
     }
 
     // ── bd-3uzh: SQLITE_BUSY_SNAPSHOT error handling tests ────────────────────

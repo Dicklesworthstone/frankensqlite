@@ -24,7 +24,10 @@ const WINDOW: usize = 50;
 mod cost_diagnostics {
     use std::fmt::Write as _;
 
-    use fsqlite_core::connection::{CatalogRowidScanCapture, CatalogRowidScanSnapshot};
+    use fsqlite_core::connection::{
+        AutocheckpointCapture, AutocheckpointSnapshot, CatalogRowidScanCapture,
+        CatalogRowidScanSnapshot,
+    };
     use fsqlite_pager::page_cache::s3_fifo_reconstruction_diagnostics::{
         CALLERS, Capture as ReconstructionCapture, Tally,
     };
@@ -70,15 +73,116 @@ mod cost_diagnostics {
         ]
     }
 
+    const AUTOCHECKPOINT_FIELDS: [&str; 19] = [
+        "entered_calls",
+        "completed_calls",
+        "incomplete_calls",
+        "elapsed_ns",
+        "skipped_non_wal",
+        "skipped_private_memory",
+        "skipped_active_concurrent",
+        "skipped_disabled",
+        "skipped_below_threshold",
+        "skipped_write_pressure",
+        "context_refusals",
+        "returned_after_pager",
+        "pager_attempts",
+        "pager_complete",
+        "pager_partial",
+        "pager_busy",
+        "pager_errors",
+        "pager_incomplete",
+        "pager_elapsed_ns",
+    ];
+
+    fn autocheckpoint_values(snapshot: AutocheckpointSnapshot) -> [u64; 19] {
+        [
+            snapshot.entered_calls,
+            snapshot.completed_calls,
+            snapshot.incomplete_calls,
+            snapshot.elapsed_ns,
+            snapshot.skipped_non_wal,
+            snapshot.skipped_private_memory,
+            snapshot.skipped_active_concurrent,
+            snapshot.skipped_disabled,
+            snapshot.skipped_below_threshold,
+            snapshot.skipped_write_pressure,
+            snapshot.context_refusals,
+            snapshot.returned_after_pager,
+            snapshot.pager_attempts,
+            snapshot.pager_complete,
+            snapshot.pager_partial,
+            snapshot.pager_busy,
+            snapshot.pager_errors,
+            snapshot.pager_incomplete,
+            snapshot.pager_elapsed_ns,
+        ]
+    }
+
     #[derive(Debug, Default, PartialEq, Eq)]
     pub struct Phase {
         pub s3: [[usize; 12]; 4],
         pub catalog: [u64; 4],
+        pub autocheckpoint: [u64; 19],
+    }
+
+    impl Phase {
+        fn assert_settled(&self) {
+            let counts = &self.autocheckpoint;
+            assert_eq!(counts[0], counts[1] + counts[2]);
+            assert_eq!(counts[1], counts[4..12].iter().sum::<u64>());
+            assert_eq!(counts[12], counts[13..18].iter().sum::<u64>());
+            assert_eq!(counts[2], 0, "successful phases have no unfinished calls");
+            assert_eq!(
+                counts[17], 0,
+                "successful phases have no unfinished pager awaits"
+            );
+            assert_eq!(
+                counts[11], counts[12],
+                "each settled pager attempt returned"
+            );
+            assert!(
+                counts[3] >= counts[18],
+                "pager time is within scheduler time"
+            );
+            if counts[12] == 0 {
+                assert_eq!(counts[18], 0, "no pager time without a pager attempt");
+            }
+            if counts[0] == 0 {
+                assert_eq!(counts[3], 0, "no scheduler time without a call");
+            }
+        }
+
+        pub(super) fn assert_one_autocheckpoint(
+            &self,
+            terminal: &str,
+            pager_outcome: Option<&str>,
+        ) {
+            assert!(AUTOCHECKPOINT_FIELDS[4..12].contains(&terminal));
+            if let Some(outcome) = pager_outcome {
+                assert!(AUTOCHECKPOINT_FIELDS[13..17].contains(&outcome));
+            }
+            assert_eq!(terminal == "returned_after_pager", pager_outcome.is_some());
+            self.assert_settled();
+            for (field, name) in AUTOCHECKPOINT_FIELDS.into_iter().enumerate() {
+                if matches!(name, "elapsed_ns" | "pager_elapsed_ns") {
+                    continue;
+                }
+                let expected = u64::from(
+                    matches!(name, "entered_calls" | "completed_calls")
+                        || name == terminal
+                        || (name == "pager_attempts" && pager_outcome.is_some())
+                        || pager_outcome == Some(name),
+                );
+                assert_eq!(self.autocheckpoint[field], expected, "{name}: {self:?}");
+            }
+        }
     }
 
     pub struct Capture {
         reconstruction: ReconstructionCapture,
         catalog: CatalogRowidScanCapture,
+        autocheckpoint: AutocheckpointCapture,
         previous: Phase,
         sum: Phase,
     }
@@ -86,9 +190,12 @@ mod cost_diagnostics {
     impl Capture {
         pub(super) fn start() -> Self {
             let catalog = CatalogRowidScanCapture::start().expect("start catalog capture");
+            let autocheckpoint =
+                AutocheckpointCapture::start().expect("start autocheckpoint capture");
             Self {
                 reconstruction: ReconstructionCapture::start(),
                 catalog,
+                autocheckpoint,
                 previous: Phase::default(),
                 sum: Phase::default(),
             }
@@ -101,11 +208,15 @@ mod cost_diagnostics {
         /// Read the immediate phase's elapsed value before reporting. The outer
         /// schema timer still includes per-window diagnostic overhead; all
         /// feature-enabled timings are a separate population from acceptance.
+        /// Inclusive scheduler/pager elapsed times are not CPU self time, and
+        /// observation overhead may change the time-based scheduling decisions.
         pub(super) fn report(&mut self, label: &str, phase: &str, sample: Option<usize>) -> Phase {
             let current = Phase {
                 s3: self.reconstruction.snapshot().map(values),
                 catalog: catalog_values(self.catalog.snapshot()),
+                autocheckpoint: autocheckpoint_values(self.autocheckpoint.snapshot()),
             };
+            current.assert_settled();
             let sample = sample.map_or_else(|| "none".to_owned(), |n| n.to_string());
             let mut delta = Phase::default();
             for (index, caller) in CALLERS.into_iter().enumerate() {
@@ -134,6 +245,18 @@ mod cost_diagnostics {
                  started_scans={} completed_scans={} rowid_visits={} scan_elapsed_ns={}",
                 delta.catalog[0], delta.catalog[1], delta.catalog[2], delta.catalog[3]
             );
+            let mut line =
+                format!("[gh402-cost] {label} phase={phase} sample={sample} caller=autocheckpoint");
+            for (field, name) in AUTOCHECKPOINT_FIELDS.into_iter().enumerate() {
+                let value = current.autocheckpoint[field]
+                    .checked_sub(self.previous.autocheckpoint[field])
+                    .expect("monotonic autocheckpoint counter");
+                delta.autocheckpoint[field] = value;
+                self.sum.autocheckpoint[field] += value;
+                write!(&mut line, " {name}={value}").expect("format diagnostic record");
+            }
+            delta.assert_settled();
+            println!("{line}");
             self.previous = current;
             delta
         }
@@ -142,7 +265,9 @@ mod cost_diagnostics {
             let actual = Phase {
                 s3: self.reconstruction.finish().map(values),
                 catalog: catalog_values(self.catalog.finish()),
+                autocheckpoint: autocheckpoint_values(self.autocheckpoint.finish()),
             };
+            actual.assert_settled();
             assert_eq!(
                 actual, self.sum,
                 "every observed call belongs to a reported phase"
@@ -386,9 +511,9 @@ fn gh402_measure_autocommit_schema_scaling() {
 
 /// Current residual matrix: keep storage mode, schema size and transaction
 /// shape separate. Timings are observations, never machine-specific pass bars.
-/// Enable `fsqlite/bench-internals` for SQL-phase catalog scans and reconstruction
-/// caller/work records. That diagnostic run includes observation overhead and
-/// must remain separate from paired performance acceptance.
+/// Enable `fsqlite/bench-internals` for SQL-phase catalog scans, reconstruction
+/// work and automatic-checkpoint outcomes. Observation overhead may change
+/// time-based scheduling; this remains separate from paired performance acceptance.
 #[test]
 #[ignore = "GH#402 residual measurement matrix; run explicitly with --nocapture"]
 fn gh402_measure_residual_schema_matrix() {
@@ -655,10 +780,9 @@ fn gh402_cost_capture_attributes_statistics_separately_from_sql() {
                     .values(),
                 &[SqliteValue::Text("kept".into())],
             );
-            assert_eq!(
-                cost.report(&label, "insert_and_read", None),
-                cost_diagnostics::Phase::default()
-            );
+            let inserted = cost.report(&label, "insert_and_read", None);
+            assert_eq!(inserted.s3, [[0; 12]; 4]);
+            assert_eq!(inserted.catalog, [0; 4]);
             let stats = conn.memory_stats().unwrap();
             let memory = cost.report(&label, "memory_stats", None);
             assert_eq!(memory.s3[0][0], 1);
@@ -667,6 +791,7 @@ fn gh402_cost_capture_attributes_statistics_separately_from_sql() {
             assert!(memory.s3[0][8] > 0, "completion loop actually executed");
             assert!(memory.s3[1..].iter().all(|row| *row == [0; 12]));
             assert_eq!(memory.catalog, [0; 4]);
+            assert_eq!(memory.autocheckpoint, [0; 19]);
             if file_backed {
                 let peer = Connection::open(target).await.unwrap();
                 assert_eq!(
@@ -696,6 +821,283 @@ fn gh402_cost_capture_attributes_statistics_separately_from_sql() {
                 cost_diagnostics::Phase::default()
             );
             cost.finish();
+        }
+    });
+}
+
+#[cfg(all(feature = "bench-internals", feature = "native"))]
+fn assert_autocheckpoint_stock_rows(path: &Path, expected: &[(i64, String)]) {
+    let stock = rusqlite::Connection::open(path).unwrap();
+    let actual: Vec<(i64, String)> = stock
+        .prepare("SELECT id, v FROM captured ORDER BY id;")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        stock
+            .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+/// An explicit memory commit reaches maintenance even when retained autocommit
+/// would defer it. Private memory normalizes WAL requests to its public memory
+/// mode, so both memory and off use the non-WAL exit. The defensive private-WAL
+/// exit has diagnostic-record coverage only; this test does not reach it.
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gh402_autocheckpoint_capture_reports_memory_and_non_wal_skips() {
+    asupersync::test_utils::run_test(|| async {
+        for (mode, reported_mode) in [("wal", "memory"), ("off", "off")] {
+            let conn = Connection::open(":memory:").await.unwrap();
+            assert_eq!(
+                conn.query_row(&format!("PRAGMA journal_mode={mode};"))
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Text(reported_mode.into())],
+            );
+            conn.execute("CREATE TABLE captured (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            let mut cost = cost_diagnostics::Capture::start();
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            conn.execute("INSERT INTO captured VALUES (1, 'kept');")
+                .await
+                .unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            cost.report(
+                &format!("autocheckpoint memory mode={mode}"),
+                "commit",
+                None,
+            )
+            .assert_one_autocheckpoint("skipped_non_wal", None);
+            cost.finish();
+            assert_eq!(
+                conn.query_row("SELECT id, v FROM captured;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(1), SqliteValue::Text("kept".into())],
+            );
+            conn.close().await.unwrap();
+        }
+    });
+}
+
+/// Threshold controls observe real automatic checkpoint calls, not explicit
+/// PRAGMA checkpoints. Urgency removes write-rate timing from the success case.
+#[cfg(all(feature = "bench-internals", feature = "native"))]
+#[test]
+fn gh402_autocheckpoint_capture_reports_disabled_threshold_and_success() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autocheckpoint_thresholds.db");
+        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode=WAL;")
+                .await
+                .unwrap()
+                .values(),
+            &[SqliteValue::Text("wal".into())],
+        );
+        conn.execute("PRAGMA wal_autocheckpoint=0;").await.unwrap();
+        conn.execute("CREATE TABLE captured (id INTEGER PRIMARY KEY, v TEXT);")
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA checkpoint_schedule=FULL;")
+                .await
+                .unwrap()
+                .values(),
+            &[SqliteValue::Text("FULL".into())],
+        );
+        for (id, threshold, urgent, terminal, pager_outcome) in [
+            (1, 0, 1, "skipped_disabled", None),
+            (2, 1_000_000, 1_000_000, "skipped_below_threshold", None),
+            (3, 1, 1, "returned_after_pager", Some("pager_complete")),
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("PRAGMA wal_autocheckpoint={threshold};"))
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(threshold)],
+            );
+            assert_eq!(
+                conn.query_row(&format!("PRAGMA checkpoint_urgent_wal_frames={urgent};"))
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(urgent)],
+            );
+            let mut cost = cost_diagnostics::Capture::start();
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            conn.execute(&format!("INSERT INTO captured VALUES ({id}, 'kept-{id}');"))
+                .await
+                .unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            cost.report("autocheckpoint thresholds", terminal, None)
+                .assert_one_autocheckpoint(terminal, pager_outcome);
+            cost.finish();
+        }
+        let rows = conn
+            .query("SELECT id, v FROM captured ORDER BY id;")
+            .await
+            .unwrap();
+        for (row, id) in rows.iter().zip(1..=3) {
+            assert_eq!(
+                row.values(),
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(format!("kept-{id}").into()),
+                ],
+            );
+        }
+        assert_eq!(rows.len(), 3);
+        conn.close().await.unwrap();
+        assert_autocheckpoint_stock_rows(
+            &path,
+            &(1..=3)
+                .map(|id| (id, format!("kept-{id}")))
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
+/// A default BEGIN reader blocks at the concurrent-registry check. An opted-out
+/// reader still owns a pager transaction, so exclusive maintenance returns Busy.
+/// This is a same-process admission control, not native-lock or cancellation proof.
+#[cfg(all(feature = "bench-internals", feature = "native"))]
+#[test]
+fn gh402_autocheckpoint_capture_distinguishes_reader_skip_from_pager_busy() {
+    asupersync::test_utils::run_test(|| async {
+        for reader_concurrent in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("autocheckpoint_reader.db");
+            let target = path.to_str().unwrap();
+            let writer = Connection::open(target).await.unwrap();
+            assert_eq!(
+                writer
+                    .query_row("PRAGMA journal_mode=WAL;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Text("wal".into())],
+            );
+            writer
+                .execute("PRAGMA wal_autocheckpoint=0;")
+                .await
+                .unwrap();
+            writer
+                .execute_batch(
+                    "CREATE TABLE captured (id INTEGER PRIMARY KEY, v TEXT); \
+                     INSERT INTO captured VALUES (1, 'kept-1');",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                writer
+                    .query_row("PRAGMA fsqlite.concurrent_mode;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(1)],
+            );
+            let reader = Connection::open(target).await.unwrap();
+            if !reader_concurrent {
+                reader
+                    .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                reader
+                    .query_row("PRAGMA fsqlite.concurrent_mode;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(i64::from(reader_concurrent))],
+            );
+            reader.execute("BEGIN;").await.unwrap();
+            assert_eq!(
+                reader
+                    .query_row("SELECT count(*) FROM captured;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(1)],
+            );
+            writer
+                .execute("PRAGMA wal_autocheckpoint=1;")
+                .await
+                .unwrap();
+            writer
+                .query("PRAGMA checkpoint_urgent_wal_frames=1;")
+                .await
+                .unwrap();
+            writer
+                .query("PRAGMA checkpoint_schedule=RESTART;")
+                .await
+                .unwrap();
+            let mut cost = cost_diagnostics::Capture::start();
+            writer.execute("BEGIN IMMEDIATE;").await.unwrap();
+            writer
+                .execute("INSERT INTO captured VALUES (2, 'kept-2');")
+                .await
+                .unwrap();
+            writer.execute("COMMIT;").await.unwrap();
+            let phase = cost.report(
+                &format!("autocheckpoint reader_concurrent={reader_concurrent}"),
+                "reader_held",
+                None,
+            );
+            if reader_concurrent {
+                phase.assert_one_autocheckpoint("skipped_active_concurrent", None);
+            } else {
+                phase.assert_one_autocheckpoint("returned_after_pager", Some("pager_busy"));
+            }
+            cost.finish();
+            assert_eq!(
+                reader
+                    .query_row("SELECT count(*) FROM captured;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(1)],
+                "the reader keeps its pre-commit snapshot"
+            );
+            reader.execute("ROLLBACK;").await.unwrap();
+            reader.close().await.unwrap();
+            let mut cost = cost_diagnostics::Capture::start();
+            writer.execute("BEGIN IMMEDIATE;").await.unwrap();
+            writer
+                .execute("INSERT INTO captured VALUES (3, 'kept-3');")
+                .await
+                .unwrap();
+            writer.execute("COMMIT;").await.unwrap();
+            cost.report("autocheckpoint reader", "reader_released", None)
+                .assert_one_autocheckpoint("returned_after_pager", Some("pager_complete"));
+            cost.finish();
+            assert_eq!(
+                writer
+                    .query_row("SELECT count(*), sum(id) FROM captured;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Integer(3), SqliteValue::Integer(6)],
+            );
+            writer.close().await.unwrap();
+            assert_autocheckpoint_stock_rows(
+                &path,
+                &(1..=3)
+                    .map(|id| (id, format!("kept-{id}")))
+                    .collect::<Vec<_>>(),
+            );
         }
     });
 }
