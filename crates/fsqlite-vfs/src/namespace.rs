@@ -931,7 +931,7 @@ impl DatabaseNamespaceBinding {
             // failure (fail closed, lease retained), never a supersession.
             match open_identity_probe(&self.stable_path) {
                 Ok(file) => match FileIdentity::from_file(&file) {
-                    Ok(Some(current)) if current == self.identity => GenerationProbe::Current,
+                    Ok(Some(current)) if current == self.identity() => GenerationProbe::Current,
                     Ok(Some(_)) => GenerationProbe::Superseded,
                     Ok(None) | Err(_) => {
                         GenerationProbe::ProbeFailed(cannot_open(&self.stable_path))
