@@ -807,6 +807,128 @@ struct StatementExecutionPlan {
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Diagnostic work performed by catalog rowid-allocation scans.
+///
+/// Completed scans reached EOF; they need not have inserted or committed a row.
+/// Visits and elapsed time are published when each scan completes or is dropped.
+/// Elapsed time includes async I/O and suspension, not just CPU self time.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatalogRowidScanSnapshot {
+    pub started_scans: u64,
+    pub completed_scans: u64,
+    pub rowid_visits: u64,
+    pub elapsed_ns: u64,
+}
+
+#[cfg(feature = "bench-internals")]
+thread_local! {
+    static CATALOG_ROWID_SCAN_CAPTURE: RefCell<Option<Rc<Cell<CatalogRowidScanSnapshot>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Capture catalog rowid-allocation work on the current thread only.
+///
+/// This guard is neither `Send` nor `Sync`. Poll all observed operations on its
+/// thread, and await or drop their futures before taking the final snapshot.
+/// Scans already in flight retain their original capture, even if this guard is
+/// dropped and a later capture starts. This also measures internal catalog
+/// insertion, not exclusively user CREATE statements; callers select SQL phases.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub struct CatalogRowidScanCapture {
+    state: Rc<Cell<CatalogRowidScanSnapshot>>,
+}
+
+#[cfg(feature = "bench-internals")]
+impl CatalogRowidScanCapture {
+    /// Start an empty capture, refusing nested captures without changing them.
+    ///
+    /// # Errors
+    /// Returns an error if this thread already has an active capture.
+    pub fn start() -> Result<Self> {
+        CATALOG_ROWID_SCAN_CAPTURE.with_borrow_mut(|active| {
+            if active.is_some() {
+                return Err(FrankenError::internal(
+                    "catalog rowid scan capture is already active on this thread",
+                ));
+            }
+            let state = Rc::new(Cell::new(CatalogRowidScanSnapshot::default()));
+            *active = Some(Rc::clone(&state));
+            Ok(Self { state })
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CatalogRowidScanSnapshot {
+        self.state.get()
+    }
+
+    #[must_use]
+    pub fn finish(self) -> CatalogRowidScanSnapshot {
+        let snapshot = self.snapshot();
+        drop(self);
+        snapshot
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for CatalogRowidScanCapture {
+    fn drop(&mut self) {
+        CATALOG_ROWID_SCAN_CAPTURE.with_borrow_mut(|active| {
+            if active
+                .as_ref()
+                .is_some_and(|state| Rc::ptr_eq(state, &self.state))
+            {
+                *active = None;
+            }
+        });
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+struct CatalogRowidScanRecord {
+    state: Rc<Cell<CatalogRowidScanSnapshot>>,
+    started: Instant,
+    rowid_visits: u64,
+    completed: bool,
+}
+
+#[cfg(feature = "bench-internals")]
+impl CatalogRowidScanRecord {
+    fn start() -> Option<Self> {
+        let state = CATALOG_ROWID_SCAN_CAPTURE.with_borrow(Clone::clone)?;
+        let mut snapshot = state.get();
+        snapshot.started_scans = snapshot.started_scans.saturating_add(1);
+        state.set(snapshot);
+        Some(Self {
+            state,
+            started: Instant::now(),
+            rowid_visits: 0,
+            completed: false,
+        })
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+#[cfg(feature = "bench-internals")]
+impl Drop for CatalogRowidScanRecord {
+    fn drop(&mut self) {
+        let elapsed_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let mut snapshot = self.state.get();
+        snapshot.completed_scans = snapshot
+            .completed_scans
+            .saturating_add(u64::from(self.completed));
+        snapshot.rowid_visits = snapshot.rowid_visits.saturating_add(self.rowid_visits);
+        snapshot.elapsed_ns = snapshot.elapsed_ns.saturating_add(elapsed_ns);
+        self.state.set(snapshot);
+    }
+}
+
 /// Opt-in for the per-column INSERT preserialize sub-timers.
 ///
 /// The insert preserialize path times up to seven nested regions per row
@@ -59108,13 +59230,23 @@ impl Connection {
             // Defensive allocation: derive a floor from actual sqlite_master
             // rowids so stale in-memory counters can never reissue rowids.
             let mut max_rowid = 0_i64;
+            #[cfg(feature = "bench-internals")]
+            let mut scan_record = CatalogRowidScanRecord::start();
             if cursor.first(cx).await? {
                 loop {
                     max_rowid = max_rowid.max(cursor.rowid(cx).await?);
+                    #[cfg(feature = "bench-internals")]
+                    if let Some(record) = scan_record.as_mut() {
+                        record.rowid_visits = record.rowid_visits.saturating_add(1);
+                    }
                     if !cursor.next(cx).await? {
                         break;
                     }
                 }
+            }
+            #[cfg(feature = "bench-internals")]
+            if let Some(record) = scan_record {
+                record.complete();
             }
             let rowid = {
                 let mut rid = self.next_master_rowid.borrow_mut();
@@ -216912,6 +217044,171 @@ fts5(title, body, content=docs, content_rowid=id)'
             let rows = conn.query("SELECT COUNT(*) FROM t3;").await.unwrap();
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
         });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_catalog_rowid_scan_capture_counts_actual_create_work() {
+        asupersync::test_utils::run_test(|| async {
+            for file_backed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("catalog_scan.db");
+                let target = if file_backed {
+                    path.to_str().unwrap()
+                } else {
+                    ":memory:"
+                };
+                let conn = Connection::open(target).await.unwrap();
+                let capture = CatalogRowidScanCapture::start().unwrap();
+                assert_eq!(capture.snapshot(), CatalogRowidScanSnapshot::default());
+                for (sql, expected_visits) in [
+                    ("CREATE TABLE scan_a (id INTEGER PRIMARY KEY, v TEXT);", 0),
+                    ("CREATE INDEX scan_a_i ON scan_a(v);", 1),
+                    ("CREATE TABLE scan_b (id INTEGER PRIMARY KEY, v TEXT);", 2),
+                    ("CREATE INDEX scan_b_i ON scan_b(v);", 3),
+                ] {
+                    let before = capture.snapshot();
+                    conn.execute(sql).await.unwrap();
+                    let after = capture.snapshot();
+                    assert_eq!(after.started_scans - before.started_scans, 1, "{sql}");
+                    assert_eq!(after.completed_scans - before.completed_scans, 1, "{sql}");
+                    assert_eq!(
+                        after.rowid_visits - before.rowid_visits,
+                        expected_visits,
+                        "{sql}, file_backed={file_backed}"
+                    );
+                }
+                let before = capture.snapshot();
+                assert!(CatalogRowidScanCapture::start().is_err());
+                assert_eq!(
+                    capture.snapshot(),
+                    before,
+                    "nested refusal preserves capture"
+                );
+                conn.execute("INSERT INTO scan_a(v) VALUES ('unchanged');")
+                    .await
+                    .unwrap();
+                conn.execute("CREATE TABLE IF NOT EXISTS scan_a(v TEXT);")
+                    .await
+                    .unwrap();
+                conn.execute("CREATE INDEX IF NOT EXISTS scan_a_i ON scan_a(v);")
+                    .await
+                    .unwrap();
+                assert!(conn.execute("CREATE TABLE scan_a(v TEXT);").await.is_err());
+                conn.execute("CREATE TEMP TABLE scan_temp(v TEXT);")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    capture.snapshot(),
+                    before,
+                    "no main-catalog insertion occurred"
+                );
+                let final_snapshot = capture.finish();
+                assert_eq!(final_snapshot.started_scans, 4);
+                assert_eq!(final_snapshot.completed_scans, 4);
+                assert_eq!(final_snapshot.rowid_visits, 6);
+
+                // A real scan while disabled must not seed the next capture.
+                conn.execute("CREATE TABLE scan_disabled(v TEXT);")
+                    .await
+                    .unwrap();
+                let capture = CatalogRowidScanCapture::start().unwrap();
+                assert_eq!(capture.snapshot(), CatalogRowidScanSnapshot::default());
+                drop(capture);
+                assert_eq!(
+                    CatalogRowidScanCapture::start().unwrap().finish(),
+                    CatalogRowidScanSnapshot::default()
+                );
+                conn.close().await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_catalog_rowid_scan_capture_preserves_holes_stale_floor_and_rollback_work() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE scan_one(v TEXT);").await.unwrap();
+            conn.execute("CREATE TABLE scan_two(v TEXT);").await.unwrap();
+            conn.execute("CREATE TABLE scan_three(v TEXT);").await.unwrap();
+            conn.execute("DROP TABLE scan_two;").await.unwrap();
+            *conn.next_master_rowid.borrow_mut() = 1;
+
+            let capture = CatalogRowidScanCapture::start().unwrap();
+            conn.execute("CREATE TABLE scan_four(v TEXT);").await.unwrap();
+            let snapshot = capture.finish();
+            assert_eq!(snapshot.started_scans, 1);
+            assert_eq!(snapshot.completed_scans, 1);
+            assert_eq!(snapshot.rowid_visits, 2, "a hole is not a visited row");
+            let rowids = conn
+                .with_pager_write_txn(async |cx, txn| {
+                    let mut cursor =
+                        Connection::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true).await?;
+                    let mut rowids = Vec::new();
+                    if cursor.first(cx).await? {
+                        loop {
+                            rowids.push(cursor.rowid(cx).await?);
+                            if !cursor.next(cx).await? {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(rowids)
+                })
+                .await
+                .unwrap();
+            assert_eq!(rowids, [1, 3, 4], "physical page-1 rowids retain the floor");
+
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            let capture = CatalogRowidScanCapture::start().unwrap();
+            conn.execute("CREATE TABLE scan_rolled_back(v TEXT);")
+                .await
+                .unwrap();
+            let before_rollback = capture.snapshot();
+            assert_eq!(before_rollback.started_scans, 1);
+            assert_eq!(before_rollback.completed_scans, 1);
+            assert_eq!(before_rollback.rowid_visits, 3);
+            conn.execute("ROLLBACK;").await.unwrap();
+            assert_eq!(
+                capture.finish(),
+                before_rollback,
+                "performed work survives rollback"
+            );
+            assert!(
+                conn.query("SELECT * FROM scan_rolled_back;")
+                    .await
+                    .is_err()
+            );
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_catalog_rowid_scan_capture_retains_incomplete_record_and_isolates_lifetimes() {
+        // This tests diagnostic record ownership, not a simulated VFS failure.
+        assert!(CatalogRowidScanRecord::start().is_none());
+        let capture = CatalogRowidScanCapture::start().unwrap();
+        let mut record = CatalogRowidScanRecord::start().unwrap();
+        record.rowid_visits = 2;
+        assert_eq!(capture.snapshot().started_scans, 1);
+        drop(record);
+        let snapshot = capture.snapshot();
+        assert_eq!(snapshot.started_scans, 1);
+        assert_eq!(snapshot.completed_scans, 0);
+        assert_eq!(snapshot.rowid_visits, 2);
+
+        let mut old_record = CatalogRowidScanRecord::start().unwrap();
+        old_record.rowid_visits = 3;
+        let old_state = Rc::clone(&capture.state);
+        drop(capture);
+        let replacement = CatalogRowidScanCapture::start().unwrap();
+        drop(old_record);
+        assert_eq!(old_state.get().started_scans, 2);
+        assert_eq!(old_state.get().completed_scans, 0);
+        assert_eq!(old_state.get().rowid_visits, 5);
+        assert_eq!(replacement.finish(), CatalogRowidScanSnapshot::default());
     }
 
     // ── bd-3uzh: SQLITE_BUSY_SNAPSHOT error handling tests ────────────────────

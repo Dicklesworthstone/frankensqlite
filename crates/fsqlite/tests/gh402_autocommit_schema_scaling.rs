@@ -20,6 +20,137 @@ use std::time::Instant;
 const DEFAULT_TABLES: usize = 300; // 600 schema objects: past the reported 200-300 object cliff.
 const WINDOW: usize = 50;
 
+#[cfg(feature = "bench-internals")]
+mod cost_diagnostics {
+    use std::fmt::Write as _;
+
+    use fsqlite_core::connection::{CatalogRowidScanCapture, CatalogRowidScanSnapshot};
+    use fsqlite_pager::page_cache::s3_fifo_reconstruction_diagnostics::{
+        CALLERS, Capture as ReconstructionCapture, Tally,
+    };
+
+    const FIELDS: [&str; 12] = [
+        "attempts",
+        "models_built",
+        "empty_refusals",
+        "oversized_refusals",
+        "resident_pages",
+        "trace_entries",
+        "replayed_accesses",
+        "replayed_insertions",
+        "completion_rounds",
+        "resident_keys_scanned",
+        "missing_page_insertions",
+        "exhausted_budgets",
+    ];
+
+    fn values(tally: Tally) -> [usize; 12] {
+        [
+            tally.attempts,
+            tally.models_built,
+            tally.empty_refusals,
+            tally.oversized_refusals,
+            tally.resident_pages,
+            tally.trace_entries,
+            tally.replayed_accesses,
+            tally.replayed_insertions,
+            tally.completion_rounds,
+            tally.resident_keys_scanned,
+            tally.missing_page_insertions,
+            tally.exhausted_budgets,
+        ]
+    }
+
+    fn catalog_values(snapshot: CatalogRowidScanSnapshot) -> [u64; 4] {
+        [
+            snapshot.started_scans,
+            snapshot.completed_scans,
+            snapshot.rowid_visits,
+            snapshot.elapsed_ns,
+        ]
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Phase {
+        pub s3: [[usize; 12]; 4],
+        pub catalog: [u64; 4],
+    }
+
+    pub struct Capture {
+        reconstruction: ReconstructionCapture,
+        catalog: CatalogRowidScanCapture,
+        previous: Phase,
+        sum: Phase,
+    }
+
+    impl Capture {
+        pub(super) fn start() -> Self {
+            let catalog = CatalogRowidScanCapture::start().expect("start catalog capture");
+            Self {
+                reconstruction: ReconstructionCapture::start(),
+                catalog,
+                previous: Phase::default(),
+                sum: Phase::default(),
+            }
+        }
+
+        pub(super) fn catalog_snapshot(&self) -> CatalogRowidScanSnapshot {
+            self.catalog.snapshot()
+        }
+
+        /// Read the immediate phase's elapsed value before reporting. The outer
+        /// schema timer still includes per-window diagnostic overhead; all
+        /// feature-enabled timings are a separate population from acceptance.
+        pub(super) fn report(&mut self, label: &str, phase: &str, sample: Option<usize>) -> Phase {
+            let current = Phase {
+                s3: self.reconstruction.snapshot().map(values),
+                catalog: catalog_values(self.catalog.snapshot()),
+            };
+            let sample = sample.map_or_else(|| "none".to_owned(), |n| n.to_string());
+            let mut delta = Phase::default();
+            for (index, caller) in CALLERS.into_iter().enumerate() {
+                let mut line = format!(
+                    "[gh402-cost] {label} phase={phase} sample={sample} caller={}",
+                    caller.name()
+                );
+                for (field, name) in FIELDS.into_iter().enumerate() {
+                    let value = current.s3[index][field]
+                        .checked_sub(self.previous.s3[index][field])
+                        .expect("monotonic reconstruction counter");
+                    delta.s3[index][field] = value;
+                    self.sum.s3[index][field] += value;
+                    write!(&mut line, " {name}={value}").expect("format diagnostic record");
+                }
+                println!("{line}");
+            }
+            for (field, value) in delta.catalog.iter_mut().enumerate() {
+                *value = current.catalog[field]
+                    .checked_sub(self.previous.catalog[field])
+                    .expect("monotonic catalog counter");
+                self.sum.catalog[field] += *value;
+            }
+            println!(
+                "[gh402-cost] {label} phase={phase} sample={sample} caller=catalog \
+                 started_scans={} completed_scans={} rowid_visits={} scan_elapsed_ns={}",
+                delta.catalog[0], delta.catalog[1], delta.catalog[2], delta.catalog[3]
+            );
+            self.previous = current;
+            delta
+        }
+
+        pub(super) fn finish(self) {
+            let actual = Phase {
+                s3: self.reconstruction.finish().map(values),
+                catalog: catalog_values(self.catalog.finish()),
+            };
+            assert_eq!(
+                actual, self.sum,
+                "every observed call belongs to a reported phase"
+            );
+        }
+    }
+}
+
 fn table_count() -> usize {
     std::env::var("FSQLITE_GH402_TABLES")
         .ok()
@@ -133,6 +264,7 @@ async fn create_schema_autocommit(
     tables: usize,
     label: &str,
     db_path: &Path,
+    #[cfg(feature = "bench-internals")] mut cost: Option<&mut cost_diagnostics::Capture>,
 ) -> Vec<u128> {
     let mut window_times = Vec::new();
     let mut window_start = Instant::now();
@@ -159,6 +291,10 @@ async fn create_schema_autocommit(
             );
             parses_before = parses_after;
             window_times.push(elapsed);
+            #[cfg(feature = "bench-internals")]
+            if let Some(cost) = cost.as_deref_mut() {
+                cost.report(label, &format!("ddl_window_{}", i + 1), None);
+            }
             before = after;
             window_start = Instant::now();
         }
@@ -180,7 +316,15 @@ fn gh402_measure_autocommit_schema_scaling() {
         let conn = Connection::open(path.to_str().unwrap())
             .await
             .expect("open");
-        let windows = create_schema_autocommit(&conn, table_count(), "seq", &path).await;
+        let windows = create_schema_autocommit(
+            &conn,
+            table_count(),
+            "seq",
+            &path,
+            #[cfg(feature = "bench-internals")]
+            None,
+        )
+        .await;
         println!("[gh402] seq window_ms trace: {windows:?}");
         println!(
             "[gh402] seq hydration_count={} after schema build",
@@ -242,6 +386,9 @@ fn gh402_measure_autocommit_schema_scaling() {
 
 /// Current residual matrix: keep storage mode, schema size and transaction
 /// shape separate. Timings are observations, never machine-specific pass bars.
+/// Enable `fsqlite/bench-internals` for SQL-phase catalog scans and reconstruction
+/// caller/work records. That diagnostic run includes observation overhead and
+/// must remain separate from paired performance acceptance.
 #[test]
 #[ignore = "GH#402 residual measurement matrix; run explicitly with --nocapture"]
 fn gh402_measure_residual_schema_matrix() {
@@ -262,8 +409,14 @@ fn gh402_measure_residual_schema_matrix() {
                         "residual storage={} mode={ddl_mode} tables={tables}",
                         if file_backed { "file" } else { "memory" },
                     );
+                    #[cfg(feature = "bench-internals")]
+                    let mut cost = cost_diagnostics::Capture::start();
                     let conn = Connection::open(target).await.expect("open");
+                    #[cfg(feature = "bench-internals")]
+                    cost.report(&label, "initial_open", None);
                     reset_hot_path_profile();
+                    #[cfg(feature = "bench-internals")]
+                    let catalog_before = cost.catalog_snapshot();
                     let started = Instant::now();
                     if ddl_mode == "txn" {
                         conn.execute("BEGIN IMMEDIATE;").await.expect("begin DDL");
@@ -286,8 +439,18 @@ fn gh402_measure_residual_schema_matrix() {
                             &snapshot_deltas(),
                             &path,
                         );
+                        #[cfg(feature = "bench-internals")]
+                        cost.report(&label, "ddl_batch", None);
                     } else {
-                        create_schema_autocommit(&conn, tables, &label, &path).await;
+                        create_schema_autocommit(
+                            &conn,
+                            tables,
+                            &label,
+                            &path,
+                            #[cfg(feature = "bench-internals")]
+                            Some(&mut cost),
+                        )
+                        .await;
                     }
                     if ddl_mode == "txn" {
                         conn.execute("COMMIT;").await.expect("commit DDL");
@@ -297,6 +460,25 @@ fn gh402_measure_residual_schema_matrix() {
                         started.elapsed().as_micros(),
                         conn.schema_reload_parse_count()
                     );
+                    #[cfg(feature = "bench-internals")]
+                    {
+                        cost.report(&label, "ddl_complete", None);
+                        let catalog_after = cost.catalog_snapshot();
+                        let inserts = u64::try_from(tables * 2).unwrap();
+                        assert_eq!(
+                            catalog_after.started_scans - catalog_before.started_scans,
+                            inserts
+                        );
+                        assert_eq!(
+                            catalog_after.completed_scans - catalog_before.completed_scans,
+                            inserts
+                        );
+                        assert_eq!(
+                            catalog_after.rowid_visits - catalog_before.rowid_visits,
+                            inserts * (inserts - 1) / 2,
+                            "actual catalog visits for a fresh table/index-pair schema"
+                        );
+                    }
 
                     let stock = rusqlite::Connection::open_in_memory().unwrap();
                     for i in 0..tables {
@@ -331,6 +513,8 @@ fn gh402_measure_residual_schema_matrix() {
                             &snapshot_deltas(),
                             &path,
                         );
+                        #[cfg(feature = "bench-internals")]
+                        cost.report(&label, &format!("inserts_txn_{in_transaction}"), None);
                         for _ in 0..20 {
                             stock
                                 .execute("INSERT INTO t0 (a) VALUES (?1)", [value])
@@ -366,6 +550,8 @@ fn gh402_measure_residual_schema_matrix() {
                         count.values(),
                         &[SqliteValue::Integer(i64::try_from(tables * 2).unwrap())]
                     );
+                    #[cfg(feature = "bench-internals")]
+                    cost.report(&label, "stock_and_catalog_validation", None);
 
                     for sample in 0..3 {
                         let started = Instant::now();
@@ -376,14 +562,26 @@ fn gh402_measure_residual_schema_matrix() {
                             stats.page_cache.cached_pages,
                             stats.page_size_bytes
                         );
+                        #[cfg(feature = "bench-internals")]
+                        {
+                            let phase = cost.report(&label, "memory_stats", Some(sample));
+                            assert_eq!(phase.s3[0][0], 1, "one statistics reconstruction attempt");
+                            assert_eq!(phase.s3[0][4], stats.page_cache.cached_pages);
+                            assert!(phase.s3[1..].iter().all(|row| *row == [0; 12]));
+                            assert_eq!(phase.catalog, [0; 4]);
+                        }
                         if file_backed {
                             let before = snapshot_deltas();
                             let started = Instant::now();
                             let peer = Connection::open(target).await.expect("peer open");
                             let open_us = started.elapsed().as_micros();
+                            #[cfg(feature = "bench-internals")]
+                            cost.report(&label, "reopen", Some(sample));
                             let started = Instant::now();
                             let row = peer.query_row("SELECT count(*) FROM t0;").await.unwrap();
                             let first_us = started.elapsed().as_micros();
+                            #[cfg(feature = "bench-internals")]
+                            cost.report(&label, "first_statement", Some(sample));
                             assert_eq!(row.values(), &[SqliteValue::Integer(40)]);
                             println!(
                                 "[gh402] {label} sample={sample} reopen_us={open_us} first_statement_us={first_us} stored_schema_parses={}",
@@ -398,13 +596,107 @@ fn gh402_measure_residual_schema_matrix() {
                                 &path,
                             );
                             peer.close().await.expect("close peer");
+                            #[cfg(feature = "bench-internals")]
+                            cost.report(&label, "peer_close", Some(sample));
                         }
                     }
                     conn.close().await.expect("close");
+                    #[cfg(feature = "bench-internals")]
+                    {
+                        cost.report(&label, "writer_close", None);
+                        cost.finish();
+                    }
                 }
             }
         }
         set_hot_path_profile_enabled(false);
+    });
+}
+
+/// Real SQL phases must be distinguishable from the expensive statistics call.
+/// The complete diagnostic matrix above records larger schemas independently.
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gh402_cost_capture_attributes_statistics_separately_from_sql() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cost_capture.db");
+            let target = if file_backed {
+                path.to_str().unwrap()
+            } else {
+                ":memory:"
+            };
+            let label = format!("keeper file_backed={file_backed}");
+            let mut cost = cost_diagnostics::Capture::start();
+            let conn = Connection::open(target).await.unwrap();
+            assert_eq!(
+                cost.report(&label, "initial_open", None),
+                cost_diagnostics::Phase::default()
+            );
+            conn.execute_batch(
+                "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT); \
+                 CREATE INDEX a_v ON a(v); \
+                 CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT); \
+                 CREATE INDEX b_v ON b(v);",
+            )
+            .await
+            .unwrap();
+            let ddl = cost.report(&label, "ddl", None);
+            assert_eq!(ddl.s3, [[0; 12]; 4]);
+            assert_eq!(ddl.catalog[..3], [4, 4, 6]);
+            conn.execute("INSERT INTO a(v) VALUES ('kept');")
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM a WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .values(),
+                &[SqliteValue::Text("kept".into())],
+            );
+            assert_eq!(
+                cost.report(&label, "insert_and_read", None),
+                cost_diagnostics::Phase::default()
+            );
+            let stats = conn.memory_stats().unwrap();
+            let memory = cost.report(&label, "memory_stats", None);
+            assert_eq!(memory.s3[0][0], 1);
+            assert_eq!(memory.s3[0][1], 1);
+            assert_eq!(memory.s3[0][4], stats.page_cache.cached_pages);
+            assert!(memory.s3[0][8] > 0, "completion loop actually executed");
+            assert!(memory.s3[1..].iter().all(|row| *row == [0; 12]));
+            assert_eq!(memory.catalog, [0; 4]);
+            if file_backed {
+                let peer = Connection::open(target).await.unwrap();
+                assert_eq!(
+                    cost.report(&label, "reopen", None),
+                    cost_diagnostics::Phase::default()
+                );
+                assert_eq!(
+                    peer.query_row("SELECT count(*) FROM a;")
+                        .await
+                        .unwrap()
+                        .values(),
+                    &[SqliteValue::Integer(1)],
+                );
+                assert_eq!(
+                    cost.report(&label, "first_statement", None),
+                    cost_diagnostics::Phase::default()
+                );
+                peer.close().await.unwrap();
+                assert_eq!(
+                    cost.report(&label, "peer_close", None),
+                    cost_diagnostics::Phase::default()
+                );
+            }
+            conn.close().await.unwrap();
+            assert_eq!(
+                cost.report(&label, "writer_close", None),
+                cost_diagnostics::Phase::default()
+            );
+            cost.finish();
+        }
     });
 }
 

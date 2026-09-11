@@ -50,6 +50,8 @@ misc = ["dep:fsqlite-ext-misc", "fsqlite-core/ext-misc"]
 async-api = ["native", "dep:asupersync", "dep:futures-lite"]
 raptorq = []
 mvcc = []
+# Opt-in diagnostics for the existing measurement harnesses; absent in normal builds.
+bench-internals = ["fsqlite-core/bench-internals", "fsqlite-pager/bench-internals"]
 
 [dev-dependencies]
 # The whole storage stack is `async` now, so every test must drive a runtime.

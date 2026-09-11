@@ -357,9 +357,9 @@ struct S3FifoQueueSnapshot {
     small_capacity: usize,
 }
 
-/// Test-only work receipt for one queue-snapshot reconstruction. Counts cover
+/// Diagnostic work receipt for one reconstruction. Counts cover
 /// the completion loop, including its final empty scan, not access-trace replay.
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct S3FifoReconstructionWork {
     model_built: bool,
@@ -450,6 +450,149 @@ fn record_s3_fifo_queue_work(work: S3FifoReconstructionWork) {
     }
 }
 
+/// Opt-in, current-thread observations for the public SQL measurement harness.
+/// This records actual reconstruction work without reconstructing a model when
+/// a snapshot is read. It does not observe work on other executor threads.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod s3_fifo_reconstruction_diagnostics {
+    use std::cell::Cell;
+    use std::marker::PhantomData;
+    use std::rc::Rc;
+
+    use super::S3FifoReconstructionWork;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Caller {
+        QueueSnapshot,
+        ChooseVictim,
+        QueueAssignments,
+        Unknown,
+    }
+
+    pub const CALLERS: [Caller; 4] = [
+        Caller::QueueSnapshot,
+        Caller::ChooseVictim,
+        Caller::QueueAssignments,
+        Caller::Unknown,
+    ];
+
+    impl Caller {
+        #[must_use]
+        pub const fn name(self) -> &'static str {
+            match self {
+                Self::QueueSnapshot => "queue_snapshot",
+                Self::ChooseVictim => "choose_victim",
+                Self::QueueAssignments => "queue_assignments",
+                Self::Unknown => "unknown",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Tally {
+        pub attempts: usize,
+        pub models_built: usize,
+        pub empty_refusals: usize,
+        pub oversized_refusals: usize,
+        pub resident_pages: usize,
+        pub trace_entries: usize,
+        pub replayed_accesses: usize,
+        pub replayed_insertions: usize,
+        pub completion_rounds: usize,
+        pub resident_keys_scanned: usize,
+        pub missing_page_insertions: usize,
+        pub exhausted_budgets: usize,
+    }
+
+    thread_local! {
+        static CAPTURE: Cell<Option<[Tally; 4]>> = const { Cell::new(None) };
+        static CALLER: Cell<Caller> = const { Cell::new(Caller::Unknown) };
+    }
+
+    /// A capture must stay on its originating thread, including across awaits.
+    /// No cell borrow is retained while the caller executes SQL.
+    pub struct Capture {
+        _thread_bound: PhantomData<Rc<()>>,
+    }
+
+    impl Capture {
+        /// Start an empty current-thread capture.
+        ///
+        /// # Panics
+        /// Panics if a capture is already active, leaving that capture intact.
+        #[must_use]
+        pub fn start() -> Self {
+            assert!(CAPTURE.get().is_none(), "reconstruction capture already active");
+            CAPTURE.set(Some([Tally::default(); 4]));
+            Self {
+                _thread_bound: PhantomData,
+            }
+        }
+
+        /// Read the current tallies without performing cache work.
+        ///
+        /// # Panics
+        /// Panics if the originating thread no longer has an active capture.
+        #[must_use]
+        pub fn snapshot(&self) -> [Tally; 4] {
+            CAPTURE.get().expect("reconstruction capture is active")
+        }
+
+        #[must_use]
+        pub fn finish(self) -> [Tally; 4] {
+            self.snapshot()
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            CAPTURE.set(None);
+        }
+    }
+
+    pub(super) struct CallerScope(Caller);
+
+    impl CallerScope {
+        pub(super) fn enter(caller: Caller) -> Self {
+            Self(CALLER.replace(caller))
+        }
+    }
+
+    impl Drop for CallerScope {
+        fn drop(&mut self) {
+            CALLER.set(self.0);
+        }
+    }
+
+    pub(super) fn record(
+        resident_pages: usize,
+        trace_entries: usize,
+        replayed_accesses: usize,
+        replayed_insertions: usize,
+        work: S3FifoReconstructionWork,
+    ) {
+        if let Some(mut tallies) = CAPTURE.get() {
+            let tally = &mut tallies[CALLER.get() as usize];
+            tally.attempts += 1;
+            tally.models_built += usize::from(work.model_built);
+            tally.empty_refusals += usize::from(resident_pages == 0);
+            tally.oversized_refusals += usize::from(
+                resident_pages > super::S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS,
+            );
+            tally.resident_pages += resident_pages;
+            tally.trace_entries += trace_entries;
+            tally.replayed_accesses += replayed_accesses;
+            tally.replayed_insertions += replayed_insertions;
+            tally.completion_rounds += work.completion_rounds;
+            tally.resident_keys_scanned += work.resident_keys_scanned;
+            tally.missing_page_insertions += work.missing_page_insertions;
+            tally.exhausted_budgets += usize::from(work.completion_budget_exhausted);
+            CAPTURE.set(Some(tallies));
+        }
+    }
+}
+
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS: usize = 4_096;
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES: usize = 8_192;
 
@@ -501,6 +644,10 @@ impl S3FifoEvictionTracker {
     }
 
     fn choose_victim(&self, resident_pages: &[PageNumber]) -> Option<PageNumber> {
+        #[cfg(feature = "bench-internals")]
+        let _caller = s3_fifo_reconstruction_diagnostics::CallerScope::enter(
+            s3_fifo_reconstruction_diagnostics::Caller::ChooseVictim,
+        );
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
         let mut model = self.build_model(resident_pages)?;
         let synthetic_miss = choose_synthetic_miss_page(&resident_set)?;
@@ -517,6 +664,10 @@ impl S3FifoEvictionTracker {
     }
 
     fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
+        #[cfg(feature = "bench-internals")]
+        let _caller = s3_fifo_reconstruction_diagnostics::CallerScope::enter(
+            s3_fifo_reconstruction_diagnostics::Caller::QueueSnapshot,
+        );
         #[cfg(test)]
         let _work_scope = S3FifoQueueWorkScope::enter();
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
@@ -545,6 +696,10 @@ impl S3FifoEvictionTracker {
         &self,
         resident_pages: &[PageNumber],
     ) -> HashMap<PageNumber, PageCacheQueueKind> {
+        #[cfg(feature = "bench-internals")]
+        let _caller = s3_fifo_reconstruction_diagnostics::CallerScope::enter(
+            s3_fifo_reconstruction_diagnostics::Caller::QueueAssignments,
+        );
         let Some(model) = self.build_model(resident_pages) else {
             return HashMap::new();
         };
@@ -566,13 +721,15 @@ impl S3FifoEvictionTracker {
     }
 
     fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "bench-internals"))]
         let mut work = S3FifoReconstructionWork::default();
         if resident_pages.is_empty()
             || resident_pages.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
         {
             #[cfg(test)]
             record_s3_fifo_queue_work(work);
+            #[cfg(feature = "bench-internals")]
+            s3_fifo_reconstruction_diagnostics::record(resident_pages.len(), 0, 0, 0, work);
             return None;
         }
 
@@ -585,18 +742,28 @@ impl S3FifoEvictionTracker {
         let (min_bound, max_bound) = self.scaled_bounds(resident_pages.len());
         model.set_adaptive_bounds(min_bound, max_bound);
 
+        #[cfg(feature = "bench-internals")]
+        let (mut replayed_accesses, mut replayed_insertions) = (0, 0);
         for &page_no in &self.access_trace {
             if !resident_set.contains(&page_no) {
                 continue;
             }
+            #[cfg(feature = "bench-internals")]
+            {
+                replayed_accesses += 1;
+            }
             if !model.access(page_no) {
+                #[cfg(feature = "bench-internals")]
+                {
+                    replayed_insertions += 1;
+                }
                 let _ = model.insert(page_no);
             }
         }
 
         let mut remaining_rounds = resident_order.len().saturating_mul(2).max(1);
         while remaining_rounds > 0 {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "bench-internals"))]
             {
                 work.completion_rounds += 1;
                 work.resident_keys_scanned += resident_order.len();
@@ -614,7 +781,7 @@ impl S3FifoEvictionTracker {
             if missing.is_empty() {
                 break;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "bench-internals"))]
             {
                 work.missing_page_insertions += missing.len();
             }
@@ -624,11 +791,20 @@ impl S3FifoEvictionTracker {
             remaining_rounds = remaining_rounds.saturating_sub(1);
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "bench-internals"))]
         {
             work.model_built = true;
             work.completion_budget_exhausted = remaining_rounds == 0;
+            #[cfg(test)]
             record_s3_fifo_queue_work(work);
+            #[cfg(feature = "bench-internals")]
+            s3_fifo_reconstruction_diagnostics::record(
+                resident_pages.len(),
+                self.access_trace.len(),
+                replayed_accesses,
+                replayed_insertions,
+                work,
+            );
         }
         Some(model)
     }
@@ -7663,6 +7839,76 @@ mod tests {
         let _ = tracker.queue_snapshot(&one);
         drop(capture);
         assert!(S3FifoQueueWorkCapture::start().finish().is_empty());
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn test_s3_fifo_reconstruction_diagnostic_capture_reports_callers_and_actual_work() {
+        use s3_fifo_reconstruction_diagnostics::{CALLERS, Caller, Capture, Tally};
+
+        let tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(6144));
+        let four: Vec<_> = (1..=4).map(|raw| PageNumber::new(raw).unwrap()).collect();
+        let capture = Capture::start();
+        let one_call = Tally {
+            attempts: 1,
+            models_built: 1,
+            resident_pages: 4,
+            completion_rounds: 8,
+            resident_keys_scanned: 32,
+            missing_page_insertions: 25,
+            exhausted_budgets: 1,
+            ..Tally::default()
+        };
+        let mut expected = [Tally::default(); CALLERS.len()];
+        assert!(tracker.queue_snapshot(&four).is_some());
+        expected[Caller::QueueSnapshot as usize] = one_call;
+        assert_eq!(capture.snapshot(), expected);
+        assert!(tracker.choose_victim(&four).is_some());
+        expected[Caller::ChooseVictim as usize] = one_call;
+        assert_eq!(capture.snapshot(), expected);
+        assert!(!tracker.queue_assignments(&four).is_empty());
+        expected[Caller::QueueAssignments as usize] = one_call;
+        assert_eq!(capture.snapshot(), expected);
+        assert!(tracker.build_model(&four).is_some());
+        expected[Caller::Unknown as usize] = one_call;
+        assert_eq!(capture.finish(), expected);
+
+        let oversized: Vec<_> = (1..=S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 1)
+            .map(|raw| PageNumber::new(u32::try_from(raw).unwrap()).unwrap())
+            .collect();
+        let capture = Capture::start();
+        assert!(tracker.queue_snapshot(&[]).is_none());
+        assert!(tracker.queue_snapshot(&oversized).is_none());
+        let mut expected = [Tally::default(); 4];
+        expected[Caller::QueueSnapshot as usize] = Tally {
+            attempts: 2,
+            empty_refusals: 1,
+            oversized_refusals: 1,
+            resident_pages: oversized.len(),
+            ..Tally::default()
+        };
+        assert_eq!(capture.finish(), expected);
+
+        let mut tracker = tracker;
+        tracker.record_access(four[0]);
+        tracker.record_access(four[0]);
+        tracker.record_access(PageNumber::new(9).unwrap());
+        let capture = Capture::start();
+        let _ = tracker.queue_snapshot(&four);
+        let actual = capture.finish()[Caller::QueueSnapshot as usize];
+        assert_eq!(actual.trace_entries, 3);
+        assert_eq!(actual.replayed_accesses, 2);
+        assert_eq!(actual.replayed_insertions, 1);
+
+        // A rejected nested capture must leave the original observation intact.
+        let capture = Capture::start();
+        let _ = tracker.queue_snapshot(&four);
+        let before = capture.snapshot();
+        assert!(std::panic::catch_unwind(Capture::start).is_err());
+        assert_eq!(capture.snapshot(), before);
+        drop(capture);
+        let _ = tracker.queue_snapshot(&four);
+        assert_eq!(Capture::start().finish(), [Tally::default(); 4]);
     }
 
     /// Isolate GH402's statistics cost from SQL, WAL I/O and connection open.
