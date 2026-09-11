@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use asupersync::runtime::spawn_blocking_io;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -37,6 +38,7 @@ use nix::unistd::{AccessFlags as UnixAccessFlags, access as unix_access};
 use tracing::debug;
 use tracing::{error, warn};
 
+use crate::namespace::{DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen};
 use crate::shm::{
     SHM_READ_MARK_OFFSET, SHM_SEGMENT_SIZE, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK,
     SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK, WAL_NREADER, WAL_NREADER_USIZE,
@@ -49,6 +51,80 @@ use crate::traits::{
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+// Keep the payload mmap offset valid on both 4-KiB and 16-KiB hosts. Hosts
+// with an incompatible page size refuse instead of mapping a different ABI.
+const MVCC_SHM_PAYLOAD_OFFSET: u64 = 64 * 1024;
+const MVCC_SHM_TRANSPORT_HEADER_BYTES: usize = 96;
+
+fn mvcc_shm_path(database_path: &Path) -> PathBuf {
+    let mut name = database_path.as_os_str().to_os_string();
+    name.push(".fsqlite-shm");
+    PathBuf::from(name)
+}
+
+fn mvcc_shm_transport_header(
+    identity: FileIdentity,
+    backing_identity: FileIdentity,
+    payload_bytes: u64,
+) -> [u8; MVCC_SHM_TRANSPORT_HEADER_BYTES] {
+    let mut header = [0_u8; MVCC_SHM_TRANSPORT_HEADER_BYTES];
+    header[..8].copy_from_slice(b"FSMVCC01");
+    header[8..16].copy_from_slice(&payload_bytes.to_le_bytes());
+    header[16..41].copy_from_slice(&identity.to_namespace_bytes());
+    header[41..66].copy_from_slice(&backing_identity.to_namespace_bytes());
+    header[72..80].copy_from_slice(&MVCC_SHM_PAYLOAD_OFFSET.to_le_bytes());
+    header
+}
+
+fn mvcc_shm_lock(file: &File, mode: FileLockMode) -> Result<()> {
+    AdvisoryFileLock::try_lock(file, mode).map_err(|error| match error {
+        FileLockError::AlreadyLocked => FrankenError::Busy,
+        FileLockError::Io(error) => FrankenError::Io(error),
+    })
+}
+
+fn validate_mvcc_shm_backing(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let descriptor = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    let effective_user = unsafe { libc::geteuid() };
+    if !descriptor.is_file()
+        || descriptor.nlink() != 1
+        || descriptor.uid() != effective_user
+        || descriptor.mode() & 0o077 != 0
+        || !named.is_file()
+        || named.nlink() != 1
+        || descriptor.dev() != named.dev()
+        || descriptor.ino() != named.ino()
+    {
+        return Err(FrankenError::CannotOpen {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_mvcc_shm_header(file: &File, identity: FileIdentity, payload_bytes: u64) -> Result<()> {
+    if file.metadata()?.len() != MVCC_SHM_PAYLOAD_OFFSET + payload_bytes {
+        return Err(FrankenError::BusyRecovery);
+    }
+    let mut actual = [0_u8; MVCC_SHM_TRANSPORT_HEADER_BYTES];
+    let read = read_full_at(
+        |buffer, offset| file.read_at(buffer, offset),
+        &mut actual,
+        0,
+        "MVCC transport header",
+    )?;
+    if read != actual.len()
+        || actual != mvcc_shm_transport_header(identity, inode_key_from_file(file)?, payload_bytes)
+    {
+        return Err(FrankenError::BusyRecovery);
+    }
+    Ok(())
 }
 
 fn invalid_io_input(message: String) -> FrankenError {
@@ -3002,6 +3078,112 @@ impl UnixFile {
         self.closed = true;
         deferred
     }
+
+    /// A separately accounted main-file owner without opening another fd.
+    /// Its eventual SHARED claim is independent of the requesting handle.
+    fn new_mvcc_mapping_owner(&self) -> Result<Self> {
+        let inode_info = Arc::clone(self.inode_info_ref());
+        {
+            let mut inode = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inode.n_ref = inode
+                .n_ref
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::internal("MVCC mmap inode reference overflow"))?;
+        }
+        Ok(Self {
+            file: self.file.as_ref().map(Arc::clone),
+            path: self.path.clone(),
+            open_flags: self.open_flags,
+            lock_level: LockLevel::None,
+            wal_lifetime_claim: WalLifetimeClaim::Unclaimed,
+            transient_shared_pending_gate: false,
+            external_shared_snapshot_attempt: None,
+            external_maintenance_attempt: None,
+            external_append_attempt: None,
+            delete_on_close: false,
+            closed: false,
+            inode_key: self.inode_key,
+            inode_info: Some(inode_info),
+            shm_owner_id: next_shm_owner_id(),
+            shm_path: self.shm_path.clone(),
+            shm_info: None,
+            shm_dms_lifetime_claim: false,
+            busy_timeout_ms: 0,
+        })
+    }
+}
+
+/// These three owners survive the requesting file and namespace binding.
+/// A failed main unlock must not release the independent namespace lease.
+struct UnixMvccMappingCleanup {
+    main: Option<UnixFile>,
+    backing: Option<File>,
+    admission: Option<PendingNamespaceOpen>,
+    namespace: Option<Arc<DatabaseNamespaceBinding>>,
+}
+
+impl UnixMvccMappingCleanup {
+    fn try_close(&mut self) -> Result<()> {
+        self.try_close_with(|main| main.close(&Cx::new()))
+    }
+
+    fn try_close_with(
+        &mut self,
+        close_main: impl FnOnce(&mut UnixFile) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(main) = self.main.as_mut() {
+            close_main(main)?;
+        }
+        drop(self.main.take());
+        // Closing this independently opened flock descriptor releases only
+        // this mapping's claim, even when peer mappings use the same file.
+        drop(self.backing.take());
+        drop(self.admission.take());
+        drop(self.namespace.take());
+        Ok(())
+    }
+}
+
+struct UnixMvccMappingLifetime {
+    cleanup: Option<UnixMvccMappingCleanup>,
+}
+
+impl Drop for UnixMvccMappingLifetime {
+    fn drop(&mut self) {
+        if let Some(mut cleanup) = self.cleanup.take()
+            && let Err(error) = cleanup.try_close()
+        {
+            warn!(%error, "MVCC mapping retained exact native cleanup for retry");
+            deferred_mvcc_mapping_cleanup_queue()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(cleanup);
+        }
+    }
+}
+
+fn deferred_mvcc_mapping_cleanup_queue() -> &'static Mutex<Vec<UnixMvccMappingCleanup>> {
+    static QUEUE: OnceLock<Mutex<Vec<UnixMvccMappingCleanup>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retry_deferred_mvcc_mapping_cleanups() {
+    let pending = {
+        let mut queue = deferred_mvcc_mapping_cleanup_queue()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *queue)
+    };
+    for mut cleanup in pending {
+        if cleanup.try_close().is_err() {
+            deferred_mvcc_mapping_cleanup_queue()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(cleanup);
+        }
+    }
 }
 
 /// The mapping backing owns this guard, which owns no strong SHM-state Arc.
@@ -3060,6 +3242,7 @@ fn retry_deferred_unix_cleanups() {
                 .push(owner);
         }
     }
+    retry_deferred_mvcc_mapping_cleanups();
 }
 
 impl VfsFile for UnixFile {
@@ -3972,6 +4155,150 @@ impl VfsFile for UnixFile {
         })
     }
 
+    fn mvcc_shm_map(&mut self, cx: &Cx, payload_bytes: u64, create: bool) -> Result<ShmRegion> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        checkpoint_or_abort(cx)?;
+        if self.closed || !self.open_flags.contains(VfsOpenFlags::MAIN_DB) {
+            return Err(FrankenError::Unsupported);
+        }
+        if create && !self.open_flags.contains(VfsOpenFlags::READWRITE) {
+            return Err(FrankenError::ReadOnly);
+        }
+        let map_size = usize::try_from(payload_bytes)
+            .ok()
+            .filter(|size| *size != 0 && isize::try_from(*size).is_ok())
+            .ok_or_else(|| invalid_io_input("invalid MVCC payload size".to_owned()))?;
+        let total_bytes = MVCC_SHM_PAYLOAD_OFFSET
+            .checked_add(payload_bytes)
+            .filter(|size| i64::try_from(*size).is_ok())
+            .ok_or_else(|| invalid_io_input("MVCC backing length overflow".to_owned()))?;
+        // SAFETY: sysconf reads an operating-system scalar and owns no memory.
+        let page_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_bytes <= 0 || !MVCC_SHM_PAYLOAD_OFFSET.is_multiple_of(page_bytes as u64) {
+            return Err(FrankenError::Unsupported);
+        }
+
+        let database_path = fs::canonicalize(&self.path)?;
+        let descriptor = self.file_ref().metadata()?;
+        let identity = inode_key_from_file(self.file_ref())?;
+        let named = fs::symlink_metadata(&database_path)?;
+        if !descriptor.is_file()
+            || descriptor.len() == 0
+            || descriptor.nlink() != 1
+            || !named.is_file()
+            || named.nlink() != 1
+            || identity != FileIdentity::from_unix_parts(named.dev(), named.ino())
+        {
+            return Err(FrankenError::CannotOpen {
+                path: database_path,
+            });
+        }
+        // Do not clone the caller's binding: its explicit quiesce would also
+        // release that clone. Hold an independent exclusive admission gate
+        // through creation so a peer cannot strand a just-created empty file
+        // by taking its SHARED flock first. The use claim stays SHARED, so
+        // existing connections/readers remain admitted throughout bootstrap.
+        let admission =
+            PendingNamespaceOpen::begin(&database_path, NamespaceOpenIntent::ExistingCompanion)?;
+        if admission.expected_identity() != Some(identity) {
+            return Err(FrankenError::CannotOpen {
+                path: database_path,
+            });
+        }
+        let owner = self.new_mvcc_mapping_owner()?;
+        let mut lifetime = UnixMvccMappingLifetime {
+            cleanup: Some(UnixMvccMappingCleanup {
+                main: Some(owner),
+                backing: None,
+                admission: Some(admission),
+                namespace: None,
+            }),
+        };
+        let cleanup = lifetime.cleanup.as_mut().expect("new mapping cleanup");
+        let main = cleanup.main.as_mut().expect("new mapping main owner");
+        main.lock(cx, LockLevel::Shared)?;
+        if main.locking_downgraded_to_whole_file_flock() {
+            return Err(FrankenError::Unsupported);
+        }
+        checkpoint_or_abort(cx)?;
+
+        let backing_path = mvcc_shm_path(&database_path);
+        let open = |create_new| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(create_new)
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&backing_path)
+        };
+        let (file, created) = if create {
+            match open(true) {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (open(false)?, false),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            (open(false)?, false)
+        };
+        cleanup.backing = Some(file);
+        let file = cleanup.backing.as_ref().expect("opened MVCC backing");
+        validate_mvcc_shm_backing(file, &backing_path)?;
+        if created {
+            mvcc_shm_lock(file, FileLockMode::Exclusive)?;
+            checkpoint_or_abort(cx)?;
+            file.set_len(total_bytes)?;
+            write_full_at(
+                |buffer, offset| file.write_at(buffer, offset),
+                &mvcc_shm_transport_header(identity, inode_key_from_file(file)?, payload_bytes),
+                0,
+                "MVCC transport header",
+            )?;
+            // flock conversion is not assumed atomic. Every existing-file
+            // opener is read-only with respect to the immutable transport
+            // header and extent, even when no live mapping currently exists.
+            // Revalidate after SHARED admission before exposing any payload.
+        }
+        mvcc_shm_lock(file, FileLockMode::Shared)?;
+        validate_mvcc_shm_backing(file, &backing_path)?;
+        validate_mvcc_shm_header(file, identity, payload_bytes)?;
+        if inode_key_from_file(main.file_ref())? != identity {
+            return Err(FrankenError::CannotOpen {
+                path: database_path,
+            });
+        }
+        checkpoint_or_abort(cx)?;
+        // SAFETY: the validated descriptor has this fixed, nonzero extent;
+        // the aligned offset is checked above. The cleanup capsule retains
+        // the backing, main-file claim, and namespace until after munmap.
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                MVCC_SHM_PAYLOAD_OFFSET as libc::off_t,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: this owns exactly the successful MAP_SHARED mapping above.
+        let mut region = unsafe { ShmRegion::from_mmap(pointer.cast::<u8>(), map_size) };
+        let namespace = cleanup
+            .admission
+            .as_mut()
+            .expect("pending companion admission")
+            .finish_existing_companion(identity)?;
+        cleanup.namespace = Some(namespace);
+        drop(cleanup.admission.take());
+        region.retain_mmap_lifetime(Box::new(lifetime));
+        checkpoint_or_abort(cx)?;
+        Ok(region)
+    }
+
     fn shm_map(
         &mut self,
         cx: &Cx,
@@ -4507,6 +4834,488 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as _};
     use std::process::{Child, Stdio};
     use std::process::{Command, Output};
+
+    fn admitted_mvcc_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        UnixFile,
+        Arc<DatabaseNamespaceBinding>,
+    ) {
+        let directory = tempfile::tempdir().expect("MVCC fixture directory");
+        let requested = directory.path().join(name);
+        fs::write(&requested, [0x53_u8; 4096]).expect("materialize main file");
+        let path = fs::canonicalize(requested).expect("canonical main file");
+        let (file, _) = UnixVfs::new()
+            .open(
+                &Cx::new(),
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .expect("open main file");
+        let namespace = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared)
+            .expect("begin namespace")
+            .bind(file.file_identity().unwrap().unwrap())
+            .expect("bind namespace");
+        namespace
+            .finish_bootstrap()
+            .expect("finish namespace bootstrap");
+        (directory, path, file, namespace)
+    }
+
+    struct MvccTransportChild(Child);
+
+    impl Drop for MvccTransportChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn mvcc_shm_native_process_atomic_ownership_and_alias_lifetime() {
+        const CHILD: &str = "FSQLITE_MVCC_TRANSPORT_CHILD";
+        const TEST: &str =
+            "unix::tests::mvcc_shm_native_process_atomic_ownership_and_alias_lifetime";
+        let cx = Cx::new();
+        if let Some(path) = std::env::var_os(CHILD) {
+            let (mut file, _) = UnixVfs::new()
+                .open(
+                    &cx,
+                    Some(Path::new(&path)),
+                    VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+                )
+                .expect("child opens actual main file");
+            let region = file
+                .mvcc_shm_map(&cx, 4096, false)
+                .expect("child maps existing payload");
+            assert!(region.is_mmap_backed());
+            assert_eq!(
+                region
+                    .atomic_compare_exchange_u64_le(
+                        0,
+                        101,
+                        202,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .unwrap(),
+                Ok(101)
+            );
+            file.close(&cx).expect("child closes origin before alias");
+            println!("mvcc-child-owned");
+            std::io::stdout().flush().unwrap();
+            let mut command = String::new();
+            assert_ne!(std::io::stdin().read_line(&mut command).unwrap(), 0);
+            assert_eq!(command.trim(), "release");
+            assert_eq!(
+                region
+                    .atomic_compare_exchange_u64_le(0, 202, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .unwrap(),
+                Ok(202)
+            );
+            drop(region);
+            println!("mvcc-child-released");
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+
+        let (directory, path, mut file, namespace) = admitted_mvcc_fixture("native.db");
+        let alias = directory.path().join("symlink.db");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let (mut existing_reader, _) = UnixVfs::new()
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        existing_reader.lock(&cx, LockLevel::Shared).unwrap();
+        let region = file
+            .mvcc_shm_map(&cx, 4096, true)
+            .expect("first mapping coexists with an admitted main SHARED reader");
+        existing_reader.close(&cx).unwrap();
+        assert!(region.is_mmap_backed());
+        region
+            .atomic_store_u64_le(0, 101, Ordering::Release)
+            .unwrap();
+        let surviving_alias = region.share();
+        let mut child = MvccTransportChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD, &alias)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn actual native peer"),
+        );
+        let output = child.0.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if send.send(line.expect("child stdout")).is_err() {
+                    break;
+                }
+            }
+        });
+        let expect_witness = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let line = receive
+                    .recv_timeout(remaining)
+                    .expect("bounded child witness");
+                if line == expected {
+                    break;
+                }
+            }
+        };
+        expect_witness("mvcc-child-owned");
+        assert_eq!(
+            region.atomic_load_u64_le(0, Ordering::Acquire).unwrap(),
+            202
+        );
+        assert_eq!(
+            region
+                .atomic_compare_exchange_u64_le(0, 101, 0, Ordering::AcqRel, Ordering::Acquire)
+                .unwrap(),
+            Err(202),
+            "a stale owner cannot release the peer's actual claim"
+        );
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+        drop(region);
+        assert_eq!(
+            surviving_alias
+                .atomic_load_u64_le(0, Ordering::Acquire)
+                .unwrap(),
+            202
+        );
+        drop(surviving_alias);
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive),
+            Err(FrankenError::Busy)
+        ));
+        writeln!(child.0.stdin.as_mut().unwrap(), "release").unwrap();
+        expect_witness("mvcc-child-released");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "native peer failed: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "native peer did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reader.join().unwrap();
+        drop(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive)
+                .expect("final native alias releases namespace generation"),
+        );
+        assert!(
+            !sqlite_shm_path(&path).exists(),
+            "MVCC never creates the stock WAL index"
+        );
+        assert!(
+            !mvcc_shm_path(&alias).exists(),
+            "symlink spelling never creates a second authority"
+        );
+    }
+
+    #[test]
+    fn mvcc_shm_admission_refusals_preserve_existing_payload_and_main_identity() {
+        let cx = Cx::new();
+        let (directory, path, mut file, namespace) = admitted_mvcc_fixture("admission.db");
+        let backing_path = mvcc_shm_path(&path);
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        assert!(matches!(
+            file.mvcc_shm_map(&cancelled, 4096, true),
+            Err(FrankenError::Abort)
+        ));
+        assert!(file.mvcc_shm_map(&cx, 4096, false).is_err());
+        assert!(!backing_path.exists());
+        let (mut readonly, _) = UnixVfs::new()
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY,
+            )
+            .unwrap();
+        assert!(matches!(
+            readonly.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(!backing_path.exists());
+        let hardlink = directory.path().join("hardlink.db");
+        fs::hard_link(&path, &hardlink).unwrap();
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(!backing_path.exists());
+        // Keep this hard-linked fixture intact. A distinct admitted database
+        // exercises successful mapping and all post-creation refusals.
+        let (_other_directory, other_path, mut other, other_namespace) =
+            admitted_mvcc_fixture("mapped.db");
+        let region = other.mvcc_shm_map(&cx, 4096, true).unwrap();
+        region
+            .atomic_store_u64_le(0, 0x1234, Ordering::Release)
+            .unwrap();
+        for create in [false, true] {
+            assert!(matches!(
+                other.mvcc_shm_map(&cx, 8192, create),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(
+                region.atomic_load_u64_le(0, Ordering::Acquire).unwrap(),
+                0x1234
+            );
+        }
+        assert_eq!(
+            fs::metadata(mvcc_shm_path(&other_path)).unwrap().len(),
+            MVCC_SHM_PAYLOAD_OFFSET + 4096
+        );
+        drop(region);
+        other.close(&cx).unwrap();
+        other_namespace.quiesce();
+        readonly.close(&cx).unwrap();
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+    }
+
+    #[test]
+    fn mvcc_shm_unadmitted_and_invalid_requests_create_no_companions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unadmitted.db");
+        fs::write(&path, [0x41_u8; 4096]).unwrap();
+        let cx = Cx::new();
+        let (mut file, _) = UnixVfs::new()
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
+        for payload_bytes in [0, u64::MAX] {
+            assert!(file.mvcc_shm_map(&cx, payload_bytes, true).is_err());
+        }
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn mvcc_shm_existing_partial_and_foreign_headers_are_never_reinitialized() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let cx = Cx::new();
+        let (_source_directory, _source_path, source, source_namespace) =
+            admitted_mvcc_fixture("source.db");
+        let foreign_identity = source.file_identity().unwrap().unwrap();
+        let foreign_header = mvcc_shm_transport_header(foreign_identity, foreign_identity, 4096);
+        for (name, bytes) in [
+            ("empty.db", Vec::new()),
+            ("partial.db", b"FSMVCC01".to_vec()),
+            ("foreign.db", {
+                let mut bytes = vec![0_u8; (MVCC_SHM_PAYLOAD_OFFSET + 4096) as usize];
+                bytes[..foreign_header.len()].copy_from_slice(&foreign_header);
+                bytes[MVCC_SHM_PAYLOAD_OFFSET as usize] = 0x9A;
+                bytes
+            }),
+        ] {
+            let (_directory, path, mut file, namespace) = admitted_mvcc_fixture(name);
+            let backing_path = mvcc_shm_path(&path);
+            let backing = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backing_path)
+                .unwrap();
+            write_full_at(
+                |buffer, offset| backing.write_at(buffer, offset),
+                &bytes,
+                0,
+                "fixture",
+            )
+            .unwrap();
+            for create in [false, true] {
+                assert!(matches!(
+                    file.mvcc_shm_map(&cx, 4096, create),
+                    Err(FrankenError::BusyRecovery)
+                ));
+                assert_eq!(fs::read(&backing_path).unwrap(), bytes);
+            }
+            file.close(&cx).unwrap();
+            namespace.quiesce();
+        }
+        source_namespace.quiesce();
+    }
+
+    #[test]
+    fn mvcc_shm_bootstrap_and_replaced_main_refuse_before_backing_mutation() {
+        let cx = Cx::new();
+        let (directory, path, mut file, namespace) = admitted_mvcc_fixture("generation.db");
+        namespace.quiesce();
+        let bootstrap =
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive).unwrap();
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::Busy)
+        ));
+        assert!(!mvcc_shm_path(&path).exists());
+        drop(bootstrap);
+        let region = file.mvcc_shm_map(&cx, 4096, true).unwrap();
+        region
+            .atomic_store_u64_le(0, 73, Ordering::Release)
+            .unwrap();
+        // Deliberately bypass cooperative namespace replacement to prove the
+        // transport rejects a pathname that no longer names its descriptor.
+        let retired = directory.path().join("retired.db");
+        fs::rename(&path, &retired).unwrap();
+        fs::write(&path, [0x72_u8; 4096]).unwrap();
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(region.atomic_load_u64_le(0, Ordering::Acquire).unwrap(), 73);
+        drop(region);
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn mvcc_shm_copied_header_cannot_join_a_replacement_backing_inode() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let cx = Cx::new();
+        let (directory, path, mut file, namespace) = admitted_mvcc_fixture("backing.db");
+        let region = file.mvcc_shm_map(&cx, 4096, true).unwrap();
+        region
+            .atomic_store_u64_le(0, 91, Ordering::Release)
+            .unwrap();
+        let backing_path = mvcc_shm_path(&path);
+        let copied = fs::read(&backing_path).unwrap();
+        // A deliberately uncooperative replacement keeps the exact old
+        // header, but cannot reuse the old backing's descriptor identity.
+        fs::rename(&backing_path, directory.path().join("retired.fsqlite-shm")).unwrap();
+        let replacement = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backing_path)
+            .unwrap();
+        write_full_at(
+            |buffer, offset| replacement.write_at(buffer, offset),
+            &copied,
+            0,
+            "copied transport fixture",
+        )
+        .unwrap();
+        for create in [false, true] {
+            assert!(matches!(
+                file.mvcc_shm_map(&cx, 4096, create),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(fs::read(&backing_path).unwrap(), copied);
+        }
+        assert_eq!(region.atomic_load_u64_le(0, Ordering::Acquire).unwrap(), 91);
+        drop(region);
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+    }
+
+    #[test]
+    fn mvcc_shm_failed_main_cleanup_retains_the_independent_namespace_owner() {
+        let cx = Cx::new();
+        let (_directory, path, mut file, namespace) = admitted_mvcc_fixture("cleanup.db");
+        let identity = file.file_identity().unwrap().unwrap();
+        let independent = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReadOnlyExisting)
+            .unwrap()
+            .bind(identity)
+            .unwrap();
+        let mut owner = file.new_mvcc_mapping_owner().unwrap();
+        owner.lock(&cx, LockLevel::Shared).unwrap();
+        let mut cleanup = UnixMvccMappingCleanup {
+            main: Some(owner),
+            backing: None,
+            admission: None,
+            namespace: Some(independent),
+        };
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+        // Synthetic close refusal at the real cleanup boundary: this tests
+        // retained ownership, not a fault injected into a native syscall.
+        assert!(matches!(
+            cleanup.try_close_with(|_| Err(FrankenError::Busy)),
+            Err(FrankenError::Busy)
+        ));
+        assert_eq!(cleanup.main.as_ref().unwrap().lock_level, LockLevel::Shared);
+        assert!(!cleanup.namespace.as_ref().unwrap().is_quiesced());
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive),
+            Err(FrankenError::Busy)
+        ));
+        deferred_mvcc_mapping_cleanup_queue()
+            .lock()
+            .unwrap()
+            .push(cleanup);
+        retry_deferred_mvcc_mapping_cleanups();
+        drop(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive)
+                .expect("deferred retry releases the exact last namespace lease"),
+        );
+    }
+
+    #[test]
+    fn mvcc_shm_pending_companion_gate_survives_validation_and_cleanup_failure() {
+        let cx = Cx::new();
+        let (_directory, path, mut file, namespace) = admitted_mvcc_fixture("pending.db");
+        let admission =
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ExistingCompanion).unwrap();
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, true),
+            Err(FrankenError::Busy)
+        ));
+        assert!(!mvcc_shm_path(&path).exists());
+        let mut owner = file.new_mvcc_mapping_owner().unwrap();
+        owner.lock(&cx, LockLevel::Shared).unwrap();
+        let mut cleanup = UnixMvccMappingCleanup {
+            main: Some(owner),
+            backing: None,
+            admission: Some(admission),
+            namespace: None,
+        };
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+        assert!(matches!(
+            cleanup
+                .admission
+                .as_mut()
+                .unwrap()
+                .finish_existing_companion(FileIdentity::from_unix_parts(0, 0)),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        // Synthetic close refusal preserves the real exclusive admission gate.
+        assert!(cleanup.try_close_with(|_| Err(FrankenError::Busy)).is_err());
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReadOnlyExisting),
+            Err(FrankenError::Busy)
+        ));
+        cleanup.try_close().unwrap();
+        drop(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive)
+                .expect("pending owner releases its gate only after main cleanup"),
+        );
+    }
 
     #[test]
     fn shm_table_registration_and_orphan_removal_preserve_one_lock_domain() {
