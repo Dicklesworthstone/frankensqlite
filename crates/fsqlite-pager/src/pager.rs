@@ -1608,13 +1608,6 @@ impl PendingGroupCommitPublication {
                     prepared.epoch
                 ))
             })?;
-        let mut members_display = prepared.members.iter().copied().collect::<Vec<_>>();
-        members_display.sort_unstable();
-        let members_display = members_display
-            .into_iter()
-            .map(|member| member.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
         queue
             .persisted_epochs
             .lock()
@@ -1630,6 +1623,13 @@ impl PendingGroupCommitPublication {
                 },
             );
         if group_commit_trace_enabled() {
+            let mut members_display = prepared.members.iter().copied().collect::<Vec<_>>();
+            members_display.sort_unstable();
+            let members_display = members_display
+                .into_iter()
+                .map(|member| member.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             trace_group_commit(format_args!(
                 "batch epoch={} members=[{members_display}] frames_written_range={}..={} fsync_seq={} commit_certificate={} durability_seq={} publication_generation={} ordered_region_ns={} batch_size={} lookup_mode={:?} control_mode={} shadow_certificate_verdict={} compatibility_selector={} fallback_reason={}",
                 prepared.epoch,
