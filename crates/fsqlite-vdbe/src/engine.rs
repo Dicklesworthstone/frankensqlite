@@ -2029,8 +2029,6 @@ impl RunIterator {
 /// - Recording written pages in the write set for FCW validation at commit
 #[derive(Clone)]
 struct ConcurrentContext {
-    /// Session ID for this concurrent transaction.
-    session_id: u64,
     /// Stable transaction ID used in hot-path logging.
     txn_id: u64,
     /// Immutable snapshot upper bound for this concurrent transaction.
@@ -2047,7 +2045,6 @@ struct ConcurrentContext {
 
 impl ConcurrentContext {
     fn new(
-        session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
         commit_index: Arc<CommitIndex>,
@@ -2061,7 +2058,6 @@ impl ConcurrentContext {
             )
         };
         Self {
-            session_id,
             txn_id,
             snapshot_high,
             handle,
@@ -2144,7 +2140,6 @@ impl SharedTxnPageIo {
     /// Create with MVCC concurrent context (bd-kivg / 5E.2).
     pub fn with_concurrent(
         txn: impl Into<TransactionKind>,
-        session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
         commit_index: Arc<CommitIndex>,
@@ -2153,7 +2148,6 @@ impl SharedTxnPageIo {
         Self::from_parts(
             txn.into(),
             Some(ConcurrentContext::new(
-                session_id,
                 handle,
                 lock_table,
                 commit_index,
@@ -2227,7 +2221,6 @@ impl SharedTxnPageIo {
             concurrent_clear_page_state(
                 &mut handle,
                 &ctx.lock_table,
-                ctx.session_id,
                 PageNumber::ONE,
             )
             .map_err(|restore_error| {
@@ -2274,7 +2267,7 @@ impl SharedTxnPageIo {
         restore_label: &str,
     ) -> Result<()> {
         let mut handle = ctx.handle.lock();
-        concurrent_restore_page_state(&mut handle, &ctx.lock_table, ctx.session_id, page_state)
+        concurrent_restore_page_state(&mut handle, &ctx.lock_table, page_state)
             .map_err(|restore_error| {
                 FrankenError::Internal(format!("{restore_label}: {restore_error}"))
             })
@@ -2312,7 +2305,7 @@ impl SharedTxnPageIo {
         let mut handle = ctx.handle.lock();
         let prior_state = concurrent_page_state(&handle, page_no);
         if let Err(prepare_error) =
-            concurrent_prepare_write_page(&mut handle, &ctx.lock_table, ctx.session_id, page_no)
+            concurrent_prepare_write_page(&mut handle, &ctx.lock_table, page_no)
         {
             return Err(FrankenError::Internal(format!(
                 "MVCC fast-path prepare failed: {prepare_error}"
@@ -2322,7 +2315,6 @@ impl SharedTxnPageIo {
             if let Err(restore_error) = concurrent_restore_page_state(
                 &mut handle,
                 &ctx.lock_table,
-                ctx.session_id,
                 &prior_state,
             ) {
                 return Err(FrankenError::Internal(format!(
@@ -2386,7 +2378,6 @@ impl SharedTxnPageIo {
                     concurrent_prepare_write_page(
                         &mut handle,
                         &ctx.lock_table,
-                        ctx.session_id,
                         page_no,
                     )
                 });
@@ -2605,7 +2596,6 @@ impl SharedTxnPageIo {
                 && let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     prior_page_state,
                 )
             {
@@ -2615,7 +2605,6 @@ impl SharedTxnPageIo {
                 && let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     page_one_state,
                 )
             {
@@ -2643,7 +2632,6 @@ impl SharedTxnPageIo {
                     concurrent_prepare_write_page(
                         &mut handle,
                         &ctx.lock_table,
-                        ctx.session_id,
                         page_no,
                     )
                 });
@@ -2814,7 +2802,6 @@ impl SharedTxnPageIo {
                 && let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     prior_page_state,
                 )
             {
@@ -2826,7 +2813,6 @@ impl SharedTxnPageIo {
                 && let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     page_one_state,
                 )
             {
@@ -3148,7 +3134,6 @@ fn track_concurrent_conflict_only_page(
                 concurrent_track_write_conflict_page(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     page_no,
                 )
             });
@@ -3525,7 +3510,6 @@ impl PageWriter for SharedTxnPageIo {
                 if let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     page_one_state,
                 ) {
                     return Err(FrankenError::Internal(format!(
@@ -3593,7 +3577,6 @@ impl PageWriter for SharedTxnPageIo {
                             concurrent_free_page(
                                 &mut handle,
                                 &ctx.lock_table,
-                                ctx.session_id,
                                 page_no,
                             )
                         });
@@ -3701,7 +3684,6 @@ impl PageWriter for SharedTxnPageIo {
                     && let Err(restore_error) = concurrent_restore_page_state(
                         &mut handle,
                         &ctx.lock_table,
-                        ctx.session_id,
                         prior_page_state,
                     )
                 {
@@ -3713,7 +3695,6 @@ impl PageWriter for SharedTxnPageIo {
                     && let Err(restore_error) = concurrent_restore_page_state(
                         &mut handle,
                         &ctx.lock_table,
-                        ctx.session_id,
                         page_one_state,
                     )
                 {
@@ -3733,7 +3714,6 @@ impl PageWriter for SharedTxnPageIo {
                 if let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
                     &ctx.lock_table,
-                    ctx.session_id,
                     prior_page_state,
                 ) {
                     return Err(FrankenError::Internal(format!(
@@ -3744,7 +3724,6 @@ impl PageWriter for SharedTxnPageIo {
                     if let Err(restore_error) = concurrent_restore_page_state(
                         &mut handle,
                         &ctx.lock_table,
-                        ctx.session_id,
                         page_one_state,
                     ) {
                         return Err(FrankenError::Internal(format!(
@@ -8399,7 +8378,6 @@ impl VdbeEngine {
     pub fn set_transaction_concurrent(
         &mut self,
         txn: impl Into<TransactionKind>,
-        session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
         commit_index: Arc<CommitIndex>,
@@ -8408,7 +8386,6 @@ impl VdbeEngine {
         self.attach_transaction_state(
             txn.into(),
             Some(ConcurrentContext::new(
-                session_id,
                 handle,
                 lock_table,
                 commit_index,
@@ -30635,7 +30612,6 @@ mod tests {
         let mut engine = VdbeEngine::new(8);
         engine.set_transaction_concurrent(
             txn1,
-            session1,
             Arc::clone(&handle1),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -30653,7 +30629,6 @@ mod tests {
 
         engine.set_transaction_concurrent(
             txn2,
-            session2,
             Arc::clone(&handle2),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -30740,7 +30715,6 @@ mod tests {
             .unwrap();
         let lock_table = Arc::new(InProcessPageLockTable::new());
         let ctx = ConcurrentContext::new(
-            session,
             registry.handle(session).unwrap(),
             Arc::clone(&lock_table),
             Arc::new(CommitIndex::new()),
@@ -30750,7 +30724,6 @@ mod tests {
             .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
             .unwrap();
         let victim_ctx = ConcurrentContext::new(
-            victim_session,
             registry.handle(victim_session).unwrap(),
             Arc::clone(&lock_table),
             Arc::new(CommitIndex::new()),
@@ -30878,7 +30851,7 @@ mod tests {
         let lock_table = Arc::new(InProcessPageLockTable::new());
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -30893,7 +30866,6 @@ mod tests {
 
         let page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -30960,7 +30932,6 @@ mod tests {
         let mut engine = VdbeEngine::new(8);
         engine.set_transaction_concurrent(
             concurrent_txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -32670,7 +32641,7 @@ mod tests {
         let lock_table = Arc::new(InProcessPageLockTable::new());
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -32681,7 +32652,7 @@ mod tests {
             (session_id, handle)
         };
         handle.lock().mark_aborted();
-        engine.set_transaction_concurrent(txn, session_id, handle, lock_table, commit_index, 5000);
+        engine.set_transaction_concurrent(txn, handle, lock_table, commit_index, 5000);
 
         let opened = run_async(engine.open_storage_cursor(0, root, true)).unwrap();
         assert!(
@@ -37024,7 +36995,6 @@ mod tests {
             concurrent_write_page(
                 &mut holder,
                 &lock_table,
-                holder_session,
                 contested_page,
                 PageData::from_vec(page_bytes.clone()),
             )
@@ -37037,7 +37007,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            writer_session,
             writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37088,7 +37057,7 @@ mod tests {
     #[test]
     fn test_shared_txn_page_io_revalidates_fcw_after_page_lock_acquisition() {
         use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
-        use fsqlite_types::Snapshot;
+        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let pager = MemoryMockMvccPager;
         let cx = Cx::new();
@@ -37100,17 +37069,20 @@ mod tests {
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
         let target_page = PageNumber::new(97).expect("test page must be non-zero");
         let page_bytes = vec![0x5A; PageSize::DEFAULT.as_usize()];
+        let owner = TxnToken::new(TxnId::new(700).unwrap(), TxnEpoch::new(9));
 
         let (session_id, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let session_id = guard
-                .begin_concurrent(snapshot)
+                .begin_concurrent_with_token(snapshot, true, owner)
                 .expect("writer session should register");
             let handle = guard
                 .handle(session_id)
                 .expect("writer session handle must be present");
+            assert_ne!(session_id, owner.id.get());
+            assert_eq!(handle.lock().txn_token(), owner);
             (session_id, handle)
         };
 
@@ -37121,7 +37093,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37198,7 +37169,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37213,7 +37183,6 @@ mod tests {
             fsqlite_mvcc::concurrent_rollback_to_savepoint(
                 &mut guard,
                 &lock_table,
-                session_id,
                 &savepoint,
             )
             .unwrap();
@@ -37291,7 +37260,6 @@ mod tests {
             concurrent_write_page(
                 &mut holder,
                 &lock_table,
-                holder_session,
                 contested_page,
                 PageData::from_vec(page_bytes.clone()),
             )
@@ -37312,12 +37280,11 @@ mod tests {
             let mut holder = guard
                 .get_mut(holder_session)
                 .expect("holder session must still be present before release");
-            concurrent_abort(&mut holder, &release_lock_table, holder_session);
+            concurrent_abort(&mut holder, &release_lock_table);
         });
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            writer_session,
             writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37369,7 +37336,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37384,7 +37351,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37424,7 +37390,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37439,7 +37405,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37502,7 +37467,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37696,7 +37660,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            writer_session,
             writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37749,7 +37712,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37764,7 +37727,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37822,7 +37784,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle, blocker_session) = {
+        let (_, handle, blocker_session) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37848,7 +37810,6 @@ mod tests {
             concurrent_track_write_conflict_page(
                 &mut blocker,
                 &lock_table,
-                blocker_session,
                 PageNumber::ONE,
             )
             .expect("blocker must hold synthetic page-one tracking");
@@ -37856,7 +37817,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37894,7 +37854,7 @@ mod tests {
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
         let target_page = PageNumber::new(2).unwrap();
 
-        let (session_id, handle, blocker_session) = {
+        let (_, handle, blocker_session) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -37920,7 +37880,6 @@ mod tests {
             concurrent_track_write_conflict_page(
                 &mut blocker,
                 &lock_table,
-                blocker_session,
                 PageNumber::ONE,
             )
             .expect("blocker must hold page-one tracking");
@@ -37928,7 +37887,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -37999,7 +37957,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle, blocker_session) = {
+        let (_, handle, blocker_session) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -38029,7 +37987,6 @@ mod tests {
                 concurrent_track_write_conflict_page(
                     &mut blocker,
                     &lock_table,
-                    blocker_session,
                     page,
                 )
                 .expect("blocker must hold predicted freelist commit page locks");
@@ -38040,7 +37997,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -38080,7 +38036,7 @@ mod tests {
         let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
 
-        let (session_id, handle) = {
+        let (_, handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -38098,7 +38054,6 @@ mod tests {
             concurrent_track_write_conflict_page(
                 &mut guard,
                 &lock_table,
-                session_id,
                 PageNumber::ONE,
             )
             .expect("synthetic page-one tracking should be installed");
@@ -38106,7 +38061,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
@@ -38172,7 +38126,6 @@ mod tests {
             concurrent_write_page(
                 &mut holder,
                 &lock_table,
-                holder_session,
                 contested_page,
                 PageData::from_vec(page_bytes.clone()),
             )
@@ -38191,7 +38144,6 @@ mod tests {
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
-            writer_session,
             writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),

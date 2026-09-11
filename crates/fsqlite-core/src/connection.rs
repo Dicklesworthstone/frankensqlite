@@ -23826,11 +23826,10 @@ impl Connection {
             // still tracks the conservative pager write set for the session.
             return Ok(None);
         }
-        let Some((session_id, handle)) = self.concurrent_session_handle()? else {
+        let Some((_, handle)) = self.concurrent_session_handle()? else {
             return Ok(None);
         };
         Ok(Some(ConcurrentPageIoContext {
-            session_id,
             handle,
             lock_table: Arc::clone(&self.concurrent_lock_table),
             commit_index: Arc::clone(&self.concurrent_commit_index),
@@ -25206,7 +25205,7 @@ impl Connection {
             {
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 if let Some(mut handle) = registry.get_mut(session_id) {
-                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table);
                 }
                 self.clear_cached_concurrent_handle();
                 registry.remove_and_recycle(session_id);
@@ -32828,7 +32827,6 @@ impl Connection {
             })?;
             let page_io = SharedTxnPageIo::with_concurrent(
                 txn,
-                concurrent_ctx.session_id,
                 concurrent_ctx.handle,
                 concurrent_ctx.lock_table,
                 concurrent_ctx.commit_index,
@@ -33011,7 +33009,6 @@ impl Connection {
             })?;
             let page_io = SharedTxnPageIo::with_concurrent(
                 txn,
-                concurrent_ctx.session_id,
                 concurrent_ctx.handle,
                 concurrent_ctx.lock_table,
                 concurrent_ctx.commit_index,
@@ -33435,7 +33432,6 @@ impl Connection {
             })?;
             let page_io = SharedTxnPageIo::with_concurrent(
                 txn,
-                concurrent_ctx.session_id,
                 concurrent_ctx.handle,
                 concurrent_ctx.lock_table,
                 concurrent_ctx.commit_index,
@@ -36163,7 +36159,6 @@ impl Connection {
                             if let Err(err) = concurrent_rollback_to_savepoint(
                                 &mut handle,
                                 &self.concurrent_lock_table,
-                                session_id,
                                 concurrent_snap,
                             ) {
                                 concurrent_rollback_succeeded = false;
@@ -56915,7 +56910,7 @@ impl Connection {
         self.clear_memory_concurrent_synced_write_roots();
         let mut registry = lock_unpoisoned(&self.concurrent_registry);
         if let Some(mut handle) = registry.get_mut(session_id) {
-            concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+            concurrent_abort(&mut handle, &self.concurrent_lock_table);
         }
         self.clear_cached_concurrent_handle();
         registry.remove_and_recycle(session_id);
@@ -57509,7 +57504,6 @@ impl Connection {
             if let Some(txn) = txn {
                 let page_io = SharedTxnPageIo::with_concurrent(
                     txn,
-                    concurrent_ctx.session_id,
                     concurrent_ctx.handle,
                     concurrent_ctx.lock_table,
                     concurrent_ctx.commit_index,
@@ -57661,7 +57655,6 @@ impl Connection {
             if let Some(txn) = txn {
                 let page_io = SharedTxnPageIo::with_concurrent(
                     txn,
-                    concurrent_ctx.session_id,
                     concurrent_ctx.handle,
                     concurrent_ctx.lock_table,
                     concurrent_ctx.commit_index,
@@ -58462,7 +58455,6 @@ impl Connection {
             if let Some(txn) = txn {
                 let page_io = SharedTxnPageIo::with_concurrent(
                     txn,
-                    concurrent_ctx.session_id,
                     concurrent_ctx.handle,
                     concurrent_ctx.lock_table,
                     concurrent_ctx.commit_index,
@@ -70448,7 +70440,6 @@ impl Connection {
             concurrent_track_write_conflict_page(
                 &mut handle,
                 &self.concurrent_lock_table,
-                session_id,
                 page,
             )
             .map_err(|error| match error {
@@ -70487,7 +70478,6 @@ impl Connection {
                 concurrent_clear_page_state(
                     &mut handle,
                     &self.concurrent_lock_table,
-                    session_id,
                     page,
                 )
                 .map_err(|error| {
@@ -70844,7 +70834,7 @@ impl Connection {
                 if let Some(shared_handle) = registry.remove(session_id) {
                     {
                         let mut handle = shared_handle.lock();
-                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                        concurrent_abort(&mut handle, &self.concurrent_lock_table);
                     }
                     self.clear_cached_concurrent_handle();
                     registry.recycle_handle(shared_handle);
@@ -70919,7 +70909,7 @@ impl Connection {
             let snapshot = {
                 let mut handle = shared_handle.lock();
                 let snapshot = Self::capture_ssi_snapshot(&handle);
-                concurrent_commit_read_only(&mut handle, &self.concurrent_lock_table, session_id);
+                concurrent_commit_read_only(&mut handle, &self.concurrent_lock_table);
                 snapshot
             };
             self.clear_cached_concurrent_handle();
@@ -71726,7 +71716,6 @@ impl Connection {
                         Some(mut handle) => concurrent_rollback_to_savepoint(
                             &mut handle,
                             &self.concurrent_lock_table,
-                            session_id,
                             &concurrent_snap,
                         )
                         .map_err(|e| {
@@ -71895,7 +71884,7 @@ impl Connection {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                     let mut registry = lock_unpoisoned(&self.concurrent_registry);
                     if let Some(mut handle) = registry.get_mut(session_id) {
-                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                        concurrent_abort(&mut handle, &self.concurrent_lock_table);
                     }
                     self.clear_cached_concurrent_handle();
                     registry.remove_and_recycle(session_id);
@@ -96833,7 +96822,7 @@ impl Drop for Connection {
             if let Some(session_id) = self.concurrent_session_id.get_mut().take() {
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 if let Some(mut handle) = registry.get_mut(session_id) {
-                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table);
                 }
                 self.clear_cached_concurrent_handle();
                 registry.remove_and_recycle(session_id);
@@ -129430,7 +129419,6 @@ struct ConcurrentExecContext {
 /// rowid allocation, so carrying `ConcurrentExecContext` there paid for an
 /// extra allocator `Arc` clone plus schema-cookie read on every row.
 struct ConcurrentPageIoContext {
-    session_id: u64,
     handle: SharedConcurrentHandle,
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
@@ -129604,7 +129592,6 @@ async fn execute_table_program_with_db(
         if let Some(ctx) = concurrent_ctx {
             engine.set_transaction_concurrent(
                 txn,
-                ctx.session_id,
                 ctx.handle,
                 ctx.lock_table,
                 ctx.commit_index,
@@ -129851,7 +129838,6 @@ async fn execute_table_program_exactly_one_row_with_db(
         if let Some(ctx) = concurrent_ctx {
             engine.set_transaction_concurrent(
                 txn,
-                ctx.session_id,
                 ctx.handle,
                 ctx.lock_table,
                 ctx.commit_index,
@@ -197820,7 +197806,7 @@ mod tests {
             // Write to a page.
             let page_no = PageNumber::new(2).unwrap();
             let data = PageData::from_vec(vec![0u8; 4096]);
-            concurrent_write_page(&mut handle, &lock_table, session_id, page_no, data).unwrap();
+            concurrent_write_page(&mut handle, &lock_table, page_no, data).unwrap();
 
             // Verify page lock is held.
             assert!(handle.held_locks().contains(&page_no));
@@ -197851,7 +197837,6 @@ mod tests {
             concurrent_write_page(
                 &mut handle,
                 &lock_table,
-                session_id,
                 page_no,
                 PageData::from_vec(data),
             )
@@ -197883,7 +197868,6 @@ mod tests {
             concurrent_write_page(
                 &mut handle1,
                 &lock_table,
-                session_id_1,
                 page_no,
                 PageData::from_vec(vec![0u8; 4096]),
             )
@@ -197898,7 +197882,6 @@ mod tests {
             let result = concurrent_write_page(
                 &mut handle2,
                 &lock_table,
-                session_id_2,
                 page_no,
                 PageData::from_vec(vec![0u8; 4096]),
             );
@@ -197909,7 +197892,6 @@ mod tests {
             concurrent_write_page(
                 &mut handle2,
                 &lock_table,
-                session_id_2,
                 page_no_3,
                 PageData::from_vec(vec![0u8; 4096]),
             )
@@ -217735,7 +217717,6 @@ fts5(title, body, content=docs, content_rowid=id)'
         concurrent_write_page(
             &mut handle1,
             &lock_table,
-            1,
             page_no,
             PageData::from_vec(vec![0u8; 4096]),
         )
@@ -217749,7 +217730,6 @@ fts5(title, body, content=docs, content_rowid=id)'
         let result = concurrent_write_page(
             &mut handle2,
             &lock_table,
-            2,
             page_no,
             PageData::from_vec(vec![0u8; 4096]),
         );
@@ -217853,7 +217833,6 @@ fts5(title, body, content=docs, content_rowid=id)'
             fsqlite_mvcc::concurrent_write_page(
                 &mut handle1,
                 &lock_table,
-                1,
                 PageNumber::new(5).unwrap(),
                 PageData::from_vec(vec![0u8; 4096]),
             )
@@ -217864,7 +217843,6 @@ fts5(title, body, content=docs, content_rowid=id)'
                 &mut handle1,
                 &commit_index,
                 &lock_table,
-                1,
                 CommitSeq::new(1),
             );
             assert!(
@@ -217884,7 +217862,6 @@ fts5(title, body, content=docs, content_rowid=id)'
             fsqlite_mvcc::concurrent_write_page(
                 &mut handle2,
                 &lock_table,
-                2,
                 PageNumber::new(5).unwrap(),
                 PageData::from_vec(vec![1u8; 4096]),
             )
@@ -217895,7 +217872,6 @@ fts5(title, body, content=docs, content_rowid=id)'
                 &mut handle2,
                 &commit_index,
                 &lock_table,
-                2,
                 CommitSeq::new(2),
             );
             assert!(commit2_result.is_err(), "Session 2 should fail to commit");
@@ -222115,7 +222091,6 @@ mod pager_routing_tests {
         concurrent_write_page(
             &mut handle1,
             &lock_table,
-            1,
             page,
             PageData::from_vec(vec![0xAA; 4096]),
         )
@@ -222140,7 +222115,6 @@ mod pager_routing_tests {
         concurrent_write_page(
             &mut handle2,
             &lock_table,
-            2,
             page,
             PageData::from_vec(vec![0xBB; 4096]),
         )
@@ -222676,7 +222650,6 @@ mod pager_routing_tests {
             let result1 = concurrent_write_page(
                 &mut h1,
                 &lock_table,
-                sid1,
                 page,
                 PageData::from_vec(vec![0xAA; 4096]),
             );
@@ -222690,7 +222663,6 @@ mod pager_routing_tests {
             let result2 = concurrent_write_page(
                 &mut h2,
                 &lock_table,
-                sid2,
                 page,
                 PageData::from_vec(vec![0xBB; 4096]),
             );
@@ -222720,7 +222692,6 @@ mod pager_routing_tests {
             let r1 = concurrent_write_page(
                 &mut h1,
                 &lock_table,
-                sid1,
                 PageNumber::new(10).unwrap(),
                 PageData::from_vec(vec![0xAA; 4096]),
             );
@@ -222732,7 +222703,6 @@ mod pager_routing_tests {
             let r2 = concurrent_write_page(
                 &mut h2,
                 &lock_table,
-                sid2,
                 PageNumber::new(20).unwrap(),
                 PageData::from_vec(vec![0xBB; 4096]),
             );
@@ -222901,7 +222871,6 @@ mod pager_routing_tests {
             concurrent_write_page(
                 &mut ha,
                 &lock_table,
-                sid,
                 page,
                 PageData::from_vec(vec![0xAA; 4096]),
             )
@@ -222955,7 +222924,6 @@ mod pager_routing_tests {
             concurrent_write_page(
                 &mut h,
                 &lock_table,
-                sid,
                 page,
                 PageData::from_vec(vec![0xCC; 4096]),
             )
