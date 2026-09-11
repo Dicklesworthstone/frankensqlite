@@ -5551,10 +5551,10 @@ async fn async_rwlock_read<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock
-            .read(&native_cx)
-            .await
-            .map_err(|error| FrankenError::internal(format!("{label} read lock failed: {error}")));
+        return lock.read(&native_cx).await.map_err(|error| match error {
+            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+            error => FrankenError::internal(format!("{label} read lock failed: {error}")),
+        });
     }
 
     loop {
@@ -5585,8 +5585,9 @@ async fn async_rwlock_write<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock.write(&native_cx).await.map_err(|error| {
-            FrankenError::internal(format!("{label} write lock failed: {error}"))
+        return lock.write(&native_cx).await.map_err(|error| match error {
+            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+            error => FrankenError::internal(format!("{label} write lock failed: {error}")),
         });
     }
 
@@ -29220,6 +29221,50 @@ mod tests {
         (pager, path)
     }
 
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_rwlock_cancellation_preserves_abort_and_masking() {
+        asupersync::test_utils::run_test(|| async {
+            let lock = AsyncRwLock::new(0_u8);
+            for write in [false, true] {
+                for cancelled_before_wait in [false, true] {
+                    let cx = Cx::new();
+                    cx.set_native_cx(asupersync::Cx::for_testing());
+                    let blocker = lock.try_write().unwrap();
+                    if cancelled_before_wait {
+                        cx.cancel();
+                    }
+                    let mut acquire = Box::pin(async {
+                        if write {
+                            async_rwlock_write(&lock, &cx, "test").await.map(drop)
+                        } else {
+                            async_rwlock_read(&lock, &cx, "test").await.map(drop)
+                        }
+                    });
+                    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    if !cancelled_before_wait {
+                        assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+                        cx.cancel();
+                    }
+                    assert!(matches!(
+                        acquire.as_mut().poll(&mut task_cx),
+                        std::task::Poll::Ready(Err(FrankenError::Abort))
+                    ));
+                    drop(acquire);
+                    drop(blocker);
+                    assert!(lock.try_write().is_ok(), "cancelled waiter must retire");
+
+                    let _mask = cx.masked();
+                    if write {
+                        assert!(async_rwlock_write(&lock, &cx, "masked").await.is_ok());
+                    } else {
+                        assert!(async_rwlock_read(&lock, &cx, "masked").await.is_ok());
+                    }
+                }
+            }
+        });
+    }
+
     #[cfg(all(feature = "native", unix))]
     #[test]
     fn native_mvcc_mapping_releases_inner_before_wait_and_outlives_pager() {
@@ -29244,10 +29289,15 @@ mod tests {
             drop(guard);
             drop(db_file);
 
-            let cancelled = Cx::new();
-            cancelled.cancel();
-            assert!(matches!(pager.mvcc_shm_map(&cancelled, 4096, true).await, Err(FrankenError::Abort)));
-            assert!(!companion.exists(), "cancelled attachment must remain byte-neutral");
+            for attach_native in [false, true] {
+                let cancelled = Cx::new();
+                if attach_native {
+                    cancelled.set_native_cx(asupersync::Cx::for_testing());
+                }
+                cancelled.cancel();
+                assert!(matches!(pager.mvcc_shm_map(&cancelled, 4096, true).await, Err(FrankenError::Abort)));
+                assert!(!companion.exists(), "cancelled attachment must remain byte-neutral");
+            }
 
             let first = pager.mvcc_shm_map(&cx, 4096, true).await.unwrap();
             assert!(first.is_mmap_backed());

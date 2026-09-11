@@ -1526,14 +1526,13 @@ impl SharedMemoryLayout {
 
     /// Allocate the next `TxnId` via CAS loop.
     ///
-    /// Returns `None` if the id space is exhausted.
+    /// Returns `None` without changing the counter if it is invalid or the id
+    /// space is exhausted. Zero must never be repaired into a reusable owner id.
     pub fn alloc_txn_id(&self) -> Option<TxnId> {
         loop {
             let current =
                 self.load_u64_field(offsets::NEXT_TXN_ID, &self.next_txn_id, Ordering::Acquire);
-            if current > TxnId::MAX_RAW {
-                return None;
-            }
+            let txn_id = TxnId::new(current)?;
             let next = current.checked_add(1)?;
             if self
                 .compare_exchange_u64_field(
@@ -1546,7 +1545,7 @@ impl SharedMemoryLayout {
                 )
                 .is_ok()
             {
-                return TxnId::new(current);
+                return Some(txn_id);
             }
         }
     }
@@ -2268,6 +2267,46 @@ mod tests {
     }
 
     #[test]
+    fn test_alloc_txn_id_invalid_counter_never_repairs_or_reuses_owners() {
+        for invalid in [0, TxnId::MAX_RAW + 1, u64::MAX] {
+            let mut bytes = SharedMemoryLayout::new(PageSize::DEFAULT, 64).to_bytes();
+            write_u64(&mut bytes, offsets::NEXT_TXN_ID, invalid);
+            let local = SharedMemoryLayout::open(&bytes).unwrap();
+            let region = ShmRegion::from_vec(bytes.clone());
+            let first = SharedMemoryLayout::open_region(region.share()).unwrap();
+            let second = SharedMemoryLayout::open_region(region.share()).unwrap();
+            for _ in 0..2 {
+                for layout in [&local, &first, &second] {
+                    assert_eq!(layout.alloc_txn_id(), None);
+                    assert_eq!(layout.to_bytes(), bytes, "invalid counter {invalid}");
+                }
+            }
+            assert_eq!(&*region.lock(), bytes.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_alloc_txn_id_last_valid_owner_is_allocated_once() {
+        let mut bytes = SharedMemoryLayout::new(PageSize::DEFAULT, 64).to_bytes();
+        write_u64(&mut bytes, offsets::NEXT_TXN_ID, TxnId::MAX_RAW - 1);
+        let local = SharedMemoryLayout::open(&bytes).unwrap();
+        let region = ShmRegion::from_vec(bytes);
+        let first = SharedMemoryLayout::open_region(region.share()).unwrap();
+        let second = SharedMemoryLayout::open_region(region.share()).unwrap();
+        for (a, b) in [(&local, &local), (&first, &second)] {
+            assert_eq!(a.alloc_txn_id().unwrap().get(), TxnId::MAX_RAW - 1);
+            assert_eq!(b.alloc_txn_id().unwrap().get(), TxnId::MAX_RAW);
+            for layout in [a, b] {
+                assert_eq!(layout.alloc_txn_id(), None);
+                assert_eq!(
+                    read_u64(&layout.to_bytes(), offsets::NEXT_TXN_ID),
+                    TxnId::MAX_RAW + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_alloc_txn_id_threaded() {
         let layout = Arc::new(SharedMemoryLayout::new(PageSize::DEFAULT, 64));
         let mut all_ids: Vec<u64> = (0..4)
@@ -2887,8 +2926,29 @@ mod tests {
                 );
             }
             assert_eq!(ids, (1..=2 * COUNT as u64).collect());
-            let layout = SharedMemoryLayout::open_region(region).unwrap();
+            let layout = SharedMemoryLayout::open_region(region.share()).unwrap();
             assert_eq!(layout.alloc_txn_id().unwrap().get(), 2 * COUNT as u64 + 1);
+
+            // Corrupt the counter only after both real processes have finished.
+            // A published header must never self-repair zero and reissue owner 1.
+            region
+                .atomic_store_u64_le(offsets::NEXT_TXN_ID, 0, Ordering::Release)
+                .unwrap();
+            let attached = SharedMemoryLayout::open_or_initialize_region(
+                region.share(),
+                PageSize::DEFAULT,
+                64,
+            )
+            .unwrap();
+            for handle in [&layout, &attached, &layout] {
+                assert_eq!(handle.alloc_txn_id(), None);
+                assert_eq!(
+                    region
+                        .atomic_load_u64_le(offsets::NEXT_TXN_ID, Ordering::Acquire)
+                        .unwrap(),
+                    0
+                );
+            }
         }
     }
 
