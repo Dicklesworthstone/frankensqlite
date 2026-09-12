@@ -336,6 +336,54 @@ fn strict_readonly_reopens_while_same_process_wal_writer_remains_alive() {
     });
 }
 
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn strict_readonly_reads_checkpointed_wal_database_without_usable_sidecar() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("checkpointed-source.db");
+        let writer = Connection::open(source.to_str().unwrap()).await.unwrap();
+        writer.execute("CREATE TABLE evidence(piece TEXT); INSERT INTO evidence VALUES ('checkpointed');")
+            .await.unwrap();
+        writer.close().await.expect("checkpoint source database");
+        let main_before = std::fs::read(&source).unwrap();
+        assert_eq!(&main_before[18..20], &[2, 2], "source retains WAL format");
+
+        for (kind, sidecar) in [
+            ("missing", None),
+            ("empty", Some(Vec::new())),
+            ("short", Some(vec![0x44; 16])),
+            ("invalid", Some(vec![0x44; 32])),
+        ] {
+            let path = dir.path().join(format!("checkpointed-{kind}.db"));
+            std::fs::copy(&source, &path).unwrap();
+            let db_str = path.to_str().unwrap();
+            let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+            if let Some(bytes) = &sidecar {
+                std::fs::write(&wal_path, bytes).unwrap();
+            }
+            let reader = Connection::open_schema_only(db_str).await.unwrap_or_else(|error| {
+                panic!("strict reader must accept checkpointed main database with {kind} WAL: {error:?}")
+            });
+            assert_eq!(
+                reader.query_row("SELECT piece FROM evidence;").await.unwrap().values(),
+                &[SqliteValue::Text("checkpointed".into())],
+                "{kind}: committed main-file row remains readable"
+            );
+            let error = reader.execute("INSERT INTO evidence VALUES ('refused');").await.unwrap_err();
+            assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{kind}: {error}");
+            reader.close().await.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), main_before, "{kind}: main bytes unchanged");
+            if let Some(bytes) = &sidecar {
+                assert_eq!(&std::fs::read(&wal_path).unwrap(), bytes, "{kind}: WAL bytes unchanged");
+            } else {
+                assert!(!wal_path.exists(), "missing WAL must not be created");
+            }
+            assert!(!std::path::Path::new(&format!("{db_str}-shm")).exists(), "{kind}: SHM must not be created");
+        }
+    });
+}
+
 /// GH #384: checkpointing from an idle connection must retain the newer
 /// page-1 change counter written to the WAL by a peer connection. Otherwise a
 /// successful TRUNCATE reset leaves both existing and newly opened in-process
