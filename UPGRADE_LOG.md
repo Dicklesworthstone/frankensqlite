@@ -115,6 +115,18 @@ This does not replace the final audit after all upgrades.
   full MVCC `3ee46e9e1442242a4b036a6e38d3e9a4282cce6bfb7aa50e2353f4e43c754397`.
   No sanitizer execution or ignored performance-gate acceptance is inferred.
 
+### crossbeam-epoch 0.9.20 → 0.9.21 — passed
+
+- Upstream improves ThreadSanitizer compatibility and makes `Shared::null`
+  const. Existing dependency requirements/features are preserved; only the
+  lockfile version/checksum change. The project consumer is MVCC reclamation.
+- Baseline full MVCC suite passed with epoch 0.9.20 and utilities 0.8.23.
+  Candidate full MVCC RCH `30016197441356046` also passed 1,568 tests,
+  15 ignored, zero failures, including EBR property tests. All 1,619 post-run
+  source inputs match manifest `bfa6497b`. Log SHA256:
+  `8e8fb1820ae13afd00b7a5b560d7929871fc275ad2dc2ea568370242203b5a9a`.
+- This does not claim sanitizer execution or ignored performance acceptance.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
