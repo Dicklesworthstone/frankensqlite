@@ -102,6 +102,19 @@ This does not replace the final audit after all upgrades.
   of an updated runtime. Log SHA256:
   `5f528f5613aa4d7c6c869069129bd3f556a9c409a437eccc8c59cbaebc6439a7`.
 
+### crossbeam-utils 0.8.22 → 0.8.23 — passed
+
+- Fixes a Stacked Borrows violation involving a leaked `ShardedLockWriteGuard`
+  and improves ThreadSanitizer compatibility. Dependency requirements, features
+  and MSRV 1.60 are unchanged. Only lockfile version/checksum change.
+- Prior-version Linux EBR baseline passed 30/30. Candidate RCH
+  `30016197441356043` passed the same 30 tests; full MVCC library RCH
+  `30016197441356045` passed 1,568 tests, 15 ignored, zero failures.
+  Both post-run manifests match all 1,619 source inputs `e42e3e2c`.
+- Log SHA256: EBR `c7ebc584159f9b97dca370539f52e515e56576d2d5eeb1794d0071892d651844`;
+  full MVCC `3ee46e9e1442242a4b036a6e38d3e9a4282cce6bfb7aa50e2353f4e43c754397`.
+  No sanitizer execution or ignored performance-gate acceptance is inferred.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
