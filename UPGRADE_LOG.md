@@ -174,6 +174,17 @@ This does not replace the final audit after all upgrades.
   because RCH quoted the assignment; the final `env` command above succeeded.
   Neither preliminary attempt is used to prove the no-update setting.
 
+### indexmap 2.14.1 → 2.14.2 — passed
+
+- Fixes map/set macro item hygiene and permits const initialization of empty
+  default-hasher maps/sets. Requirements/features and MSRV 1.85 stay unchanged.
+- Only lockfile version/checksum change. Native RCH `30017537169162285`
+  passed 210 full JSON extension tests, one ignored, including ordered object
+  removal and interleaved duplicate-key controls. All 1,643 post-run hashes
+  match `7bf5626a`. `preserve_order` stays local to that crate; the GH356
+  workspace-wide feature leak is not reintroduced. Log SHA256:
+  `0ed6fb75e096e8f87f1ec0929193b890dd170c5a1b2999332ef94a23a55d428a`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
