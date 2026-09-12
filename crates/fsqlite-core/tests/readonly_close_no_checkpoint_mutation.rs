@@ -268,6 +268,122 @@ fn readonly_connection_close_does_not_mutate_main_db_bytes() {
     });
 }
 
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn strict_readonly_reopens_while_same_process_wal_writer_remains_alive() {
+    asupersync::test_utils::run_test(|| async {
+        for microbatch_enabled in [true, false] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("same-process-readonly.db");
+        let path = db.to_str().expect("UTF-8 database path");
+        let writer = Connection::open(path).await.expect("open writer");
+        writer
+            .execute("PRAGMA journal_mode=WAL;")
+            .await
+            .expect("configure WAL writer");
+        if !microbatch_enabled {
+            writer.execute("PRAGMA fsqlite.stmt_microbatch=OFF;")
+                .await.expect("disable statement microbatching");
+        }
+        assert_eq!(
+            writer.query_row("PRAGMA fsqlite.stmt_microbatch;")
+                .await.expect("read statement microbatch setting").values(),
+            &[SqliteValue::Integer(i64::from(microbatch_enabled))]
+        );
+        writer
+            .execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, piece TEXT);")
+            .await
+            .expect("create evidence");
+        writer
+            .execute("INSERT INTO evidence VALUES (1, 'committed');")
+            .await
+            .expect("seed evidence");
+        for pinned_writer_read in [false, true] {
+            if pinned_writer_read {
+                writer.execute("BEGIN;").await.expect("begin writer read");
+            }
+            assert_eq!(
+                writer.query_row("SELECT piece FROM evidence WHERE id=1;")
+                    .await.expect("writer reads committed row").values(),
+                &[SqliteValue::Text("committed".into())]
+            );
+            let before = db_bytes(path);
+            let wal_before = std::fs::read(format!("{path}-wal")).expect("read WAL");
+            for attempt in 0..8 {
+                // SQLITE_OPEN_READ_ONLY routes to this exact core constructor.
+                let reader = Connection::open_schema_only(path).await.unwrap_or_else(|error| {
+                    panic!("strict read-only open {attempt} failed with live writer (pinned={pinned_writer_read}, microbatch={microbatch_enabled}): {error:?}")
+                });
+                assert_eq!(
+                    reader.query_row("SELECT piece FROM evidence WHERE id=1;")
+                        .await.expect("strict reader reads committed row").values(),
+                    &[SqliteValue::Text("committed".into())]
+                );
+                let error = reader.execute("INSERT INTO evidence VALUES (2, 'refused');")
+                    .await.expect_err("strict reader must reject writes");
+                assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{error}");
+                reader.close().await.expect("close strict reader");
+                assert_eq!(db_bytes(path), before, "strict reader changed the database");
+                assert_eq!(std::fs::read(format!("{path}-wal")).expect("read WAL"),
+                    wal_before, "strict reader changed the WAL");
+            }
+            if pinned_writer_read {
+                writer.execute("ROLLBACK;").await.expect("end writer read");
+            }
+        }
+        writer.close().await.expect("close writer");
+        }
+    });
+}
+
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn strict_readonly_reads_checkpointed_wal_database_without_usable_sidecar() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("checkpointed-source.db");
+        let writer = Connection::open(source.to_str().unwrap()).await.unwrap();
+        writer.execute("CREATE TABLE evidence(piece TEXT); INSERT INTO evidence VALUES ('checkpointed');")
+            .await.unwrap();
+        writer.close().await.expect("checkpoint source database");
+        let main_before = std::fs::read(&source).unwrap();
+        assert_eq!(&main_before[18..20], &[2, 2], "source retains WAL format");
+
+        for (kind, sidecar) in [
+            ("missing", None),
+            ("empty", Some(Vec::new())),
+            ("short", Some(vec![0x44; 16])),
+            ("invalid", Some(vec![0x44; 32])),
+        ] {
+            let path = dir.path().join(format!("checkpointed-{kind}.db"));
+            std::fs::copy(&source, &path).unwrap();
+            let db_str = path.to_str().unwrap();
+            let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
+            if let Some(bytes) = &sidecar {
+                std::fs::write(&wal_path, bytes).unwrap();
+            }
+            let reader = Connection::open_schema_only(db_str).await.unwrap_or_else(|error| {
+                panic!("strict reader must accept checkpointed main database with {kind} WAL: {error:?}")
+            });
+            assert_eq!(
+                reader.query_row("SELECT piece FROM evidence;").await.unwrap().values(),
+                &[SqliteValue::Text("checkpointed".into())],
+                "{kind}: committed main-file row remains readable"
+            );
+            let error = reader.execute("INSERT INTO evidence VALUES ('refused');").await.unwrap_err();
+            assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{kind}: {error}");
+            reader.close().await.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), main_before, "{kind}: main bytes unchanged");
+            if let Some(bytes) = &sidecar {
+                assert_eq!(&std::fs::read(&wal_path).unwrap(), bytes, "{kind}: WAL bytes unchanged");
+            } else {
+                assert!(!wal_path.exists(), "missing WAL must not be created");
+            }
+            assert!(!std::path::Path::new(&format!("{db_str}-shm")).exists(), "{kind}: SHM must not be created");
+        }
+    });
+}
+
 /// GH #384: checkpointing from an idle connection must retain the newer
 /// page-1 change counter written to the WAL by a peer connection. Otherwise a
 /// successful TRUNCATE reset leaves both existing and newly opened in-process

@@ -14548,6 +14548,7 @@ where
                 .maintenance_open_lease
                 .lock()
                 .map_err(|_| FrankenError::internal("pager open-lease lock poisoned"))?;
+            let constructor_open = open_lease.is_some();
             let mut transaction_lease = if open_lease.is_none() {
                 Some(self.maintenance_gate.enter_transaction()?)
             } else {
@@ -14562,6 +14563,22 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+            // A read-only constructor starts on the main-file read path until
+            // an existing WAL has been validated and installed. Joining that
+            // WAL adopts its read mode; it does not change the file format or
+            // require exclusive maintenance against already-pinned readers.
+            // Missing/empty sidecars keep the main-only mode below, and normal
+            // writable transitions retain their whole-image maintenance gate.
+            if constructor_open
+                && inner.access_mode.is_readonly()
+                && mode == JournalMode::Wal
+                && inner.active_transactions == 0
+                && !inner.checkpoint_active
+                && has_wal_backend(&self.wal_backend)?
+            {
+                inner.journal_mode = mode;
+            }
 
             if inner.journal_mode == mode {
                 if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
