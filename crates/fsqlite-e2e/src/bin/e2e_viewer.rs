@@ -1082,6 +1082,7 @@ mod tests {
             ops_count: 10_000,
             report: EngineRunReport {
                 wall_time_ms: 1234,
+                wall_time_ns: 1234_u64.saturating_mul(1_000_000),
                 ops_total: 10_000,
                 ops_per_sec: 8_103.7,
                 retries: 0,

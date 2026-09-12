@@ -1772,6 +1772,7 @@ mod tests {
             |_| {
                 Ok::<_, String>(crate::report::EngineRunReport {
                     wall_time_ms: wall_ms,
+                    wall_time_ns: wall_ms.saturating_mul(1_000_000),
                     ops_total,
                     ops_per_sec: ops_total as f64 / (wall_ms as f64 / 1000.0),
                     retries: 0,
@@ -1836,6 +1837,7 @@ mod tests {
             iterations: vec![IterationRecord {
                 iteration: 0,
                 wall_time_ms: 10,
+                wall_time_ns: 10_000_000,
                 ops_per_sec: throughput_ops_per_sec,
                 ops_total: 100,
                 retries: 0,

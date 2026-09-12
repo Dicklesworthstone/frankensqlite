@@ -588,6 +588,8 @@ pub struct StorageWiringReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRunReport {
+    /// Exact measured engine wall time, before conversion to display units.
+    pub wall_time_ns: u64,
     pub wall_time_ms: u64,
     pub ops_total: u64,
     pub ops_per_sec: f64,
@@ -805,6 +807,7 @@ mod tests {
     #[test]
     fn run_record_jsonl_roundtrip() {
         let report = EngineRunReport {
+            wall_time_ns: 123_000_000,
             wall_time_ms: 123,
             ops_total: 7,
             ops_per_sec: 3.5_f64,
@@ -870,6 +873,7 @@ mod tests {
     #[test]
     fn run_record_marks_profile_only_equivalent_behavior_explicitly() {
         let report = EngineRunReport {
+            wall_time_ns: 42_000_000,
             wall_time_ms: 42,
             ops_total: 7,
             ops_per_sec: 3.5_f64,
@@ -918,6 +922,7 @@ mod tests {
     #[test]
     fn hot_path_profile_jsonl_roundtrip() {
         let report = EngineRunReport {
+            wall_time_ns: 123_000_000,
             wall_time_ms: 123,
             ops_total: 7,
             ops_per_sec: 3.5_f64,

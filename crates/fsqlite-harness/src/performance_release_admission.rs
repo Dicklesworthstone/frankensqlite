@@ -1717,6 +1717,12 @@ mod tests {
             }),
         };
         validate_gate(repo.path(), &tested, &gate).expect("keeper authorizes structurally");
+        crate::release_certificate::validate_phase5_performance_regression_gate(
+            repo.path(),
+            &tested,
+            &gate,
+        )
+        .expect("the certificate authorization boundary accepts a validated pack");
         assert_eq!(
             authorized_artifact_paths(repo.path(), &tested, &gate)
                 .expect("authorized artifact inventory")
@@ -1731,6 +1737,17 @@ mod tests {
             validate_pack(repo.path(), &tested, &mismatched, false)
                 .expect_err("report provenance must be cross-checked")
                 .contains("host fingerprint")
+        );
+        fs::write(repo.path().join("admission-pack.json"), b"{}")
+            .expect("tamper with the previously validated pack");
+        assert!(
+            crate::release_certificate::validate_phase5_performance_regression_gate(
+                repo.path(),
+                &tested,
+                &gate,
+            )
+            .expect_err("an earlier successful validation cannot authorize changed bytes")
+            .contains("admission pack SHA-256 does not bind its bytes")
         );
     }
 

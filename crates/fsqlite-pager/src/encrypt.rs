@@ -449,6 +449,54 @@ mod tests {
     }
 
     #[test]
+    fn test_argon2id_kek_matches_libsodium_vectors() {
+        // Libsodium tv3 cases 2 and 4: Argon2id v19, no secret or associated data.
+        // https://github.com/jedisct1/libsodium/blob/39184b5b96176536f905bb42eafdc59c22a20e6e/test/default/pwhash_argon2id.c#L195-L200
+        // Fixed external answers guard key compatibility across KDF upgrades;
+        // encrypt/decrypt roundtrips alone would accept a changed derived key.
+        let cases = [
+            (
+                b"".as_slice(),
+                [
+                    0x6c, 0x0f, 0x35, 0x6a, 0xbb, 0x22, 0x5f, 0x2b, 0x1d, 0xdd, 0x66, 0xd3,
+                    0x47, 0x39, 0x84, 0x3b,
+                ],
+                Argon2Params {
+                    m_cost: 4_882,
+                    t_cost: 2,
+                    p_cost: 1,
+                },
+                [
+                    0x36, 0x6f, 0x10, 0x04, 0xcf, 0xbb, 0x44, 0x7d, 0x43, 0x5e, 0x8f, 0x6b,
+                    0xbe, 0x9e, 0x5c, 0xc0, 0xa1, 0x0e, 0x38, 0xe7, 0xc3, 0xda, 0x0e, 0x89,
+                    0xbb, 0x19, 0x57, 0x8a, 0x1a, 0x0d, 0x72, 0x91,
+                ],
+            ),
+            (
+                // The final space is part of this 66-byte password.
+                b"^T5H$JYt39n%K*j:W]!1s?vg!:jGi]Ax?..l7[p0v:1jHTpla9;]bUN;?bWyCbtqg ".as_slice(),
+                *b">A 16-bytes salt",
+                Argon2Params {
+                    m_cost: 4_096,
+                    t_cost: 19,
+                    p_cost: 1,
+                },
+                [
+                    0x96, 0xd0, 0x7f, 0xb9, 0xed, 0x64, 0x3e, 0xd0, 0x4c, 0x04, 0x67, 0xec,
+                    0xca, 0xc3, 0x29, 0x3e, 0x28, 0x04, 0xea, 0x18, 0x8d, 0x10, 0xa6, 0x7d,
+                    0xbe, 0xcf, 0x2f, 0x2c, 0xd5, 0x43, 0x40, 0x60,
+                ],
+            ),
+        ];
+
+        for (case, (passphrase, salt, params, expected)) in cases.into_iter().enumerate() {
+            let actual = KeyManager::derive_kek(passphrase, &salt, &params)
+                .expect("valid Libsodium Argon2id parameters");
+            assert_eq!(actual, expected, "Libsodium Argon2id case {case}");
+        }
+    }
+
+    #[test]
     fn test_dek_kek_envelope_wrap_unwrap() {
         let passphrase = b"test-passphrase-42";
         let salt = [0x11u8; 16];

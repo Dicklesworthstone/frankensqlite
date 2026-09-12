@@ -1167,6 +1167,7 @@ mod tests {
         };
         EngineRunReport {
             wall_time_ms: wall_ms,
+            wall_time_ns: wall_ms.saturating_mul(1_000_000),
             ops_total: ops,
             ops_per_sec,
             retries: 2,

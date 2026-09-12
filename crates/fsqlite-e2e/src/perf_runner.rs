@@ -3198,7 +3198,7 @@ fn build_hot_path_baseline_waste_ledger(
         .engine_report
         .runtime_phase_timing
         .unwrap_or_default();
-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let wall_time_ns = report.engine_report.wall_time_ns;
     let parser_time_ns = report
         .parser
         .parse_time_ns
@@ -3565,7 +3565,7 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
 fn build_hot_path_wall_time_components(
     report: &HotPathProfileReport,
 ) -> Vec<HotPathWallTimeComponentEntry> {
-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let wall_time_ns = report.engine_report.wall_time_ns;
     let allocator_copy_time_ns = report
         .row_materialization
         .result_row_materialization_time_ns_total;
@@ -3715,7 +3715,7 @@ fn build_hot_path_causal_classification(
     HotPathCausalClassificationSummary,
     Vec<HotPathCausalBucketEntry>,
 ) {
-    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let wall_time_ns = report.engine_report.wall_time_ns;
     let runtime_phase_timing = report
         .engine_report
         .runtime_phase_timing
@@ -4820,6 +4820,7 @@ mod tests {
     fn sample_engine_report() -> EngineRunReport {
         EngineRunReport {
             wall_time_ms: 42,
+            wall_time_ns: 42_u64.saturating_mul(1_000_000),
             ops_total: 17,
             ops_per_sec: 404.0,
             retries: 0,
@@ -4854,6 +4855,7 @@ mod tests {
         };
         let engine_report = EngineRunReport {
             wall_time_ms: 42,
+            wall_time_ns: 42_u64.saturating_mul(1_000_000),
             ops_total: 17,
             ops_per_sec: 404.0,
             retries: 0,

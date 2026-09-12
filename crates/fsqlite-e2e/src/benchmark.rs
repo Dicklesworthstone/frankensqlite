@@ -1268,6 +1268,8 @@ pub struct ThroughputStats {
 pub struct IterationRecord {
     /// 0-based index within the measurement phase (excludes warmup).
     pub iteration: u32,
+    /// Exact measured engine wall time; used for submillisecond statistics.
+    pub wall_time_ns: u64,
     /// Wall time in milliseconds.
     pub wall_time_ms: u64,
     /// Operations per second.
@@ -1331,6 +1333,7 @@ where
                 }
                 IterationRecord {
                     iteration: measurement_idx,
+                    wall_time_ns: report.wall_time_ns,
                     wall_time_ms: report.wall_time_ms,
                     ops_per_sec: report.ops_per_sec,
                     ops_total: report.ops_total,
@@ -1341,6 +1344,7 @@ where
             }
             Err(e) => IterationRecord {
                 iteration: measurement_idx,
+                wall_time_ns: u64::try_from(iter_elapsed.as_nanos()).unwrap_or(u64::MAX),
                 wall_time_ms: duration_to_u64_ms(iter_elapsed),
                 ops_per_sec: 0.0,
                 ops_total: 0,
@@ -1363,7 +1367,10 @@ where
     let total_measurement_ms = duration_to_u64_ms(measurement_start.elapsed());
 
     // ── Compute statistics ─────────────────────────────────────────
-    let wall_times: Vec<f64> = iterations.iter().map(|r| r.wall_time_ms as f64).collect();
+    let wall_times: Vec<f64> = iterations
+        .iter()
+        .map(|r| r.wall_time_ns as f64 / 1_000_000.0)
+        .collect();
     let throughputs: Vec<f64> = iterations.iter().map(|r| r.ops_per_sec).collect();
 
     let latency = compute_latency_stats(&wall_times);
@@ -1515,6 +1522,7 @@ mod tests {
             0.0
         };
         EngineRunReport {
+            wall_time_ns: wall_ms.saturating_mul(1_000_000),
             wall_time_ms: wall_ms,
             ops_total: ops,
             ops_per_sec,
@@ -1555,6 +1563,35 @@ mod tests {
             min_iterations: 5,
             measurement_time_secs: 0,
         }
+    }
+
+    #[test]
+    fn submillisecond_latency_preserves_engine_timing_and_raw_samples() {
+        let config = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 5,
+            measurement_time_secs: 0,
+        };
+        let summary = run_benchmark(&config, &test_meta(), |_| {
+            let mut report = dummy_report(0, 100);
+            report.wall_time_ns = 250_000;
+            report.ops_per_sec = 400_000.0;
+            Ok::<_, String>(report)
+        });
+        assert_eq!(summary.measurement_count, 5);
+        for sample in &summary.iterations {
+            assert_eq!(sample.wall_time_ns, 250_000);
+            assert_eq!(sample.wall_time_ms, 0);
+        }
+        assert_eq!(summary.latency.min_ms, 0.25);
+        assert_eq!(summary.latency.median_ms, 0.25);
+        assert_eq!(summary.latency.p95_ms, 0.25);
+        assert_eq!(summary.latency.p99_ms, 0.25);
+        let roundtrip: BenchmarkSummary =
+            serde_json::from_str(&summary.to_jsonl().expect("serialize precise samples"))
+                .expect("deserialize precise samples");
+        assert_eq!(roundtrip.iterations[0].wall_time_ns, 250_000);
+        assert_eq!(roundtrip.latency.p95_ms, 0.25);
     }
 
     fn scorecard_summary(
