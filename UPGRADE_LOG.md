@@ -1,5 +1,42 @@
 # Dependency Upgrade Log
 
+## September 12, 2026 — release dependency review in progress
+
+The owner requested latest stable dependency updates before the next DSR,
+crates.io and Homebrew release. Updates will be researched and tested one at
+a time through RCH. Existing path/git dependencies and prereleases retain their
+declared policy. The nightly toolchain and concurrent-writer defaults remain
+unchanged. Completed upgrades and their individual checks are recorded below.
+
+The live direct-dependency inventory is retained at
+`/tmp/frankensqlite-dependency-research-live-20260912.json`. Patch candidates
+include bitflags, smallvec, toml, crossbeam, io-uring, trybuild and asupersync;
+Argon2, ftui, jsonschema and syn require breaking-change review. The earlier
+tinyvec build failure below must be checked before accepting a newer version.
+
+Release qualification is still incomplete: the all-features run exhausted its
+four-hour RCH timeout during compilation, and the historical performance
+comparison remains red. Earlier focused checks are not final updated-lockfile
+acceptance. Homebrew's existing `fsqlite` formula is at 0.3.9 and needs an update
+using verified hashes from the eventual new release assets.
+
+### bitflags 2.13.1 → 2.13.2 — passed
+
+- The published patch moves const declarations outside nested const blocks;
+  MSRV remains 1.56.0. No public API migration is declared.
+- Research: [exact packaged changelog](https://github.com/bitflags/bitflags/blob/80ce9b545acb0bd42150695fc351889cac1d8eb4/CHANGELOG.md).
+- Only the lockfile version and published registry checksum changed; the
+  existing `2.13` requirement and serde feature are unchanged.
+- Native macOS `fsqlite-types --lib`: 562 passed, zero failed/ignored,
+  strict RCH job `30017370403635261`. All 1,616 post-run source hashes
+  match manifest `91d724fdf5d58fb1a4bee62734b6be4641328b87215345c3383d837c741e12d4`.
+- Test log SHA256: `838846882d5ee47c55876bf8b8a157fd0e21553ce12546cf02136de59f77951b`.
+- Native macOS workspace/all-targets compilation passed in strict RCH
+  `30017370403635263`; all 1,616 post-run source hashes match the same manifest.
+  Check log SHA256: `e7ec0cc7cef30e15c4da3fd3dd2d7f3e8542547ff1678fba478f323ab2a3584f`.
+- Final updated-dependency workspace tests, all-features checks and security
+  audit remain separate release requirements.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
