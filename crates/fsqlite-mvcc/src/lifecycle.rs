@@ -380,6 +380,10 @@ pub enum MvccError {
     ShmTooSmall,
     /// SHM magic bytes do not match `FSQLSHM\0`.
     ShmBadMagic,
+    /// Another opener claimed SHM initialization; retry within the caller's deadline.
+    ShmInitializing,
+    /// An existing SHM layout disagrees with the requested configuration.
+    ShmConfigurationMismatch,
     /// SHM version field does not match the expected version.
     ShmVersionMismatch,
     /// SHM page_size is not a valid power-of-two in \[512, 65536\].
@@ -403,6 +407,8 @@ impl std::fmt::Display for MvccError {
             Self::TxnIdExhausted => write!(f, "TxnId space exhausted"),
             Self::ShmTooSmall => write!(f, "SHM buffer too small"),
             Self::ShmBadMagic => write!(f, "SHM bad magic"),
+            Self::ShmInitializing => write!(f, "SHM initialization in progress"),
+            Self::ShmConfigurationMismatch => write!(f, "SHM configuration mismatch"),
             Self::ShmVersionMismatch => write!(f, "SHM version mismatch"),
             Self::ShmInvalidPageSize => write!(f, "SHM invalid page size"),
             Self::ShmChecksumMismatch => write!(f, "SHM checksum mismatch"),
@@ -416,7 +422,7 @@ impl std::error::Error for MvccError {}
 
 fn map_read_page_error(error: MvccError, pgno: PageNumber) -> FrankenError {
     match error {
-        MvccError::Busy => FrankenError::Busy,
+        MvccError::Busy | MvccError::ShmInitializing => FrankenError::Busy,
         MvccError::BusySnapshot => FrankenError::BusySnapshot {
             conflicting_pages: pgno.get().to_string(),
         },
@@ -424,6 +430,7 @@ fn map_read_page_error(error: MvccError, pgno: PageNumber) -> FrankenError {
         MvccError::IoErr => FrankenError::IoRead { page: pgno.get() },
         MvccError::InvalidState
         | MvccError::TxnIdExhausted
+        | MvccError::ShmConfigurationMismatch
         | MvccError::InvalidWriteMergePolicy => FrankenError::Internal(error.to_string()),
         MvccError::ShmTooSmall
         | MvccError::ShmBadMagic

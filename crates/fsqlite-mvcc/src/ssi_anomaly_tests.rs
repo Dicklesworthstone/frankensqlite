@@ -181,12 +181,12 @@ fn ssi_anomaly_write_skew_detected() {
     {
         let mut h1 = registry.get_mut(s1).unwrap();
         h1.record_read(test_page(100));
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(200), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(200), test_data()).unwrap();
     }
     {
         let mut h2 = registry.get_mut(s2).unwrap();
         h2.record_read(test_page(200));
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(100), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(100), test_data()).unwrap();
     }
 
     // T1 commits first.
@@ -251,27 +251,13 @@ fn ssi_write_skew_balance_constraint_aborts_one_without_mock_edges() {
         let mut h1 = registry.get_mut(s1).unwrap();
         h1.record_read(balance_a);
         h1.record_read(balance_b);
-        concurrent_write_page(
-            &mut h1,
-            &lock_table,
-            s1,
-            balance_a,
-            balance_data(withdrawn_a),
-        )
-        .unwrap();
+        concurrent_write_page(&mut h1, &lock_table, balance_a, balance_data(withdrawn_a)).unwrap();
     }
     {
         let mut h2 = registry.get_mut(s2).unwrap();
         h2.record_read(balance_a);
         h2.record_read(balance_b);
-        concurrent_write_page(
-            &mut h2,
-            &lock_table,
-            s2,
-            balance_b,
-            balance_data(withdrawn_b),
-        )
-        .unwrap();
+        concurrent_write_page(&mut h2, &lock_table, balance_b, balance_data(withdrawn_b)).unwrap();
     }
 
     let result1 = concurrent_commit_with_ssi(
@@ -384,12 +370,12 @@ fn ssi_anomaly_phantom_via_registry() {
         for p in 300..305 {
             h1.record_read(test_page(p));
         }
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(400), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(400), test_data()).unwrap();
     }
     {
         let mut h2 = registry.get_mut(s2).unwrap();
         h2.record_read(test_page(500));
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(303), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(303), test_data()).unwrap();
     }
 
     // T2 commits first (only has incoming edge from T1).
@@ -445,7 +431,7 @@ fn ssi_predicate_phantom_cycle_aborts_scan_without_mock_edges() {
     {
         let mut h_scan = registry.get_mut(scan).unwrap();
         h_scan.record_read_witness(scanned_range);
-        concurrent_write_page(&mut h_scan, &lock_table, scan, aggregate_page, test_data()).unwrap();
+        concurrent_write_page(&mut h_scan, &lock_table, aggregate_page, test_data()).unwrap();
     }
     {
         let mut h_insert = registry.get_mut(insert).unwrap();
@@ -454,8 +440,7 @@ fn ssi_predicate_phantom_cycle_aborts_scan_without_mock_edges() {
             WitnessKey::for_point_write(index_root, inserted_key, insert_leaf);
         h_insert.record_write_witness(cell_witness);
         h_insert.record_write_witness(page_witness);
-        concurrent_write_page(&mut h_insert, &lock_table, insert, insert_leaf, test_data())
-            .unwrap();
+        concurrent_write_page(&mut h_insert, &lock_table, insert_leaf, test_data()).unwrap();
     }
 
     let scan_result = concurrent_commit_with_ssi(
@@ -516,12 +501,12 @@ fn ssi_anomaly_lost_update_prevented_by_fcw() {
     // T1 writes page 50.
     {
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(50), test_data()).unwrap();
     }
     // T2 writes a different page (page lock prevents writing the same page concurrently).
     {
         let mut h2 = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(60), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(60), test_data()).unwrap();
     }
 
     // T1 commits first, updates commit_index for page 50.
@@ -541,7 +526,7 @@ fn ssi_anomaly_lost_update_prevented_by_fcw() {
     let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
     {
         let mut h3 = registry.get_mut(s3).unwrap();
-        concurrent_write_page(&mut h3, &lock_table, s3, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h3, &lock_table, test_page(50), test_data()).unwrap();
     }
 
     // T3 should fail FCW: page 50 was committed at seq 11 > T3's snapshot high 10.
@@ -575,19 +560,19 @@ fn ssi_anomaly_three_way_write_skew_cycle() {
     {
         let mut h1 = registry.get_mut(s1).unwrap();
         h1.record_read(test_page(100));
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(200), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(200), test_data()).unwrap();
     }
     // T2: reads B (page 200), writes C (page 300).
     {
         let mut h2 = registry.get_mut(s2).unwrap();
         h2.record_read(test_page(200));
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(300), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(300), test_data()).unwrap();
     }
     // T3: reads C (page 300), writes A (page 100).
     {
         let mut h3 = registry.get_mut(s3).unwrap();
         h3.record_read(test_page(300));
-        concurrent_write_page(&mut h3, &lock_table, s3, test_page(100), test_data()).unwrap();
+        concurrent_write_page(&mut h3, &lock_table, test_page(100), test_data()).unwrap();
     }
 
     let mut commits = 0u32;
@@ -1021,7 +1006,7 @@ fn rebase_fcw_conflict_detected() {
     // T1 writes page 50.
     {
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(50), test_data()).unwrap();
     }
     // T1 commits → page 50 now at seq 11.
     let result1 = concurrent_commit_with_ssi(
@@ -1036,7 +1021,7 @@ fn rebase_fcw_conflict_detected() {
     // T2 writes the same page 50 (with snapshot at seq 10).
     {
         let mut h2 = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(50), test_data()).unwrap();
     }
 
     // T2 should fail FCW validation.
@@ -1066,11 +1051,11 @@ fn rebase_disjoint_pages_both_commit() {
 
     {
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(50), test_data()).unwrap();
     }
     {
         let mut h2 = registry.get_mut(s2).unwrap();
-        concurrent_write_page(&mut h2, &lock_table, s2, test_page(60), test_data()).unwrap();
+        concurrent_write_page(&mut h2, &lock_table, test_page(60), test_data()).unwrap();
     }
 
     let result1 = concurrent_commit_with_ssi(
@@ -1108,19 +1093,19 @@ fn rebase_abort_releases_locks() {
     let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
     {
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(&mut h1, &lock_table, s1, test_page(50), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, test_page(50), test_data()).unwrap();
     }
     // Abort T1.
     {
         let mut h1 = registry.get_mut(s1).unwrap();
-        concurrent_abort(&mut h1, &lock_table, s1);
+        concurrent_abort(&mut h1, &lock_table);
     }
 
     // T2 should be able to acquire the same page lock.
     let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
     {
         let mut h2 = registry.get_mut(s2).unwrap();
-        let result = concurrent_write_page(&mut h2, &lock_table, s2, test_page(50), test_data());
+        let result = concurrent_write_page(&mut h2, &lock_table, test_page(50), test_data());
         assert!(
             result.is_ok(),
             "bead_id={BEAD_ID} rebase-abort: T2 can write page 50 after T1 abort"
@@ -1163,7 +1148,7 @@ fn rebase_sequential_abort_retry_cycles() {
         // T1 writes page 50.
         {
             let mut h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(&mut h1, &lock_table, s1, test_page(50), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, test_page(50), test_data()).unwrap();
         }
         // T1 commits with fresh snapshot.
         let result1 = concurrent_commit_with_ssi(
@@ -1182,7 +1167,7 @@ fn rebase_sequential_abort_retry_cycles() {
         // T2 writes page 50 (stale snapshot from before T1's commit).
         {
             let mut h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_page(&mut h2, &lock_table, s2, test_page(50), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, test_page(50), test_data()).unwrap();
         }
         // T2 should abort: page 50 committed after T2's snapshot.
         let result2 = concurrent_commit_with_ssi(
