@@ -27,7 +27,7 @@ source-bound receipts below do not certify a new release. Job IDs use prefix
 
 While qualification ran, remote main advanced to `5ced8e118`, incorporating the
 same parser and dependency source. Its production files match the tested tree;
-history and validation-note reconciliation remain pending.
+the histories are reconciled with the current validation notes retained.
 
 Independent acceptance inspection retained closure of bd-7rg1a.3 after checking
 the original contract, exact source and actual test receipts. This was independent
