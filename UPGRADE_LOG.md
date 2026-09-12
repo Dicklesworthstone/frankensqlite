@@ -1,5 +1,30 @@
 # Dependency Upgrade Log
 
+## September 12 — remote integration correction; final qualification pending
+
+A rejected push revealed that the local checkout was behind remote main by
+21 commits. Remote `a8b76fb81` already contains Asupersync 0.5.0, engine 0.4.0,
+pager/core/facade 0.4.1, and read-only WAL/reserved-freelist fixes. The fsqlite
+0.4.0 and 0.4.1 crates were published September 12 at 13:52 and 17:28 UTC;
+GitHub's latest binary release remains v0.3.18. The earlier v0.3.19 release plan
+is therefore stale. Remote changes were read and merged without dropping either
+side's code or tests; the ordinary index and protected peer bytes are preserved.
+
+The merged tree adds our WASM/parser repair and individually qualified FTUI 0.7
+family, retaining remote Asupersync requirements and crate versions. Its 1,645-input
+source manifest is `e727b7e8c216c655834000498dfbaa908a01bd2915221e03fe5a6d4e412f40bb`.
+Final merged-source tests and compiler/lint checks are pending. Earlier source-bound
+receipts below do not certify this merge or a new release.
+
+Separate pre-merge Asupersync 0.5 consumer results on source `bb29a034`:
+98 context tests (RCH 56195), 32 io_uring tests including actual kernel I/O (56198),
+1,568 MVCC tests with 15 ignored (56200), 35 commit-repair tests (56202), and
+41 real Chrome all-feature tests (56199) passed. All 1,645 source hashes matched
+after each run. The original commit-repair selector 56197 ran **zero tests**;
+it is excluded from proof and was replaced by the actual `commit_repair::` module
+selector. These results do not establish the broader historical performance gate.
+All job numbers in this paragraph have prefix `300161974413`.
+
 ## September 12 — WASM family and recoverable parser diagnostics integrated
 
 Updated wasm-bindgen and its matching packages from 0.2.127 to 0.2.128.
