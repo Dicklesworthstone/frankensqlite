@@ -37,6 +37,24 @@ using verified hashes from the eventual new release assets.
 - Final updated-dependency workspace tests, all-features checks and security
   audit remain separate release requirements.
 
+### tinyvec 1.12.0 → 1.13.2 — passed; existing WASM warnings retained
+
+- The previously rejected 1.13.0 is not retried. Upstream 1.13.1 fixes
+  allocation without `std`, and 1.13.2 fixes a further `no_std` macro expansion
+  bug. [Exact changelog](https://github.com/Lokathor/tinyvec/blob/5ae3e523dd46392d45f929591889430d1438ae5e/changelog.md).
+- Only the lockfile version/checksum changes. This dependency is reached
+  through `asupersync` → `unicode-normalization` → `tinyvec`.
+- Native types tests passed 562/562, zero ignored, in strict RCH
+  `30017370403635265`, with all 1,616 source hashes matching `07135f5f`.
+  Test log SHA256: `5e0acdafdb34330a66a2cd74f9c4c2f2e0bb7b24c16b0f2168eb7baae566e417`.
+- WebAssembly consumer compilation passed in RCH `30016197441356027`, with
+  all 1,616 source hashes unchanged. Log SHA256:
+  `43f46704a834166fb58160312b8c25e94bfcca9d9b89f5ad7511d4600f802668`.
+- It emitted 45 project warnings in pager/core. Repeating the identical
+  command with tinyvec 1.12.0 also passed and emitted exactly the same 47
+  diagnostic headings (45 warnings plus two summaries). These warnings
+  predate the upgrade; no warning-free or browser-runtime claim is made.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
