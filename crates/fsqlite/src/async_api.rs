@@ -5173,6 +5173,80 @@ mod tests {
     }
 
     #[test]
+    fn restricted_native_context_preserves_sql_work_and_join_cleanup() {
+        test_runtime().block_on(async {
+            let parent = NativeCx::current().expect("runtime should install its context");
+            let parent_caps = parent.capabilities();
+            assert!(parent_caps.spawn);
+            let restricted = parent.restrict::<native_cap::None>();
+            let restricted_caps = restricted.capabilities().effective;
+
+            let mut operation = std::pin::pin!(async {
+                let native = NativeCx::current().expect("restricted context should be installed");
+                assert_eq!(native.capabilities().effective, restricted_caps);
+                let cx = Cx::new();
+                cx.set_native_cx(native);
+                let mut conn = AsyncConnection::open(&cx, ":memory:")
+                    .await
+                    .expect("restricted caller should open the SQL worker");
+                let state = Arc::clone(&conn.state);
+                conn.execute(&cx, "CREATE TABLE restricted_caller (value INTEGER)")
+                    .await
+                    .expect("schema operation should complete");
+                conn.execute(&cx, "INSERT INTO restricted_caller VALUES (42)")
+                    .await
+                    .expect("admitted write should complete");
+                let rows = conn
+                    .query(&cx, "SELECT value FROM restricted_caller")
+                    .await
+                    .expect("restricted caller should observe the completed write");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(42)));
+
+                let cancelled = Cx::new();
+                cancelled.cancel();
+                assert!(matches!(
+                    conn.execute(&cancelled, "INSERT INTO restricted_caller VALUES (99)")
+                        .await,
+                    Err(FrankenError::Interrupt)
+                ));
+                assert_eq!(
+                    conn.query(&cx, "SELECT value FROM restricted_caller")
+                        .await
+                        .expect("rejected write must leave the connection usable")
+                        .len(),
+                    1
+                );
+
+                conn.close(&cx)
+                    .await
+                    .expect("restricted caller should join the worker through the runtime pool");
+                assert_eq!(state.cleanup_calls.load(Ordering::Acquire), 1);
+                assert_eq!(state.phase(), WorkerPhase::Terminal);
+            });
+            std::future::poll_fn(|task_cx| {
+                // Install only for this poll, as runtime and adapter bridges do.
+                // Reinstalling the captured FullCx must retain its denied caps.
+                let _restricted = restricted.clone().set_current_restricted();
+                let captured = NativeCx::current().expect("restricted context should be visible");
+                let _reinstalled = NativeCx::set_current(Some(captured));
+                assert_eq!(
+                    NativeCx::current()
+                        .expect("reinstalled context")
+                        .capabilities()
+                        .effective,
+                    restricted_caps
+                );
+                operation.as_mut().poll(task_cx)
+            })
+            .await;
+            let restored = NativeCx::current().expect("parent context should be restored");
+            assert_eq!(restored.task_id(), parent.task_id());
+            assert_eq!(restored.capabilities(), parent_caps);
+        });
+    }
+
+    #[test]
     fn attached_runtime_budget_selects_preflight_and_async_close_cleans_once() {
         let runtime = test_runtime();
         let exhausted_native =
