@@ -1716,21 +1716,23 @@ async fn execute_batch_with_executor(
     let mut timing = BatchTiming::default();
 
     let begin_started = Instant::now();
-    executor
-        .conn
-        .begin_transaction()
-        .await
-        .map_err(|err| {
-            let begin_boundary = duration_to_u64_ns(begin_started.elapsed());
-            let mut failure = classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin);
-            match &mut failure {
-                BatchError::Busy { timing: failed_timing, .. }
-                | BatchError::Fatal { timing: failed_timing, .. } => {
-                    failed_timing.begin_boundary = begin_boundary;
-                }
+    executor.conn.begin_transaction().await.map_err(|err| {
+        let begin_boundary = duration_to_u64_ns(begin_started.elapsed());
+        let mut failure = classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin);
+        match &mut failure {
+            BatchError::Busy {
+                timing: failed_timing,
+                ..
             }
-            failure
-        })?;
+            | BatchError::Fatal {
+                timing: failed_timing,
+                ..
+            } => {
+                failed_timing.begin_boundary = begin_boundary;
+            }
+        }
+        failure
+    })?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
     let mut ok: u64 = 0;
@@ -4876,7 +4878,10 @@ mod tests {
             assert_eq!(timing.rollback, 0);
             assert_eq!(stats.retries, 0);
             assert_eq!(attempt, 0);
-            assert!(conn.in_transaction(), "the existing transaction must survive");
+            assert!(
+                conn.in_transaction(),
+                "the existing transaction must survive"
+            );
             conn.rollback_transaction().await.unwrap();
         });
     }
