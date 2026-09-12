@@ -20,6 +20,13 @@ comparison remains red. Earlier focused checks are not final updated-lockfile
 acceptance. Homebrew's existing `fsqlite` formula is at 0.3.9 and needs an update
 using verified hashes from the eventual new release assets.
 
+Interim RustSec audit (bitflags/tinyvec upgraded, smallvec under test): 419
+dependencies, zero reported vulnerabilities, no advisory warnings. Database
+commit `b50980aad8b8f14f77e25a97b32dd94bf008b0af` contains 1,243 advisories and
+was fetched for this run. The first RCH worker lacked `cargo-audit`; a verified
+copy of the already installed Linux audit binary ran through RCH successfully.
+This does not replace the final audit after all upgrades.
+
 ### bitflags 2.13.1 → 2.13.2 — passed
 
 - The published patch moves const declarations outside nested const blocks;
@@ -54,6 +61,18 @@ using verified hashes from the eventual new release assets.
   command with tinyvec 1.12.0 also passed and emitted exactly the same 47
   diagnostic headings (45 warnings plus two summaries). These warnings
   predate the upgrade; no warning-free or browser-runtime claim is made.
+
+### smallvec 1.16.0 → 1.16.1 — passed
+
+- Upstream changes `push` internals for performance and fixes documentation/
+  Cargo warnings; no API migration is declared. [Release notes](https://github.com/servo/rust-smallvec/releases/tag/v1.16.1).
+- The existing version requirement is preserved; only the lockfile version
+  and registry checksum change.
+- Native RCH `30017370403635267` passed 562 type, 613 parser and 489 B-tree
+  tests (1,664 total); 12 B-tree tests were ignored. All 1,616 post-run source
+  hashes match `58045a79`. Log SHA256:
+  `822f88fc88c91c1fcdcb8f8d4eb9fccb2a4405dc3c5003c8788f623bc021a572`.
+- No project performance improvement is inferred from the upstream optimization.
 
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
