@@ -35397,7 +35397,9 @@ impl Connection {
                     FrankenError::FunctionError("incomplete input".to_owned())
                 } else {
                     let lexeme = sql.get(start..end).unwrap_or("");
-                    FrankenError::FunctionError(format!("near \"{lexeme}\": syntax error"))
+                    FrankenError::SyntaxError {
+                        token: lexeme.to_owned(),
+                    }
                 }
             }
             fsqlite_parser::ParseErrorKind::Semantic => {
