@@ -133,7 +133,7 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 [workspace.dependencies]
 # Internal crates
 fsqlite-types = { version = "0.4.0", path = "crates/fsqlite-types", default-features = false }
-fsqlite-error = { version = "0.3.18", path = "crates/fsqlite-error" }
+fsqlite-error = { version = "0.4.0", path = "crates/fsqlite-error" }
 fsqlite-vfs = { version = "0.4.0", path = "crates/fsqlite-vfs", default-features = false }
 fsqlite-pager = { version = "0.4.0", path = "crates/fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.4.0", path = "crates/fsqlite-wal", default-features = false }
