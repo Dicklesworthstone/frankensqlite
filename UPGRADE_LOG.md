@@ -260,6 +260,42 @@ This does not replace the final audit after all upgrades.
   Clippy `aceb65df8cb23d4a6712a648b20eb7fde5d43e22c7031f5b9f10401cb4d9e61c`;
   formatting `4d1813cff34bb44bf941153493eb563cc05638906a76d2683a81ac93037f44c0`.
 
+### hashlink 0.12.1 → 0.12.2 — passed after metric-test repair
+
+- Published source `c7aaa3c2504c08baf8c97da11f3536258464da8f` adds
+  `LinkedHashMap::insert_front`; requirements/features remain unchanged.
+  Only its lockfile version/checksum change. The consumer is bundled SQLite
+  reference testing through rusqlite.
+- Initial parallel VDBE run `30016197441356069` passed 1,165 tests, failed two
+  process-global metric assertions, and ignored one manual performance test.
+  All 1,645 source hashes match `47936999`; this failed run is retained.
+  Old Hashlink control `30016197441356072` passed 1,167 tests, one ignored;
+  a single passing control does not resolve an intermittent measurement race.
+- Bug `bd-7rg1a.1`: isolate eight exact decode-counter tests with existing
+  thread-local metrics, and the root-initialization test with three test-only
+  page-motion counters at the actual normalization branches. Preserve numeric,
+  row, cached-value and record-profile assertions; production metrics and
+  writer locking are unchanged.
+- A real borrowed page copy on another thread deterministically makes the old
+  global assertion fail (`30016197441356074`, source `528c32e3`, 0 passed/1 failed).
+  The final repaired parallel Linux suite `30016197441356077` passed 1,167 tests,
+  one ignored, including that challenge and the live SQLite PRAGMA oracle.
+  Native macOS full suite `30017537169162335` passed 1,167 tests, one ignored,
+  before adding the challenge; final native challenge `30017537169162340`
+  passed 1/1. Formatting `30016197441356076` passed. All final post-run manifests
+  match 1,645 inputs in source
+  `eef23d2f07dcdeb0ee7c9974095ca8c88e38b5a888cc881b308910003020cdcf`.
+- Workspace/all-targets check `30016197441356078` and warnings-denied Clippy
+  `30016197441356079`, both with optional TUI, passed without warnings/errors.
+  All 1,645 post-run source hashes match `eef23d2f`.
+- Transcript SHA256 values: initial failure
+  `50985792b333ffad9fbc906255308c3e7baa7dc02d5b256eebd22f2ce85e9ac3`;
+  deterministic negative `3b4be4b78863b13f8a06c96b09d7e6fc9e20f44a9b930d1082ac3daf8e6b6408`;
+  final parallel suite `9e601346c32fd533518d64c20eb900584f0fd07600ec5d1ff831d7c129ef4730`;
+  final native challenge `b1af447ba27e1c840ec6e7147469a955e9113b33a2aea56e7f544c91b1aee59a`;
+  workspace check `28b6067d463e5d6c5c65cde6600f83157cc2451508e410cd6c7f97667baede87`;
+  Clippy `84ffd7228afd1630c27d68dc8bf284124adf7d5c7cc15b030aba09d57eae6669`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
