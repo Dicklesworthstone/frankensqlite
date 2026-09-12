@@ -85,6 +85,23 @@ This does not replace the final audit after all upgrades.
 - Logs SHA256: doctor `8da582a0c60997c16bed061f9db7e0eeff7bff46cf23754d2fe644477f1452e9`;
   harness `bd9fb43658435b361c1e9fe513e91fb1235f5aa78f4c0b9122d7ef834ffb6bfc`.
 
+### trybuild 1.0.120 → 1.0.121 — passed
+
+- Replaces its sole `target-triple` dependency with `target-tuple` 1.0.2.
+  Published helper build scripts are identical; no target-selection behavior
+  change was identified. Other dependency requirements are unchanged.
+  [Exact upstream comparison](https://github.com/dtolnay/trybuild/compare/2adc26560dba1d8eaeb596c5625f854e5d6c68b2...4b511198467970a3ec448df3e3837f53e0677940).
+- Native RCH `30017537169162244` passed the real sealed/open-trait test:
+  three compile-fail fixtures and one compile-pass fixture. Existing `.stderr`
+  expectations are unchanged; `TRYBUILD=overwrite` was not used. All 1,619
+  post-run source hashes match manifest `81b63a1b`. Log SHA256:
+  `58bee4b96da4b618c6a52f1581f5f9c93c156c528e046d9be009fd1e7f7eac38`.
+- On the same lockfile, Linux RCH `30016197441356035` passed all 30 MVCC EBR
+  tests with the old Crossbeam versions, zero ignored. All 1,619 post-run
+  inputs match. This is the baseline for the next Crossbeam update, not proof
+  of an updated runtime. Log SHA256:
+  `5f528f5613aa4d7c6c869069129bd3f556a9c409a437eccc8c59cbaebc6439a7`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
