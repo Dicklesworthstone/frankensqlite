@@ -127,6 +127,20 @@ This does not replace the final audit after all upgrades.
   `8e8fb1820ae13afd00b7a5b560d7929871fc275ad2dc2ea568370242203b5a9a`.
 - This does not claim sanitizer execution or ignored performance acceptance.
 
+### crossbeam-deque 0.8.7 → 0.8.8 — passed
+
+- Upstream improves ThreadSanitizer compatibility and uses 64-bit indexes on
+  32-bit platforms with 64-bit atomics. Existing requirements/features stay
+  unchanged. Project consumer: VDBE vectorized dispatch and work stealing.
+- Native old-version dispatcher baseline `30017537169162265` passed all 14
+  tests, with all 1,619 `bfa6497b` inputs unchanged afterward. Candidate Linux
+  `30016197441356048` and native macOS `30017537169162268` each passed the same
+  14 tests, zero ignored; both post-run manifests match all 1,619 `6575a43d`
+  inputs. These 64-bit runs cannot prove the changed 32-bit index path.
+- Log SHA256: baseline `04be2e2f48cebd025b8a80a39699a9e17251239e69ea8297e0d02b4366ac71c1`;
+  Linux `54c15bdc2e854e03a7afb0d4fe8ca41c29e920949a5ee921b098e174ad01b920`;
+  macOS `eee8cf98993970f4bf95fc769b294a6ad1eb27ca0ead271445c4374c2b8881c5`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
