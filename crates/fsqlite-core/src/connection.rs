@@ -12446,13 +12446,13 @@ pub struct Connection {
     without_rowid_pk_desc: RefCell<HashMap<String, Vec<bool>>>,
     /// Original CREATE TABLE/INDEX/VIEW SQL text, keyed by lowercased
     /// object name.  Used by `build_sqlite_master_rows` so that
-    /// `SELECT sql FROM sqlite_master` returns the text as written by the user,
-    /// not a regenerated form with gratuitous identifier quoting.
+    /// `SELECT sql FROM sqlite_master` retains source spelling after required
+    /// CREATE-prefix normalization, without gratuitous identifier quoting.
     original_ddl_sql: RefCell<HashMap<String, String>>,
     /// Verbatim source text of the single top-level `CREATE` statement currently
     /// being executed through [`Connection::execute`], captured so DDL persists
-    /// into `sqlite_master` exactly as the user wrote it (matching stock SQLite),
-    /// rather than a re-serialized AST form that can drop semantically necessary
+    /// into `sqlite_master` with original body spelling after CREATE-prefix
+    /// normalization, rather than a re-serialized AST form that can drop semantic
     /// parentheses. `None` for multi-statement batches and non-CREATE statements;
     /// consumed (taken) by the CREATE handler.
     pending_ddl_source: RefCell<Option<String>>,
@@ -61678,22 +61678,21 @@ impl Connection {
                     check_constraints: check_defs,
                 };
                 let implicit_indexes_for_master = table_schema.indexes.clone();
-                // Persist the user's verbatim CREATE text when available (a single
-                // top-level CREATE routed through execute()); fall back to AST
-                // serialization for multi-statement batches and internal rewrite
-                // paths. This keeps sqlite_master.sql byte-faithful to the original
-                // statement, matching stock SQLite's .schema output.
+                // Normalize only the CREATE prefix for sqlite_master. Stock
+                // SQLite's ALTER ADD COLUMN relies on that prefix; retaining IF
+                // NOT EXISTS gives it the wrong splice offset. Keep the original
+                // name/body spelling, including comments and semantic parentheses.
                 let pending_create_sql = self.take_pending_ddl_source_for_storage();
-                let create_sql = if create.name.schema.is_some() {
-                    // sqlite_master stores persistent object names without a
-                    // database qualifier. Keeping `main.` here makes canonical
-                    // SQLite reject the entire schema as malformed on reopen.
-                    let mut stored_create = create.clone();
-                    stored_create.name.schema = None;
-                    stored_create.to_string()
-                } else {
-                    pending_create_sql.unwrap_or_else(|| create.to_string())
-                };
+                let create_sql = pending_create_sql
+                    .as_deref()
+                    .and_then(normalize_create_table_sql_for_storage)
+                    .unwrap_or_else(|| {
+                        let mut stored_create = create.clone();
+                        stored_create.name.schema = None;
+                        stored_create.if_not_exists = false;
+                        stored_create.temporary = false;
+                        stored_create.to_string()
+                    });
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 if target_is_temp {
@@ -92828,6 +92827,12 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
+        // Prepared DML reaches compilation before the interpreted dispatcher
+        // numbers placeholders. Index probes can select a later WHERE term,
+        // so bind slots must follow SQL order before codegen reorders emission.
+        // Keep the caller's AST and original SQL intact for public metadata.
+        let canonical_update = canonicalize_update_placeholders(update)?;
+        let update = &canonical_update;
         // Direct DML on the schema table with writable_schema OFF is rejected
         // with SQLITE_ERROR here — the resolve below would otherwise raise the
         // generic "no such table" (sqlite_master is not a user-schema table).
@@ -92893,6 +92898,10 @@ impl Connection {
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
+        // DELETE shares UPDATE's index-probe emission order: a later indexed
+        // conjunct must retain its own bind slot rather than use the first one.
+        let canonical_delete = canonicalize_delete_placeholders(delete)?;
+        let delete = &canonical_delete;
         // GH #284: reject direct DML on the schema table with writable_schema
         // OFF (SQLITE_ERROR), rather than the generic "no such table" the
         // resolve below would raise (sqlite_master is not a user-schema table).
@@ -104912,6 +104921,45 @@ fn strip_trailing_sql_comments_and_terminator(text: &str) -> &str {
     text
 }
 
+/// Normalize the prefix of a parsed column-definition CREATE TABLE, retaining
+/// the original unqualified name and everything after it. Token spans keep
+/// quoted identifiers, comments and expression parentheses byte-faithful.
+/// CREATE AS SELECT has a separate generated-schema path and is not accepted.
+fn normalize_create_table_sql_for_storage(source: &str) -> Option<String> {
+    use fsqlite_parser::{Lexer, TokenKind};
+
+    let mut lexer = Lexer::new(source);
+    if lexer.next_token().kind != TokenKind::KwCreate {
+        return None;
+    }
+    let mut token = lexer.next_token();
+    if matches!(token.kind, TokenKind::KwTemp | TokenKind::KwTemporary) {
+        token = lexer.next_token();
+    }
+    if token.kind != TokenKind::KwTable {
+        return None;
+    }
+    let mut name = lexer.next_token();
+    if name.kind == TokenKind::KwIf {
+        if lexer.next_token().kind != TokenKind::KwNot
+            || lexer.next_token().kind != TokenKind::KwExists
+        {
+            return None;
+        }
+        name = lexer.next_token();
+    }
+    let mut after_name = lexer.next_token();
+    if after_name.kind == TokenKind::Dot {
+        name = lexer.next_token();
+        after_name = lexer.next_token();
+    }
+    if after_name.kind != TokenKind::LeftParen {
+        return None;
+    }
+    let suffix = source.get(usize::try_from(name.span.start).ok()?..)?;
+    Some(format!("CREATE TABLE {suffix}"))
+}
+
 /// bd-67tdh Phase 2: stock sqlite3 3.46.1 (oracle) implements ALTER TABLE ADD
 /// COLUMN by splicing the new column definition into the *original* CREATE text
 /// verbatim -- immediately after the last column definition and before any
@@ -105053,6 +105101,42 @@ fn splice_added_column_into_create_sql(original_sql: &str, new_column_sql: &str)
 #[cfg(test)]
 mod splice_added_column_tests {
     use super::splice_added_column_into_create_sql;
+
+    #[test]
+    fn test_br_ivf5p_create_prefix_matches_stock_sqlite() {
+        for source in [
+            "CREATE TABLE t (a INTEGER)",
+            "create table if not exists t (a INTEGER /* keep this */)",
+            "CREATE TABLE main.\"t.dot\" /* after name */ (a INTEGER CHECK ((a + 2) * 3 > 0))",
+            "CREATE TEMP TABLE IF NOT EXISTS [t space] (a TEXT DEFAULT (('quoted')))",
+            "/* lead */ create /* a */ temporary /* b */ table /* c */ if /* d */ not exists /* e */ `t``quoted` (a INT)",
+            "CREATE TABLE main.\"t é\" (a TEXT DEFAULT 'IF NOT EXISTS (main.t)')",
+        ] {
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite.execute_batch(source).unwrap();
+            let expected: String = sqlite
+                .query_row(
+                    "SELECT sql FROM sqlite_master UNION ALL SELECT sql FROM sqlite_temp_master",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                super::normalize_create_table_sql_for_storage(source),
+                Some(expected),
+                "source: {source}"
+            );
+        }
+        for other in [
+            "",
+            "CREATE TABLE",
+            "CREATE TABLE IF NOT t (a INT)",
+            "CREATE TABLE t AS SELECT 1 AS a",
+            "CREATE INDEX t ON x(a)",
+        ] {
+            assert_eq!(super::normalize_create_table_sql_for_storage(other), None);
+        }
+    }
 
     #[test]
     fn test_splice_ignores_close_paren_inside_line_comment() {
@@ -206405,6 +206489,119 @@ mod sqlite_master_btree_tests {
         rows
     }
 
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn test_br_ivf5p_created_table_accepts_stock_add_column() {
+        asupersync::test_utils::run_test(|| async {
+            for prefix in [
+                "CREATE TABLE IF NOT EXISTS t",
+                "create /* prefix */ table if not exists main.\"t\"",
+                "CREATE TABLE main.[t]",
+            ] {
+                let source = format!(
+                    "{prefix} /* name suffix */ (id INTEGER PRIMARY KEY, a INTEGER, \
+                     b INTEGER DEFAULT ((4)), CHECK ((a + b) * 2 > 10))"
+                );
+                let oracle = rusqlite::Connection::open_in_memory().unwrap();
+                oracle.execute_batch(&source).unwrap();
+                let expected: String = oracle
+                    .query_row("SELECT sql FROM sqlite_master WHERE name='t'", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("normalized-create.db");
+                let conn = Connection::open(path.to_string_lossy().as_ref())
+                    .await
+                    .unwrap();
+                conn.execute(&source).await.unwrap();
+                conn.execute("INSERT INTO t(id,a) VALUES(1,2)").await.unwrap();
+                let stored = conn
+                    .query("SELECT sql FROM sqlite_master WHERE name='t'")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stored[0].get(0),
+                    Some(&SqliteValue::Text(expected.clone().into()))
+                );
+                conn.close().await.unwrap();
+
+                // Close the native owner before opening stock SQLite: this
+                // validates the actual persisted schema, not a cached display.
+                let sqlite = rusqlite::Connection::open(&path).unwrap();
+                let persisted: String = sqlite
+                    .query_row("SELECT sql FROM sqlite_master WHERE name='t'", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(persisted, expected);
+                sqlite
+                    .execute_batch("ALTER TABLE t ADD COLUMN topic TEXT DEFAULT 'kept'")
+                    .unwrap();
+                let row: (i64, i64, String) = sqlite
+                    .query_row("SELECT a,b,topic FROM t WHERE id=1", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(row, (2, 4, "kept".to_owned()));
+                assert!(
+                    sqlite
+                        .execute("INSERT INTO t(id,a,b) VALUES(2,1,1)", [])
+                        .is_err()
+                );
+                let integrity: String = sqlite
+                    .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(integrity, "ok");
+                sqlite.close().unwrap();
+
+                let reopened = Connection::open(path.to_string_lossy().as_ref())
+                    .await
+                    .unwrap();
+                let rows = reopened
+                    .query("SELECT a,b,topic FROM t WHERE id=1")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows[0].values(),
+                    &[
+                        SqliteValue::Integer(2),
+                        SqliteValue::Integer(4),
+                        SqliteValue::Text("kept".into())
+                    ]
+                );
+                reopened.close().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_br_ivf5p_batch_create_normalizes_ast_fallback() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS main.first(a INTEGER); \
+                 CREATE TABLE IF NOT EXISTS second(b TEXT)",
+            )
+            .await
+            .unwrap();
+            let rows = conn
+                .query("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                let Some(SqliteValue::Text(sql)) = row.get(0) else {
+                    panic!("expected CREATE text");
+                };
+                assert!(sql.starts_with("CREATE TABLE "));
+                assert!(!sql.contains("IF NOT EXISTS"));
+                assert!(!sql.contains("main."));
+            }
+            conn.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn test_create_table_inserts_sqlite_master_row() {
         asupersync::test_utils::run_test(|| async {
@@ -288715,6 +288912,68 @@ mod pager_routing_tests {
                 }
                 panic!("{} integer overflow edge mismatches", mismatches.len());
             }
+        });
+    }
+
+    #[test]
+    fn test_prepared_dml_later_index_conjunct_preserves_bind_slots() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "PRAGMA foreign_keys = OFF",
+                "CREATE TABLE recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+                "CREATE INDEX recipients_agent ON recipients(agent_id)",
+                "CREATE TABLE audit (read_ts INTEGER, ack_ts INTEGER)",
+                "CREATE TRIGGER recipient_updated AFTER UPDATE ON recipients BEGIN INSERT INTO audit VALUES (NEW.read_ts, NEW.ack_ts); END",
+                "INSERT INTO recipients VALUES (1, 2, NULL, NULL), (2, 1, NULL, NULL)",
+            ] {
+                conn.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+            let update = "UPDATE recipients SET read_ts = ?, ack_ts = ? WHERE message_id = ? AND agent_id = ?";
+            let params = [
+                SqliteValue::Integer(200),
+                SqliteValue::Integer(100),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+            ];
+            let prepared = conn.prepare(update).await.unwrap();
+            assert_eq!(prepared.original_sql.as_ref(), update);
+            assert_eq!(prepared.execute_with_params(&params).await.unwrap(), 1);
+            assert_eq!(stock.execute(update, [200, 100, 1, 2]).unwrap(), 1);
+            drop(prepared);
+
+            // The public parameterized execution route reuses preparation too.
+            assert_eq!(
+                conn.execute_with_params(update, &params).await.unwrap(),
+                1
+            );
+            assert_eq!(stock.execute(update, [200, 100, 1, 2]).unwrap(), 1);
+            let queries = [
+                "SELECT message_id, agent_id, read_ts, ack_ts FROM recipients ORDER BY message_id",
+                "SELECT read_ts, ack_ts FROM audit ORDER BY rowid",
+            ];
+            assert!(oracle_compare(&conn, &stock, &queries).await.is_empty());
+            assert_eq!(conn.query("SELECT * FROM audit").await.unwrap().len(), 2);
+
+            // DELETE has the same later-conjunct index probe, without SET slots.
+            let delete = "DELETE FROM recipients WHERE message_id = ? AND agent_id = ?";
+            let prepared = conn.prepare(delete).await.unwrap();
+            assert_eq!(prepared.original_sql.as_ref(), delete);
+            assert_eq!(prepared.execute_with_params(&params[2..]).await.unwrap(), 1);
+            assert_eq!(stock.execute(delete, [1, 2]).unwrap(), 1);
+            drop(prepared);
+            assert!(oracle_compare(&conn, &stock, &queries).await.is_empty());
+            let remaining = conn
+                .query("SELECT message_id, agent_id FROM recipients")
+                .await
+                .unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(
+                remaining[0].values(),
+                &[SqliteValue::Integer(2), SqliteValue::Integer(1)]
+            );
         });
     }
 
