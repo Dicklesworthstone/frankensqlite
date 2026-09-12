@@ -158,6 +158,22 @@ This does not replace the final audit after all upgrades.
 - No 32-bit runtime proof or existing cancellation-latency release-gate
   acceptance is inferred from these focused checks.
 
+### console 0.16.4 → 0.16.6 — passed
+
+- Upstream fixes Unicode truncation panics, measures truncation tails in visible
+  columns and strips OSC/DCS sequences. [0.16.5 notes](https://github.com/console-rs/console/releases/tag/0.16.5),
+  [0.16.6 notes](https://github.com/console-rs/console/releases/tag/0.16.6).
+- Only lockfile version/checksum change. The project consumes console through
+  Insta. Native RCH `30017537169162284` passed all 11 tests across the four
+  actual planner/bytecode snapshot targets, with `env INSTA_UPDATE=no` explicit
+  in the remote command. All 1,643 source hashes match `cbbeb53c`, including
+  all 24 expected snapshots. Log SHA256:
+  `c9e19ada3107c1e5377e9410688a95ce3efbe462214cb2fe06ec08d31799dd3c`.
+- The first run passed but its controller-only environment variable was not
+  explicitly forwarded. A bare assignment retry failed with shell exit 127
+  because RCH quoted the assignment; the final `env` command above succeeded.
+  Neither preliminary attempt is used to prove the no-update setting.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
