@@ -5551,10 +5551,10 @@ async fn async_rwlock_read<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock
-            .read(&native_cx)
-            .await
-            .map_err(|error| FrankenError::internal(format!("{label} read lock failed: {error}")));
+        return lock.read(&native_cx).await.map_err(|error| match error {
+            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+            error => FrankenError::internal(format!("{label} read lock failed: {error}")),
+        });
     }
 
     loop {
@@ -5585,8 +5585,9 @@ async fn async_rwlock_write<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock.write(&native_cx).await.map_err(|error| {
-            FrankenError::internal(format!("{label} write lock failed: {error}"))
+        return lock.write(&native_cx).await.map_err(|error| match error {
+            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+            error => FrankenError::internal(format!("{label} write lock failed: {error}")),
         });
     }
 
@@ -26581,6 +26582,43 @@ where
         }
     }
 
+    fn settle_commit<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<crate::traits::PagerCommitState>> + 'a {
+        async move {
+            if self.finished {
+                return Ok(self.pager_commit_state());
+            }
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            let cx = &cleanup_cx;
+            if self.rollback_commit_finalization_pending {
+                self.finish_durable_rollback_commit(cx).await?;
+                return Ok(self.pager_commit_state());
+            }
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
+            if let Some(attempt) = self.pending_group_commit_attempt.clone() {
+                match attempt.reconcile_global_from_queue()? {
+                    PendingGroupCommitTxnResolution::Pending => {}
+                    PendingGroupCommitTxnResolution::NotCommitted => {
+                        self.restore_not_committed_wal_attempt()?;
+                    }
+                    PendingGroupCommitTxnResolution::Authorized(_) => {
+                        self.finish_authorized_wal_attempt(cx, true).await?;
+                    }
+                }
+            }
+            // Restoring a rejected attempt must not fall through to Phase A/B:
+            // the caller still owns the original failure and rollback decision.
+            Ok(self.pager_commit_state())
+        }
+    }
+
     fn pager_commit_state(&self) -> crate::traits::PagerCommitState {
         use crate::traits::PagerCommitState;
 
@@ -29220,6 +29258,50 @@ mod tests {
         (pager, path)
     }
 
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_rwlock_cancellation_preserves_abort_and_masking() {
+        asupersync::test_utils::run_test(|| async {
+            let lock = AsyncRwLock::new(0_u8);
+            for write in [false, true] {
+                for cancelled_before_wait in [false, true] {
+                    let cx = Cx::new();
+                    cx.set_native_cx(asupersync::Cx::for_testing());
+                    let blocker = lock.try_write().unwrap();
+                    if cancelled_before_wait {
+                        cx.cancel();
+                    }
+                    let mut acquire = Box::pin(async {
+                        if write {
+                            async_rwlock_write(&lock, &cx, "test").await.map(drop)
+                        } else {
+                            async_rwlock_read(&lock, &cx, "test").await.map(drop)
+                        }
+                    });
+                    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    if !cancelled_before_wait {
+                        assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+                        cx.cancel();
+                    }
+                    assert!(matches!(
+                        acquire.as_mut().poll(&mut task_cx),
+                        std::task::Poll::Ready(Err(FrankenError::Abort))
+                    ));
+                    drop(acquire);
+                    drop(blocker);
+                    assert!(lock.try_write().is_ok(), "cancelled waiter must retire");
+
+                    let _mask = cx.masked();
+                    if write {
+                        assert!(async_rwlock_write(&lock, &cx, "masked").await.is_ok());
+                    } else {
+                        assert!(async_rwlock_read(&lock, &cx, "masked").await.is_ok());
+                    }
+                }
+            }
+        });
+    }
+
     #[cfg(all(feature = "native", unix))]
     #[test]
     fn native_mvcc_mapping_releases_inner_before_wait_and_outlives_pager() {
@@ -29244,10 +29326,15 @@ mod tests {
             drop(guard);
             drop(db_file);
 
-            let cancelled = Cx::new();
-            cancelled.cancel();
-            assert!(matches!(pager.mvcc_shm_map(&cancelled, 4096, true).await, Err(FrankenError::Abort)));
-            assert!(!companion.exists(), "cancelled attachment must remain byte-neutral");
+            for attach_native in [false, true] {
+                let cancelled = Cx::new();
+                if attach_native {
+                    cancelled.set_native_cx(asupersync::Cx::for_testing());
+                }
+                cancelled.cancel();
+                assert!(matches!(pager.mvcc_shm_map(&cancelled, 4096, true).await, Err(FrankenError::Abort)));
+                assert!(!companion.exists(), "cancelled attachment must remain byte-neutral");
+            }
 
             let first = pager.mvcc_shm_map(&cx, 4096, true).await.unwrap();
             assert!(first.is_mmap_backed());
@@ -42575,6 +42662,180 @@ mod tests {
             assert_eq!(*batch_calls.lock().unwrap(), 1);
             assert_eq!(*sync_calls.lock().unwrap(), 1);
             assert_eq!(*observed_lock_level.lock().unwrap(), baseline);
+        });
+    }
+
+    #[test]
+    fn test_settle_pending_wal_attempt_retains_fence_until_source_completion() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let vfs = ObservedLockVfs::new();
+            let lock_level = vfs.observed_lock_level();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/settle_pending_attempt.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, append_entered, source_completion) =
+                PendingAcceptedWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::Deferred)
+                .unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &vec![0x44; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            let mut commit = Box::pin(txn.commit(&cx));
+            std::future::poll_fn(|poll_cx| match commit.as_mut().poll(poll_cx) {
+                std::task::Poll::Pending if append_entered.load(AtomicOrdering::Acquire) => {
+                    std::task::Poll::Ready(())
+                }
+                std::task::Poll::Pending => {
+                    poll_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Ready(result) => {
+                    panic!("accepted WAL write unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+            drop(commit);
+            let completion = source_completion.lock().unwrap().as_ref().unwrap().clone();
+            let frame_count = frames.lock().unwrap().len();
+            cx.cancel();
+            assert!(matches!(
+                txn.settle_commit(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+            assert_eq!(txn.pager_commit_state(), traits::PagerCommitState::InDoubt);
+            assert_eq!(*lock_level.lock().unwrap(), LockLevel::Reserved);
+            assert!(completion.complete_success());
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::Committed
+            );
+            assert_eq!(*lock_level.lock().unwrap(), LockLevel::None);
+            assert_eq!(frames.lock().unwrap().len(), frame_count);
+        });
+    }
+
+    #[test]
+    fn test_settle_rejected_wal_attempt_does_not_append_again() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/settle_rejected_attempt.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, sync_calls, reconcile_calls) =
+                MockWalBackend::new_with_failing_append_before_write();
+            let append_calls = Arc::clone(&backend.batch_calls);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            let payload = vec![0x55; PageSize::DEFAULT.as_usize()];
+            txn.write_page(&cx, page, &payload).await.unwrap();
+            let error = txn.commit(&cx).await.unwrap_err();
+            assert!(error.to_string().contains("append failure before WAL write"));
+            assert_eq!(txn.pager_commit_state(), traits::PagerCommitState::InDoubt);
+            assert_eq!(*append_calls.lock().unwrap(), 1);
+
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::NotCommitted
+            );
+            assert_eq!(*reconcile_calls.lock().unwrap(), 1);
+            assert_eq!(*append_calls.lock().unwrap(), 1);
+            assert_eq!(*sync_calls.lock().unwrap(), 0);
+            assert!(frames.lock().unwrap().is_empty());
+            assert_eq!(txn.get_page(&cx, page).await.unwrap().as_ref(), payload);
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::NotCommitted
+            );
+            assert_eq!(*append_calls.lock().unwrap(), 1);
+            txn.rollback(&cx).await.unwrap();
+
+            let mut retry = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let retry_page = retry.allocate_page(&cx).await.unwrap();
+            retry.write_page(&cx, retry_page, &payload).await.unwrap();
+            retry.commit(&cx).await.unwrap();
+            assert_eq!(*append_calls.lock().unwrap(), 2);
+            let mut reader = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, retry_page).await.unwrap().as_ref(),
+                payload
+            );
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_settle_authorized_wal_attempt_publishes_without_reappend() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/settle_authorized_attempt.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, _sync_calls, reconcile_calls) =
+                MockWalBackend::new_with_failing_sync();
+            let append_calls = Arc::clone(&backend.batch_calls);
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+                .unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            let payload = vec![0x77; PageSize::DEFAULT.as_usize()];
+            txn.write_page(&cx, page, &payload).await.unwrap();
+            assert!(txn.commit(&cx).await.is_err());
+            assert_eq!(txn.pager_commit_state(), traits::PagerCommitState::InDoubt);
+            let frame_count = frames.lock().unwrap().len();
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::Committed
+            );
+            assert_eq!(*reconcile_calls.lock().unwrap(), 1);
+            assert_eq!(*append_calls.lock().unwrap(), 1);
+            assert_eq!(frames.lock().unwrap().len(), frame_count);
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::Committed
+            );
+            let mut reader = pager.begin(&cx, TransactionMode::Deferred).await.unwrap();
+            assert_eq!(reader.get_page(&cx, page).await.unwrap().as_ref(), payload);
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_settle_unattempted_dirty_transaction_never_commits() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, frames) = wal_pager().await;
+            let cx = Cx::new();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, page, &vec![0x33; PageSize::DEFAULT.as_usize()])
+                .await
+                .unwrap();
+            assert_eq!(
+                txn.settle_commit(&cx).await.unwrap(),
+                traits::PagerCommitState::NotCommitted
+            );
+            assert!(frames.lock().unwrap().is_empty());
+            txn.rollback(&cx).await.unwrap();
         });
     }
 
@@ -59389,6 +59650,63 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
                 "caller should own backend cleanup after a rejected install"
+            );
+        });
+    }
+
+    #[test]
+    fn test_quiesce_does_not_admit_wal_install_after_a_new_finalization_root() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+
+            // This existing seam fixes the interleaving: a new root arrives
+            // after successful quiescence but before backend installation.
+            let root = ProcessRootFinalizationAttempt::register(&pager.group_commit_queue);
+            let dropped = Arc::new(Mutex::new(false));
+            let backend = DropAwareWalBackend {
+                dropped: Arc::clone(&dropped),
+            };
+            let (error, backend) = pager
+                .set_wal_backend_owned(backend)
+                .expect_err("a new finalization root must refuse backend installation");
+            assert!(matches!(error, FrankenError::BusyRecovery));
+            assert!(!has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            );
+
+            // The same error can also come from quiescing an unresolved root;
+            // the core diagnostic must distinguish these two call boundaries.
+            assert!(matches!(
+                pager.quiesce_pending_group_commit_finalization().await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            root.release_after_terminal();
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            pager
+                .set_wal_backend_owned(backend)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("the retained backend must install after settlement: {error:?}")
+                });
+            assert!(has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
             );
         });
     }

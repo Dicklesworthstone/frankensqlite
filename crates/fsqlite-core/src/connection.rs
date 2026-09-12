@@ -5379,7 +5379,18 @@ where
     // guard does not spuriously refuse this benign self-inflicted state with
     // BusyRecovery. Writable installs settle through the later set_journal_mode.
     if allow_readonly {
-        pager.quiesce_pending_group_commit_finalization().await?;
+        pager
+            .quiesce_pending_group_commit_finalization()
+            .await
+            .inspect_err(|error| {
+                if matches!(error, FrankenError::BusyRecovery) {
+                    tracing::warn!(
+                        target: "fsqlite.core.readonly_wal_install",
+                        stage = "quiesce",
+                        "read-only WAL admission refused pending recovery"
+                    );
+                }
+            })?;
     }
 
     // bd-zna34 fix: Always open the WAL file READWRITE. Opening READONLY
@@ -5421,7 +5432,15 @@ where
 
     let wal = WalFile::open(cx, file).await?;
     if allow_readonly {
-        install_opened_wal_backend_bare(pager, cx, wal)?;
+        install_opened_wal_backend_bare(pager, cx, wal).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                tracing::warn!(
+                    target: "fsqlite.core.readonly_wal_install",
+                    stage = "install_after_quiesce",
+                    "read-only WAL admission refused pending recovery"
+                );
+            }
+        })?;
     } else {
         install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
     }
@@ -71240,7 +71259,7 @@ impl Connection {
             // was rejected. Group-commit completion and rollback-journal Phase
             // C can report a local finalization error after the exact WAL/database
             // commit is already authorized. Preserve the prepared MVCC plan and
-            // drive that same transaction handle to a terminal pager state before
+            // settle that same attempt to a terminal pager state before
             // deciding whether CommitIndex/SSI publication or rollback applies.
             let mut post_durable_commit_error = None;
             let mut obligation_retry_attempt = 0_u32;
@@ -71257,7 +71276,7 @@ impl Connection {
                 };
                 match pager_state {
                     PagerCommitState::NotCommitted => {
-                        commit_res = Err(error);
+                        commit_res = Err(post_durable_commit_error.take().unwrap_or(error));
                         break;
                     }
                     PagerCommitState::Committed => {
@@ -71279,7 +71298,11 @@ impl Connection {
                         commit_res = {
                             let mut txn_guard = self.active_txn.borrow_mut();
                             if let Some(txn) = txn_guard.as_mut() {
-                                txn.commit(&cleanup_cx).await
+                                match txn.settle_commit(&cleanup_cx).await {
+                                    Ok(PagerCommitState::Committed) => Ok(()),
+                                    Ok(_) => Err(FrankenError::BusyRecovery),
+                                    Err(error) => Err(error),
+                                }
                             } else {
                                 Ok(())
                             }
