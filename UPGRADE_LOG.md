@@ -222,6 +222,16 @@ This does not replace the final audit after all upgrades.
   workspace `618009d7a2a75885ed9158338a0f703a6565a6a021c922e174180f474b66a953`;
   schema `d8712f94d7d26a6950c2e6ed49ea4654a72c41ef1d980d8364e9ecce228bb778`.
 
+### hybrid-array 0.4.14 → 0.4.15 — passed
+
+- Adds the `ArraySize` implementation for `U513`; published source
+  `09310c55` retains existing requirements/features. Only lockfile
+  version/checksum change. The active consumer path includes crypto primitives.
+- Native RCH `30017537169162299` passed all 32 pager encryption tests,
+  including authenticated-context swaps, wrong keys, corrupted ciphertext
+  and DEK wrapping/rekeying. All 1,645 post-run source hashes match `693b9117`.
+  Log SHA256: `4fa9dd2b97e04ef68bb23c7a20e63163a00defbff86bd074a5227ae6953676ec`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
