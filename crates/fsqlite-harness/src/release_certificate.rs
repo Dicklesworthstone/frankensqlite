@@ -56,7 +56,6 @@ use crate::parity_verification_workflow::{
     BEAD_ID as WORKFLOW_BEAD_ID, SCHEMA_VERSION as WORKFLOW_SCHEMA_VERSION, WorkflowOutcome,
     WorkflowPhase, WorkflowReport, validate_workflow_report,
 };
-#[cfg(test)]
 use crate::performance_release_admission::validate_gate as validate_performance_admission_gate;
 use crate::performance_release_admission::{PerformanceAdmissionGate, authorized_artifact_paths};
 use crate::score_engine::BayesianScorecard;
@@ -4526,15 +4525,18 @@ fn validate_t16_binary_manifest_binding(
     Ok(())
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn validate_phase5_performance_regression_gate(
+pub(crate) fn validate_phase5_performance_regression_gate(
     workspace_root: &Path,
     tested_commit: &str,
     performance: &Phase5PerformanceRegressionGate,
 ) -> Result<(), String> {
     validate_performance_admission_gate(workspace_root, tested_commit, performance)
-        .map_err(|error| format!("phase5_performance_regression_gate_contract_invalid: {error}"))
+        .map_err(|error| format!("phase5_performance_regression_gate_contract_invalid: {error}"))?;
+    if !performance.release_authorized {
+        return Err("phase5_performance_regression_gate_not_authorized".to_owned());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -4750,7 +4752,13 @@ fn validate_phase5_manifest(
     if t16_evidence.is_none() {
         return Err("phase5_t16_receipt_missing".to_owned());
     }
-    Err("phase5_performance_regression_gate_not_authorized".to_owned())
+    // A well-formed missing-policy blocker is valid metadata, but cannot
+    // authorize a certificate. Revalidate the bound pack at this final boundary.
+    validate_phase5_performance_regression_gate(
+        workspace_root,
+        tested_candidate_git_sha,
+        &manifest.performance_regression_gate,
+    )
 }
 
 fn validate_run_identity(input: &StrictCertificateEvidenceInput) -> Result<(), String> {
@@ -5476,13 +5484,13 @@ mod tests {
     #[test]
     fn phase5_missing_policy_gate_is_typed_and_non_authorizing() {
         let mut performance = blocked_missing_authoritative_policy();
-        assert!(
+        assert_eq!(
             validate_phase5_performance_regression_gate(
                 Path::new("."),
                 "a".repeat(40).as_str(),
                 &performance,
-            )
-            .is_ok()
+            ),
+            Err("phase5_performance_regression_gate_not_authorized".to_owned())
         );
         performance.release_authorized = true;
         assert_eq!(
