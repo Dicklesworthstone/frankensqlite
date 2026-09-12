@@ -185,6 +185,21 @@ This does not replace the final audit after all upgrades.
   workspace-wide feature leak is not reintroduced. Log SHA256:
   `0ed6fb75e096e8f87f1ec0929193b890dd170c5a1b2999332ef94a23a55d428a`.
 
+### cc 1.4.4 → 1.4.5 with required find-msvc-tools 0.1.12 — passed
+
+- Fixes flag probing outside Cargo build scripts when `OUT_DIR` is absent.
+  The published manifest requires find-msvc-tools >=0.1.12, so the helper's
+  0.1.11 → 0.1.12 update is part of this dependency closure. MSRV remains 1.65.
+- Only lockfile versions/checksums change. Native RCH `30017537169162287`
+  passed all 562 type/hashing tests. Linux RCH `30016197441356053` rebuilt
+  bundled SQLite and passed 1,167 VDBE tests, including live SQLite oracle
+  comparisons; one manual performance test was ignored. Both post-run
+  manifests match all 1,643 source inputs `98707534`.
+- Log SHA256: native `621f47a1bd194cfe77f6e7cd21fa88fcd43b2837e8928c62a27c257993e8c45b`;
+  Linux `9ee9b5002fb137f2512d4572a3b7dd0d1af36088738c3b09e4919173989cd056`.
+- Native Windows compiler discovery is not proven by these macOS/Linux checks;
+  exact release target checks remain due.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
