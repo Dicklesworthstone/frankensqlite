@@ -19023,6 +19023,15 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(
             header.as_ref().map_or(0, |header| header.change_counter),
         ));
+        // Joining a persisted WAL database is not a journal-mode transition.
+        // Publishing Delete here would make connection bootstrap request an
+        // exclusive maintenance upgrade, refusing otherwise valid readers.
+        // A missing header was accepted above only after validating committed
+        // page 1 in the live WAL, which remains authoritative for that case.
+        let initial_journal_mode = match header.as_ref() {
+            Some(header) => Self::journal_mode_from_database_header(header)?,
+            None => JournalMode::Wal,
+        };
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -19061,7 +19070,7 @@ where
                 freelist_repair_dropped: 0,
                 wal_reader: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
-                journal_mode: JournalMode::Delete,
+                journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 access_mode: PagerAccessMode::ReadOnly,
@@ -19089,14 +19098,14 @@ where
             published: Arc::new(PublishedPagerState::new(
                 db_size,
                 initial_commit_seq,
-                JournalMode::Delete,
+                initial_journal_mode,
                 0, // freelist_count = 0 for read-only
             )),
             wal_backend: new_shared_wal_backend(),
             committed_snapshot: Arc::new(RwLock::new(Arc::new(PagerCommittedSnapshot {
                 commit_seq: initial_commit_seq,
                 db_size,
-                journal_mode: JournalMode::Delete,
+                journal_mode: initial_journal_mode,
                 freelist_count: 0,
                 checkpoint_active: false,
                 writer_active: false,
