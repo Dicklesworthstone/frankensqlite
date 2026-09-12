@@ -1116,20 +1116,16 @@ impl SharedWalIndexAppendPlan {
             } else {
                 0
             };
-            for offset in (page_start..WAL_SHM_PAGE_ARRAY_BYTES).step_by(4) {
-                scratch[offset..offset + 4].copy_from_slice(
-                    &region
-                        .atomic_load_u32_ne(offset, Ordering::Acquire)?
-                        .to_ne_bytes(),
-                );
-            }
-            for offset in (WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES).step_by(2) {
-                scratch[offset..offset + 2].copy_from_slice(
-                    &region
-                        .atomic_load_u16_ne(offset, Ordering::Acquire)?
-                        .to_ne_bytes(),
-                );
-            }
+            region.atomic_copy_u32_ne(
+                page_start,
+                &mut scratch[page_start..WAL_SHM_PAGE_ARRAY_BYTES],
+                Ordering::Acquire,
+            )?;
+            region.atomic_copy_u16_ne(
+                WAL_SHM_PAGE_ARRAY_BYTES,
+                &mut scratch[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES],
+                Ordering::Acquire,
+            )?;
             clear_native_wal_index_tail(&mut scratch, *number, baseline.mx_frame)?;
             while let Some(&(frame, page, _)) = entries.get(entry_cursor) {
                 if WalIndexFrameLocation::new(frame)?.region != *number {
