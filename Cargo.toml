@@ -206,8 +206,10 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # every fsqlite crate. Keep this registry-resolvable so downstream git consumers
 # can build FrankenSQLite without a private `/dp/asupersync` checkout; local
 # asupersync development belongs in an uncommitted Cargo patch/config override.
-# Cx appears in public APIs. The 0.4 engine line uses Asupersync 0.5 throughout;
-# allowing older runtime minors here would split those types across consumers.
+# Native context attachment and blocking-pool discovery share Asupersync types
+# and thread-local state with callers. Cx appears in public APIs. The 0.4
+# engine line uses Asupersync 0.5 throughout; allowing older runtime minors
+# here would split those types across consumers.
 asupersync = { version = "0.5.0", default-features = false }
 futures-lite = "2.6.1"
 
