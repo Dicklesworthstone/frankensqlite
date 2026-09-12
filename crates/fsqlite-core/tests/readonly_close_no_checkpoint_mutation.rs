@@ -272,14 +272,24 @@ fn readonly_connection_close_does_not_mutate_main_db_bytes() {
 #[test]
 fn strict_readonly_reopens_while_same_process_wal_writer_remains_alive() {
     asupersync::test_utils::run_test(|| async {
+        for microbatch_enabled in [true, false] {
         let dir = tempfile::tempdir().expect("temp dir");
         let db = dir.path().join("same-process-readonly.db");
         let path = db.to_str().expect("UTF-8 database path");
         let writer = Connection::open(path).await.expect("open writer");
         writer
-            .execute("PRAGMA journal_mode=WAL; PRAGMA fsqlite.stmt_microbatch=OFF;")
+            .execute("PRAGMA journal_mode=WAL;")
             .await
             .expect("configure WAL writer");
+        if !microbatch_enabled {
+            writer.execute("PRAGMA fsqlite.stmt_microbatch=OFF;")
+                .await.expect("disable statement microbatching");
+        }
+        assert_eq!(
+            writer.query_row("PRAGMA fsqlite.stmt_microbatch;")
+                .await.expect("read statement microbatch setting").values(),
+            &[SqliteValue::Integer(i64::from(microbatch_enabled))]
+        );
         writer
             .execute("CREATE TABLE evidence(id INTEGER PRIMARY KEY, piece TEXT);")
             .await
@@ -298,26 +308,31 @@ fn strict_readonly_reopens_while_same_process_wal_writer_remains_alive() {
                 &[SqliteValue::Text("committed".into())]
             );
             let before = db_bytes(path);
+            let wal_before = std::fs::read(format!("{path}-wal")).expect("read WAL");
             for attempt in 0..8 {
                 // SQLITE_OPEN_READ_ONLY routes to this exact core constructor.
                 let reader = Connection::open_schema_only(path).await.unwrap_or_else(|error| {
-                    panic!("strict read-only open {attempt} failed with live writer (pinned={pinned_writer_read}): {error:?}")
+                    panic!("strict read-only open {attempt} failed with live writer (pinned={pinned_writer_read}, microbatch={microbatch_enabled}): {error:?}")
                 });
                 assert_eq!(
                     reader.query_row("SELECT piece FROM evidence WHERE id=1;")
                         .await.expect("strict reader reads committed row").values(),
                     &[SqliteValue::Text("committed".into())]
                 );
-                reader.execute("INSERT INTO evidence VALUES (2, 'refused');")
+                let error = reader.execute("INSERT INTO evidence VALUES (2, 'refused');")
                     .await.expect_err("strict reader must reject writes");
+                assert!(matches!(error, fsqlite_error::FrankenError::ReadOnly), "{error}");
                 reader.close().await.expect("close strict reader");
                 assert_eq!(db_bytes(path), before, "strict reader changed the database");
+                assert_eq!(std::fs::read(format!("{path}-wal")).expect("read WAL"),
+                    wal_before, "strict reader changed the WAL");
             }
             if pinned_writer_read {
                 writer.execute("ROLLBACK;").await.expect("end writer read");
             }
         }
         writer.close().await.expect("close writer");
+        }
     });
 }
 
