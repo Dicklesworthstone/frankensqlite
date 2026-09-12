@@ -11051,6 +11051,11 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         .map(|frame| frame.db_size_if_commit)
         .max()
         .unwrap_or(0);
+    // GH#410 / cass#462: normalization deliberately removes the reserved
+    // lock-byte page from damaged durable freelists. It can never be allocated,
+    // so omitting it is repair, not erasure of a peer's free page. Keep the raw
+    // chain above for cycle detection, and exempt only the erasure arm below.
+    let reserved_page = crate::journal::PENDING_BYTE_OFFSET / page_size as u64 + 1;
 
     let mut offending: Vec<u32> = published_set
         .iter()
@@ -11059,6 +11064,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         .chain(current.iter().copied().filter(|page| {
             !published_set.contains(page)
                 && !consumed.contains(page)
+                && u64::from(*page) != reserved_page
                 && (publication_db_size == 0 || *page <= publication_db_size)
         }))
         // DOUBLE-CONSUMPTION: a page this batch consumed from the DURABLE
@@ -14542,6 +14548,7 @@ where
                 .maintenance_open_lease
                 .lock()
                 .map_err(|_| FrankenError::internal("pager open-lease lock poisoned"))?;
+            let constructor_open = open_lease.is_some();
             let mut transaction_lease = if open_lease.is_none() {
                 Some(self.maintenance_gate.enter_transaction()?)
             } else {
@@ -14556,6 +14563,22 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+            // A read-only constructor starts on the main-file read path until
+            // an existing WAL has been validated and installed. Joining that
+            // WAL adopts its read mode; it does not change the file format or
+            // require exclusive maintenance against already-pinned readers.
+            // Missing/empty sidecars keep the main-only mode below, and normal
+            // writable transitions retain their whole-image maintenance gate.
+            if constructor_open
+                && inner.access_mode.is_readonly()
+                && mode == JournalMode::Wal
+                && inner.active_transactions == 0
+                && !inner.checkpoint_active
+                && has_wal_backend(&self.wal_backend)?
+            {
+                inner.journal_mode = mode;
+            }
 
             if inner.journal_mode == mode {
                 if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
@@ -45683,6 +45706,67 @@ mod tests {
     }
 
     #[test]
+    fn test_gh462_freelist_repair_keeps_real_conflict_guards() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+            for raw in [512_u32, 4096, 65536] {
+                let page_size = PageSize::new(raw).unwrap();
+                let reserved = crate::journal::lock_byte_page(page_size);
+                let db_size = reserved + 1;
+                let mut page_one = vec![0_u8; page_size.as_usize()];
+                page_one[32..36].copy_from_slice(&3_u32.to_be_bytes());
+                page_one[36..40].copy_from_slice(&3_u32.to_be_bytes());
+                let mut trunk = vec![0_u8; page_size.as_usize()];
+                trunk[4..8].copy_from_slice(&2_u32.to_be_bytes());
+                trunk[8..12].copy_from_slice(&7_u32.to_be_bytes());
+                trunk[12..16].copy_from_slice(&reserved.to_be_bytes());
+                let (mut wal, frames, _, _) = MockWalBackend::new();
+                frames.lock().unwrap().extend([
+                    (1, page_one.clone(), 0),
+                    (3, trunk, db_size),
+                ]);
+
+                // These synthetic durable tails exercise the production guard
+                // directly. The core GH#462 keeper separately traverses a real
+                // on-disk WAL open, repair commit, checkpoint and reopen.
+                for (case, published, freed, consumed, durable_consumed, expected) in [
+                    ("repair", vec![3, 7], vec![], vec![], vec![], vec![]),
+                    ("legal_free", vec![3, 7, 8], vec![8], vec![], vec![], vec![]),
+                    ("legal_consume", vec![3], vec![], vec![7], vec![7], vec![]),
+                    ("erasure", vec![3], vec![], vec![], vec![], vec![7]),
+                    ("resurrection", vec![3, 7, 8], vec![], vec![], vec![], vec![8]),
+                    ("double_consume", vec![3, 7], vec![], vec![9], vec![9], vec![9]),
+                    ("combined", vec![3, 8], vec![], vec![9], vec![9], vec![7, 8, 9]),
+                ] {
+                    let batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: page_one.clone(),
+                        db_size_if_commit: db_size,
+                    }])
+                    .with_freelist_publication(
+                        Some(published),
+                        freed,
+                        consumed,
+                        durable_consumed,
+                    );
+                    let offending = resurrected_or_erased_freelist_pages(
+                        &cx,
+                        &mut wal,
+                        &db_file,
+                        page_size.as_usize(),
+                        &[batch],
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(offending, expected, "page_size={raw} case={case}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_ioq6x_intragroup_publication_header_wins_over_stale_grow() {
         // bd-ioq6x (GH#346): a group commit that mixes a freelist-publishing
         // batch (a DELETE that durably freed pages) with a later-appended
@@ -59650,6 +59734,63 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
                 "caller should own backend cleanup after a rejected install"
+            );
+        });
+    }
+
+    #[test]
+    fn test_quiesce_does_not_admit_wal_install_after_a_new_finalization_root() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+
+            // This existing seam fixes the interleaving: a new root arrives
+            // after successful quiescence but before backend installation.
+            let root = ProcessRootFinalizationAttempt::register(&pager.group_commit_queue);
+            let dropped = Arc::new(Mutex::new(false));
+            let backend = DropAwareWalBackend {
+                dropped: Arc::clone(&dropped),
+            };
+            let (error, backend) = pager
+                .set_wal_backend_owned(backend)
+                .expect_err("a new finalization root must refuse backend installation");
+            assert!(matches!(error, FrankenError::BusyRecovery));
+            assert!(!has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            );
+
+            // The same error can also come from quiescing an unresolved root;
+            // the core diagnostic must distinguish these two call boundaries.
+            assert!(matches!(
+                pager.quiesce_pending_group_commit_finalization().await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            root.release_after_terminal();
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            pager
+                .set_wal_backend_owned(backend)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("the retained backend must install after settlement: {error:?}")
+                });
+            assert!(has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
             );
         });
     }

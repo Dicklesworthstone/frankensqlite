@@ -5379,7 +5379,18 @@ where
     // guard does not spuriously refuse this benign self-inflicted state with
     // BusyRecovery. Writable installs settle through the later set_journal_mode.
     if allow_readonly {
-        pager.quiesce_pending_group_commit_finalization().await?;
+        pager
+            .quiesce_pending_group_commit_finalization()
+            .await
+            .inspect_err(|error| {
+                if matches!(error, FrankenError::BusyRecovery) {
+                    tracing::warn!(
+                        target: "fsqlite.core.readonly_wal_install",
+                        stage = "quiesce",
+                        "read-only WAL admission refused pending recovery"
+                    );
+                }
+            })?;
     }
 
     // bd-zna34 fix: Always open the WAL file READWRITE. Opening READONLY
@@ -5421,7 +5432,15 @@ where
 
     let wal = WalFile::open(cx, file).await?;
     if allow_readonly {
-        install_opened_wal_backend_bare(pager, cx, wal)?;
+        install_opened_wal_backend_bare(pager, cx, wal).inspect_err(|error| {
+            if matches!(error, FrankenError::BusyRecovery) {
+                tracing::warn!(
+                    target: "fsqlite.core.readonly_wal_install",
+                    stage = "install_after_quiesce",
+                    "read-only WAL admission refused pending recovery"
+                );
+            }
+        })?;
     } else {
         install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
     }
