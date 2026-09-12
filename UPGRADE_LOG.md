@@ -232,6 +232,34 @@ This does not replace the final audit after all upgrades.
   and DEK wrapping/rekeying. All 1,645 post-run source hashes match `693b9117`.
   Log SHA256: `4fa9dd2b97e04ef68bb23c7a20e63163a00defbff86bd074a5227ae6953676ec`.
 
+### argon2 0.5.3 → 0.6.0 — passed
+
+- Reviewed published source `b1e0ad6fe229b1ba74e4696c7359ab45d7e931f0`.
+  The raw Argon2id v19 API used by `KeyManager::derive_kek` is unchanged.
+  Required closure: Blake2 0.11.0, password-hash 0.6.1 and PHC 0.6.1;
+  the existing cpufeatures 0.3.1 and digest 0.11.3 satisfy their requirements.
+  RCH `30016197441356062` resolved this closure without unrelated upgrades.
+- Added two independent Libsodium known-answer vectors to the existing pager
+  encryption tests, including an empty password and a password with a significant
+  trailing space. Both pin all 32 derived key bytes; production KDF code is unchanged.
+  Old Argon2 baseline RCH `30017537169162304` passed all 33 encryption tests.
+  All 1,645 baseline source hashes match `8eb9ada0`.
+- Candidate native RCH `30017537169162314` passed all 33 encryption tests.
+  Linux workspace/all-targets check with optional TUI `30016197441356063`
+  passed without warnings or errors. WASM target compilation `30016197441356065`
+  passed with the same 45 existing warnings as the retained baseline; this is
+  compilation evidence, not browser execution. Formatting `30016197441356067`
+  passed. All four post-run manifests match all 1,645 inputs in source
+  `2969036dea32316cb116da9405dcac3da82669d7e04a7f824b417902f4a2b233`.
+- Workspace/all-targets warnings-denied Clippy with optional TUI
+  `30016197441356066` passed; all 1,645 post-run source hashes match `2969036d`.
+- Transcript SHA256 values: native encryption
+  `4b5789723bfddeadddffd3d0c79eb8f6a2c0b68312c1761e6794741748b43ee7`;
+  workspace check `65995b92a0f6a34d62337e40c7c1262c24318450ca07e74ec11b6b0d47bf5f49`;
+  WASM `45a6eeb22c18a20fe7eb1dbd0f0bfccfc0344a034bb2bc73cae5eaa86ea93b5e`;
+  Clippy `aceb65df8cb23d4a6712a648b20eb7fde5d43e22c7031f5b9f10401cb4d9e61c`;
+  formatting `4d1813cff34bb44bf941153493eb563cc05638906a76d2683a81ac93037f44c0`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
