@@ -479,6 +479,10 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.shm_map(cx, region, size, extend)
     }
 
+    fn mvcc_shm_map(&mut self, cx: &Cx, payload_bytes: u64, create: bool) -> Result<ShmRegion> {
+        self.inner.mvcc_shm_map(cx, payload_bytes, create)
+    }
+
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
         self.inner.shm_lock(cx, offset, n, flags)
     }

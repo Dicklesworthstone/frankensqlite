@@ -73,6 +73,10 @@ pub enum NamespaceOpenIntent {
     /// Join an existing generation without creating or rewriting namespace
     /// records. Missing or malformed records fail closed.
     ReadOnlyExisting,
+    /// Join an existing identity while retaining the exclusive admission gate
+    /// through creation or validation of one identity-bound companion. Never
+    /// create namespace sidecars or admit without an existing identity record.
+    ExistingCompanion,
     /// Exclusively reserve the namespace through empty-database bootstrap.
     ReservedExclusive,
 }
@@ -150,7 +154,10 @@ impl PendingNamespaceOpen {
     /// path.  This operation is non-blocking; lock contention returns BUSY.
     pub fn begin(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Self> {
         validate_stable_path(stable_path)?;
-        let (gate, mut use_file) = if intent == NamespaceOpenIntent::ReadOnlyExisting {
+        let (gate, mut use_file) = if matches!(
+            intent,
+            NamespaceOpenIntent::ReadOnlyExisting | NamespaceOpenIntent::ExistingCompanion
+        ) {
             // GH#140 / bd-daqmp: a read-only open must be byte-neutral for the
             // whole file family. When the namespace sidecars do not exist (a
             // database never admitted by FrankenSQLite), creating them here
@@ -167,6 +174,9 @@ impl PendingNamespaceOpen {
                 )
             };
             if sidecar_missing(&gate_path) || sidecar_missing(&use_path) {
+                if intent == NamespaceOpenIntent::ExistingCompanion {
+                    return Err(cannot_open(stable_path));
+                }
                 return Ok(Self {
                     stable_path: stable_path.to_owned(),
                     lease: Some(PendingLease::ReadOnlyUnadmitted),
@@ -225,7 +235,7 @@ impl PendingNamespaceOpen {
                     }
                 }
             }
-            NamespaceOpenIntent::ReadOnlyExisting => {
+            NamespaceOpenIntent::ReadOnlyExisting | NamespaceOpenIntent::ExistingCompanion => {
                 if let Err(error) = try_lock(&use_file, FileLockMode::Shared) {
                     release_namespace_locks(&gate, &use_file);
                     return Err(error);
@@ -281,6 +291,41 @@ impl PendingNamespaceOpen {
     /// descriptor.  No recovery artifact may be inspected before this step.
     pub fn bind(self, identity: FileIdentity) -> Result<Arc<DatabaseNamespaceBinding>> {
         self.bind_with_gate_release(identity, release_gate)
+    }
+
+    /// Finish a companion admission without consuming its retry owner on error.
+    /// Native mapping cleanup retains this pending admission until the main
+    /// lifetime has closed, including a failed gate release or validation.
+    #[cfg(unix)]
+    pub(crate) fn finish_existing_companion(
+        &mut self,
+        identity: FileIdentity,
+    ) -> Result<Arc<DatabaseNamespaceBinding>> {
+        let Some(PendingLease::JoinShared {
+            gate,
+            use_file,
+            generation_identity,
+        }) = self.lease.as_mut()
+        else {
+            return Err(cannot_open(&self.stable_path));
+        };
+        if *generation_identity != identity
+            || read_identity_record(use_file, &self.stable_path)? != identity
+        {
+            return Err(cannot_open(&self.stable_path));
+        }
+        validate_generation_path_identity(&self.stable_path, identity)?;
+        release_gate(gate)?;
+        let Some(PendingLease::JoinShared { gate, use_file, .. }) = self.lease.take() else {
+            unreachable!("validated companion admission still owns its lease");
+        };
+        drop(gate);
+        Ok(Arc::new(DatabaseNamespaceBinding {
+            stable_path: self.stable_path.clone(),
+            identity: Mutex::new(identity),
+            provisional_identity: AtomicBool::new(false),
+            lease: Mutex::new(BindingLease::Shared { use_file }),
+        }))
     }
 
     /// Bind a newly opened generation after proving that a stale namespace
@@ -931,7 +976,7 @@ impl DatabaseNamespaceBinding {
             // failure (fail closed, lease retained), never a supersession.
             match open_identity_probe(&self.stable_path) {
                 Ok(file) => match FileIdentity::from_file(&file) {
-                    Ok(Some(current)) if current == self.identity => GenerationProbe::Current,
+                    Ok(Some(current)) if current == self.identity() => GenerationProbe::Current,
                     Ok(Some(_)) => GenerationProbe::Superseded,
                     Ok(None) | Err(_) => {
                         GenerationProbe::ProbeFailed(cannot_open(&self.stable_path))
@@ -2728,7 +2773,7 @@ pub fn validate_reserved_database_artifacts(
     pre_open_lock_sidecars: Option<&PreOpenLockSidecars>,
 ) -> Result<()> {
     validate_stable_path(database_path)?;
-    for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+    for suffix in ["-journal", "-wal", "-wal-fec", "-shm", ".fsqlite-shm"] {
         reject_existing_entry(database_path, &sidecar_path(database_path, suffix))?;
     }
 
@@ -5644,6 +5689,30 @@ mod tests {
             ),
             Err(FrankenError::CannotOpen { .. })
         ));
+    }
+
+    #[test]
+    fn artifact_validation_preserves_existing_mvcc_authority() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("mvcc-reserved.db");
+        create_database(&database, b"");
+        validate_reserved_database_artifacts(&database, WindowsLockSidecarPolicy::RejectAll, None)
+            .expect("empty reservation without an authority");
+
+        let companion = sidecar_path(&database, ".fsqlite-shm");
+        let authority = b"existing generation and live ownership";
+        fs::write(&companion, authority).expect("seed existing authority");
+        for policy in [
+            WindowsLockSidecarPolicy::RejectAll,
+            WindowsLockSidecarPolicy::AllowExpected,
+        ] {
+            assert!(matches!(
+                validate_reserved_database_artifacts(&database, policy, None),
+                Err(FrankenError::CannotOpen { .. })
+            ));
+            assert_eq!(fs::read(&companion).unwrap(), authority);
+            assert_eq!(fs::read(&database).unwrap(), b"");
+        }
     }
 
     #[cfg(unix)]

@@ -1362,6 +1362,30 @@ pub trait VfsFile: Send + Sync {
     /// (Equivalent to sqlite3_io_methods.xShmMap)
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion>;
 
+    /// Map a dedicated MVCC payload bound to this admitted main-file identity.
+    ///
+    /// This is separate from SQLite's WAL-index `-shm` regions. The native
+    /// transport preserves a fixed payload length and never resets, grows, or
+    /// unlinks an existing backing. `create` permits creation only for a
+    /// writable main file; a non-creating request never changes backing bytes.
+    /// The returned aliases retain their own native and namespace lifetimes
+    /// after this handle closes. All payload synchronization belongs to the
+    /// caller's atomic protocol, not to a whole-transaction writer lock.
+    ///
+    /// Unix requires a materialized, single-link main file with completed
+    /// namespace admission. Symlink spellings use its canonical namespace.
+    /// Like that namespace, this is a cooperative trusted-parent protocol:
+    /// callers must not unlink, rename, or mutate its companion externally
+    /// while a mapping lives. Initial companion creation is serialized only
+    /// by the short namespace admission gate, and allows existing main-file
+    /// SHARED readers. Payload access retains no exclusive admission gate.
+    /// The identity fence describes live open files, not a durable authority
+    /// epoch or cross-boot transaction generation. Unsupported backends must
+    /// refuse rather than return process-local heap storage as shared memory.
+    fn mvcc_shm_map(&mut self, _cx: &Cx, _payload_bytes: u64, _create: bool) -> Result<ShmRegion> {
+        Err(FrankenError::Unsupported)
+    }
+
     /// Acquire or release a shared-memory lock.
     /// `offset` and `n` define a range of lock slots.
     /// `flags`: SHM_LOCK | (SHM_SHARED | SHM_EXCLUSIVE).

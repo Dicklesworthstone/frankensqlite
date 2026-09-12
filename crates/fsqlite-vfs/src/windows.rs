@@ -79,6 +79,10 @@ const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const ERROR_NOT_LOCKED: i32 = 158;
 
+// Dedicated database workers may perform bounded I/O without another thread
+// hop. Match the Unix backend's limit; ordinary async callers still offload.
+const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
+
 fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::Result<u64> {
     let total = u64::try_from(total).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "I/O offset is too large")
@@ -2468,6 +2472,12 @@ impl VfsFile for WindowsFile {
         checkpoint_or_abort(cx)?;
         let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
         let requested = buf.len();
+        if cx.blocking_io_inline_safe() && requested <= INLINE_IO_MAX_BYTES {
+            let (data, total) = read_owned_at(&file, requested, offset)?;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            return Ok(total);
+        }
         let (data, total) = spawn_blocking_io(move || read_owned_at(&file, requested, offset))
             .await
             .map_err(FrankenError::Io)?;
@@ -2479,6 +2489,10 @@ impl VfsFile for WindowsFile {
     async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+            write_owned_at(&file, buf, offset)?;
+            return checkpoint_or_abort(cx);
+        }
         let data = buf.to_vec();
         spawn_blocking_io(move || write_owned_at(&file, &data, offset))
             .await
@@ -2503,8 +2517,12 @@ impl VfsFile for WindowsFile {
                 return Err(error);
             }
         };
-        let data = buf.to_vec();
         let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+            write_owned_at_tracked(&file, buf, offset, source_completion)?;
+            return checkpoint_or_abort(cx);
+        }
+        let data = buf.to_vec();
         spawn_blocking_io(move || write_owned_at_tracked(&file, &data, offset, source_completion))
             .await
             .map_err(FrankenError::Io)?;
@@ -3672,6 +3690,117 @@ mod tests {
                 sidecar.display()
             );
         }
+    }
+
+    #[test]
+    fn test_windowsvfs_inline_io_roundtrip_without_yielding() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("inline.db");
+        let (file, _) = WindowsVfs::new()
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let payload = vec![0x5a; INLINE_IO_MAX_BYTES];
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            std::pin::pin!(file.write(&cx, &payload, 0)).poll(&mut task_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        let mut buf = vec![0; payload.len()];
+        assert!(matches!(
+            std::pin::pin!(file.read(&cx, &mut buf, 0)).poll(&mut task_cx),
+            std::task::Poll::Ready(Ok(INLINE_IO_MAX_BYTES))
+        ));
+        assert_eq!(buf, payload);
+
+        let mut tail = [0xff; 8];
+        assert!(matches!(
+            std::pin::pin!(file.read(&cx, &mut tail, INLINE_IO_MAX_BYTES as u64 - 3))
+                .poll(&mut task_cx),
+            std::task::Poll::Ready(Ok(3))
+        ));
+        assert_eq!(tail, [0x5a, 0x5a, 0x5a, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            std::pin::pin!(file.read(&cx, &mut [], 0)).poll(&mut task_cx),
+            std::task::Poll::Ready(Ok(0))
+        ));
+    }
+
+    #[test]
+    fn test_windowsvfs_inline_tracked_write_outcomes() {
+        use crate::traits::VfsWriteCompletionState;
+
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("inline-tracked.db");
+        let (mut file, _) = WindowsVfs::new()
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let completion = VfsWriteCompletion::new();
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::pin::pin!(file.write_tracked(&cx, b"retained", 0, completion.clone()))
+                .poll(&mut task_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+
+        let cancelled = Cx::new();
+        cancelled.mark_blocking_io_inline_safe();
+        cancelled.cancel();
+        let completion = VfsWriteCompletion::new();
+        assert!(matches!(
+            std::pin::pin!(file.write_tracked(&cancelled, b"changed!", 0, completion.clone()))
+                .poll(&mut task_cx),
+            std::task::Poll::Ready(Err(FrankenError::Abort))
+        ));
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+        file.close(&cx).expect("close writer");
+
+        let (readonly, _) = WindowsVfs::new()
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY,
+            )
+            .expect("open readonly");
+        let completion = VfsWriteCompletion::new();
+        assert!(matches!(
+            std::pin::pin!(readonly.write_tracked(&cx, b"changed!", 0, completion.clone()))
+                .poll(&mut task_cx),
+            std::task::Poll::Ready(Err(FrankenError::Io(_)))
+        ));
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+        assert_eq!(fs::read(&path).expect("read retained bytes"), b"retained");
+    }
+
+    #[test]
+    fn test_windowsvfs_inline_large_transfer_falls_back() {
+        let cx = Cx::new();
+        cx.mark_blocking_io_inline_safe();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("inline-large.db");
+        let (file, _) = WindowsVfs::new()
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+        let payload = vec![0xa5; INLINE_IO_MAX_BYTES + 1];
+        let completion = VfsWriteCompletion::new();
+        crate::block_on_test_io(
+            &cx,
+            file.write_tracked(&cx, &payload, 0, completion.clone()),
+        )
+        .expect("write above inline limit");
+        assert_eq!(
+            completion.state(),
+            crate::traits::VfsWriteCompletionState::Success
+        );
+        let mut buf = vec![0; payload.len()];
+        let total = crate::block_on_test_io(&cx, file.read(&cx, &mut buf, 0)).expect("read");
+        assert_eq!(total, payload.len());
+        assert_eq!(buf, payload);
     }
 
     #[test]
