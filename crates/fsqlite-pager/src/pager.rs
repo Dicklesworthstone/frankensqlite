@@ -11051,6 +11051,11 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         .map(|frame| frame.db_size_if_commit)
         .max()
         .unwrap_or(0);
+    // GH#410 / cass#462: normalization deliberately removes the reserved
+    // lock-byte page from damaged durable freelists. It can never be allocated,
+    // so omitting it is repair, not erasure of a peer's free page. Keep the raw
+    // chain above for cycle detection, and exempt only the erasure arm below.
+    let reserved_page = crate::journal::PENDING_BYTE_OFFSET / page_size as u64 + 1;
 
     let mut offending: Vec<u32> = published_set
         .iter()
@@ -11059,6 +11064,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
         .chain(current.iter().copied().filter(|page| {
             !published_set.contains(page)
                 && !consumed.contains(page)
+                && u64::from(*page) != reserved_page
                 && (publication_db_size == 0 || *page <= publication_db_size)
         }))
         // DOUBLE-CONSUMPTION: a page this batch consumed from the DURABLE
@@ -45679,6 +45685,67 @@ mod tests {
                 2,
                 "bead_id=bd-3wop3.1.2 case=disjoint_writers_commit_all_frames"
             );
+        });
+    }
+
+    #[test]
+    fn test_gh462_freelist_repair_keeps_real_conflict_guards() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+            for raw in [512_u32, 4096, 65536] {
+                let page_size = PageSize::new(raw).unwrap();
+                let reserved = crate::journal::lock_byte_page(page_size);
+                let db_size = reserved + 1;
+                let mut page_one = vec![0_u8; page_size.as_usize()];
+                page_one[32..36].copy_from_slice(&3_u32.to_be_bytes());
+                page_one[36..40].copy_from_slice(&3_u32.to_be_bytes());
+                let mut trunk = vec![0_u8; page_size.as_usize()];
+                trunk[4..8].copy_from_slice(&2_u32.to_be_bytes());
+                trunk[8..12].copy_from_slice(&7_u32.to_be_bytes());
+                trunk[12..16].copy_from_slice(&reserved.to_be_bytes());
+                let (mut wal, frames, _, _) = MockWalBackend::new();
+                frames.lock().unwrap().extend([
+                    (1, page_one.clone(), 0),
+                    (3, trunk, db_size),
+                ]);
+
+                // These synthetic durable tails exercise the production guard
+                // directly. The core GH#462 keeper separately traverses a real
+                // on-disk WAL open, repair commit, checkpoint and reopen.
+                for (case, published, freed, consumed, durable_consumed, expected) in [
+                    ("repair", vec![3, 7], vec![], vec![], vec![], vec![]),
+                    ("legal_free", vec![3, 7, 8], vec![8], vec![], vec![], vec![]),
+                    ("legal_consume", vec![3], vec![], vec![7], vec![7], vec![]),
+                    ("erasure", vec![3], vec![], vec![], vec![], vec![7]),
+                    ("resurrection", vec![3, 7, 8], vec![], vec![], vec![], vec![8]),
+                    ("double_consume", vec![3, 7], vec![], vec![9], vec![9], vec![9]),
+                    ("combined", vec![3, 8], vec![], vec![9], vec![9], vec![7, 8, 9]),
+                ] {
+                    let batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                        page_number: 1,
+                        page_data: page_one.clone(),
+                        db_size_if_commit: db_size,
+                    }])
+                    .with_freelist_publication(
+                        Some(published),
+                        freed,
+                        consumed,
+                        durable_consumed,
+                    );
+                    let offending = resurrected_or_erased_freelist_pages(
+                        &cx,
+                        &mut wal,
+                        &db_file,
+                        page_size.as_usize(),
+                        &[batch],
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(offending, expected, "page_size={raw} case={case}");
+                }
+            }
         });
     }
 

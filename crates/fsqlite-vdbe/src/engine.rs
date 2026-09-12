@@ -2866,6 +2866,24 @@ impl SharedTxnPageIo {
 const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
 const PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL: Duration = Duration::from_millis(50);
 
+// Exact-count tests execute on their current-thread runtime. Other tests may
+// write pages concurrently while the process-wide metrics switch is enabled.
+#[cfg(test)]
+thread_local! {
+    static PAGE_DATA_BORROWED_COPIES_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PAGE_DATA_OWNED_PASSTHROUGH_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PAGE_DATA_RESIZED_COPIES_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn thread_page_data_motion() -> (u64, u64, u64) {
+    (
+        PAGE_DATA_BORROWED_COPIES_THREAD.with(std::cell::Cell::get),
+        PAGE_DATA_OWNED_PASSTHROUGH_THREAD.with(std::cell::Cell::get),
+        PAGE_DATA_RESIZED_COPIES_THREAD.with(std::cell::Cell::get),
+    )
+}
+
 fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
     let metrics_enabled = vdbe_metrics_enabled();
     add_vdbe_counter_if(
@@ -2879,6 +2897,10 @@ fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> 
             &FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL,
             1,
         );
+        #[cfg(test)]
+        if metrics_enabled {
+            PAGE_DATA_BORROWED_COPIES_THREAD.with(|c| c.set(c.get().saturating_add(1)));
+        }
         add_vdbe_counter_if(
             metrics_enabled,
             &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL,
@@ -2922,6 +2944,10 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
             &FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL,
             1,
         );
+        #[cfg(test)]
+        if metrics_enabled {
+            PAGE_DATA_OWNED_PASSTHROUGH_THREAD.with(|c| c.set(c.get().saturating_add(1)));
+        }
         return Ok(data);
     }
     if data.len() > page_size {
@@ -2956,6 +2982,10 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
         &FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL,
         1,
     );
+    #[cfg(test)]
+    if metrics_enabled {
+        PAGE_DATA_RESIZED_COPIES_THREAD.with(|c| c.set(c.get().saturating_add(1)));
+    }
     add_vdbe_counter_if(
         metrics_enabled,
         &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL,
@@ -22151,12 +22181,11 @@ mod tests {
             assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
         }
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         let first =
             run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed");
         let second =
             run_async(engine.cursor_column(0, 0)).expect("pinned-row cache hit should succeed");
-        let after = vdbe_metrics_snapshot();
         let sc = engine
             .storage_cursors
             .get(&0)
@@ -22169,24 +22198,11 @@ mod tests {
             sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
             Some("alpha-track-s")
         );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            0
-        );
+        assert_eq!(thread_decode_cache_misses(), 1);
+        assert_eq!(thread_decode_cache_hits(), 1);
+        let (position_invalidations, write_invalidations, _) = thread_decode_cache_invalidations();
+        assert_eq!(position_invalidations, 0);
+        assert_eq!(write_invalidations, 0);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -22549,7 +22565,7 @@ mod tests {
             assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
         }
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         assert_eq!(
             run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed"),
             SqliteValue::Text("alpha-track-s".into())
@@ -22565,7 +22581,6 @@ mod tests {
             run_async(engine.cursor_column(0, 0)).expect("post-move text decode should succeed"),
             SqliteValue::Text("beta-track-s".into())
         );
-        let after = vdbe_metrics_snapshot();
         let sc = engine
             .storage_cursors
             .get(&0)
@@ -22576,29 +22591,9 @@ mod tests {
             sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
             Some("beta-track-s")
         );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_pseudo_total
-                - before.decode_cache_invalidations_pseudo_total,
-            0
-        );
+        assert_eq!(thread_decode_cache_misses(), 2);
+        assert_eq!(thread_decode_cache_hits(), 0);
+        assert_eq!(thread_decode_cache_invalidations(), (1, 0, 0));
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -22636,7 +22631,7 @@ mod tests {
             assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
         }
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         assert_eq!(
             run_async(engine.cursor_column(0, 0)).expect("first text decode should succeed"),
             SqliteValue::Text("alpha-track-j".into())
@@ -22654,7 +22649,6 @@ mod tests {
                 .expect("same-slot successor should force a fresh decode"),
             SqliteValue::Text("beta-track-j".into())
         );
-        let after = vdbe_metrics_snapshot();
         let sc = engine
             .storage_cursors
             .get(&0)
@@ -22665,24 +22659,11 @@ mod tests {
             sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
             Some("beta-track-j")
         );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
+        let (position_invalidations, write_invalidations, _) = thread_decode_cache_invalidations();
+        assert_eq!(write_invalidations, 1);
+        assert_eq!(position_invalidations, 0);
+        assert_eq!(thread_decode_cache_hits(), 0);
+        assert_eq!(thread_decode_cache_misses(), 2);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -28740,7 +28721,7 @@ mod tests {
         table.insert(1, vec![SqliteValue::Integer(10)]);
         table.insert(2, vec![SqliteValue::Integer(20)]);
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
             let done = b.emit_label();
@@ -28759,27 +28740,13 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        let after = vdbe_metrics_snapshot();
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(20)]]);
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
+        let (position_invalidations, write_invalidations, _) = thread_decode_cache_invalidations();
+        assert_eq!(write_invalidations, 1);
+        assert_eq!(position_invalidations, 0);
+        assert_eq!(thread_decode_cache_hits(), 0);
+        assert_eq!(thread_decode_cache_misses(), 2);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -31144,30 +31111,35 @@ mod tests {
 
         // Snapshot motion counters immediately before the root-init write so the
         // delta isolates exactly the zero-page initialization path.
-        let before = vdbe_metrics_snapshot();
+        let (borrowed_before, passthrough_before, resized_before) = thread_page_data_motion();
         assert!(
             run_async(engine.open_storage_cursor(0, root_pgno.get() as i32, true)).unwrap(),
             "txn-backed writable cursor should open on a fresh zeroed root page"
         );
-        let after = vdbe_metrics_snapshot();
+        // A different test thread may perform a borrowed page copy during this
+        // window. It must not contaminate this root-init operation's counters.
+        std::thread::spawn(|| {
+            let page = vec![0_u8; PageSize::DEFAULT.as_usize()];
+            normalize_owned_page_data(page.len(), &page)
+                .expect("unrelated thread's borrowed page copy should succeed");
+        })
+        .join()
+        .expect("unrelated page-copy thread should finish");
+        let (borrowed_after, passthrough_after, resized_after) = thread_page_data_motion();
 
         // The root-init write takes the owned-passthrough lane: at least one owned
         // passthrough, and zero borrowed/resized full-page copies on this path.
         assert!(
-            after.page_data_motion.owned_passthrough_total
-                - before.page_data_motion.owned_passthrough_total
-                >= 1,
+            passthrough_after - passthrough_before >= 1,
             "zeroed-root init must write its owned page image via owned passthrough"
         );
         assert_eq!(
-            after.page_data_motion.borrowed_exact_size_copies_total
-                - before.page_data_motion.borrowed_exact_size_copies_total,
+            borrowed_after - borrowed_before,
             0,
             "zeroed-root init must not clone a full page image through the borrowed lane"
         );
         assert_eq!(
-            after.page_data_motion.owned_resized_copies_total
-                - before.page_data_motion.owned_resized_copies_total,
+            resized_after - resized_before,
             0,
             "an exactly-page-size root image must never trigger a resize copy"
         );
@@ -33418,7 +33390,8 @@ mod tests {
         table.insert(1, vec![SqliteValue::Integer(10)]);
         table.insert(2, vec![SqliteValue::Integer(20)]);
 
-        let before = vdbe_metrics_snapshot();
+        // The current-thread runtime keeps this program's decode work local.
+        reset_thread_decode_cache_metrics();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
             let eof = b.emit_label();
@@ -33438,7 +33411,6 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        let after = vdbe_metrics_snapshot();
 
         assert_eq!(
             rows,
@@ -33447,29 +33419,9 @@ mod tests {
                 vec![SqliteValue::Integer(20), SqliteValue::Integer(20)],
             ]
         );
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            2
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_pseudo_total
-                - before.decode_cache_invalidations_pseudo_total,
-            0
-        );
+        assert_eq!(thread_decode_cache_hits(), 2);
+        assert_eq!(thread_decode_cache_misses(), 2);
+        assert_eq!(thread_decode_cache_invalidations(), (1, 0, 0));
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -33560,7 +33512,7 @@ mod tests {
         engine.collect_vdbe_metrics = true;
         engine.sorters.insert(0, sorter);
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         assert_eq!(
             run_async(engine.cursor_column(0, 1)).expect("first sorter decode should succeed"),
             SqliteValue::Text("alpha".into())
@@ -33578,31 +33530,10 @@ mod tests {
             run_async(engine.cursor_column(0, 1)).expect("next sorter row should decode"),
             SqliteValue::Text("beta".into())
         );
-        let after = vdbe_metrics_snapshot();
 
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            2
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_position_total
-                - before.decode_cache_invalidations_position_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_write_total
-                - before.decode_cache_invalidations_write_total,
-            0
-        );
-        assert_eq!(
-            after.decode_cache_invalidations_pseudo_total
-                - before.decode_cache_invalidations_pseudo_total,
-            0
-        );
+        assert_eq!(thread_decode_cache_hits(), 1);
+        assert_eq!(thread_decode_cache_misses(), 2);
+        assert_eq!(thread_decode_cache_invalidations(), (1, 0, 0));
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -33673,7 +33604,7 @@ mod tests {
         engine.collect_vdbe_metrics = true;
         engine.sorters.insert(0, sorter);
 
-        let before = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         assert_eq!(
             run_async(engine.cursor_column(0, 64))
                 .expect("first wide sorter decode should succeed"),
@@ -33684,16 +33615,9 @@ mod tests {
                 .expect("second wide sorter read should hit cache"),
             SqliteValue::Integer(64)
         );
-        let after = vdbe_metrics_snapshot();
 
-        assert_eq!(
-            after.decode_cache_hits_total - before.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after.decode_cache_misses_total - before.decode_cache_misses_total,
-            1
-        );
+        assert_eq!(thread_decode_cache_hits(), 1);
+        assert_eq!(thread_decode_cache_misses(), 1);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
@@ -33716,7 +33640,7 @@ mod tests {
             .expect("table should exist")
             .insert(1, row);
 
-        let before_metrics = vdbe_metrics_snapshot();
+        reset_thread_decode_cache_metrics();
         let before_record_profile = fsqlite_types::record::record_profile_snapshot();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
@@ -33731,21 +33655,14 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        let after_metrics = vdbe_metrics_snapshot();
         let after_record_profile = fsqlite_types::record::record_profile_snapshot();
 
         assert_eq!(
             rows,
             vec![vec![SqliteValue::Integer(64), SqliteValue::Integer(64)]]
         );
-        assert_eq!(
-            after_metrics.decode_cache_hits_total - before_metrics.decode_cache_hits_total,
-            1
-        );
-        assert_eq!(
-            after_metrics.decode_cache_misses_total - before_metrics.decode_cache_misses_total,
-            1
-        );
+        assert_eq!(thread_decode_cache_hits(), 1);
+        assert_eq!(thread_decode_cache_misses(), 1);
         assert_eq!(
             after_record_profile
                 .callsite_breakdown

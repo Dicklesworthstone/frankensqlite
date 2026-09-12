@@ -55,6 +55,19 @@ pub const MEASUREMENT_TIME_SECS: u64 = 10;
 /// Canonical cargo profile for authoritative throughput measurements.
 pub const AUTHORITATIVE_PERF_CARGO_PROFILE: &str = "release-perf";
 
+/// Cargo profile recorded by the build script from Cargo's output directory.
+///
+/// Cargo exposes `PROFILE` and `OPT_LEVEL` to build scripts, not directly to
+/// crate compilation. Preserve custom profile names instead of inferring them
+/// from optimization or debug assertions.
+#[must_use]
+pub fn compiled_cargo_profile() -> &'static str {
+    match env!("FSQLITE_BENCH_BUILD_SELECTED_PROFILE") {
+        "debug" => "dev",
+        profile => profile,
+    }
+}
+
 /// Methodology metadata embedded in every benchmark report.
 ///
 /// This record is serialized into the report JSON so that consumers can
@@ -151,8 +164,11 @@ impl BuildHygieneMeta {
             profile_contract_expectations(cargo_profile);
         Self {
             authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
-            matches_authoritative_profile: cargo_profile == AUTHORITATIVE_PERF_CARGO_PROFILE,
-            opt_level: option_env!("OPT_LEVEL").unwrap_or("unknown").to_owned(),
+            matches_authoritative_profile: cargo_profile == AUTHORITATIVE_PERF_CARGO_PROFILE
+                && compiled_cargo_profile() == AUTHORITATIVE_PERF_CARGO_PROFILE
+                && env!("FSQLITE_BENCH_BUILD_OPT_LEVEL") == "3"
+                && !cfg!(debug_assertions),
+            opt_level: env!("FSQLITE_BENCH_BUILD_OPT_LEVEL").to_owned(),
             debug_assertions: cfg!(debug_assertions),
             panic_strategy: if cfg!(panic = "abort") {
                 "abort"
@@ -187,8 +203,9 @@ fn profile_contract_expectations(
     cargo_profile: &str,
 ) -> (Option<bool>, Option<u32>, Option<bool>, Option<bool>) {
     match cargo_profile {
-        "release" => (Some(true), Some(1), Some(true), Some(false)),
-        AUTHORITATIVE_PERF_CARGO_PROFILE => (Some(true), Some(1), Some(false), Some(true)),
+        "release" | AUTHORITATIVE_PERF_CARGO_PROFILE => {
+            (Some(true), Some(1), Some(false), Some(true))
+        }
         _ => (None, None, None, None),
     }
 }
@@ -367,7 +384,38 @@ mod tests {
             AUTHORITATIVE_PERF_CARGO_PROFILE
         );
         assert_eq!(env.build_hygiene.debug_assertions, cfg!(debug_assertions));
-        assert!(!env.build_hygiene.opt_level.is_empty());
+        assert_eq!(
+            env.build_hygiene.opt_level,
+            env!("FSQLITE_BENCH_BUILD_OPT_LEVEL")
+        );
+        assert_ne!(env.build_hygiene.opt_level, "unknown");
+    }
+
+    #[test]
+    fn build_hygiene_does_not_certify_a_caller_supplied_profile_label() {
+        let claimed = BuildHygieneMeta::capture(AUTHORITATIVE_PERF_CARGO_PROFILE);
+        let actual_profile = compiled_cargo_profile();
+        assert_eq!(
+            claimed.matches_authoritative_profile,
+            actual_profile == AUTHORITATIVE_PERF_CARGO_PROFILE
+                && env!("FSQLITE_BENCH_BUILD_OPT_LEVEL") == "3"
+                && !cfg!(debug_assertions)
+        );
+        for other in ["dev", "release", "test", "unknown", ""] {
+            assert!(!BuildHygieneMeta::capture(other).matches_authoritative_profile);
+        }
+        if cfg!(debug_assertions) {
+            assert!(!claimed.matches_authoritative_profile);
+        }
+    }
+
+    #[test]
+    fn release_profile_contract_uses_stripped_binaries_without_debug_symbols() {
+        for profile in ["release", AUTHORITATIVE_PERF_CARGO_PROFILE] {
+            let captured = BuildHygieneMeta::capture(profile);
+            assert_eq!(captured.profile_debug_symbols, Some(false));
+            assert_eq!(captured.profile_strip, Some(true));
+        }
     }
 
     #[test]

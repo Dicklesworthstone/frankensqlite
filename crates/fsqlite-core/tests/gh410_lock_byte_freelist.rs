@@ -62,13 +62,13 @@ fn scalar_i64(rows: &[Row]) -> i64 {
 }
 
 /// Build a sparse database that declares `PAGE_COUNT` pages and whose durable
-/// freelist is exactly `free` (which must be strictly descending).
+/// freelist is exactly `free` (which must contain unique page numbers).
 ///
 /// Starts from a real, empty SQLite file (so page 1 is a genuine header plus
 /// an empty `sqlite_master` leaf) and then rewrites the page-count and
 /// freelist header fields and lays down the trunk chain, byte for byte the way
 /// the engine's own serializer does.
-fn build_sparse_archive(path: &Path, free: &[u32]) {
+fn build_sparse_archive(path: &Path, free: &[u32], journal_version: u8) {
     {
         let conn = rusqlite::Connection::open(path).expect("create fixture");
         conn.pragma_update(None, "page_size", 4096_i64)
@@ -81,10 +81,12 @@ fn build_sparse_archive(path: &Path, free: &[u32]) {
         conn.execute_batch("CREATE TABLE seed(x); VACUUM;")
             .expect("seed");
     }
-    assert!(
-        free.windows(2).all(|w| w[0] > w[1]),
-        "the fixture freelist must be strictly descending"
+    assert_eq!(
+        free.iter().copied().collect::<std::collections::HashSet<_>>().len(),
+        free.len(),
+        "the fixture freelist must contain unique pages"
     );
+    assert!(matches!(journal_version, 1 | 2));
 
     let trunk_count = free.len().div_ceil(MAX_LEAF_ENTRIES + 1);
     let trunks: Vec<u32> = free.iter().copied().take(trunk_count).collect();
@@ -101,6 +103,10 @@ fn build_sparse_archive(path: &Path, free: &[u32]) {
     let mut header = [0_u8; 100];
     file.read_exact(&mut header).expect("read header");
     assert_eq!(&header[..16], b"SQLite format 3\0", "fixture is a SQLite file");
+    // A checkpointed WAL database can have no WAL sidecar. Persist the mode
+    // before the first FrankenSQLite open so its migration repair uses WAL.
+    header[18] = journal_version;
+    header[19] = journal_version;
     header[28..32].copy_from_slice(&PAGE_COUNT.to_be_bytes());
     header[32..36].copy_from_slice(&trunks[0].to_be_bytes());
     header[36..40].copy_from_slice(&(free.len() as u32).to_be_bytes());
@@ -179,7 +185,7 @@ fn gh410_durable_freelist_naming_the_lock_byte_page_is_detected_and_repairable()
         // Every page above the seed table's root is free, INCLUDING the
         // reserved lock-byte page — the shape observed on the damaged archive.
         let free: Vec<u32> = (3..=PAGE_COUNT).rev().collect();
-        build_sparse_archive(&db_path, &free);
+        build_sparse_archive(&db_path, &free, 1);
         assert!(durable_freelist(&db_path).contains(&LOCK_BYTE_PAGE));
         let db_str = db_path.to_string_lossy().into_owned();
 
@@ -225,6 +231,71 @@ fn gh410_durable_freelist_naming_the_lock_byte_page_is_detected_and_repairable()
 }
 
 #[test]
+fn gh462_wal_open_repairs_reserved_freelist_trunks_and_leaves() {
+    asupersync::test_utils::run_test(|| async {
+        for reserved_is_leaf in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("gh462_wal_lock_byte.db");
+            let mut free: Vec<u32> = (3..=PAGE_COUNT).rev().collect();
+            if reserved_is_leaf {
+                let last = free.len() - 1;
+                free.swap(1, last);
+            }
+            build_sparse_archive(&db_path, &free, 2);
+            assert!(durable_freelist(&db_path).contains(&LOCK_BYTE_PAGE));
+
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str)
+                .await
+                .expect("WAL migration must publish reserved-page repair without BusySnapshot");
+            assert_eq!(
+                texts(&conn.query("PRAGMA journal_mode;").await.unwrap()),
+                vec!["wal".to_owned()]
+            );
+            assert!(
+                std::fs::metadata(format!("{db_str}-wal")).unwrap().len() > 32,
+                "repair must traverse the real WAL publication path"
+            );
+            assert_eq!(
+                scalar_i64(&conn.query("PRAGMA freelist_count;").await.unwrap()),
+                i64::from(PAGE_COUNT - 3)
+            );
+            assert_eq!(
+                scalar_i64(&conn.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+                0,
+                "the on-open repair must be idempotent"
+            );
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            conn.execute("INSERT INTO seed VALUES (462);").await.unwrap();
+            assert_eq!(
+                texts(&conn.query("PRAGMA integrity_check;").await.unwrap()),
+                vec!["ok".to_owned()]
+            );
+            conn.close().await.unwrap();
+
+            let mut durable = durable_freelist(&db_path);
+            durable.sort_unstable();
+            let expected: Vec<u32> = (3..=PAGE_COUNT)
+                .filter(|page| *page != LOCK_BYTE_PAGE)
+                .collect();
+            assert_eq!(durable, expected, "repair must preserve every legal free page");
+
+            let reopened = Connection::open(&db_str).await.unwrap();
+            assert_eq!(
+                scalar_i64(&reopened.query("SELECT x FROM seed;").await.unwrap()),
+                462
+            );
+            assert_eq!(
+                scalar_i64(&reopened.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+                0
+            );
+            reopened.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
@@ -236,7 +307,7 @@ fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
         // reserved page as an orphan (it is owned by nobody by design) and
         // freed it, which is how page 262145 reached the archive's freelist.
         let free: Vec<u32> = (3..=PAGE_COUNT).rev().filter(|p| *p != LOCK_BYTE_PAGE).collect();
-        build_sparse_archive(&db_path, &free);
+        build_sparse_archive(&db_path, &free, 1);
         assert!(!durable_freelist(&db_path).contains(&LOCK_BYTE_PAGE));
         let db_str = db_path.to_string_lossy().into_owned();
 

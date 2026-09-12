@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fsqlite_e2e::benchmark::{BenchmarkSummary, IterationRecord, LatencyStats, ThroughputStats};
+use fsqlite_e2e::benchmark::{
+    BenchmarkComparisonMetadata, BenchmarkSummary, IterationRecord, LatencyStats, ThroughputStats,
+};
 use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BenchmarkArtifactCommand, BenchmarkArtifactManifest,
     BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
@@ -14,10 +16,14 @@ use fsqlite_e2e::fixture_select::{
     PLACEMENT_PROFILE_BASELINE_UNPINNED, build_benchmark_artifact_manifest,
     load_beads_benchmark_campaign,
 };
-use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
+use fsqlite_e2e::methodology::{
+    AUTHORITATIVE_PERF_CARGO_PROFILE, EnvironmentCaptureMode, EnvironmentMeta, MethodologyMeta,
+};
 use fsqlite_e2e::overlay_honesty_gate::{
-    MatrixRegressionThresholds, evaluate_matrix_regression_gate_from_paths,
-    evaluate_overlay_honesty_gate_from_paths, load_benchmark_summaries,
+    MatrixRegressionThresholds, benchmark_cell_key, evaluate_matrix_regression_gate,
+    evaluate_matrix_regression_gate_from_paths, evaluate_overlay_honesty_gate,
+    load_benchmark_summaries, load_c1_evidence_pack_scorecard,
+    load_persistent_phase_pack_scorecard,
 };
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
 use serde::Serialize;
@@ -48,36 +54,45 @@ const RELEASE_FORBIDDEN_MATRIX_ENV: &[&str] = &[
     // Thresholds: relax the comparator until any result passes.
     "FSQLITE_MATRIX_MAX_P95_RATIO",
     "FSQLITE_MATRIX_MIN_THROUGHPUT_RATIO",
-    // Baseline: point the historical comparison at an arbitrary file, or omit
-    // it and skip the comparison silently. Refused outright at v0.2.0 because
-    // no canonical historical baseline exists to select.
+    // Baseline: replace the committed, checksum-pinned historical measurement
+    // with an arbitrary file or silently skip the comparison.
     "FSQLITE_MATRIX_BASELINE_JSONL",
 ];
 
-/// Manifest status recorded when no canonical historical baseline exists.
-///
-/// The v0.2.0 release is the bootstrap: it publishes the first immutable
-/// complete-matrix baseline instead of comparing against one.
-const MATRIX_REGRESSION_STATUS_BOOTSTRAP: &str = "unavailable_bootstrap_v0_2_0";
+/// Published v0.3.18 engine, measured with the same repaired benchmark harness
+/// as the candidate. The adjacent README records the exact patch and RCH run.
+const MATRIX_BASELINE_RELPATH: &str = "baselines/complete-matrix-v0.3.18-20260911/results.jsonl";
+const MATRIX_BASELINE_SHA256: &str =
+    "e595a08f9550e1b66a6f8eb1d19108df93409a6a05078d958b15bb2b6f56ebf9";
+const MATRIX_BASELINE_ENGINE_REVISION: &str = "1600766ca698dae99b6018474bc8c150ece4a82d";
 
-/// The single package version permitted to skip historical regression.
-const MATRIX_BOOTSTRAP_PKG_VERSION: &str = "0.2.0";
-
-/// Refuse the bootstrap escape at any version other than [`MATRIX_BOOTSTRAP_PKG_VERSION`].
-///
-/// Bootstrap is a one-time concession: v0.2.0 publishes the first immutable
-/// complete-matrix baseline. Once that baseline exists, a later release that
-/// still skipped historical regression would be silently unguarded, so this
-/// fails closed and forces the successor to wire the real comparison.
-fn bootstrap_allowed_for_version(pkg_version: &str) -> Result<(), String> {
-    if pkg_version == MATRIX_BOOTSTRAP_PKG_VERSION {
-        return Ok(());
+fn parse_pinned_matrix_baseline(raw: &[u8]) -> Result<Vec<BenchmarkSummary>, Box<dyn Error>> {
+    let actual_hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(raw));
+    if actual_hash != MATRIX_BASELINE_SHA256 {
+        return Err(format!("historical matrix checksum mismatch: {actual_hash}").into());
     }
-    Err(format!(
-        "historical-regression bootstrap is permitted only at package version \
-         {MATRIX_BOOTSTRAP_PKG_VERSION}, found `{pkg_version}`; v{MATRIX_BOOTSTRAP_PKG_VERSION} \
-         published the first immutable baseline, so this release must compare against it"
-    ))
+    let summaries = std::str::from_utf8(raw)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<BenchmarkSummary>)
+        .collect::<Result<Vec<_>, _>>()?;
+    for summary in &summaries {
+        let comparison = summary
+            .comparison
+            .as_ref()
+            .ok_or("baseline lacks provenance")?;
+        let manifest = comparison
+            .canonical_artifact_manifest
+            .as_ref()
+            .ok_or("baseline lacks canonical artifact manifest")?;
+        if comparison.row_identity.source_revision.as_deref()
+            != Some(MATRIX_BASELINE_ENGINE_REVISION)
+            || manifest.provenance.source_revision != MATRIX_BASELINE_ENGINE_REVISION
+        {
+            return Err("historical matrix is not the pinned engine revision".into());
+        }
+    }
+    Ok(summaries)
 }
 
 /// Names from [`RELEASE_FORBIDDEN_MATRIX_ENV`] that `is_set` reports as present.
@@ -102,10 +117,11 @@ const RELEASE_EVIDENCE_PREFIX: &str = "tests/artifacts/release-evidence";
 /// Suffix identifying the c1 overlay scorecard within one commit's evidence.
 const RELEASE_C1_SCORECARD_SUFFIX: &str = "performance/c1/c1_scorecard.json";
 
-/// Suffix identifying the persistent overlay scorecard within one commit's
-/// evidence.
+/// The release-perf matrix consumes the matching persistent scorecard emitted
+/// by phase5_evidence_capture. The release verifier separately requires both
+/// the distribution and throughput profile packs.
 const RELEASE_PERSISTENT_SCORECARD_SUFFIX: &str =
-    "performance/persistent/persistent_scorecard.json";
+    "performance/persistent/release-perf/persistent_scorecard.json";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -362,6 +378,175 @@ fn benchmark_mode_id(mode: BenchmarkMode) -> &'static str {
     }
 }
 
+type MatrixPopulationKey = (String, String, u16, String);
+
+fn required_matrix_population(
+    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+) -> BTreeSet<MatrixPopulationKey> {
+    let mut required = BTreeSet::new();
+    for row in &campaign.matrix_rows {
+        for fixture in &row.fixtures {
+            for &mode in &row.modes {
+                required.insert((
+                    fixture.clone(),
+                    row.workload.clone(),
+                    row.concurrency,
+                    benchmark_mode_id(mode).to_owned(),
+                ));
+            }
+        }
+    }
+    required
+}
+
+/// The generic comparator permits focused subsets. A release must first prove
+/// that every canonical fixture/workload/concurrency/mode cell is present once.
+fn validate_complete_matrix_population(
+    campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
+    summaries: &[BenchmarkSummary],
+) -> Result<(), String> {
+    let required = required_matrix_population(campaign);
+    if required.is_empty() {
+        return Err("canonical matrix has no required cells".to_owned());
+    }
+    let mut observed = BTreeSet::new();
+    for summary in summaries {
+        let mode =
+            benchmark_mode_from_engine(&summary.engine).map_err(|error| error.to_string())?;
+        let key = (
+            summary.fixture_id.clone(),
+            summary.workload.clone(),
+            summary.concurrency,
+            benchmark_mode_id(mode).to_owned(),
+        );
+        if !observed.insert(key.clone()) {
+            return Err(format!("duplicate release matrix cell: {key:?}"));
+        }
+    }
+    if observed != required {
+        let missing = required.difference(&observed).collect::<Vec<_>>();
+        let unexpected = observed.difference(&required).collect::<Vec<_>>();
+        return Err(format!(
+            "incomplete release matrix: missing={missing:?}, unexpected={unexpected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_matrix_measurements(summaries: &[BenchmarkSummary]) -> Result<(), String> {
+    if summaries.is_empty() {
+        return Err("release matrix contains no measurements".to_owned());
+    }
+    let methodology = MethodologyMeta::current();
+    for summary in summaries {
+        let id = &summary.benchmark_id;
+        if summary.methodology != methodology
+            || summary.warmup_count != methodology.warmup_iterations
+            || summary.measurement_count < methodology.min_measurement_iterations
+            || usize::try_from(summary.measurement_count).ok() != Some(summary.iterations.len())
+            || summary.total_measurement_ms < methodology.measurement_time_secs * 1_000
+        {
+            return Err(format!("{id}: incomplete canonical measurement protocol"));
+        }
+        let environment = &summary.environment;
+        let build = &environment.build_hygiene;
+        if environment.capture_mode != EnvironmentCaptureMode::Captured
+            || environment.cargo_profile != AUTHORITATIVE_PERF_CARGO_PROFILE
+            || !build.matches_authoritative_profile
+            || build.opt_level != "3"
+            || build.debug_assertions
+        {
+            return Err(format!(
+                "{id}: missing authoritative release-perf build facts"
+            ));
+        }
+        for (index, sample) in summary.iterations.iter().enumerate() {
+            if usize::try_from(sample.iteration).ok() != Some(index)
+                || sample.error.is_some()
+                || sample.ops_total == 0
+                || sample.wall_time_ns == 0
+                || sample.wall_time_ms != sample.wall_time_ns / 1_000_000
+                || !sample.ops_per_sec.is_finite()
+                || sample.ops_per_sec <= 0.0
+            {
+                return Err(format!(
+                    "{id}: invalid or failed measurement sample {index}"
+                ));
+            }
+        }
+        for value in [
+            summary.latency.min_ms,
+            summary.latency.max_ms,
+            summary.latency.mean_ms,
+            summary.latency.median_ms,
+            summary.latency.p95_ms,
+            summary.latency.p99_ms,
+            summary.throughput.mean_ops_per_sec,
+            summary.throughput.median_ops_per_sec,
+            summary.throughput.peak_ops_per_sec,
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!(
+                    "{id}: non-positive or non-finite measured statistic"
+                ));
+            }
+        }
+        if !summary.latency.stddev_ms.is_finite() || summary.latency.stddev_ms < 0.0 {
+            return Err(format!("{id}: invalid measured latency deviation"));
+        }
+    }
+    Ok(())
+}
+
+/// A historical ratio is meaningful only for matching hardware, compiler,
+/// fixture bytes, placement, retry policy and workload seed. Revision and run
+/// identifiers deliberately differ between the two measurements.
+fn validate_release_matrix_comparability(
+    baseline: &[BenchmarkSummary],
+    current: &[BenchmarkSummary],
+) -> Result<(), String> {
+    let baseline_by_cell = baseline
+        .iter()
+        .map(|summary| (benchmark_cell_key(summary), summary))
+        .collect::<BTreeMap<_, _>>();
+    if baseline_by_cell.len() != baseline.len() || baseline.is_empty() || current.is_empty() {
+        return Err("historical comparison requires nonempty, unique populations".to_owned());
+    }
+    for summary in current {
+        let key = benchmark_cell_key(summary);
+        let prior = baseline_by_cell
+            .get(&key)
+            .ok_or_else(|| format!("{key}: missing historical cell"))?;
+        if summary.environment != prior.environment || summary.methodology != prior.methodology {
+            return Err(format!(
+                "{key}: historical hardware/build/methodology mismatch"
+            ));
+        }
+        let prior_manifest = prior
+            .comparison
+            .as_ref()
+            .and_then(|comparison| comparison.canonical_artifact_manifest.as_ref())
+            .ok_or_else(|| format!("{key}: historical cell lacks canonical provenance"))?;
+        let current_manifest = summary
+            .comparison
+            .as_ref()
+            .and_then(|comparison| comparison.canonical_artifact_manifest.as_ref())
+            .ok_or_else(|| format!("{key}: current cell lacks canonical provenance"))?;
+        if prior_manifest.provenance.fixture != current_manifest.provenance.fixture
+            || prior_manifest.provenance.build_profile != current_manifest.provenance.build_profile
+            || prior_manifest.provenance.placement_policy
+                != current_manifest.provenance.placement_policy
+            || prior_manifest.retry_policy_id != current_manifest.retry_policy_id
+            || prior_manifest.seed_policy_id != current_manifest.seed_policy_id
+        {
+            return Err(format!(
+                "{key}: historical fixture or execution policy mismatch"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn hardware_signature(
     campaign: &fsqlite_e2e::fixture_select::BeadsBenchmarkCampaign,
     hardware_class_id: &str,
@@ -590,6 +775,7 @@ fn sample_benchmark_summary(
         aggregated_hot_path: None,
         iterations: vec![IterationRecord {
             iteration: 0,
+            wall_time_ns: 10_000_000,
             wall_time_ms: 10,
             ops_per_sec: throughput_ops_per_sec,
             ops_total: 100,
@@ -645,6 +831,208 @@ fn matrix_regression_gate_loads_canonical_record_lines_via_benchmark_summary() {
     let summaries = load_benchmark_summaries(&path).expect("load summaries");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].benchmark_id, "fsqlite:count_star:fixture:c1");
+}
+
+#[test]
+fn release_matrix_population_refuses_empty_missing_duplicate_and_unexpected_cells() {
+    let campaign = load_beads_benchmark_campaign(&repo_root()).expect("canonical campaign");
+    let summaries = required_matrix_population(&campaign)
+        .into_iter()
+        .map(|(fixture, workload, concurrency, mode)| {
+            sample_benchmark_summary(
+                &format!("{mode}:{workload}:{fixture}:c{concurrency}"),
+                &mode,
+                &workload,
+                &fixture,
+                concurrency,
+                10.0,
+                1_000.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!summaries.is_empty());
+    validate_complete_matrix_population(&campaign, &summaries).expect("complete population");
+    assert!(
+        validate_complete_matrix_population(&campaign, &[])
+            .unwrap_err()
+            .contains("incomplete release matrix")
+    );
+    assert!(
+        validate_complete_matrix_population(&campaign, &summaries[1..])
+            .unwrap_err()
+            .contains("missing=")
+    );
+    let mut duplicate = summaries.clone();
+    duplicate.push(summaries[0].clone());
+    assert!(
+        validate_complete_matrix_population(&campaign, &duplicate)
+            .unwrap_err()
+            .contains("duplicate release matrix cell")
+    );
+    let mut unexpected = summaries;
+    unexpected[0].fixture_id = "not-a-campaign-fixture".to_owned();
+    assert!(
+        validate_complete_matrix_population(&campaign, &unexpected)
+            .unwrap_err()
+            .contains("unexpected=[(")
+    );
+}
+
+#[test]
+fn release_matrix_measurements_refuse_failed_samples_short_runs_and_false_build_facts() {
+    // Artifact-validation fixture, not evidence that this test binary was
+    // compiled in release-perf or that a workload was measured here.
+    let mut valid =
+        sample_benchmark_summary("fixture", "fsqlite_mvcc", "insert", "db", 1, 10.0, 10_000.0);
+    valid.warmup_count = valid.methodology.warmup_iterations;
+    valid.measurement_count = valid.methodology.min_measurement_iterations;
+    valid.total_measurement_ms = valid.methodology.measurement_time_secs * 1_000;
+    let sample = valid.iterations[0].clone();
+    valid.iterations = (0..valid.measurement_count)
+        .map(|iteration| IterationRecord {
+            iteration,
+            ..sample.clone()
+        })
+        .collect();
+    valid.environment.cargo_profile = AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned();
+    valid
+        .environment
+        .build_hygiene
+        .matches_authoritative_profile = true;
+    valid.environment.build_hygiene.opt_level = "3".to_owned();
+    valid.environment.build_hygiene.debug_assertions = false;
+    validate_release_matrix_measurements(std::slice::from_ref(&valid)).expect("valid artifact");
+    assert!(validate_release_matrix_measurements(&[]).is_err());
+
+    let mutations: &[fn(&mut BenchmarkSummary)] = &[
+        |row| row.iterations[0].error = Some("rollback failed: database is busy".to_owned()),
+        |row| row.iterations[0].wall_time_ns = 0,
+        |row| row.iterations[0].wall_time_ms += 1,
+        |row| row.iterations[0].ops_total = 0,
+        |row| row.iterations[0].ops_per_sec = f64::NAN,
+        |row| row.iterations[0].iteration = 1,
+        |row| row.measurement_count += 1,
+        |row| row.warmup_count = 0,
+        |row| row.total_measurement_ms = 0,
+        |row| row.methodology.measurement_time_secs = 0,
+        |row| row.environment.capture_mode = EnvironmentCaptureMode::Suppressed,
+        |row| row.environment.cargo_profile = "release".to_owned(),
+        |row| row.environment.build_hygiene.matches_authoritative_profile = false,
+        |row| row.environment.build_hygiene.opt_level = "0".to_owned(),
+        |row| row.environment.build_hygiene.debug_assertions = true,
+        |row| row.latency.p95_ms = 0.0,
+        |row| row.latency.p95_ms = f64::NAN,
+        |row| row.latency.stddev_ms = f64::NAN,
+        |row| row.throughput.median_ops_per_sec = f64::INFINITY,
+    ];
+    for (index, mutate) in mutations.iter().enumerate() {
+        let mut invalid = valid.clone();
+        mutate(&mut invalid);
+        assert!(
+            validate_release_matrix_measurements(&[invalid]).is_err(),
+            "invalid artifact mutation {index} must be refused"
+        );
+    }
+}
+
+#[test]
+fn release_matrix_comparison_refuses_changed_hardware_fixtures_and_policies() {
+    // A synthetic artifact tests validation only; it is not a measured baseline.
+    let root = repo_root();
+    let campaign = load_beads_benchmark_campaign(&root).expect("canonical campaign");
+    let row = &campaign.matrix_rows[0];
+    let mode = row.modes[0];
+    let mut baseline = sample_benchmark_summary(
+        "comparison-validation",
+        benchmark_mode_id(mode),
+        &row.workload,
+        &row.fixtures[0],
+        row.concurrency,
+        10.0,
+        1_000.0,
+    );
+    let cell = resolve_canonical_cell(&campaign, &baseline, mode).expect("canonical cell");
+    let manifest = build_benchmark_artifact_manifest(
+        &root,
+        &campaign,
+        &cell,
+        BenchmarkArtifactProvenanceCapture {
+            run_id: "validation-fixture".to_owned(),
+            retention_class: BenchmarkArtifactRetentionClass::FullProof,
+            command_entrypoint: "artifact-validation-only".to_owned(),
+            source_revision: "a".repeat(40),
+            beads_data_hash: "b".repeat(64),
+            kernel_release: baseline.environment.os.clone(),
+            commands: vec![BenchmarkArtifactCommand {
+                tool: "test".to_owned(),
+                command_line: "artifact-validation-only".to_owned(),
+            }],
+            tool_versions: vec![BenchmarkArtifactToolVersion {
+                tool: "test".to_owned(),
+                version: "fixture".to_owned(),
+            }],
+            fallback_notes: vec!["synthetic validation fixture, not runtime evidence".to_owned()],
+        },
+    )
+    .expect("validation manifest");
+    baseline.comparison = Some(BenchmarkComparisonMetadata::canonical(
+        &baseline, manifest, None,
+    ));
+    let mut current = baseline.clone();
+    let comparison = current.comparison.as_mut().unwrap();
+    comparison.row_identity.source_revision = Some("c".repeat(40));
+    comparison
+        .canonical_artifact_manifest
+        .as_mut()
+        .unwrap()
+        .provenance
+        .source_revision = "c".repeat(40);
+    validate_release_matrix_comparability(
+        std::slice::from_ref(&baseline),
+        std::slice::from_ref(&current),
+    )
+    .expect("a different revision on the same measurement setup is comparable");
+    let mutations: &[fn(&mut BenchmarkSummary)] = &[
+        |row| row.environment.cpu_count += 1,
+        |row| row.environment.cpu_model = Some("different CPU".to_owned()),
+        |row| row.environment.rustc_version.push_str("-different"),
+        |row| row.environment.cargo_profile = "dev".to_owned(),
+        |row| row.methodology.warmup_iterations += 1,
+        |row| row.comparison = None,
+        |row| row.comparison.as_mut().unwrap().canonical_artifact_manifest = None,
+    ];
+    for (index, mutate) in mutations.iter().enumerate() {
+        let mut changed = current.clone();
+        mutate(&mut changed);
+        assert!(
+            validate_release_matrix_comparability(std::slice::from_ref(&baseline), &[changed])
+                .is_err(),
+            "noncomparable artifact mutation {index} must be refused"
+        );
+    }
+    let manifest_mutations: &[fn(&mut BenchmarkArtifactManifest)] = &[
+        |manifest| manifest.provenance.fixture.working_copy_sha256 = "d".repeat(64),
+        |manifest| manifest.retry_policy_id = "different-retry".to_owned(),
+        |manifest| manifest.seed_policy_id = "different-seed".to_owned(),
+        |manifest| manifest.provenance.placement_policy.placement_profile_id = "pinned".to_owned(),
+    ];
+    for (index, mutate) in manifest_mutations.iter().enumerate() {
+        let mut changed = current.clone();
+        mutate(
+            changed
+                .comparison
+                .as_mut()
+                .unwrap()
+                .canonical_artifact_manifest
+                .as_mut()
+                .unwrap(),
+        );
+        assert!(
+            validate_release_matrix_comparability(std::slice::from_ref(&baseline), &[changed])
+                .is_err(),
+            "noncomparable manifest mutation {index} must be refused"
+        );
+    }
 }
 
 #[test]
@@ -1072,7 +1460,7 @@ fn release_scorecard_paths_are_fixed_and_canonical() {
     assert_eq!(
         release_evidence_relpath(revision, RELEASE_PERSISTENT_SCORECARD_SUFFIX),
         format!(
-            "tests/artifacts/release-evidence/{revision}/performance/persistent/persistent_scorecard.json"
+            "tests/artifacts/release-evidence/{revision}/performance/persistent/release-perf/persistent_scorecard.json"
         )
     );
 
@@ -1124,54 +1512,65 @@ fn release_scorecard_paths_are_fixed_and_canonical() {
     }
 }
 
-/// Keeper: the v0.2.0 historical-regression bootstrap contract.
-///
-/// No canonical historical complete-matrix baseline exists — not in-tree, and
-/// not in the v0.1.17/v0.1.18/v0.1.19 tags, which do not contain this file at
-/// all. So the release must not invent a predecessor, must not accept an
-/// env-selected baseline, and must record the absence explicitly rather than
-/// letting the comparison be silently skipped.
+/// Validate the recorded baseline and exercise the real historical comparator.
+/// Replaying stored measurements here is a gate test, not a new benchmark run.
 #[test]
-fn matrix_regression_is_explicit_bootstrap_with_no_env_baseline() {
+fn matrix_regression_uses_verified_complete_historical_baseline() {
+    let root = repo_root();
+    let campaign = load_beads_benchmark_campaign(&root).expect("canonical campaign");
+    let raw = fs::read(root.join(MATRIX_BASELINE_RELPATH)).expect("pinned baseline");
+    let baseline = parse_pinned_matrix_baseline(&raw).expect("verified historical baseline");
+    validate_complete_matrix_population(&campaign, &baseline).expect("complete baseline");
+    validate_release_matrix_measurements(&baseline).expect("successful canonical measurements");
+    validate_release_matrix_comparability(&baseline, &baseline).expect("same recorded setup");
+    let thresholds = MatrixRegressionThresholds::default();
+    let unchanged = evaluate_matrix_regression_gate(
+        &baseline,
+        &baseline,
+        "historical",
+        "unchanged artifact control",
+        thresholds,
+    )
+    .expect("compare unchanged control");
     assert_eq!(
-        MATRIX_REGRESSION_STATUS_BOOTSTRAP, "unavailable_bootstrap_v0_2_0",
-        "the bootstrap status is part of the manifest contract"
+        unchanged.compared_cells,
+        required_matrix_population(&campaign).len()
+    );
+    assert!(unchanged.failure_summary().is_none());
+    let mut regressed = baseline.clone();
+    regressed[0].latency.p95_ms *= thresholds.max_p95_ratio + 1.0;
+    let rejected = evaluate_matrix_regression_gate(
+        &baseline,
+        &regressed,
+        "historical",
+        "planted regression control",
+        thresholds,
+    )
+    .expect("compare planted regression");
+    assert_eq!(
+        rejected.failing_cells,
+        vec![benchmark_cell_key(&baseline[0])]
+    );
+    assert!(rejected.failure_summary().is_some());
+    let mut tampered = raw;
+    tampered.push(b' ');
+    assert!(
+        parse_pinned_matrix_baseline(&tampered)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
     );
 
-    // The baseline env var is refused like every other weakening input, so a
-    // canonical-argv receipt cannot smuggle in an arbitrary comparison target
-    // nor silently omit the comparison.
     assert_eq!(
         forbidden_matrix_env_present(|name| name == "FSQLITE_MATRIX_BASELINE_JSONL"),
         vec!["FSQLITE_MATRIX_BASELINE_JSONL"],
-        "an env-selected baseline must be refused at v0.2.0"
+        "an env-selected baseline must still be refused"
     );
-    assert!(
-        RELEASE_FORBIDDEN_MATRIX_ENV.contains(&"FSQLITE_MATRIX_BASELINE_JSONL"),
-        "the baseline variable belongs in the forbidden set, not the allowed set"
-    );
-
-    // The release remains hard-gated by the commit-keyed scorecards even though
-    // historical regression is unavailable.
     let config = overlay_gate_config(MatrixRegressionThresholds::default());
     assert!(
         config.require_c1_pack && config.require_persistent_pack,
-        "bootstrap must not relax the scorecard gate that still applies"
+        "historical comparison must retain the commit-keyed scorecard gates"
     );
-
-    // The escape expires with the version: it is valid only at 0.2.0, and the
-    // crate this test ships in must actually be that version today.
-    assert!(bootstrap_allowed_for_version(MATRIX_BOOTSTRAP_PKG_VERSION).is_ok());
-    assert!(
-        bootstrap_allowed_for_version(env!("CARGO_PKG_VERSION")).is_ok(),
-        "this crate is past the bootstrap version; wire the real historical comparison"
-    );
-    for later in ["0.2.1", "0.3.0", "1.0.0", "0.2.0-rc.1", "0.20.0", ""] {
-        assert!(
-            bootstrap_allowed_for_version(later).is_err(),
-            "`{later}` must not inherit the v0.2.0 bootstrap escape"
-        );
-    }
 }
 
 /// Negative keepers: every weakening bypass class must be refused.
@@ -1272,13 +1671,6 @@ fn overlay_honesty_gate_config_is_unconditionally_strict() {
 #[test]
 #[ignore = "Runs the complete canonical benchmark matrix and writes artifact bundles."]
 fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
-    // First gate, before every other check and before any workload or artifact
-    // work: the bootstrap concession is valid at exactly one version. A later
-    // release reaching this test at all means the historical comparison was
-    // never wired, so refuse immediately rather than after spending a matrix
-    // run and writing a pack that would look citable.
-    bootstrap_allowed_for_version(env!("CARGO_PKG_VERSION"))?;
-
     // Fail closed before doing any work: the receipt cannot attest environment,
     // so a weakening variable must abort the run rather than silently produce a
     // receipt for a reduced measurement.
@@ -1294,6 +1686,11 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let repo_root = repo_root();
     let campaign = load_beads_benchmark_campaign(&repo_root)
         .map_err(|error| format!("load canonical Beads benchmark campaign: {error}"))?;
+    // Validate the fixed historical input before launching any benchmarks.
+    let baseline_jsonl = repo_root.join(MATRIX_BASELINE_RELPATH);
+    let baseline = parse_pinned_matrix_baseline(&fs::read(&baseline_jsonl)?)?;
+    validate_complete_matrix_population(&campaign, &baseline)?;
+    validate_release_matrix_measurements(&baseline)?;
     let run_id = matrix_run_id();
     let source_revision = git_head_revision(&repo_root)?;
     let beads_data_hash = sha256_file(&repo_root.join(&campaign.beads_data_relpath))?;
@@ -1442,39 +1839,47 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     }
     fs::write(&full_jsonl, combined)?;
 
-    // v0.2.0 bootstrap: there is no canonical historical complete-matrix
-    // baseline. A repo/release audit found none in the tree and none in the
-    // v0.1.17/v0.1.18/v0.1.19 tags — those tags do not even contain this file,
-    // and the v0.1.17 GitHub release carries only binaries, SBOM, provenance,
-    // and checksums. An env-selected baseline is therefore refused (see
-    // RELEASE_FORBIDDEN_MATRIX_ENV): the receipt binds argv but not
-    // environment, so a caller could otherwise point the historical comparison
-    // at any file, or omit it and skip the comparison silently.
-    //
-    // The historical regression report is consequently recorded as explicitly
-    // UNAVAILABLE/bootstrap in the manifest rather than being quietly absent,
-    // and this run's full JSONL is marked as the immutable baseline for the
-    // next release. The current release stays hard-gated by the commit-keyed
-    // c1 + persistent scorecards, which are required unconditionally.
-    // Version gate already cleared at the top of this test.
-    let matrix_regression_status = MATRIX_REGRESSION_STATUS_BOOTSTRAP;
+    let full_summaries = load_benchmark_summaries(&full_jsonl)?;
+    validate_complete_matrix_population(&campaign, &full_summaries)?;
+    validate_release_matrix_measurements(&full_summaries)?;
+
+    validate_release_matrix_comparability(&baseline, &full_summaries)?;
     // Release thresholds are pinned, never read from the environment: the
     // receipt binds argv but not env, so `from_env()` here would let
     // FSQLITE_MATRIX_MAX_P95_RATIO=1e300 (or a tiny min-throughput) pass the
     // gate under the exact canonical argv, undetectably.
     let matrix_thresholds = MatrixRegressionThresholds::default();
+    let matrix_regression_json = artifact_dir.join(format!("{stem}.matrix_regression.json"));
+    let regression = evaluate_matrix_regression_gate(
+        &baseline,
+        &full_summaries,
+        baseline_jsonl.display().to_string(),
+        full_jsonl.display().to_string(),
+        matrix_thresholds,
+    )?;
+    fs::write(
+        &matrix_regression_json,
+        serde_json::to_vec_pretty(&regression)?,
+    )?;
+    if let Some(summary) = regression.failure_summary() {
+        return Err(format!("historical matrix regression gate failed: {summary}").into());
+    }
 
     let (overlay_c1_scorecard_json, overlay_persistent_scorecard_json) =
         release_scorecard_paths(&repo_root, &source_revision)?;
     let overlay_honesty_gate_report = {
-        let report = evaluate_overlay_honesty_gate_from_paths(
-            &full_jsonl,
-            // No historical baseline at v0.2.0 bootstrap; see
-            // MATRIX_REGRESSION_STATUS_BOOTSTRAP. Passing None explicitly
-            // rather than an env-selected path is the whole point.
-            None,
-            Some(overlay_c1_scorecard_json.as_path()),
-            Some(overlay_persistent_scorecard_json.as_path()),
+        let c1_scorecard = load_c1_evidence_pack_scorecard(&overlay_c1_scorecard_json)?;
+        let persistent_scorecard =
+            load_persistent_phase_pack_scorecard(&overlay_persistent_scorecard_json)?;
+        // Consume exactly the bytes validated above, without reopening either
+        // matrix after checksum/population/comparability checks.
+        let report = evaluate_overlay_honesty_gate(
+            &full_summaries,
+            Some(&baseline),
+            full_jsonl.display().to_string(),
+            Some(baseline_jsonl.display().to_string()),
+            Some(&c1_scorecard),
+            Some(&persistent_scorecard),
             overlay_gate_config(matrix_thresholds),
         )?;
         fs::write(
@@ -1504,17 +1909,12 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         "matrix_single_writer_jsonl": ran_single.then_some(single_jsonl),
         "matrix_single_writer_md": ran_single.then_some(single_md),
         "matrix_full_jsonl": full_jsonl,
-        // Historical regression is explicitly unavailable at v0.2.0 bootstrap —
-        // recorded as a status, never as a silently-absent field.
-        "matrix_regression_status": matrix_regression_status,
-        "matrix_regression_unavailable_reason":
-            "no canonical historical complete-matrix baseline exists in-tree or in the \
-             v0.1.17/v0.1.18/v0.1.19 tags; env-selected baselines are refused because the \
-             release receipt binds argv but not environment",
-        // This run's full JSONL is the immutable baseline for the next release.
+        "matrix_regression_status": "passed",
         "matrix_baseline_for_next_release_jsonl": full_jsonl,
-        "matrix_baseline_jsonl": serde_json::Value::Null,
-        "matrix_regression_summary_json": serde_json::Value::Null,
+        "matrix_baseline_jsonl": baseline_jsonl,
+        "matrix_baseline_sha256": MATRIX_BASELINE_SHA256,
+        "matrix_baseline_engine_revision": MATRIX_BASELINE_ENGINE_REVISION,
+        "matrix_regression_summary_json": matrix_regression_json,
         "matrix_regression_thresholds": matrix_thresholds,
         "overlay_honesty_gate_json": overlay_honesty_gate_report.as_ref().map(|_| overlay_honesty_gate_json.clone()),
         "overlay_honesty_gate_c1_scorecard_json": overlay_c1_scorecard_json,

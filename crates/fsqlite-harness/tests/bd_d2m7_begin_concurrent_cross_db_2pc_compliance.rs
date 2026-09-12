@@ -187,14 +187,14 @@ fn run_begin_concurrent_scenario() -> Result<(), String> {
         let mut handle = registry
             .get_mut(s1)
             .ok_or_else(|| "missing_handle_s1".to_string())?;
-        concurrent_write_page(&mut handle, &lock_table, s1, page(5), page_data(0xA1))
+        concurrent_write_page(&mut handle, &lock_table, page(5), page_data(0xA1))
             .map_err(|error| format!("write_s1_failed error={error:?}"))?;
     }
     {
         let mut handle = registry
             .get_mut(s2)
             .ok_or_else(|| "missing_handle_s2".to_string())?;
-        concurrent_write_page(&mut handle, &lock_table, s2, page(9), page_data(0xB2))
+        concurrent_write_page(&mut handle, &lock_table, page(9), page_data(0xB2))
             .map_err(|error| format!("write_s2_failed error={error:?}"))?;
     }
 
@@ -202,27 +202,15 @@ fn run_begin_concurrent_scenario() -> Result<(), String> {
         let mut handle = registry
             .get_mut(s1)
             .ok_or_else(|| "missing_handle_s1_commit".to_string())?;
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s1,
-            CommitSeq::new(101),
-        )
-        .map_err(|(error, fcw)| format!("commit_s1_failed error={error:?} fcw={fcw:?}"))?
+        concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(101))
+            .map_err(|(error, fcw)| format!("commit_s1_failed error={error:?} fcw={fcw:?}"))?
     };
     let seq2 = {
         let mut handle = registry
             .get_mut(s2)
             .ok_or_else(|| "missing_handle_s2_commit".to_string())?;
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s2,
-            CommitSeq::new(102),
-        )
-        .map_err(|(error, fcw)| format!("commit_s2_failed error={error:?} fcw={fcw:?}"))?
+        concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(102))
+            .map_err(|(error, fcw)| format!("commit_s2_failed error={error:?} fcw={fcw:?}"))?
     };
 
     if seq1 != CommitSeq::new(101) || seq2 != CommitSeq::new(102) {
@@ -240,7 +228,7 @@ fn run_begin_concurrent_scenario() -> Result<(), String> {
         let mut handle = registry
             .get_mut(s3)
             .ok_or_else(|| "missing_handle_s3".to_string())?;
-        concurrent_write_page(&mut handle, &lock_table, s3, page(5), page_data(0xC3))
+        concurrent_write_page(&mut handle, &lock_table, page(5), page_data(0xC3))
             .map_err(|error| format!("write_s3_failed error={error:?}"))?;
     }
 
@@ -248,13 +236,7 @@ fn run_begin_concurrent_scenario() -> Result<(), String> {
         let mut handle = registry
             .get_mut(s3)
             .ok_or_else(|| "missing_handle_s3_commit".to_string())?;
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s3,
-            CommitSeq::new(103),
-        )
+        concurrent_commit(&mut handle, &commit_index, &lock_table, CommitSeq::new(103))
     };
     match conflict {
         Err((MvccError::BusySnapshot, FcwResult::Conflict { .. })) => Ok(()),

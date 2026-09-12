@@ -61,8 +61,10 @@ fn drop_without_close_frees_ordinary_writer_for_siblings() {
             a.execute("INSERT INTO t (id, v) VALUES (1, 10);")
                 .await
                 .expect("commit row");
-            // Open, UNCOMMITTED ordinary write transaction — the "dirty" state.
-            a.execute("BEGIN;").await.expect("begin");
+            // Plain BEGIN promotes to concurrent mode. Explicit IMMEDIATE
+            // exercises the ordinary writer without changing that default.
+            assert!(a.is_concurrent_mode_default());
+            a.execute("BEGIN IMMEDIATE;").await.expect("begin");
             a.execute("INSERT INTO t (id, v) VALUES (2, 20);")
                 .await
                 .expect("dirty insert");
@@ -74,9 +76,12 @@ fn drop_without_close_frees_ordinary_writer_for_siblings() {
         // abandoned writer had leaked the write lock, this write would park and
         // return Busy within the timeout rather than committing.
         let b = Connection::open(&db).await.expect("open B");
+        assert!(b.is_concurrent_mode_default());
         b.execute("PRAGMA busy_timeout=750;").await.expect("busy");
         b.execute("PRAGMA journal_mode=WAL;").await.expect("wal B");
-        let wrote = b.execute("INSERT INTO t (id, v) VALUES (3, 30);").await;
+        let wrote = b
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO t (id, v) VALUES (3, 30); COMMIT;")
+            .await;
         assert!(
             wrote.is_ok(),
             "sibling write after an abandoned ordinary txn drop must not wedge: {wrote:?}"
