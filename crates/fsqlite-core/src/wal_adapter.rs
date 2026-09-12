@@ -2054,11 +2054,19 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 return Ok(WalNativeReadOutcome::RecoveryRequired(reason));
             }
             let source = self.wal_index_shm_source.as_ref().ok_or(FrankenError::Unsupported)?;
-            if !source.validates_reader_binding(&binding) || binding.boundary().database_only {
+            if !source.validates_reader_binding(&binding) {
                 return Err(FrankenError::BusyRecovery);
             }
             let header = binding.header();
             header.validate()?;
+            // Slot zero protects the database image, not WAL frames. It can
+            // therefore pin an empty WAL horizon, but must never authorize
+            // reading a nonempty WAL without a corresponding reader mark.
+            if binding.boundary().database_only
+                && (header.mx_frame != 0 || binding.boundary().maximum_wal_frame != 0)
+            {
+                return Err(FrankenError::BusyRecovery);
+            }
             if header.mx_frame != binding.boundary().maximum_wal_frame {
                 return Err(FrankenError::BusyRecovery);
             }
@@ -9359,7 +9367,7 @@ mod tests {
 
     #[cfg(all(feature = "native", unix))]
     #[test]
-    fn test_native_read_binding_refuses_database_only_lease_without_changing_pin() {
+    fn test_native_read_binding_accepts_empty_database_only_lease() {
         use std::sync::atomic::Ordering;
 
         let cx = test_cx();
@@ -9369,15 +9377,62 @@ mod tests {
         let source = Arc::clone(fixture.adapter.wal_index_shm_source.as_ref().unwrap());
         let mut lease = source.acquire_reader(&cx).expect("database-only lease");
         assert!(lease.boundary().unwrap().database_only);
+        let binding = lease.binding().unwrap();
+        let token = binding.token().clone();
+        assert_eq!(
+            fixture
+                .adapter
+                .begin_native_read(&cx, binding)
+                .expect("slot zero protects empty WAL snapshot"),
+            WalNativeReadOutcome::Ready,
+        );
+        assert_eq!(
+            fixture.adapter.pinned_read_snapshot().unwrap().last_commit_frame,
+            None,
+        );
+        assert_eq!(
+            fixture.adapter.read_page_pinned(&cx, 1).expect("empty WAL has no pinned page"),
+            None,
+        );
+        assert!(
+            fixture.adapter.native_read_binding().unwrap().boundary().database_only,
+        );
+        fixture.adapter.end_native_read(&token).unwrap();
+        assert!(fixture.adapter.pinned_read_snapshot().is_none());
+        lease.release().expect("release database-only claim");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_read_binding_refuses_nonempty_database_only_lease() {
+        use fsqlite_wal::wal_index::publish_shared_wal_index_header;
+        use std::sync::atomic::Ordering;
+
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let mut fixture = synthetic_shared_publication(&vfs, &cx);
+        let mut header = fixture.baseline;
+        header.mx_frame = 1;
+        header.update_checksum().unwrap();
+        publish_shared_wal_index_header(&fixture.region, &header).unwrap();
+        fixture
+            .region
+            .atomic_store_u32_ne(96, 1, Ordering::Release)
+            .unwrap();
+        let source = Arc::clone(fixture.adapter.wal_index_shm_source.as_ref().unwrap());
+        let mut lease = source
+            .acquire_reader(&cx)
+            .expect("fully backfilled database-only lease");
+        assert!(lease.boundary().unwrap().database_only);
         let before = fixture.adapter.published_snapshot();
         assert!(matches!(
-            fixture.adapter.begin_native_read(&cx, lease.binding().unwrap()).expect_err("slot zero cannot bind WAL bytes"),
-            FrankenError::BusyRecovery,
+            fixture.adapter.begin_native_read(&cx, lease.binding().unwrap()).wait(),
+            Err(FrankenError::BusyRecovery),
         ));
         assert_eq!(fixture.adapter.published_snapshot(), before);
         assert!(fixture.adapter.native_read_binding().is_none());
         assert!(fixture.adapter.pinned_read_snapshot().is_none());
-        lease.release().expect("release database-only claim");
+        lease.release().expect("release nonempty database-only claim");
     }
 
     #[test]

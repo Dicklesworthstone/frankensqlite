@@ -5492,7 +5492,15 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
             ));
         };
         let backfilled = region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES, AtomicOrdering::Acquire)?;
-        let database_slot = if !require_wal && backfilled == header.mx_frame {
+        // A read-only opener cannot publish a new nonzero read mark after
+        // TRUNCATE has retired them all. An empty, fully backfilled snapshot
+        // has no WAL pages: slot zero protects its actual main-file authority.
+        // Keep nonempty runtime snapshots on a generation-pinning WAL slot,
+        // and retain the runtime's external-snapshot ownership precondition.
+        let empty_readonly_snapshot = !self.can_publish_reader_marks && header.mx_frame == 0;
+        let database_slot = if (!require_wal || empty_readonly_snapshot)
+            && backfilled == header.mx_frame
+        {
             match file.shm_lock(cx, WAL_READ_LOCK_BASE, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED) {
                 Ok(()) => Some(0),
                 Err(FrankenError::Busy) => None,
@@ -14598,6 +14606,58 @@ where
                 return Err(FrankenError::Unsupported);
             }
 
+            if inner.access_mode.is_readonly() {
+                // Installing an existing WAL backend catches up this reader's
+                // local mode; it does not change the physical database format.
+                // Verify that format under the exact SHARED snapshot attempt
+                // instead of asking a live writer for exclusive maintenance.
+                if mode != JournalMode::Wal {
+                    return Err(FrankenError::ReadOnly);
+                }
+                let mut external_lock = BeginExternalLockState::new(
+                    &self.group_commit_queue,
+                    Arc::clone(&inner.db_file),
+                    cx,
+                );
+                external_lock.acquire_snapshot(cx).await?;
+                let validation = async {
+                    self.validate_namespace_binding_locked(&mut inner)?;
+                    let file = shared_db_file_read(&inner.db_file, cx).await?;
+                    if Self::journal_mode_from_database_file(cx, &*file).await? != mode {
+                        return Err(FrankenError::ReadOnly);
+                    }
+                    Ok(())
+                }
+                .await;
+                let restore = external_lock.restore().await;
+                match (validation, restore) {
+                    (Ok(()), Ok(())) => {}
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                    (Err(validation), Err(restore)) => {
+                        return Err(FrankenError::internal(format!(
+                            "readonly WAL binding failed: validation={validation}; restore={restore}"
+                        )));
+                    }
+                }
+                inner.journal_mode = mode;
+                self.cache.evict(PageNumber::ONE);
+                self.published.publish_remove_page(
+                    cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                    PageNumber::ONE,
+                );
+                let mut snapshot = self.committed_snapshot.write()
+                    .map_err(|_| FrankenError::internal("committed snapshot poisoned"))?;
+                Arc::make_mut(&mut snapshot).journal_mode = mode;
+                return Ok(mode);
+            }
+
             // A real format change (or pending WAL retirement) must exclude
             // new same-process transactions until the complete transition ends.
             // Idempotent confirmations above retain normal reader admission.
@@ -17406,6 +17466,29 @@ where
         }
     }
 
+    /// Classify a reader's journal while its main-file SHARED fence is held.
+    /// A valid journal owned by a RESERVED writer is not an orphan requiring
+    /// recovery: SHARED still prevents that writer from changing the main image.
+    /// Recovery/finalization callers must keep using the strict classifier.
+    async fn verify_readonly_snapshot_journal_state(
+        cx: &Cx,
+        vfs: &V,
+        journal_path: &Path,
+        db_file: &V::File,
+        maintenance_gate: &PagerMaintenanceGate,
+    ) -> Result<()> {
+        if maintenance_gate.rollback_recovery_pending() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if db_file.check_reserved_lock(cx)? {
+            if maintenance_gate.rollback_recovery_pending() {
+                return Err(FrankenError::BusyRecovery);
+            }
+            return Ok(());
+        }
+        Self::verify_readonly_rollback_journal_state(cx, vfs, journal_path).await
+    }
+
     /// Native acquisition and backend binding share the caller's cleanup owner.
     async fn try_bind_runtime_native_reader(
         &self,
@@ -17567,9 +17650,17 @@ where
             let operation_result = if had_pending {
                 Err(FrankenError::BusyRecovery)
             } else {
-                match Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
-                    .await
-                {
+                let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                let journal_state = Self::verify_readonly_snapshot_journal_state(
+                    cx,
+                    &*self.vfs,
+                    &journal_path,
+                    &*db_file,
+                    &self.maintenance_gate,
+                )
+                .await;
+                drop(db_file);
+                match journal_state {
                     Ok(()) => {
                         self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock).await?;
                         inner
@@ -18902,19 +18993,26 @@ where
         let db_file = Arc::new(AsyncRwLock::with_name("pager_db_file", db_file));
 
         let journal_path = Self::journal_path(&db_path);
-        let mut header_state = (Arc::clone(&vfs), journal_path.clone(), db_path.clone());
+        let mut header_state = (
+            Arc::clone(&vfs),
+            journal_path.clone(),
+            db_path.clone(),
+            Arc::clone(&maintenance_gate),
+        );
         let (file_size, header_bytes) = with_main_shared_lock(
             cx,
             &group_commit_queue,
             &db_file,
             &mut header_state,
             |cx, db_file, state| {
-            let (vfs, journal_path, db_path) = state;
+            let (vfs, journal_path, db_path, maintenance_gate) = state;
             Box::pin(async move {
-            // Read-only and schema-only opens cannot replay. They may accept a
-            // proven non-hot construction leftover, but they must never cache
-            // a database image for which recovery is required or ambiguous.
-            Self::verify_readonly_rollback_journal_state(cx, &*vfs, journal_path).await?;
+            // Read-only and schema-only opens cannot replay. A RESERVED owner
+            // makes its journal live rather than hot; our retained SHARED
+            // fence protects the committed image until this header is read.
+            Self::verify_readonly_snapshot_journal_state(
+                cx, &*vfs, journal_path, db_file, maintenance_gate,
+            ).await?;
             let file_size = db_file.file_size(cx)?;
             if file_size == 0 {
                 return Err(FrankenError::CannotOpen {
@@ -28756,6 +28854,40 @@ where
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
+        // A newly enabled WAL can reach checkpoint before the first runtime
+        // read initialized its shared index. Reuse that read's existing
+        // recovery ownership protocol BEFORE taking checkpoint maintenance:
+        // its begin/rollback retains exact cleanup on cancellation or error.
+        // Normal checkpoint admission below then revalidates the family under
+        // its own fences; recovery never grants an unchecked checkpoint.
+        let inspect_native_index = {
+            let inner = self.inner.lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            inner.journal_mode == JournalMode::Wal
+                && !inner.access_mode.is_readonly()
+                && inner.active_transactions == 0
+                && !inner.writer_active
+                && !inner.checkpoint_active
+        };
+        if inspect_native_index {
+            let backend = wal_backend_handle(&self.wal_backend)?;
+            let native = async_rwlock_read(&backend, cx, "checkpoint native admission")
+                .await?.native_reader_required();
+            if native {
+                let source = self.wal_index_shm_source()?;
+                let needs_recovery = match source.map_region(cx, 0, false).await {
+                    Ok(region) => fsqlite_wal::wal_index::read_shared_wal_index_header(&region)?.is_none(),
+                    Err(FrankenError::CannotOpen { .. }) => true,
+                    Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error),
+                };
+                if needs_recovery {
+                    let mut reader = self.begin(cx, TransactionMode::ReadOnly).await?;
+                    reader.rollback(cx).await?;
+                    settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
+                }
+            }
+        }
         let maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
         self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
@@ -29261,6 +29393,62 @@ mod tests {
                 peer.wal_checkpoint_reset_gate_release(&cx).unwrap();
             }
             peer.close(&cx).expect("close checkpoint handle");
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn readonly_empty_wal_reader_uses_slot_zero_without_publishing_marks() {
+        asupersync::test_utils::run_test(|| async {
+            use fsqlite_vfs::shm::{SHM_READ_MARK_OFFSET, WAL_NREADER};
+            use fsqlite_wal::wal_index::read_shared_wal_index_header;
+
+            let cx = Cx::new();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("readonly-empty-wal.db");
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE kept(value INTEGER); INSERT INTO kept VALUES(37); PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let pager = SimplePager::open_readonly_with_cx(
+                &cx, UnixVfs::new(), &path, PageSize::DEFAULT,
+            ).await.unwrap();
+            let source = pager.wal_index_shm_source().unwrap();
+            assert!(!source.can_publish_reader_marks);
+            let region = source.map_region(&cx, 0, false).await.unwrap();
+            assert_eq!(read_shared_wal_index_header(&region).unwrap().unwrap().mx_frame, 0);
+            // A valid empty checkpoint need not retain a reusable nonzero
+            // read mark. Prepare that shape under exact native mark ownership.
+            for slot in 1..WAL_NREADER {
+                let mut file = shared_db_file_write(&source.db_file, &cx).await.unwrap();
+                file.wal_reader_mark_exclusive_acquire(&cx, slot).unwrap();
+                region.atomic_store_u32_ne(
+                    SHM_READ_MARK_OFFSET + usize::try_from(slot).unwrap() * 4,
+                    u32::MAX, AtomicOrdering::Release,
+                ).unwrap();
+                file.shm_lock(&cx, fsqlite_vfs::shm::WAL_READ_LOCK_BASE + slot, 1,
+                    fsqlite_vfs::shm::SQLITE_SHM_UNLOCK | fsqlite_vfs::shm::SQLITE_SHM_EXCLUSIVE,
+                ).unwrap();
+            }
+            let before = region.lock().to_vec();
+            let mut owner = BeginExternalLockState::new(
+                &pager.group_commit_queue, Arc::clone(&source.db_file), &cx,
+            );
+            owner.acquire_snapshot(&cx).await.unwrap();
+            assert_eq!(source.acquire_reader_into(&cx, &mut owner, true).await.unwrap(),
+                traits::WalNativeReadOutcome::Ready);
+            let binding = owner.native_reader.as_ref().unwrap().validated.as_ref().unwrap();
+            assert!(binding.boundary().database_only);
+            assert_eq!(binding.boundary().maximum_wal_frame, 0);
+            assert_eq!(region.lock().to_vec(), before, "read-only admission must not publish read marks");
+            let (mut peer, _) = UnixVfs::new().open(&cx, Some(&path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+            assert!(!peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap(),
+                "slot zero must protect the checkpointed main-file snapshot");
+            owner.restore().await.unwrap();
+            assert!(peer.wal_checkpoint_backfill_gate_acquire(&cx).unwrap());
+            peer.wal_checkpoint_backfill_gate_release(&cx).unwrap();
+            peer.close(&cx).unwrap();
+            assert_eq!(region.lock().to_vec(), before);
+            assert_eq!(stock.query_row("SELECT value FROM kept", [], |row| row.get::<_, i64>(0)).unwrap(), 37);
         });
     }
 
@@ -36136,6 +36324,108 @@ mod tests {
                 .unwrap();
             journal_after_file.close(&cx).unwrap();
             assert_eq!(journal_after, malformed_header);
+        });
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn readonly_native_snapshot_accepts_reserved_writer_journal_but_refuses_orphan() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("reserved-reader.db");
+            let journal_path = SimplePager::<UnixVfs>::journal_path(&path);
+            let page_size = PageSize::DEFAULT.as_usize();
+            {
+                let pager = SimplePager::open_with_cx(
+                    &cx,
+                    UnixVfs::new(),
+                    &path,
+                    PageSize::DEFAULT,
+                )
+                .await
+                .unwrap();
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                assert_eq!(page.get(), 2);
+                txn.write_page(&cx, page, &vec![0x22; page_size])
+                    .await
+                    .unwrap();
+                txn.commit(&cx).await.unwrap();
+            }
+
+            // Real native handles and real same-process RESERVED ownership;
+            // the valid journal preimage models the writer's pre-publication
+            // phase without changing any committed main-file bytes.
+            let vfs = UnixVfs::new();
+            let (mut writer, _) = vfs
+                .open(
+                    &cx,
+                    Some(&path),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                )
+                .unwrap();
+            writer.lock(&cx, LockLevel::Shared).unwrap();
+            writer.lock(&cx, LockLevel::Reserved).unwrap();
+            let mut main_before = vec![0; writer.file_size(&cx).unwrap() as usize];
+            writer.read(&cx, &mut main_before, 0).await.unwrap();
+            let header = JournalHeader {
+                page_count: 1,
+                nonce: 0x1380_0003,
+                initial_db_size: 2,
+                sector_size: 512,
+                page_size: PageSize::DEFAULT.get(),
+            };
+            let mut journal_before = header.encode_padded();
+            journal_before.extend_from_slice(
+                &JournalPageRecord::new(2, vec![0x22; page_size], header.nonce).encode(),
+            );
+            let (mut journal, _) = vfs
+                .open(
+                    &cx,
+                    Some(&journal_path),
+                    VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL,
+                )
+                .unwrap();
+            journal.write(&cx, &journal_before, 0).await.unwrap();
+            journal.sync(&cx, SyncFlags::FULL).unwrap();
+
+            let reader = SimplePager::open_readonly_with_cx(
+                &cx,
+                UnixVfs::new(),
+                &path,
+                PageSize::DEFAULT,
+            )
+            .await
+            .expect("RESERVED writer journal is not orphan recovery");
+            let mut txn = reader.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                txn.get_page(&cx, PageNumber::new(2).unwrap())
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                vec![0x22; page_size].as_slice(),
+            );
+            txn.rollback(&cx).await.unwrap();
+            drop(reader);
+
+            writer.unlock(&cx, LockLevel::None).unwrap();
+            let orphan = SimplePager::open_readonly_with_cx(
+                &cx,
+                UnixVfs::new(),
+                &path,
+                PageSize::DEFAULT,
+            )
+            .await;
+            assert!(matches!(orphan, Err(FrankenError::BusyRecovery)));
+            let mut main_after = vec![0; main_before.len()];
+            writer.read(&cx, &mut main_after, 0).await.unwrap();
+            assert_eq!(main_after, main_before);
+            let mut journal_after = vec![0; journal_before.len()];
+            journal.read(&cx, &mut journal_after, 0).await.unwrap();
+            assert_eq!(journal_after, journal_before);
+            journal.close(&cx).unwrap();
+            writer.close(&cx).unwrap();
         });
     }
 

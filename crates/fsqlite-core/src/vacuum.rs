@@ -281,13 +281,21 @@ pub(crate) async fn persist_compacted_database(
     extra_master_entries: &[SqliteMasterEntry],
     original_ddl: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
+    // INTO publishes a self-contained database, not the source's WAL family.
+    // Preserve metadata while making the output's header describe its actual
+    // standalone format. In-place rebuilds retain the source journal mode.
+    let mut output_header = header.clone();
+    if target.kind() == VacuumTargetKind::UserOutput {
+        output_header.write_version = 1;
+        output_header.read_version = 1;
+    }
     persist_to_reserved_sqlite_with_header_and_master_entries(
         cx,
         target.path(),
         target.identity(),
         schema,
         db,
-        header,
+        &output_header,
         extra_master_entries,
         original_ddl,
     )

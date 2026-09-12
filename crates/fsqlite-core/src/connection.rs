@@ -179964,6 +179964,107 @@ mod tests {
         });
     }
 
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_readonly_wal_binding_under_live_native_writer() {
+        use fsqlite_pager::JournalMode;
+
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("readonly-live-writer.db");
+            let path_text = path.to_string_lossy().into_owned();
+            let writer = Connection::open(&path_text).await.unwrap();
+            for sql in [
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA wal_autocheckpoint=0",
+                "CREATE TABLE kept(value INTEGER)",
+                "INSERT INTO kept VALUES(37)",
+                "BEGIN IMMEDIATE",
+            ] {
+                writer.execute(sql).await.unwrap();
+            }
+            let reader = Connection::open_schema_only(&path_text).await.unwrap();
+            assert!(reader.pager.is_readonly());
+            assert_eq!(reader.pager.journal_mode(), JournalMode::Wal);
+            match &reader.pager {
+                PagerBackend::Unix(pager) => {
+                    assert_eq!(pager.published_snapshot().journal_mode, JournalMode::Wal);
+                    assert_eq!(pager.committed_snapshot().journal_mode, JournalMode::Wal);
+                }
+                #[cfg(target_os = "linux")]
+                PagerBackend::IoUring(pager) => {
+                    assert_eq!(pager.published_snapshot().journal_mode, JournalMode::Wal);
+                    assert_eq!(pager.committed_snapshot().journal_mode, JournalMode::Wal);
+                }
+                _ => panic!("test requires the native Unix pager"),
+            }
+            let rows = reader.query("SELECT value FROM kept").await.unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(37)]);
+            reader.close().await.unwrap();
+            writer.execute("ROLLBACK").await.unwrap();
+            writer.execute("INSERT INTO kept VALUES(38)").await.unwrap();
+            writer.close().await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn test_vacuum_into_wal_source_publishes_standalone_readonly_image() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("wal-source.db");
+            let target_path = dir.path().join("standalone-copy.db");
+            let source = Connection::open(source_path.to_string_lossy().as_ref())
+                .await
+                .unwrap();
+            for sql in [
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA wal_autocheckpoint=0",
+                "CREATE TABLE kept(id INTEGER PRIMARY KEY, value TEXT)",
+                "INSERT INTO kept VALUES(1, 'committed WAL row')",
+                "PRAGMA user_version=417",
+                "PRAGMA application_id=12345",
+            ] {
+                source.execute(sql).await.unwrap();
+            }
+            let expected = source.query("SELECT * FROM kept").await.unwrap();
+            source
+                .execute_with_params(
+                    "VACUUM INTO ?1",
+                    &[SqliteValue::Text(target_path.to_string_lossy().into_owned().into())],
+                )
+                .await
+                .unwrap();
+            let bytes = std::fs::read(&target_path).unwrap();
+            assert_eq!(&bytes[18..20], &[1, 1]);
+            assert_eq!(u32::from_be_bytes(bytes[60..64].try_into().unwrap()), 417);
+            assert_eq!(u32::from_be_bytes(bytes[68..72].try_into().unwrap()), 12345);
+
+            let copied = Connection::open_schema_only(target_path.to_string_lossy().as_ref())
+                .await
+                .unwrap();
+            assert!(copied.pager.is_readonly());
+            assert_eq!(copied.query("SELECT * FROM kept").await.unwrap(), expected);
+            copied.close().await.unwrap();
+            let canonical = rusqlite::Connection::open_with_flags(
+                &target_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let check: String = canonical
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(check, "ok");
+            let value: String = canonical
+                .query_row("SELECT value FROM kept", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "committed WAL row");
+            drop(canonical);
+            assert_eq!(std::fs::read(&target_path).unwrap(), bytes);
+            source.close().await.unwrap();
+        });
+    }
+
     /// Read byte zero of `root_page` in a file-backed database.
     ///
     /// SQLite b-tree page types: `0x0D` leaf **table**, `0x05` interior
