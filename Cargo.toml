@@ -135,7 +135,7 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 fsqlite-types = { version = "0.4.0", path = "crates/fsqlite-types", default-features = false }
 fsqlite-error = { version = "0.4.0", path = "crates/fsqlite-error" }
 fsqlite-vfs = { version = "0.4.0", path = "crates/fsqlite-vfs", default-features = false }
-fsqlite-pager = { version = "0.4.0", path = "crates/fsqlite-pager", default-features = false }
+fsqlite-pager = { version = "0.4.1", path = "crates/fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.4.0", path = "crates/fsqlite-wal", default-features = false }
 fsqlite-mvcc = { version = "0.4.0", path = "crates/fsqlite-mvcc", default-features = false }
 fsqlite-btree = { version = "0.4.0", path = "crates/fsqlite-btree", default-features = false }
@@ -151,8 +151,8 @@ fsqlite-ext-json = { version = "0.4.0", path = "crates/fsqlite-ext-json" }
 fsqlite-ext-session = { version = "0.4.0", path = "crates/fsqlite-ext-session" }
 fsqlite-ext-icu = { version = "0.4.0", path = "crates/fsqlite-ext-icu" }
 fsqlite-ext-misc = { version = "0.4.0", path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { version = "0.4.0", path = "crates/fsqlite-core", default-features = false }
-fsqlite = { version = "0.4.0", path = "crates/fsqlite", default-features = false }
+fsqlite-core = { version = "0.4.1", path = "crates/fsqlite-core", default-features = false }
+fsqlite = { version = "0.4.1", path = "crates/fsqlite", default-features = false }
 fsqlite-cli = { version = "0.3.18", path = "crates/fsqlite-cli" }
 fsqlite-harness = { version = "0.3.18", path = "crates/fsqlite-harness" }
 fsqlite-e2e = { version = "0.3.18", path = "crates/fsqlite-e2e" }
