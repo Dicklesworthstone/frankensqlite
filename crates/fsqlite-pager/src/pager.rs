@@ -59722,6 +59722,63 @@ mod tests {
     }
 
     #[test]
+    fn test_quiesce_does_not_admit_wal_install_after_a_new_finalization_root() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            assert!(
+                !pager
+                    .group_commit_queue
+                    .has_process_root_finalization_attempt()
+            );
+
+            // This existing seam fixes the interleaving: a new root arrives
+            // after successful quiescence but before backend installation.
+            let root = ProcessRootFinalizationAttempt::register(&pager.group_commit_queue);
+            let dropped = Arc::new(Mutex::new(false));
+            let backend = DropAwareWalBackend {
+                dropped: Arc::clone(&dropped),
+            };
+            let (error, backend) = pager
+                .set_wal_backend_owned(backend)
+                .expect_err("a new finalization root must refuse backend installation");
+            assert!(matches!(error, FrankenError::BusyRecovery));
+            assert!(!has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            );
+
+            // The same error can also come from quiescing an unresolved root;
+            // the core diagnostic must distinguish these two call boundaries.
+            assert!(matches!(
+                pager.quiesce_pending_group_commit_finalization().await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            root.release_after_terminal();
+            pager
+                .quiesce_pending_group_commit_finalization()
+                .await
+                .unwrap();
+            pager
+                .set_wal_backend_owned(backend)
+                .unwrap_or_else(|(error, _)| {
+                    panic!("the retained backend must install after settlement: {error:?}")
+                });
+            assert!(has_wal_backend(&pager.wal_backend).unwrap());
+            assert!(
+                !*dropped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            );
+        });
+    }
+
+    #[test]
     fn test_set_wal_backend_owned_rejects_active_transaction() {
         asupersync::test_utils::run_test(|| async {
             let (pager, _) = test_pager().await;
