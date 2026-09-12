@@ -836,9 +836,18 @@ pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u
     let retained = usize::try_from(retained)
         .map_err(|_| FrankenError::internal("WAL-index prefix exceeds usize"))?
         .min(capacity);
-    for slot in 0..WAL_INDEX_HASH_SLOTS {
+    // The caller retains the WRITE owner, so only this owner can change hash
+    // slots. Capture them at their atomic protocol width under one local lock;
+    // readers may continue using the published prefix throughout cleanup.
+    let mut hash_entries = vec![0_u8; WAL_INDEX_HASH_SLOTS * 2];
+    segment.atomic_copy_u16_ne(
+        WAL_SHM_PAGE_ARRAY_BYTES,
+        &mut hash_entries,
+        Ordering::Acquire,
+    )?;
+    for (slot, bytes) in hash_entries.as_chunks::<2>().0.iter().enumerate() {
         let hash_offset = WAL_SHM_PAGE_ARRAY_BYTES + slot * 2;
-        if usize::from(segment.atomic_load_u16_ne(hash_offset, Ordering::Acquire)?) > retained {
+        if usize::from(u16::from_ne_bytes(*bytes)) > retained {
             segment.atomic_store_u16_ne(hash_offset, 0, Ordering::Release)?;
         }
     }
