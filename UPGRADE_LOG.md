@@ -296,6 +296,26 @@ This does not replace the final audit after all upgrades.
   workspace check `28b6067d463e5d6c5c65cde6600f83157cc2451508e410cd6c7f97667baede87`;
   Clippy `84ffd7228afd1630c27d68dc8bf284124adf7d5c7cc15b030aba09d57eae6669`.
 
+### io-uring 0.7.14 → 0.7.15 — passed scoped kernel checks
+
+- Published source `a51717806263c0b11dcd0d4ea9f8c7de0357bd26` handles
+  pending deferred task work during submission, adds completion-eventfd control
+  and write-stream fields whose default remains zero. Requirements/features
+  are unchanged; only lockfile version/checksum change. The VFS does not enable
+  deferred-task-work setup, so this is not a claimed repair of its timing gate.
+- On the same Linux worker, old-version RCH `30016197441356080` and candidate
+  `30016197441356085` each passed all 32 `uring::tests`, no ignored tests,
+  including actual kernel ownership, completion-after-observer-drop and both
+  unchanged five-millisecond cancellation assertions. Both embedded fresh-process
+  checks also passed. All 1,645 post-run inputs match the respective manifests:
+  baseline `eef23d2f`, candidate
+  `cc4cdb2444abb1f9101060cbea4c1951205c90e0591cf5a00f5aa537b5270533`.
+- These bounded runs do not supersede earlier failed cancellation timing batches
+  or close `bd-6hdwo.35`; final release qualification remains open.
+- Transcript SHA256: baseline
+  `b4b6e7e6ba9b12b990b149c095d2eb2d180d42d5c59b025a4677b532623212df`;
+  candidate `c3566ee1d1ad0e3bf39009dad6d6da4e2d40f7ec2f6ccddb14f8a83dd4e23394`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
