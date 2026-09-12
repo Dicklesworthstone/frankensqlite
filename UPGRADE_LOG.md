@@ -141,6 +141,23 @@ This does not replace the final audit after all upgrades.
   Linux `54c15bdc2e854e03a7afb0d4fe8ca41c29e920949a5ee921b098e174ad01b920`;
   macOS `eee8cf98993970f4bf95fc769b294a6ad1eb27ca0ead271445c4374c2b8881c5`.
 
+### crossbeam-queue 0.3.13 → 0.3.14 — passed
+
+- Uses 64-bit indexes on 32-bit platforms with 64-bit atomics; requirements,
+  features and MSRV 1.60 remain unchanged. Only lockfile version/checksum change.
+- Published asupersync source uses `SegQueue` for scheduler global queues,
+  blocking tasks, epoch work and cleanup entries. The mpsc channel's mentions
+  of ArrayQueue are explanatory comments, not its backing implementation.
+- Native dispatcher RCH `30017537169162272` passed 14/14. Linux RCH
+  `30016197441356050` passed all three real-kernel driver-failure ownership
+  guards; `30016197441356051` passed tracked-write observer-drop coverage.
+  All 1,619 post-run source hashes match `ff39544a` on both workers.
+- Log SHA256: native `761873fd052c561c5049417d6a7656929e6ecc37a35e26c533fd02e250eaee96`;
+  ownership `3c5d1571f4a891296f5bc54445d8b0f33cf1fc41a218484624477b7c6deb7d00`;
+  observer `b137cb37687215907a3cd9ebd284ff11ce1a838eecb447918787833230a05432`.
+- No 32-bit runtime proof or existing cancellation-latency release-gate
+  acceptance is inferred from these focused checks.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
