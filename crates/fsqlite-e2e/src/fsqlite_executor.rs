@@ -1720,7 +1720,17 @@ async fn execute_batch_with_executor(
         .conn
         .begin_transaction()
         .await
-        .map_err(|err| classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin))?;
+        .map_err(|err| {
+            let begin_boundary = duration_to_u64_ns(begin_started.elapsed());
+            let mut failure = classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin);
+            match &mut failure {
+                BatchError::Busy { timing: failed_timing, .. }
+                | BatchError::Fatal { timing: failed_timing, .. } => {
+                    failed_timing.begin_boundary = begin_boundary;
+                }
+            }
+            failure
+        })?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
     let mut ok: u64 = 0;
@@ -4833,6 +4843,42 @@ mod tests {
             classify_fsqlite_error_as_batch(err),
             BatchError::Busy { .. }
         ));
+    }
+
+    #[test]
+    fn failed_begin_preserves_measured_time_and_the_existing_transaction() {
+        crate::block_on(async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.begin_transaction().await.unwrap();
+            let mut executor = PreparedOpExecutor::new(&conn);
+            let mut stats = WorkerStats::default();
+            let mut attempt = 0;
+            let result = execute_batch_with_executor(
+                &mut executor,
+                &[],
+                BatchRange {
+                    start: 0,
+                    end: 0,
+                    commit: true,
+                },
+                &FsqliteExecConfig::default(),
+                &mut stats,
+                &mut attempt,
+            )
+            .await;
+            let Err(BatchError::Fatal { phase, timing, .. }) = result else {
+                panic!("starting a nested transaction must remain a fatal BEGIN error");
+            };
+            assert_eq!(phase, BatchPhase::Begin);
+            assert!(timing.begin_boundary > 0, "failed BEGIN time was discarded");
+            assert_eq!(timing.body_execution, 0);
+            assert_eq!(timing.commit_finalize, 0);
+            assert_eq!(timing.rollback, 0);
+            assert_eq!(stats.retries, 0);
+            assert_eq!(attempt, 0);
+            assert!(conn.in_transaction(), "the existing transaction must survive");
+            conn.rollback_transaction().await.unwrap();
+        });
     }
 
     #[test]
