@@ -135,7 +135,7 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 fsqlite-types = { version = "0.4.0", path = "crates/fsqlite-types", default-features = false }
 fsqlite-error = { version = "0.4.0", path = "crates/fsqlite-error" }
 fsqlite-vfs = { version = "0.4.0", path = "crates/fsqlite-vfs", default-features = false }
-fsqlite-pager = { version = "0.4.0", path = "crates/fsqlite-pager", default-features = false }
+fsqlite-pager = { version = "0.4.1", path = "crates/fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.4.0", path = "crates/fsqlite-wal", default-features = false }
 fsqlite-mvcc = { version = "0.4.0", path = "crates/fsqlite-mvcc", default-features = false }
 fsqlite-btree = { version = "0.4.0", path = "crates/fsqlite-btree", default-features = false }
@@ -151,8 +151,8 @@ fsqlite-ext-json = { version = "0.4.0", path = "crates/fsqlite-ext-json" }
 fsqlite-ext-session = { version = "0.4.0", path = "crates/fsqlite-ext-session" }
 fsqlite-ext-icu = { version = "0.4.0", path = "crates/fsqlite-ext-icu" }
 fsqlite-ext-misc = { version = "0.4.0", path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { version = "0.4.0", path = "crates/fsqlite-core", default-features = false }
-fsqlite = { version = "0.4.0", path = "crates/fsqlite", default-features = false }
+fsqlite-core = { version = "0.4.1", path = "crates/fsqlite-core", default-features = false }
+fsqlite = { version = "0.4.1", path = "crates/fsqlite", default-features = false }
 fsqlite-cli = { version = "0.3.18", path = "crates/fsqlite-cli" }
 fsqlite-harness = { version = "0.3.18", path = "crates/fsqlite-harness" }
 fsqlite-e2e = { version = "0.3.18", path = "crates/fsqlite-e2e" }
@@ -161,7 +161,7 @@ fsqlite-c-api = { version = "0.3.18", path = "crates/fsqlite-c-api" }
 fsqlite-wasm = { version = "0.3.18", path = "crates/fsqlite-wasm" }
 
 # External dependencies
-ftui = { version = "0.5.0", default-features = false }
+ftui = { version = "0.7.0", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 # No `preserve_order` here (fsqlite#356): the workspace-wide feature leaked
@@ -206,8 +206,10 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # every fsqlite crate. Keep this registry-resolvable so downstream git consumers
 # can build FrankenSQLite without a private `/dp/asupersync` checkout; local
 # asupersync development belongs in an uncommitted Cargo patch/config override.
-# Cx appears in public APIs. The 0.4 engine line uses Asupersync 0.5 throughout;
-# allowing older runtime minors here would split those types across consumers.
+# Native context attachment and blocking-pool discovery share Asupersync types
+# and thread-local state with callers. Cx appears in public APIs. The 0.4
+# engine line uses Asupersync 0.5 throughout; allowing older runtime minors
+# here would split those types across consumers.
 asupersync = { version = "0.5.0", default-features = false }
 futures-lite = "2.6.1"
 

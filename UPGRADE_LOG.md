@@ -1,5 +1,44 @@
 # Dependency Upgrade Log
 
+## September 12 — WASM family and recoverable parser diagnostics integrated
+
+Updated wasm-bindgen and its matching packages from 0.2.127 to 0.2.128.
+The eleven-package closure includes upstream's required minicov 0.3.8 pin
+([profiling-runtime incompatibility](https://github.com/wasm-bindgen/wasm-bindgen/pull/5283));
+unstable coverage generation was not exercised. Manifest feature policy is unchanged.
+
+The old-lock browser run exposed bd-7rg1a.3: unexpected SQL tokens were
+reported as nonrecoverable function errors. The connection now returns the
+existing `SyntaxError` variant, preserving stock text, primary/extended code 1
+and nontransient status. The added native test checks both execute and query,
+then executes corrected SQL on the same connection. Existing assertions remain intact.
+
+Main's 1,645 source inputs exactly match qualified manifest
+`84c57d313790585258e9b9226165e0d658914c6cc0f941c9436c4865fdb7ae2b`.
+Strict RCH receipts on that source: full-feature Chrome 56145 passed 41 tests;
+default Chrome 56150 passed 19; memory-options without diagnostics 56153 passed
+21; native parser 56148 passed six. All had zero ignored tests. Workspace/all-targets/TUI
+check 56147, warnings-denied Clippy 56149 and formatting 56146 passed, with
+all source hashes checked afterward. Job numbers in this section have prefix
+`300161974413`. Browser tooling was matching bindgen 128 plus Chrome/chromedriver
+153.0.8010.36; its hashes are retained in
+`/tmp/frankensqlite-wasm-browser-gpu-disabled-toolchain-20260912.sha256`.
+
+The old full browser run 56141 remains a failure: 32 passed and nine failed
+(the metadata assertion followed by poisoned-lock failures). An isolated old
+generated-JS control passed six selected cases; it does not replace that failure.
+Before integrating the dependency closure, the syntax-only main source also passed
+all six native tests (56190), formatting (56196), and workspace/all-targets/TUI
+check (56191). Its distinct source manifest is `8cff11f1`; those checks do not
+stand in for the final dependency-source receipts above. Independent source review
+found no material issue. UBS findings in the test file were test assertions/panics,
+fixed SQL construction, and a false secret detection on the parser's `token` field;
+no suppression or weakened gate was added. Concurrent-writer defaults are unchanged.
+
+This is the nineteenth qualified dependency step. Asupersync 0.5.0 is newly
+available and is being tested separately; final updated-dependency and release
+qualification remain incomplete.
+
 ## September 12, 2026 — release dependency review in progress
 
 The owner requested latest stable dependency updates before the next DSR,
