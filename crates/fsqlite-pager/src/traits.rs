@@ -1092,7 +1092,7 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 /// an error observed after the commit marker became durable. Upper layers must
 /// only run rollback semantics for [`NotCommitted`](Self::NotCommitted);
 /// every other nonterminal state retains a commit obligation that must be
-/// reconciled by retrying the same transaction handle.
+/// reconciled by settling the same attempt, without starting another write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagerCommitState {
     /// No physical commit is pending and rollback is still permitted.
@@ -1243,6 +1243,19 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// `DurableNeedsPublication` back into `NotCommitted`.
     fn pager_commit_state(&self) -> PagerCommitState {
         PagerCommitState::NotCommitted
+    }
+
+    /// Settle an existing physical commit attempt without starting a new one.
+    ///
+    /// A `NotCommitted` result permits rollback; it does not commit restored
+    /// dirty pages. Authorized durability must finish publication, and pending
+    /// I/O must retain its recovery ownership. The default only reports state
+    /// for handles without asynchronous physical recovery.
+    fn settle_commit<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<PagerCommitState>> + 'a {
+        async move { Ok(self.pager_commit_state()) }
     }
 
     /// Commit dirty pages and reset for immediate reuse without destroying
@@ -2158,6 +2171,13 @@ impl TransactionHandle for TransactionKind {
 
     fn pager_commit_state(&self) -> PagerCommitState {
         dispatch_transaction_kind!(self, txn => txn.pager_commit_state())
+    }
+
+    fn settle_commit<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PagerCommitState>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.settle_commit(cx).await) }
     }
 
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
