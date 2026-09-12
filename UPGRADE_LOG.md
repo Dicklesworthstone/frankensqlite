@@ -74,6 +74,17 @@ This does not replace the final audit after all upgrades.
   `822f88fc88c91c1fcdcb8f8d4eb9fccb2a4405dc3c5003c8788f623bc021a572`.
 - No project performance improvement is inferred from the upstream optimization.
 
+### toml 1.1.5 → 1.1.6 — passed
+
+- Upstream reduces parser allocation; existing dependency requirements and
+  feature selection remain compatible. [Exact changelog](https://github.com/toml-rs/toml/blob/572c005d80cca5f7bd163805c2f33ba0a5207b6d/crates/toml/CHANGELOG.md).
+- Only lockfile version/checksum change. Native RCH `30017537169162241`
+  passed all 29 beads-doctor tests; `30017537169162243` passed all 74 selected
+  tests across the six harness TOML-consuming modules, zero ignored. Both
+  post-run manifests match all 1,616 source inputs `7e712883`.
+- Logs SHA256: doctor `8da582a0c60997c16bed061f9db7e0eeff7bff46cf23754d2fe644477f1452e9`;
+  harness `bd9fb43658435b361c1e9fe513e91fb1235f5aa78f4c0b9122d7ef834ffb6bfc`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
