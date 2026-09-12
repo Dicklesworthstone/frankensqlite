@@ -316,6 +316,73 @@ This does not replace the final audit after all upgrades.
   `b4b6e7e6ba9b12b990b149c095d2eb2d180d42d5c59b025a4677b532623212df`;
   candidate `c3566ee1d1ad0e3bf39009dad6d6da4e2d40f7ec2f6ccddb14f8a83dd4e23394`.
 
+### asupersync 0.4.10 → 0.4.11 — passed scoped runtime checks
+
+- Retained the existing workspace requirement and disabled default features.
+  Updated only asupersync and its required franken-decision/evidence/kernel
+  closure to 0.4.11. Unrelated resolver deduplication was not applied.
+- Reviewed the published runtime changes to oneshot permit settlement,
+  current-thread task driving, timer wakeups and runtime-owner teardown.
+  No application runtime API or concurrency default changed.
+- Old-version controls passed: native pager RCH `30017537169162353`
+  (998 passed, 13 ignored), Linux MVCC `30016197441356088`
+  (1,568 passed, 15 ignored), and the preceding io-uring kernel suite
+  `30016197441356085` (32 passed, none ignored).
+- Candidate source manifest
+  `/tmp/frankensqlite-0319-asupersync-source-20260912.sha256`, SHA-256
+  `144f11d6691f22cc4e61b1103aafc53a7f3755ee3753b8155bc7e31428dd0b2d`:
+  native pager `30017537169162360` passed 998 tests (13 ignored);
+  Linux kernel `30016197441356091` passed 32 (none ignored);
+  full parallel MVCC `30016197441356095` passed 1,568 (15 ignored);
+  workspace/all-targets/TUI check `30016197441356092` and warnings-denied
+  Clippy `30016197441356096` passed. Native diagnostic public contract
+  `30017537169162371` passed all 17 tests, including real mid-scan and
+  cached prepared-read cancellation. All 1,645 inputs matched each worker
+  after its run. Embedded subprocess test summaries are not extra cases.
+- Candidate transcript SHA-256: pager
+  `92aaeb27dcebb49e68b833fde481c52d6498b1fe0bad98bb1fa0472d82ad91f9`;
+  kernel `ed3ef5ae7230ad4e4ba74cb68f154fc23349f7b4f1e9608968ef2d168fb79f06`;
+  MVCC `174962db43f6c6da58df36d4b7617b0f89426431a6cfa45fbe005ef3e2edd118`;
+  check `ca47f0f14b4ec4f12952d75dff895e28d6627002405088a7aa8abf9f11e7b9ee`;
+  Clippy `b89a86329accb4700a6731f621ec05ff3d2736db8de0fc1f90b34aeaa75c13e7`;
+  public contract `e63e8205076d3bf3a234dadbb186ae47e6c19a9116aed0092a5b960c0fe0afda`.
+- Review found an existing coverage error, tracked as `bd-7rg1a.2`: the
+  ordinary writer drop test used plain BEGIN, which promotes to concurrent
+  mode. Both ordinary writer and sibling now explicitly use BEGIN IMMEDIATE,
+  assert concurrent defaults remain enabled, and retain the original durable
+  row, abandoned row and sibling progress assertions. The concurrent case
+  remains unchanged. Native `30017537169162377` passed both cases, none
+  ignored, on source manifest SHA-256
+  `4f83a8c30a03f1b926620051cb572450650467bf5dd8d0767fc83e4edd86e9ed`;
+  all 1,645 inputs matched. Transcript SHA-256
+  `a458035e122fff2a446e5fcdb429f27bde597f46a4efc0a8586ce59bb7c75c75`.
+- The first extra async-facade drop invocation `30017537169162378` failed
+  before compilation because it omitted required feature `async-api`.
+  It provides no test evidence. Corrected native `30017537169162379` passed
+  the one actual test, none ignored: no background family-size mutation and
+  unchanged main/WAL sizes through read-only opens. All 1,645 final test-source
+  inputs matched afterward. Transcript SHA-256
+  `1e12e7d420b55e25166183a28b48fa4c03b19662867d1c0499feed4f40611398`.
+  Formatting `30016197441356099` also passed with matching final-source inputs;
+  transcript `b38b4545df0ed71fb55f028fe51df0ad74e5cb057d4100b5143b20130618a332`.
+- Canonical writer targets `30016197441356098` passed: 4 active cases in
+  `bd_1r0ha_3_concurrent_writer_e2e` (one manual profile ignored), and all
+  15 in `mvcc_concurrent_writers`. The latter includes SQLite scaling controls
+  and sequential FrankenSQLite baselines; the former exercises actual parallel
+  FrankenSQLite worker progress. All 1,645 source144f11d6 inputs matched.
+  Transcript SHA-256
+  `d9256a3dac6692a48df1650c0473c739e1af407c150efded36a2bf10a644ccf2`.
+- Final test-source workspace/all-targets/TUI check `30016197441356100`
+  passed with all 1,645 inputs matching; transcript SHA-256
+  `598070d2327a143a1ab5432e718e6eb111984de052a0d06ef6213cddd57eab13`.
+  Final warnings-denied Clippy `30016197441356107` passed with all 1,645
+  inputs matching; transcript SHA-256
+  `744455762ecc413fb8ab580227aed6a99bc1cc0bf988d44a6958e286fa03b86c`.
+  Independent read-only review found no blocking issue in the lock delta,
+  ordinary-drop correction or proof claims. These scoped results do not
+  close the historical five-millisecond cancellation gate, ignored performance
+  gates, private core-lib settlement coverage, or release qualification.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
