@@ -200,6 +200,28 @@ This does not replace the final audit after all upgrades.
 - Native Windows compiler discovery is not proven by these macOS/Linux checks;
   exact release target checks remain due.
 
+### zerocopy and zerocopy-derive 0.8.56 → 0.8.57 — passed
+
+- Exact published source `6dc429c4` → `0c90b11a` preserves original source bytes
+  when `try_transmute!` validation fails and qualifies generated `KnownLayout`
+  metadata extraction through the intended trait. It also fixes generated
+  helper lint allowances. The derive dependency requires the exact same version.
+- Inspected locked ahash, half and ppv-lite86 consumers use infallible transmute
+  and generated traits; none calls `try_transmute!`. Project tests do not prove
+  that upstream failure branch. Features and other requirements are unchanged.
+- Native RCH `30017537169162291` passed all 562 type/property tests. Linux
+  RCH `30016197441356054` passed workspace/all-target compilation with optional
+  E2E TUI targets, no reported warnings/errors. Both post-run manifests match
+  all 1,643 `08154e72` inputs.
+- Native RCH `30017537169162296` passed the actual fixture-selection schema
+  consumer test. Its required schema/manifest files were verified before and
+  after; all 1,645 expanded-manifest inputs `1271261a` match. The preliminary
+  selector named an uncompiled source module and ran zero tests; it is excluded
+  from validation evidence. Only pair versions/checksums change.
+- Log SHA256: types `0eee37f78527e48698aaafbdd535f907e1e4e40507c6c156f4f2fd42e3bf88b1`;
+  workspace `618009d7a2a75885ed9158338a0f703a6565a6a021c922e174180f474b66a953`;
+  schema `d8712f94d7d26a6950c2e6ed49ea4654a72c41ef1d980d8364e9ecce228bb778`.
+
 **Date:** 2026-09-03 · **Project:** frankensqlite · **Language:** Rust (nightly, edition 2024)
 **Method:** `cargo update` (semver-compatible lockfile refresh) verified on a quiet host (trj),
 then landed. No manifest version constraints were changed — this is a lockfile-only refresh.
