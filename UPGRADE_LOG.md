@@ -21,7 +21,7 @@ also passed. Warnings-denied Clippy 56215, the restricted native-context consume
 none ignored/filtered) passed. All source hashes matched afterward; all seven
 browser-tool hashes also matched. Final TUI 56220 passed all seventeen tests
 (dashboard one, viewer sixteen), with none ignored/filtered and all source hashes
-matching afterward. Default/memory browser variants remain pending.
+matching afterward. Replacement default/memory browser variants passed as recorded below.
 Default-browser run 56219 reported nineteen passes, but its post-run source
 check found four files matching the older `a8b76fb81` instead of the frozen
 manifest: both root Cargo files and the two parser-repair files. That run is
@@ -30,6 +30,12 @@ repository's Git submodule. The replacement uses an isolated worktree at
 `dbca5d37c` with RCH's worker-verified source-content receipt; its first admission
 outside the configured project root refused, then the worktree was moved under
 the configured root. No local fallback or fleet repair was used.
+Replacement default 56234 passed all nineteen tests and memory-options without
+diagnostics 56242 passed all twenty-one, with none ignored or filtered. Both
+completed remotely on hz3; their source-content receipts matched all 1,645 inputs
+and their terminal tool checks matched all seven browser-tool hashes. Receipt
+roots are `19f831a53cf2a1a4519885e4e901577e6c17b74b0201115b766c014f803775ad`
+and `07e7dd40b17d21c5b49f37c5c42e46b1396120cdd16ac31a707da59c4929a641`.
 The first TUI admission was refused for ovh-a disk pressure;
 no local fallback or host cleanup occurred, and the retry uses ovh-b. Earlier
 source-bound receipts below do not certify a new release. Job IDs use prefix
@@ -65,7 +71,7 @@ it is excluded from proof and was replaced by the actual `commit_repair::` modul
 selector. These results do not establish the broader historical performance gate.
 All job numbers in this paragraph have prefix `300161974413`.
 
-### JSONschema 0.56 preparation — not yet qualified
+### JSONschema 0.56 — focused qualification complete
 
 The current 0.48.5 schema-consumer baseline 56227 passed both compiled
 `matches_json_schema` tests (699 filtered), with all six fixture files present
@@ -77,8 +83,30 @@ HTTP and async resolution remain disabled. `serde_json/float_roundtrip` was
 already enabled by 0.48.5. Review of fancy-regex 0.19.1 covered its optional
 capture, Unicode matching, bounded seek expansion and delegated-engine cache
 changes. The six-package candidate is now applied to main, preserving current
-engine versions. Actual schema consumers and workspace gates remain pending;
-dependency resolution alone does not qualify the upgrade.
+engine versions. The candidate's 1,649 source/fixture inputs have manifest hash
+`d3c940f2cd16e408873ff7c56a6896cbec6faeac7d81fc9ee3d7c022fd779856`.
+
+RCH 56238 passed nine actual tests across seven targets: fixture selection,
+comprehensive report, realdb report, manifest, and SSI/busy/crash matrices.
+The matrices exercised six, three and six scenario outcomes respectively.
+All six tracked fixtures were present. There were no failures or ignored tests;
+809 tests were filtered. The bridge selector in that TUI-only invocation was
+not compiled, so it contributes no test to that count. Separate bridge-experiment
+run 56248 passed its actual positive/negative schema test (one passed, fifty
+filtered). Both source-content receipts match all 1,649 expected inputs, with
+terminal remote exit zero and artifact retrieval complete. Receipt roots:
+`a4b0eba0eee7e07830c08693e944bf932a171e225db91cc3c3b25d526c096a44`
+and `27914ef5bc0a095e41f722a7197a710590b7f7176e6fd721ac9d22fd784d76fd`.
+An independent agent inspected the bridge log and receipt; it did not rerun it.
+
+Workspace/all-targets/TUI check 56249 and warnings-denied Clippy 56252 passed,
+each with all 1,649 inputs matched and terminal remote exit zero. Configured
+formatting 56251 passed as an RCH non-compilation job with matching post-worker
+hashes; the existing fsqlite-core exclusion remains. The first check attempt
+was refused for ovh-b disk pressure, and the first formatter invocation was
+rejected because source-content receipts and job mode cannot be combined.
+Neither refusal is validation. Tests and compiler checks establish this focused
+dependency update, not whole-project release readiness or performance parity.
 
 ## September 12 — WASM family and recoverable parser diagnostics integrated
 
