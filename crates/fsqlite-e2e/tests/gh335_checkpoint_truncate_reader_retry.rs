@@ -95,7 +95,7 @@ fn supervise_campaign(mode: &str, timeout: Duration) -> Result<(), String> {
         .args([
             KEEPER_NAME,
             "--exact",
-            "--ignored",
+            "--include-ignored",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -185,8 +185,9 @@ fn phase_name(p: u8) -> &'static str {
     }
 }
 
-// JOINT #335 + bd-b4u1r guard — committed #[ignore]d (red by design until the
-// bd-b4u1r open-path interlock lands). A/B evidence (phase-instrumented, 60 iters):
+// Joint #335 + bd-b4u1r regression: fresh opens and first SELECTs must complete
+// while both the writer and nonempty TRUNCATE checkpoints make progress.
+// Historical A/B evidence (phase-instrumented, 60 iterations):
 //   * PRE-FIX (Pragma-only retry): SELECT-phase fails BusySnapshot (iter 1) AND
 //     plain Busy (iters 6,8 — the bd-b4u1r symptom), plus a phase=`open` WEDGE.
 //   * WITH the #335 read-retry (Statement::Select added to the autocommit retry
@@ -197,9 +198,8 @@ fn phase_name(p: u8) -> &'static str {
 //     the OPEN path, NOT the statement retry loop (which is busy_timeout-bounded).
 // That open wedge is bd-b4u1r / GH#367 (recovery-fence contention -> pool
 // checkout-validation) and is fixed by that lane's header-rewrite interlock, not
-// by this connection-layer read retry. Flip off #[ignore] once the interlock
-// lands to prove BOTH fixes compose.
-#[ignore = "joint #335+bd-b4u1r guard: #335 read-retry verified to kill SELECT-phase BusySnapshot/Busy (3->0); full green needs the bd-b4u1r fresh-open-during-TRUNCATE interlock to remove the open-phase wedge"]
+// by this connection-layer read retry. The supervised campaign exercises both
+// fixes together and fails if either antagonist stops making progress.
 #[test]
 fn gh335_checkpoint_truncate_never_fails_fresh_reader_first_select() {
     let Ok(mode) = std::env::var(CHILD_MODE) else {

@@ -1059,18 +1059,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite-e2e/tests/gh335_checkpoint_truncate_reader_retry.rs",
-      "test_name": "gh335_checkpoint_truncate_never_fails_fresh_reader_first_select",
-      "reason": "joint #335+bd-b4u1r guard: #335 read-retry verified to kill SELECT-phase BusySnapshot/Busy (3->0); full green needs the bd-b4u1r fresh-open-during-TRUNCATE interlock to remove the open-phase wedge",
-      "cfg_condition": null,
-      "kind": "known_bug",
-      "policy": "block_release",
-      "evidence": {
-        "requirement": "Qualify this unchanged exact joint keeper at the release source with no fresh-open/first-SELECT failure or timeout wedge before removing its ignore. Retain the command, source identity, platform, toolchain, and terminal result; a different reader test's passing run is not evidence for this keeper.",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite-e2e/tests/index_range_eqp_diagnostic.rs",
       "test_name": "diagnostic_composite_desc_order_by",
       "reason": "diagnostic/A-B bench; run explicitly under --profile release-perf",
