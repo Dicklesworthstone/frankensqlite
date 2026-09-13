@@ -13,8 +13,48 @@ side's code or tests; the ordinary index and protected peer bytes are preserved.
 The merged tree adds our WASM/parser repair and individually qualified FTUI 0.7
 family, retaining remote Asupersync requirements and crate versions. Its 1,645-input
 source manifest is `e727b7e8c216c655834000498dfbaa908a01bd2915221e03fe5a6d4e412f40bb`.
-Final merged-source tests and compiler/lint checks are pending. Earlier source-bound
-receipts below do not certify this merge or a new release.
+Merged-source RCH 56204 passed all six parser and eight read-only WAL regression
+tests, with none ignored or filtered. RCH 56205 passed workspace/all-targets/TUI
+checking. Both workers matched all 1,645 source hashes after completion. Formatting
+also passed. Warnings-denied Clippy 56215, the restricted native-context consumer
+56213 (one passed, 744 filtered), and real Chrome all-feature run 56206 (41 passed,
+none ignored/filtered) passed. All source hashes matched afterward; all seven
+browser-tool hashes also matched. Final TUI 56220 passed all seventeen tests
+(dashboard one, viewer sixteen), with none ignored/filtered and all source hashes
+matching afterward. Default/memory browser variants remain pending.
+Default-browser run 56219 reported nineteen passes, but its post-run source
+check found four files matching the older `a8b76fb81` instead of the frozen
+manifest: both root Cargo files and the two parser-repair files. That run is
+excluded from current-source acceptance. Clean-overlay recovery refused the
+repository's Git submodule. The replacement uses an isolated worktree at
+`dbca5d37c` with RCH's worker-verified source-content receipt; its first admission
+outside the configured project root refused, then the worktree was moved under
+the configured root. No local fallback or fleet repair was used.
+The first TUI admission was refused for ovh-a disk pressure;
+no local fallback or host cleanup occurred, and the retry uses ovh-b. Earlier
+source-bound receipts below do not certify a new release. Job IDs use prefix
+`300161974413`.
+
+While qualification ran, remote main advanced to `5ced8e118`, incorporating the
+same parser and dependency source. Its production files match the tested tree;
+the histories are reconciled with the current validation notes retained.
+
+Independent acceptance inspection retained closure of bd-7rg1a.3 after checking
+the original contract, exact source and actual test receipts. This was independent
+inspection, not an independent re-execution. Configured formatting excludes
+fsqlite-core, so it does not mechanically certify the two parser-repair files;
+the narrow diff was visually reviewed. No benchmark or whole-project acceptance
+is implied by this closure.
+
+Independent review against remote main found exactly eleven WASM and eleven FTUI
+package-version changes, no other changed lock records, and no forbidden runtime.
+The remote Asupersync 0.5.0 requirements and all engine package versions remain
+intact. FTUI keeps `default-features=false` and the existing opt-in TUI feature.
+Its separate pre-merge qualification on source `697f677d` passed seventeen binary
+tests (56159), workspace checking (56160), Clippy (56171), formatting (56168), and
+strict real-PTY navigation, resize and terminal-restoration checks (56173).
+The first PTY run had an insufficient resize assertion; the tightened rerun is
+the accepted receipt. These are UI checks, not database workload benchmarks.
 
 Separate pre-merge Asupersync 0.5 consumer results on source `bb29a034`:
 98 context tests (RCH 56195), 32 io_uring tests including actual kernel I/O (56198),
@@ -24,6 +64,21 @@ after each run. The original commit-repair selector 56197 ran **zero tests**;
 it is excluded from proof and was replaced by the actual `commit_repair::` module
 selector. These results do not establish the broader historical performance gate.
 All job numbers in this paragraph have prefix `300161974413`.
+
+### JSONschema 0.56 preparation — not yet qualified
+
+The current 0.48.5 schema-consumer baseline 56227 passed both compiled
+`matches_json_schema` tests (699 filtered), with all six fixture files present
+and all 1,645 post-run source hashes matching. Isolated resolver 56229 selected
+exactly the four JSONschema-family packages at 0.56.0, Fraction 0.17.0 and
+fancy-regex 0.19.1; other package records are unchanged and no forbidden runtime
+appears. The new IDNA feature must be explicitly enabled to retain old behavior;
+HTTP and async resolution remain disabled. `serde_json/float_roundtrip` was
+already enabled by 0.48.5. Review of fancy-regex 0.19.1 covered its optional
+capture, Unicode matching, bounded seek expansion and delegated-engine cache
+changes. The six-package candidate is now applied to main, preserving current
+engine versions. Actual schema consumers and workspace gates remain pending;
+dependency resolution alone does not qualify the upgrade.
 
 ## September 12 — WASM family and recoverable parser diagnostics integrated
 
@@ -38,7 +93,7 @@ existing `SyntaxError` variant, preserving stock text, primary/extended code 1
 and nontransient status. The added native test checks both execute and query,
 then executes corrected SQL on the same connection. Existing assertions remain intact.
 
-Main's 1,645 source inputs exactly match qualified manifest
+Before the remote merge, main's 1,645 source inputs matched qualified manifest
 `84c57d313790585258e9b9226165e0d658914c6cc0f941c9436c4865fdb7ae2b`.
 Strict RCH receipts on that source: full-feature Chrome 56145 passed 41 tests;
 default Chrome 56150 passed 19; memory-options without diagnostics 56153 passed
@@ -60,9 +115,9 @@ found no material issue. UBS findings in the test file were test assertions/pani
 fixed SQL construction, and a false secret detection on the parser's `token` field;
 no suppression or weakened gate was added. Concurrent-writer defaults are unchanged.
 
-This is the nineteenth qualified dependency step. Asupersync 0.5.0 is newly
-available and is being tested separately; final updated-dependency and release
-qualification remain incomplete.
+This was the nineteenth qualified dependency step. The newer remote versions and
+their current integration status are recorded above; final updated-dependency and
+release qualification remain incomplete.
 
 ## September 12, 2026 — release dependency review in progress
 
