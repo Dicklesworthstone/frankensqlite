@@ -82,6 +82,75 @@ const T: &[&str] = &[
 ];
 
 #[test]
+fn gh418_sudoku_repeated_on_same_connection_keeps_materialized_roots_live() {
+    asupersync::test_utils::run_test(|| async {
+        let sql = r"
+WITH RECURSIVE
+  input(sud) AS (
+    VALUES('53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79')
+  ),
+  digits(z, lp) AS (
+    VALUES('1', 1)
+    UNION ALL SELECT
+    CAST(lp+1 AS TEXT), lp+1 FROM digits WHERE lp<9
+  ),
+  x(s, ind) AS (
+    SELECT sud, instr(sud, '.') FROM input
+    UNION ALL
+    SELECT
+      substr(s, 1, ind-1) || z || substr(s, ind+1),
+      instr( substr(s, 1, ind-1) || z || substr(s, ind+1), '.' )
+     FROM x, digits AS z
+    WHERE ind>0
+      AND NOT EXISTS (
+            SELECT 1
+              FROM digits AS lp
+             WHERE z.z = substr(s, ((ind-1)/9)*9 + lp, 1)
+                OR z.z = substr(s, ((ind-1)%9) + (lp-1)*9 + 1, 1)
+                OR z.z = substr(s, (((ind-1)/3) % 3) * 3
+                        + ((ind-1)/27) * 27 + lp
+                        + ((lp-1) / 3) * 6, 1)
+         )
+  )
+SELECT s FROM x WHERE ind=0;
+";
+        let expected =
+            "534678912672195348198342567859761423426853791713924856961537284287419635345286179";
+
+        // The CLI asks prepare() for column names before query(), discarding
+        // metadata-preparation errors. Cover that ordering and query() alone;
+        // the unrecognized `.timer on` never calls the connection.
+        for preview_columns in [false, true] {
+            let connection = Connection::open(":memory:").await.expect("open");
+            for iteration in 1..=2 {
+                if preview_columns {
+                    let _column_names = connection
+                        .prepare(sql)
+                        .await
+                        .ok()
+                        .map(|prepared| prepared.column_names().to_vec());
+                }
+                let rows = connection.query(sql).await.unwrap_or_else(|error| {
+                    panic!(
+                        "GH418 iteration {iteration}, preview_columns={preview_columns}: {error}"
+                    )
+                });
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "GH418 iteration {iteration}, preview_columns={preview_columns}"
+                );
+                assert_eq!(
+                    rows[0].values(),
+                    &[SqliteValue::Text(expected.into())],
+                    "GH418 iteration {iteration}, preview_columns={preview_columns}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn counters_and_accumulation() {
     asupersync::test_utils::run_test(|| async {
         agree(&[], "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT n FROM c ORDER BY n",
