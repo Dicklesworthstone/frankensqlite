@@ -151,6 +151,70 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-core/tests/bd_qgh42_freelist_reopen_repro.rs",
+      "test_name": "fresh_open_after_delete_grows_freelist_of_vacuumed_db_bd_qgh42",
+      "reason": "bd-qgh42 negative repro probe (heavy); plain VACUUM/DELETE reopens fine",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Historical negative-reproduction probe only; it does not reproduce the archive-reconstruct failure and cannot satisfy release acceptance for bd-qgh42.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+      "test_name": "beads_churn_command_helper",
+      "reason": "multi-process helper; spawned by the churn-across-processes driver",
+      "cfg_condition": null,
+      "kind": "subprocess_helper",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "beads_cache_rebuild_churn_across_processes_keeps_freelist_disjoint_from_trees"
+        },
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "beads_concurrent_processes_churn_with_passive_checkpoints_keeps_unique_page_ownership"
+        },
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "beads_concurrent_processes_churn_with_truncate_checkpoints_keeps_unique_page_ownership"
+        },
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "beads_concurrent_processes_churn_without_checkpoints_keeps_unique_page_ownership"
+        }
+      ],
+      "evidence": {
+        "requirement": "Exact designated parents must pass with source-bound receipts validating child completion and the freelist/page-ownership assertions; standalone helper execution is not acceptance evidence.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+      "test_name": "gh399_reset_gate_reader_helper",
+      "reason": "multi-process helper; spawned by the GH#399 reset-gate keeper",
+      "cfg_condition": "unix",
+      "kind": "subprocess_helper",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "gh294_readonly_peer_preserves_snapshot_across_writer_and_checkpoints"
+        },
+        {
+          "source_path": "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs",
+          "test_name": "gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends"
+        }
+      ],
+      "evidence": {
+        "requirement": "Exact designated Unix parents must pass with source-bound receipts validating child synchronization, snapshot preservation, and WAL-reset deferral; standalone helper execution is not acceptance evidence.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-core/tests/codegen_gap_probe.rs",
       "test_name": "codegen_gap_probe",
       "reason": "diagnostic triage harness; run with --ignored --nocapture",
@@ -223,6 +287,30 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-core/tests/gh409_read_after_commit_scaling.rs",
+      "test_name": "gh409_probe_access_path_for_unique_column_equality",
+      "reason": "GH#409 access-path probe; run with --ignored --nocapture",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run only for access-path investigation; this probe cannot satisfy release acceptance. Convert findings into asserted keepers and retain source-bound output before citing observations.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh409_read_after_commit_scaling.rs",
+      "test_name": "gh409_profile_the_first_read_after_a_commit",
+      "reason": "GH#409 diagnostic probe; run with --ignored --nocapture",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run only for first-read profiling; retain source, host, toolchain, workload, and output before citing observations. This probe cannot replace a release acceptance gate.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-e2e/src/perf_runner.rs",
       "test_name": "tests::focused_disjoint_c8_release_perf_triplet_emits_results",
       "reason": "manual remote perf evidence for the flagship c8 row",
@@ -267,6 +355,48 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "None; this is an exploratory A/B diagnostic and cannot satisfy release acceptance.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs",
+      "test_name": "kill9_helper_entrypoint",
+      "reason": "invoked via subprocess by the kill9 corpus tests",
+      "cfg_condition": null,
+      "kind": "subprocess_helper",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs",
+          "test_name": "kill9_after_many_commits_replays_full_wal"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs",
+          "test_name": "kill9_mid_uncommitted_discards_partial_batch"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs",
+          "test_name": "kill9_recovered_image_passes_first_open_repair"
+        },
+        {
+          "source_path": "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs",
+          "test_name": "kill9_recovery_is_deterministic_across_reopens"
+        }
+      ],
+      "evidence": {
+        "requirement": "Exact designated parents must pass with source-bound evidence of the intended crash boundary and termination plus recovery assertions. An arbitrary unsuccessful child exit or early panic does not prove the crash scenario (bd-7rg1a.7); standalone helper execution is not acceptance evidence.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/aggregate_window_tvf_divergence_probe.rs",
+      "test_name": "aggregate_window_tvf_divergence_probe",
+      "reason": "wider divergence probe (not a keeper): aggregate/window/TVF frank-vs-sqlite3 mismatches",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
         "receipt": null
       }
     },
@@ -893,6 +1023,54 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-e2e/tests/cross_engine_ondisk_format_probe.rs",
+      "test_name": "cross_engine_ondisk_format_probe",
+      "reason": "cross-engine on-disk format probe (not a keeper): frank-written files must be stock-readable",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/cross_engine_ondisk_format_probe.rs",
+      "test_name": "cross_engine_uncheckpointed_wal_probe",
+      "reason": "uncheckpointed WAL-sidecar probe (not a keeper): stock must replay frank's -wal",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/executor_dml_cte_divergence_probe.rs",
+      "test_name": "executor_dml_cte_divergence_probe",
+      "reason": "executor/DML/CTE divergence probe (not a keeper): frank-vs-sqlite3 mismatches",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/gh335_checkpoint_truncate_reader_retry.rs",
+      "test_name": "gh335_checkpoint_truncate_never_fails_fresh_reader_first_select",
+      "reason": "joint #335+bd-b4u1r guard: #335 read-retry verified to kill SELECT-phase BusySnapshot/Busy (3->0); full green needs the bd-b4u1r fresh-open-during-TRUNCATE interlock to remove the open-phase wedge",
+      "cfg_condition": null,
+      "kind": "known_bug",
+      "policy": "block_release",
+      "evidence": {
+        "requirement": "Qualify this unchanged exact joint keeper at the release source with no fresh-open/first-SELECT failure or timeout wedge before removing its ignore. Retain the command, source identity, platform, toolchain, and terminal result; a different reader test's passing run is not evidence for this keeper.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-e2e/tests/index_range_eqp_diagnostic.rs",
       "test_name": "diagnostic_composite_desc_order_by",
       "reason": "diagnostic/A-B bench; run explicitly under --profile release-perf",
@@ -989,6 +1167,18 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-e2e/tests/scalar_func_divergence_probe.rs",
+      "test_name": "scalar_func_divergence_probe",
+      "reason": "divergence probe (not a keeper): prints frank-vs-sqlite3 scalar mismatches",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-e2e/tests/swarm_writer_harness.rs",
       "test_name": "swarm_writer_harness",
       "reason": "long-running multi-process harness; run with --ignored",
@@ -997,6 +1187,18 @@
       "policy": "run_for_release",
       "evidence": {
         "requirement": "Exact opt-in multi-process harness exits 0 before its deadline; immutable receipt records release commit, platform, toolchain, workload, process count, and per-criterion results.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-e2e/tests/trigger_ddl_pragma_divergence_probe.rs",
+      "test_name": "trigger_ddl_pragma_divergence_probe",
+      "reason": "trigger/DDL/PRAGMA/txn divergence probe (not a keeper): frank-vs-sqlite3 mismatches",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Exploratory mismatch reporting only; the probe does not assert zero divergence and cannot satisfy release acceptance. Convert findings into asserted keepers.",
         "receipt": null
       }
     },
@@ -1189,6 +1391,18 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run this exact ignored benchmark under --profile release-perf --nocapture and retain output with commit, toolchain, host, and RUSTFLAGS before citing a numeric result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-harness/tests/bd_2yqp6_4_1_runtime_stub_inventory.rs",
+      "test_name": "regenerate_inventory_toml",
+      "reason": "operator-run regenerator; prints the canonical inventory TOML",
+      "cfg_condition": null,
+      "kind": "artifact_generation",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Operator-run inventory generation only; review any proposed output against source fingerprints and preserve existing identities and closure history. Generation is not release acceptance evidence.",
         "receipt": null
       }
     },
@@ -1398,6 +1612,18 @@
     },
     {
       "source_path": "crates/fsqlite-pager/src/page_cache.rs",
+      "test_name": "tests::gh402_measure_cache_metrics_reconstruction",
+      "reason": "GH402 cache statistics measurement; run explicitly with --nocapture",
+      "cfg_condition": "test",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact measurement and retain source-bound output with commit, executable identity, toolchain, host, profile, RUSTFLAGS, and workload parameters before any numeric claim. This measurement does not replace the canonical release performance gate.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-pager/src/page_cache.rs",
       "test_name": "tests::page_cache_hot_cold_eviction_microbench_report",
       "reason": "benchmark evidence only",
       "cfg_condition": "test",
@@ -1453,6 +1679,24 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run this exact ignored benchmark under --profile release-perf --nocapture and retain output with commit, toolchain, host, and RUSTFLAGS before citing a numeric result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-pager/src/pager.rs",
+      "test_name": "tests::stock_multisection_hot_journal_crash_child",
+      "reason": "subprocess helper for stock_multisection_hot_journal_recovers",
+      "cfg_condition": "all(feature=\"native\",test,unix)",
+      "kind": "subprocess_helper",
+      "policy": "covered_by_parent",
+      "parent_tests": [
+        {
+          "source_path": "crates/fsqlite-pager/src/pager.rs",
+          "test_name": "tests::stock_multisection_hot_journal_recovers"
+        }
+      ],
+      "evidence": {
+        "requirement": "The exact native Unix parent must pass with source-bound evidence of the intended crash boundary, child termination, and hot-journal recovery assertions. An arbitrary unsuccessful child exit or early panic does not prove the crash scenario; standalone helper execution is not acceptance evidence.",
         "receipt": null
       }
     },
@@ -1567,6 +1811,18 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run scripts/verify_bd_db300_3_4_3_wal_frame_scratch_benchmark.sh and retain its validated JSON report with commit, toolchain, host, and RUSTFLAGS provenance before citing the result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite/benches/minmax_prefix_contract_bench.rs",
+      "test_name": "minmax_prefix_contract",
+      "reason": "contract profiler; run the custom release-perf bench target",
+      "cfg_condition": "test",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the custom release-perf target and retain its executable and source identities, paired A/A controls, benchmark output, commit, toolchain, host, and RUSTFLAGS before citing the contract profile.",
         "receipt": null
       }
     },
@@ -1709,6 +1965,30 @@
       }
     },
     {
+      "source_path": "crates/fsqlite/tests/gh402_autocommit_schema_scaling.rs",
+      "test_name": "gh402_measure_autocommit_schema_scaling",
+      "reason": "GH#402 measurement harness; prints timings and counter deltas",
+      "cfg_condition": null,
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact measurement and retain source-bound output with commit, executable identity, toolchain, host, profile, RUSTFLAGS, and workload parameters before any numeric claim. This measurement does not replace the canonical release performance gate.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite/tests/gh402_autocommit_schema_scaling.rs",
+      "test_name": "gh402_measure_residual_schema_matrix",
+      "reason": "GH#402 residual measurement matrix; run explicitly with --nocapture",
+      "cfg_condition": null,
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run the exact measurement and retain source-bound output with commit, executable identity, toolchain, host, profile, RUSTFLAGS, and workload parameters before any numeric claim. This measurement does not replace the canonical release performance gate.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite/tests/minmax_composite_leading_profile.rs",
       "test_name": "minmax_composite_leading_seek_or_scan",
       "reason": "profile; run under --profile release-perf",
@@ -1769,18 +2049,6 @@
       }
     },
     {
-      "source_path": "crates/fsqlite/tests/minmax_prefix_profile.rs",
-      "test_name": "minmax_prefix_contract",
-      "reason": "contract profiler; run the custom release-perf bench target",
-      "cfg_condition": "test",
-      "kind": "performance",
-      "policy": "exempt",
-      "evidence": {
-        "requirement": "Run the custom release-perf target and retain its executable and source identities, paired A/A controls, benchmark output, commit, toolchain, host, and RUSTFLAGS before citing the contract profile.",
-        "receipt": null
-      }
-    },
-    {
       "source_path": "crates/fsqlite/tests/minmax_range_profile.rs",
       "test_name": "minmax_range_seek_or_scan",
       "reason": "profile; run under --profile release-perf",
@@ -1801,6 +2069,18 @@
       "policy": "exempt",
       "evidence": {
         "requirement": "Run this exact ignored benchmark under --profile release-perf --nocapture and retain output with commit, toolchain, host, and RUSTFLAGS before citing a numeric result.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite/tests/p8byg_temp_shadow_repro.rs",
+      "test_name": "p8byg_pinpoint_failing_statement",
+      "reason": "bd-p8byg diagnostic (not a keeper): pinpoints that unqualified INSERT INTO t (TEMP-shadowed temp.t with non-leading temp_id INTEGER PRIMARY KEY + decoy rowid/_rowid_/oid columns) mis-resolves the rowid alias -> PK collision. Qualified temp.t DML works. Fix is TEMP-shadow name resolution (connection.rs, GH#144/bd-yuj70 family).",
+      "cfg_condition": null,
+      "kind": "diagnostic",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Historical first-failing-statement diagnostic only; it lacks expected-content and stock-oracle assertions and cannot satisfy release acceptance. Use the asserted GH#144 conformance keeper for correctness evidence.",
         "receipt": null
       }
     },
