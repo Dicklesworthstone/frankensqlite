@@ -60,6 +60,31 @@ const CANONICAL_WORKSPACE_TEST_ARGV: &[&str] = &[
 // preserving the same number of parent edges.
 const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
     (
+        "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::beads_churn_command_helper",
+        &[
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::beads_cache_rebuild_churn_across_processes_keeps_freelist_disjoint_from_trees",
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::beads_concurrent_processes_churn_with_passive_checkpoints_keeps_unique_page_ownership",
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::beads_concurrent_processes_churn_with_truncate_checkpoints_keeps_unique_page_ownership",
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::beads_concurrent_processes_churn_without_checkpoints_keeps_unique_page_ownership",
+        ],
+    ),
+    (
+        "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::gh399_reset_gate_reader_helper",
+        &[
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::gh294_readonly_peer_preserves_snapshot_across_writer_and_checkpoints",
+            "crates/fsqlite-core/tests/bulk_import_upsert_text_pk_phantom_pk.rs::gh399_truncate_checkpoint_defers_wal_reset_until_peer_reader_ends",
+        ],
+    ),
+    (
+        "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs::kill9_helper_entrypoint",
+        &[
+            "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs::kill9_after_many_commits_replays_full_wal",
+            "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs::kill9_mid_uncommitted_discards_partial_batch",
+            "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs::kill9_recovered_image_passes_first_open_repair",
+            "crates/fsqlite-e2e/tests/adversarial_kill9_fsync.rs::kill9_recovery_is_deterministic_across_reopens",
+        ],
+    ),
+    (
         "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs::bd_3wop3_1_2_parallel_wal_staging_child_entrypoint",
         &[
             "crates/fsqlite-e2e/tests/bd_3wop3_1_2_parallel_wal_staging.rs::bd_3wop3_1_2_parallel_wal_staging_control_modes_emit_lane_logs_and_preserve_rows",
@@ -109,6 +134,12 @@ const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
         "crates/fsqlite-e2e/tests/recovery_data_loss.rs::yfdb6_producer_helper",
         &[
             "crates/fsqlite-e2e/tests/recovery_data_loss.rs::two_process_sigkill_recovery_loses_no_committed_writes",
+        ],
+    ),
+    (
+        "crates/fsqlite-pager/src/pager.rs::tests::stock_multisection_hot_journal_crash_child",
+        &[
+            "crates/fsqlite-pager/src/pager.rs::tests::stock_multisection_hot_journal_recovers",
         ],
     ),
     (
