@@ -29868,14 +29868,24 @@ mod tests {
             _backfilled_frames: u32, _oldest_reader_frame: Option<u32>,
         ) -> WalFuture<'a, crate::traits::CheckpointResult> {
             Box::pin(async move {
-                let calls = self.empty_checkpoint_calls.as_ref().ok_or(FrankenError::Unsupported)?;
-                assert!(self.binding.is_none(), "preflight must retire its reader before checkpoint");
+                let calls = self
+                    .empty_checkpoint_calls
+                    .as_ref()
+                    .ok_or(FrankenError::Unsupported)?;
+                assert!(
+                    self.binding.is_none(),
+                    "preflight must retire its reader before checkpoint"
+                );
                 calls.fetch_add(1, AtomicOrdering::AcqRel);
                 // Opt-in ownership probe only: no physical WAL frames exist,
                 // so this reports no backfill or generation reset.
                 Ok(crate::traits::CheckpointResult {
-                    total_frames: 0, frames_backfilled: 0, completed: true,
-                    wal_was_reset: false, requested_mode: mode, effective_mode: mode,
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
                 })
             })
         }
@@ -30114,16 +30124,19 @@ mod tests {
     #[test]
     fn native_checkpoint_preflight_error_and_drop_release_ownership_before_retry() {
         asupersync::test_utils::run_test(|| async {
-            use fsqlite_wal::wal_index::{WalIndexHdr, WAL_INDEX_VERSION, read_shared_wal_index_header};
+            use fsqlite_wal::wal_index::{
+                WAL_INDEX_VERSION, WalIndexHdr, read_shared_wal_index_header,
+            };
 
             for phase in ["recovery_error", "recovery_drop", "binding_drop"] {
                 let cx = Cx::new();
                 let attempt_cx = Cx::new();
                 let directory = tempfile::tempdir().unwrap().keep();
                 let path = directory.join("checkpoint-preflight.db");
-                let pager = SimplePager::open_with_cx(
-                    &cx, UnixVfs::new(), &path, PageSize::DEFAULT,
-                ).await.unwrap();
+                let pager =
+                    SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, PageSize::DEFAULT)
+                        .await
+                        .unwrap();
                 let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
                 let page = seed.allocate_page(&cx).await.unwrap();
                 let payload = vec![0x6D; PageSize::DEFAULT.as_usize()];
@@ -30138,44 +30151,69 @@ mod tests {
                 let retirements = Arc::new(AtomicUsize::new(0));
                 let checkpoint_calls = Arc::new(AtomicUsize::new(0));
                 let mut header = WalIndexHdr {
-                    i_version: WAL_INDEX_VERSION, unused: 0, i_change: 0, is_init: 1,
-                    big_end_cksum: 0, sz_page: 4096, mx_frame: 0, n_page: page.get(),
-                    a_frame_cksum: [0, 0], a_salt: [0, 0], a_cksum: [0, 0],
+                    i_version: WAL_INDEX_VERSION,
+                    unused: 0,
+                    i_change: 0,
+                    is_init: 1,
+                    big_end_cksum: 0,
+                    sz_page: 4096,
+                    mx_frame: 0,
+                    n_page: page.get(),
+                    a_frame_cksum: [0, 0],
+                    a_salt: [0, 0],
+                    a_cksum: [0, 0],
                 };
                 header.update_checksum().unwrap();
-                pager.set_wal_backend(Box::new(NativeBindingProbeWalBackend {
-                    binding: None,
-                    pause_binding: Arc::clone(&pause_binding),
-                    binding_entered: Arc::clone(&binding_entered),
-                    fail_page_read: Arc::new(AtomicBool::new(false)),
-                    fail_retirement: Arc::new(AtomicBool::new(false)),
-                    retirements: Arc::clone(&retirements),
-                    recovery: Some(NativeBootstrapRecoveryProbe {
-                        source: Arc::clone(&source), header,
-                        entered: Arc::clone(&recovery_entered),
-                        pause: Arc::clone(&pause_recovery),
-                        fail_once: phase == "recovery_error",
-                    }),
-                    empty_checkpoint_calls: Some(Arc::clone(&checkpoint_calls)),
-                })).unwrap();
+                pager
+                    .set_wal_backend(Box::new(NativeBindingProbeWalBackend {
+                        binding: None,
+                        pause_binding: Arc::clone(&pause_binding),
+                        binding_entered: Arc::clone(&binding_entered),
+                        fail_page_read: Arc::new(AtomicBool::new(false)),
+                        fail_retirement: Arc::new(AtomicBool::new(false)),
+                        retirements: Arc::clone(&retirements),
+                        recovery: Some(NativeBootstrapRecoveryProbe {
+                            source: Arc::clone(&source),
+                            header,
+                            entered: Arc::clone(&recovery_entered),
+                            pause: Arc::clone(&pause_recovery),
+                            fail_once: phase == "recovery_error",
+                        }),
+                        empty_checkpoint_calls: Some(Arc::clone(&checkpoint_calls)),
+                    }))
+                    .unwrap();
                 pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
                 let region = source.map_region(&cx, 0, true).await.unwrap();
-                assert_eq!(read_shared_wal_index_header(&region).unwrap(), None,
-                    "checkpoint must start without a valid native index");
+                assert_eq!(
+                    read_shared_wal_index_header(&region).unwrap(),
+                    None,
+                    "checkpoint must start without a valid native index"
+                );
                 let before = read_all_vfs_bytes(&UnixVfs::new(), &cx, &path).await;
-                let (mut peer, _) = UnixVfs::new().open(
-                    &cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
-                ).unwrap();
+                let (mut peer, _) = UnixVfs::new()
+                    .open(
+                        &cx,
+                        Some(&path),
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                    )
+                    .unwrap();
 
-                let mut checkpoint = Box::pin(pager.checkpoint(&attempt_cx, traits::CheckpointMode::Passive));
+                let mut checkpoint =
+                    Box::pin(pager.checkpoint(&attempt_cx, traits::CheckpointMode::Passive));
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let result = std::future::poll_fn(|task_cx| {
-                    assert!(Instant::now() < deadline, "{phase}: preflight must reach its fault boundary");
+                    assert!(
+                        Instant::now() < deadline,
+                        "{phase}: preflight must reach its fault boundary"
+                    );
                     match checkpoint.as_mut().poll(task_cx) {
                         std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
-                        std::task::Poll::Pending if (phase == "recovery_drop"
-                            && recovery_entered.load(AtomicOrdering::Acquire))
-                            || (phase == "binding_drop" && binding_entered.load(AtomicOrdering::Acquire)) => {
+                        std::task::Poll::Pending
+                            if (phase == "recovery_drop"
+                                && recovery_entered.load(AtomicOrdering::Acquire))
+                                || (phase == "binding_drop"
+                                    && binding_entered.load(AtomicOrdering::Acquire)) =>
+                        {
                             std::task::Poll::Ready(None)
                         }
                         std::task::Poll::Pending => {
@@ -30183,40 +30221,68 @@ mod tests {
                             std::task::Poll::Pending
                         }
                     }
-                }).await;
-                assert!(recovery_entered.load(AtomicOrdering::Acquire),
-                    "the fault must be inside the new checkpoint reader preflight");
-                assert_eq!(checkpoint_calls.load(AtomicOrdering::Acquire), 0,
-                    "a failed or suspended reader must not enter checkpoint maintenance");
+                })
+                .await;
+                assert!(
+                    recovery_entered.load(AtomicOrdering::Acquire),
+                    "the fault must be inside the new checkpoint reader preflight"
+                );
+                assert_eq!(
+                    checkpoint_calls.load(AtomicOrdering::Acquire),
+                    0,
+                    "a failed or suspended reader must not enter checkpoint maintenance"
+                );
                 if phase == "recovery_error" {
                     assert!(matches!(result, Some(Err(FrankenError::Busy))));
                     drop(checkpoint);
                     assert_eq!(read_shared_wal_index_header(&region).unwrap(), None);
                 } else {
-                    assert!(result.is_none(), "the exact fault boundary must remain suspended");
-                    assert!(!peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap(),
-                        "preflight holds a real recovery or nonzero reader claim");
+                    assert!(
+                        result.is_none(),
+                        "the exact fault boundary must remain suspended"
+                    );
+                    assert!(
+                        !peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap(),
+                        "preflight holds a real recovery or nonzero reader claim"
+                    );
                     let held_file = shared_db_file_read(&source.db_file, &cx).await.unwrap();
                     attempt_cx.cancel();
                     assert!(attempt_cx.checkpoint().is_err());
                     drop(checkpoint);
-                    assert!(pager.group_commit_queue.has_process_root_finalization_attempt(),
-                        "caller drop must retain exact physical cleanup when its handle is contended");
+                    assert!(
+                        pager
+                            .group_commit_queue
+                            .has_process_root_finalization_attempt(),
+                        "caller drop must retain exact physical cleanup when its handle is contended"
+                    );
                     {
                         let state = pager.maintenance_gate.state.lock().unwrap();
                         assert_eq!(state.active_openers, 0);
-                        assert_eq!(state.active_transactions, usize::from(phase == "binding_drop"));
+                        assert_eq!(
+                            state.active_transactions,
+                            usize::from(phase == "binding_drop")
+                        );
                         assert_eq!(state.maintenance_active, phase == "recovery_drop");
                     }
-                    assert!(matches!(pager.maintenance_gate.enter_exclusive_maintenance(), Err(FrankenError::Busy)),
-                        "checkpoint admission cannot overtake deferred preflight cleanup");
+                    assert!(
+                        matches!(
+                            pager.maintenance_gate.enter_exclusive_maintenance(),
+                            Err(FrankenError::Busy)
+                        ),
+                        "checkpoint admission cannot overtake deferred preflight cleanup"
+                    );
                     assert!(!peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
                     drop(held_file);
                 }
-                let mut cleanup = Box::pin(settle_pending_group_commit_finalization(&pager.group_commit_queue));
+                let mut cleanup = Box::pin(settle_pending_group_commit_finalization(
+                    &pager.group_commit_queue,
+                ));
                 let deadline = Instant::now() + Duration::from_secs(5);
                 std::future::poll_fn(|task_cx| {
-                    assert!(Instant::now() < deadline, "{phase}: exact preflight cleanup must finish");
+                    assert!(
+                        Instant::now() < deadline,
+                        "{phase}: exact preflight cleanup must finish"
+                    );
                     match cleanup.as_mut().poll(task_cx) {
                         std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
                         std::task::Poll::Pending => {
@@ -30224,9 +30290,15 @@ mod tests {
                             std::task::Poll::Pending
                         }
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 drop(cleanup);
-                assert!(!pager.group_commit_queue.has_process_root_finalization_attempt());
+                assert!(
+                    !pager
+                        .group_commit_queue
+                        .has_process_root_finalization_attempt()
+                );
                 {
                     let state = pager.maintenance_gate.state.lock().unwrap();
                     assert_eq!((state.active_openers, state.active_transactions), (0, 0));
@@ -30238,20 +30310,30 @@ mod tests {
                     assert!(!inner.writer_active && !inner.checkpoint_active);
                     assert!(inner.wal_reader.is_none());
                 }
-                assert_eq!(retirements.load(AtomicOrdering::Acquire), usize::from(phase == "binding_drop"));
+                assert_eq!(
+                    retirements.load(AtomicOrdering::Acquire),
+                    usize::from(phase == "binding_drop")
+                );
                 assert!(peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
                 peer.wal_checkpoint_reset_gate_release(&cx).unwrap();
-                peer.lock(&cx, LockLevel::Exclusive).expect("preflight main-file fence released");
+                peer.lock(&cx, LockLevel::Exclusive)
+                    .expect("preflight main-file fence released");
                 peer.unlock(&cx, LockLevel::None).unwrap();
-                assert_eq!(read_all_vfs_bytes(&UnixVfs::new(), &cx, &path).await, before,
-                    "preflight cancellation or error must preserve the committed main image");
+                assert_eq!(
+                    read_all_vfs_bytes(&UnixVfs::new(), &cx, &path).await,
+                    before,
+                    "preflight cancellation or error must preserve the committed main image"
+                );
 
                 pause_recovery.store(false, AtomicOrdering::Release);
                 pause_binding.store(false, AtomicOrdering::Release);
                 let mut retry = Box::pin(pager.checkpoint(&cx, traits::CheckpointMode::Passive));
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let result = std::future::poll_fn(|task_cx| {
-                    assert!(Instant::now() < deadline, "{phase}: checkpoint retry must finish");
+                    assert!(
+                        Instant::now() < deadline,
+                        "{phase}: checkpoint retry must finish"
+                    );
                     match retry.as_mut().poll(task_cx) {
                         std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
                         std::task::Poll::Pending => {
@@ -30259,22 +30341,38 @@ mod tests {
                             std::task::Poll::Pending
                         }
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 drop(retry);
                 assert!(result.completed);
                 assert_eq!((result.total_frames, result.frames_backfilled), (0, 0));
                 assert!(!result.wal_was_reset);
                 assert_eq!(checkpoint_calls.load(AtomicOrdering::Acquire), 1);
                 assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(header));
-                assert_eq!(retirements.load(AtomicOrdering::Acquire), 1,
-                    "exactly one successful or dropped reader binding must be retired");
-                assert_eq!(read_all_vfs_bytes(&UnixVfs::new(), &cx, &path).await, before);
+                assert_eq!(
+                    retirements.load(AtomicOrdering::Acquire),
+                    1,
+                    "exactly one successful or dropped reader binding must be retired"
+                );
+                assert_eq!(
+                    read_all_vfs_bytes(&UnixVfs::new(), &cx, &path).await,
+                    before
+                );
                 let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
-                assert_eq!(reader.get_page(&cx, page).await.unwrap().as_ref(), payload.as_slice());
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_ref(),
+                    payload.as_slice()
+                );
                 reader.rollback(&cx).await.unwrap();
+                assert_eq!(retirements.load(AtomicOrdering::Acquire), 2);
                 assert!(peer.wal_checkpoint_reset_gate_acquire(&cx).unwrap());
                 peer.wal_checkpoint_reset_gate_release(&cx).unwrap();
-                assert!(!pager.group_commit_queue.has_process_root_finalization_attempt());
+                assert!(
+                    !pager
+                        .group_commit_queue
+                        .has_process_root_finalization_attempt()
+                );
                 let state = pager.maintenance_gate.state.lock().unwrap();
                 assert_eq!((state.active_openers, state.active_transactions), (0, 0));
                 assert!(!state.maintenance_active);
