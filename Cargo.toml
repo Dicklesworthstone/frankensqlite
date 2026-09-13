@@ -161,7 +161,7 @@ fsqlite-c-api = { version = "0.3.18", path = "crates/fsqlite-c-api" }
 fsqlite-wasm = { version = "0.3.18", path = "crates/fsqlite-wasm" }
 
 # External dependencies
-ftui = { version = "0.5.0", default-features = false }
+ftui = { version = "0.7.0", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 # No `preserve_order` here (fsqlite#356): the workspace-wide feature leaked

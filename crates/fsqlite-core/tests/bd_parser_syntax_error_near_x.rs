@@ -7,6 +7,41 @@
 // (e.g. `expected column name after '.'`, trigger-body restrictions) are deferred to
 // later slices and intentionally not asserted here.
 use fsqlite_core::connection::Connection;
+use fsqlite_error::FrankenError;
+
+#[test]
+fn parser_unexpected_tokens_preserve_recoverable_metadata() {
+    asupersync::test_utils::run_test(|| async {
+        let c = Connection::open(":memory:").await.unwrap();
+        let execute_error = c
+            .execute("NOT VALID SQL {{{{")
+            .await
+            .expect_err("malformed statement must be rejected");
+        let query_error = c
+            .query("SELECT FROM t")
+            .await
+            .expect_err("malformed query must be rejected");
+
+        for (error, expected_token) in [(execute_error, "NOT"), (query_error, "FROM")] {
+            assert!(matches!(
+                &error,
+                FrankenError::SyntaxError { token } if token == expected_token
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("near \"{expected_token}\": syntax error")
+            );
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(error.extended_error_code(), 1);
+            assert!(!error.is_transient());
+            assert!(error.is_user_recoverable());
+        }
+
+        let rows = c.query("SELECT 1").await.expect("corrected SQL must succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[fsqlite_types::SqliteValue::Integer(1)]);
+    });
+}
 
 async fn err_of(sql: &str) -> String {
     let c = Connection::open(":memory:").await.unwrap();

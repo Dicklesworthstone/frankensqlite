@@ -60,7 +60,7 @@ criterion = { workspace = true }
 # Gunzip for the checksum-pinned bd-105ga corruption-regression corpus
 # (fixtures/bd105ga/); only tests/bd_105ga_replay_regression.rs uses it.
 flate2 = "1.1"
-jsonschema = { version = "0.48.5", default-features = false }
+jsonschema = { version = "0.56.0", default-features = false, features = ["idna"] }
 fsqlite-ext-session = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-observability = { workspace = true }

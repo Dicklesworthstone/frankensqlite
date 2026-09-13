@@ -13,6 +13,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,6 +23,7 @@ use tempfile::tempdir;
 
 const HELPER_MODE_ENV: &str = "FSQLITE_KILL9_HELPER_MODE";
 const HELPER_DB_PATH_ENV: &str = "FSQLITE_KILL9_HELPER_DB_PATH";
+const HELPER_PROGRESS_PATH_ENV: &str = "FSQLITE_KILL9_HELPER_PROGRESS_PATH";
 const HELPER_TEST_NAME: &str = "kill9_helper_entrypoint";
 const MIGRATION_MARKER_SUFFIX: &str = ".fsqlite-migration-state";
 
@@ -90,19 +92,72 @@ async fn assert_recovered_matches(db: &Path, expected: &[i64], label: &str) {
 }
 
 fn spawn_kill9_helper(mode: &str, db: &Path) {
-    let status = Command::new(env::current_exe().expect("current_exe"))
+    verify_kill9_helper(mode, db).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn verify_kill9_helper(mode: &str, db: &Path) -> Result<(), String> {
+    // Each invocation gets a fresh marker location, so a previous child cannot
+    // supply evidence for one that failed before reaching its crash boundary.
+    let progress_dir = tempdir().expect("progress tempdir");
+    let progress_path = progress_dir.path().join("abort-ready");
+    // Keep nested libtest summaries out of the parent transcript: an expected
+    // child failure must not look like a failed Cargo target or erase the
+    // release parser's attribution of earlier parent-test successes.
+    let output = Command::new(env::current_exe().expect("current_exe"))
         .arg("--exact")
         .arg(HELPER_TEST_NAME)
         .arg("--ignored")
         .arg("--nocapture")
         .env(HELPER_MODE_ENV, mode)
         .env(HELPER_DB_PATH_ENV, db.as_os_str())
-        .status()
+        .env(HELPER_PROGRESS_PATH_ENV, &progress_path)
+        .output()
         .expect("spawn kill9 helper");
-    assert!(
-        !status.success(),
-        "the helper must die via abort() (mode={mode}), not exit cleanly"
-    );
+    let status = output.status;
+    let progress = std::fs::read(&progress_path).map_err(|error| {
+        format!(
+            "helper did not reach abort boundary (mode={mode}, status={status}): \
+             {error}; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })?;
+    if progress != mode.as_bytes() {
+        return Err(format!("helper abort-boundary marker mismatch (mode={mode})"));
+    }
+    if status.success() {
+        return Err(format!("helper returned after abort boundary (mode={mode})"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if status.signal().is_none() {
+            return Err(format!(
+                "helper exited without a signal (mode={mode}): {status}"
+            ));
+        }
+        // Linux and macOS define SIGABRT as 6. On other Unix platforms the
+        // marker plus signal termination is checked without guessing an ABI.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if status.signal() != Some(6) {
+            return Err(format!(
+                "helper did not receive SIGABRT (mode={mode}): {status}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn kill9_parent_rejects_early_child_failure() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("early-failure.db");
+    for mode in ["early_panic", "early_return"] {
+        let error = verify_kill9_helper(mode, &db)
+            .expect_err("a child that never reaches the abort boundary must be rejected");
+        assert!(error.contains("did not reach abort boundary"), "{error}");
+    }
 }
 
 async fn insert_range(conn: &Connection, start: i64, end_exclusive: i64) {
@@ -211,6 +266,22 @@ fn kill9_recovered_image_passes_first_open_repair() {
 
 // ── crash helper subprocess ────────────────────────────────────────────────
 
+fn record_progress_and_abort(mode: &str) -> ! {
+    let path = env::var_os(HELPER_PROGRESS_PATH_ENV).expect("helper progress path");
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create abort-boundary marker");
+    marker
+        .write_all(mode.as_bytes())
+        .expect("write abort-boundary marker");
+    // This is a process abort, not a power cut: the parent can read the
+    // completed write through the kernel. Do not add an fsync barrier that
+    // could perturb the database durability window under test.
+    std::process::abort();
+}
+
 fn helper_many_commits(db: &Path) -> ! {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(db.to_string_lossy().as_ref())
@@ -224,7 +295,7 @@ fn helper_many_commits(db: &Path) -> ! {
             insert_range(&conn, batch * 20, batch * 20 + 20).await;
             conn.execute("COMMIT;").await.expect("commit");
         }
-        std::process::abort();
+        record_progress_and_abort("many_commits");
     });
     unreachable!("helper aborts inside the runtime");
 }
@@ -237,7 +308,7 @@ fn helper_uncommitted(db: &Path) -> ! {
         setup_table(&conn).await;
         conn.execute("BEGIN;").await.expect("begin uncommitted");
         insert_range(&conn, 50, 100).await;
-        std::process::abort();
+        record_progress_and_abort("uncommitted");
     });
     unreachable!("helper aborts inside the runtime");
 }
@@ -255,6 +326,8 @@ fn kill9_helper_entrypoint() {
     match mode.to_string_lossy().as_ref() {
         "many_commits" => helper_many_commits(&db),
         "uncommitted" => helper_uncommitted(&db),
+        "early_panic" => panic!("intentional failure before database work or abort marker"),
+        "early_return" => (),
         other => panic!("unknown kill9 helper mode: {other}"),
     }
 }

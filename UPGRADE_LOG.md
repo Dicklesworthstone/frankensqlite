@@ -1,5 +1,152 @@
 # Dependency Upgrade Log
 
+## September 12 — remote integration correction; final qualification pending
+
+A rejected push revealed that the local checkout was behind remote main by
+21 commits. Remote `a8b76fb81` already contains Asupersync 0.5.0, engine 0.4.0,
+pager/core/facade 0.4.1, and read-only WAL/reserved-freelist fixes. The fsqlite
+0.4.0 and 0.4.1 crates were published September 12 at 13:52 and 17:28 UTC;
+GitHub's latest binary release remains v0.3.18. The earlier v0.3.19 release plan
+is therefore stale. Remote changes were read and merged without dropping either
+side's code or tests; the ordinary index and protected peer bytes are preserved.
+
+The merged tree adds our WASM/parser repair and individually qualified FTUI 0.7
+family, retaining remote Asupersync requirements and crate versions. Its 1,645-input
+source manifest is `e727b7e8c216c655834000498dfbaa908a01bd2915221e03fe5a6d4e412f40bb`.
+Merged-source RCH 56204 passed all six parser and eight read-only WAL regression
+tests, with none ignored or filtered. RCH 56205 passed workspace/all-targets/TUI
+checking. Both workers matched all 1,645 source hashes after completion. Formatting
+also passed. Warnings-denied Clippy 56215, the restricted native-context consumer
+56213 (one passed, 744 filtered), and real Chrome all-feature run 56206 (41 passed,
+none ignored/filtered) passed. All source hashes matched afterward; all seven
+browser-tool hashes also matched. Final TUI 56220 passed all seventeen tests
+(dashboard one, viewer sixteen), with none ignored/filtered and all source hashes
+matching afterward. Replacement default/memory browser variants passed as recorded below.
+Default-browser run 56219 reported nineteen passes, but its post-run source
+check found four files matching the older `a8b76fb81` instead of the frozen
+manifest: both root Cargo files and the two parser-repair files. That run is
+excluded from current-source acceptance. Clean-overlay recovery refused the
+repository's Git submodule. The replacement uses an isolated worktree at
+`dbca5d37c` with RCH's worker-verified source-content receipt; its first admission
+outside the configured project root refused, then the worktree was moved under
+the configured root. No local fallback or fleet repair was used.
+Replacement default 56234 passed all nineteen tests and memory-options without
+diagnostics 56242 passed all twenty-one, with none ignored or filtered. Both
+completed remotely on hz3; their source-content receipts matched all 1,645 inputs
+and their terminal tool checks matched all seven browser-tool hashes. Receipt
+roots are `19f831a53cf2a1a4519885e4e901577e6c17b74b0201115b766c014f803775ad`
+and `07e7dd40b17d21c5b49f37c5c42e46b1396120cdd16ac31a707da59c4929a641`.
+The first TUI admission was refused for ovh-a disk pressure;
+no local fallback or host cleanup occurred, and the retry uses ovh-b. Earlier
+source-bound receipts below do not certify a new release. Job IDs use prefix
+`300161974413`.
+
+While qualification ran, remote main advanced to `5ced8e118`, incorporating the
+same parser and dependency source. Its production files match the tested tree;
+the histories are reconciled with the current validation notes retained.
+
+Independent acceptance inspection retained closure of bd-7rg1a.3 after checking
+the original contract, exact source and actual test receipts. This was independent
+inspection, not an independent re-execution. Configured formatting excludes
+fsqlite-core, so it does not mechanically certify the two parser-repair files;
+the narrow diff was visually reviewed. No benchmark or whole-project acceptance
+is implied by this closure.
+
+Independent review against remote main found exactly eleven WASM and eleven FTUI
+package-version changes, no other changed lock records, and no forbidden runtime.
+The remote Asupersync 0.5.0 requirements and all engine package versions remain
+intact. FTUI keeps `default-features=false` and the existing opt-in TUI feature.
+Its separate pre-merge qualification on source `697f677d` passed seventeen binary
+tests (56159), workspace checking (56160), Clippy (56171), formatting (56168), and
+strict real-PTY navigation, resize and terminal-restoration checks (56173).
+The first PTY run had an insufficient resize assertion; the tightened rerun is
+the accepted receipt. These are UI checks, not database workload benchmarks.
+
+Separate pre-merge Asupersync 0.5 consumer results on source `bb29a034`:
+98 context tests (RCH 56195), 32 io_uring tests including actual kernel I/O (56198),
+1,568 MVCC tests with 15 ignored (56200), 35 commit-repair tests (56202), and
+41 real Chrome all-feature tests (56199) passed. All 1,645 source hashes matched
+after each run. The original commit-repair selector 56197 ran **zero tests**;
+it is excluded from proof and was replaced by the actual `commit_repair::` module
+selector. These results do not establish the broader historical performance gate.
+All job numbers in this paragraph have prefix `300161974413`.
+
+### JSONschema 0.56 — focused qualification complete
+
+The current 0.48.5 schema-consumer baseline 56227 passed both compiled
+`matches_json_schema` tests (699 filtered), with all six fixture files present
+and all 1,645 post-run source hashes matching. Isolated resolver 56229 selected
+exactly the four JSONschema-family packages at 0.56.0, Fraction 0.17.0 and
+fancy-regex 0.19.1; other package records are unchanged and no forbidden runtime
+appears. The new IDNA feature must be explicitly enabled to retain old behavior;
+HTTP and async resolution remain disabled. `serde_json/float_roundtrip` was
+already enabled by 0.48.5. Review of fancy-regex 0.19.1 covered its optional
+capture, Unicode matching, bounded seek expansion and delegated-engine cache
+changes. The six-package candidate is now applied to main, preserving current
+engine versions. The candidate's 1,649 source/fixture inputs have manifest hash
+`d3c940f2cd16e408873ff7c56a6896cbec6faeac7d81fc9ee3d7c022fd779856`.
+
+RCH 56238 passed nine actual tests across seven targets: fixture selection,
+comprehensive report, realdb report, manifest, and SSI/busy/crash matrices.
+The matrices exercised six, three and six scenario outcomes respectively.
+All six tracked fixtures were present. There were no failures or ignored tests;
+809 tests were filtered. The bridge selector in that TUI-only invocation was
+not compiled, so it contributes no test to that count. Separate bridge-experiment
+run 56248 passed its actual positive/negative schema test (one passed, fifty
+filtered). Both source-content receipts match all 1,649 expected inputs, with
+terminal remote exit zero and artifact retrieval complete. Receipt roots:
+`a4b0eba0eee7e07830c08693e944bf932a171e225db91cc3c3b25d526c096a44`
+and `27914ef5bc0a095e41f722a7197a710590b7f7176e6fd721ac9d22fd784d76fd`.
+An independent agent inspected the bridge log and receipt; it did not rerun it.
+
+Workspace/all-targets/TUI check 56249 and warnings-denied Clippy 56252 passed,
+each with all 1,649 inputs matched and terminal remote exit zero. Configured
+formatting 56251 passed as an RCH non-compilation job with matching post-worker
+hashes; the existing fsqlite-core exclusion remains. The first check attempt
+was refused for ovh-b disk pressure, and the first formatter invocation was
+rejected because source-content receipts and job mode cannot be combined.
+Neither refusal is validation. Tests and compiler checks establish this focused
+dependency update, not whole-project release readiness or performance parity.
+
+## September 12 — WASM family and recoverable parser diagnostics integrated
+
+Updated wasm-bindgen and its matching packages from 0.2.127 to 0.2.128.
+The eleven-package closure includes upstream's required minicov 0.3.8 pin
+([profiling-runtime incompatibility](https://github.com/wasm-bindgen/wasm-bindgen/pull/5283));
+unstable coverage generation was not exercised. Manifest feature policy is unchanged.
+
+The old-lock browser run exposed bd-7rg1a.3: unexpected SQL tokens were
+reported as nonrecoverable function errors. The connection now returns the
+existing `SyntaxError` variant, preserving stock text, primary/extended code 1
+and nontransient status. The added native test checks both execute and query,
+then executes corrected SQL on the same connection. Existing assertions remain intact.
+
+Before the remote merge, main's 1,645 source inputs matched qualified manifest
+`84c57d313790585258e9b9226165e0d658914c6cc0f941c9436c4865fdb7ae2b`.
+Strict RCH receipts on that source: full-feature Chrome 56145 passed 41 tests;
+default Chrome 56150 passed 19; memory-options without diagnostics 56153 passed
+21; native parser 56148 passed six. All had zero ignored tests. Workspace/all-targets/TUI
+check 56147, warnings-denied Clippy 56149 and formatting 56146 passed, with
+all source hashes checked afterward. Job numbers in this section have prefix
+`300161974413`. Browser tooling was matching bindgen 128 plus Chrome/chromedriver
+153.0.8010.36; its hashes are retained in
+`/tmp/frankensqlite-wasm-browser-gpu-disabled-toolchain-20260912.sha256`.
+
+The old full browser run 56141 remains a failure: 32 passed and nine failed
+(the metadata assertion followed by poisoned-lock failures). An isolated old
+generated-JS control passed six selected cases; it does not replace that failure.
+Before integrating the dependency closure, the syntax-only main source also passed
+all six native tests (56190), formatting (56196), and workspace/all-targets/TUI
+check (56191). Its distinct source manifest is `8cff11f1`; those checks do not
+stand in for the final dependency-source receipts above. Independent source review
+found no material issue. UBS findings in the test file were test assertions/panics,
+fixed SQL construction, and a false secret detection on the parser's `token` field;
+no suppression or weakened gate was added. Concurrent-writer defaults are unchanged.
+
+This was the nineteenth qualified dependency step. The newer remote versions and
+their current integration status are recorded above; final updated-dependency and
+release qualification remain incomplete.
+
 ## September 12, 2026 — release dependency review in progress
 
 The owner requested latest stable dependency updates before the next DSR,

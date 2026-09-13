@@ -93,22 +93,40 @@ async fn assert_header_corruption_rejected(name: &str, offset: usize, value: u8)
     );
 }
 
-macro_rules! header_scenario {
-    ($fn_name:ident, $label:literal, $off:expr, $val:expr) => {
-        #[test]
-        fn $fn_name() {
-            asupersync::test_utils::run_test(|| async {
-                assert_header_corruption_rejected($label, $off, $val).await;
-            });
-        }
-    };
-}
-
 // The magic string "SQLite format 3\0" occupies offsets 0..16; any byte broken
 // makes the file not a database. The page-size is a 2-byte big-endian field at
 // offsets 16..18 constrained to a power of two in [512, 65536].
-header_scenario!(header_magic_byte_0, "magic0", 0, 0xFF);
-header_scenario!(header_magic_byte_8, "magic8", 8, 0x00);
-header_scenario!(header_magic_byte_15, "magic15", 15, 0x01);
-header_scenario!(header_page_size_high_invalid, "pagesize_hi", 16, 0xFF);
-header_scenario!(header_page_size_low_not_pow2, "pagesize_lo", 17, 0x01);
+#[test]
+fn header_magic_byte_0() {
+    asupersync::test_utils::run_test(|| async {
+        assert_header_corruption_rejected("magic0", 0, 0xFF).await;
+    });
+}
+
+#[test]
+fn header_magic_byte_8() {
+    asupersync::test_utils::run_test(|| async {
+        assert_header_corruption_rejected("magic8", 8, 0x00).await;
+    });
+}
+
+#[test]
+fn header_magic_byte_15() {
+    asupersync::test_utils::run_test(|| async {
+        assert_header_corruption_rejected("magic15", 15, 0x01).await;
+    });
+}
+
+#[test]
+fn header_page_size_high_invalid() {
+    asupersync::test_utils::run_test(|| async {
+        assert_header_corruption_rejected("pagesize_hi", 16, 0xFF).await;
+    });
+}
+
+#[test]
+fn header_page_size_low_not_pow2() {
+    asupersync::test_utils::run_test(|| async {
+        assert_header_corruption_rejected("pagesize_lo", 17, 0x01).await;
+    });
+}

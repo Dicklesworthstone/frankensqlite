@@ -202,22 +202,46 @@ async fn assert_bit_flip_caught(name: &str, offset_in_page2: usize, mask: u8) {
     );
 }
 
-macro_rules! bit_flip_scenario {
-    ($fn_name:ident, $label:literal, $off:expr, $mask:expr) => {
-        #[test]
-        fn $fn_name() {
-            asupersync::test_utils::run_test(|| async {
-                assert_bit_flip_caught($label, $off, $mask).await;
-            });
-        }
-    };
-}
-
 // Page 2 layout (offsets relative to the page start): byte 0 = b-tree page
 // type; bytes 3..5 = cell count; bytes 8.. = the 2-byte cell pointer array.
-bit_flip_scenario!(bit_flip_page2_btree_page_type, "pg2_type", 0, 0x08);
-bit_flip_scenario!(bit_flip_page2_cell_count_high, "pg2_cellcount_hi", 3, 0x01);
-bit_flip_scenario!(bit_flip_page2_cell_count_low, "pg2_cellcount_lo", 4, 0x02);
-bit_flip_scenario!(bit_flip_page2_first_cell_pointer, "pg2_cellptr0", 8, 0x08);
-bit_flip_scenario!(bit_flip_page2_second_cell_pointer, "pg2_cellptr1", 10, 0x08);
-bit_flip_scenario!(bit_flip_page2_cell_content_area, "pg2_cellcontent", 5, 0x10);
+#[test]
+fn bit_flip_page2_btree_page_type() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_type", 0, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_count_high() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcount_hi", 3, 0x01).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_count_low() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcount_lo", 4, 0x02).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_first_cell_pointer() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellptr0", 8, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_second_cell_pointer() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellptr1", 10, 0x08).await;
+    });
+}
+
+#[test]
+fn bit_flip_page2_cell_content_area() {
+    asupersync::test_utils::run_test(|| async {
+        assert_bit_flip_caught("pg2_cellcontent", 5, 0x10).await;
+    });
+}
