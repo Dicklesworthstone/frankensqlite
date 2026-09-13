@@ -7,3 +7,5 @@ tmp_golden/
 # in .rch/config.toml; a blanket .beads/ rule would hide the fixture again.
 .beads.recovery_*/
 .git/
+# Local agent session state changes during builds and is not a build input.
+.ee/
