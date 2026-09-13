@@ -69,11 +69,6 @@ async fn run_both(fconn: &Connection, rconn: &rusqlite::Connection, stmts: &[&st
 }
 
 #[test]
-#[ignore = "bd-gh-trigger-rowid-alias (GH #205): NEW.rowid/OLD.rowid are NULL on a \
-no-INTEGER-PRIMARY-KEY table because TriggerFrame has no old_rowid/new_rowid and the actual \
-affected rowid is not captured at the row-collection points (collect_delete_trigger_rows / \
-collect_insert_trigger_rows) nor threaded through fire_*_triggers -> make_trigger_frame. \
-Un-ignore when that pipeline lands."]
 fn trigger_rowid_alias_no_ipk_gh205() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
@@ -94,8 +89,6 @@ fn trigger_rowid_alias_no_ipk_gh205() {
 }
 
 #[test]
-#[ignore = "bd-gh-trigger-pseudo-row-rowid (GH #216): NEW.oid / NEW._rowid_ share the same \
-missing-rowid-capture root cause as GH #205 on a no-INTEGER-PRIMARY-KEY table. Un-ignore with #205."]
 fn trigger_rowid_alias_oid_underscore_gh216() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
