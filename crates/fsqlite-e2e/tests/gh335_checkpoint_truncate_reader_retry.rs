@@ -82,7 +82,7 @@ const KEEPER_NAME: &str = "gh335_checkpoint_truncate_never_fails_fresh_reader_fi
 // Covers seed, worker readiness, all 60 receives, and shutdown. The outer
 // process owns the fixture, so killing a wedged child cannot leak its threads
 // into another libtest case or remove files while those threads still use them.
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(1_260);
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_mins(21);
 
 fn supervise_campaign(mode: &str, timeout: Duration) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
