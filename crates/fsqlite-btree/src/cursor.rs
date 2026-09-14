@@ -416,10 +416,10 @@ pub trait PageWriter: PageReader {
     ) -> impl Future<Output = Result<()>> + 'a;
     /// Drop a just-freed page's cached buffer from the page pool.
     ///
-    /// Default is a no-op. The teardown path ([`BtCursor::free_subtree_pages`])
-    /// calls this after freeing each page so a large DROP does not retain the
-    /// whole b-tree (and its overflow chains) in the page cache and exhaust the
-    /// buffer pool (bd-pirr5, GH#371). Implementations backed by a shared page
+    /// Default is a no-op. The teardown path
+    /// ([`BtCursor::free_subtree_pages_bounded`]) calls this after freeing each
+    /// page so a large DROP does not retain the whole b-tree (and its overflow
+    /// chains) in the page cache and exhaust the buffer pool (bd-pirr5, GH#371). Implementations backed by a shared page
     /// cache override it to evict the buffer; the page is already on the freelist
     /// and is re-read fresh if it is re-allocated, so this only bounds resident
     /// memory and never affects correctness. Kept out of `free_page` so normal
@@ -5440,13 +5440,48 @@ impl IndexSeekBias {
 }
 
 impl<P: PageWriter> BtCursor<P> {
-    /// Free all pages in the B-tree rooted at `page_no`,
-    /// including `page_no` itself, any overflow chains attached to cells,
-    /// and all child subtrees. Used by DROP TABLE / DROP INDEX to return
-    /// every page of the dropped object to the pager freelist.
+    /// Free all pages in the B-tree rooted at `page_no`, including `page_no`
+    /// itself, any overflow chains attached to cells, and all child subtrees.
+    /// Used by DROP TABLE / DROP INDEX to return every page of the dropped
+    /// object to the pager freelist.
+    ///
+    /// Thin wrapper over [`Self::free_subtree_pages_bounded`] with no page
+    /// budget — the whole subtree is dismantled within the current transaction.
+    /// Callers tearing down a potentially large table (e.g. a DROP) should
+    /// instead drive `free_subtree_pages_bounded` across committed transactions
+    /// so the working set stays bounded (bd-pirr5, GH#371).
     pub async fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let mut pending = vec![page_no];
-        while let Some(current_page) = pending.pop() {
+        self.free_subtree_pages_bounded(cx, &mut pending, usize::MAX)
+            .await
+    }
+
+    /// Free up to `budget` pages of a subtree, resuming from a caller-owned DFS
+    /// stack.
+    ///
+    /// `pending` is the depth-first frontier of page numbers still to free;
+    /// seed it with the subtree root and call this repeatedly (each call in its
+    /// own committed write transaction) until `pending` is empty. Both b-tree
+    /// pages and the overflow-chain pages hanging off their cells count against
+    /// `budget`, so a single large-value leaf cannot pull an unbounded overflow
+    /// chain into the page pool. The stack holds only page numbers, so it
+    /// survives across transactions cheaply — that is what keeps a WITHOUT-ROWID
+    /// / large-table teardown from materializing the whole b-tree in the page
+    /// pool of one transaction and exhausting the buffer pool (bd-pirr5,
+    /// GH#371). A page whose children were already pushed is freed after them,
+    /// so committing between calls only ever leaves un-freed pages that are
+    /// still reachable from `pending`.
+    pub async fn free_subtree_pages_bounded(
+        &mut self,
+        cx: &Cx,
+        pending: &mut Vec<PageNumber>,
+        budget: usize,
+    ) -> Result<()> {
+        let mut freed = 0usize;
+        while freed < budget {
+            let Some(current_page) = pending.pop() else {
+                break;
+            };
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             let page_data = self.pager.read_btree_page_data(cx, current_page).await?;
             let header = cell::parse_page_header(page_data.as_bytes(), current_page)?;
@@ -5455,7 +5490,9 @@ impl<P: PageWriter> BtCursor<P> {
 
             // Free overflow chains on ALL cells (both interior and leaf).
             // Interior cells of index B-trees carry key payloads that can
-            // overflow; table B-tree interior cells only carry rowids.
+            // overflow; table B-tree interior cells only carry rowids. Charge
+            // the freed overflow pages against the budget so this page's chains
+            // cannot blow the working-set bound.
             for ptr in &ptrs {
                 let cell = CellRef::parse(
                     page_data.as_bytes(),
@@ -5464,7 +5501,7 @@ impl<P: PageWriter> BtCursor<P> {
                     self.usable_size,
                 )?;
                 if let Some(first_overflow) = cell.overflow_page {
-                    self.free_overflow_chain(cx, first_overflow).await?;
+                    freed += self.free_overflow_chain(cx, first_overflow).await?;
                 }
             }
 
@@ -5504,6 +5541,7 @@ impl<P: PageWriter> BtCursor<P> {
             // so tearing down a large (e.g. WITHOUT ROWID) table does not retain
             // the whole b-tree in the page cache and exhaust the buffer pool.
             self.pager.forget_page(current_page);
+            freed += 1;
         }
         Ok(())
     }
@@ -6364,7 +6402,13 @@ impl<P: PageWriter> BtCursor<P> {
         .await
     }
 
-    async fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<()> {
+    /// Free an overflow chain, returning the number of pages freed.
+    ///
+    /// The count lets a bounded teardown ([`Self::free_subtree_pages_bounded`])
+    /// charge overflow pages against its per-batch page budget so a single
+    /// large-value cell cannot pull an unbounded chain into the page pool.
+    /// All other callers discard the count (bd-pirr5, GH#371).
+    async fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<usize> {
         let cleanup_cx = cx.create_child();
         let _mask = cleanup_cx.masked();
         let mut current = Some(first);
@@ -6406,7 +6450,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.pager.forget_page(pgno);
         }
 
-        Ok(())
+        Ok(visited)
     }
 
     /// Encode a table leaf cell into the provided buffer, returning the
@@ -7849,7 +7893,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
             self.at_eof = false;
             if let Some(first) = old_overflow {
-                self.free_overflow_chain(cx, first).await?;
+                let _ = self.free_overflow_chain(cx, first).await?;
             }
             return Ok(false);
         }
@@ -7885,7 +7929,7 @@ impl<P: PageWriter> BtCursor<P> {
         // chain before `balance_for_insert` commits would let an error return
         // with pages freed while the old cell is still the rollback source.
         if let Some(first) = old_overflow {
-            self.free_overflow_chain(cx, first).await?;
+            let _ = self.free_overflow_chain(cx, first).await?;
         }
 
         Ok(true)
@@ -8454,7 +8498,7 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         if let Some(first) = overflow_head {
-            self.free_overflow_chain(cx, first).await?;
+            let _ = self.free_overflow_chain(cx, first).await?;
         }
 
         Ok((leaf_page_no, new_count))
@@ -8640,7 +8684,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Now it is safe to free the overflow chain.
         if let Some(first) = overflow_head {
-            self.free_overflow_chain(cx, first).await?;
+            let _ = self.free_overflow_chain(cx, first).await?;
         }
 
         Ok((leaf_page_no, new_count))
@@ -9148,7 +9192,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(None) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first).await?;
+                    let _ = self.free_overflow_chain(cx, first).await?;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -9254,7 +9298,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(false) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first).await?;
+                    let _ = self.free_overflow_chain(cx, first).await?;
                 }
                 self.stack.clear();
                 self.at_eof = true;
@@ -9484,7 +9528,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(None) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
-                    self.free_overflow_chain(cx, first).await?;
+                    let _ = self.free_overflow_chain(cx, first).await?;
                 }
                 self.clear_rightmost_leaf_cache();
                 Ok(None)
@@ -9639,7 +9683,7 @@ impl<P: PageWriter> BtCursor<P> {
                         Ok(true) => return Ok(true),
                         Ok(false) => {
                             if let Some(first) = overflow_head {
-                                self.free_overflow_chain(cx, first).await?;
+                                let _ = self.free_overflow_chain(cx, first).await?;
                             }
                             return Ok(false);
                         }
@@ -9871,7 +9915,7 @@ impl<P: PageWriter> BtCursor<P> {
                 match fallback_result {
                     Ok(inserted) => {
                         if !inserted && let Some(first) = overflow_head {
-                            self.free_overflow_chain(cx, first).await?;
+                            let _ = self.free_overflow_chain(cx, first).await?;
                         }
                         Ok(inserted)
                     }
