@@ -2,23 +2,63 @@
 use super::*;
 
 impl Connection {
-    pub(super) async fn pragma_integrity_check_rows(&self, quick: bool) -> Vec<Row> {
-        let result = self.validate_database_integrity(quick).await;
+    pub(super) async fn pragma_integrity_check_rows(
+        &self,
+        pragma: &fsqlite_ast::PragmaStatement,
+    ) -> Vec<Row> {
+        let quick = pragma.name.name.eq_ignore_ascii_case("quick_check");
+        let max_errors = integrity_check_error_limit(pragma.value.as_ref());
+        let mut failures = Vec::new();
+        if let Err(error) = self.validate_database_integrity(quick).await {
+            failures.push(error.to_string());
+        }
+
+        // Qualified attached PRAGMAs already delegate to their child Connection.
+        // Unqualified whole-database checks must also visit every attachment;
+        // a clean main database alone cannot establish an aggregate "ok" verdict.
+        if pragma.name.schema.is_none() {
+            let attached_schemas = self
+                .attached_schemas
+                .borrow()
+                .all_schemas()
+                .into_iter()
+                .filter(|schema| !is_builtin_schema(schema))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for schema in attached_schemas {
+                // The existing validator reports at most one failure per
+                // database. N caps diagnostics across the entire traversal.
+                if failures.len() >= max_errors {
+                    break;
+                }
+                if let Err(error) = self
+                    .with_attached_connection_async(&schema, async |child| {
+                        child.validate_database_integrity(quick).await
+                    })
+                    .await
+                {
+                    failures.push(format!("*** in database {schema} ***\n{error}"));
+                }
+            }
+        }
+
         if !fsqlite_observability::metrics::metrics_disabled() {
             let registry = fsqlite_observability::metrics::global();
-            if result.is_ok() {
+            if failures.is_empty() {
                 registry.integrity_check_ok_total.inc();
             } else {
                 registry.integrity_check_fail_total.inc();
             }
         }
-        let outcome = match result {
-            Ok(()) => "ok".to_owned(),
-            Err(err) => err.to_string(),
-        };
-        let mut rows = vec![Row {
-            values: vec![SqliteValue::Text(outcome.into())],
-        }];
+        if failures.is_empty() {
+            failures.push("ok".to_owned());
+        }
+        let mut rows = failures
+            .into_iter()
+            .map(|outcome| Row {
+                values: vec![SqliteValue::Text(outcome.into())],
+            })
+            .collect::<Vec<_>>();
         // bd-7o1vu (GH#370), complement option (1): surface a legacy orphaned
         // `%_content` shadow on a CONTENTLESS FTS5 table as an informational
         // NOTE. The shadow is a well-formed table, so it never fails the
@@ -157,6 +197,30 @@ impl Connection {
     }
 }
 
+fn integrity_check_error_limit(value: Option<&fsqlite_ast::PragmaValue>) -> usize {
+    let Some(value) = value else {
+        return 100;
+    };
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(expr) | fsqlite_ast::PragmaValue::Call(expr) => expr,
+    };
+    // SQLite reads the integer token's magnitude even when it has a sign.
+    let expr = match expr {
+        Expr::UnaryOp {
+            op: UnaryOp::Plus | UnaryOp::Negate,
+            expr,
+            ..
+        } => expr.as_ref(),
+        _ => expr,
+    };
+    match expr {
+        Expr::Literal(Literal::Integer(limit), _) if *limit != 0 => {
+            usize::try_from(limit.unsigned_abs()).unwrap_or(usize::MAX)
+        }
+        _ => 100,
+    }
+}
+
 fn parse_checkpoint_mode(value: &fsqlite_ast::PragmaValue) -> Result<CheckpointMode> {
     let expr = match value {
         fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
@@ -184,6 +248,205 @@ fn parse_checkpoint_mode(value: &fsqlite_ast::PragmaValue) -> Result<CheckpointM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn corrupt_integrity_test_root(conn: &Connection) -> Result<()> {
+        let root_page = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .map(|table| table.root_page)
+            .expect("fixture table root");
+        let cx = conn.op_cx()?;
+        if conn.retained_autocommit_txn.borrow().is_some() {
+            conn.flush_retained_autocommit_txn(&cx).await?;
+        }
+        conn.invalidate_cached_write_txn(&cx).await;
+        conn.invalidate_cached_read_snapshot(&cx).await;
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).await?;
+        let page_no = PageNumber::new(u32::try_from(root_page).unwrap()).unwrap();
+        let mut page = txn.get_page(&cx, page_no).await?.into_vec();
+        assert_eq!(page[0], 0x0D, "fixture must start as a table leaf");
+        page[0] = 0xFF;
+        txn.write_page(&cx, page_no, &page).await?;
+        txn.commit(&cx).await
+    }
+
+    fn assert_integrity_ok(rows: &[Row]) {
+        assert_eq!(rows.len(), 1, "clean databases return one verdict");
+        assert_eq!(rows[0].values(), &[SqliteValue::Text("ok".into())]);
+    }
+
+    #[test]
+    fn unqualified_integrity_checks_report_attached_corruption() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            for schema in ["good", "bad_first", "bad_second"] {
+                conn.execute(&format!("ATTACH DATABASE ':memory:' AS {schema};"))
+                    .await
+                    .unwrap();
+                conn.execute(&format!(
+                    "CREATE TABLE {schema}.t(id INTEGER PRIMARY KEY, v TEXT); \
+                     INSERT INTO {schema}.t VALUES (1, 'payload');"
+                ))
+                .await
+                .unwrap();
+            }
+            for pragma in ["integrity_check", "quick_check"] {
+                assert_integrity_ok(&conn.query(&format!("PRAGMA {pragma};")).await.unwrap());
+                let prepared = conn.prepare(&format!("PRAGMA {pragma};")).await.unwrap();
+                assert_integrity_ok(&prepared.query().await.unwrap());
+            }
+            for schema in ["bad_first", "bad_second"] {
+                conn.with_attached_connection_async(schema, async |child| {
+                    corrupt_integrity_test_root(child).await
+                })
+                .await
+                .unwrap();
+            }
+
+            for pragma in ["integrity_check", "quick_check"] {
+                for schema in ["main", "good"] {
+                    assert_integrity_ok(
+                        &conn
+                            .query(&format!("PRAGMA {schema}.{pragma};"))
+                            .await
+                            .unwrap(),
+                    );
+                }
+                // Establish actual corruption before testing aggregate dispatch.
+                for schema in ["bad_first", "bad_second"] {
+                    let rows = conn
+                        .query(&format!("PRAGMA {schema}.{pragma};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let SqliteValue::Text(message) = &rows[0].values()[0] else {
+                        panic!("expected corruption diagnostic");
+                    };
+                    assert!(message.contains("invalid B-tree page type"), "{message}");
+                }
+                for prepared in [false, true] {
+                    for (argument, expected_count) in [
+                        ("", 2),
+                        ("(1)", 1),
+                        ("(2)", 2),
+                        ("(0)", 2),
+                        ("(-1)", 1),
+                        ("(+1)", 1),
+                    ] {
+                        let sql = format!("PRAGMA {pragma}{argument};");
+                        let rows = if prepared {
+                            conn.prepare(&sql).await.unwrap().query().await.unwrap()
+                        } else {
+                            conn.query(&sql).await.unwrap()
+                        };
+                        assert_eq!(
+                            rows.len(),
+                            expected_count,
+                            "{sql} prepared={prepared} must apply one shared error budget: {rows:?}"
+                        );
+                        // FrankenSQLite's existing validator returns one diagnostic
+                        // per database, including for hard B-tree corruption. This
+                        // guards traversal, not stock's hard-error sequencing.
+                        for (row, schema) in rows.iter().zip(["bad_first", "bad_second"]) {
+                            let SqliteValue::Text(message) = &row.values()[0] else {
+                                panic!("expected corruption diagnostic");
+                            };
+                            assert!(
+                                message.starts_with(&format!("*** in database {schema} ***\n")),
+                                "{message}"
+                            );
+                            assert!(message.contains("invalid B-tree page type"), "{message}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn qualified_integrity_checks_do_not_visit_corrupt_main() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY); \
+                 INSERT INTO t VALUES (1); \
+                 ATTACH DATABASE ':memory:' AS aux; \
+                 CREATE TABLE aux.t(id INTEGER PRIMARY KEY);",
+            )
+            .await
+            .unwrap();
+            corrupt_integrity_test_root(&conn).await.unwrap();
+            for pragma in ["integrity_check", "quick_check"] {
+                assert_integrity_ok(&conn.query(&format!("PRAGMA aux.{pragma};")).await.unwrap());
+                for scope in ["", "main."] {
+                    let rows = conn
+                        .query(&format!("PRAGMA {scope}{pragma};"))
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let SqliteValue::Text(message) = &rows[0].values()[0] else {
+                        panic!("expected corruption diagnostic");
+                    };
+                    assert!(message.contains("invalid B-tree page type"), "{message}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn stock_integrity_checks_visit_attached_schemas() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH DATABASE ':memory:' AS aux; \
+             ATTACH DATABASE ':memory:' AS aux_second; \
+             CREATE TABLE aux.t(v INTEGER CHECK(v > 0)); \
+             CREATE TABLE aux_second.t(v INTEGER CHECK(v > 0)); \
+             PRAGMA ignore_check_constraints=ON; \
+             INSERT INTO aux.t VALUES(-1); \
+             INSERT INTO aux_second.t VALUES(-1); \
+             PRAGMA ignore_check_constraints=OFF;",
+        )
+        .unwrap();
+        for pragma in ["integrity_check", "quick_check"] {
+            let main: String = conn
+                .query_row(&format!("PRAGMA main.{pragma};"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(main, "ok");
+            for scope in ["", "aux."] {
+                let report: String = conn
+                    .query_row(&format!("PRAGMA {scope}{pragma};"), [], |row| row.get(0))
+                    .unwrap();
+                assert!(report.contains("CHECK constraint failed"), "{report}");
+            }
+            for (argument, expected_count) in [
+                ("", 2),
+                ("(1)", 1),
+                ("(2)", 2),
+                ("(0)", 2),
+                ("(-1)", 1),
+                ("(+1)", 1),
+            ] {
+                let sql = format!("PRAGMA {pragma}{argument};");
+                let mut statement = conn.prepare(&sql).unwrap();
+                let reports = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(reports.len(), expected_count, "{sql}: {reports:?}");
+                assert!(
+                    reports
+                        .iter()
+                        .all(|report| report.contains("CHECK constraint failed"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn unqualified_wal_checkpoint_truncates_attached_wal() {
