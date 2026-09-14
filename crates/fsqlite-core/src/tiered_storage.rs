@@ -417,6 +417,17 @@ impl TieredStorage {
         }
         cx.checkpoint().map_err(|_| FrankenError::Busy)?;
 
+        // Bind the entire response before ESI deduplication can hide foreign
+        // records or let their bytes enter the decoder and repair cache.
+        if let Some(record) = fetched.iter().find(|record| record.object_id != object_id) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "remote tier returned symbols for object {} while fetching object {object_id}",
+                    record.object_id
+                ),
+            });
+        }
+
         let merged = merge_symbol_sets(&local_records, &fetched);
         let recovered = match recover_object_hybrid(&merged) {
             Ok(value) => value,
@@ -1494,6 +1505,84 @@ mod tests {
                 .all(SymbolRecord::verify_integrity),
             "local self-healing must prefer the repaired symbol over the stale corrupt copy"
         );
+    }
+
+    #[test]
+    fn test_fetch_rejects_foreign_objects_before_decode_or_write_back() {
+        let object_id = object_id_from_u64(74);
+        let foreign_id = object_id_from_u64(75);
+        let payload = b"requested-object-payload";
+        let full = make_symbol_records(object_id, payload, 8, 0);
+        let foreign = make_symbol_records(foreign_id, b"foreign-object-payload!!", 8, 0);
+
+        for seed_local in [false, true] {
+            for mix_requested in [false, true] {
+                let mut storage = TieredStorage::new(DurabilityMode::local());
+                if seed_local {
+                    storage.insert_l2_segment(422, vec![full[0].clone()]);
+                }
+                let before = storage.l2_segments.clone();
+                let mut response = if mix_requested {
+                    full.clone()
+                } else {
+                    Vec::new()
+                };
+                // Valid frames with colliding ESIs must still belong to the
+                // requested object, including otherwise redundant records.
+                response.extend(foreign.clone());
+                assert!(response.iter().all(SymbolRecord::verify_integrity));
+                let mut remote = MockRemoteTier::default();
+                remote.set_object_symbols(object_id, response);
+                let cx = Cx::<cap::All>::new();
+
+                let result = storage.fetch_object(
+                    &cx,
+                    object_id,
+                    60,
+                    Some(&mut remote),
+                    Some(remote_cap(15)),
+                );
+                assert!(
+                    matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+                    "foreign response accepted (local={seed_local}, mixed={mix_requested}): {result:?}"
+                );
+                assert_eq!(remote.fetch_calls(), 1);
+                assert_eq!(storage.l2_segments, before);
+                assert!(storage.l2_records_for_object(foreign_id).is_empty());
+                assert!(
+                    storage
+                        .take_decode_audit_entries()
+                        .iter()
+                        .all(|entry| entry.object_id == object_id && !entry.decode_success)
+                );
+
+                // Rejection must leave the object recoverable on a correct
+                // retry, including repair of the existing partial local copy.
+                remote.set_object_symbols(object_id, full.clone());
+                let recovered = storage
+                    .fetch_object(&cx, object_id, 61, Some(&mut remote), Some(remote_cap(15)))
+                    .expect("correct remote response should recover the requested object");
+                assert_eq!(recovered.bytes, payload);
+                assert!(recovered.remote_used);
+                assert_eq!(
+                    recovered.write_back_count,
+                    full.len() - usize::from(seed_local)
+                );
+                assert_eq!(remote.fetch_calls(), 2);
+                let replay = storage
+                    .fetch_object(
+                        &cx,
+                        object_id,
+                        62,
+                        Option::<&mut MockRemoteTier>::None,
+                        None,
+                    )
+                    .expect("correct repairs should support a local-only replay");
+                assert_eq!(replay.bytes, payload);
+                assert!(!replay.remote_used);
+                assert!(storage.l2_records_for_object(foreign_id).is_empty());
+            }
+        }
     }
 
     #[test]

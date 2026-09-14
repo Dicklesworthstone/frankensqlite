@@ -123,10 +123,14 @@ fn verify_kill9_helper(mode: &str, db: &Path) -> Result<(), String> {
         )
     })?;
     if progress != mode.as_bytes() {
-        return Err(format!("helper abort-boundary marker mismatch (mode={mode})"));
+        return Err(format!(
+            "helper abort-boundary marker mismatch (mode={mode})"
+        ));
     }
     if status.success() {
-        return Err(format!("helper returned after abort boundary (mode={mode})"));
+        return Err(format!(
+            "helper returned after abort boundary (mode={mode})"
+        ));
     }
     #[cfg(unix)]
     {

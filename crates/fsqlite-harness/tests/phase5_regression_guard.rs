@@ -138,9 +138,7 @@ const AUDITED_COVERED_PARENT_CONTRACT: &[(&str, &[&str])] = &[
     ),
     (
         "crates/fsqlite-pager/src/pager.rs::tests::stock_multisection_hot_journal_crash_child",
-        &[
-            "crates/fsqlite-pager/src/pager.rs::tests::stock_multisection_hot_journal_recovers",
-        ],
+        &["crates/fsqlite-pager/src/pager.rs::tests::stock_multisection_hot_journal_recovers"],
     ),
     (
         "crates/fsqlite-pager/src/pager.rs::tests::test_16t_throughput_exceeds_sqlite",
