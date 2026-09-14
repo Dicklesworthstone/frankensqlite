@@ -62405,6 +62405,14 @@ impl Connection {
         Ok(())
     }
 
+    /// Number of pages a single teardown batch frees before committing.
+    ///
+    /// Bounds the working set of a DROP / table teardown: at 4 KiB pages this
+    /// keeps peak page-pool residency near 8 MiB per batch regardless of table
+    /// size, instead of pulling the whole b-tree into the pool in one
+    /// transaction and exhausting the buffer pool (bd-pirr5, GH#371).
+    const TEARDOWN_BATCH_PAGES: usize = 2048;
+
     /// Free all pages of a B-tree (table or index) back to the pager freelist.
     ///
     /// This must be called for every root page of a dropped table/index so
@@ -62417,11 +62425,62 @@ impl Connection {
             Some(pg) => pg,
             None => return Ok(()),
         };
-        self.with_pager_write_txn(async |cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root_page, is_table).await?;
-            cursor.free_subtree_pages(cx, root_page).await
-        })
-        .await
+        // bd-pirr5 (GH#371): free the b-tree in bounded page batches, each in
+        // its own write transaction, so tearing down a large (e.g. WITHOUT
+        // ROWID) table keeps a bounded working set instead of materializing the
+        // whole tree in the page pool of one transaction. The DFS frontier
+        // (`pending`, page numbers only) survives across transactions; a page
+        // is freed only after its children are pushed onto it, so a committed
+        // batch never leaves a page that is unreachable from `pending`. In
+        // autocommit each batch commits (bounding memory); inside an explicit
+        // transaction the batches share that transaction and stay atomic — a
+        // teardown that must be atomic cannot also be bounded, and the
+        // sqlite_master row is removed first (execute_drop_single) so a crash
+        // between committed batches leaks recoverable pages, never a dangling
+        // table.
+        let mut pending = vec![root_page];
+        while !pending.is_empty() {
+            // Move the DFS frontier into the batch's transaction and take it back
+            // when the batch commits, so nothing is borrowed across the `.await`.
+            let batch_pending = std::mem::take(&mut pending);
+            pending = self
+                .with_pager_write_txn(async move |cx, txn| {
+                    let mut cursor =
+                        Self::new_pager_btree_cursor(cx, txn, root_page, is_table).await?;
+                    let mut frontier = batch_pending;
+                    cursor
+                        .free_subtree_pages_bounded(cx, &mut frontier, Self::TEARDOWN_BATCH_PAGES)
+                        .await?;
+                    Ok(frontier)
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Attribute a page-pool-exhaustion / out-of-memory error raised while
+    /// tearing down `object` via `operation` (e.g. `"DROP TABLE"`).
+    ///
+    /// A bare `out of memory` / `page buffer capacity exhausted` gives a
+    /// consumer nothing to route on; naming the object and operation lets it
+    /// pick a specific remediation instead of declaring the whole database
+    /// unhealthy (bd-pirr5, GH#371). Non-memory errors pass through unchanged.
+    fn attribute_teardown_memory_error(
+        err: FrankenError,
+        operation: &str,
+        object: &str,
+    ) -> FrankenError {
+        if matches!(
+            err,
+            FrankenError::OutOfMemory | FrankenError::PageBufferCapacityExhausted { .. }
+        ) {
+            FrankenError::function_error(format!(
+                "{operation} {object}: ran out of page-buffer pool while freeing the object's \
+                 b-tree ({err}); the teardown could not stay within the configured buffer budget"
+            ))
+        } else {
+            err
+        }
     }
 
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
@@ -62617,8 +62676,7 @@ impl Connection {
                     // vector positions cannot redirect a lookup to another
                     // table's root page during this DROP statement.
                     self.rebuild_schema_indices();
-                    // Free all B-tree pages for the table and its indexes back
-                    // to the pager freelist BEFORE removing in-memory state.
+                    // Catalog rows go first (crash safety for batched frees).
                     // Virtual tables may have materialized root pages in the
                     // MemDatabase that do NOT correspond to real pager pages.
                     // Attempting to free those would cause a snapshot conflict.
@@ -62627,21 +62685,48 @@ impl Connection {
                         .borrow()
                         .get(&obj_name.to_ascii_lowercase())
                         .is_some_and(|sql| is_virtual_table_sql(sql));
-                    if !is_virtual && table.root_page > 0 {
-                        for index in &table.indexes {
-                            self.free_btree_pages(index.root_page, false).await?;
-                        }
-                        self.free_btree_pages(table.root_page, true).await?;
+                    // bd-pirr5 (GH#371): remove the persistent sqlite_master rows
+                    // for the table and its indexes BEFORE freeing their b-tree
+                    // pages. free_btree_pages tears the b-tree down in bounded
+                    // page batches across committed transactions, so a crash
+                    // mid-teardown must not leave a catalog row referencing a
+                    // half-freed b-tree. Deleting the catalog first means a crash
+                    // between committed free batches leaks recoverable orphan
+                    // pages (integrity-check / VACUUM reclaims them) rather than a
+                    // dangling table/index reference.
+                    if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name).await {
+                        swallow_missing_master(err)?;
                     }
-                    self.db.borrow_mut().destroy_table(table.root_page);
                     for index in &table.indexes {
-                        self.db.borrow_mut().destroy_table(index.root_page);
                         if let Err(err) = self
                             .delete_sqlite_master_typed_row("index", &index.name)
                             .await
                         {
                             swallow_missing_master(err)?;
                         }
+                    }
+                    // Free B-tree pages back to the freelist. Virtual tables may
+                    // have materialized root pages in the MemDatabase that do NOT
+                    // correspond to real pager pages; skip those.
+                    if !is_virtual && table.root_page > 0 {
+                        for index in &table.indexes {
+                            self.free_btree_pages(index.root_page, false)
+                                .await
+                                .map_err(|e| {
+                                    Self::attribute_teardown_memory_error(e, "DROP TABLE", obj_name)
+                                })?;
+                        }
+                        self.free_btree_pages(table.root_page, true)
+                            .await
+                            .map_err(|e| {
+                                Self::attribute_teardown_memory_error(e, "DROP TABLE", obj_name)
+                            })?;
+                    }
+                    // Drop the in-memory MemDatabase roots after the persistent
+                    // catalog rows and on-disk pages are gone.
+                    self.db.borrow_mut().destroy_table(table.root_page);
+                    for index in &table.indexes {
+                        self.db.borrow_mut().destroy_table(index.root_page);
                     }
                     if !self.temp_table_names.borrow().contains(&name_key) {
                         self.rowid_alias_columns.borrow_mut().remove(&name_key);
@@ -62693,9 +62778,8 @@ impl Connection {
                         }
                     }
 
-                    if let Err(err) = self.delete_sqlite_master_typed_row("table", obj_name).await {
-                        swallow_missing_master(err)?;
-                    }
+                    // (bd-pirr5) The table's sqlite_master row was already removed
+                    // above, before the batched page-free, for crash safety.
                     true
                 } else {
                     if drop_stmt.if_exists {
@@ -62751,12 +62835,24 @@ impl Connection {
                         "no such index: {obj_name}"
                     )));
                 }
+                // bd-pirr5 (GH#371): remove the persistent sqlite_master row
+                // before freeing the index b-tree. free_btree_pages tears the
+                // b-tree down in bounded page batches across committed
+                // transactions, so a crash mid-teardown must leak recoverable
+                // orphan pages rather than a dangling index reference.
+                if !dropped_temp
+                    && let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name).await
+                {
+                    swallow_missing_master(err)?;
+                }
                 if let Some(root_page) = dropped_root_page {
                     // TEMP indexes are MemDatabase-only and must never be
                     // interpreted as main-pager roots. Persistent indexes are
                     // returned to the pager freelist as usual.
                     if !dropped_temp {
-                        self.free_btree_pages(root_page, false).await?;
+                        self.free_btree_pages(root_page, false).await.map_err(|e| {
+                            Self::attribute_teardown_memory_error(e, "DROP INDEX", obj_name)
+                        })?;
                     }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
@@ -62764,11 +62860,6 @@ impl Connection {
                     && let Some(table) = self.db.borrow_mut().get_table_mut(table_root)
                 {
                     table.remove_unique_column_group_with_collations(&columns, &collations);
-                }
-                if !dropped_temp
-                    && let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name).await
-                {
-                    swallow_missing_master(err)?;
                 }
                 true
             }
