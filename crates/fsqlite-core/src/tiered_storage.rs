@@ -32,6 +32,7 @@ const FETCH_SYMBOLS_COMPUTATION: &str = "fsqlite:tiered:fetch_symbols:v1";
 const UPLOAD_SEGMENT_COMPUTATION: &str = "fsqlite:tiered:upload_segment:v1";
 const DEFAULT_WRITE_BACK_SEGMENT_ID: u64 = u64::MAX - 1;
 const DEFAULT_FALLBACK_DECODE_SLACK: usize = 2;
+const MAX_FETCH_PREFERENCE_BYTES: usize = 4096;
 
 /// Native-mode durability policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +79,8 @@ impl DurabilityMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchSymbolsRequest {
     pub object_id: ObjectId,
+    /// Advisory source-symbol prefix, capped at 4 KiB by `TieredStorage`.
+    /// Stores may return additional source and repair symbols.
     pub preferred_esis: Vec<u32>,
     pub max_symbols: usize,
     pub idempotency_key: IdempotencyKey,
@@ -605,8 +608,9 @@ fn preferred_source_esis(oti: Option<Oti>) -> Vec<u32> {
     let Ok(source_symbols) = source_symbol_count(oti) else {
         return Vec::new();
     };
-    let max_u32 = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
-    let capped = source_symbols.min(max_u32);
+    // Hints need not enumerate the entire object. Bound this allocation and
+    // derive_fetch_key's copy before using an untrusted OTI source count.
+    let capped = source_symbols.min(MAX_FETCH_PREFERENCE_BYTES / std::mem::size_of::<u32>());
     let mut esis = Vec::with_capacity(capped);
     for idx in 0..capped {
         if let Ok(esi) = u32::try_from(idx) {
@@ -1204,6 +1208,88 @@ mod tests {
                 &proof.rejected_symbols,
             )
             .ok
+    }
+
+    #[test]
+    fn test_preferred_source_esis_bound_untrusted_metadata() {
+        let mut oti = Oti {
+            f: 0,
+            al: 1,
+            t: 1,
+            z: 1,
+            n: 1,
+        };
+        assert!(preferred_source_esis(None).is_empty());
+        // The 1025-symbol case fails before the extreme declarations on the
+        // old implementation, so the causal control never allocates gigabytes.
+        for source_symbols in [0, 1, 1023, 1024, 1025, u64::from(u32::MAX), u64::MAX] {
+            oti.f = source_symbols;
+            let preferred = preferred_source_esis(Some(oti));
+            let expected_len = source_symbol_count(oti).map_or(0, |count| count.min(1024));
+            assert_eq!(
+                preferred.len(),
+                expected_len,
+                "preference metadata exceeds its 4 KiB budget for F={source_symbols}"
+            );
+            assert!(
+                preferred
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &esi)| usize::try_from(esi) == Ok(index))
+            );
+        }
+        oti.f = 8193;
+        oti.t = 8;
+        assert_eq!(preferred_source_esis(Some(oti)).len(), 1024);
+
+        for invalid in [
+            Oti { t: 0, ..oti },
+            Oti { z: 0, ..oti },
+            Oti { n: 2, ..oti },
+        ] {
+            assert!(preferred_source_esis(Some(invalid)).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_fetch_bounded_hints_recover_beyond_prefix_and_replay() {
+        let object_id = object_id_from_u64(76);
+        let payload: Vec<u8> = (0..1025_u32)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect();
+        let records = make_symbol_records(object_id, &payload, 1, 0);
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(423, vec![records[0].clone()]);
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, records);
+        let cx = Cx::<cap::All>::new();
+
+        let recovered = storage
+            .fetch_object(&cx, object_id, 63, Some(&mut remote), Some(remote_cap(16)))
+            .expect("a bounded preference prefix must not truncate object recovery");
+        assert_eq!(remote.last_fetch_preferred.len(), 1024);
+        assert_eq!(remote.last_fetch_preferred.first(), Some(&0));
+        assert_eq!(remote.last_fetch_preferred.last(), Some(&1023));
+        assert_eq!(remote.fetch_calls(), 1);
+        assert_eq!(recovered.bytes, payload);
+        assert!(recovered.remote_used);
+        assert_eq!(recovered.write_back_count, payload.len() - 1);
+
+        let replay = storage
+            .fetch_object(
+                &cx,
+                object_id,
+                64,
+                Option::<&mut MockRemoteTier>::None,
+                None,
+            )
+            .expect("repaired symbols beyond the hint prefix must remain available locally");
+        assert_eq!(replay.bytes, payload);
+        assert!(!replay.remote_used);
+        assert_eq!(
+            storage.l2_records_for_object(object_id).len(),
+            payload.len()
+        );
     }
 
     #[test]
