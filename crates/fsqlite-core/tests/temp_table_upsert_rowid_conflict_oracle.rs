@@ -11,6 +11,19 @@
 //! branch of `emit_not_null_constraints`) are inert here — they are entered only
 //! when a column carries a generated expression. A failure in this file is
 //! therefore independent of that work.
+//!
+//! Current state of the three bd-29phg symptoms:
+//!   1. upsert inserting a duplicate — FIXED, guarded by
+//!      `temp_table_upsert_on_rowid_alias_matches_stock_sqlite` (runs by default);
+//!   2. failed multi-row INSERT keeping its partial row — still open,
+//!      `temp_table_failed_multi_row_insert_is_atomic_like_stock` (`#[ignore]`d);
+//!   3. a UNIQUE violation naming the wrong column — still open, visible in the
+//!      Q5 line of `temp_table_constraint_lane_diagnostic` (`#[ignore]`d).
+//!
+//! The two `#[ignore]`d investigation aids (`temp_table_constraint_lane_diagnostic`
+//! and `temp_vs_main_upsert_program_dump`) print characterisations rather than
+//! asserting; run them with
+//! `cargo test -p fsqlite-core --test temp_table_upsert_rowid_conflict_oracle -- --ignored --nocapture`.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
@@ -40,20 +53,18 @@ async fn assert_same_rows(conn: &Connection, stock: &rusqlite::Connection, table
     assert_eq!(actual, expected, "{ctx}");
 }
 
-/// KNOWN-RED on the `temporary=true` arm — this is the executable repro for
-/// **bd-29phg**, not a passing guard. The `temporary=false` arm passes.
+/// Regression guard for **bd-29phg symptom 1** — now GREEN.
 ///
-/// Ignored so it does not break the default suite while the defect is open;
-/// run it explicitly with
-/// `cargo test -p fsqlite-core --test temp_table_upsert_rowid_conflict_oracle -- --ignored`.
-/// Remove the `#[ignore]` as part of fixing bd-29phg.
+/// Before the fix this failed on the `temporary=true` arm: `INSERT INTO g(id,v)
+/// VALUES(1,13) ON CONFLICT(id) DO UPDATE SET v=excluded.v` produced
+/// `[[1,5],[2,7],[3,13]]` where stock gives `[[1,13],[2,7]]` — the update never
+/// happened and a duplicate row appeared at a fresh rowid.
 ///
-/// Last run 2026-09-15 on vmi1264463 against 0a5335a86 + the bd-fjieg.5/.6/.7
-/// candidate: FAILED on `temporary=true`, `INSERT INTO g(id,v) VALUES(1,13)
-/// ON CONFLICT(id) DO UPDATE SET v=excluded.v` —
-/// fsqlite `[[1,5],[2,7],[3,13]]` vs stock `[[1,13],[2,7]]`.
+/// Cause: the MemDatabase branch of the seek opcodes never positioned its
+/// cursor, so `Delete` in the DO UPDATE body was a silent no-op (it requires
+/// `MemCursor.position`) and the re-insert then drew a new rowid. See the
+/// `NotFound`/`NotExists` and `Found` arms in `fsqlite-vdbe/src/engine.rs`.
 #[test]
-#[ignore = "bd-29phg: TEMP upsert inserts a duplicate instead of updating; repro kept executable"]
 fn temp_table_upsert_on_rowid_alias_matches_stock_sqlite() {
     asupersync::test_utils::run_test(|| async {
         for temporary in [false, true] {
@@ -99,6 +110,10 @@ fn temp_table_upsert_on_rowid_alias_matches_stock_sqlite() {
 /// second symptom: a multi-row INSERT that violates NOT NULL on its *second*
 /// row must leave the table untouched, but on a TEMP table the first row
 /// survives the failed statement.
+///
+/// Confirmed INDEPENDENT of symptom 1: still red after the cursor-positioning
+/// fix that turned the upsert guard above green, so this is a
+/// statement-rollback problem rather than a cursor-position one.
 ///
 /// Again deliberately **no generated columns**, so this is independent of
 /// bd-fjieg.5. It is the plain-NOT-NULL analogue of the divergence the .5
@@ -210,6 +225,74 @@ fn temp_table_constraint_lane_diagnostic() {
                 "FINAL stock   = {expected:?}\nFINAL fsqlite = {:?}",
                 actual.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
             );
+
+            conn.close().await.unwrap();
+        }
+    });
+}
+
+/// bd-29phg step 2: dump the compiled program for the *same* upsert statement
+/// against a main-schema table and a TEMP table, and print them side by side.
+///
+/// The live hypothesis is that on the TEMP lane the conflict probe tests a
+/// freshly allocated rowid rather than the explicit one, which would explain
+/// both the missed conflict and the row landing at max(rowid)+1. That is a
+/// claim about which instruction populates the register feeding
+/// `NotExists`/`NotFound`, so the two programs are the evidence.
+///
+/// Caveat to keep in mind when reading the output: `EXPLAIN` renders
+/// `try_compile_statement`, and TEMP inserts are deliberately routed away from
+/// the direct lane (connection.rs ~44955, GH#290). If the two programs come
+/// back identical, that does NOT clear codegen — it means EXPLAIN is not
+/// showing the program TEMP execution actually runs, and the next step is to
+/// instrument the executing lane instead.
+#[test]
+#[ignore = "bd-29phg program dump; prints evidence, run explicitly"]
+fn temp_vs_main_upsert_program_dump() {
+    asupersync::test_utils::run_test(|| async {
+        const UPSERT: &str =
+            "INSERT INTO g(id,v) VALUES(1,13) ON CONFLICT(id) DO UPDATE SET v=excluded.v";
+
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            println!("\n######## temporary={temporary} ########");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(&format!(
+                "CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER)"
+            ))
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO g(v) VALUES(5)").await.unwrap();
+            conn.execute("INSERT INTO g(v) VALUES(7)").await.unwrap();
+
+            match conn.query(&format!("EXPLAIN {UPSERT}")).await {
+                Ok(rows) => {
+                    for row in &rows {
+                        let v = row.values();
+                        let cell = |i: usize| {
+                            v.get(i).map_or_else(
+                                || "-".to_owned(),
+                                |value| match value {
+                                    SqliteValue::Integer(n) => n.to_string(),
+                                    SqliteValue::Text(t) => t.as_str().to_owned(),
+                                    other => format!("{other:?}"),
+                                },
+                            )
+                        };
+                        println!(
+                            "{:>4}  {:<18} p1={:<6} p2={:<6} p3={:<6} p4={}",
+                            cell(0),
+                            cell(1),
+                            cell(2),
+                            cell(3),
+                            cell(4),
+                            cell(5)
+                        );
+                    }
+                }
+                Err(error) => println!("EXPLAIN failed: {error}"),
+            }
 
             conn.close().await.unwrap();
         }

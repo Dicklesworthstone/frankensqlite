@@ -10632,16 +10632,27 @@ impl VdbeEngine {
                                 .table_move_to(&cursor.cx, rowid_val)
                                 .await?
                                 .is_found()
-                        } else if let Some(cursor) = self.cursors.get(&cursor_id) {
-                            if let Some(db) = self.db.as_ref() {
-                                if let Some(table) = db.get_table(cursor.root_page) {
-                                    table.find_by_rowid(rowid_val).is_some()
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
+                        } else if let Some(root_page) =
+                            self.cursors.get(&cursor_id).map(|cursor| cursor.root_page)
+                        {
+                            // bd-29phg: the storage branch above POSITIONS its
+                            // cursor via `table_move_to`, and the opcodes that
+                            // follow a successful probe (Rowid / Column /
+                            // Delete) are all cursor-relative. `find_by_rowid`
+                            // already returns the row index, so store it as the
+                            // MemCursor position instead of discarding it —
+                            // otherwise a TEMP cursor stays unpositioned and an
+                            // UPSERT's DO UPDATE body reads and rewrites the
+                            // wrong row.
+                            let found = self
+                                .db
+                                .as_ref()
+                                .and_then(|db| db.get_table(root_page))
+                                .and_then(|table| table.find_by_rowid(rowid_val));
+                            if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                                cursor.position = found;
                             }
+                            found.is_some()
                         } else {
                             false
                         }
@@ -10681,16 +10692,22 @@ impl VdbeEngine {
                                 .table_move_to(&cursor.cx, rowid_val)
                                 .await?
                                 .is_found()
-                        } else if let Some(cursor) = self.cursors.get(&cursor_id) {
-                            if let Some(db) = self.db.as_ref() {
-                                if let Some(table) = db.get_table(cursor.root_page) {
-                                    table.find_by_rowid(rowid_val).is_some()
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
+                        } else if let Some(root_page) =
+                            self.cursors.get(&cursor_id).map(|cursor| cursor.root_page)
+                        {
+                            // bd-29phg: position the MemCursor on a hit, for the
+                            // same reason as the NotFound/NotExists arm above —
+                            // the storage branch positions and the opcodes after
+                            // a taken branch are cursor-relative.
+                            let found = self
+                                .db
+                                .as_ref()
+                                .and_then(|db| db.get_table(root_page))
+                                .and_then(|table| table.find_by_rowid(rowid_val));
+                            if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                                cursor.position = found;
                             }
+                            found.is_some()
                         } else {
                             false
                         }
