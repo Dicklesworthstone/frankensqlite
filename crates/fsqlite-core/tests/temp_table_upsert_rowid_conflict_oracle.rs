@@ -551,3 +551,72 @@ fn unique_violation_names_the_conflicting_columns_like_stock() {
         }
     });
 }
+
+/// Guard against the obvious WRONG fix for **bd-5bq6u**.
+///
+/// SQLite's conflict resolutions differ on exactly this point:
+///   * ABORT (the default) backs out the changes made by the failed statement;
+///   * FAIL stops the statement but **does not** back out its prior changes.
+///
+/// So a statement-scoped undo region added for bd-5bq6u must honour
+/// `preserve_prior_changes_on_constraint_violation` — which `Connection`
+/// already computes as `or_conflict == Some(ConflictAction::Fail)`. An
+/// unconditional "roll the statement back on error" would fix the ABORT case
+/// and silently break this one.
+///
+/// Note the irony worth keeping in mind while fixing bd-5bq6u: on a TEMP table
+/// `OR FAIL` is correct *today* precisely because nothing rolls back. This test
+/// passes on both schemas now, and exists so that a naive fix turns it red
+/// instead of trading one defect for another.
+#[test]
+fn insert_or_fail_preserves_partial_rows_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            let ctx = format!("temporary={temporary}");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let ddl = format!(
+                "CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)"
+            );
+            stock.execute_batch(&ddl).unwrap();
+            conn.execute(&ddl).await.unwrap();
+            for sql in ["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"] {
+                stock.execute(sql, []).unwrap();
+                conn.execute(sql).await.unwrap();
+            }
+
+            // OR FAIL: the (19) row is written, then (NULL) violates NOT NULL.
+            // The statement stops, but the (19) row must SURVIVE.
+            let sql = "INSERT OR FAIL INTO g(v) VALUES(19),(NULL)";
+            let ctx = format!("{ctx}, sql={sql}");
+            let stock_error = stock.execute(sql, []).unwrap_err().to_string();
+            assert!(
+                stock_error.contains("NOT NULL"),
+                "stock: {ctx}: {stock_error}"
+            );
+            let error = conn.execute(sql).await.expect_err(&ctx).to_string();
+            assert!(error.contains("NOT NULL"), "{ctx}: {error}");
+
+            // Pin the surviving row explicitly as well as comparing engines, so
+            // this still fails loudly if BOTH engines were to start discarding
+            // it for some reason.
+            let expected_ids = stock
+                .prepare("SELECT id FROM g ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                expected_ids,
+                vec![1, 2, 3],
+                "stock must keep the partial OR FAIL row: {ctx}"
+            );
+            assert_same_rows(&conn, &stock, "g", &ctx).await;
+
+            conn.close().await.unwrap();
+        }
+    });
+}
