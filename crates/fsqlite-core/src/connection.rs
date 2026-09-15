@@ -74,7 +74,7 @@ use fsqlite_ast::{
 };
 use fsqlite_btree::cursor::{
     TableLeafDeleteRun, TableLeafDeleteRunDelete, TableLeafDeleteRunMissReason,
-    TableLeafPayloadPatchRun, TransactionPageIo,
+    TableLeafPayloadPatchRun, TeardownTask, TransactionPageIo,
 };
 use fsqlite_btree::{
     BtreeCopyProfileSnapshot, BtreeCursorOps, BtreeLeafReuseSnapshot, PageReader, PageWriter,
@@ -62407,10 +62407,15 @@ impl Connection {
 
     /// Number of pages a single teardown batch frees before committing.
     ///
-    /// Bounds the working set of a DROP / table teardown: at 4 KiB pages this
-    /// keeps peak page-pool residency near 8 MiB per batch regardless of table
-    /// size, instead of pulling the whole b-tree into the pool in one
+    /// Pages freed per DROP / table-teardown batch, bounding the transaction's
+    /// working set instead of pulling the whole b-tree into the pool in one
     /// transaction and exhausting the buffer pool (bd-pirr5, GH#371).
+    ///
+    /// This is a count of freed pages, not a measured residency figure: buffers
+    /// are dropped as pages are freed (`forget_page`), so the pool holds far
+    /// fewer than 2048 pages, while the batch transaction's own freed-page
+    /// bookkeeping does grow with the batch. Every freed page — b-tree and
+    /// overflow alike — costs exactly one unit of this budget (bd-fmhvo).
     const TEARDOWN_BATCH_PAGES: usize = 2048;
 
     /// Free all pages of a B-tree (table or index) back to the pager freelist.
@@ -62430,7 +62435,8 @@ impl Connection {
         // ROWID) table keeps a bounded working set instead of materializing the
         // whole tree in the page pool of one transaction. The DFS frontier
         // (`pending`, page numbers only) survives across transactions; a page
-        // is freed only after its children are pushed onto it, so a committed
+        // is freed only after everything still reachable through it — children
+        // and overflow heads (bd-fmhvo) — is on the frontier, so a committed
         // batch never leaves a page that is unreachable from `pending`. In
         // autocommit each batch commits (bounding memory); inside an explicit
         // transaction the batches share that transaction and stay atomic — a
@@ -62438,7 +62444,7 @@ impl Connection {
         // sqlite_master row is removed first (execute_drop_single) so a crash
         // between committed batches leaks recoverable pages, never a dangling
         // table.
-        let mut pending = vec![root_page];
+        let mut pending = vec![TeardownTask::Subtree(root_page)];
         while !pending.is_empty() {
             // Move the DFS frontier into the batch's transaction and take it back
             // when the batch commits, so nothing is borrowed across the `.await`.

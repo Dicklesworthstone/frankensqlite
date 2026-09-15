@@ -5439,6 +5439,30 @@ impl IndexSeekBias {
     }
 }
 
+/// One unit of remaining work in a bounded b-tree teardown
+/// ([`BtCursor::free_subtree_pages_bounded`]).
+///
+/// The frontier is caller-owned and survives across the transactions a DROP
+/// drives its batches with, so every variant carries plain page numbers only.
+/// Splitting overflow work out of the b-tree walk is what makes the page
+/// budget an actual bound rather than a post-hoc count: a batch can now stop
+/// *inside* a long overflow chain and resume at the same page (bd-fmhvo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownTask {
+    /// Visit this b-tree page: queue its cells' overflow heads and its
+    /// children, then free the page itself.
+    Subtree(PageNumber),
+    /// Free this overflow page and queue its successor.
+    Overflow {
+        /// The overflow page to free.
+        page: PageNumber,
+        /// This page's 1-based position in its chain. Carried on the frontier
+        /// so the [`overflow::MAX_OVERFLOW_CHAIN`] corruption bound still
+        /// applies to the chain as a whole, across batch boundaries.
+        visited: usize,
+    },
+}
+
 impl<P: PageWriter> BtCursor<P> {
     /// Free all pages in the B-tree rooted at `page_no`, including `page_no`
     /// itself, any overflow chains attached to cells, and all child subtrees.
@@ -5451,7 +5475,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// instead drive `free_subtree_pages_bounded` across committed transactions
     /// so the working set stays bounded (bd-pirr5, GH#371).
     pub async fn free_subtree_pages(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        let mut pending = vec![page_no];
+        let mut pending = vec![TeardownTask::Subtree(page_no)];
         self.free_subtree_pages_bounded(cx, &mut pending, usize::MAX)
             .await
     }
@@ -5459,40 +5483,84 @@ impl<P: PageWriter> BtCursor<P> {
     /// Free up to `budget` pages of a subtree, resuming from a caller-owned DFS
     /// stack.
     ///
-    /// `pending` is the depth-first frontier of page numbers still to free;
-    /// seed it with the subtree root and call this repeatedly (each call in its
-    /// own committed write transaction) until `pending` is empty. Both b-tree
-    /// pages and the overflow-chain pages hanging off their cells count against
-    /// `budget`, so a single large-value leaf cannot pull an unbounded overflow
-    /// chain into the page pool. The stack holds only page numbers, so it
-    /// survives across transactions cheaply — that is what keeps a WITHOUT-ROWID
-    /// / large-table teardown from materializing the whole b-tree in the page
-    /// pool of one transaction and exhausting the buffer pool (bd-pirr5,
-    /// GH#371). A page whose children were already pushed is freed after them,
-    /// so committing between calls only ever leaves un-freed pages that are
-    /// still reachable from `pending`.
+    /// `pending` is the depth-first frontier of work still to do; seed it with
+    /// [`TeardownTask::Subtree`] over the subtree root and call this repeatedly
+    /// (each call in its own committed write transaction) until `pending` is
+    /// empty. Every freed page — b-tree pages and the overflow-chain pages
+    /// hanging off their cells alike — costs exactly one budget unit, and an
+    /// overflow chain is walked one page per unit with its successor left on
+    /// the frontier. A single large-value leaf therefore cannot carry the batch
+    /// past `budget` (bd-fmhvo); before that fix the chain was freed inline to
+    /// completion and only *counted* afterwards, so the budget bounded nothing.
+    ///
+    /// The frontier holds only page numbers, so it survives across
+    /// transactions cheaply — that is what keeps a WITHOUT-ROWID / large-table
+    /// teardown from materializing the whole b-tree in the page pool of one
+    /// transaction and exhausting the buffer pool (bd-pirr5, GH#371). A page is
+    /// freed only once everything still reachable through it (children,
+    /// overflow heads) is on the frontier, so committing between calls never
+    /// leaves an un-freed page that `pending` cannot reach.
     pub async fn free_subtree_pages_bounded(
         &mut self,
         cx: &Cx,
-        pending: &mut Vec<PageNumber>,
+        pending: &mut Vec<TeardownTask>,
         budget: usize,
     ) -> Result<()> {
+        // One masked child for the whole batch, so freeing an overflow page
+        // stays atomic between its read and its free without paying a
+        // `create_child` per page. Masking the child does not mask `cx`, so the
+        // top-of-loop checkpoint below still observes caller cancellation —
+        // that is what makes a long chain interruptible *between* pages.
+        let cleanup_cx = cx.create_child();
+        let _cleanup_mask = cleanup_cx.masked();
+
         let mut freed = 0usize;
         while freed < budget {
-            let Some(current_page) = pending.pop() else {
+            let Some(task) = pending.pop() else {
                 break;
             };
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+
+            let current_page = match task {
+                TeardownTask::Overflow { page, visited } => {
+                    if visited > overflow::MAX_OVERFLOW_CHAIN {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "overflow chain exceeds {} pages while freeing",
+                                overflow::MAX_OVERFLOW_CHAIN
+                            ),
+                        });
+                    }
+                    // The chain as a whole is interruptible between pages.
+                    // Nothing is stranded either way: the successor is on
+                    // `pending`, and an interrupt aborts the batch transaction,
+                    // which rolls the partial chain back.
+                    let next = self.free_overflow_page(&cleanup_cx, page).await?;
+                    if let Some(next) = next {
+                        pending.push(TeardownTask::Overflow {
+                            page: next,
+                            visited: visited + 1,
+                        });
+                    }
+                    freed += 1;
+                    continue;
+                }
+                TeardownTask::Subtree(page) => page,
+            };
+
             let page_data = self.pager.read_btree_page_data(cx, current_page).await?;
             let header = cell::parse_page_header(page_data.as_bytes(), current_page)?;
             let header_offset = cell::header_offset_for_page(current_page);
             let ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
 
-            // Free overflow chains on ALL cells (both interior and leaf).
+            // Collect the overflow heads on ALL cells (both interior and leaf).
             // Interior cells of index B-trees carry key payloads that can
-            // overflow; table B-tree interior cells only carry rowids. Charge
-            // the freed overflow pages against the budget so this page's chains
-            // cannot blow the working-set bound.
+            // overflow; table B-tree interior cells only carry rowids. These
+            // are queued on the frontier rather than freed inline, so each
+            // overflow page costs its own budget unit (bd-fmhvo). Capturing the
+            // head page numbers here is what frees this b-tree page to go now:
+            // nothing reads its cells again.
+            let mut overflow_heads = Vec::new();
             for ptr in &ptrs {
                 let cell = CellRef::parse(
                     page_data.as_bytes(),
@@ -5501,7 +5569,7 @@ impl<P: PageWriter> BtCursor<P> {
                     self.usable_size,
                 )?;
                 if let Some(first_overflow) = cell.overflow_page {
-                    freed += self.free_overflow_chain(cx, first_overflow).await?;
+                    overflow_heads.push(first_overflow);
                 }
             }
 
@@ -5521,7 +5589,7 @@ impl<P: PageWriter> BtCursor<P> {
                                     current_page.get()
                                 ),
                             })?;
-                    pending.push(left_child);
+                    pending.push(TeardownTask::Subtree(left_child));
                 }
 
                 let right_child =
@@ -5533,7 +5601,7 @@ impl<P: PageWriter> BtCursor<P> {
                                 current_page.get()
                             ),
                         })?;
-                pending.push(right_child);
+                pending.push(TeardownTask::Subtree(right_child));
             }
 
             self.pager.free_page(cx, current_page).await?;
@@ -5542,6 +5610,16 @@ impl<P: PageWriter> BtCursor<P> {
             // the whole b-tree in the page cache and exhaust the buffer pool.
             self.pager.forget_page(current_page);
             freed += 1;
+
+            // Pushed last so they pop first, keeping the pre-bd-fmhvo order in
+            // which a page's overflow chains are dismantled before the walk
+            // descends into its children.
+            for head in overflow_heads {
+                pending.push(TeardownTask::Overflow {
+                    page: head,
+                    visited: 1,
+                });
+            }
         }
         Ok(())
     }
@@ -6402,12 +6480,55 @@ impl<P: PageWriter> BtCursor<P> {
         .await
     }
 
-    /// Free an overflow chain, returning the number of pages freed.
+    /// Free one overflow page and return its successor, or `None` at the end
+    /// of the chain.
     ///
-    /// The count lets a bounded teardown ([`Self::free_subtree_pages_bounded`])
-    /// charge overflow pages against its per-batch page budget so a single
-    /// large-value cell cannot pull an unbounded chain into the page pool.
-    /// All other callers discard the count (bd-pirr5, GH#371).
+    /// Cancellation policy belongs to the caller, because the two callers need
+    /// different granularity. [`Self::free_overflow_chain`] runs the whole
+    /// chain under one masked child context, so a best-effort cleanup cannot
+    /// strand a half-freed chain behind an interrupt.
+    /// [`Self::free_subtree_pages_bounded`] instead drives one page per budget
+    /// unit under a per-page mask, so a long chain cannot overrun the batch
+    /// budget (bd-fmhvo).
+    async fn free_overflow_page(
+        &mut self,
+        cx: &Cx,
+        pgno: PageNumber,
+    ) -> Result<Option<PageNumber>> {
+        let page = self.pager.read_page_data(cx, pgno).await?;
+        let page_bytes = page.as_bytes();
+        if page_bytes.len() < 4 {
+            warn!(
+                page = pgno.get(),
+                page_len = page_bytes.len(),
+                "overflow chain corruption detected while freeing"
+            );
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("overflow page {} too small while freeing", pgno.get()),
+            });
+        }
+
+        let next = u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
+        self.pager.free_page(cx, pgno).await?;
+        // bd-pirr5 (GH#371): drop overflow pages from the pool as they are
+        // freed too, so a large-value teardown stays within a bounded working
+        // set (overflow pages dominate the size of the fts_messages case).
+        self.pager.forget_page(pgno);
+        Ok(PageNumber::new(next))
+    }
+
+    /// Free a whole overflow chain in one go, returning its length in pages.
+    ///
+    /// Runs under a single masked child context: once this best-effort cleanup
+    /// starts it must finish, so the statement cannot strand partially-freed
+    /// pages behind an interrupt. Every caller discards the count; it is
+    /// returned because the chain length is the quantity the
+    /// [`overflow::MAX_OVERFLOW_CHAIN`] corruption bound is stated over.
+    ///
+    /// Bounded teardown deliberately does **not** use this entry point — an
+    /// unbounded inline chain is exactly what made its page budget a post-hoc
+    /// count instead of a bound (bd-fmhvo). See
+    /// [`Self::free_subtree_pages_bounded`].
     async fn free_overflow_chain(&mut self, cx: &Cx, first: PageNumber) -> Result<usize> {
         let cleanup_cx = cx.create_child();
         let _mask = cleanup_cx.masked();
@@ -6415,8 +6536,6 @@ impl<P: PageWriter> BtCursor<P> {
         let mut visited = 0usize;
 
         while let Some(pgno) = current {
-            // Once overflow cleanup starts, finish the chain so the statement
-            // cannot strand partially-freed pages behind an interrupt.
             visited += 1;
             if visited > overflow::MAX_OVERFLOW_CHAIN {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -6427,27 +6546,7 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
-            let page = self.pager.read_page_data(&cleanup_cx, pgno).await?;
-            let page_bytes = page.as_bytes();
-            if page_bytes.len() < 4 {
-                warn!(
-                    page = pgno.get(),
-                    page_len = page_bytes.len(),
-                    "overflow chain corruption detected while freeing"
-                );
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("overflow page {} too small while freeing", pgno.get()),
-                });
-            }
-
-            let next =
-                u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
-            current = PageNumber::new(next);
-            self.pager.free_page(&cleanup_cx, pgno).await?;
-            // bd-pirr5 (GH#371): drop overflow pages from the pool as they are
-            // freed too, so a large-value teardown stays within a bounded working
-            // set (overflow pages dominate the size of the fts_messages case).
-            self.pager.forget_page(pgno);
+            current = self.free_overflow_page(&cleanup_cx, pgno).await?;
         }
 
         Ok(visited)
@@ -16364,6 +16463,164 @@ mod tests {
             assert_eq!(
                 reachable, all_pages,
                 "no unreachable pages should remain after collapsing the empty root"
+            );
+        });
+    }
+
+    /// bd-fmhvo: every freed page must cost exactly one budget unit.
+    ///
+    /// Before the fix `free_subtree_pages_bounded` freed a cell's whole
+    /// overflow chain inline and only *added* its length to `freed` afterwards,
+    /// so the first `budget = 1` call tore down the leaf and all of its
+    /// overflow pages at once. The budget was a post-hoc count, not a bound.
+    #[test]
+    fn test_bounded_teardown_charges_each_overflow_page_against_its_budget() {
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+            // One row whose payload spills into a long overflow chain.
+            let payload = vec![0xCD_u8; 100 * 1024];
+            cursor.table_insert(&cx, 1, &payload).await.unwrap();
+            assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
+            assert_eq!(cursor.payload(&cx).await.unwrap(), payload);
+
+            let initial = cursor.pager.pages.len();
+            assert!(
+                initial > 8,
+                "fixture must produce a multi-page overflow chain, got {initial} page(s)"
+            );
+
+            let mut pending = vec![TeardownTask::Subtree(root)];
+            let mut calls = 0usize;
+            while !pending.is_empty() {
+                let before = cursor.pager.pages.len();
+                cursor
+                    .free_subtree_pages_bounded(&cx, &mut pending, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    before - cursor.pager.pages.len(),
+                    1,
+                    "call {calls} must free exactly its one-page budget"
+                );
+                calls += 1;
+                assert!(
+                    calls <= initial,
+                    "teardown must make bounded progress, not revisit pages"
+                );
+            }
+
+            assert_eq!(
+                calls, initial,
+                "one page per call means exactly one call per owned page"
+            );
+            assert!(
+                cursor.pager.pages.is_empty(),
+                "the whole subtree must still be reclaimed: {:?}",
+                cursor.pager.pages.keys().collect::<BTreeSet<_>>()
+            );
+        });
+    }
+
+    /// bd-fmhvo: a zero budget must free nothing and leave the frontier intact,
+    /// so a caller that hands out no budget cannot silently tear anything down.
+    #[test]
+    fn test_bounded_teardown_zero_budget_frees_nothing() {
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            cursor
+                .table_insert(&cx, 1, &vec![0xAB_u8; 100 * 1024])
+                .await
+                .unwrap();
+
+            let before = cursor.pager.pages.clone();
+            let mut pending = vec![TeardownTask::Subtree(root)];
+            cursor
+                .free_subtree_pages_bounded(&cx, &mut pending, 0)
+                .await
+                .unwrap();
+
+            assert_eq!(pending, vec![TeardownTask::Subtree(root)]);
+            assert_eq!(
+                cursor.pager.pages.len(),
+                before.len(),
+                "a zero budget must not free a page"
+            );
+        });
+    }
+
+    /// bd-fmhvo: a mid-sized budget over a multi-level tree whose rows all
+    /// carry overflow chains must still reclaim every page exactly once, with
+    /// no page freed twice and none left behind.
+    #[test]
+    fn test_bounded_teardown_multi_level_overflow_tree_reclaims_every_page_once() {
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+            for rowid in 1_i64..=40_i64 {
+                cursor
+                    .table_insert(&cx, rowid, &vec![rowid as u8; 20 * 1024])
+                    .await
+                    .unwrap();
+            }
+
+            let owned: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
+            // `collect_reachable_pages` walks b-tree structure only, so the
+            // overflow pages are the difference. Requiring both to be non-empty
+            // pins the fixture as a genuinely mixed b-tree + overflow tree.
+            let mut btree_pages = BTreeSet::new();
+            collect_reachable_pages(&cursor.pager, root, USABLE, &mut btree_pages);
+            assert!(
+                btree_pages.len() > 1 && owned.len() > btree_pages.len(),
+                "fixture must mix b-tree and overflow pages: {} b-tree of {} owned",
+                btree_pages.len(),
+                owned.len()
+            );
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            assert!(
+                BtreePageHeader::parse(root_page, 0)
+                    .unwrap()
+                    .page_type
+                    .is_interior(),
+                "fixture must build a multi-level tree"
+            );
+
+            const BUDGET: usize = 7;
+            let mut pending = vec![TeardownTask::Subtree(root)];
+            let mut total_freed = 0usize;
+            while !pending.is_empty() {
+                let before = cursor.pager.pages.len();
+                cursor
+                    .free_subtree_pages_bounded(&cx, &mut pending, BUDGET)
+                    .await
+                    .unwrap();
+                let freed = before - cursor.pager.pages.len();
+                assert!(
+                    freed <= BUDGET,
+                    "a batch freed {freed} pages against a {BUDGET}-page budget"
+                );
+                assert!(freed > 0, "a non-empty frontier must make progress");
+                total_freed += freed;
+            }
+
+            assert_eq!(
+                total_freed,
+                owned.len(),
+                "every owned page must be freed exactly once"
+            );
+            assert!(
+                cursor.pager.pages.is_empty(),
+                "leftover pages after teardown: {:?}",
+                cursor.pager.pages.keys().collect::<BTreeSet<_>>()
             );
         });
     }
