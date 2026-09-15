@@ -488,3 +488,66 @@ fn temp_statement_atomicity_inside_explicit_transaction() {
         }
     });
 }
+
+/// Regression guard for **bd-towj6**: a UNIQUE violation must name the columns
+/// that actually conflicted, on both schemas.
+///
+/// Before the fix the MemDatabase insert path OR-ed the rowid and secondary
+/// unique conflicts into one boolean and then unconditionally named the IPK
+/// column, so a conflict on `g.v` was reported as `g.id`; a second TEMP insert
+/// path reported the literal `TEMP table unique constraint`.
+#[test]
+fn unique_violation_names_the_conflicting_columns_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            let ctx = format!("temporary={temporary}");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let ddl = format!(
+                "CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER, a INTEGER, b INTEGER);\
+                 CREATE UNIQUE INDEX gu ON g(v);\
+                 CREATE UNIQUE INDEX gab ON g(a,b);"
+            );
+            stock.execute_batch(&ddl).unwrap();
+            conn.execute(&ddl).await.unwrap();
+            for sql in [
+                "INSERT INTO g(id,v,a,b) VALUES(1,10,100,200)",
+                "INSERT INTO g(id,v,a,b) VALUES(2,20,101,201)",
+            ] {
+                stock.execute(sql, []).unwrap();
+                conn.execute(sql).await.unwrap();
+            }
+
+            for (label, sql) in [
+                // Rowid/IPK collision: bd-977wx's behaviour, must be preserved.
+                ("ipk", "INSERT INTO g(id,v,a,b) VALUES(1,30,102,202)"),
+                // Single-column secondary UNIQUE.
+                ("single", "INSERT INTO g(id,v,a,b) VALUES(3,10,103,203)"),
+                // Composite secondary UNIQUE: stock lists every column.
+                ("composite", "INSERT INTO g(id,v,a,b) VALUES(4,40,100,200)"),
+            ] {
+                let ctx = format!("{ctx}, case={label}, sql={sql}");
+                let expected = stock.execute(sql, []).unwrap_err().to_string();
+                let actual = conn.execute(sql).await.expect_err(&ctx).to_string();
+                assert!(
+                    expected.contains("UNIQUE constraint failed:"),
+                    "stock: {ctx}: {expected}"
+                );
+                let expected_cols = expected
+                    .rsplit("UNIQUE constraint failed:")
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                assert!(
+                    actual.contains(&format!("UNIQUE constraint failed: {expected_cols}")),
+                    "{ctx}\n  stock   = {expected}\n  fsqlite = {actual}"
+                );
+            }
+
+            conn.close().await.unwrap();
+        }
+    });
+}

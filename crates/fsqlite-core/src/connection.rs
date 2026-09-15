@@ -62067,9 +62067,13 @@ impl Connection {
                                     "canonical autoindex layout lost a validated column",
                                 ));
                             };
-                            mem_table.add_unique_column_group_with_collations(
+                            mem_table.add_unique_column_group_labeled(
                                 col_indices,
                                 slot.definition.key_collations.clone(),
+                                qualified_unique_constraint_label(
+                                    &table_name,
+                                    slot.definition.columns.iter().map(String::as_str),
+                                ),
                             );
                         }
                     }
@@ -66083,7 +66087,14 @@ impl Connection {
                     name: table_name.clone(),
                 })?;
             if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
-                table.add_unique_column_group_with_collations(columns, key_collations.clone());
+                table.add_unique_column_group_labeled(
+                    columns,
+                    key_collations.clone(),
+                    qualified_unique_constraint_label(
+                        table_name,
+                        col_names.iter().map(String::as_str),
+                    ),
+                );
             }
         }
 
@@ -78958,9 +78969,13 @@ impl Connection {
                         continue;
                     };
                     if !columns.is_empty() {
-                        mem_table.add_unique_column_group_with_collations(
+                        mem_table.add_unique_column_group_labeled(
                             columns,
                             index.key_collations.clone(),
+                            qualified_unique_constraint_label(
+                                &temp_schema.name,
+                                index.columns.iter().map(String::as_str),
+                            ),
                         );
                     }
                 }
@@ -96268,9 +96283,13 @@ impl Connection {
                                 });
                             };
                             if !column_indices.is_empty() {
-                                mem_table.add_unique_column_group_with_collations(
+                                mem_table.add_unique_column_group_labeled(
                                     column_indices,
                                     slot.key_collations().to_vec(),
+                                    qualified_unique_constraint_label(
+                                        name.as_str(),
+                                        slot.columns().iter().map(String::as_str),
+                                    ),
                                 );
                             }
                         }
@@ -147792,6 +147811,29 @@ fn for_each_column_ref_in_expr(expr: &Expr, visit: &mut impl FnMut(&ColumnRef)) 
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => {}
     }
+}
+
+/// bd-towj6: the qualified label stock SQLite reports for a UNIQUE violation —
+/// `t.a` for one column, `t.a, t.b` for a composite constraint.
+///
+/// `MemTable` stores column positions and knows no names, so this is built
+/// where the constraint is registered and carried on the constraint itself.
+/// Returns `None` for an empty column list, which leaves the engine's previous
+/// wording in place rather than reporting an empty label.
+pub(crate) fn qualified_unique_constraint_label<'a>(
+    table_name: &str,
+    column_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut label = String::new();
+    for name in column_names {
+        if !label.is_empty() {
+            label.push_str(", ");
+        }
+        label.push_str(table_name);
+        label.push('.');
+        label.push_str(name);
+    }
+    (!label.is_empty()).then_some(label)
 }
 
 fn find_column_index_case_insensitive(column_names: &[String], target: &str) -> Option<usize> {
