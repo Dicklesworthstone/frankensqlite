@@ -12,17 +12,20 @@
 //! when a column carries a generated expression. A failure in this file is
 //! therefore independent of that work.
 //!
-//! Current state of the three bd-29phg symptoms:
+//! State of the three symptoms originally filed as bd-29phg:
 //!   1. upsert inserting a duplicate — FIXED, guarded by
 //!      `temp_table_upsert_on_rowid_alias_matches_stock_sqlite` (runs by default);
-//!   2. failed multi-row INSERT keeping its partial row — still open,
+//!   2. a failed statement leaving partial rows — open as **bd-5bq6u**,
 //!      `temp_table_failed_multi_row_insert_is_atomic_like_stock` (`#[ignore]`d);
-//!   3. a UNIQUE violation naming the wrong column — still open, visible in the
-//!      Q5 line of `temp_table_constraint_lane_diagnostic` (`#[ignore]`d).
+//!   3. a UNIQUE violation naming the wrong column — open as **bd-towj6**,
+//!      visible in the Q5 line of `temp_table_constraint_lane_diagnostic`.
 //!
-//! The two `#[ignore]`d investigation aids (`temp_table_constraint_lane_diagnostic`
-//! and `temp_vs_main_upsert_program_dump`) print characterisations rather than
-//! asserting; run them with
+//! Three `#[ignore]`d investigation aids print characterisations rather than
+//! asserting — `temp_table_constraint_lane_diagnostic` (which layer of the TEMP
+//! lane is wrong), `temp_vs_main_upsert_program_dump` (the program comparison
+//! that ruled codegen out for symptom 1), and
+//! `temp_statement_atomicity_blast_radius` (which statement shapes bd-5bq6u
+//! affects). Run them with
 //! `cargo test -p fsqlite-core --test temp_table_upsert_rowid_conflict_oracle -- --ignored --nocapture`.
 
 use fsqlite_core::connection::Connection;
@@ -119,7 +122,7 @@ fn temp_table_upsert_on_rowid_alias_matches_stock_sqlite() {
 /// bd-fjieg.5. It is the plain-NOT-NULL analogue of the divergence the .5
 /// oracle hits on its TEMP arm with `INSERT INTO g(v) VALUES(19),(0)`.
 #[test]
-#[ignore = "bd-29phg: failed multi-row INSERT leaves a partial row on a TEMP table"]
+#[ignore = "bd-5bq6u: a failed statement leaves partial rows on a TEMP table"]
 fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
     asupersync::test_utils::run_test(|| async {
         for temporary in [false, true] {
@@ -295,6 +298,96 @@ fn temp_vs_main_upsert_program_dump() {
             }
 
             conn.close().await.unwrap();
+        }
+    });
+}
+
+/// bd-5bq6u blast-radius probe: is the missing statement-level undo on the TEMP
+/// lane confined to INSERT, or does it also affect UPDATE and INSERT ... SELECT?
+///
+/// That question decides the shape of the fix — an INSERT-only undo log needs
+/// just the inserted rowids, whereas UPDATE needs pre-images — so measure it
+/// rather than assume. Prints every case instead of stopping at the first
+/// divergence.
+#[test]
+#[ignore = "bd-5bq6u blast-radius probe; prints a characterisation, run explicitly"]
+fn temp_statement_atomicity_blast_radius() {
+    asupersync::test_utils::run_test(|| async {
+        let cases: [(&str, &[&str], &str); 4] = [
+            (
+                "multi-row INSERT, row 2 fails",
+                &["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"],
+                "INSERT INTO g(v) VALUES(19),(NULL)",
+            ),
+            (
+                "multi-row INSERT, row 3 fails",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT INTO g(v) VALUES(19),(21),(NULL)",
+            ),
+            (
+                "multi-row UPDATE, later row fails",
+                &[
+                    "INSERT INTO g(v) VALUES(5)",
+                    "INSERT INTO g(v) VALUES(7)",
+                    "INSERT INTO g(v) VALUES(9)",
+                ],
+                "UPDATE g SET v = CASE WHEN id < 3 THEN v + 100 ELSE NULL END",
+            ),
+            (
+                "INSERT ... SELECT, later row fails",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT INTO g(v) SELECT CASE WHEN x = 2 THEN NULL ELSE x END \
+                 FROM (SELECT 1 AS x UNION ALL SELECT 2)",
+            ),
+        ];
+
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            println!("\n######## temporary={temporary} ########");
+
+            for (label, setup, failing) in &cases {
+                let conn = Connection::open(":memory:").await.unwrap();
+                let stock = rusqlite::Connection::open_in_memory().unwrap();
+                let ddl =
+                    format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+                stock.execute_batch(&ddl).unwrap();
+                conn.execute(&ddl).await.unwrap();
+                for sql in *setup {
+                    stock.execute(sql, []).unwrap();
+                    conn.execute(sql).await.unwrap();
+                }
+
+                let stock_failed = stock.execute(failing, []).is_err();
+                let fsqlite_failed = conn.execute(failing).await.is_err();
+
+                let read = "SELECT id,v FROM g ORDER BY id";
+                let expected = stock
+                    .prepare(read)
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let actual = conn
+                    .query(read)
+                    .await
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| match (&row.values()[0], &row.values()[1]) {
+                                (SqliteValue::Integer(a), SqliteValue::Integer(b)) => (*a, *b),
+                                _ => (-1, -1),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                println!(
+                    "{label}\n  stmt         = {failing}\n  errored      stock={stock_failed} fsqlite={fsqlite_failed}\n  stock rows   = {expected:?}\n  fsqlite rows = {actual:?}\n  ATOMIC       = {}",
+                    if expected == actual { "yes" } else { "NO" }
+                );
+
+                conn.close().await.unwrap();
+            }
         }
     });
 }
