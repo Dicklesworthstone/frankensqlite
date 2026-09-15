@@ -137,3 +137,81 @@ fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
         }
     });
 }
+
+/// Diagnostic ladder for **bd-29phg**: isolates *which* layer of the TEMP lane
+/// is wrong, by asking the narrowest questions in order. Each step prints its
+/// result rather than stopping at the first divergence, so one run characterises
+/// the whole defect.
+///
+/// Q1/Q2 — can the TEMP lane even *find* a row by its rowid alias? The upsert
+/// conflict probe locates the conflicting row with exactly such a SELECT.
+/// Q3 — is the implicit rowid/PRIMARY KEY uniqueness enforced at all?
+/// Q4 — is an explicit rowid honoured on insert?
+/// Q5 — is a secondary UNIQUE index enforced?
+#[test]
+#[ignore = "bd-29phg diagnostic ladder; prints a characterisation, run explicitly"]
+fn temp_table_constraint_lane_diagnostic() {
+    asupersync::test_utils::run_test(|| async {
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            println!("\n######## temporary={temporary} ########");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let ddl = format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER)");
+            stock.execute_batch(&ddl).unwrap();
+            conn.execute(&ddl).await.unwrap();
+            for sql in ["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"] {
+                stock.execute(sql, []).unwrap();
+                conn.execute(sql).await.unwrap();
+            }
+
+            for (label, sql) in [
+                ("Q1 find by ipk      ", "SELECT id,v FROM g WHERE id=1"),
+                ("Q2 project rowid    ", "SELECT rowid,id,v FROM g WHERE id=1"),
+            ] {
+                let got = conn.query(sql).await;
+                println!(
+                    "{label} {sql}\n      fsqlite = {:?}",
+                    got.map(|rows| rows
+                        .iter()
+                        .map(|r| r.values().to_vec())
+                        .collect::<Vec<_>>())
+                );
+            }
+
+            for (label, sql) in [
+                ("Q3 dup explicit pk  ", "INSERT INTO g(id,v) VALUES(1,99)"),
+                ("Q4 fresh explicit pk", "INSERT INTO g(id,v) VALUES(50,50)"),
+            ] {
+                let stock_res = stock.execute(sql, []).map_err(|e| e.to_string());
+                let fs_res = conn.execute(sql).await.map_err(|e| e.to_string());
+                println!("{label} {sql}\n      stock   = {stock_res:?}\n      fsqlite = {fs_res:?}");
+            }
+
+            let idx = "CREATE UNIQUE INDEX gu ON g(v)";
+            stock.execute_batch(idx).unwrap();
+            conn.execute(idx).await.unwrap();
+            let sql = "INSERT INTO g(v) VALUES(7)";
+            let stock_res = stock.execute(sql, []).map_err(|e| e.to_string());
+            let fs_res = conn.execute(sql).await.map_err(|e| e.to_string());
+            println!("Q5 unique index      {sql}\n      stock   = {stock_res:?}\n      fsqlite = {fs_res:?}");
+
+            let read = "SELECT id,v FROM g ORDER BY id";
+            let expected = stock
+                .prepare(read)
+                .unwrap()
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let actual = conn.query(read).await.unwrap();
+            println!(
+                "FINAL stock   = {expected:?}\nFINAL fsqlite = {:?}",
+                actual.iter().map(|r| r.values().to_vec()).collect::<Vec<_>>()
+            );
+
+            conn.close().await.unwrap();
+        }
+    });
+}

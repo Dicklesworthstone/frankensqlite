@@ -184,8 +184,14 @@ fn virtual_generated_not_null_writes_match_stock_sqlite() {
                         //   * a multi-row INSERT whose later row fails a
                         //     constraint keeps the earlier row instead of rolling
                         //     the statement back;
-                        //   * a UNIQUE index is not enforced (`INSERT INTO g(v)
-                        //     VALUES(7)` returns Ok where stock raises UNIQUE).
+                        //   * a UNIQUE violation names the wrong column in its
+                        //     message (g.id for a conflict on g.v).
+                        // Plus bd-01uq7, which IS generated-column specific and
+                        // is why `INSERT INTO g(v) VALUES(7)` returns Ok here
+                        // where stock raises UNIQUE: this table's unique index
+                        // g_n is keyed on the VIRTUAL column n, and on TEMP that
+                        // index registers against the stored NULL placeholder
+                        // rather than the computed value, so it never fires.
                         // These are independent of this fix and would mask, not
                         // test, the VIRTUAL NOT NULL behaviour. The main-schema
                         // arms still run every statement, so DO UPDATE, OR
