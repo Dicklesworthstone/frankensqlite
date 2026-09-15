@@ -547,6 +547,12 @@ impl Default for RegisterAllocator {
 
 // ── VDBE Program Builder ────────────────────────────────────────────────────
 
+#[derive(Debug, Default)]
+struct GeneratedColumnEmission {
+    active: Vec<(usize, usize)>,
+    error: Option<String>,
+}
+
 /// A VDBE bytecode program under construction.
 ///
 /// Provides methods to emit instructions, create/resolve labels for forward
@@ -569,6 +575,8 @@ pub struct ProgramBuilder {
     table_index_meta: HashMap<i32, Vec<fsqlite_types::opcode::IndexCursorMeta>>,
     /// Schema-owned expression surrounding the current emission, if any.
     schema_evaluation_context: Option<SchemaEvaluationContext>,
+    /// Allocated only when expanding a VIRTUAL generated column.
+    generated_column_emission: Option<Box<GeneratedColumnEmission>>,
 }
 
 impl ProgramBuilder {
@@ -582,6 +590,7 @@ impl ProgramBuilder {
             next_aux_cursor: 16_384,
             table_index_meta: HashMap::new(),
             schema_evaluation_context: None,
+            generated_column_emission: None,
         }
     }
 
@@ -880,6 +889,13 @@ impl ProgramBuilder {
 
     /// Validate all labels are resolved and return the finished program.
     pub fn finish(self) -> Result<VdbeProgram> {
+        if let Some(emission) = self.generated_column_emission
+            && let Some(message) = emission.error
+        {
+            // Reject before execution, including for an empty table where a
+            // runtime Halt inside the row loop would never be reached.
+            return Err(FrankenError::FunctionError(message));
+        }
         // Check for unresolved labels.
         for (i, state) in self.labels.iter().enumerate() {
             if let LabelState::Unresolved(refs) = state

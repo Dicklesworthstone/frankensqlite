@@ -1,0 +1,139 @@
+//! Stock-oracle keeper for `INSERT ... ON CONFLICT(<rowid alias>) DO UPDATE`
+//! on a TEMP table.
+//!
+//! The main-schema form of this statement has long been covered; the TEMP-schema
+//! form was not. It surfaced while bringing up the bd-fjieg.5 generated-column
+//! oracle, whose TEMP arm is simply the first matrix cell that ever reached an
+//! upsert on a TEMP table.
+//!
+//! Deliberately uses a table with **no generated columns at all**, so the
+//! bd-fjieg.5/.6 codegen paths (`emit_virtual_generated_column`, the VIRTUAL
+//! branch of `emit_not_null_constraints`) are inert here — they are entered only
+//! when a column carries a generated expression. A failure in this file is
+//! therefore independent of that work.
+
+use fsqlite_core::connection::Connection;
+use fsqlite_types::SqliteValue;
+
+/// Read `SELECT id, v FROM <table> ORDER BY id` from both engines and compare.
+async fn assert_same_rows(conn: &Connection, stock: &rusqlite::Connection, table: &str, ctx: &str) {
+    let sql = format!("SELECT id, v FROM {table} ORDER BY id");
+    let expected = stock
+        .prepare(&sql)
+        .unwrap()
+        .query_map([], |row| {
+            Ok(vec![
+                SqliteValue::Integer(row.get(0)?),
+                SqliteValue::Integer(row.get(1)?),
+            ])
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let actual = conn
+        .query(&sql)
+        .await
+        .unwrap_or_else(|error| panic!("{ctx}: read: {error}"))
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "{ctx}");
+}
+
+/// KNOWN-RED on the `temporary=true` arm — this is the executable repro for
+/// **bd-29phg**, not a passing guard. The `temporary=false` arm passes.
+///
+/// Ignored so it does not break the default suite while the defect is open;
+/// run it explicitly with
+/// `cargo test -p fsqlite-core --test temp_table_upsert_rowid_conflict_oracle -- --ignored`.
+/// Remove the `#[ignore]` as part of fixing bd-29phg.
+///
+/// Last run 2026-09-15 on vmi1264463 against 0a5335a86 + the bd-fjieg.5/.6/.7
+/// candidate: FAILED on `temporary=true`, `INSERT INTO g(id,v) VALUES(1,13)
+/// ON CONFLICT(id) DO UPDATE SET v=excluded.v` —
+/// fsqlite `[[1,5],[2,7],[3,13]]` vs stock `[[1,13],[2,7]]`.
+#[test]
+#[ignore = "bd-29phg: TEMP upsert inserts a duplicate instead of updating; repro kept executable"]
+fn temp_table_upsert_on_rowid_alias_matches_stock_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            let ctx = format!("temporary={temporary}");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+
+            let ddl = format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER)");
+            stock.execute_batch(&ddl).unwrap();
+            conn.execute(&ddl).await.unwrap();
+
+            for sql in [
+                "INSERT INTO g(v) VALUES(5)",
+                "INSERT INTO g(v) VALUES(7)",
+                // The statement under test: an explicit rowid that collides
+                // with an existing row must take the DO UPDATE branch, not
+                // insert a fresh row under a newly allocated rowid.
+                "INSERT INTO g(id,v) VALUES(1,13) ON CONFLICT(id) DO UPDATE SET v=excluded.v",
+                // The DO NOTHING branch of the same shape.
+                "INSERT INTO g(id,v) VALUES(2,99) ON CONFLICT(id) DO NOTHING",
+                // A non-colliding explicit rowid still inserts.
+                "INSERT INTO g(id,v) VALUES(9,21) ON CONFLICT(id) DO UPDATE SET v=excluded.v",
+            ] {
+                let expected = stock.execute(sql, []);
+                let actual = conn.execute(sql).await;
+                let ctx = format!("{ctx}, sql={sql}");
+                assert_eq!(
+                    actual.unwrap_or_else(|error| panic!("{ctx}: {error}")),
+                    expected.unwrap_or_else(|error| panic!("stock: {ctx}: {error}")),
+                    "{ctx}: affected row count"
+                );
+                assert_same_rows(&conn, &stock, "g", &ctx).await;
+            }
+
+            conn.close().await.unwrap();
+        }
+    });
+}
+
+/// KNOWN-RED on the `temporary=true` arm — executable repro for **bd-29phg**'s
+/// second symptom: a multi-row INSERT that violates NOT NULL on its *second*
+/// row must leave the table untouched, but on a TEMP table the first row
+/// survives the failed statement.
+///
+/// Again deliberately **no generated columns**, so this is independent of
+/// bd-fjieg.5. It is the plain-NOT-NULL analogue of the divergence the .5
+/// oracle hits on its TEMP arm with `INSERT INTO g(v) VALUES(19),(0)`.
+#[test]
+#[ignore = "bd-29phg: failed multi-row INSERT leaves a partial row on a TEMP table"]
+fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for temporary in [false, true] {
+            let keyword = if temporary { "TEMP " } else { "" };
+            let ctx = format!("temporary={temporary}");
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+
+            let ddl = format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+            stock.execute_batch(&ddl).unwrap();
+            conn.execute(&ddl).await.unwrap();
+
+            for sql in ["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"] {
+                stock.execute(sql, []).unwrap();
+                conn.execute(sql).await.unwrap();
+            }
+
+            // Second row violates NOT NULL: the whole statement must roll back.
+            let sql = "INSERT INTO g(v) VALUES(19),(NULL)";
+            let ctx = format!("{ctx}, sql={sql}");
+            let stock_error = stock.execute(sql, []).unwrap_err().to_string();
+            assert!(stock_error.contains("NOT NULL"), "stock: {ctx}: {stock_error}");
+            let error = conn.execute(sql).await.expect_err(&ctx).to_string();
+            assert!(error.contains("NOT NULL"), "{ctx}: {error}");
+
+            assert_same_rows(&conn, &stock, "g", &ctx).await;
+
+            conn.close().await.unwrap();
+        }
+    });
+}

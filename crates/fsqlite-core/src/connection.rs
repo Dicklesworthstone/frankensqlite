@@ -144458,8 +144458,14 @@ fn invoke_scalar_for_sync_evaluation(
     let collation = if resolved.consumes_argument_collation() {
         let collation = collation_name
             .map(|collation_name| {
+                // VIRTUAL row inflation can run without a join context.
+                // Match the pattern-operator fallback for builtin names;
+                // an installed context retains its application overrides.
                 with_current_join_eval_collation_context(|context| {
-                    context.and_then(|context| context.registry.find(collation_name))
+                    context.map_or_else(
+                        || CollationRegistry::new().find(collation_name),
+                        |context| context.registry.find(collation_name),
+                    )
                 })
                 .ok_or_else(|| {
                     FrankenError::function_error(format!(

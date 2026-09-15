@@ -27633,6 +27633,94 @@ fn virtual_generated_column_expr(col: &ColumnInfo) -> Option<Expr> {
     parse_default_expr(col.generated_expr.as_ref()?)
 }
 
+/// Expand one VIRTUAL column while detecting recursive schema references.
+/// All recursion retains the same borrowed TableSchema, so its address is
+/// an identity token only; it is never dereferenced or retained past codegen.
+/// Root-page numbers are insufficient because main and TEMP can share them.
+fn emit_virtual_generated_column(
+    b: &mut ProgramBuilder,
+    column_index: usize,
+    expr: &Expr,
+    reg: i32,
+    scan: &ScanCtx<'_>,
+) {
+    let key = (std::ptr::from_ref(scan.table).addr(), column_index);
+    let state = b.generated_column_emission.get_or_insert_with(Default::default);
+    if state.error.is_some() {
+        return;
+    }
+    // A long cycle must be found before recursive emission consumes the
+    // native stack. Short chains need only the cheap active-stack check.
+    if state.active.len() == 32
+        && let Some(cycle) = virtual_generated_dependency_cycle(scan, column_index)
+    {
+        state.error = Some(format!(
+            "generated column loop on \"{}\"",
+            scan.table.columns[cycle].name
+        ));
+        return;
+    }
+    if state.active.contains(&key) {
+        state.error = Some(format!(
+            "generated column loop on \"{}\"",
+            scan.table.columns[column_index].name
+        ));
+        return;
+    }
+    state.active.push(key);
+    b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
+        emit_expr(b, expr, reg, Some(scan));
+    });
+    let popped = b
+        .generated_column_emission
+        .as_mut()
+        .expect("VIRTUAL emission owns its active stack")
+        .active
+        .pop();
+    debug_assert_eq!(popped, Some(key));
+    emit_single_column_affinity(b, reg, scan.table.columns[column_index].affinity);
+}
+
+/// Traverse generated-column dependencies without recursive column expansion.
+/// STORED/plain columns terminate the walk, just as their reads emit Copy or
+/// Column rather than another generated expression. This is not STORED-cycle
+/// or CREATE-phase validation.
+fn virtual_generated_dependency_cycle(scan: &ScanCtx<'_>, start: usize) -> Option<usize> {
+    let mut state = vec![0_u8; scan.table.columns.len()];
+    let mut pending = vec![(start, false)];
+    while let Some((index, leaving)) = pending.pop() {
+        if leaving {
+            state[index] = 2;
+            continue;
+        }
+        match state[index] {
+            1 => return Some(index),
+            2 => continue,
+            _ => {}
+        }
+        let Some(expr) = virtual_generated_column_expr(&scan.table.columns[index]) else {
+            continue;
+        };
+        state[index] = 1;
+        pending.push((index, true));
+        let dependencies = std::cell::RefCell::new(Vec::new());
+        // Reuse the expression-column visitor; this callback never rejects a
+        // reference, and only records the VIRTUAL references codegen expands.
+        let _ = validate_expr_columns_with(&expr, &|reference| {
+            if reference.table.as_deref().is_none_or(|qualifier| {
+                matches_table_or_alias(qualifier, scan.table, scan.table_alias)
+            }) && let Some(dependency) = scan.table.column_index(&reference.column)
+                && scan.table.columns[dependency].generated_stored == Some(false)
+            {
+                dependencies.borrow_mut().push(dependency);
+            }
+            Ok(())
+        });
+        pending.extend(dependencies.into_inner().into_iter().rev().map(|index| (index, false)));
+    }
+    None
+}
+
 /// bd-r3303: emit `Opcode::Affinity` to coerce a single register to a column's
 /// declared type affinity. Used after computing a VIRTUAL generated column on
 /// read, mirroring the per-column affinity that record packing applies to
@@ -27681,10 +27769,7 @@ fn emit_table_column_read(
             register_base: None,
             secondaries: &[],
         };
-        b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
-            emit_expr(b, &gen_expr, reg, Some(&scan));
-        });
-        emit_single_column_affinity(b, reg, col.affinity);
+        emit_virtual_generated_column(b, col_idx, &gen_expr, reg, &scan);
     } else {
         b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
     }
@@ -27795,7 +27880,24 @@ fn emit_not_null_constraints(
 
     for (col_idx, col) in table.columns.iter().enumerate() {
         if (col.notnull || wr_pk.contains(&col_idx)) && !col.is_ipk {
-            let reg = val_regs + col_idx as i32;
+            let reg = if let Some(expr) = virtual_generated_column_expr(col) {
+                // VIRTUAL columns retain a NULL record placeholder. Evaluate
+                // their value in scratch storage for the constraint, just as
+                // CHECK and index expressions resolve virtual column reads.
+                let scratch = b.alloc_reg();
+                let gen_ctx = ScanCtx {
+                    cursor: 0,
+                    table,
+                    table_alias: None,
+                    schema: None,
+                    register_base: Some(val_regs),
+                    secondaries: &[],
+                };
+                emit_virtual_generated_column(b, col_idx, &expr, scratch, &gen_ctx);
+                scratch
+            } else {
+                val_regs + col_idx as i32
+            };
             let ok_label = b.emit_label();
             b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
             // A statement-level `INSERT OR <algo>` overrides the column's
@@ -28276,10 +28378,7 @@ fn emit_table_column_read_from_register_row(
             register_base: Some(source_base),
             secondaries: &[],
         };
-        b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
-            emit_expr(b, &generated_expr, target, Some(&scan));
-        });
-        emit_single_column_affinity(b, target, column.affinity);
+        emit_virtual_generated_column(b, column_index, &generated_expr, target, &scan);
     } else {
         b.emit_op(
             Opcode::Copy,
@@ -34728,11 +34827,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                         // index key over it, or a STORED column / CHECK constraint
                         // that reads it — recompute it from the sibling column
                         // registers and coerce to its declared affinity.
-                        b.with_schema_evaluation_context(
-                            SchemaEvaluationContext::GeneratedColumn,
-                            |b| emit_expr(b, &gen_expr, reg, Some(sc)),
-                        );
-                        emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
+                        emit_virtual_generated_column(b, col_idx, &gen_expr, reg, sc);
                     } else {
                         b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
                     }
@@ -34752,11 +34847,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     // referenced base columns resolve through this same path),
                     // then coerce to the column's declared affinity — matching
                     // what record packing applies to STORED columns at write.
-                    b.with_schema_evaluation_context(
-                        SchemaEvaluationContext::GeneratedColumn,
-                        |b| emit_expr(b, &gen_expr, reg, Some(sc)),
-                    );
-                    emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
+                    emit_virtual_generated_column(b, col_idx, &gen_expr, reg, sc);
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
                 }
@@ -56691,6 +56782,140 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    #[test]
+    fn test_codegen_virtual_generated_cycles_fail_before_execution() {
+        for two_columns in [false, true] {
+            let mut table = test_schema_with_virtual_generated().remove(0);
+            table.columns[2].notnull = true;
+            table.columns[2].generated_expr = Some(if two_columns {
+                "b + 1".to_owned()
+            } else {
+                "c + 1".to_owned()
+            });
+            if two_columns {
+                table.columns[1].generated_expr = Some("c + 1".to_owned());
+                table.columns[1].generated_stored = Some(false);
+            }
+            for entry in ["cursor", "register", "not_null", "index"] {
+                let mut builder = ProgramBuilder::new();
+                let row = builder.alloc_regs(3);
+                let dest = builder.alloc_reg();
+                match entry {
+                    "cursor" => emit_table_column_read(
+                        &mut builder, 0, &table, None, None, 2, dest,
+                    ),
+                    "register" => emit_table_column_read_from_register_row(
+                        &mut builder, &table, None, None, row, 2, dest,
+                    ),
+                    "not_null" => {
+                        emit_not_null_constraints(&mut builder, &table, row, None, None);
+                    }
+                    "index" => {
+                        let scan = ScanCtx {
+                            cursor: 0,
+                            table: &table,
+                            table_alias: None,
+                            schema: None,
+                            register_base: Some(row),
+                            secondaries: &[],
+                        };
+                        let index = IndexSchema {
+                            name: "idx_cycle".to_owned(),
+                            root_page: 3,
+                            columns: Vec::new(),
+                            key_expressions: vec!["c + 2".to_owned()],
+                            key_sort_directions: Vec::new(),
+                            where_clause: None,
+                            is_unique: false,
+                            key_collations: Vec::new(),
+                            conflict_action: None,
+                        };
+                        emit_index_key_term(&mut builder, &index, 0, dest, &scan);
+                    }
+                    _ => unreachable!(),
+                }
+                builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                let error = builder.finish().expect_err(entry);
+                assert!(
+                    matches!(error, fsqlite_error::FrankenError::FunctionError(ref message)
+                        if message.contains("generated column loop on")),
+                    "two_columns={two_columns}, entry={entry}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_codegen_virtual_generated_long_cycle_fails_before_execution() {
+        let mut table = test_schema().remove(0);
+        for index in 0..128 {
+            let mut column = ColumnInfo::basic(format!("g{index}"), 'D', false);
+            column.generated_stored = Some(false);
+            column.generated_expr = Some(format!("g{} + 1", (index + 1) % 128));
+            table.columns.push(column);
+        }
+        let mut builder = ProgramBuilder::new();
+        let result = builder.alloc_reg();
+        emit_table_column_read(&mut builder, 0, &table, None, None, 2, result);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let error = builder.finish().expect_err("long VIRTUAL cycle must fail");
+        assert!(matches!(error, fsqlite_error::FrankenError::FunctionError(ref message)
+            if message.contains("generated column loop on")), "{error}");
+    }
+
+    #[test]
+    fn test_codegen_virtual_generated_forward_and_repeated_reads() {
+        let mut schema = test_schema_with_virtual_generated();
+        schema[0].columns[1].generated_stored = Some(false);
+        schema[0].columns[1].generated_expr = Some("c + 1".to_owned());
+        schema[0].columns[2].generated_expr = Some("a + 1".to_owned());
+        let mut database = MemDatabase::new();
+        database.create_table_at(2, 3);
+        database.get_table_mut(2).unwrap().insert_row(
+            1,
+            vec![SqliteValue::Integer(3), SqliteValue::Null, SqliteValue::Null],
+        );
+        let rows = execute_codegen_select_with_storage_cursor(
+            &select_sql("SELECT b,b+b,c FROM t"),
+            &schema,
+            database,
+        );
+        assert_eq!(rows, vec![vec![
+            SqliteValue::Integer(5),
+            SqliteValue::Integer(10),
+            SqliteValue::Integer(4),
+        ]]);
+    }
+
+    #[test]
+    fn test_codegen_plain_column_keeps_bytecode_without_generated_state() {
+        let schema = test_schema();
+        let mut builder = ProgramBuilder::new();
+        let result = builder.alloc_reg();
+        emit_table_column_read(&mut builder, 7, &schema[0], None, None, 0, result);
+        assert!(builder.generated_column_emission.is_none());
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().unwrap();
+        assert_eq!(program.ops(), &[
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 7,
+                p2: 0,
+                p3: result,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+        ]);
     }
 
     #[test]
