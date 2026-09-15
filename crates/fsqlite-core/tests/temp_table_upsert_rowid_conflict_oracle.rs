@@ -391,3 +391,100 @@ fn temp_statement_atomicity_blast_radius() {
         }
     });
 }
+
+/// bd-5bq6u decisive probe: is the gap confined to AUTOCOMMIT?
+///
+/// `MemDatabase` already has a complete undo log (`push_undo`, `undo_version`,
+/// `rollback_to`, gated on `undo_enabled`), but `Connection` calls `begin_undo()`
+/// only when an explicit transaction — or a SAVEPOINT that implicitly starts one
+/// — begins (connection.rs ~70313 and ~72181). In autocommit `undo_enabled` is
+/// therefore false and nothing is recorded, which would explain the whole
+/// symptom.
+///
+/// If that is right, the same statements are ATOMIC inside `BEGIN`/`COMMIT` and
+/// the fix is narrowly "enable statement-scoped undo in autocommit too" rather
+/// than "build an undo log". It also gives callers an immediate workaround.
+#[test]
+#[ignore = "bd-5bq6u autocommit-vs-transaction probe; prints a characterisation"]
+fn temp_statement_atomicity_inside_explicit_transaction() {
+    asupersync::test_utils::run_test(|| async {
+        let cases: [(&str, &[&str], &str); 3] = [
+            (
+                "multi-row INSERT, row 2 fails",
+                &["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"],
+                "INSERT INTO g(v) VALUES(19),(NULL)",
+            ),
+            (
+                "multi-row UPDATE, later row fails",
+                &[
+                    "INSERT INTO g(v) VALUES(5)",
+                    "INSERT INTO g(v) VALUES(7)",
+                    "INSERT INTO g(v) VALUES(9)",
+                ],
+                "UPDATE g SET v = CASE WHEN id < 3 THEN v + 100 ELSE NULL END",
+            ),
+            (
+                "INSERT ... SELECT, later row fails",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT INTO g(v) SELECT CASE WHEN x = 2 THEN NULL ELSE x END \
+                 FROM (SELECT 1 AS x UNION ALL SELECT 2)",
+            ),
+        ];
+
+        for in_txn in [false, true] {
+            println!("\n######## TEMP, explicit transaction = {in_txn} ########");
+            for (label, setup, failing) in &cases {
+                let conn = Connection::open(":memory:").await.unwrap();
+                let stock = rusqlite::Connection::open_in_memory().unwrap();
+                let ddl = "CREATE TEMP TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)";
+                stock.execute_batch(ddl).unwrap();
+                conn.execute(ddl).await.unwrap();
+                for sql in *setup {
+                    stock.execute(sql, []).unwrap();
+                    conn.execute(sql).await.unwrap();
+                }
+
+                if in_txn {
+                    stock.execute_batch("BEGIN").unwrap();
+                    conn.execute("BEGIN").await.unwrap();
+                }
+                let _ = stock.execute(failing, []);
+                let _ = conn.execute(failing).await;
+                if in_txn {
+                    // Stock keeps the transaction open after a statement-level
+                    // abort, so COMMIT here preserves whatever survived.
+                    let _ = stock.execute_batch("COMMIT");
+                    let _ = conn.execute("COMMIT").await;
+                }
+
+                let read = "SELECT id,v FROM g ORDER BY id";
+                let expected = stock
+                    .prepare(read)
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let actual = conn
+                    .query(read)
+                    .await
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| match (&row.values()[0], &row.values()[1]) {
+                                (SqliteValue::Integer(a), SqliteValue::Integer(b)) => (*a, *b),
+                                _ => (-1, -1),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                println!(
+                    "{label}\n  stock rows   = {expected:?}\n  fsqlite rows = {actual:?}\n  ATOMIC       = {}",
+                    if expected == actual { "yes" } else { "NO" }
+                );
+
+                conn.close().await.unwrap();
+            }
+        }
+    });
+}
