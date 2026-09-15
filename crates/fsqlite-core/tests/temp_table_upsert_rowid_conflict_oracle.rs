@@ -620,3 +620,111 @@ fn insert_or_fail_preserves_partial_rows_like_stock() {
         }
     });
 }
+
+/// bd-5bq6u: measure the FULL conflict-resolution contract before implementing
+/// the statement-atomicity region, instead of guessing it.
+///
+/// `OR FAIL` was already caught by reasoning (ABORT backs out, FAIL does not)
+/// and is pinned by `insert_or_fail_preserves_partial_rows_like_stock`. But
+/// ABORT / FAIL / IGNORE / REPLACE / ROLLBACK each have a different
+/// preserve-or-discard contract, and a region that treats them alike will get
+/// some of them wrong the same way a naive one would have broken OR FAIL. This
+/// prints every combination on both schemas so the contract is measured.
+///
+/// Read the output as: for each resolution, does fsqlite match stock, and which
+/// rows survive. Any row where main says `match` and TEMP says `DIVERGES` is a
+/// shape the fix must repair; any row where BOTH match today is a shape the fix
+/// must not break.
+#[test]
+#[ignore = "bd-5bq6u conflict-resolution contract probe; prints a characterisation"]
+fn temp_conflict_resolution_contract() {
+    asupersync::test_utils::run_test(|| async {
+        // (label, DDL tail, setup, failing statement)
+        let cases: [(&str, &str, &[&str], &str); 5] = [
+            (
+                "ABORT (plain)",
+                "v INTEGER NOT NULL",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT INTO g(v) VALUES(19),(NULL)",
+            ),
+            (
+                "OR FAIL",
+                "v INTEGER NOT NULL",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT OR FAIL INTO g(v) VALUES(19),(NULL)",
+            ),
+            (
+                "OR IGNORE",
+                "v INTEGER NOT NULL",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT OR IGNORE INTO g(v) VALUES(19),(NULL),(21)",
+            ),
+            (
+                "OR ROLLBACK",
+                "v INTEGER NOT NULL",
+                &["INSERT INTO g(v) VALUES(5)"],
+                "INSERT OR ROLLBACK INTO g(v) VALUES(19),(NULL)",
+            ),
+            (
+                // REPLACE needs a UNIQUE violation to be meaningful.
+                "OR REPLACE (unique)",
+                "v INTEGER UNIQUE",
+                &["INSERT INTO g(v) VALUES(5)", "INSERT INTO g(v) VALUES(7)"],
+                "INSERT OR REPLACE INTO g(v) VALUES(19),(5)",
+            ),
+        ];
+
+        for (label, ddl_tail, setup, failing) in &cases {
+            println!("\n######## {label} ########");
+            println!("  stmt = {failing}");
+            for temporary in [false, true] {
+                let keyword = if temporary { "TEMP " } else { "" };
+                let conn = Connection::open(":memory:").await.unwrap();
+                let stock = rusqlite::Connection::open_in_memory().unwrap();
+                let ddl = format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, {ddl_tail})");
+                stock.execute_batch(&ddl).unwrap();
+                conn.execute(&ddl).await.unwrap();
+                for sql in *setup {
+                    stock.execute(sql, []).unwrap();
+                    conn.execute(sql).await.unwrap();
+                }
+
+                let stock_failed = stock.execute(failing, []).is_err();
+                let fsqlite_failed = conn.execute(failing).await.is_err();
+
+                let read = "SELECT id,v FROM g ORDER BY id";
+                let expected = stock
+                    .prepare(read)
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let actual = conn
+                    .query(read)
+                    .await
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|row| match (&row.values()[0], &row.values()[1]) {
+                                (SqliteValue::Integer(a), SqliteValue::Integer(b)) => (*a, *b),
+                                _ => (-1, -1),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                println!(
+                    "  {:<6} errored stock={stock_failed:<5} fsqlite={fsqlite_failed:<5}  {}\n           stock   = {expected:?}\n           fsqlite = {actual:?}",
+                    if temporary { "TEMP" } else { "main" },
+                    if expected == actual && stock_failed == fsqlite_failed {
+                        "match"
+                    } else {
+                        "DIVERGES"
+                    }
+                );
+
+                conn.close().await.unwrap();
+            }
+        }
+    });
+}
