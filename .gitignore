@@ -413,3 +413,5 @@ crates/fsqlite-e2e/tests/*_ignored.rs
 # Skill-loop / repo-janitor scratch
 .skill-loop-progress.md
 .skill-loop-progress-*.md
+# rustc metadata leftover at repo root (`librust_out.rmeta`); not cargo output.
+/*.rmeta
