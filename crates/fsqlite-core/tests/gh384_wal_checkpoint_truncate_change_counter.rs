@@ -1,3 +1,10 @@
+// bd-ltoge: see the same note in agent_swarm_explain_concurrency_contract.rs.
+// This target hits the trait solver's default query depth for the same reason
+// (deeply nested async blocks in an integration test), and it was invisible
+// until that one was raised, because the first failure aborted the whole
+// `--all-targets` clippy invocation.
+#![recursion_limit = "256"]
+
 //! GH#384: `PRAGMA wal_checkpoint(TRUNCATE)` must never stamp the database
 //! header change counter (bytes 24..28 / 92..96) with a value BELOW the one
 //! carried by the page-1 image it backfills from the WAL.
