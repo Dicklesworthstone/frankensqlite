@@ -8,6 +8,7 @@ export class FrankenPreparedStatement<
   Row extends Record<string, unknown> = Record<string, unknown>,
 > {
   readonly #client: FrankenWorkerClient;
+  readonly #transactionId: string | undefined;
   readonly #statementId: string;
   readonly #run: StatementOperation;
   readonly #onFinalize: (() => void) | undefined;
@@ -24,8 +25,10 @@ export class FrankenPreparedStatement<
     columnNames: readonly string[],
     run: StatementOperation = (operation) => operation(),
     onFinalize?: () => void,
+    transactionId?: string,
   ) {
     this.#client = client;
+    this.#transactionId = transactionId;
     this.#statementId = statementId;
     this.#run = run;
     this.#onFinalize = onFinalize;
@@ -38,7 +41,7 @@ export class FrankenPreparedStatement<
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.executePrepared(this.#statementId, params));
+    return this.#run(() => this.#client.executePrepared(this.#statementId, params, this.#transactionId));
   }
 
   executeMany(
@@ -48,14 +51,14 @@ export class FrankenPreparedStatement<
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.executePreparedMany(this.#statementId, parameterSets, options));
+    return this.#run(() => this.#client.executePreparedMany(this.#statementId, parameterSets, options, this.#transactionId));
   }
 
   query(params: readonly SqlScalar[] = []): Promise<QueryResult<Row>> {
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.queryPrepared<Row>(this.#statementId, params));
+    return this.#run(() => this.#client.queryPrepared<Row>(this.#statementId, params, this.#transactionId));
   }
 
   finalize(): Promise<void> {
@@ -66,7 +69,7 @@ export class FrankenPreparedStatement<
       // Keep scope ownership until the worker actually accepts finalization.
       // Admission refusals run no SQL and must leave the handle retryable (or
       // available to the owning transaction's drain/cleanup after overload).
-      this.#finalizePromise = this.#client.finalizePrepared(this.#statementId).then(
+      this.#finalizePromise = this.#client.finalizePrepared(this.#statementId, this.#transactionId).then(
         () => { this.#onFinalize?.(); },
         (error: unknown) => {
           if (error instanceof FrankenSQLiteError &&

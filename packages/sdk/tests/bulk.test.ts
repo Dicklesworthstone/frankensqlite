@@ -22,6 +22,7 @@ async function fixture() {
     switch (request.kind) {
       case "init": return { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } };
       case "execute-batch": return { kind: "execute-batch-result", requestId };
+      case "transaction": return { kind: "transaction-result", requestId };
       case "execute-many":
       case "statement-execute-many": {
         if (fail) return { kind: "error", requestId, error: failure };
@@ -49,7 +50,8 @@ async function fixture() {
     fail() { fail = true; },
     hold() { hold = true; },
     flush() { hold = false; for (const request of held.splice(0)) worker.reply(response(request)); },
-    requests() { return worker.requests.map((request) => "sql" in request ? request.sql : request.kind); },
+    requests() { return worker.requests.map((request) => request.kind === "transaction"
+      ? request.action.toUpperCase() : "sql" in request ? request.sql : request.kind); },
   };
 }
 
@@ -114,7 +116,7 @@ describe("SDK atomic bulk execution", () => {
     await expect(escaped.executeMany(SQL, [[2]])).rejects.toThrow("finished");
     await expect(statement.executeMany([[2]])).rejects.toThrow("finished");
     expect(f.worker.requests.map((request) => request.kind)).toEqual([
-      "init", "execute-batch", "prepare", "statement-execute-many", "statement-finalize", "execute-batch",
+      "init", "transaction", "prepare", "statement-execute-many", "statement-finalize", "transaction",
     ]);
   });
 
@@ -388,6 +390,6 @@ describe("SDK cooperative bulk cancellation", () => {
     await f.db.transaction(async () => {
       await expect(f.db.executeMany(SQL, [[1]], { signal: controller.signal })).rejects.toThrow("owns this connection");
     });
-    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-batch", "execute-batch"]);
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "transaction", "transaction"]);
   });
 });

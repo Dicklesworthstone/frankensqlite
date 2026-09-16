@@ -443,7 +443,8 @@ test("a failed cancellation rollback makes the connection terminal, not silently
   const f = await fixture({ beforeBatch(sql) { if (sql === "ROLLBACK") throw new Error("rollback unavailable"); } });
   await assert.rejects(f.db.executeStream(INSERT, [[1, "a"]], { signal: controller.signal, onProgress() { controller.abort(); } }), e => {
     assert.ok(e instanceof AggregateError); assert.ok(isStreamCancelled(e.cause));
-    assert.match(e.errors[1].message, /rollback unavailable/); return true;
+    assert.equal(e.errors[1].code, "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE");
+    assert.match(e.errors[1].cause.message, /rollback unavailable/); return true;
   });
   assert.equal(f.worker.terminateCount, 1);
   await assert.rejects(f.db.execute(INSERT, [2, "must not write"]), AggregateError);
