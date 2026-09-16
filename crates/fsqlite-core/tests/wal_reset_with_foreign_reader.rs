@@ -1020,6 +1020,118 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
     });
 }
 
+/// Build two real stock WAL generations on a separate seed inode. The target
+/// receives generation B's database/WAL and generation A's complete SHM. In
+/// the contention case stock first owns BEGIN IMMEDIATE on the target, then
+/// deliberately reinstates the stale derived fixture while retaining WRITE.
+#[cfg(all(unix, feature = "native"))]
+fn stale_generation_fixture(path: &Path, writer: bool) -> PublicReaderProcess {
+    let script = r#"
+import pathlib, shutil, sqlite3, sys
+p = pathlib.Path(sys.argv[1])
+seed = str(p) + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40], 'fixture must span distinct WAL salt generations'
+for suffix in ['', '-wal']:
+    shutil.copyfile(seed + suffix, str(p) + suffix)
+pathlib.Path(str(p) + '-shm').write_bytes(old)
+c.close()
+if sys.argv[2] == 'writer':
+    c = sqlite3.connect(str(p), timeout=0)
+    c.execute('BEGIN IMMEDIATE')
+    pathlib.Path(str(p) + '-shm').write_bytes(old)
+print('stale-generation-ready', flush=True)
+sys.stdin.readline()
+if sys.argv[2] == 'writer':
+    c.rollback()
+    print('writer-released', flush=True)
+    sys.stdin.readline()
+    c.close()
+"#;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(path)
+        .arg(if writer { "writer" } else { "idle" })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Python sqlite3 creates real WAL generations");
+    let stdout = child.stdout.take().unwrap();
+    let (sender, output) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let fixture = PublicReaderProcess {
+        child, output, reader_thread: Some(reader_thread), kind: "stale-generation",
+    };
+    fixture.witness("stale-generation-ready");
+    fixture
+}
+
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn cass_gh477_explicit_index_recovery_preserves_database_and_wal() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        for writer in [false, true] {
+            let path = directory.path().join(format!("generation-{writer}.db"));
+            let mut fixture = stale_generation_fixture(&path, writer);
+            let fingerprint = |suffix: &str| {
+                let file = sidecar(&path, suffix);
+                (std::fs::read(&file).unwrap(), std::fs::metadata(file).unwrap().modified().unwrap())
+            };
+            let main_before = fingerprint("");
+            let wal_before = fingerprint("-wal");
+            let shm_before = fingerprint("-shm");
+            let started = std::time::Instant::now();
+            let strict = Connection::open_schema_only(path.to_str().unwrap()).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "strict refusal must be prompt");
+            assert!(matches!(strict, Err(fsqlite_error::FrankenError::BusyRecovery)));
+            assert_eq!(fingerprint("-shm"), shm_before, "strict readonly refusal is byte neutral");
+            let started = std::time::Instant::now();
+            let result = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await;
+            if writer {
+                assert!(started.elapsed() < std::time::Duration::from_secs(5), "writer refusal must be prompt");
+                assert!(matches!(result, Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery)),
+                    "a genuine foreign writer prevents derived-index recovery");
+                assert_eq!(fingerprint("-shm"), shm_before, "lock refusal cannot modify SHM");
+                assert_eq!(fingerprint(""), main_before);
+                assert_eq!(fingerprint("-wal"), wal_before);
+                fixture.signal("release");
+                fixture.witness("writer-released");
+                let connection = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await
+                    .expect("the same stale fixture recovers after its writer releases WRITE");
+                assert_eq!(scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                connection.close_without_checkpoint().await.unwrap();
+            } else {
+                let connection = result.expect("explicit recovery accepts the current WAL generation");
+                assert_eq!(scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                assert!(matches!(connection.execute("INSERT INTO t VALUES(99)").await,
+                    Err(fsqlite_error::FrankenError::ReadOnly)));
+                connection.close_without_checkpoint().await.unwrap();
+                assert_ne!(fingerprint("-shm").0, shm_before.0, "derived index was rebuilt");
+                let strict = Connection::open_schema_only(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(scalar_i64(&strict.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                strict.close_without_checkpoint().await.unwrap();
+            }
+            assert_eq!(fingerprint(""), main_before, "main bytes and mtime preserved");
+            assert_eq!(fingerprint("-wal"), wal_before, "WAL bytes and mtime preserved");
+            fixture.signal("exit");
+            fixture.wait_success();
+        }
+    });
+}
+
 /// Preserve the attachment-lifetime boundary when
 /// the writer closes before the pinned stock reader releases its snapshot.
 /// Keep both close orders in the default regression suite.

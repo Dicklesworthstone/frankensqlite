@@ -7441,12 +7441,13 @@ impl WalCommitSyncPolicy {
 enum PagerAccessMode {
     ReadWrite,
     ReadOnly,
+    ReadOnlyWithWalIndexRecovery,
 }
 
 impl PagerAccessMode {
     #[must_use]
     const fn is_readonly(self) -> bool {
-        matches!(self, Self::ReadOnly)
+        !matches!(self, Self::ReadWrite)
     }
 }
 
@@ -13696,6 +13697,8 @@ pub enum ConnectionPagerOpenMode {
     ReservedEmpty(FileIdentity),
     /// Open an existing database read-only, optionally identity-bound.
     ReadOnly(Option<FileIdentity>),
+    /// Read-only database/WAL access with explicit derived WAL-index recovery.
+    ReadOnlyWithWalIndexRecovery(Option<FileIdentity>),
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -17615,7 +17618,7 @@ where
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
-            if inner.access_mode.is_readonly() || recovered_once {
+            if inner.access_mode == PagerAccessMode::ReadOnly || recovered_once {
                 return Err(FrankenError::BusyRecovery);
             }
             external_lock.restore().await?;
@@ -17917,8 +17920,9 @@ where
                 )
                 .await
             }
-            ConnectionPagerOpenMode::ReadOnly(expected_identity) => {
-                Self::open_readonly_with_optional_expected_identity(
+            ConnectionPagerOpenMode::ReadOnly(expected_identity)
+            | ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity) => {
+                let pager = Self::open_readonly_with_optional_expected_identity(
                     cx,
                     vfs,
                     path,
@@ -17927,7 +17931,13 @@ where
                     page_buffer_max,
                     false,
                 )
-                .await
+                .await?;
+                if matches!(mode, ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(_)) {
+                    pager.inner.lock()
+                        .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
+                        .access_mode = PagerAccessMode::ReadOnlyWithWalIndexRecovery;
+                }
+                Ok(pager)
             }
         }
     }

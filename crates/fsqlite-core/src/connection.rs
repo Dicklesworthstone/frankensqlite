@@ -4647,6 +4647,7 @@ impl PagerBackend {
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
+        recover_wal_index: bool,
     ) -> Result<Self> {
         if path == ":memory:" {
             if expected_identity.is_some() {
@@ -4667,7 +4668,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4683,7 +4688,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4699,7 +4708,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4707,7 +4720,7 @@ impl PagerBackend {
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
-            let _ = expected_identity;
+            let _ = (expected_identity, recover_wal_index);
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
             ))
@@ -14126,6 +14139,7 @@ impl Drop for MaterializedTablesCleanupGuard<'_> {
 #[derive(Debug, Clone, Copy)]
 enum SchemaOnlyPagerDisposition {
     Ordinary,
+    RecoverWalIndex,
     #[cfg(not(target_arch = "wasm32"))]
     ReservedEmptyRollback(FileIdentity),
 }
@@ -14254,6 +14268,28 @@ impl Connection {
     /// ```
     pub async fn open_schema_only(path: impl Into<String>) -> Result<Self> {
         Self::open_schema_only_with_env(path, ConnectionEnv::default()).await
+    }
+
+    /// Open an existing database read-only, explicitly allowing reconstruction
+    /// of its derived WAL index under the native recovery locks.
+    ///
+    /// Unlike [`Self::open_schema_only`], this may modify the SHM sidecar when
+    /// its publication is missing, invalid, or belongs to an older WAL
+    /// generation. It does not authorize database/WAL writes, checkpoints,
+    /// rollback-journal recovery, or SQL writes. A live conflicting owner
+    /// causes a retryable error rather than forced recovery.
+    pub async fn open_schema_only_with_wal_index_recovery(path: impl Into<String>) -> Result<Self> {
+        Self::open_schema_only_with_wal_index_recovery_and_env(path, ConnectionEnv::default()).await
+    }
+
+    /// Explicit derived WAL-index recovery with a caller-selected runtime.
+    pub async fn open_schema_only_with_wal_index_recovery_and_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path, None, env, false, false, SchemaOnlyPagerDisposition::RecoverWalIndex,
+        ).await
     }
 
     /// Open an existing file-backed database for reading and writing while
@@ -14456,7 +14492,7 @@ impl Connection {
                 })
                 .await?
             }
-            SchemaOnlyPagerDisposition::Ordinary => {
+            SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex => {
                 retry_busy_connection_bootstrap(|| {
                     PagerBackend::open_readonly_with_page_buffer_max(
                         &path,
@@ -14464,6 +14500,7 @@ impl Connection {
                         expected_identity,
                         env.page_buffer_max(),
                         env.memory_vfs_config(),
+                        matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex),
                     )
                 })
                 .await?
