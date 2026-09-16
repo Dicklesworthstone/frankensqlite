@@ -1,22 +1,31 @@
-import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar, TransactionOptions } from "./types";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import type { FrankenDB } from "./database";
-import { FrankenPreparedStatement } from "./statement";
+import type { FrankenPreparedStatement } from "./statement";
 
 type TransactionCapableDb = Pick<
   FrankenDB,
   "execute" | "executeBatch" | "executeMany" | "executeStream" | "query" | "prepare"
 >;
 
-type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>) => Promise<T>;
+type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>, options?: TransactionOptions) => Promise<T>;
+
+/** Native dependent signals avoid a secondary set of retained JS listeners. */
+export function combineTransactionSignals(scope: AbortSignal | undefined, operation: AbortSignal | undefined): AbortSignal | undefined {
+  if (scope === undefined) return operation;
+  if (operation === undefined || operation === scope) return scope;
+  return AbortSignal.any([scope, operation]);
+}
 
 export class FrankenTransaction {
   readonly #db: TransactionCapableDb;
   readonly #nested: NestedTransaction | undefined;
+  readonly signal: AbortSignal;
 
-  constructor(db: TransactionCapableDb, nested?: NestedTransaction) {
+  constructor(db: TransactionCapableDb, nested?: NestedTransaction, signal = new AbortController().signal) {
     this.#db = db;
     this.#nested = nested;
+    this.signal = signal;
   }
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
@@ -59,10 +68,10 @@ export class FrankenTransaction {
   }
 
   /** Run an isolated child scope using a SAVEPOINT on this transaction. */
-  transaction<T>(work: (tx: FrankenTransaction) => T | Promise<T>): Promise<T> {
+  transaction<T>(work: (tx: FrankenTransaction) => T | Promise<T>, options?: TransactionOptions): Promise<T> {
     if (this.#nested === undefined) {
       return Promise.reject(new Error("Nested transactions require a managed transaction callback"));
     }
-    return this.#nested(work);
+    return this.#nested(work, options);
   }
 }

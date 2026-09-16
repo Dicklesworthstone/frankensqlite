@@ -101,14 +101,30 @@ interface Frame {
   id: string;
   savepoint: string | null;
   failure: { cause: unknown } | null;
+  committing: boolean;
 }
 
-/** Only called inside a single host's SQL FIFO, never a cross-connection lock. */
+/** SQL runs in one host's FIFO; cancel() only changes its in-memory fence. */
 export class ManagedTransactions {
   readonly #stack: Frame[] = [];
   #lastId = 0n;
 
   clear(): void { this.#stack.length = 0; }
+
+  cancel(id: string): boolean {
+    validateTransactionId(id);
+    const index = this.#stack.findIndex(frame => frame.id === id);
+    if (index < 0 || this.#stack[index]!.committing) return false;
+    const cause = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CANCELLED",
+      "This managed transaction was cancelled; cleanup and rollback must finish");
+    // Cancelling a child must not poison its parent or successful siblings.
+    // A parent can still be cancelled while a child's RELEASE is in flight:
+    // that release is provisional, and the parent will roll back afterward.
+    for (let i = index; i < this.#stack.length; i++) {
+      this.#stack[i]!.failure ??= { cause };
+    }
+    return true;
+  }
 
   assertOwner(id: string | undefined, cleanup = false): void {
     const frame = this.#stack.at(-1);
@@ -118,6 +134,10 @@ export class ManagedTransactions {
     }
     if (frame.id !== id) throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Another transaction scope owns this worker connection");
     if (!cleanup && frame.failure !== null) {
+      if (frame.failure.cause instanceof ManagedTransactionError &&
+          frame.failure.cause.code === "ERR_FSQLITE_TRANSACTION_CANCELLED") {
+        throw frame.failure.cause;
+      }
       throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_ABORTED",
         "This scope failed; only cleanup and rollback may run", { cause: frame.failure.cause });
     }
@@ -150,7 +170,10 @@ export class ManagedTransactions {
         this.fail(request.parentId, cause);
         throw cause;
       }
-      this.#stack.push({ id, savepoint, failure: null });
+      // An out-of-band cancel may have fenced the parent while SAVEPOINT was
+      // awaited. Still acknowledge the successful begin so its caller knows
+      // it owns rollback, but never let the new child execute unfenced work.
+      this.#stack.push({ id, savepoint, failure: this.#stack.at(-1)?.failure ?? null, committing: false });
       return;
     }
     this.assertOwner(id, request.action === "rollback");
@@ -171,8 +194,12 @@ export class ManagedTransactions {
           "Managed rollback failed; no further SQL may execute on this connection", { cause }, true);
       }
     } else {
+      // free() may re-enter control delivery. Check again after cleanup and
+      // seal immediately before dispatch, not while commit is merely queued.
+      this.assertOwner(id);
+      frame.committing = true;
       try { await db.executeBatch(frame.savepoint === null ? "COMMIT" : `RELEASE SAVEPOINT ${frame.savepoint}`); }
-      catch (cause: unknown) { this.fail(id, cause); throw cause; }
+      catch (cause: unknown) { frame.committing = false; this.fail(id, cause); throw cause; }
     }
     this.#stack.pop();
   }

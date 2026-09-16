@@ -1,5 +1,5 @@
 import { FrankenPreparedStatement } from "./statement";
-import { FrankenTransaction } from "./transaction";
+import { combineTransactionSignals, FrankenTransaction } from "./transaction";
 import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SnapshotMetadata } from "./types";
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
@@ -8,9 +8,12 @@ import { checkStreamCancellation, executeRowStream, streamOptions } from "./stre
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import { resolveRequestLimits } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
+import type { TransactionOptions } from "./types";
 
 interface TransactionScope {
   readonly id: string;
+  readonly signal: AbortSignal;
+  cancellationError: FrankenSQLiteError | null;
   accepting: boolean;
   pending: Set<Promise<unknown>>;
   statements: Set<string>;
@@ -133,11 +136,14 @@ export class FrankenDB {
       // awaits its prepare, chunks, source cleanup and finalize itself, so SQL
       // errors retain their global stream index instead of being double-wrapped
       // by per-operation callback bookkeeping.
-      const consume = (_tx: FrankenTransaction, scope: TransactionScope) => executeRowStream({
-        prepare: (statementSql) => this.#client.prepare(statementSql, scope.id),
-        executePreparedMany: (id, values, settings) => this.#client.executePreparedMany(id, values, settings, scope.id),
-        finalizePrepared: (id) => this.#client.finalizePrepared(id, scope.id),
-      }, sql, rows, config);
+      const consume = (_tx: FrankenTransaction, scope: TransactionScope) => {
+        const signal = combineTransactionSignals(scope.signal, config.signal)!;
+        return executeRowStream({
+          prepare: (statementSql) => this.#client.prepare(statementSql, scope.id),
+          executePreparedMany: (id, values, settings) => this.#client.executePreparedMany(id, values, settings, scope.id),
+          finalizePrepared: (id) => this.#client.finalizePrepared(id, scope.id),
+        }, sql, rows, { ...config, signal });
+      };
       const beforeCommit = () => checkStreamCancellation(config);
       return parent === null
         ? this.#transaction(null, consume, beforeCommit)
@@ -175,6 +181,7 @@ export class FrankenDB {
       (operation) => this.#run(scope, operation),
       () => { scope?.statements.delete(metadata.statementId); },
       scope?.id,
+      scope?.signal,
     );
   }
 
@@ -193,36 +200,68 @@ export class FrankenDB {
 
   transaction<T>(
     work: (tx: FrankenTransaction) => T | Promise<T>,
+    options?: TransactionOptions,
   ): Promise<T> {
     // Never expose the internal scope/capability as a second callback argument.
-    return this.#transaction(null, tx => work(tx));
+    return this.#transaction(null, tx => work(tx), undefined, options);
   }
 
   async #transaction<T>(
     parent: TransactionScope | null,
     work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
     beforeCommit?: () => void,
+    options?: TransactionOptions,
   ): Promise<T> {
+    this.#assertOwner(parent);
+    const requestedSignal = options?.signal;
+    const signals: AbortSignal[] = [];
+    if (parent !== null) signals.push(parent.signal);
+    if (requestedSignal !== undefined) {
+      // Use the native getter's brand check, not duck typing. Some runtimes'
+      // any() silently ignore plain { aborted: false } objects.
+      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(requestedSignal);
+      signals.push(requestedSignal);
+    }
+    const signal = AbortSignal.any(signals);
+    // Reading caller options can re-enter this connection. Check again before
+    // capturing authority; a child always inherits its parent's abort signal.
     this.#assertOwner(parent);
     const scope: TransactionScope = {
       id: String(this.#nextTransactionId++),
+      signal, cancellationError: null,
       accepting: true, pending: new Set(), statements: new Set(), errors: [],
       children: new Set(),
     };
+    this.#checkCancellation(scope);
     // Claim before the first await so foreign operations cannot enter between
     // BEGIN and the callback, or while the callback awaits application work.
     this.#transactionScope = scope;
     let began = false;
+    let settling = false;
+    let cancelSent = false;
+    const cancel = (): void => {
+      if (began && !settling && !cancelSent) {
+        cancelSent = true;
+        this.#client.cancelTransaction(scope.id);
+      }
+    };
     try {
+      signal.addEventListener("abort", cancel, { once: true });
       await this.#client.transaction("begin", scope.id, parent?.id);
       began = true;
+      // An abort during BEGIN must wait for its actual result before rollback.
+      // Do not race the callback against abort: escaped callback work must drain.
+      this.#checkCancellation(scope);
       const result = await this.#finishScope(scope, work);
       // Last synchronous cancellation boundary, after all source/handle cleanup.
       // Once COMMIT/RELEASE dispatch starts, its actual outcome is authoritative.
       beforeCommit?.();
+      this.#checkCancellation(scope);
+      settling = true;
       await this.#client.transaction("commit", scope.id);
       return result;
     } catch (error: unknown) {
+      settling = true;
       // A failed BEGIN does not authorize rolling back an existing transaction.
       if (began && this.#transactionFailure === null) {
         try {
@@ -248,6 +287,7 @@ export class FrankenDB {
     } finally {
       scope.accepting = false;
       this.#transactionScope = parent;
+      signal.removeEventListener("abort", cancel);
     }
   }
 
@@ -255,13 +295,14 @@ export class FrankenDB {
     parent: TransactionScope,
     work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
     beforeCommit?: () => void,
+    options?: TransactionOptions,
   ): Promise<T> {
     try {
       this.#assertOwner(parent);
     } catch (error: unknown) {
       return Promise.reject(error);
     }
-    const promise = this.#transaction(parent, work, beforeCommit);
+    const promise = this.#transaction(parent, work, beforeCommit, options);
     parent.children.add(promise);
     // A rolled-back child is recoverable by its parent. Unlike a direct SQL
     // failure, a caught child failure must not automatically poison the parent.
@@ -285,6 +326,18 @@ export class FrankenDB {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
         message: "A transaction owns this connection; use its transaction handle or wait until it finishes" });
     }
+    if (scope !== null) this.#checkCancellation(scope);
+  }
+
+  #checkCancellation(scope: TransactionScope): void {
+    if (!scope.signal.aborted) return;
+    if (scope.cancellationError === null) {
+      scope.cancellationError = new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_CANCELLED",
+        message: "This managed transaction was cancelled", transient: false });
+      // Keep the caller's exact reason locally; it need not be structured-cloneable.
+      scope.cancellationError.cause = scope.signal.reason;
+    }
+    throw scope.cancellationError;
   }
 
   #run<T>(scope: TransactionScope | null, operation: () => Promise<T>): Promise<T> {
@@ -319,13 +372,14 @@ export class FrankenDB {
     const tx = new FrankenTransaction({
       execute: (sql, params) => this.#run(scope, () => this.#client.execute(sql, params, scope.id)),
       executeBatch: (sql) => this.#run(scope, () => this.#client.executeBatch(sql, scope.id)),
-      executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets, options, scope.id)),
+      executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets,
+        { signal: combineTransactionSignals(scope.signal, options?.signal)! }, scope.id)),
       executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
       query: <Row extends Record<string, unknown>>(sql: string, params: readonly SqlScalar[] = []) =>
         this.#run(scope, () => this.#client.query<Row>(sql, params, scope.id)),
       prepare: <Row extends Record<string, unknown>>(sql: string) =>
         this.#run(scope, () => this.#prepare<Row>(sql, scope)),
-    }, (nestedWork) => this.#nestedTransaction(scope, tx => nestedWork(tx)));
+    }, (nestedWork, options) => this.#nestedTransaction(scope, tx => nestedWork(tx), undefined, options), scope.signal);
     let result!: T;
     let callbackErrors: unknown[] = [];
     try {
@@ -353,6 +407,8 @@ export class FrankenDB {
       }
     }
     scope.statements.clear();
+    try { this.#checkCancellation(scope); }
+    catch (error: unknown) { scope.errors.push(error); }
     if (this.#transactionFailure !== null) scope.errors.push(this.#transactionFailure);
     const errors = [...new Set([...callbackErrors, ...scope.errors])];
     if (errors.length === 1) throw errors[0];

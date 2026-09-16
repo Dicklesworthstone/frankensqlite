@@ -23,6 +23,11 @@ export interface ExecuteManyOptions {
   signal?: AbortSignal;
 }
 
+export interface TransactionOptions {
+  /** Cancel the whole scope; settles after callback, SQL and rollback drain. */
+  signal?: AbortSignal;
+}
+
 /** A pull-based source. Each yielded value is one positional parameter set. */
 export type SqlRowSource =
   | Iterable<readonly SqlScalar[]>

@@ -30,8 +30,8 @@ export function sqliteSnapshotWorker(hooks = {}) {
       path,
       close() { events.push("close"); hooks.beforeClose?.(); if (!closed) { db.close(); closed = true; } },
       free() { events.push("free"); if (!closed) { db.close(); closed = true; } },
-      async execute(sql) { events.push(sql); return Number(db.prepare(sql).run().changes); },
-      async executeWithParams(sql, params) { events.push(sql); return Number(db.prepare(sql).run(...parameters(params)).changes); },
+      async execute(sql) { events.push(sql); await hooks.beforeExecute?.(sql,[],db); return Number(db.prepare(sql).run().changes); },
+      async executeWithParams(sql, params) { events.push(sql); await hooks.beforeExecute?.(sql,params,db); return Number(db.prepare(sql).run(...parameters(params)).changes); },
       async executeBatch(sql) { events.push(sql); await hooks.beforeBatch?.(sql); db.exec(sql); },
       async query(sql) { return query(sql); },
       async queryWithParams(sql, params) { return query(sql, params); },
@@ -40,9 +40,9 @@ export function sqliteSnapshotWorker(hooks = {}) {
         const columns = statement.columns().map(c => c.name);
         let freed = false;
         return { sql, columnCount: columns.length, columnNames: () => columns,
-          free() { if (freed) throw new Error("double finalize"); freed = true; },
-          async execute() { if (freed) throw new Error("freed"); return Number(statement.run().changes); },
-          async executeWithParams(params) { if (freed) throw new Error("freed"); return Number(statement.run(...parameters(params)).changes); },
+          free() { if (freed) throw new Error("double finalize"); freed = true; hooks.statementFree?.(sql); },
+          async execute() { if (freed) throw new Error("freed"); await hooks.beforeExecute?.(sql,[],db); return Number(statement.run().changes); },
+          async executeWithParams(params) { if (freed) throw new Error("freed"); await hooks.beforeExecute?.(sql,params,db); return Number(statement.run(...parameters(params)).changes); },
           async query() { return query(sql); }, async queryWithParams(params) { return query(sql, params); },
         };
       },

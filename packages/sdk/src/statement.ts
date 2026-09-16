@@ -1,6 +1,7 @@
 import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
 import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
+import { combineTransactionSignals } from "./transaction";
 
 type StatementOperation = <T>(operation: () => Promise<T>) => Promise<T>;
 
@@ -12,6 +13,7 @@ export class FrankenPreparedStatement<
   readonly #statementId: string;
   readonly #run: StatementOperation;
   readonly #onFinalize: (() => void) | undefined;
+  readonly #signal: AbortSignal | undefined;
   #finalizePromise: Promise<void> | null = null;
   readonly sql: string;
   readonly columnCount: number;
@@ -26,12 +28,14 @@ export class FrankenPreparedStatement<
     run: StatementOperation = (operation) => operation(),
     onFinalize?: () => void,
     transactionId?: string,
+    signal?: AbortSignal,
   ) {
     this.#client = client;
     this.#transactionId = transactionId;
     this.#statementId = statementId;
     this.#run = run;
     this.#onFinalize = onFinalize;
+    this.#signal = signal;
     this.sql = sql;
     this.columnCount = columnCount;
     this.columnNames = [...columnNames];
@@ -51,7 +55,11 @@ export class FrankenPreparedStatement<
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.executePreparedMany(this.#statementId, parameterSets, options, this.#transactionId));
+    return this.#run(() => {
+      const signal = combineTransactionSignals(this.#signal, options?.signal);
+      return this.#client.executePreparedMany(this.#statementId, parameterSets,
+        signal === undefined ? {} : { signal }, this.#transactionId);
+    });
   }
 
   query(params: readonly SqlScalar[] = []): Promise<QueryResult<Row>> {

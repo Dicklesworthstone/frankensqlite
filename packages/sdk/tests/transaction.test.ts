@@ -27,7 +27,8 @@ class TransactionWorker implements WorkerLike {
   }
 
   postMessage(message: any): void {
-    this.requests.push({ kind: message.kind, sql: message.sql });
+    this.requests.push({ kind: message.kind,
+      sql: message.kind === "transaction" ? message.action.toUpperCase() : message.sql });
     const response: WorkerResponse =
       message.kind === "init"
         ? {
@@ -35,9 +36,9 @@ class TransactionWorker implements WorkerLike {
             requestId: message.requestId,
             data: { path: ":memory:", persistence: "memory" },
           }
-        : message.kind === "execute-batch"
+        : message.kind === "execute-batch" || message.kind === "transaction"
           ? {
-              kind: "execute-batch-result",
+              kind: message.kind === "transaction" ? "transaction-result" : "execute-batch-result",
               requestId: message.requestId,
             }
           : message.kind === "close"

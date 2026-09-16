@@ -19,6 +19,7 @@ export type {
   SqlScalar,
   SqlRowSource,
   SnapshotMetadata,
+  TransactionOptions,
 } from "./types";
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type { WorkerLike } from "./worker-client";

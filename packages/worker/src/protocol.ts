@@ -124,6 +124,12 @@ export interface CancelBulkRequest extends WorkerRequestBase {
   targetRequestId: number;
 }
 
+/** Fence an active managed scope and its descendants, without running SQL. */
+export interface CancelTransactionRequest extends WorkerRequestBase {
+  kind: "cancel-transaction";
+  targetTransactionId: string;
+}
+
 export interface QueryRequest extends WorkerRequestBase {
   kind: "query";
   sql: string;
@@ -171,6 +177,7 @@ export type WorkerRequest =
   | ExecuteBatchRequest
   | ExecuteManyRequest
   | CancelBulkRequest
+  | CancelTransactionRequest
   | QueryRequest
   | PrepareRequest
   | StatementExecuteRequest
@@ -203,6 +210,12 @@ export interface ExecuteManyResponse extends WorkerResponseBase {
 export interface CancelBulkResponse extends WorkerResponseBase {
   kind: "cancel-bulk-result";
   /** Accepted before commit dispatch; NOT proof that rollback has completed. */
+  accepted: boolean;
+}
+
+export interface CancelTransactionResponse extends WorkerResponseBase {
+  kind: "cancel-transaction-result";
+  /** The scope was fenced before COMMIT dispatch; rollback is still pending. */
   accepted: boolean;
 }
 
@@ -246,6 +259,7 @@ export type WorkerResponse =
   | ExecuteBatchResponse
   | ExecuteManyResponse
   | CancelBulkResponse
+  | CancelTransactionResponse
   | QueryResponse
   | PrepareResponse
   | StatementFinalizeResponse

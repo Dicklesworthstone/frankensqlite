@@ -115,6 +115,19 @@ export class FrankenWorkerClient {
     ensureKind(response, "transaction-result");
   }
 
+  cancelTransaction(transactionId: string): void {
+    if (this.#terminalError !== null) return;
+    try {
+      // No acknowledgement promise is retained. Only the scope's actual
+      // rollback response proves cleanup; cancellation must bypass saturation.
+      this.#worker.postMessage({ kind: "cancel-transaction", requestId: this.#nextId(),
+        targetTransactionId: transactionId });
+    } catch {
+      // Failed delivery is not proof of rollback. Local admission stops and
+      // the transaction still awaits its real terminal database response.
+    }
+  }
+
   async execute(sql: string, params: readonly SqlScalar[] = [], transactionId?: string): Promise<number> {
     const response = await this.#send({
       kind: "execute",

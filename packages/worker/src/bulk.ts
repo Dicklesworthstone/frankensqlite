@@ -32,6 +32,8 @@ export class BulkCancellation {
   #requested = false;
   #sealed = false;
 
+  constructor(private readonly checkOwner?: () => void) {}
+
   request(): boolean {
     if (this.#sealed) return false;
     this.#requested = true;
@@ -39,6 +41,7 @@ export class BulkCancellation {
   }
 
   check(): void {
+    this.checkOwner?.();
     if (this.#requested) {
       throw Object.assign(new Error("FrankenSQLite bulk execution was cancelled"), {
         code: "ERR_FSQLITE_BULK_CANCELLED", transient: false,

@@ -11,19 +11,40 @@ async function fixture() {
   const held = new Set<string>();
   const failures = new Map<string, string>();
   const waiting: WorkerRequest[] = [];
-  const key = (request: WorkerRequest) => "sql" in request ? request.sql : request.kind;
+  const names = new Map<string, string>();
+  const failedAt = new Map<number, number>();
+  // This controlled transport traces logical boundary stages for these SDK
+  // lifetime tests. Real worker SQL/fences are covered in managed-transactions.
+  // One typed child rollback includes both rollback-to and cleanup release.
+  const stages = (request: WorkerRequest): string[] => {
+    if (request.kind !== "transaction") return ["sql" in request ? request.sql : request.kind];
+    if (request.action === "begin" && request.parentId !== undefined && !names.has(request.transactionId)) {
+      names.set(request.transactionId, `fsqlite_sdk_${names.size + 1}`);
+    }
+    const name = names.get(request.transactionId);
+    if (name === undefined) return [request.action.toUpperCase()];
+    if (request.action === "begin") return [`SAVEPOINT ${name}`];
+    if (request.action === "commit") return [`RELEASE SAVEPOINT ${name}`];
+    return [`ROLLBACK TO SAVEPOINT ${name}`, `RELEASE SAVEPOINT ${name}`];
+  };
+  const key = (request: WorkerRequest) => stages(request)[0]!;
   function reply(request: WorkerRequest): void {
-    const failure = failures.get(key(request));
-    if (failure !== undefined) {
-      worker.reply({ kind: "error", requestId: request.requestId,
-        error: { code: "SQLITE_ERROR", message: failure } });
-      return;
+    const keys = stages(request);
+    for (let i = 0; i < keys.length; i++) {
+      const failure = failures.get(keys[i]!);
+      if (failure !== undefined) {
+        failedAt.set(request.requestId, i + 1);
+        worker.reply({ kind: "error", requestId: request.requestId,
+          error: { code: "SQLITE_ERROR", message: failure } });
+        return;
+      }
     }
     const requestId = request.requestId;
     let response: WorkerResponse;
     switch (request.kind) {
       case "init": response = { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } }; break;
       case "execute-batch": response = { kind: "execute-batch-result", requestId }; break;
+      case "transaction": response = { kind: "transaction-result", requestId }; break;
       case "execute": case "statement-execute": response = { kind: "execute-result", requestId, changes: 1 }; break;
       case "prepare": response = { kind: "prepare-result", requestId, data: {
         statementId: String(requestId), sql: request.sql, columnCount: 1, columnNames: ["value"],
@@ -34,6 +55,7 @@ async function fixture() {
       case "statement-finalize": response = { kind: "statement-finalize-result", requestId }; break;
       case "export": response = { kind: "export-result", requestId, data: Uint8Array.of(1) }; break;
       case "close": response = { kind: "close-result", requestId }; break;
+      default: throw new Error(`Unexpected fixture request ${request.kind}`);
     }
     worker.reply(response);
   }
@@ -45,7 +67,7 @@ async function fixture() {
   worker.requests.length = 0;
   return {
     db, worker, held, failures,
-    log: () => worker.requests.map(key),
+    log: () => worker.requests.flatMap(request => stages(request).slice(0, failedAt.get(request.requestId))),
     release(sql: string) {
       held.delete(sql);
       for (const request of waiting.splice(0)) {

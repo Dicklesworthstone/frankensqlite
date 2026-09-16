@@ -122,6 +122,11 @@ export class WorkerConnectionHost {
   }
 
   #admit(request: WorkerRequest): Promise<WorkerResponse> {
+    if (request.kind === "cancel-transaction") {
+      // No SQL, queue reservation or tombstone is created by this control.
+      return Promise.resolve({ kind: "cancel-transaction-result", requestId: request.requestId,
+        accepted: this.#transactions.cancel(request.targetTransactionId) });
+    }
     if (request.kind === "cancel-bulk") {
       validateRequestId(request.targetRequestId);
       // Do not put cancellation behind the work it needs to cancel. This only
@@ -160,14 +165,18 @@ export class WorkerConnectionHost {
         error: { code: "ERR_FSQLITE_CONNECTION_CLOSED", message: "FrankenSQLite worker connection is closing or closed" } });
     }
     let cancellation: BulkCancellation | undefined;
-    if ((request.kind === "execute-many" || request.kind === "statement-execute-many") && request.cancellable) {
-      cancellation = new BulkCancellation();
-      this.#bulkCancellations.set(request.requestId, cancellation);
+    if (request.kind === "execute-many" || request.kind === "statement-execute-many") {
+      const transactionId = request.transactionId;
+      if (request.cancellable || transactionId !== undefined) {
+        cancellation = new BulkCancellation(transactionId === undefined
+          ? undefined : () => this.#transactions.assertOwner(transactionId));
+        if (request.cancellable) this.#bulkCancellations.set(request.requestId, cancellation);
+      }
     }
     // Worker message callbacks are not awaited by the browser. Keep ownership
     // of this connection (and its WASM handles) until each request settles,
     // including init, finalize, export and close. Other hosts remain independent.
-    const ordinary = request as Exclude<WorkerRequest, { kind: "cancel-bulk" }>;
+    const ordinary = request as Exclude<WorkerRequest, { kind: "cancel-bulk" | "cancel-transaction" }>;
     const response = this.#requestTail.then(() => this.#handle(ordinary, cancellation)).finally(() => {
       release();
       if (cancellation !== undefined) {
@@ -182,7 +191,7 @@ export class WorkerConnectionHost {
   }
 
   async #handle(
-    request: Exclude<WorkerRequest, { kind: "cancel-bulk" }>,
+    request: Exclude<WorkerRequest, { kind: "cancel-bulk" | "cancel-transaction" }>,
     cancellation?: BulkCancellation,
   ): Promise<WorkerResponse> {
     try {
