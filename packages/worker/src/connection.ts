@@ -20,7 +20,7 @@ import {
   resolvePersistenceMode,
   UnsupportedPersistenceModeError,
 } from "./vfs-init";
-import { BulkExecutionError, executeMany } from "./bulk";
+import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
 
 export interface CorePreparedStatementHandle {
   readonly sql: string;
@@ -80,23 +80,47 @@ export class WorkerConnectionHost {
   #requestTail: Promise<void> = Promise.resolve();
   #nextBulkSavepoint = 1n;
   #terminalError: BulkExecutionError | null = null;
+  readonly #bulkCancellations = new Map<number, BulkCancellation>();
 
   constructor(loader: CoreModuleLoader = defaultCoreModuleLoader) {
     this.#loader = loader;
   }
 
   handle(request: WorkerRequest): Promise<WorkerResponse> {
+    if (request.kind === "cancel-bulk") {
+      // Do not put cancellation behind the work it needs to cancel. This only
+      // updates a token; SQL and handle destruction still run in FIFO order.
+      return Promise.resolve({ kind: "cancel-bulk-result", requestId: request.requestId,
+        accepted: this.#bulkCancellations.get(request.targetRequestId)?.request() ?? false });
+    }
+    let cancellation: BulkCancellation | undefined;
+    if ((request.kind === "execute-many" || request.kind === "statement-execute-many") && request.cancellable) {
+      if (this.#bulkCancellations.has(request.requestId)) {
+        return Promise.resolve({ kind: "error", requestId: request.requestId,
+          error: { code: "ERR_FSQLITE_BULK_INPUT", message: "Duplicate active bulk request id" } });
+      }
+      cancellation = new BulkCancellation();
+      this.#bulkCancellations.set(request.requestId, cancellation);
+    }
     // Worker message callbacks are not awaited by the browser. Keep ownership
     // of this connection (and its WASM handles) until each request settles,
     // including init, finalize, export and close. Other hosts remain independent.
-    const response = this.#requestTail.then(() => this.#handle(request));
+    const response = this.#requestTail.then(() => this.#handle(request, cancellation)).finally(() => {
+      if (cancellation !== undefined) {
+        cancellation.finish();
+        this.#bulkCancellations.delete(request.requestId);
+      }
+    });
     // A failed request must not poison the queue, even if serializing its error
     // throws. Return the original promise so the caller still sees that failure.
     this.#requestTail = response.then(() => undefined, () => undefined);
     return response;
   }
 
-  async #handle(request: WorkerRequest): Promise<WorkerResponse> {
+  async #handle(
+    request: Exclude<WorkerRequest, { kind: "cancel-bulk" }>,
+    cancellation?: BulkCancellation,
+  ): Promise<WorkerResponse> {
     try {
       if (this.#terminalError !== null && request.kind !== "close") {
         throw this.#terminalError;
@@ -113,10 +137,10 @@ export class WorkerConnectionHost {
         case "execute-batch":
           return await this.#executeBatch(request.requestId, request.sql);
         case "execute-many":
-          return await this.#executeMany(request.requestId, request.sql, request.parameterSets);
+          return await this.#executeMany(request.requestId, request.sql, request.parameterSets, undefined, cancellation);
         case "statement-execute-many": {
           const statement = this.#requireStatement(request.statementId);
-          return await this.#executeMany(request.requestId, statement.sql, request.parameterSets, statement);
+          return await this.#executeMany(request.requestId, statement.sql, request.parameterSets, statement, cancellation);
         }
         case "query":
           return await this.#query(
@@ -235,12 +259,13 @@ export class WorkerConnectionHost {
     sql: string,
     parameterSets: SqlScalar[][],
     prepared?: CorePreparedStatementHandle,
+    cancellation?: BulkCancellation,
   ): Promise<ExecuteManyResponse> {
     return {
       kind: "execute-many-result",
       requestId,
       data: await executeMany(this.#requireDatabase(), sql, parameterSets,
-        `fsqlite_bulk_${this.#nextBulkSavepoint++}`, prepared),
+        `fsqlite_bulk_${this.#nextBulkSavepoint++}`, prepared, cancellation),
     };
   }
 

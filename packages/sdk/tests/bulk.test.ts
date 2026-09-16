@@ -208,3 +208,186 @@ describe("SDK atomic bulk execution", () => {
     expect((await f.db.executeMany(SQL, [[1]])).changes).toBe(1);
   });
 });
+
+async function cancellationFixture() {
+  const worker = new ControlledWorker();
+  worker.onPost = (request) => {
+    if (request.kind === "init") {
+      queueMicrotask(() => worker.reply({ kind: "ready", requestId: request.requestId,
+        data: { path: ":memory:", persistence: "memory" } }));
+    } else if (request.kind === "cancel-bulk") {
+      queueMicrotask(() => worker.reply({ kind: "cancel-bulk-result", requestId: request.requestId, accepted: true }));
+    }
+  };
+  const db = await FrankenDB.open({ worker });
+  const batchId = () => {
+    const request = worker.requests.find((item) => item.kind === "execute-many");
+    if (request === undefined) throw new Error("batch was not posted");
+    return request.requestId;
+  };
+  return { db, worker, batchId,
+    complete() { worker.reply({ kind: "execute-many-result", requestId: batchId(),
+      data: { executions: 1, changes: 1, changesPerExecution: [1] } }); },
+    cancelled() { worker.reply({ kind: "error", requestId: batchId(), error: {
+      code: "ERR_FSQLITE_BULK_CANCELLED", message: "bulk execution was cancelled", transient: false,
+    } }); },
+  };
+}
+
+function trackedSignal() {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const add = signal.addEventListener.bind(signal);
+  const remove = signal.removeEventListener.bind(signal);
+  let added = 0;
+  let removed = 0;
+  signal.addEventListener = ((...args: Parameters<typeof signal.addEventListener>) => {
+    if (args[0] === "abort") added += 1;
+    add(...args);
+  }) as typeof signal.addEventListener;
+  signal.removeEventListener = ((...args: Parameters<typeof signal.removeEventListener>) => {
+    if (args[0] === "abort") removed += 1;
+    remove(...args);
+  }) as typeof signal.removeEventListener;
+  return { controller, signal, counts: () => [added, removed] };
+}
+
+describe("SDK cooperative bulk cancellation", () => {
+  it("rejects a pre-aborted signal without posting any batch or listener", async () => {
+    const f = await cancellationFixture();
+    const tracked = trackedSignal();
+    tracked.controller.abort();
+    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow("cancelled");
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init"]);
+    expect(tracked.counts()).toEqual([0, 0]);
+  });
+
+  it("waits for the batch's rollback response, not the cancellation acknowledgement", async () => {
+    const f = await cancellationFixture();
+    const tracked = trackedSignal();
+    const batch = observe(f.db.executeMany(SQL, [[1]], { signal: tracked.signal }));
+    tracked.controller.abort();
+    await drain();
+    expect(batch.outcome.status).toBe("pending");
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "cancel-bulk"]);
+    const request = f.worker.requests.at(-1);
+    if (request?.kind !== "cancel-bulk") throw new Error("missing cancel request");
+    expect(request.targetRequestId).toBe(f.batchId());
+    f.cancelled();
+    await batch.settled;
+    const failure = rejected(batch);
+    if (!(failure instanceof FrankenSQLiteError)) throw new Error("missing typed error");
+    expect(failure.code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(tracked.counts()).toEqual([1, 1]);
+  });
+
+  it("preserves a successful commit when cancellation arrives too late", async () => {
+    const f = await cancellationFixture();
+    const controller = new AbortController();
+    f.worker.onPost = (request) => {
+      if (request.kind === "cancel-bulk") f.worker.reply({ kind: "cancel-bulk-result", requestId: request.requestId, accepted: false });
+    };
+    const batch = f.db.executeMany(SQL, [[1]], { signal: controller.signal });
+    controller.abort();
+    f.complete();
+    expect(await batch).toEqual({ executions: 1, changes: 1, changesPerExecution: [1] });
+  });
+
+  it("removes the abort listener after success and ignores later aborts", async () => {
+    const f = await cancellationFixture();
+    const tracked = trackedSignal();
+    const batch = f.db.executeMany(SQL, [[1]], { signal: tracked.signal });
+    f.complete(); await batch;
+    expect(tracked.counts()).toEqual([1, 1]);
+    tracked.controller.abort();
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many"]);
+  });
+
+  it("removes listeners after a synchronous transport failure", async () => {
+    const f = await cancellationFixture();
+    const tracked = trackedSignal();
+    f.worker.onPost = () => { throw new Error("clone failed"); };
+    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow("clone failed");
+    expect(tracked.counts()).toEqual([1, 1]);
+    tracked.controller.abort();
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many"]);
+  });
+
+  it("posts cancellation after the batch when abort occurs inside postMessage", async () => {
+    const f = await cancellationFixture();
+    const controller = new AbortController();
+    const prior = f.worker.onPost!;
+    f.worker.onPost = (request) => {
+      if (request.kind === "execute-many") controller.abort();
+      prior(request);
+    };
+    const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "cancel-bulk"]);
+    f.cancelled(); await batch.settled;
+    expect(rejected(batch) instanceof FrankenSQLiteError).toBe(true);
+  });
+
+  it("does not turn a failed cancellation delivery into a false rollback claim", async () => {
+    const f = await cancellationFixture();
+    const controller = new AbortController();
+    f.worker.onPost = (request) => {
+      if (request.kind === "cancel-bulk") throw new Error("cancel transport unavailable");
+    };
+    const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
+    controller.abort(); await drain();
+    expect(batch.outcome.status).toBe("pending");
+    f.complete(); await batch.settled;
+    expect(batch.outcome.status).toBe("fulfilled");
+  });
+
+  it("allows cancellation of admitted work while close is queued", async () => {
+    const f = await cancellationFixture();
+    const controller = new AbortController();
+    const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
+    const close = f.db.close();
+    controller.abort();
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "close", "cancel-bulk"]);
+    await drain();
+    expect(batch.outcome.status).toBe("pending");
+    f.cancelled(); await batch.settled;
+    const closeRequest = f.worker.requests.find((item) => item.kind === "close")!;
+    f.worker.reply({ kind: "close-result", requestId: closeRequest.requestId });
+    await close;
+    expect(f.worker.terminateCount).toBe(1);
+    expect(rejected(batch) instanceof FrankenSQLiteError).toBe(true);
+  });
+
+  it("settles the batch and removes its listener when the worker crashes", async () => {
+    const f = await cancellationFixture();
+    const tracked = trackedSignal();
+    const batch = observe(f.db.executeMany(SQL, [[1]], { signal: tracked.signal }));
+    tracked.controller.abort();
+    f.worker.crash("worker stopped");
+    await batch.settled;
+    expect(String(rejected(batch))).toContain("worker stopped");
+    expect(tracked.counts()).toEqual([1, 1]);
+  });
+
+  it("threads signals through prepared and managed transaction handles", async () => {
+    const f = await fixture();
+    const controller = new AbortController();
+    const statement = await f.db.prepare(SQL);
+    await statement.executeMany([[1]], { signal: controller.signal });
+    await f.db.transaction(async (tx) => {
+      await tx.executeMany(SQL, [[2]], { signal: controller.signal });
+      const prepared = await tx.prepare(SQL);
+      await prepared.executeMany([[3]], { signal: controller.signal });
+    });
+    const batches = f.worker.requests.filter((item) => item.kind === "execute-many" || item.kind === "statement-execute-many");
+    expect(batches.map((item) => item.cancellable)).toEqual([true, true, true]);
+  });
+
+  it("does not bypass transaction ownership even with a pre-aborted signal", async () => {
+    const f = await fixture();
+    const controller = new AbortController(); controller.abort();
+    await f.db.transaction(async () => {
+      await expect(f.db.executeMany(SQL, [[1]], { signal: controller.signal })).rejects.toThrow("owns this connection");
+    });
+    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-batch", "execute-batch"]);
+  });
+});

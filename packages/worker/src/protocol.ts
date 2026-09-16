@@ -90,12 +90,20 @@ export interface ExecuteManyRequest extends WorkerRequestBase {
   kind: "execute-many";
   sql: string;
   parameterSets: SqlParams[];
+  cancellable?: boolean;
 }
 
 export interface StatementExecuteManyRequest extends WorkerRequestBase {
   kind: "statement-execute-many";
   statementId: string;
   parameterSets: SqlParams[];
+  cancellable?: boolean;
+}
+
+/** Out-of-band control: requests cancellation, never performs database work. */
+export interface CancelBulkRequest extends WorkerRequestBase {
+  kind: "cancel-bulk";
+  targetRequestId: number;
 }
 
 export interface QueryRequest extends WorkerRequestBase {
@@ -139,6 +147,7 @@ export type WorkerRequest =
   | ExecuteRequest
   | ExecuteBatchRequest
   | ExecuteManyRequest
+  | CancelBulkRequest
   | QueryRequest
   | PrepareRequest
   | StatementExecuteRequest
@@ -165,6 +174,12 @@ export interface ExecuteBatchResponse extends WorkerResponseBase {
 export interface ExecuteManyResponse extends WorkerResponseBase {
   kind: "execute-many-result";
   data: ExecuteManyResult;
+}
+
+export interface CancelBulkResponse extends WorkerResponseBase {
+  kind: "cancel-bulk-result";
+  /** Accepted before commit dispatch; NOT proof that rollback has completed. */
+  accepted: boolean;
 }
 
 export interface QueryResponse extends WorkerResponseBase {
@@ -200,6 +215,7 @@ export type WorkerResponse =
   | ExecuteResponse
   | ExecuteBatchResponse
   | ExecuteManyResponse
+  | CancelBulkResponse
   | QueryResponse
   | PrepareResponse
   | StatementFinalizeResponse

@@ -27,6 +27,42 @@ function invalid(message: string): Error {
   return Object.assign(new Error(message), { code: "ERR_FSQLITE_BULK_INPUT" });
 }
 
+/** One token per admitted batch, owned by its WorkerConnectionHost. */
+export class BulkCancellation {
+  #requested = false;
+  #sealed = false;
+
+  request(): boolean {
+    if (this.#sealed) return false;
+    this.#requested = true;
+    return true;
+  }
+
+  check(): void {
+    if (this.#requested) {
+      throw Object.assign(new Error("FrankenSQLite bulk execution was cancelled"), {
+        code: "ERR_FSQLITE_BULK_CANCELLED", transient: false,
+      });
+    }
+  }
+
+  seal(): void {
+    this.check();
+    this.finish();
+  }
+
+  finish(): void {
+    this.#sealed = true;
+  }
+
+  async yield(): Promise<void> {
+    // A chain of already-resolved core promises would otherwise starve worker
+    // message events. This is a task yield, not just another microtask.
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+    this.check();
+  }
+}
+
 /**
  * Admit one DML statement, never transaction control or a multi-statement script.
  * This is a boundary check, not a SQL parser: the core still parses the SQL and
@@ -102,14 +138,19 @@ export async function executeMany(
   parameterSets: readonly (readonly SqlScalar[])[],
   savepoint: string,
   prepared?: CorePreparedStatementHandle,
+  cancellation?: BulkCancellation,
 ): Promise<ExecuteManyResult> {
+  cancellation?.check();
   validateBulkSql(sql);
   validateParameterSets(parameterSets);
   if (prepared !== undefined && prepared.columnCount !== 0) {
     throw invalid("Bulk execution does not accept result rows; use query for RETURNING/SELECT");
   }
   const result: ExecuteManyResult = { executions: 0, changes: 0, changesPerExecution: [] };
-  if (parameterSets.length === 0) return result;
+  if (parameterSets.length === 0) {
+    cancellation?.seal();
+    return result;
+  }
 
   let statement = prepared;
   let ownsStatement = false;
@@ -129,10 +170,12 @@ export async function executeMany(
     }
   };
   try {
+    if (cancellation !== undefined) await cancellation.yield();
     if (statement === undefined) {
       statement = await db.prepare(sql);
       ownsStatement = true;
     }
+    cancellation?.check();
     if (statement.columnCount !== 0) {
       throw invalid("Bulk execution does not accept result rows; use query for RETURNING/SELECT");
     }
@@ -140,22 +183,31 @@ export async function executeMany(
     began = true;
     for (const [index, params] of parameterSets.entries()) {
       batchIndex = index;
+      cancellation?.check();
       // Explicitly bind EVERY row, even []. Never reuse the previous row's binds.
       const changes = await statement.executeWithParams([...params]);
+      cancellation?.check();
       if (!Number.isSafeInteger(changes) || changes < 0 || !Number.isSafeInteger(result.changes + changes)) {
         throw invalid("Bulk affected-row count is outside the safe integer range");
       }
       result.changesPerExecution.push(changes);
       result.changes += changes;
       result.executions += 1;
+      if (cancellation !== undefined && result.executions % 128 === 0) {
+        await cancellation.yield();
+      }
     }
     batchIndex = undefined;
     // Finalization failure must roll back, not report failure after committing.
     freeOwned();
+    // Once RELEASE is dispatched, cancellation cannot safely claim that the
+    // batch did not commit. Keep the actual commit outcome authoritative.
+    cancellation?.seal();
     await db.executeBatch(`RELEASE SAVEPOINT ${savepoint}`);
     began = false;
     return result;
   } catch (cause: unknown) {
+    cancellation?.finish();
     const cleanupErrors: unknown[] = [];
     try {
       freeOwned();

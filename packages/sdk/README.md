@@ -75,6 +75,42 @@ checks connection/handle ownership. The SQL must be one `INSERT`, `UPDATE`,
 transaction-control statements, `SELECT`, and `RETURNING` reject; use the existing
 query API for results. `executeBatch` remains the separate SQL-script API.
 
+### Cancelling a bulk write
+
+Database, transaction, and prepared `executeMany` calls accept an optional
+`{ signal: AbortSignal }` argument:
+
+```ts
+const controller = new AbortController();
+const pending = db.executeMany(
+  "INSERT INTO users(id, name) VALUES (?, ?)",
+  [[10, "Ada"], [11, "Grace"]],
+  { signal: controller.signal },
+);
+// For example, a UI cancel action can call controller.abort().
+const result = await pending;
+```
+
+A pre-aborted signal rejects before posting the batch. Otherwise cancellation
+uses a targeted control message that can reach queued or active work without
+waiting behind it. An accepted cancellation finishes the currently executing
+core operation, rolls back the complete batch, and only then rejects with
+`ERR_FSQLITE_BULK_CANCELLED`. It does not merely abandon the caller's promise.
+The control acknowledgement alone is not proof of rollback; always await the
+original batch promise. Ordinary transaction error rules still apply, so use a
+child transaction to recover a cancelled batch without failing its parent.
+
+Cancellation is cooperative, not an interrupt of an individual SQL statement.
+Cancellable batches yield to worker tasks before preparing and every 128
+executions so resolved-promise chains cannot starve cancellation messages.
+There is no wall-clock cancellation bound for one long-running core operation.
+Once savepoint `RELEASE` is dispatched, cancellation is too late: the real commit
+result remains authoritative, rather than falsely reporting committed writes
+as cancelled. A failed cancellation-message delivery likewise cannot establish
+rollback. Cancellation rollback failure makes the connection unusable and
+retains the original cause and cleanup errors. Abort listeners are removed when
+the batch settles; aborting a finished operation does not affect later work.
+
 ## Transactions and connection ownership
 
 Use the callback's `tx` handle for every operation in a managed transaction:

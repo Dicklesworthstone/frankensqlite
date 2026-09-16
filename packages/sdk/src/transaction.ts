@@ -1,4 +1,4 @@
-import type { ExecuteManyResult, QueryResult, SqlScalar } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
 import type { FrankenDB } from "./database";
 import { FrankenPreparedStatement } from "./statement";
 
@@ -25,8 +25,9 @@ export class FrankenTransaction {
   executeMany(
     sql: string,
     parameterSets: readonly (readonly SqlScalar[])[],
+    options?: ExecuteManyOptions,
   ): Promise<ExecuteManyResult> {
-    return this.#db.executeMany(sql, parameterSets);
+    return this.#db.executeMany(sql, parameterSets, options);
   }
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(

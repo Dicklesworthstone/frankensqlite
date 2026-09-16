@@ -3,6 +3,7 @@ export { FrankenSQLiteError } from "./errors";
 export { FrankenPreparedStatement } from "./statement";
 export { FrankenTransaction } from "./transaction";
 export type {
+  ExecuteManyOptions,
   ExecuteManyResult,
   FrankenDbOpenOptions,
   PersistenceMode,

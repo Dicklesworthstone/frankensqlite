@@ -14,6 +14,7 @@ import type {
 import { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 
 import { FrankenSQLiteError } from "./errors";
+import type { ExecuteManyOptions } from "./types";
 
 export interface WorkerMessageEvent {
   readonly data: WorkerResponse;
@@ -116,26 +117,28 @@ export class FrankenWorkerClient {
   async executeMany(
     sql: string,
     parameterSets: readonly (readonly SqlScalar[])[],
+    options: ExecuteManyOptions = {},
   ): Promise<ExecuteManyResult> {
-    const response = await this.#send({
+    const response = await this.#sendBulk({
       kind: "execute-many",
       requestId: this.#nextId(),
       sql,
       parameterSets: copyParameterSets(parameterSets),
-    });
+    }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
 
   async executePreparedMany(
     statementId: string,
     parameterSets: readonly (readonly SqlScalar[])[],
+    options: ExecuteManyOptions = {},
   ): Promise<ExecuteManyResult> {
-    const response = await this.#send({
+    const response = await this.#sendBulk({
       kind: "statement-execute-many",
       requestId: this.#nextId(),
       statementId,
       parameterSets: copyParameterSets(parameterSets),
-    });
+    }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
 
@@ -266,6 +269,47 @@ export class FrankenWorkerClient {
 
   #nextId(): number {
     return this.#nextRequestId++;
+  }
+
+  async #sendBulk(
+    request: Extract<WorkerRequest, { kind: "execute-many" | "statement-execute-many" }>,
+    signal?: AbortSignal,
+  ): Promise<WorkerResponse> {
+    if (signal === undefined) return this.#send(request);
+    const checkAborted = (): void => {
+      if (signal.aborted) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_BULK_CANCELLED",
+          message: "FrankenSQLite bulk execution was cancelled before admission", transient: false });
+      }
+    };
+    checkAborted();
+    request.cancellable = true;
+    let posted = false;
+    let cancelSent = false;
+    let settled = false;
+    const cancel = (): void => {
+      if (!posted || settled || cancelSent) return;
+      cancelSent = true;
+      // Close may already be queued behind this batch. Allow its cancellation
+      // control message through, but never admit additional SQL during close.
+      void this.#send({ kind: "cancel-bulk", requestId: this.#nextId(),
+        targetRequestId: request.requestId }, true).catch(() => {
+        // A failed cancellation delivery cannot establish rollback. The batch's
+        // own response (or worker-crash error) remains authoritative.
+      });
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      checkAborted();
+      const response = this.#send(request);
+      posted = true;
+      // Covers abort during custom transport dispatch or listener registration.
+      if (signal.aborted) cancel();
+      return await response;
+    } finally {
+      settled = true;
+      signal.removeEventListener("abort", cancel);
+    }
   }
 
   #send(request: WorkerRequest, allowClosing = false): Promise<WorkerResponse> {
