@@ -5,6 +5,7 @@ export type { StreamFailurePhase } from "./stream";
 export { FrankenPreparedStatement } from "./statement";
 export { FrankenTransaction } from "./transaction";
 export type {
+  ResultEncoding,
   ExecuteManyOptions,
   ExecuteManyResult,
   ExecuteStreamOptions,

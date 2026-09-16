@@ -8,12 +8,14 @@ import type {
   SnapshotMetadata,
   RequestLimits,
   RequestQueueStats,
+  ResultEncoding,
 } from "@frankensqlite/worker";
 
 import type { WorkerLike } from "./worker-client";
 
 export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SnapshotMetadata };
 export type { RequestLimits, RequestQueueStats };
+export type { ResultEncoding };
 
 export type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> =
   WorkerQueryResult<Row>;

@@ -17,6 +17,8 @@ import type {
 import { RequestAdmissionError, RequestBudget } from "@frankensqlite/worker";
 
 import { FrankenSQLiteError } from "./errors";
+import { decodeQueryResult, resolveResultEncoding, ResultCodecError } from "@frankensqlite/worker";
+import type { ResultEncoding } from "@frankensqlite/worker";
 import type { ExecuteManyOptions } from "./types";
 
 export interface WorkerMessageEvent {
@@ -63,6 +65,7 @@ export class FrankenWorkerClient {
   #closing = false;
   #disposed = false;
   #closePromise: Promise<void> | null = null;
+  #resultEncoding: ResultEncoding = "structured-clone";
 
   readonly #onMessage = (event: WorkerMessageEvent): void => {
     const pending = this.#pending.get(event.data.requestId);
@@ -97,13 +100,26 @@ export class FrankenWorkerClient {
     return this.#budget.stats;
   }
 
+  get resultEncoding(): ResultEncoding {
+    return this.#resultEncoding;
+  }
+
   async init(config: InitConfig) {
+    const requested = resolveResultEncoding(config.resultEncoding);
     const response = await this.#send({
       kind: "init",
       requestId: this.#nextId(),
       config,
     });
-    return ensureKind(response, "ready").data;
+    const ready = ensureKind(response, "ready").data;
+    const accepted = resolveResultEncoding(ready.resultEncoding);
+    if (accepted !== "structured-clone" && accepted !== requested) {
+      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_RESULT_ENCODING", transient: false,
+        message: "Worker enabled a result encoding that was not requested" });
+    }
+    // An older worker may omit the acknowledgement and keep structured clone.
+    this.#resultEncoding = accepted;
+    return ready;
   }
 
   /** Boundaries are worker operations, never SQL supplied through a public handle. */
@@ -193,7 +209,7 @@ export class FrankenWorkerClient {
       params,
       ...(transactionId === undefined ? {} : { transactionId }),
     });
-    return ensureKind(response, "query-result").data as QueryResult<Row>;
+    return this.#queryResult<Row>(response);
   }
 
   async prepare(sql: string, transactionId?: string) {
@@ -233,7 +249,26 @@ export class FrankenWorkerClient {
       params,
       ...(transactionId === undefined ? {} : { transactionId }),
     });
-    return ensureKind(response, "query-result").data as QueryResult<Row>;
+    return this.#queryResult<Row>(response);
+  }
+
+  #queryResult<Row extends Record<string, unknown>>(response: WorkerResponse): QueryResult<Row> {
+    if (response.kind !== "query-binary-result") {
+      return ensureKind(response, "query-result").data as QueryResult<Row>;
+    }
+    try {
+      if (this.#resultEncoding === "structured-clone" || response.encoding !== "fqr1") {
+        throw new ResultCodecError("Unexpected or unnegotiated binary result encoding");
+      }
+      return decodeQueryResult(response.data) as QueryResult<Row>;
+    } catch (error: unknown) {
+      // SQL has already executed. Reject AFTER #send released its reservation;
+      // never retry a write/RETURNING query because its result could not decode.
+      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_RESULT_DECODE", transient: false,
+        userRecoverable: false,
+        message: error instanceof Error ? error.message : "Could not decode query result",
+        suggestion: "The SQL may have executed. Do not automatically retry writes; inspect database state." });
+    }
   }
 
   async finalizePrepared(statementId: string, transactionId?: string): Promise<void> {

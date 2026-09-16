@@ -6,7 +6,7 @@ import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
 import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
-import { resolveRequestLimits } from "@frankensqlite/worker";
+import { resolveRequestLimits, resolveResultEncoding } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 import type { TransactionOptions } from "./types";
 
@@ -41,8 +41,10 @@ export class FrankenDB {
     const normalized = normalizeOpenOptions(options);
     // Validate before allocating a worker or transferring a snapshot buffer.
     const limits = resolveRequestLimits(normalized.requestLimits);
+    const resultEncoding = resolveResultEncoding(normalized.resultEncoding);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
+    if (normalized.resultEncoding !== undefined) config.resultEncoding = resultEncoding;
     if (normalized.dbName !== undefined) {
       config.dbName = normalized.dbName;
     }
@@ -85,6 +87,11 @@ export class FrankenDB {
 
   get persistence(): PersistenceMode {
     return this.#persistence;
+  }
+
+  /** Effective worker policy; individual noncanonical results may still fall back. */
+  get resultEncoding() {
+    return this.#client.resultEncoding;
   }
 
   /** Last loaded/published checkpoint, not the state of unsaved memory writes. */
