@@ -8,6 +8,7 @@ import type {
   QueryResult,
   QueryResponse,
   SqlScalar,
+  SnapshotMetadata,
   WorkerRequest,
   WorkerResponse,
 } from "@frankensqlite/worker";
@@ -205,6 +206,11 @@ export class FrankenWorkerClient {
       requestId: this.#nextId(),
     });
     return ensureKind(response, "export-result").data;
+  }
+
+  async checkpoint(): Promise<SnapshotMetadata> {
+    const response = await this.#send({ kind: "checkpoint", requestId: this.#nextId() });
+    return ensureKind(response, "checkpoint-result").data;
   }
 
   close(): Promise<void> {

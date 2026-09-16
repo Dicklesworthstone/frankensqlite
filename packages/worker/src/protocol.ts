@@ -1,4 +1,6 @@
-export type PersistenceMode = "memory" | "opfs" | "indexeddb";
+import type { SnapshotMetadata } from "./snapshot-store";
+
+export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot";
 
 export type SqlScalar =
   | null
@@ -38,6 +40,8 @@ export interface InitConfig {
 export interface InitResult {
   path: string;
   persistence: PersistenceMode;
+  /** Last explicit checkpoint; absent for non-snapshot modes. */
+  snapshot?: SnapshotMetadata | null;
 }
 
 export interface PreparedStatementMetadata {
@@ -142,6 +146,10 @@ export interface CloseRequest extends WorkerRequestBase {
   kind: "close";
 }
 
+export interface CheckpointRequest extends WorkerRequestBase {
+  kind: "checkpoint";
+}
+
 export type WorkerRequest =
   | InitRequest
   | ExecuteRequest
@@ -155,6 +163,7 @@ export type WorkerRequest =
   | StatementQueryRequest
   | StatementFinalizeRequest
   | ExportRequest
+  | CheckpointRequest
   | CloseRequest;
 
 export interface ReadyResponse extends WorkerResponseBase {
@@ -205,6 +214,11 @@ export interface CloseResponse extends WorkerResponseBase {
   kind: "close-result";
 }
 
+export interface CheckpointResponse extends WorkerResponseBase {
+  kind: "checkpoint-result";
+  data: SnapshotMetadata;
+}
+
 export interface ErrorResponse extends WorkerResponseBase {
   kind: "error";
   error: SerializedFrankenError;
@@ -220,5 +234,6 @@ export type WorkerResponse =
   | PrepareResponse
   | StatementFinalizeResponse
   | ExportResponse
+  | CheckpointResponse
   | CloseResponse
   | ErrorResponse;

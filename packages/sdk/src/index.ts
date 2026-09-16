@@ -10,6 +10,7 @@ export type {
   QueryResult,
   SerializedFrankenError,
   SqlScalar,
+  SnapshotMetadata,
 } from "./types";
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type { WorkerLike } from "./worker-client";

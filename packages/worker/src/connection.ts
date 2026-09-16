@@ -1,4 +1,5 @@
 import type {
+  CheckpointResponse,
   ExecuteBatchResponse,
   ExecuteManyResponse,
   ExecuteResponse,
@@ -21,6 +22,16 @@ import {
   UnsupportedPersistenceModeError,
 } from "./vfs-init";
 import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
+import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName } from "./snapshot-store";
+import type { SnapshotMetadata } from "./snapshot-store";
+
+class CheckpointRollbackError extends SnapshotStoreError {
+  readonly cleanupErrors: unknown[] = [];
+  constructor(cause: unknown) {
+    super("ERR_FSQLITE_SNAPSHOT_CONNECTION_UNUSABLE",
+      "The checkpoint transaction probe could not roll back; reopen the connection", { cause });
+  }
+}
 
 export interface CorePreparedStatementHandle {
   readonly sql: string;
@@ -79,8 +90,10 @@ export class WorkerConnectionHost {
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
   #requestTail: Promise<void> = Promise.resolve();
   #nextBulkSavepoint = 1n;
-  #terminalError: BulkExecutionError | null = null;
+  #terminalError: Error | null = null;
   readonly #bulkCancellations = new Map<number, BulkCancellation>();
+  #snapshotStore: IndexedDbSnapshotStore | null = null;
+  #snapshotRevision: string | null = null;
 
   constructor(loader: CoreModuleLoader = defaultCoreModuleLoader) {
     this.#loader = loader;
@@ -166,6 +179,8 @@ export class WorkerConnectionHost {
           return this.#statementFinalize(request.requestId, request.statementId);
         case "export":
           return await this.#exportSnapshot(request.requestId);
+        case "checkpoint":
+          return await this.#checkpoint(request.requestId);
         case "close":
           return this.#close(request.requestId);
       }
@@ -193,20 +208,46 @@ export class WorkerConnectionHost {
     const ready = createReadyResult(config);
     assertSupportedPersistenceMode(ready.persistence);
 
-    const core = await this.#loader.load(config.wasmUrl);
-    this.#disposeDatabase();
-    this.#db = config.snapshot
-      ? await core.FrankenDB.import(config.snapshot)
-      : await core.FrankenDB.create(resolveDatabasePath(config));
-
-    return {
-      kind: "ready",
-      requestId,
-      data: {
-        path: this.#db.path || ready.path,
-        persistence: resolvePersistenceMode(config.persistence),
-      },
-    };
+    let stagedStore: IndexedDbSnapshotStore | null = null;
+    try {
+      let image = config.snapshot;
+      let saved: SnapshotMetadata | null = null;
+      if (ready.persistence === "indexeddb-snapshot") {
+        validateSnapshotName(config.dbName ?? "");
+        if (image !== undefined) validateSnapshotBytes(image);
+        stagedStore = await IndexedDbSnapshotStore.open(config.dbName!);
+        const loaded = await stagedStore.load();
+        if (loaded !== null) {
+          if (image !== undefined) {
+            throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_EXISTS",
+              "An existing checkpoint cannot be replaced by an initialization snapshot");
+          }
+          image = loaded.bytes;
+          saved = { revision: loaded.revision, parentRevision: loaded.parentRevision,
+            byteLength: loaded.byteLength, sha256: loaded.sha256 };
+        }
+      }
+      // Validate storage before disposing the old session. Failed or corrupt
+      // loads must neither erase the old image nor initialize an empty DB.
+      const core = await this.#loader.load(config.wasmUrl);
+      this.#disposeDatabase();
+      this.#db = image !== undefined
+        ? await core.FrankenDB.import(image)
+        : await core.FrankenDB.create(resolveDatabasePath(config));
+      this.#snapshotStore = stagedStore;
+      stagedStore = null; // Ownership transfers only after core initialization.
+      this.#snapshotRevision = saved?.revision ?? null;
+      return {
+        kind: "ready", requestId,
+        data: {
+          path: ready.persistence === "indexeddb-snapshot" ? ready.path : this.#db.path || ready.path,
+          persistence: resolvePersistenceMode(config.persistence),
+          ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved } : {}),
+        },
+      };
+    } finally {
+      stagedStore?.close();
+    }
   }
 
   async #execute(
@@ -340,6 +381,40 @@ export class WorkerConnectionHost {
     };
   }
 
+  async #checkpoint(requestId: number): Promise<CheckpointResponse> {
+    const db = this.#requireDatabase();
+    const store = this.#snapshotStore;
+    if (store === null) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
+        "Explicit checkpoints require persistence: indexeddb-snapshot");
+    }
+    // The current WASM contract has no transaction-state accessor. Probe an
+    // empty BEGIN/ROLLBACK boundary instead of guessing from SQL text (which
+    // misses scripts, prepared control statements and implicit rollbacks).
+    // A failed BEGIN does NOT authorize rolling back the caller's transaction.
+    try {
+      await db.executeBatch("BEGIN");
+    } catch (cause: unknown) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_TRANSACTION",
+        "Could not establish an idle checkpoint boundary; finish any active transaction first", { cause });
+    }
+    try {
+      await db.executeBatch("ROLLBACK");
+    } catch (cause: unknown) {
+      const failure = new CheckpointRollbackError(cause);
+      this.#terminalError = failure;
+      try { this.#disposeDatabase(); }
+      catch (cleanupError: unknown) { failure.cleanupErrors.push(cleanupError); }
+      throw failure;
+    }
+    // Remain in the same host FIFO slot through export, hash, CAS and commit.
+    // Quota/conflict/export failures leave both the prior durable checkpoint
+    // and this session's expected revision unchanged; memory remains usable.
+    const saved = await store.save(await db.export(), this.#snapshotRevision);
+    this.#snapshotRevision = saved.revision;
+    return { kind: "checkpoint-result", requestId, data: saved };
+  }
+
   #close(requestId: number): WorkerResponse {
     this.#disposeDatabase();
     return {
@@ -353,8 +428,13 @@ export class WorkerConnectionHost {
     this.#statements.clear();
     const db = this.#db;
     this.#db = null;
+    const snapshotStore = this.#snapshotStore;
+    this.#snapshotStore = null;
+    this.#snapshotRevision = null;
 
     let firstError: unknown;
+    try { snapshotStore?.close(); }
+    catch (error: unknown) { firstError = error; }
     for (const stmt of statements) {
       try {
         stmt.free();
@@ -453,6 +533,16 @@ export function serializeFrankenError(
   }
   if (error instanceof Error && error.stack !== undefined) {
     serialized.stack = error.stack;
+  }
+
+  if (error instanceof SnapshotStoreError && depth < 4 && error.cause !== undefined) {
+    serialized.cause = serializeFrankenError(error.cause, depth + 1);
+  }
+  if (error instanceof CheckpointRollbackError) {
+    serialized.transient = false;
+    serialized.userRecoverable = false;
+    serialized.cleanupErrors = depth < 4
+      ? error.cleanupErrors.map((item) => serializeFrankenError(item, depth + 1)) : [];
   }
 
   return serialized;

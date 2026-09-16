@@ -33,7 +33,7 @@ export function createReadyResult(config: InitConfig): InitResult {
 export function assertSupportedPersistenceMode(
   persistence: PersistenceMode,
 ): void {
-  if (persistence !== "memory") {
+  if (persistence !== "memory" && persistence !== "indexeddb-snapshot") {
     throw new UnsupportedPersistenceModeError(persistence);
   }
 }
