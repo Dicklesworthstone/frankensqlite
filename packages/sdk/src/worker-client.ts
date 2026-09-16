@@ -1,5 +1,6 @@
 import type {
   ExecuteBatchResponse,
+  ExecuteManyResult,
   ExecuteResponse,
   ExportResponse,
   InitConfig,
@@ -10,6 +11,7 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from "@frankensqlite/worker";
+import { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 
 import { FrankenSQLiteError } from "./errors";
 
@@ -109,6 +111,32 @@ export class FrankenWorkerClient {
       sql,
     });
     ensureKind(response, "execute-batch-result");
+  }
+
+  async executeMany(
+    sql: string,
+    parameterSets: readonly (readonly SqlScalar[])[],
+  ): Promise<ExecuteManyResult> {
+    const response = await this.#send({
+      kind: "execute-many",
+      requestId: this.#nextId(),
+      sql,
+      parameterSets: copyParameterSets(parameterSets),
+    });
+    return ensureKind(response, "execute-many-result").data;
+  }
+
+  async executePreparedMany(
+    statementId: string,
+    parameterSets: readonly (readonly SqlScalar[])[],
+  ): Promise<ExecuteManyResult> {
+    const response = await this.#send({
+      kind: "statement-execute-many",
+      requestId: this.#nextId(),
+      statementId,
+      parameterSets: copyParameterSets(parameterSets),
+    });
+    return ensureKind(response, "execute-many-result").data;
   }
 
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -262,6 +290,22 @@ export class FrankenWorkerClient {
       }
     });
   }
+}
+
+function copyParameterSets(parameterSets: readonly (readonly SqlScalar[])[]): SqlScalar[][] {
+  // Bound input before cloning/posting it. Never split a batch into separately
+  // committed chunks behind the caller's back.
+  if (!Array.isArray(parameterSets) || parameterSets.length > MAX_EXECUTE_MANY_ROWS) {
+    throw new FrankenSQLiteError({ code: "ERR_FSQLITE_BULK_INPUT",
+      message: `Bulk execution accepts at most ${MAX_EXECUTE_MANY_ROWS} parameter sets` });
+  }
+  return Array.from(parameterSets, (params, batchIndex) => {
+    if (!Array.isArray(params)) {
+      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_BULK_INPUT", batchIndex,
+        message: "Each parameter set must be an array" });
+    }
+    return [...params];
+  });
 }
 
 function ensureKind<K extends WorkerResponse["kind"]>(

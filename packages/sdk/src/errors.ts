@@ -7,11 +7,18 @@ export class FrankenSQLiteError extends Error {
   readonly transient?: boolean;
   readonly userRecoverable?: boolean;
   readonly suggestion?: string;
+  readonly batchIndex?: number;
+  readonly cleanupErrors: readonly FrankenSQLiteError[];
 
   constructor(error: SerializedFrankenError) {
-    super(error.message);
+    super(error.message, error.cause === undefined
+      ? undefined : { cause: new FrankenSQLiteError(error.cause) });
     this.name = "FrankenSQLiteError";
     this.code = error.code;
+    this.cleanupErrors = (error.cleanupErrors ?? []).map((item) => new FrankenSQLiteError(item));
+    if (error.batchIndex !== undefined) {
+      this.batchIndex = error.batchIndex;
+    }
     if (error.sqliteCode !== undefined) {
       this.sqliteCode = error.sqliteCode;
     }

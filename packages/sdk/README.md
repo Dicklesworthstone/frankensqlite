@@ -7,7 +7,7 @@ Current behavior:
 
 - `FrankenDB.open()` starts a dedicated module worker and initializes the WASM
   runtime through `@frankensqlite/worker`.
-- `execute`, `executeBatch`, `query`, `prepare`, `export`, and `transaction`
+- `execute`, `executeBatch`, `executeMany`, `query`, `prepare`, `export`, and `transaction`
   are exposed as Promise-based APIs.
 - Persistence is intentionally memory-first until OPFS and IndexedDB backends
   land. Passing `opfs` or `indexeddb` surfaces an explicit worker error.
@@ -28,6 +28,52 @@ const result = await db.query<{ id: number; name: string }>(
 console.log(result.rows);
 await db.close();
 ```
+
+## Atomic bulk writes
+
+`executeMany(sql, parameterSets)` sends one worker request and reuses one prepared
+statement for all input rows. It returns `{ executions, changes,
+changesPerExecution }`; the counts are direct affected-row counts, not counts of
+trigger or cascading effects. Values remain bound parameters, including `bigint`,
+`null`, and `Uint8Array` blobs.
+
+```ts
+const imported = await db.executeMany(
+  "INSERT INTO users(id, name) VALUES (?, ?)",
+  [[1, "Ada"], [2, "Grace"], [3, "Linus"]],
+);
+console.log(imported.executions, imported.changesPerExecution);
+
+// Existing prepared handles also support atomic batches and remain reusable.
+const update = await db.prepare("UPDATE users SET name = ? WHERE id = ?");
+await update.executeMany([["Ada Lovelace", 1], ["Grace Hopper", 2]]);
+await update.finalize();
+```
+
+Each batch uses a unique savepoint. Outside a transaction it commits on success;
+inside `tx.executeMany(...)` or a transaction-owned prepared statement, it stays
+part of the enclosing transaction. A failing row rolls back the complete batch,
+including earlier executions and their transactional trigger effects. A
+finalization or deferred-constraint failure also rolls back before rejecting.
+`FrankenSQLiteError.batchIndex` identifies a failing parameter set (zero-based).
+Boundary failures have no row index. The SQLite codes, original `cause`, and
+`cleanupErrors` survive the worker boundary.
+
+Like other scoped operations, a failed `tx.executeMany()` makes that managed
+callback fail even when its rejection is caught. To discard one batch and
+continue the parent, run it in `tx.transaction(child => child.executeMany(...))`
+and catch the child's failure after rollback. `OR ROLLBACK` or a rollback-raising
+trigger may abort the entire outer transaction; failed savepoint recovery makes
+the host unusable (`ERR_FSQLITE_BULK_CONNECTION_UNUSABLE`), never silently reusable.
+
+One request accepts at most `MAX_EXECUTE_MANY_ROWS` (10,000) parameter sets. Larger
+inputs reject before posting/writing; they are never silently split into partial
+commits. To import more rows atomically, issue sequential batches within one
+managed transaction. Empty input performs no preparation or writes, but still
+checks connection/handle ownership. The SQL must be one `INSERT`, `UPDATE`,
+`DELETE`, `REPLACE`, or `WITH` DML statement with no returned columns. Scripts,
+transaction-control statements, `SELECT`, and `RETURNING` reject; use the existing
+query API for results. `executeBatch` remains the separate SQL-script API.
 
 ## Transactions and connection ownership
 

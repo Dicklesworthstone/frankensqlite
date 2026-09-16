@@ -1,10 +1,10 @@
-import type { QueryResult, SqlScalar } from "./types";
+import type { ExecuteManyResult, QueryResult, SqlScalar } from "./types";
 import type { FrankenDB } from "./database";
 import { FrankenPreparedStatement } from "./statement";
 
 type TransactionCapableDb = Pick<
   FrankenDB,
-  "execute" | "query" | "prepare"
+  "execute" | "executeMany" | "query" | "prepare"
 >;
 
 type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>) => Promise<T>;
@@ -20,6 +20,13 @@ export class FrankenTransaction {
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     return this.#db.execute(sql, params);
+  }
+
+  executeMany(
+    sql: string,
+    parameterSets: readonly (readonly SqlScalar[])[],
+  ): Promise<ExecuteManyResult> {
+    return this.#db.executeMany(sql, parameterSets);
   }
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
