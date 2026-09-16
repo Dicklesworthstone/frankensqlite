@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "fsqlite-ast",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "argon2",
  "asupersync",
