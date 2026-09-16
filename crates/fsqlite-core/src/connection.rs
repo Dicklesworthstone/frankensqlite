@@ -14470,6 +14470,7 @@ impl Connection {
         let path = path.into();
         if path.is_empty()
             || (writable && path == ":memory:")
+            || (matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex) && path == ":memory:")
             || (expected_identity.is_some() && path == ":memory:")
         {
             return Err(FrankenError::CannotOpen {

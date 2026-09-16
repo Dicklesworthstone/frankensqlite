@@ -1025,7 +1025,7 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
 /// the contention case stock first owns BEGIN IMMEDIATE on the target, then
 /// deliberately reinstates the stale derived fixture while retaining WRITE.
 #[cfg(all(unix, feature = "native"))]
-fn stale_generation_fixture(path: &Path, writer: bool) -> PublicReaderProcess {
+fn stale_generation_fixture(path: &Path, writer: bool, header_only: bool) -> PublicReaderProcess {
     let script = r#"
 import pathlib, shutil, sqlite3, sys
 p = pathlib.Path(sys.argv[1])
@@ -1038,8 +1038,15 @@ c.execute('INSERT INTO t VALUES(20)')
 c.commit()
 current = pathlib.Path(seed + '-shm').read_bytes()
 assert old[32:40] != current[32:40], 'fixture must span distinct WAL salt generations'
+if sys.argv[3] == 'header-only':
+    checkpoint = c.execute('PRAGMA wal_checkpoint(FULL)').fetchone()
+    assert checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
 for suffix in ['', '-wal']:
     shutil.copyfile(seed + suffix, str(p) + suffix)
+if sys.argv[3] == 'header-only':
+    header = pathlib.Path(seed + '-wal').read_bytes()[:32]
+    assert len(header) == 32
+    pathlib.Path(str(p) + '-wal').write_bytes(header)
 pathlib.Path(str(p) + '-shm').write_bytes(old)
 c.close()
 if sys.argv[2] == 'writer':
@@ -1058,6 +1065,7 @@ if sys.argv[2] == 'writer':
         .args(["-c", script])
         .arg(path)
         .arg(if writer { "writer" } else { "idle" })
+        .arg(if header_only { "header-only" } else { "committed-frames" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1083,15 +1091,18 @@ if sys.argv[2] == 'writer':
 fn cass_gh477_explicit_index_recovery_preserves_database_and_wal() {
     asupersync::test_utils::run_test(|| async {
         let directory = tempfile::tempdir().unwrap();
-        for writer in [false, true] {
-            let path = directory.path().join(format!("generation-{writer}.db"));
-            let mut fixture = stale_generation_fixture(&path, writer);
+        for (writer, header_only) in [(false, false), (true, false), (false, true), (true, true)] {
+            let path = directory.path().join(format!("generation-{writer}-{header_only}.db"));
+            let mut fixture = stale_generation_fixture(&path, writer, header_only);
             let fingerprint = |suffix: &str| {
                 let file = sidecar(&path, suffix);
                 (std::fs::read(&file).unwrap(), std::fs::metadata(file).unwrap().modified().unwrap())
             };
             let main_before = fingerprint("");
             let wal_before = fingerprint("-wal");
+            if header_only {
+                assert_eq!(wal_before.0.len(), 32, "valid empty WAL retains its complete header");
+            }
             let shm_before = fingerprint("-shm");
             let started = std::time::Instant::now();
             let strict = Connection::open_schema_only(path.to_str().unwrap()).await;

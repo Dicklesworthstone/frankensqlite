@@ -1717,6 +1717,9 @@ enum WorkerOpenRequest {
     SchemaOnly {
         path: String,
     },
+    SchemaOnlyWithWalIndexRecovery {
+        path: String,
+    },
     SchemaOnlyWithEnv {
         path: String,
         env: ConnectionEnv,
@@ -1774,6 +1777,13 @@ impl WorkerOpenRequest {
             }
             Self::SchemaOnlyWithEnv { path, env } => {
                 Connection::open_schema_only_with_env(path, dedicated_worker_env(env)).await
+            }
+            Self::SchemaOnlyWithWalIndexRecovery { path } => {
+                Connection::open_schema_only_with_wal_index_recovery_and_env(
+                    path,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
             }
             Self::ExistingSchemaOnlyWithEnv { path, env } => {
                 Connection::open_existing_schema_only_with_env(path, dedicated_worker_env(env))
@@ -2074,6 +2084,20 @@ impl AsyncConnection {
     /// avoid introducing writer semantics such as close-time checkpoints.
     pub fn open_schema_only_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
         Self::open_sync_with_request(WorkerOpenRequest::SchemaOnly { path: path.into() })
+    }
+
+    /// Open read-only on the dedicated worker, explicitly permitting only
+    /// derived WAL-index recovery under the native recovery locks.
+    ///
+    /// Database/WAL writes, checkpoints, and rollback-journal recovery remain
+    /// forbidden. The ordinary readonly constructors retain their strict
+    /// refusal behavior when SHM needs recovery.
+    pub fn open_schema_only_with_wal_index_recovery_sync(
+        path: impl Into<String>,
+    ) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::SchemaOnlyWithWalIndexRecovery {
+            path: path.into(),
+        })
     }
 
     /// Open an existing database in read-only schema-only mode with a custom
@@ -6745,6 +6769,102 @@ mod tests {
             "schema-only mode must expose the persisted table definition"
         );
         conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn owner_stale_generation_fixture(path: &std::path::Path, header_only: bool) {
+        let script = r#"
+import pathlib, shutil, sqlite3, sys
+p = sys.argv[1]
+seed = p + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40]
+if sys.argv[2] == 'header-only':
+    checkpoint = c.execute('PRAGMA wal_checkpoint(FULL)').fetchone()
+    assert checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
+shutil.copyfile(seed, p)
+wal = pathlib.Path(seed + '-wal').read_bytes()
+pathlib.Path(p + '-wal').write_bytes(wal[:32] if sys.argv[2] == 'header-only' else wal)
+pathlib.Path(p + '-shm').write_bytes(old)
+c.close()
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(path)
+            .arg(if header_only { "header-only" } else { "frames" })
+            .output()
+            .expect("Python sqlite3 creates two real WAL generations");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn cass_gh477_owner_recovers_stale_wal_index_without_primary_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        for header_only in [false, true] {
+            let path = directory.path().join(format!("owner-{header_only}.db"));
+            owner_stale_generation_fixture(&path, header_only);
+            let fingerprint = |suffix: &str| {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                let file = std::path::PathBuf::from(file);
+                (
+                    std::fs::read(&file).unwrap(),
+                    std::fs::metadata(file).unwrap().modified().unwrap(),
+                )
+            };
+            let main_before = fingerprint("");
+            let wal_before = fingerprint("-wal");
+            let shm_before = fingerprint("-shm");
+            if header_only {
+                assert_eq!(wal_before.0.len(), 32);
+            }
+            let started = std::time::Instant::now();
+            let strict = AsyncConnection::open_with_flags_sync(
+                path.to_str().unwrap(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(matches!(strict, Err(FrankenError::BusyRecovery)));
+            assert_eq!(fingerprint("-shm"), shm_before);
+            let mut connection = AsyncConnection::open_schema_only_with_wal_index_recovery_sync(
+                path.to_str().unwrap(),
+            )
+            .expect("dedicated owner repairs only the derived index");
+            let rows = connection.query_sync("SELECT sum(n) FROM t").unwrap();
+            assert_eq!(
+                rows.first().and_then(|row| row.get(0)),
+                Some(&SqliteValue::Integer(30))
+            );
+            assert!(matches!(
+                connection.execute_sync("INSERT INTO t VALUES(99)"),
+                Err(FrankenError::ReadOnly)
+            ));
+            connection.close_without_checkpoint_sync().unwrap();
+            assert_eq!(fingerprint(""), main_before);
+            assert_eq!(fingerprint("-wal"), wal_before);
+            assert_ne!(fingerprint("-shm").0, shm_before.0);
+        }
+        let missing = directory.path().join("missing.db");
+        assert!(matches!(
+            AsyncConnection::open_schema_only_with_wal_index_recovery_sync(missing.to_str().unwrap()),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(!missing.exists());
+        assert!(matches!(
+            AsyncConnection::open_schema_only_with_wal_index_recovery_sync(":memory:"),
+            Err(FrankenError::CannotOpen { .. })
+        ));
     }
 
     #[cfg(all(feature = "native", any(unix, windows)))]
