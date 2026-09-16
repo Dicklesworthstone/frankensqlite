@@ -1,5 +1,6 @@
 import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
 import { FrankenWorkerClient } from "./worker-client";
+import { FrankenSQLiteError } from "./errors";
 
 type StatementOperation = <T>(operation: () => Promise<T>) => Promise<T>;
 
@@ -62,9 +63,24 @@ export class FrankenPreparedStatement<
       return this.#finalizePromise;
     }
     return this.#run(() => {
-      // Do not mark finalized if transaction ownership rejects admission.
-      this.#onFinalize?.();
-      this.#finalizePromise = this.#client.finalizePrepared(this.#statementId);
+      // Keep scope ownership until the worker actually accepts finalization.
+      // Admission refusals run no SQL and must leave the handle retryable (or
+      // available to the owning transaction's drain/cleanup after overload).
+      this.#finalizePromise = this.#client.finalizePrepared(this.#statementId).then(
+        () => { this.#onFinalize?.(); },
+        (error: unknown) => {
+          if (error instanceof FrankenSQLiteError &&
+            (error.code === "ERR_FSQLITE_QUEUE_FULL" || error.code === "ERR_FSQLITE_REQUEST_TOO_LARGE" ||
+             error.code === "ERR_FSQLITE_REQUEST_INPUT")) {
+            this.#finalizePromise = null;
+          } else {
+            // A free() error can occur after the worker removed the handle;
+            // that outcome is not a license to finalize the same handle twice.
+            this.#onFinalize?.();
+          }
+          throw error;
+        },
+      );
       return this.#finalizePromise;
     });
   }

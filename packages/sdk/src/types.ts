@@ -6,11 +6,14 @@ import type {
   SerializedFrankenError,
   SqlScalar,
   SnapshotMetadata,
+  RequestLimits,
+  RequestQueueStats,
 } from "@frankensqlite/worker";
 
 import type { WorkerLike } from "./worker-client";
 
 export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SnapshotMetadata };
+export type { RequestLimits, RequestQueueStats };
 
 export type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> =
   WorkerQueryResult<Row>;
@@ -56,4 +59,6 @@ export interface FrankenDbOpenOptions
   extends Omit<InitConfig, "snapshot"> {
   snapshot?: Uint8Array;
   worker?: WorkerLike | (() => WorkerLike);
+  /** Bound active + queued request count and accounted payload before IPC. */
+  requestLimits?: Partial<RequestLimits>;
 }

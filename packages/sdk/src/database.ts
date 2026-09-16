@@ -6,6 +6,8 @@ import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
 import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
+import { resolveRequestLimits } from "@frankensqlite/worker";
+import type { RequestQueueStats } from "./types";
 
 interface TransactionScope {
   accepting: boolean;
@@ -33,7 +35,9 @@ export class FrankenDB {
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
     const normalized = normalizeOpenOptions(options);
-    const client = new FrankenWorkerClient(resolveWorker(normalized.worker));
+    // Validate before allocating a worker or transferring a snapshot buffer.
+    const limits = resolveRequestLimits(normalized.requestLimits);
+    const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
     if (normalized.dbName !== undefined) {
       config.dbName = normalized.dbName;
@@ -82,6 +86,11 @@ export class FrankenDB {
   /** Last loaded/published checkpoint, not the state of unsaved memory writes. */
   get snapshotRevision(): string | null {
     return this.#snapshotRevision;
+  }
+
+  /** Ordinary requests only; close/cancellation have a separate control lane. */
+  get requestQueue(): RequestQueueStats {
+    return this.#client.requestQueue;
   }
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {

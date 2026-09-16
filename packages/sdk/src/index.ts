@@ -13,6 +13,8 @@ export type {
   FrankenDbOpenOptions,
   PersistenceMode,
   QueryResult,
+  RequestLimits,
+  RequestQueueStats,
   SerializedFrankenError,
   SqlScalar,
   SqlRowSource,

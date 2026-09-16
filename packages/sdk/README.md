@@ -290,6 +290,161 @@ requests, and shares one completion promise across repeated calls. A worker
 crash or disposal rejects pending and future calls rather than leaving promises
 unsettled. Failed initialization also releases the worker's resources.
 
+## Streaming imports
+
+`executeStream(sql, rows, options)` consumes an `Iterable` or `AsyncIterable`
+of positional parameter arrays. It can import more than 10,000 rows without
+materializing the complete input or returning one counter per input row:
+
+```ts
+async function* importedRows() {
+  for await (const record of inputRecords) {
+    yield [record.id, record.name];
+  }
+}
+
+const imported = await db.executeStream(
+  "INSERT INTO users(id, name) VALUES (?, ?)",
+  importedRows(),
+  { batchSize: 256, maxBatchBytes: 1024 * 1024 },
+);
+console.log(imported.executions, imported.changes, imported.batches);
+```
+
+The **whole stream is one transaction**, not one commit per worker chunk.
+An invalid row, producer error, SQL error, or failed iterator/statement cleanup
+rolls back all earlier chunks. Deferred constraints can still reject the final
+commit. The returned counts acknowledge a successful outer SQL commit; they do
+not imply that an `indexeddb-snapshot` checkpoint has been saved. Await an
+explicit `db.checkpoint()` afterward to publish a snapshot.
+
+`tx.executeStream(...)` uses a child savepoint for the complete import. A parent
+can catch its failure and keep its own work and successful siblings. A later
+parent rollback also undoes a successful import. Always await the stream before
+returning from the parent callback. The source must not use `db` or a parent
+handle to operate on the same connection while the import owns it; those calls
+are refused. Independent connections remain independent.
+
+There is one SDK/worker prepared handle for the stream, with bounded chunks
+posted sequentially. The next chunk is not prefetched while a database request
+is pending. Rows and blob values are copied on receipt, so a producer can reuse
+its scratch row and buffer on subsequent yields. `batchSize` defaults to 256
+(maximum 10,000). `maxBatchBytes` defaults to 1 MiB (maximum 64 MiB) and counts
+16 bytes per row, 16 per value, UTF-16 string bytes and blob bytes. One row must
+fit the budget; at most one detached lookahead row is held alongside a batch.
+This is **parameter-buffer accounting, not a database or process-memory cap**:
+the engine's data, transaction state, transport copies and producer memory are
+separate. The snapshot image limit remains 64 MiB.
+
+Stream-stage failures are `FrankenStreamError` instances. `phase` identifies
+input, source, preparation, execution or cleanup; `rowIndex` is the zero-based
+global input index when known (not merely the position within a chunk). `cause`
+preserves the original producer or `FrankenSQLiteError`, including its SQLite
+details, and `cleanupErrors` retains secondary failures. Boundary failures such
+as a rejected `BEGIN`, final `COMMIT`, or rollback use the existing transaction
+error contract. Iterators are closed once on early exit, and statement handles
+are finalized before the enclosing transaction settles.
+
+### Import progress and cancellation
+
+```ts
+const controller = new AbortController();
+const pending = db.executeStream(
+  "INSERT INTO users(id, name) VALUES (?, ?)",
+  importedRows(),
+  {
+    signal: controller.signal,
+    onProgress(progress) {
+      // These rows have executed, but the import has NOT committed yet.
+      console.log(progress.executions, progress.batches, progress.committed);
+    },
+  },
+);
+// A cancellation action may call controller.abort().
+const committed = await pending;
+```
+
+`onProgress` receives a frozen snapshot after each successful chunk, always
+with `committed: false`. The next source pull waits for an async callback to
+finish. A thrown/rejected callback aborts the entire import. No progress event
+claims that a SQL commit or browser checkpoint succeeded; use the final promise
+and explicit checkpoint result for those acknowledgments.
+
+An abort observed before the final transaction boundary rolls back the complete
+stream, including earlier chunks. A cancellation arriving too late for one
+chunk's savepoint release can still undo that chunk through the enclosing
+transaction. Once the **outer COMMIT** (or the import's child-savepoint RELEASE)
+has been dispatched, its actual result wins: a late signal cannot relabel a
+committed success as cancelled. A genuine SQL failure is not hidden by a
+coincident abort. `FrankenStreamError` uses
+`ERR_FSQLITE_STREAM_CANCELLED` for cancellation observed by the importer; its
+cause and cleanup failures remain available. Progress errors have phase
+`progress`, and producer errors retain phase `source` and their original cause.
+
+Cancellation is cooperative. The importer awaits an outstanding `next()`,
+progress callback, iterator `return()`, or individual core SQL operation rather
+than abandoning it. Pass the same signal to the producer's own I/O so a blocked
+input can respond. A producer or callback that never settles can therefore
+delay cancellation; no wall-clock interruption bound is promised. No additional
+rows are consumed or written after cancellation is observed, and the connection
+remains owned until cleanup and rollback settle.
+
+## Bounded request admission
+
+Each SDK client and each worker host independently limits ordinary outstanding
+requests. Defaults are **128 active-plus-queued requests** and **128 MiB of
+accounted request payload**. Admission refuses overload rather than creating
+another unbounded queue of waiting promises. Await operations or use
+`executeStream()` to feed a large input sequentially.
+
+```ts
+const db = await FrankenDB.open({
+  requestLimits: {
+    maxPendingRequests: 32,
+    maxPendingBytes: 16 * 1024 * 1024,
+  },
+});
+console.log(db.requestQueue.pendingRequests, db.requestQueue.pendingBytes);
+```
+
+Options are captured before worker creation. `maxPendingRequests` accepts
+integers in 1..4096 and `maxPendingBytes` accepts 256 bytes..1 GiB. The frozen
+`db.requestQueue` snapshot also reports the configured limits and cumulative
+`rejectedRequests`. It describes this client's reservations, not engine memory
+or the worker's independently configured budget. Custom worker hosts can set
+their own limits via `new WorkerConnectionHost(loader, limits)` and inspect
+`host.requestQueue`. An SDK setting cannot raise the receiver's limits.
+
+`ERR_FSQLITE_QUEUE_FULL` is a transient admission refusal: **none of that
+request's SQL ran**. Await previously admitted work before retrying. A request
+too large even for an idle queue returns `ERR_FSQLITE_REQUEST_TOO_LARGE`; reduce
+its size instead of retrying unchanged. Inside a managed transaction, a caught
+admission error still causes that scope to drain and roll back, just like other
+scoped operation failures. Retry the complete transaction or use a child scope
+for recoverable work; do not assume earlier writes were committed.
+
+Pre-IPC checks capture plain protocol fields and positional scalar arrays before
+`postMessage`, excluding extra object properties and custom array iterators.
+Accounting includes SQL and UTF-16 text, fixed message/array/value allowances,
+and each distinct binary backing buffer's full capacity within a request, not
+just the visible bytes of a small subarray. This avoids cloning a large backing
+allocation disguised as a tiny view. Reservations last until settlement and
+are returned on SQL errors, synchronous transport failures, crashes and disposal.
+
+Close reserves a separate, deduplicated fence; cancellation control is not
+trapped behind a full SQL queue. Already-admitted work settles before close
+frees handles. A queue-refused statement `finalize()` remains retryable, and
+transaction cleanup retains ownership of that statement. Once the worker's
+close fence is admitted, later SQL and reinitialization are rejected.
+
+These limits are **not a heap/RSS, result-size or database-memory guarantee**.
+They do not bound engine transaction state, prepared handles retained by an
+application, producer-owned memory, query results, or a custom sender's runtime
+message queue before the host receives messages. The byte estimator is explicit
+accounting rather than a JavaScript heap measurement. Stream `maxBatchBytes`
+and request accounting have different envelope allowances; choose stream chunks
+that fit both budgets. Independent connections still execute independently.
+
 ## Manual npm Release
 
 For v0.2.0, release preparation and publication are manual. No GitHub Actions

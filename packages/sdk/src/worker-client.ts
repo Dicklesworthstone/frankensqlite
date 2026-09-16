@@ -11,8 +11,10 @@ import type {
   SnapshotMetadata,
   WorkerRequest,
   WorkerResponse,
+  RequestLimits,
+  RequestQueueStats,
 } from "@frankensqlite/worker";
-import { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
+import { RequestAdmissionError, RequestBudget } from "@frankensqlite/worker";
 
 import { FrankenSQLiteError } from "./errors";
 import type { ExecuteManyOptions } from "./types";
@@ -49,10 +51,12 @@ export interface WorkerLike {
 interface PendingRequest {
   resolve: (value: WorkerResponse) => void;
   reject: (reason?: unknown) => void;
+  release: () => void;
 }
 
 export class FrankenWorkerClient {
   readonly #worker: WorkerLike;
+  readonly #budget: RequestBudget;
   readonly #pending = new Map<number, PendingRequest>();
   #nextRequestId = 1;
   #terminalError: Error | null = null;
@@ -66,6 +70,7 @@ export class FrankenWorkerClient {
       return;
     }
     this.#pending.delete(event.data.requestId);
+    pending.release();
     if (event.data.kind === "error") {
       pending.reject(new FrankenSQLiteError(event.data.error));
       return;
@@ -81,10 +86,15 @@ export class FrankenWorkerClient {
     this.#rejectPending(this.#terminalError);
   };
 
-  constructor(worker: WorkerLike) {
+  constructor(worker: WorkerLike, limits: Partial<RequestLimits> = {}) {
+    this.#budget = new RequestBudget(limits);
     this.#worker = worker;
     this.#worker.addEventListener("message", this.#onMessage);
     this.#worker.addEventListener("error", this.#onError);
+  }
+
+  get requestQueue(): RequestQueueStats {
+    return this.#budget.stats;
   }
 
   async init(config: InitConfig) {
@@ -101,7 +111,7 @@ export class FrankenWorkerClient {
       kind: "execute",
       requestId: this.#nextId(),
       sql,
-      params: [...params],
+      params,
     });
     return ensureKind(response, "execute-result").changes;
   }
@@ -124,7 +134,7 @@ export class FrankenWorkerClient {
       kind: "execute-many",
       requestId: this.#nextId(),
       sql,
-      parameterSets: copyParameterSets(parameterSets),
+      parameterSets,
     }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
@@ -138,7 +148,7 @@ export class FrankenWorkerClient {
       kind: "statement-execute-many",
       requestId: this.#nextId(),
       statementId,
-      parameterSets: copyParameterSets(parameterSets),
+      parameterSets,
     }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
@@ -151,7 +161,7 @@ export class FrankenWorkerClient {
       kind: "query",
       requestId: this.#nextId(),
       sql,
-      params: [...params],
+      params,
     });
     return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
@@ -173,7 +183,7 @@ export class FrankenWorkerClient {
       kind: "statement-execute",
       requestId: this.#nextId(),
       statementId,
-      params: [...params],
+      params,
     });
     return ensureKind(response, "execute-result").changes;
   }
@@ -186,7 +196,7 @@ export class FrankenWorkerClient {
       kind: "statement-query",
       requestId: this.#nextId(),
       statementId,
-      params: [...params],
+      params,
     });
     return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
@@ -268,6 +278,7 @@ export class FrankenWorkerClient {
 
   #rejectPending(error: Error): void {
     for (const pending of this.#pending.values()) {
+      pending.release();
       pending.reject(error);
     }
     this.#pending.clear();
@@ -298,17 +309,22 @@ export class FrankenWorkerClient {
       cancelSent = true;
       // Close may already be queued behind this batch. Allow its cancellation
       // control message through, but never admit additional SQL during close.
-      void this.#send({ kind: "cancel-bulk", requestId: this.#nextId(),
-        targetRequestId: request.requestId }, true).catch(() => {
+      if (this.#terminalError !== null || !this.#pending.has(request.requestId)) return;
+      try {
+        // No pending promise for this acknowledgement: only the original bulk
+        // result proves rollback. A peer withholding cancel acks must not cause
+        // an unbounded secondary queue. At most one cancel is sent per batch.
+        this.#worker.postMessage({ kind: "cancel-bulk", requestId: this.#nextId(),
+          targetRequestId: request.requestId });
+      } catch {
         // A failed cancellation delivery cannot establish rollback. The batch's
         // own response (or worker-crash error) remains authoritative.
-      });
+      }
     };
     signal.addEventListener("abort", cancel, { once: true });
     try {
       checkAborted();
-      const response = this.#send(request);
-      posted = true;
+      const response = this.#send(request, false, () => { posted = true; });
       // Covers abort during custom transport dispatch or listener registration.
       if (signal.aborted) cancel();
       return await response;
@@ -318,44 +334,51 @@ export class FrankenWorkerClient {
     }
   }
 
-  #send(request: WorkerRequest, allowClosing = false): Promise<WorkerResponse> {
+  #send(request: WorkerRequest, allowClosing = false, onPosted?: () => void): Promise<WorkerResponse> {
     if (this.#terminalError !== null) {
       return Promise.reject(this.#terminalError);
     }
     if (this.#closing && !allowClosing) {
       return Promise.reject(new Error("FrankenSQLite worker client is closing"));
     }
+    let release = () => {};
+    if (request.kind !== "close") {
+      try {
+        const admitted = this.#budget.admit(request);
+        request = admitted.request;
+        release = admitted.release;
+      } catch (error: unknown) {
+        if (error instanceof RequestAdmissionError) {
+          return Promise.reject(new FrankenSQLiteError({ code: error.code, message: error.message,
+            transient: error.transient, userRecoverable: error.userRecoverable, suggestion: error.suggestion,
+            ...(error.batchIndex === undefined ? {} : { batchIndex: error.batchIndex }) }));
+        }
+        return Promise.reject(error);
+      }
+    }
+    // Capture can invoke application getters which may have closed/disposed
+    // this client. Recheck before posting, and return the unused reservation.
+    if (this.#terminalError !== null || (this.#closing && !allowClosing)) {
+      release();
+      return Promise.reject(this.#terminalError ?? new Error("FrankenSQLite worker client is closing"));
+    }
     return new Promise<WorkerResponse>((resolve, reject) => {
-      this.#pending.set(request.requestId, { resolve, reject });
+      this.#pending.set(request.requestId, { resolve, reject, release });
       try {
         if (request.kind === "init" && request.config.snapshot) {
           this.#worker.postMessage(request, [request.config.snapshot.buffer]);
         } else {
           this.#worker.postMessage(request);
         }
+        onPosted?.();
       } catch (error: unknown) {
         // A synchronous clone/transport failure has no response to consume.
         this.#pending.delete(request.requestId);
+        release();
         reject(error);
       }
     });
   }
-}
-
-function copyParameterSets(parameterSets: readonly (readonly SqlScalar[])[]): SqlScalar[][] {
-  // Bound input before cloning/posting it. Never split a batch into separately
-  // committed chunks behind the caller's back.
-  if (!Array.isArray(parameterSets) || parameterSets.length > MAX_EXECUTE_MANY_ROWS) {
-    throw new FrankenSQLiteError({ code: "ERR_FSQLITE_BULK_INPUT",
-      message: `Bulk execution accepts at most ${MAX_EXECUTE_MANY_ROWS} parameter sets` });
-  }
-  return Array.from(parameterSets, (params, batchIndex) => {
-    if (!Array.isArray(params)) {
-      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_BULK_INPUT", batchIndex,
-        message: "Each parameter set must be an array" });
-    }
-    return [...params];
-  });
 }
 
 function ensureKind<K extends WorkerResponse["kind"]>(
