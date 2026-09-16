@@ -74,12 +74,24 @@ export class WorkerConnectionHost {
   #db: CoreDatabaseHandle | null = null;
   #nextStatementId = 1;
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
+  #requestTail: Promise<void> = Promise.resolve();
 
   constructor(loader: CoreModuleLoader = defaultCoreModuleLoader) {
     this.#loader = loader;
   }
 
-  async handle(request: WorkerRequest): Promise<WorkerResponse> {
+  handle(request: WorkerRequest): Promise<WorkerResponse> {
+    // Worker message callbacks are not awaited by the browser. Keep ownership
+    // of this connection (and its WASM handles) until each request settles,
+    // including init, finalize, export and close. Other hosts remain independent.
+    const response = this.#requestTail.then(() => this.#handle(request));
+    // A failed request must not poison the queue, even if serializing its error
+    // throws. Return the original promise so the caller still sees that failure.
+    this.#requestTail = response.then(() => undefined, () => undefined);
+    return response;
+  }
+
+  async #handle(request: WorkerRequest): Promise<WorkerResponse> {
     try {
       switch (request.kind) {
         case "init":
