@@ -7,11 +7,15 @@ type TransactionCapableDb = Pick<
   "execute" | "query" | "prepare"
 >;
 
+type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>) => Promise<T>;
+
 export class FrankenTransaction {
   readonly #db: TransactionCapableDb;
+  readonly #nested: NestedTransaction | undefined;
 
-  constructor(db: TransactionCapableDb) {
+  constructor(db: TransactionCapableDb, nested?: NestedTransaction) {
     this.#db = db;
+    this.#nested = nested;
   }
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
@@ -29,5 +33,13 @@ export class FrankenTransaction {
     sql: string,
   ): Promise<FrankenPreparedStatement<Row>> {
     return this.#db.prepare<Row>(sql);
+  }
+
+  /** Run an isolated child scope using a SAVEPOINT on this transaction. */
+  transaction<T>(work: (tx: FrankenTransaction) => T | Promise<T>): Promise<T> {
+    if (this.#nested === undefined) {
+      return Promise.reject(new Error("Nested transactions require a managed transaction callback"));
+    }
+    return this.#nested(work);
   }
 }

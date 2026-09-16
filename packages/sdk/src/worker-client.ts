@@ -51,6 +51,10 @@ export class FrankenWorkerClient {
   readonly #worker: WorkerLike;
   readonly #pending = new Map<number, PendingRequest>();
   #nextRequestId = 1;
+  #terminalError: Error | null = null;
+  #closing = false;
+  #disposed = false;
+  #closePromise: Promise<void> | null = null;
 
   readonly #onMessage = (event: WorkerMessageEvent): void => {
     const pending = this.#pending.get(event.data.requestId);
@@ -69,10 +73,8 @@ export class FrankenWorkerClient {
     const error = new Error(
       `FrankenSQLite worker crashed: ${event.message || "unknown error"}`,
     );
-    for (const pending of this.#pending.values()) {
-      pending.reject(error);
-    }
-    this.#pending.clear();
+    this.#terminalError ??= error;
+    this.#rejectPending(this.#terminalError);
   };
 
   constructor(worker: WorkerLike) {
@@ -174,18 +176,63 @@ export class FrankenWorkerClient {
     return ensureKind(response, "export-result").data;
   }
 
-  async close(): Promise<void> {
-    const response = await this.#send({
+  close(): Promise<void> {
+    if (this.#closePromise !== null) {
+      return this.#closePromise;
+    }
+    // Stop admission synchronously. Requests already posted precede close in
+    // the worker's FIFO queue and keep their original completion promises.
+    this.#closing = true;
+    this.#closePromise = this.#send({
       kind: "close",
       requestId: this.#nextId(),
-    });
-    ensureKind(response, "close-result");
+    }, true).then((response) => {
+      ensureKind(response, "close-result");
+    }).then(
+      () => { this.dispose(); },
+      (error: unknown) => {
+        try {
+          this.dispose();
+        } catch (cleanupError: unknown) {
+          throw new AggregateError([error, cleanupError],
+            "FrankenSQLite close and worker cleanup both failed", { cause: error });
+        }
+        throw error;
+      },
+    );
+    return this.#closePromise;
   }
 
-  dispose(): void {
-    this.#worker.removeEventListener("message", this.#onMessage);
-    this.#worker.removeEventListener("error", this.#onError);
-    this.#worker.terminate?.();
+  dispose(reason: Error = new Error("FrankenSQLite worker client is disposed")): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    this.#terminalError ??= reason;
+    // Settle promises BEFORE detaching listeners, including when cleanup throws.
+    this.#rejectPending(this.#terminalError);
+    const errors: unknown[] = [];
+    for (const cleanup of [
+      () => this.#worker.removeEventListener("message", this.#onMessage),
+      () => this.#worker.removeEventListener("error", this.#onError),
+      () => this.#worker.terminate?.(),
+    ]) {
+      try {
+        cleanup();
+      } catch (error: unknown) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "FrankenSQLite worker cleanup failed", { cause: errors[0] });
+    }
+  }
+
+  #rejectPending(error: Error): void {
+    for (const pending of this.#pending.values()) {
+      pending.reject(error);
+    }
     this.#pending.clear();
   }
 
@@ -193,14 +240,26 @@ export class FrankenWorkerClient {
     return this.#nextRequestId++;
   }
 
-  #send(request: WorkerRequest): Promise<WorkerResponse> {
+  #send(request: WorkerRequest, allowClosing = false): Promise<WorkerResponse> {
+    if (this.#terminalError !== null) {
+      return Promise.reject(this.#terminalError);
+    }
+    if (this.#closing && !allowClosing) {
+      return Promise.reject(new Error("FrankenSQLite worker client is closing"));
+    }
     return new Promise<WorkerResponse>((resolve, reject) => {
       this.#pending.set(request.requestId, { resolve, reject });
-      if (request.kind === "init" && request.config.snapshot) {
-        this.#worker.postMessage(request, [request.config.snapshot.buffer]);
-        return;
+      try {
+        if (request.kind === "init" && request.config.snapshot) {
+          this.#worker.postMessage(request, [request.config.snapshot.buffer]);
+        } else {
+          this.#worker.postMessage(request);
+        }
+      } catch (error: unknown) {
+        // A synchronous clone/transport failure has no response to consume.
+        this.#pending.delete(request.requestId);
+        reject(error);
       }
-      this.#worker.postMessage(request);
     });
   }
 }
