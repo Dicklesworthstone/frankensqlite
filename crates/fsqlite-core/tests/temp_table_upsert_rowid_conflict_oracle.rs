@@ -146,7 +146,8 @@ fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
             let conn = Connection::open(":memory:").await.unwrap();
             let stock = rusqlite::Connection::open_in_memory().unwrap();
 
-            let ddl = format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+            let ddl =
+                format!("CREATE {keyword}TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
             stock.execute_batch(&ddl).unwrap();
             conn.execute(&ddl).await.unwrap();
 
@@ -159,7 +160,10 @@ fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
             let sql = "INSERT INTO g(v) VALUES(19),(NULL)";
             let ctx = format!("{ctx}, sql={sql}");
             let stock_error = stock.execute(sql, []).unwrap_err().to_string();
-            assert!(stock_error.contains("NOT NULL"), "stock: {ctx}: {stock_error}");
+            assert!(
+                stock_error.contains("NOT NULL"),
+                "stock: {ctx}: {stock_error}"
+            );
             let error = conn.execute(sql).await.expect_err(&ctx).to_string();
             assert!(error.contains("NOT NULL"), "{ctx}: {error}");
 
