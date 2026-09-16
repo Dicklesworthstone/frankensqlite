@@ -1,6 +1,7 @@
 import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
 import type { InitConfig, SqlScalar, WorkerRequest } from "./protocol";
 import { validateTransactionId } from "./transactions";
+import { resolveResultEncoding } from "./result-codec";
 
 export interface RequestLimits {
   /** Active plus queued ordinary requests. Close/cancel use a separate lane. */
@@ -147,6 +148,11 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       if (persistence !== undefined) { text(persistence); config.persistence = persistence; }
       if (wasmUrl !== undefined) config.wasmUrl = text(wasmUrl);
       if (snapshot !== undefined) config.snapshot = blob(snapshot);
+      const resultEncoding = source.resultEncoding;
+      if (resultEncoding !== undefined) {
+        config.resultEncoding = resolveResultEncoding(resultEncoding);
+        text(config.resultEncoding);
+      }
       request = { kind, requestId, config };
       break;
     }

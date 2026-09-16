@@ -1,5 +1,6 @@
 import type { ErrorResponse, WorkerRequest, WorkerResponse } from "./protocol";
 import { serializeFrankenError, WorkerConnectionHost } from "./connection";
+import { responseTransferList } from "./result-codec";
 
 const host = new WorkerConnectionHost();
 const workerScope = globalThis as unknown as DedicatedWorkerGlobalScope;
@@ -22,11 +23,7 @@ async function dispatch(request: WorkerRequest): Promise<void> {
 }
 
 function postResponse(response: WorkerResponse | ErrorResponse): void {
-  if (response.kind === "export-result") {
-    workerScope.postMessage(response, [response.data.buffer]);
-    return;
-  }
-  workerScope.postMessage(response);
+  workerScope.postMessage(response, responseTransferList(response));
 }
 
 export {};

@@ -1,4 +1,5 @@
 import type { SnapshotMetadata } from "./snapshot-store";
+import type { ResultEncoding } from "./result-codec";
 
 export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot";
 
@@ -35,6 +36,8 @@ export interface InitConfig {
   persistence?: PersistenceMode;
   wasmUrl?: string;
   snapshot?: Uint8Array;
+  /** Opt in to FQR1 transfer; unsupported result shapes still use structured clone. */
+  resultEncoding?: ResultEncoding;
 }
 
 export interface InitResult {
@@ -42,6 +45,8 @@ export interface InitResult {
   persistence: PersistenceMode;
   /** Last explicit checkpoint; absent for non-snapshot modes. */
   snapshot?: SnapshotMetadata | null;
+  /** Absent on older workers, which only return structured-clone query results. */
+  resultEncoding?: ResultEncoding;
 }
 
 export interface PreparedStatementMetadata {
@@ -224,6 +229,13 @@ export interface QueryResponse extends WorkerResponseBase {
   data: QueryResult;
 }
 
+export interface BinaryQueryResponse extends WorkerResponseBase {
+  kind: "query-binary-result";
+  encoding: "fqr1";
+  /** Fresh owned bytes, transferred once; never a core/WASM backing allocation. */
+  data: ArrayBuffer;
+}
+
 export interface PrepareResponse extends WorkerResponseBase {
   kind: "prepare-result";
   data: PreparedStatementMetadata;
@@ -261,6 +273,7 @@ export type WorkerResponse =
   | CancelBulkResponse
   | CancelTransactionResponse
   | QueryResponse
+  | BinaryQueryResponse
   | PrepareResponse
   | StatementFinalizeResponse
   | ExportResponse

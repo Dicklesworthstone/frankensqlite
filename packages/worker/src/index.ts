@@ -4,6 +4,9 @@ export {
   WorkerConnectionHost,
 } from "./connection";
 export * from "./protocol";
+export { BINARY_RESULT_THRESHOLD, MAX_BINARY_RESULT_BYTES, ResultCodecError,
+  decodeQueryResult, resolveResultEncoding, responseTransferList } from "./result-codec";
+export type { ResultEncoding } from "./result-codec";
 export { DEFAULT_REQUEST_LIMITS, RequestAdmissionError, RequestBudget, resolveRequestLimits } from "./admission";
 export type { RequestLimits, RequestQueueStats } from "./admission";
 export { validateBulkSql } from "./bulk";

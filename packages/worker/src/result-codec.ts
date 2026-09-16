@@ -1,4 +1,4 @@
-import type { QueryResult, SqlScalar } from "./protocol";
+import type { BinaryQueryResponse, QueryResponse, QueryResult, SqlScalar, WorkerResponse } from "./protocol";
 
 /** Binary transport is opt-in until measured on the application's browser. */
 export type ResultEncoding = "structured-clone" | "binary" | "auto";
@@ -25,6 +25,24 @@ export function resolveResultEncoding(value: unknown = "structured-clone"): Resu
   throw Object.assign(new TypeError("resultEncoding must be structured-clone, binary or auto"), {
     code: "ERR_FSQLITE_RESULT_ENCODING", transient: false,
   });
+}
+
+/** Encode only after execution, with no retry or change to the SQL outcome. */
+export function encodeQueryResponse(
+  requestId: number, data: QueryResult, encoding: ResultEncoding,
+): QueryResponse | BinaryQueryResponse {
+  if (encoding !== "structured-clone") {
+    const buffer = tryEncodeQueryResult(data, encoding === "auto" ? BINARY_RESULT_THRESHOLD : 0);
+    if (buffer !== null) return { kind: "query-binary-result", requestId, encoding: "fqr1", data: buffer };
+  }
+  return { kind: "query-result", requestId, data };
+}
+
+/** Only binary result frames and the existing export path own transferable bytes. */
+export function responseTransferList(response: WorkerResponse): Transferable[] {
+  if (response.kind === "query-binary-result") return [response.data];
+  if (response.kind === "export-result") return [response.data.buffer];
+  return [];
 }
 
 function invalid(): never {

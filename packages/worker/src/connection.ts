@@ -1,4 +1,5 @@
 import type {
+  BinaryQueryResponse,
   CheckpointResponse,
   ExecuteBatchResponse,
   ExecuteManyResponse,
@@ -27,6 +28,8 @@ import type { SnapshotMetadata } from "./snapshot-store";
 import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
 import type { RequestLimits, RequestQueueStats } from "./admission";
 import { ManagedTransactionError, ManagedTransactions, validateManagedSql } from "./transactions";
+import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
+import type { ResultEncoding } from "./result-codec";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
@@ -101,6 +104,7 @@ export class WorkerConnectionHost {
   #snapshotRevision: string | null = null;
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
+  #resultEncoding: ResultEncoding = "structured-clone";
 
   constructor(loader: CoreModuleLoader = defaultCoreModuleLoader, limits: Partial<RequestLimits> = {}) {
     this.#loader = loader;
@@ -290,6 +294,7 @@ export class WorkerConnectionHost {
   ): Promise<ReadyResponse> {
     const ready = createReadyResult(config);
     assertSupportedPersistenceMode(ready.persistence);
+    const resultEncoding = resolveResultEncoding(config.resultEncoding);
 
     let stagedStore: IndexedDbSnapshotStore | null = null;
     try {
@@ -320,11 +325,13 @@ export class WorkerConnectionHost {
       this.#snapshotStore = stagedStore;
       stagedStore = null; // Ownership transfers only after core initialization.
       this.#snapshotRevision = saved?.revision ?? null;
+      this.#resultEncoding = resultEncoding;
       return {
         kind: "ready", requestId,
         data: {
           path: ready.persistence === "indexeddb-snapshot" ? ready.path : this.#db.path || ready.path,
           persistence: resolvePersistenceMode(config.persistence),
+          resultEncoding,
           ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved } : {}),
         },
       };
@@ -365,17 +372,13 @@ export class WorkerConnectionHost {
     requestId: number,
     sql: string,
     params: readonly unknown[],
-  ): Promise<QueryResponse> {
+  ): Promise<QueryResponse | BinaryQueryResponse> {
     const db = this.#requireDatabase();
     const data =
       params.length === 0
         ? await db.query(sql)
         : await db.queryWithParams(sql, [...params]);
-    return {
-      kind: "query-result",
-      requestId,
-      data,
-    };
+    return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 
   async #executeMany(
@@ -431,17 +434,13 @@ export class WorkerConnectionHost {
     requestId: number,
     statementId: string,
     params: readonly unknown[],
-  ): Promise<QueryResponse> {
+  ): Promise<QueryResponse | BinaryQueryResponse> {
     const stmt = this.#requireStatement(statementId);
     const data =
       params.length === 0
         ? await stmt.query()
         : await stmt.queryWithParams([...params]);
-    return {
-      kind: "query-result",
-      requestId,
-      data,
-    };
+    return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 
   #statementFinalize(
