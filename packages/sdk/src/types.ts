@@ -20,6 +20,38 @@ export interface ExecuteManyOptions {
   signal?: AbortSignal;
 }
 
+/** A pull-based source. Each yielded value is one positional parameter set. */
+export type SqlRowSource =
+  | Iterable<readonly SqlScalar[]>
+  | AsyncIterable<readonly SqlScalar[]>;
+
+export interface ExecuteStreamOptions {
+  /** Maximum rows per worker request, 1..10,000. Defaults to 256. */
+  batchSize?: number;
+  /**
+   * Accounted parameter bytes per batch, 1..64 MiB. Defaults to 1 MiB.
+   * Counts UTF-16 text, blob bytes and fixed row/value allowances, not heap/RSS.
+   * A row larger than this budget is rejected; one lookahead row may be held.
+   */
+  maxBatchBytes?: number;
+  /** Cooperatively cancel input consumption and undo the entire stream. */
+  signal?: AbortSignal;
+  /** Awaited between chunks; all counts are provisional until the outer commit. */
+  onProgress?: (progress: Readonly<ExecuteStreamProgress>) => void | Promise<void>;
+}
+
+/** Aggregate counts only: no result array proportional to the input length. */
+export interface ExecuteStreamResult {
+  executions: number;
+  changes: number;
+  batches: number;
+}
+
+export interface ExecuteStreamProgress extends ExecuteStreamResult {
+  /** A delivered chunk is not a committed import. */
+  committed: false;
+}
+
 export interface FrankenDbOpenOptions
   extends Omit<InitConfig, "snapshot"> {
   snapshot?: Uint8Array;

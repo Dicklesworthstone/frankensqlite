@@ -1,15 +1,21 @@
 export { FrankenDB } from "./database";
 export { FrankenSQLiteError } from "./errors";
+export { FrankenStreamError } from "./stream";
+export type { StreamFailurePhase } from "./stream";
 export { FrankenPreparedStatement } from "./statement";
 export { FrankenTransaction } from "./transaction";
 export type {
   ExecuteManyOptions,
   ExecuteManyResult,
+  ExecuteStreamOptions,
+  ExecuteStreamProgress,
+  ExecuteStreamResult,
   FrankenDbOpenOptions,
   PersistenceMode,
   QueryResult,
   SerializedFrankenError,
   SqlScalar,
+  SqlRowSource,
   SnapshotMetadata,
 } from "./types";
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";

@@ -1,10 +1,11 @@
 import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
+import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import type { FrankenDB } from "./database";
 import { FrankenPreparedStatement } from "./statement";
 
 type TransactionCapableDb = Pick<
   FrankenDB,
-  "execute" | "executeMany" | "query" | "prepare"
+  "execute" | "executeMany" | "executeStream" | "query" | "prepare"
 >;
 
 type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>) => Promise<T>;
@@ -28,6 +29,15 @@ export class FrankenTransaction {
     options?: ExecuteManyOptions,
   ): Promise<ExecuteManyResult> {
     return this.#db.executeMany(sql, parameterSets, options);
+  }
+
+  /** A recoverable child savepoint containing the entire stream. */
+  executeStream(
+    sql: string,
+    rows: SqlRowSource,
+    options?: ExecuteStreamOptions,
+  ): Promise<ExecuteStreamResult> {
+    return this.#db.executeStream(sql, rows, options);
   }
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
