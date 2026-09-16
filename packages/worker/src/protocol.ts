@@ -10,7 +10,7 @@ export type SqlScalar =
   | boolean
   | Uint8Array;
 
-export type SqlParams = SqlScalar[];
+export type SqlParams = readonly SqlScalar[];
 
 /** A batch is never silently split: all executions share one savepoint. */
 export const MAX_EXECUTE_MANY_ROWS = 10_000;
@@ -93,14 +93,14 @@ export interface ExecuteBatchRequest extends WorkerRequestBase {
 export interface ExecuteManyRequest extends WorkerRequestBase {
   kind: "execute-many";
   sql: string;
-  parameterSets: SqlParams[];
+  parameterSets: readonly SqlParams[];
   cancellable?: boolean;
 }
 
 export interface StatementExecuteManyRequest extends WorkerRequestBase {
   kind: "statement-execute-many";
   statementId: string;
-  parameterSets: SqlParams[];
+  parameterSets: readonly SqlParams[];
   cancellable?: boolean;
 }
 

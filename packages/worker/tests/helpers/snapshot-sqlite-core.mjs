@@ -59,7 +59,7 @@ export function sqliteSnapshotWorker(hooks = {}) {
   const host = new WorkerConnectionHost({ async load() { return { FrankenDB: {
     async create() { creates++; return open(); },
     async import(bytes) { imports++; await hooks.beforeImport?.(); return open(bytes); },
-  } }; } });
+  } }; } }, hooks.requestLimits);
   const messages = new Set();
   const errors = new Set();
   let terminated = false;
