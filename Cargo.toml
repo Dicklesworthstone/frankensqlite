@@ -138,11 +138,11 @@ fsqlite-vfs = { version = "0.4.0", path = "crates/fsqlite-vfs", default-features
 fsqlite-pager = { version = "0.4.2", path = "crates/fsqlite-pager", default-features = false }
 fsqlite-wal = { version = "0.4.0", path = "crates/fsqlite-wal", default-features = false }
 fsqlite-mvcc = { version = "0.4.0", path = "crates/fsqlite-mvcc", default-features = false }
-fsqlite-btree = { version = "0.4.0", path = "crates/fsqlite-btree", default-features = false }
+fsqlite-btree = { version = "0.4.1", path = "crates/fsqlite-btree", default-features = false }
 fsqlite-ast = { version = "0.4.0", path = "crates/fsqlite-ast" }
 fsqlite-parser = { version = "0.4.0", path = "crates/fsqlite-parser" }
 fsqlite-planner = { version = "0.4.0", path = "crates/fsqlite-planner", default-features = false }
-fsqlite-vdbe = { version = "0.4.0", path = "crates/fsqlite-vdbe", default-features = false }
+fsqlite-vdbe = { version = "0.4.1", path = "crates/fsqlite-vdbe", default-features = false }
 fsqlite-func = { version = "0.4.0", path = "crates/fsqlite-func" }
 fsqlite-ext-fts3 = { version = "0.4.0", path = "crates/fsqlite-ext-fts3" }
 fsqlite-ext-fts5 = { version = "0.4.0", path = "crates/fsqlite-ext-fts5" }

@@ -24,6 +24,9 @@
 //! cargo test -p fsqlite-e2e --test seed_reproducibility -- --nocapture
 //! ```
 
+// The composed Connection futures exceed Rust's default type-query depth.
+#![recursion_limit = "512"]
+
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

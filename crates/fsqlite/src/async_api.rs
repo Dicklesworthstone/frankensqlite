@@ -6857,7 +6857,9 @@ c.close()
         }
         let missing = directory.path().join("missing.db");
         assert!(matches!(
-            AsyncConnection::open_schema_only_with_wal_index_recovery_sync(missing.to_str().unwrap()),
+            AsyncConnection::open_schema_only_with_wal_index_recovery_sync(
+                missing.to_str().unwrap()
+            ),
             Err(FrankenError::CannotOpen { .. })
         ));
         assert!(!missing.exists());
