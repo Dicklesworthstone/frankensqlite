@@ -20,6 +20,20 @@
 //!   3. a UNIQUE violation naming the wrong column — open as **bd-towj6**,
 //!      visible in the Q5 line of `temp_table_constraint_lane_diagnostic`.
 //!
+//! One divergence the contract probe still prints is NOT a TEMP-atomicity
+//! problem and is tracked with bd-55kh5: `INSERT OR IGNORE` burns a rowid for
+//! the discarded row on a TEMP table. The main-schema half of that defect is
+//! fixed, but TEMP never reaches the storage-cursor allocator — `NewRowid`
+//! falls back to `MemDatabase::alloc_rowid`, a plain monotonic counter.
+//! Swapping that for `max_visible_rowid() + 1` would match stock for an
+//! ordinary rowid table and is O(1), but it is NOT a one-line change: the
+//! memdb branch of `NewRowid` never sets `new_autoinc_root` (only the
+//! storage branch does, engine.rs ~10975) and `MemTable` carries no rowid-mode
+//! field, so that lane is structurally blind to AUTOINCREMENT — which must
+//! keep burning. Doing it blind would trade the OR IGNORE burn for an
+//! AUTOINCREMENT parity regression. The fix needs the table's rowid mode
+//! plumbed into the memdb lane first.
+//!
 //! Three `#[ignore]`d investigation aids print characterisations rather than
 //! asserting — `temp_table_constraint_lane_diagnostic` (which layer of the TEMP
 //! lane is wrong), `temp_vs_main_upsert_program_dump` (the program comparison

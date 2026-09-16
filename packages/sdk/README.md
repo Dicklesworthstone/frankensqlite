@@ -9,8 +9,10 @@ Current behavior:
   runtime through `@frankensqlite/worker`.
 - `execute`, `executeBatch`, `executeMany`, `query`, `prepare`, `export`, and `transaction`
   are exposed as Promise-based APIs.
-- Persistence is intentionally memory-first until OPFS and IndexedDB backends
-  land. Passing `opfs` or `indexeddb` surfaces an explicit worker error.
+- `indexeddb-snapshot` provides opt-in, explicit whole-database checkpoints.
+  It is not a page-level VFS or automatic per-SQL-commit persistence.
+- `memory` remains the default. Passing `opfs` or `indexeddb` still surfaces
+  an explicit error; their page-level storage backends are not implemented.
 
 ## Example
 
@@ -110,6 +112,109 @@ as cancelled. A failed cancellation-message delivery likewise cannot establish
 rollback. Cancellation rollback failure makes the connection unusable and
 retains the original cause and cleanup errors. Abort listeners are removed when
 the batch settles; aborting a finished operation does not affect later work.
+
+## Explicit browser checkpoints
+
+Use a stable name and explicitly await `checkpoint()` after committing SQL:
+
+```ts
+const db = await FrankenDB.open({
+  dbName: "offline-notes",
+  persistence: "indexeddb-snapshot",
+});
+await db.execute("CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)");
+await db.transaction(async (tx) => {
+  await tx.executeMany("INSERT INTO notes(body) VALUES (?)", [["First note"], ["Second note"]]);
+});
+const saved = await db.checkpoint();
+console.log(saved.revision, saved.byteLength, saved.sha256);
+await db.close();
+// Opening the same name in the same origin restores the last checkpoint.
+```
+
+**Only a successful, awaited checkpoint acknowledges snapshot publication.**
+SQL operations and SQL `COMMIT` still operate on the in-memory database.
+`close()` does not checkpoint automatically. A crash, tab close, or worker
+termination discards writes made since the last successful checkpoint. This
+explicit mode must not be confused with automatic IndexedDB/OPFS page
+persistence or native FrankenSQLite MVCC across browser tabs.
+
+The worker holds its request queue through export, hashing, and an atomic
+IndexedDB compare-and-swap transaction. The SDK resolves only after that
+transaction completes, not when its `put()` request succeeds. Publication
+requests `durability: "strict"` and rejects browsers that do not expose that
+policy. The policy is still a browser durability hint: origin eviction, user
+data clearing, private browsing, and platform failure remain possible. It is
+not an unconditional power-loss or permanent-retention guarantee.
+
+`db.persistence` reports the resolved mode. `db.snapshotRevision` is the last
+loaded or successfully published revision, **not** an indication that every
+current in-memory write is saved. A checkpoint returns `SnapshotMetadata`:
+`revision`, `parentRevision`, `byteLength`, and `sha256`. No data is published
+just by opening a new name. An optional initialization `snapshot` can seed an
+absent name, but rejects with `ERR_FSQLITE_SNAPSHOT_EXISTS` if a checkpoint
+already exists; it never silently overwrites a saved database.
+
+### Competing tabs and failures
+
+Separate workers execute SQL independently. If two sessions loaded the same
+revision, only one can replace it. The loser receives
+`ERR_FSQLITE_SNAPSHOT_CONFLICT`; its in-memory data and expected revision stay
+unchanged. Reopen the current checkpoint and explicitly merge application
+changes, or export the losing session for recovery. Do not blindly retry a
+stale checkpoint or assume row-level write merging. Unrelated database names
+use separate IndexedDB databases rather than a shared write-transaction lock.
+
+Quota, export, and failed publication do not discard the session's in-memory
+changes. The previous checkpoint remains available, and a retry after fixing
+the failure uses the same expected revision. Random revision tokens also
+prevent an old session from mistaking an evicted/recreated snapshot for its
+original revision. Corrupt, wrong-identity, or unsupported stored envelopes
+reject initialization instead of silently creating an empty database.
+
+Checkpoint outside all transactions, including manually issued `BEGIN` and
+`SAVEPOINT`. Managed-callback ownership rejects `db.checkpoint()` inside a
+callback. For raw SQL transactions the worker probes an empty `BEGIN` and
+`ROLLBACK` boundary using the existing core API; a failed `BEGIN` never grants
+permission to roll back the caller's transaction. Failure to roll back that
+empty probe makes the connection unusable and closes its resources.
+
+Snapshots are bounded to 64 MiB, use an exact-sized copy, and validate their
+SQLite header/page alignment and SHA-256 before import. They are **not
+encrypted**, and the checksum is corruption detection, not authentication
+against other code on the same origin. Whole-image export/import is O(database
+size) work and needs additional memory; the image limit is not a bound on
+query memory or on the browser's internal IndexedDB allocations. Use the
+existing export API for portable backups. Page-level browser persistence,
+cross-tab native MVCC, and automatic durability remain separate work.
+
+### Verification commands and scope
+
+The storage model has a dependency-free Node 22.16+ runner:
+
+```sh
+node --experimental-transform-types --test packages/worker/tests/snapshot-store.model.test.mjs
+```
+
+The actual Chromium storage gate uses the repository's TypeScript and
+Playwright dependencies and is intentionally separate from the model:
+
+```sh
+node --test packages/worker/tests/snapshot-store.browser.test.mjs
+```
+
+`FSQLITE_CHROMIUM_PATH`, `FSQLITE_PLAYWRIGHT_MODULE`, and
+`FSQLITE_TYPESCRIPT_MODULE` optionally select installed test tools. Neither
+runner silently substitutes a model for a browser. The SQL checkpoint
+integration target `packages/worker/tests/snapshot-checkpoint.model.test.mjs`
+uses the production SDK/worker, a transactional IndexedDB model, and Node's
+SQLite reference engine; run it with an ESM TypeScript resolver honoring the
+workspace's `@frankensqlite/worker` alias. It is not a WASM certificate.
+
+At implementation time, model and reference-SQL tests passed; the actual
+Chromium local test page was blocked by the execution environment's managed
+URL policy. No policy was changed. Real browser/WASM and Rust release gates
+must still be executed before claiming browser persistence certification.
 
 ## Transactions and connection ownership
 

@@ -5,11 +5,12 @@ import type {
   QueryResult as WorkerQueryResult,
   SerializedFrankenError,
   SqlScalar,
+  SnapshotMetadata,
 } from "@frankensqlite/worker";
 
 import type { WorkerLike } from "./worker-client";
 
-export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar };
+export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SnapshotMetadata };
 
 export type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> =
   WorkerQueryResult<Row>;

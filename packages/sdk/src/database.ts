@@ -1,6 +1,6 @@
 import { FrankenPreparedStatement } from "./statement";
 import { FrankenTransaction } from "./transaction";
-import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, QueryResult, SqlScalar } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SnapshotMetadata } from "./types";
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
@@ -16,13 +16,17 @@ interface TransactionScope {
 export class FrankenDB {
   readonly #client: FrankenWorkerClient;
   readonly #path: string;
+  readonly #persistence: PersistenceMode;
+  #snapshotRevision: string | null;
   #transactionScope: TransactionScope | null = null;
   #transactionFailure: Error | null = null;
   #nextSavepointId = 1n;
 
-  private constructor(client: FrankenWorkerClient, path: string) {
+  private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null) {
     this.#client = client;
     this.#path = path;
+    this.#persistence = persistence;
+    this.#snapshotRevision = snapshotRevision;
   }
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
@@ -43,7 +47,7 @@ export class FrankenDB {
     }
     try {
       const ready = await client.init(config);
-      return new FrankenDB(client, ready.path);
+      return new FrankenDB(client, ready.path, ready.persistence, ready.snapshot?.revision ?? null);
     } catch (error: unknown) {
       try {
         client.dispose();
@@ -67,6 +71,15 @@ export class FrankenDB {
 
   get path(): string {
     return this.#path;
+  }
+
+  get persistence(): PersistenceMode {
+    return this.#persistence;
+  }
+
+  /** Last loaded/published checkpoint, not the state of unsaved memory writes. */
+  get snapshotRevision(): string | null {
+    return this.#snapshotRevision;
   }
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
@@ -118,6 +131,15 @@ export class FrankenDB {
 
   export(): Promise<Uint8Array> {
     return this.#run(null, () => this.#client.export());
+  }
+
+  /** Publish an explicit whole-image checkpoint after all SQL transactions end. */
+  checkpoint(): Promise<SnapshotMetadata> {
+    return this.#run(null, async () => {
+      const saved = await this.#client.checkpoint();
+      this.#snapshotRevision = saved.revision;
+      return saved;
+    });
   }
 
   transaction<T>(

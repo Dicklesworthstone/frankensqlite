@@ -4487,9 +4487,15 @@ struct StorageCursor {
     /// AUTOINCREMENT lower bound loaded once per execution for this cursor.
     autoincrement_high_water: i64,
     /// Highest rowid allocated by `NewRowid` on this cursor (bd-1yi8).
-    /// Ensures consecutive allocations return unique values even when
-    /// no Insert has been issued between them.
+    /// Trusted as `max(rowid)` only while the row it was allocated for has
+    /// landed as the rightmost row (see `last_alloc_rowid_tracks_table`); an
+    /// allocation the statement discarded is handed out again, as stock's
+    /// `OP_NewRowid` recomputation does.
     last_alloc_rowid: i64,
+    /// Whether the row allocated as `last_alloc_rowid` was inserted through
+    /// this cursor. A pending (unlanded) allocation may be reissued for a
+    /// rowid table; a landed one never is.
+    last_alloc_landed: bool,
     /// Pre-allocated buffer to read payloads into without allocating.
     payload_buf: Vec<u8>,
     /// Scratch buffer for parsing target index keys.
@@ -7440,11 +7446,12 @@ impl VdbeEngine {
     }
 
     fn clear_storage_cursor_statement_state(sc: &mut StorageCursor) {
-        // `last_alloc_rowid` exists only to keep multiple OP_NewRowid calls in a
-        // single statement unique before any corresponding insert lands. If a
-        // retained cursor carries it across statements, conflict-only INSERT /
-        // UPSERT statements incorrectly burn normal rowids.
+        // `last_alloc_rowid` exists only to skip the max-rowid probe inside a
+        // single statement's insert stream. If a retained cursor carries it
+        // across statements, conflict-only INSERT / UPSERT statements
+        // incorrectly burn normal rowids.
         sc.last_alloc_rowid = 0;
+        sc.last_alloc_landed = false;
     }
 
     fn clear_retained_storage_cursor_statement_state(&mut self) {
@@ -8183,6 +8190,19 @@ impl VdbeEngine {
             self.collect_vdbe_metrics,
             DecodeCacheInvalidationReason::WriteMutation,
         );
+        // bd-55kh5: the provisional table row has just been removed again, so
+        // the allocator must stop treating that rowid as landed. Without this
+        // the UNIQUE-conflict discard path still burns it — the row was
+        // inserted (marking it landed) before the index insert conflicted, and
+        // the next NewRowid would skip past a rowid no row ever occupied. The
+        // NOT NULL / CHECK discards never reach this function because they fail
+        // before the table insert.
+        if tsc.last_alloc_rowid == rollback.rowid {
+            tsc.last_alloc_landed = false;
+        }
+        if tsc.last_successful_insert_rowid == Some(rollback.rowid) {
+            tsc.last_successful_insert_rowid = None;
+        }
         let rollback_cursor_id = rollback.cursor_id;
         let rollback_rowid = rollback.rowid;
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
@@ -8544,12 +8564,29 @@ impl VdbeEngine {
         }
     }
 
+    /// Whether `last_alloc_rowid` still equals the table's `max(rowid)`.
+    ///
+    /// Stock recomputes `max(rowid)+1` on every `OP_NewRowid`; the per-cursor
+    /// cache only exists to skip that probe inside an append stream, and it
+    /// tracks the table exactly while the allocation it records has landed as
+    /// the rightmost row (`last_successful_insert_rowid`). After a row was
+    /// discarded between `NewRowid` and `Insert` (OR IGNORE / DO NOTHING on a
+    /// NOT NULL, CHECK, or UNIQUE violation, or an UPSERT that updated the
+    /// existing row instead), or after an explicit-rowid insert landed, the
+    /// cache is stale and the next allocation must look at the table again so
+    /// a rowid table does not burn the discarded value: stock hands out 4
+    /// after 1,2,3 even when the same statement's first row was ignored.
+    /// AUTOINCREMENT keeps its burned values through `autoinc_max`.
+    fn last_alloc_rowid_tracks_table(sc: &StorageCursor) -> bool {
+        sc.last_alloc_rowid > 0 && sc.last_successful_insert_rowid == Some(sc.last_alloc_rowid)
+    }
+
     async fn allocate_serialized_storage_rowid(
         sc: &mut StorageCursor,
         autoinc_max: i64,
         overflow_detail: &'static str,
     ) -> Result<i64> {
-        let base = if sc.last_alloc_rowid > 0 {
+        let base = if Self::last_alloc_rowid_tracks_table(sc) {
             sc.last_alloc_rowid.max(autoinc_max)
         } else {
             Self::storage_cursor_visible_max_rowid(sc)
@@ -8562,6 +8599,7 @@ impl VdbeEngine {
                 detail: overflow_detail.into(),
             })?;
         sc.last_alloc_rowid = rowid;
+        sc.last_alloc_landed = false;
         Ok(rowid)
     }
 
@@ -8579,7 +8617,23 @@ impl VdbeEngine {
         sc: &mut StorageCursor,
         overflow_detail: &'static str,
     ) -> Result<i64> {
-        let visible_max = if sc.last_alloc_rowid > 0 {
+        // A rowid this cursor allocated but never landed is still reserved to
+        // this session by the shared allocator, so no other writer can hold
+        // it. Hand it out again for a rowid table, which is what stock's
+        // `max(rowid)+1` recomputation yields. AUTOINCREMENT must burn it, and
+        // an explicit-rowid insert that landed at or above it makes it stale
+        // (the Insert arm has already raised the allocator floor past that
+        // row, so a fresh allocation lands above it as stock does).
+        if sc.last_alloc_rowid > 0
+            && !sc.last_alloc_landed
+            && matches!(mode, RowIdMode::Normal)
+            && sc
+                .last_successful_insert_rowid
+                .is_none_or(|landed| landed < sc.last_alloc_rowid)
+        {
+            return Ok(sc.last_alloc_rowid);
+        }
+        let visible_max = if Self::last_alloc_rowid_tracks_table(sc) {
             sc.last_alloc_rowid.max(autoinc_max)
         } else {
             Self::storage_cursor_visible_max_rowid(sc)
@@ -8598,6 +8652,7 @@ impl VdbeEngine {
             .map_err(|err| Self::map_rowid_allocator_error(err, overflow_detail))?
             .get();
         sc.last_alloc_rowid = rowid;
+        sc.last_alloc_landed = false;
         Ok(rowid)
     }
 
@@ -9996,6 +10051,7 @@ impl VdbeEngine {
                                 rowid_mode: RowIdMode::Normal,
                                 autoincrement_high_water: 0,
                                 last_alloc_rowid: 0,
+                                last_alloc_landed: false,
                                 payload_buf: Vec::new(),
                                 target_vals_buf: Vec::new(),
                                 cur_vals_buf: Vec::new(),
@@ -10903,7 +10959,17 @@ impl VdbeEngine {
                     let mut new_autoinc_root: Option<i32> = None;
                     let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         let root_page = sc.root_page;
-                        let autoinc_max = sc.autoincrement_high_water;
+                        // GH #186: a burned AUTOINCREMENT value lives in the
+                        // program-scoped high-water until sqlite_sequence is
+                        // written. Fold it into the floor so a re-probe after a
+                        // discarded row still allocates above it (stock: 5
+                        // after 1,2,3 when the ignored row took 4).
+                        let autoinc_max = sc.autoincrement_high_water.max(
+                            self.autoinc_alloc_high_water
+                                .get(&root_page)
+                                .copied()
+                                .unwrap_or(0),
+                        );
                         let rowid_mode = sc.rowid_mode;
                         if matches!(rowid_mode, RowIdMode::AutoIncrement) {
                             new_autoinc_root = Some(root_page);
@@ -11178,6 +11244,9 @@ impl VdbeEngine {
                                             FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
                                                 .fetch_add(1, AtomicOrdering::Relaxed);
                                         }
+                                    }
+                                    if rowid == sc.last_alloc_rowid {
+                                        sc.last_alloc_landed = true;
                                     }
                                     invalidate_storage_cursor_row_cache_with_reason(
                                         sc,
@@ -14715,6 +14784,7 @@ impl VdbeEngine {
                                     .await;
                                 if result.is_ok() {
                                     sc.last_successful_insert_rowid = Some(rowid);
+                                    sc.last_alloc_landed = true;
                                 }
                                 result
                             } else {
@@ -15316,6 +15386,7 @@ impl VdbeEngine {
                     .await?;
                 if result {
                     sc.last_successful_insert_rowid = Some(rowid);
+                    sc.last_alloc_landed = true;
                 }
                 result
             } else {
@@ -15342,6 +15413,7 @@ impl VdbeEngine {
                     .await;
                 if result.is_ok() {
                     sc.last_successful_insert_rowid = Some(rowid);
+                    sc.last_alloc_landed = true;
                 }
                 result
             } else {
@@ -15892,6 +15964,7 @@ impl VdbeEngine {
                 rowid_mode: old_sc.rowid_mode,
                 autoincrement_high_water: old_sc.autoincrement_high_water,
                 last_alloc_rowid: 0,
+                last_alloc_landed: false,
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
@@ -17304,6 +17377,7 @@ impl VdbeEngine {
                             rowid_mode,
                             autoincrement_high_water,
                             last_alloc_rowid: 0,
+                            last_alloc_landed: false,
                             last_successful_insert_rowid: None,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
@@ -17464,6 +17538,7 @@ impl VdbeEngine {
                             rowid_mode,
                             autoincrement_high_water,
                             last_alloc_rowid: 0,
+                            last_alloc_landed: false,
                             last_successful_insert_rowid: None,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
@@ -17661,6 +17736,7 @@ impl VdbeEngine {
                 rowid_mode,
                 autoincrement_high_water,
                 last_alloc_rowid: 0,
+                last_alloc_landed: false,
                 last_successful_insert_rowid: None,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
@@ -29044,7 +29120,8 @@ mod tests {
 
     #[test]
     fn test_newrowid_with_storage_cursor_allocates_correctly() {
-        // Verify NewRowid allocates sequential rowids when using storage cursors.
+        // Verify NewRowid allocates sequential rowids when using storage
+        // cursors once each allocation has landed, as an INSERT stream does.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         let table = db.get_table_mut(root).unwrap();
@@ -29056,20 +29133,82 @@ mod tests {
 
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
-            // Allocate two new rowids and output them.
+            // Allocate, land that row, allocate again; output both rowids.
+            //
+            // `ResultRow` CONSUMES its registers (`take_reg_range`), so the
+            // allocated rowid is copied into a scratch register for output and
+            // register 1 is kept intact for `Insert` to use as the rowid.
+            // Emitting `ResultRow` directly on register 1 and then handing the
+            // same register to `Insert` inserts rowid 0.
             b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::NewRowid, 0, 2, 0, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 1, 5, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 60, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+            b.emit_op(Opcode::NewRowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 4, 6, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
 
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
 
-        // The table had rowid 5 → next_rowid should be 6, then 7.
+        // The table had rowid 5 → 6 is allocated and lands, then 7.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], SqliteValue::Integer(6));
         assert_eq!(rows[1][0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_newrowid_discarded_allocation_is_reissued_like_stock() {
+        // Stock's OP_NewRowid recomputes max(rowid)+1 every time, so an
+        // allocation whose row never landed (OR IGNORE discarded it) is handed
+        // out again; only a landed row moves the next value. This is the
+        // rowid-table half of the burned-rowid parity fix; AUTOINCREMENT keeps
+        // burning through the program-scoped high-water (GH #186).
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(5, vec![SqliteValue::Integer(50)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Allocate and discard (no Insert), allocate again, land it,
+            // allocate once more.
+            // `ResultRow` consumes its registers, so each allocated rowid is
+            // copied to a scratch register for output; register 1 must survive
+            // to be `Insert`'s rowid operand.
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 1, 5, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 1, 6, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 60, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+            b.emit_op(Opcode::NewRowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 4, 7, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 7, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(6)],
+                vec![SqliteValue::Integer(6)],
+                vec![SqliteValue::Integer(7)],
+            ],
+            "discarded 6 is reissued; landed 6 moves the next allocation to 7"
+        );
     }
 
     #[test]
