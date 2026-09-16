@@ -7439,7 +7439,7 @@ impl WalCommitSyncPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PagerAccessMode {
-    ReadWrite,
+    Writable,
     ReadOnly,
     ReadOnlyWithWalIndexRecovery,
 }
@@ -7447,7 +7447,7 @@ enum PagerAccessMode {
 impl PagerAccessMode {
     #[must_use]
     const fn is_readonly(self) -> bool {
-        !matches!(self, Self::ReadWrite)
+        !matches!(self, Self::Writable)
     }
 }
 
@@ -18752,7 +18752,7 @@ where
                 writer_active: false,
                 active_transactions: 0,
                 checkpoint_active: false,
-                access_mode: PagerAccessMode::ReadWrite,
+                access_mode: PagerAccessMode::Writable,
                 durable_freelist_view: freelist.iter().map(|page| page.get()).collect(),
                 freelist,
                 abandoned_eof_reservations: Vec::new(),

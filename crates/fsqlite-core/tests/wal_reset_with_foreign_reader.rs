@@ -1027,7 +1027,7 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
 #[cfg(all(unix, feature = "native"))]
 fn stale_generation_fixture(path: &Path, writer: bool, header_only: bool) -> PublicReaderProcess {
     let script = r#"
-import pathlib, shutil, sqlite3, sys
+import os, pathlib, shutil, sqlite3, sys
 p = pathlib.Path(sys.argv[1])
 seed = str(p) + '.seed'
 c = sqlite3.connect(seed)
@@ -1051,8 +1051,9 @@ pathlib.Path(str(p) + '-shm').write_bytes(old)
 c.close()
 if sys.argv[2] == 'writer':
     c = sqlite3.connect(str(p), timeout=0)
+    shm_fd = os.open(str(p) + '-shm', os.O_RDWR)
     c.execute('BEGIN IMMEDIATE')
-    pathlib.Path(str(p) + '-shm').write_bytes(old)
+    assert os.pwrite(shm_fd, old, 0) == len(old)
 print('stale-generation-ready', flush=True)
 sys.stdin.readline()
 if sys.argv[2] == 'writer':
@@ -1060,6 +1061,7 @@ if sys.argv[2] == 'writer':
     print('writer-released', flush=True)
     sys.stdin.readline()
     c.close()
+    os.close(shm_fd)
 "#;
     let mut child = std::process::Command::new("python3")
         .args(["-c", script])
@@ -1083,6 +1085,26 @@ if sys.argv[2] == 'writer':
         child, output, reader_thread: Some(reader_thread), kind: "stale-generation",
     };
     fixture.witness("stale-generation-ready");
+    if writer {
+        // Closing any SHM descriptor in the writer process would drop all of
+        // its POSIX locks. Verify WRITE from an independent process before
+        // using this fixture as a recovery-contention oracle.
+        let probe = r#"
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 120, os.SEEK_SET)
+except BlockingIOError:
+    sys.exit(0)
+sys.exit('stock writer does not own WAL_WRITE_LOCK')
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", probe])
+            .arg(sidecar(path, "-shm"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
     fixture
 }
 
@@ -1113,8 +1135,14 @@ fn cass_gh477_explicit_index_recovery_preserves_database_and_wal() {
             let result = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await;
             if writer {
                 assert!(started.elapsed() < std::time::Duration::from_secs(5), "writer refusal must be prompt");
-                assert!(matches!(result, Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery)),
-                    "a genuine foreign writer prevents derived-index recovery");
+                match result {
+                    Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery) => {}
+                    Err(error) => panic!("unexpected writer recovery refusal: {error}"),
+                    Ok(connection) => {
+                        connection.close_without_checkpoint().await.unwrap();
+                        panic!("a genuine foreign writer must prevent derived-index recovery");
+                    }
+                }
                 assert_eq!(fingerprint("-shm"), shm_before, "lock refusal cannot modify SHM");
                 assert_eq!(fingerprint(""), main_before);
                 assert_eq!(fingerprint("-wal"), wal_before);

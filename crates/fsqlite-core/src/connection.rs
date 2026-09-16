@@ -14288,8 +14288,14 @@ impl Connection {
         env: ConnectionEnv,
     ) -> Result<Self> {
         Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
-            path, None, env, false, false, SchemaOnlyPagerDisposition::RecoverWalIndex,
-        ).await
+            path,
+            None,
+            env,
+            false,
+            false,
+            SchemaOnlyPagerDisposition::RecoverWalIndex,
+        )
+        .await
     }
 
     /// Open an existing file-backed database for reading and writing while
@@ -14470,7 +14476,8 @@ impl Connection {
         let path = path.into();
         if path.is_empty()
             || (writable && path == ":memory:")
-            || (matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex) && path == ":memory:")
+            || (matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex)
+                && path == ":memory:")
             || (expected_identity.is_some() && path == ":memory:")
         {
             return Err(FrankenError::CannotOpen {
