@@ -29,8 +29,18 @@ export class FrankenDB {
     if (normalized.snapshot !== undefined) {
       config.snapshot = normalized.snapshot;
     }
-    const ready = await client.init(config);
-    return new FrankenDB(client, ready.path);
+    try {
+      const ready = await client.init(config);
+      return new FrankenDB(client, ready.path);
+    } catch (error: unknown) {
+      try {
+        client.dispose();
+      } catch (cleanupError: unknown) {
+        throw new AggregateError([error, cleanupError],
+          "FrankenSQLite initialization and worker cleanup both failed", { cause: error });
+      }
+      throw error;
+    }
   }
 
   static import(
@@ -93,11 +103,7 @@ export class FrankenDB {
     }
   }
 
-  async close(): Promise<void> {
-    try {
-      await this.#client.close();
-    } finally {
-      this.#client.dispose();
-    }
+  close(): Promise<void> {
+    return this.#client.close();
   }
 }
