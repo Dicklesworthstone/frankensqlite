@@ -1,4 +1,4 @@
-import type { QueryResult, SqlScalar } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar } from "./types";
 import { FrankenWorkerClient } from "./worker-client";
 
 type StatementOperation = <T>(operation: () => Promise<T>) => Promise<T>;
@@ -38,6 +38,16 @@ export class FrankenPreparedStatement<
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
     return this.#run(() => this.#client.executePrepared(this.#statementId, params));
+  }
+
+  executeMany(
+    parameterSets: readonly (readonly SqlScalar[])[],
+    options?: ExecuteManyOptions,
+  ): Promise<ExecuteManyResult> {
+    if (this.#finalizePromise !== null) {
+      return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
+    }
+    return this.#run(() => this.#client.executePreparedMany(this.#statementId, parameterSets, options));
   }
 
   query(params: readonly SqlScalar[] = []): Promise<QueryResult<Row>> {

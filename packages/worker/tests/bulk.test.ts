@@ -37,7 +37,14 @@ async function fixture(faults: Faults = {}) {
   let prepares = 0;
   let releases = 0;
   let rowGate: ReturnType<typeof deferred> | undefined;
+  let blockedRow = 0;
   const started = deferred();
+  const boundaries = new Map<string, { gate: ReturnType<typeof deferred>; started: ReturnType<typeof deferred> }>();
+  async function waitBoundary(name: string): Promise<void> {
+    const boundary = boundaries.get(name);
+    boundary?.started.resolve();
+    await boundary?.gate.promise;
+  }
   const statement: CorePreparedStatementHandle = {
     sql: SQL,
     columnCount: faults.resultColumns ?? 0,
@@ -52,8 +59,10 @@ async function fixture(faults: Faults = {}) {
       events.push("row");
       const index = bindings.length;
       bindings.push(params);
-      started.resolve();
-      await rowGate?.promise;
+      if (rowGate !== undefined && index === blockedRow) {
+        started.resolve();
+        await rowGate.promise;
+      }
       if (faults.row === index) {
         if (faults.wholeTransactionRollback) {
           rows = snapshots[0]?.rows ?? [];
@@ -79,14 +88,17 @@ async function fixture(faults: Faults = {}) {
       events.push(sql);
       const name = sql.split(" ").at(-1)!;
       if (sql.startsWith("SAVEPOINT ")) {
+        await waitBoundary("savepoint");
         if (faults.begin) throw new Error("begin failed");
         snapshots.push({ name, rows: rows.map((row) => [...row]) });
       } else if (sql.startsWith("ROLLBACK TO ")) {
+        await waitBoundary("rollback");
         if (faults.rollback) throw new Error("rollback failed");
         const snapshot = snapshots.at(-1);
         if (snapshot?.name !== name) throw new Error("savepoint missing");
         rows = snapshot.rows.map((row) => [...row]);
       } else if (sql.startsWith("RELEASE ")) {
+        await waitBoundary("release");
         releases += 1;
         if (faults.release === releases) throw new Error("release failed");
         if (snapshots.at(-1)?.name !== name) throw new Error("savepoint missing");
@@ -95,7 +107,7 @@ async function fixture(faults: Faults = {}) {
     },
     async query() { events.push("query"); return emptyResult; },
     async queryWithParams() { return emptyResult; },
-    async prepare() { events.push("prepare"); prepares += 1; return statement; },
+    async prepare() { events.push("prepare"); prepares += 1; await waitBoundary("prepare"); return statement; },
     async export() { return Uint8Array.of(1); },
   };
   const host = new WorkerConnectionHost({
@@ -109,7 +121,13 @@ async function fixture(faults: Faults = {}) {
     rows: () => rows,
     frees: () => frees,
     prepares: () => prepares,
-    block() { rowGate = deferred(); return { ...rowGate, started: started.promise }; },
+    block(index = 0) { blockedRow = index; rowGate = deferred(); return { ...rowGate, started: started.promise }; },
+    blockBoundary(name: string) {
+      const gate = deferred();
+      const started = deferred();
+      boundaries.set(name, { gate, started });
+      return { ...gate, started: started.promise };
+    },
     run(parameterSets: SqlScalar[][] = [[1], [2], [3]], sql = SQL) {
       return host.handle({ kind: "execute-many", requestId: 2, sql, parameterSets });
     },
@@ -302,4 +320,177 @@ describe("bulk SQL boundary", () => {
       validateBulkSql(sql);
     });
   }
+});
+
+function cancel(host: WorkerConnectionHost, targetRequestId = 2, requestId = 90) {
+  return host.handle({ kind: "cancel-bulk", requestId, targetRequestId });
+}
+
+function cancellable(host: WorkerConnectionHost, requestId = 2) {
+  return host.handle({ kind: "execute-many", requestId, sql: SQL,
+    parameterSets: [[1], [2], [3]], cancellable: true });
+}
+
+describe("bulk cancellation and commit boundary", () => {
+  it("cancels a queued batch before any prepare or savepoint", async () => {
+    const f = await fixture();
+    const pending = cancellable(f.host);
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(f.events).toEqual([]);
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+  });
+
+  for (const blockedRow of [0, 2]) {
+    it(`finishes the active row ${blockedRow} and rolls back the entire batch`, async () => {
+      const f = await fixture();
+      const gate = f.block(blockedRow);
+      const pending = cancellable(f.host);
+      let settled = false;
+      void pending.then(() => { settled = true; });
+      await gate.started;
+      expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+      expect(settled).toBe(false);
+      expect(f.frees()).toBe(0);
+      gate.resolve();
+      expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+      expect(f.rows()).toEqual([["before"]]);
+      expect(f.frees()).toBe(1);
+      expect(f.events.slice(-2)).toEqual(["ROLLBACK TO SAVEPOINT fsqlite_bulk_1", "RELEASE SAVEPOINT fsqlite_bulk_1"]);
+      expect((await f.run([[4]])).kind).toBe("execute-many-result");
+      expect(f.rows()).toEqual([["before"], [4]]);
+    });
+  }
+
+  it("does not settle the batch until the cancellation rollback completes", async () => {
+    const f = await fixture();
+    const row = f.block();
+    const rollback = f.blockBoundary("rollback");
+    const pending = cancellable(f.host);
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await row.started;
+    await cancel(f.host);
+    row.resolve();
+    await rollback.started;
+    expect(settled).toBe(false);
+    expect(f.events.at(-1)).toBe("ROLLBACK TO SAVEPOINT fsqlite_bulk_1");
+    rollback.resolve();
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(f.rows()).toEqual([["before"]]);
+  });
+
+  it("frees a statement prepared during cancellation without starting a savepoint", async () => {
+    const f = await fixture();
+    const gate = f.blockBoundary("prepare");
+    const pending = cancellable(f.host);
+    await gate.started;
+    await cancel(f.host);
+    gate.resolve();
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(f.events).toEqual(["prepare", "free"]);
+  });
+
+  it("rolls back when cancellation arrives during savepoint creation", async () => {
+    const f = await fixture();
+    const gate = f.blockBoundary("savepoint");
+    const pending = cancellable(f.host);
+    await gate.started;
+    await cancel(f.host);
+    gate.resolve();
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(f.bindings.length).toBe(0);
+    expect(f.rows()).toEqual([["before"]]);
+    expect(f.events.includes("ROLLBACK TO SAVEPOINT fsqlite_bulk_1")).toBe(true);
+  });
+
+  it("refuses late cancellation once RELEASE has been dispatched", async () => {
+    const f = await fixture();
+    const gate = f.blockBoundary("release");
+    const pending = cancellable(f.host);
+    await gate.started;
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    gate.resolve();
+    expect((await pending).kind).toBe("execute-many-result");
+    expect(f.rows()).toEqual([["before"], [1], [2], [3]]);
+    expect(f.events.some((event) => event.startsWith("ROLLBACK"))).toBe(false);
+  });
+
+  it("preserves a statement error that races with cancellation", async () => {
+    const f = await fixture({ row: 0 });
+    const gate = f.block();
+    const pending = cancellable(f.host);
+    await gate.started;
+    await cancel(f.host);
+    gate.resolve();
+    expect(error(await pending).code).toBe("SQLITE_CONSTRAINT");
+    expect(f.rows()).toEqual([["before"]]);
+  });
+
+  it("invalidates the host if rollback of a cancelled batch fails", async () => {
+    const f = await fixture({ rollback: true });
+    const gate = f.block();
+    const pending = cancellable(f.host);
+    await gate.started;
+    await cancel(f.host);
+    gate.resolve();
+    const failure = error(await pending);
+    expect(failure.code).toBe("ERR_FSQLITE_BULK_CONNECTION_UNUSABLE");
+    expect(failure.cause?.code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(failure.cleanupErrors?.map((item) => item.message)).toEqual(["rollback failed"]);
+    expect(f.events.slice(-2)).toEqual(["close", "database.free"]);
+    expect(error(await f.run([[4]])).code).toBe("ERR_FSQLITE_BULK_CONNECTION_UNUSABLE");
+  });
+
+  it("targets one queued batch without cancelling its predecessor or successor", async () => {
+    const f = await fixture();
+    const gate = f.block();
+    const first = f.run([[11]]);
+    await gate.started;
+    const second = cancellable(f.host, 3);
+    const third = f.host.handle({ kind: "execute-many", requestId: 4, sql: SQL, parameterSets: [[44]] });
+    await cancel(f.host, 3);
+    gate.resolve();
+    expect((await first).kind).toBe("execute-many-result");
+    expect(error(await second).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect((await third).kind).toBe("execute-many-result");
+    expect(f.rows()).toEqual([["before"], [11], [44]]);
+  });
+
+  it("does not cancel noncancellable, unknown or completed operations", async () => {
+    const f = await fixture();
+    const gate = f.block();
+    const pending = f.run();
+    await gate.started;
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    expect(await cancel(f.host, 123)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    gate.resolve();
+    expect((await pending).kind).toBe("execute-many-result");
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+  });
+
+  it("rejects duplicate active cancellation ids without replacing the first token", async () => {
+    const f = await fixture();
+    const pending = cancellable(f.host);
+    expect(error(await cancellable(f.host)).message).toBe("Duplicate active bulk request id");
+    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+  });
+
+  it("keeps a cancelled prepared handle reusable after successful rollback", async () => {
+    const f = await fixture();
+    const prepared = await f.host.handle({ kind: "prepare", requestId: 7, sql: SQL });
+    if (prepared.kind !== "prepare-result") throw new Error("prepare failed");
+    const gate = f.block();
+    const pending = f.host.handle({ kind: "statement-execute-many", requestId: 2,
+      statementId: prepared.data.statementId, parameterSets: [[1]], cancellable: true });
+    await gate.started;
+    await cancel(f.host);
+    gate.resolve();
+    expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
+    expect(f.frees()).toBe(0);
+    expect((await f.host.handle({ kind: "statement-execute-many", requestId: 3,
+      statementId: prepared.data.statementId, parameterSets: [[4]] })).kind).toBe("execute-many-result");
+    expect(f.rows()).toEqual([["before"], [4]]);
+  });
 });
