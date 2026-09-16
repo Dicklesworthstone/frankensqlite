@@ -87,7 +87,7 @@ export async function drain(): Promise<void> {
   for (let i = 0; i < 30; i += 1) await Promise.resolve();
 }
 
-export function rejected<T>(observation: { outcome: Outcome<T> }): unknown {
+export function rejected(observation: { outcome: Outcome<unknown> }): unknown {
   const outcome = observation.outcome;
   if (outcome.status !== "rejected") {
     throw new Error(`Expected prompt rejection, got ${outcome.status}`);
