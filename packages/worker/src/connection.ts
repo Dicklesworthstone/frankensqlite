@@ -24,6 +24,8 @@ import {
 import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
 import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName } from "./snapshot-store";
 import type { SnapshotMetadata } from "./snapshot-store";
+import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
+import type { RequestLimits, RequestQueueStats } from "./admission";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
@@ -94,31 +96,77 @@ export class WorkerConnectionHost {
   readonly #bulkCancellations = new Map<number, BulkCancellation>();
   #snapshotStore: IndexedDbSnapshotStore | null = null;
   #snapshotRevision: string | null = null;
+  readonly #budget: RequestBudget;
+  #closePromise: Promise<WorkerResponse> | null = null;
 
-  constructor(loader: CoreModuleLoader = defaultCoreModuleLoader) {
+  constructor(loader: CoreModuleLoader = defaultCoreModuleLoader, limits: Partial<RequestLimits> = {}) {
     this.#loader = loader;
+    this.#budget = new RequestBudget(limits);
+  }
+
+  get requestQueue(): RequestQueueStats {
+    return this.#budget.stats;
   }
 
   handle(request: WorkerRequest): Promise<WorkerResponse> {
+    try {
+      validateRequestId(request.requestId);
+      return this.#admit(request);
+    } catch (error: unknown) {
+      return Promise.resolve({ kind: "error", requestId: request.requestId,
+        error: serializeFrankenError(error) });
+    }
+  }
+
+  #admit(request: WorkerRequest): Promise<WorkerResponse> {
     if (request.kind === "cancel-bulk") {
+      validateRequestId(request.targetRequestId);
       // Do not put cancellation behind the work it needs to cancel. This only
       // updates a token; SQL and handle destruction still run in FIFO order.
       return Promise.resolve({ kind: "cancel-bulk-result", requestId: request.requestId,
         accepted: this.#bulkCancellations.get(request.targetRequestId)?.request() ?? false });
     }
+    if (request.kind === "close") {
+      const requestId = request.requestId;
+      if (this.#closePromise !== null) {
+        return this.#closePromise.then(response => ({ ...response, requestId }));
+      }
+      // Reserve one close fence independently of ordinary queue capacity. Later
+      // SQL cannot enter; earlier SQL must settle before any handle is freed.
+      const response = this.#requestTail.then(() => this.#handle({ kind: "close", requestId }));
+      this.#closePromise = response;
+      this.#requestTail = response.then(() => undefined, () => undefined);
+      return response;
+    }
+    if (this.#closePromise !== null) {
+      return Promise.resolve({ kind: "error", requestId: request.requestId,
+        error: { code: "ERR_FSQLITE_CONNECTION_CLOSED", message: "FrankenSQLite worker connection is closing or closed" } });
+    }
+    if (this.#bulkCancellations.has(request.requestId)) {
+      return Promise.resolve({ kind: "error", requestId: request.requestId,
+        error: { code: "ERR_FSQLITE_BULK_INPUT", message: "Duplicate active bulk request id" } });
+    }
+    const admitted = this.#budget.admit(request);
+    request = admitted.request;
+    const release = admitted.release;
+    // Direct host callers may supply getters. As on the SDK side, capture can
+    // re-enter close; never append captured SQL after an already-admitted fence.
+    if (this.#closePromise !== null) {
+      release();
+      return Promise.resolve({ kind: "error", requestId: request.requestId,
+        error: { code: "ERR_FSQLITE_CONNECTION_CLOSED", message: "FrankenSQLite worker connection is closing or closed" } });
+    }
     let cancellation: BulkCancellation | undefined;
     if ((request.kind === "execute-many" || request.kind === "statement-execute-many") && request.cancellable) {
-      if (this.#bulkCancellations.has(request.requestId)) {
-        return Promise.resolve({ kind: "error", requestId: request.requestId,
-          error: { code: "ERR_FSQLITE_BULK_INPUT", message: "Duplicate active bulk request id" } });
-      }
       cancellation = new BulkCancellation();
       this.#bulkCancellations.set(request.requestId, cancellation);
     }
     // Worker message callbacks are not awaited by the browser. Keep ownership
     // of this connection (and its WASM handles) until each request settles,
     // including init, finalize, export and close. Other hosts remain independent.
-    const response = this.#requestTail.then(() => this.#handle(request, cancellation)).finally(() => {
+    const ordinary = request as Exclude<WorkerRequest, { kind: "cancel-bulk" }>;
+    const response = this.#requestTail.then(() => this.#handle(ordinary, cancellation)).finally(() => {
+      release();
       if (cancellation !== undefined) {
         cancellation.finish();
         this.#bulkCancellations.delete(request.requestId);
@@ -298,7 +346,7 @@ export class WorkerConnectionHost {
   async #executeMany(
     requestId: number,
     sql: string,
-    parameterSets: SqlScalar[][],
+    parameterSets: readonly (readonly SqlScalar[])[],
     prepared?: CorePreparedStatementHandle,
     cancellation?: BulkCancellation,
   ): Promise<ExecuteManyResponse> {
@@ -510,6 +558,9 @@ export function serializeFrankenError(
           ? error
           : "Unknown FrankenSQLite worker error",
   };
+  if (error instanceof RequestAdmissionError && error.batchIndex !== undefined) {
+    serialized.batchIndex = error.batchIndex;
+  }
 
   const sqliteCode = extractNumberProperty(error, "sqliteCode");
   if (sqliteCode !== undefined) {

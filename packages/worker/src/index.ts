@@ -4,6 +4,9 @@ export {
   WorkerConnectionHost,
 } from "./connection";
 export * from "./protocol";
+export { DEFAULT_REQUEST_LIMITS, RequestAdmissionError, RequestBudget, resolveRequestLimits } from "./admission";
+export type { RequestLimits, RequestQueueStats } from "./admission";
+export { validateBulkSql } from "./bulk";
 export { IndexedDbSnapshotStore, MAX_SNAPSHOT_BYTES, SnapshotStoreError } from "./snapshot-store";
 export type { SnapshotMetadata, StoredSnapshot } from "./snapshot-store";
 export {

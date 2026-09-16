@@ -4,6 +4,10 @@ import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, Persi
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
+import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
+import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
+import { resolveRequestLimits } from "@frankensqlite/worker";
+import type { RequestQueueStats } from "./types";
 
 interface TransactionScope {
   accepting: boolean;
@@ -31,7 +35,9 @@ export class FrankenDB {
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
     const normalized = normalizeOpenOptions(options);
-    const client = new FrankenWorkerClient(resolveWorker(normalized.worker));
+    // Validate before allocating a worker or transferring a snapshot buffer.
+    const limits = resolveRequestLimits(normalized.requestLimits);
+    const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
     if (normalized.dbName !== undefined) {
       config.dbName = normalized.dbName;
@@ -82,6 +88,11 @@ export class FrankenDB {
     return this.#snapshotRevision;
   }
 
+  /** Ordinary requests only; close/cancellation have a separate control lane. */
+  get requestQueue(): RequestQueueStats {
+    return this.#client.requestQueue;
+  }
+
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     return this.#run(null, () => this.#client.execute(sql, params));
   }
@@ -97,6 +108,38 @@ export class FrankenDB {
     options?: ExecuteManyOptions,
   ): Promise<ExecuteManyResult> {
     return this.#run(null, () => this.#client.executeMany(sql, parameterSets, options));
+  }
+
+  /** Consume a bounded row stream in one transaction, not one commit per batch. */
+  executeStream(
+    sql: string,
+    rows: SqlRowSource,
+    options?: ExecuteStreamOptions,
+  ): Promise<ExecuteStreamResult> {
+    return this.#streamTransaction(null, sql, rows, options);
+  }
+
+  #streamTransaction(
+    parent: TransactionScope | null,
+    sql: string,
+    rows: SqlRowSource,
+    options?: ExecuteStreamOptions,
+  ): Promise<ExecuteStreamResult> {
+    try {
+      this.#assertOwner(parent);
+      const config = streamOptions(sql, options);
+      // No user transaction handle escapes this callback. The stream owns and
+      // awaits its prepare, chunks, source cleanup and finalize itself, so SQL
+      // errors retain their global stream index instead of being double-wrapped
+      // by per-operation callback bookkeeping.
+      const consume = () => executeRowStream(this.#client, sql, rows, config);
+      const beforeCommit = () => checkStreamCancellation(config);
+      return parent === null
+        ? this.#transaction(null, consume, beforeCommit)
+        : this.#nestedTransaction(parent, consume, beforeCommit);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
   }
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
@@ -151,6 +194,7 @@ export class FrankenDB {
   async #transaction<T>(
     parent: TransactionScope | null,
     work: (tx: FrankenTransaction) => T | Promise<T>,
+    beforeCommit?: () => void,
   ): Promise<T> {
     this.#assertOwner(parent);
     const scope: TransactionScope = {
@@ -166,6 +210,9 @@ export class FrankenDB {
       await this.#client.executeBatch(savepoint === null ? "BEGIN" : `SAVEPOINT ${savepoint}`);
       began = true;
       const result = await this.#finishScope(scope, work);
+      // Last synchronous cancellation boundary, after all source/handle cleanup.
+      // Once COMMIT/RELEASE dispatch starts, its actual outcome is authoritative.
+      beforeCommit?.();
       await this.#client.executeBatch(savepoint === null ? "COMMIT" : `RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error: unknown) {
@@ -207,13 +254,14 @@ export class FrankenDB {
   #nestedTransaction<T>(
     parent: TransactionScope,
     work: (tx: FrankenTransaction) => T | Promise<T>,
+    beforeCommit?: () => void,
   ): Promise<T> {
     try {
       this.#assertOwner(parent);
     } catch (error: unknown) {
       return Promise.reject(error);
     }
-    const promise = this.#transaction(parent, work);
+    const promise = this.#transaction(parent, work, beforeCommit);
     parent.children.add(promise);
     // A rolled-back child is recoverable by its parent. Unlike a direct SQL
     // failure, a caught child failure must not automatically poison the parent.
@@ -271,6 +319,7 @@ export class FrankenDB {
     const tx = new FrankenTransaction({
       execute: (sql, params) => this.#run(scope, () => this.#client.execute(sql, params)),
       executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets, options)),
+      executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
       query: <Row extends Record<string, unknown>>(sql: string, params: readonly SqlScalar[] = []) =>
         this.#run(scope, () => this.#client.query<Row>(sql, params)),
       prepare: <Row extends Record<string, unknown>>(sql: string) =>
