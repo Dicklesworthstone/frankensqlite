@@ -1026,7 +1026,7 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
 /// deliberately reinstates the stale derived fixture while retaining WRITE.
 #[cfg(all(unix, feature = "native"))]
 fn stale_generation_fixture(path: &Path, writer: bool, header_only: bool) -> PublicReaderProcess {
-    let script = r#"
+    let script = r"
 import os, pathlib, shutil, sqlite3, sys
 p = pathlib.Path(sys.argv[1])
 seed = str(p) + '.seed'
@@ -1062,7 +1062,7 @@ if sys.argv[2] == 'writer':
     sys.stdin.readline()
     c.close()
     os.close(shm_fd)
-"#;
+";
     let mut child = std::process::Command::new("python3")
         .args(["-c", script])
         .arg(path)
@@ -1089,7 +1089,7 @@ if sys.argv[2] == 'writer':
         // Closing any SHM descriptor in the writer process would drop all of
         // its POSIX locks. Verify WRITE from an independent process before
         // using this fixture as a recovery-contention oracle.
-        let probe = r#"
+        let probe = r"
 import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
 try:
@@ -1097,7 +1097,7 @@ try:
 except BlockingIOError:
     sys.exit(0)
 sys.exit('stock writer does not own WAL_WRITE_LOCK')
-"#;
+";
         let output = std::process::Command::new("python3")
             .args(["-c", probe])
             .arg(sidecar(path, "-shm"))

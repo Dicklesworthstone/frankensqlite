@@ -6773,7 +6773,7 @@ mod tests {
 
     #[cfg(all(feature = "native", unix))]
     fn owner_stale_generation_fixture(path: &std::path::Path, header_only: bool) {
-        let script = r#"
+        let script = r"
 import pathlib, shutil, sqlite3, sys
 p = sys.argv[1]
 seed = p + '.seed'
@@ -6793,7 +6793,7 @@ wal = pathlib.Path(seed + '-wal').read_bytes()
 pathlib.Path(p + '-wal').write_bytes(wal[:32] if sys.argv[2] == 'header-only' else wal)
 pathlib.Path(p + '-shm').write_bytes(old)
 c.close()
-"#;
+";
         let output = std::process::Command::new("python3")
             .args(["-c", script])
             .arg(path)
