@@ -63,6 +63,41 @@ transaction state is no longer trustworthy. Do not issue manual transaction
 control SQL (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, or `RELEASE`) inside a
 managed callback; its transaction boundaries belong to the SDK.
 
+### Nested transactions
+
+Use `tx.transaction()` for a child savepoint. Catch a child's failure after its
+rollback completes to continue the parent without discarding successful siblings:
+
+```ts
+await db.transaction(async (parent) => {
+  await parent.execute("INSERT INTO users(name) VALUES (?)", ["Ada"]);
+  try {
+    await parent.transaction(async (child) => {
+      await child.execute("INSERT INTO users(name) VALUES (?)", ["Temporary"]);
+      throw new Error("Discard this child only");
+    });
+  } catch {
+    // Ada remains in the parent; Temporary was rolled back.
+  }
+  await parent.execute("INSERT INTO users(name) VALUES (?)", ["Grace"]);
+});
+```
+
+Children use unique SDK-generated `SAVEPOINT` names. Success releases the
+savepoint; failure performs `ROLLBACK TO` followed by `RELEASE`. A released
+child is still part of its parent: an outer rollback also undoes released
+children. Nesting can span multiple levels, but only the deepest active child
+may issue operations. Await siblings sequentially, and use the child's handle
+inside its callback, not the parent or a parent's prepared statement.
+
+Always await each child. If a parent callback returns with an active child,
+the SDK drains that child and rolls back the parent with
+`ERR_FSQLITE_TRANSACTION_UNAWAITED`, rather than committing early. A failed
+rollback-to or cleanup release makes the entire connection unusable; the SDK
+does not release an unsuccessfully rolled-back child into its parent.
+
+### Closing
+
 `close()` stops admitting new requests, completes previously admitted worker
 requests, and shares one completion promise across repeated calls. A worker
 crash or disposal rejects pending and future calls rather than leaving promises

@@ -285,3 +285,256 @@ describe("managed transaction ownership", () => {
     await Promise.all([first.db.close(), second.db.close()]);
   });
 });
+
+describe("nested transaction savepoints", () => {
+  it("uses named savepoints rather than nested BEGIN and preserves callback results", async () => {
+    const f = await fixture();
+    const result = await f.db.transaction(async (parent) => {
+      await parent.execute("PARENT");
+      return parent.transaction(async (child) => {
+        await child.execute("CHILD");
+        return 42;
+      });
+    });
+    expect(result).toBe(42);
+    expect(f.log()).toEqual([
+      "BEGIN", "PARENT", "SAVEPOINT fsqlite_sdk_1", "CHILD",
+      "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT",
+    ]);
+    await f.db.close();
+  });
+
+  it("rolls back and releases a failed child before the parent continues", async () => {
+    const f = await fixture();
+    const cause = new Error("child failed");
+    await f.db.transaction(async (parent) => {
+      await parent.execute("SIBLING_BEFORE");
+      const child = observe(parent.transaction(async (tx) => {
+        await tx.execute("DISCARDED");
+        throw cause;
+      }));
+      await child.settled;
+      expect(rejected(child)).toBe(cause);
+      await parent.execute("SIBLING_AFTER");
+    });
+    expect(f.log()).toEqual([
+      "BEGIN", "SIBLING_BEFORE", "SAVEPOINT fsqlite_sdk_1", "DISCARDED",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "SIBLING_AFTER", "COMMIT",
+    ]);
+    await f.db.close();
+  });
+
+  it("allows a parent to recover from a child's SQL failure", async () => {
+    const f = await fixture();
+    f.failures.set("BAD_CHILD_SQL", "constraint failed");
+    await f.db.transaction(async (parent) => {
+      const child = observe(parent.transaction(async (tx) => {
+        await tx.execute("BAD_CHILD_SQL").catch(() => {});
+      }));
+      await child.settled;
+      expect((rejected(child) as Error).message).toContain("constraint failed");
+      await parent.execute("RECOVERED");
+    });
+    expect(f.log()).toEqual([
+      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "BAD_CHILD_SQL",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "RECOVERED", "COMMIT",
+    ]);
+    await f.db.close();
+  });
+
+  it("rejects parent, sibling and parent-prepared operations while a child owns the connection", async () => {
+    const f = await fixture();
+    await f.db.transaction(async (parent) => {
+      const statement = await parent.prepare("SELECT 1");
+      const gate = deferred<void>();
+      const started = deferred<void>();
+      const child = parent.transaction(async (tx) => { started.resolve(); await gate.promise; await tx.execute("CHILD"); });
+      await started.promise;
+      const operations: Promise<unknown>[] = [
+        parent.execute("FOREIGN"), parent.query("FOREIGN"), parent.prepare("FOREIGN"),
+        parent.transaction(async () => 0), statement.execute(), statement.query(), statement.finalize(),
+      ];
+      const results = operations.map(observe);
+      await drain();
+      const outcomes = results.map((r) => r.outcome);
+      gate.resolve();
+      await child;
+      for (const outcome of outcomes) expectOwnershipError(rejected({ outcome }));
+      expect(await statement.execute()).toBe(1);
+    });
+    expect(f.log().includes("FOREIGN")).toBe(false);
+    expect(f.log().filter((s) => s.startsWith("SAVEPOINT "))).toHaveLength(1);
+    await f.db.close();
+  });
+
+  it("holds child ownership while SAVEPOINT is still pending", async () => {
+    const f = await fixture();
+    f.held.add("SAVEPOINT fsqlite_sdk_1");
+    await f.db.transaction(async (parent) => {
+      const child = parent.transaction(async () => 1);
+      const foreign = observe(parent.execute("FOREIGN"));
+      await drain();
+      const outcome = foreign.outcome;
+      f.release("SAVEPOINT fsqlite_sdk_1");
+      expect(await child).toBe(1);
+      expectOwnershipError(rejected({ outcome }));
+    });
+    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT"]);
+    await f.db.close();
+  });
+
+  it("keeps ownership through RELEASE and only then restores the parent", async () => {
+    const f = await fixture();
+    f.held.add("RELEASE SAVEPOINT fsqlite_sdk_1");
+    await f.db.transaction(async (parent) => {
+      const child = parent.transaction(async (tx) => { await tx.execute("CHILD"); });
+      await drain();
+      const foreign = observe(parent.execute("FOREIGN"));
+      await drain();
+      const outcome = foreign.outcome;
+      f.release("RELEASE SAVEPOINT fsqlite_sdk_1");
+      await child;
+      expectOwnershipError(rejected({ outcome }));
+      await parent.execute("AFTER");
+    });
+    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1", "AFTER", "COMMIT"]);
+    await f.db.close();
+  });
+
+  it("supports multiple nesting levels in strict stack order", async () => {
+    const f = await fixture();
+    await f.db.transaction((parent) => parent.transaction((child) => child.transaction(async (grandchild) => {
+      await grandchild.execute("DEEPEST");
+    })));
+    expect(f.log()).toEqual([
+      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "SAVEPOINT fsqlite_sdk_2", "DEEPEST",
+      "RELEASE SAVEPOINT fsqlite_sdk_2", "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT",
+    ]);
+    await f.db.close();
+  });
+
+  it("invalidates a child handle as soon as that child's callback finishes", async () => {
+    const f = await fixture();
+    await f.db.transaction(async (parent) => {
+      const child = await parent.transaction((tx) => tx);
+      const late = [observe(child.execute("LATE")), observe(child.transaction(async () => 0))];
+      await drain();
+      for (const result of late) expect((rejected(result) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_CLOSED");
+      await parent.execute("PARENT_STILL_VALID");
+    });
+    expect(f.log().includes("LATE")).toBe(false);
+    await f.db.close();
+  });
+
+  it("does not rollback or release a savepoint that failed to start", async () => {
+    const f = await fixture();
+    f.failures.set("SAVEPOINT fsqlite_sdk_1", "savepoint failed");
+    await f.db.transaction(async (parent) => {
+      let called = false;
+      const child = observe(parent.transaction(() => { called = true; }));
+      await child.settled;
+      expect((rejected(child) as Error).message).toContain("savepoint failed");
+      expect(called).toBe(false);
+      await parent.execute("STILL_VALID");
+    });
+    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "STILL_VALID", "COMMIT"]);
+    await f.db.close();
+  });
+
+  it("never releases a failed rollback-to or commits the outer transaction", async () => {
+    const f = await fixture();
+    f.failures.set("ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "rollback-to failed");
+    const cause = new Error("child failure");
+    const transaction = observe(f.db.transaction((parent) => parent.transaction(() => { throw cause; })));
+    await transaction.settled;
+    const error = rejected(transaction);
+    expect(error instanceof AggregateError).toBe(true);
+    expect((error as AggregateError).cause).toBe(cause);
+    expect(((error as AggregateError).errors[1] as Error).message).toContain("rollback-to failed");
+    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1"]);
+    expect(f.worker.terminateCount).toBe(1);
+  });
+
+  it("fails closed when RELEASE fails after a successful rollback-to", async () => {
+    const f = await fixture();
+    f.failures.set("RELEASE SAVEPOINT fsqlite_sdk_1", "release failed");
+    const cause = new Error("child failure");
+    const transaction = observe(f.db.transaction(async (parent) => {
+      await parent.transaction(() => { throw cause; }).catch(() => {});
+    }));
+    await transaction.settled;
+    const error = rejected(transaction);
+    expect(error instanceof AggregateError).toBe(true);
+    expect((error as AggregateError).cause).toBe(cause);
+    expect(f.worker.terminateCount).toBe(1);
+    expect(f.log()).toEqual([
+      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1",
+    ]);
+  });
+
+  it("drains a child that outlives its parent callback and rolls back instead of committing early", async () => {
+    const f = await fixture();
+    const gate = deferred<void>();
+    const started = deferred<void>();
+    const transaction = observe(f.db.transaction(async (parent) => {
+      void parent.transaction(async (child) => {
+        started.resolve();
+        await gate.promise;
+        await child.execute("CHILD");
+      });
+    }));
+    await started.promise;
+    await drain();
+    const before = f.log();
+    gate.resolve();
+    await transaction.settled;
+    expect((rejected(transaction) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_UNAWAITED");
+    expect(before).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1"]);
+    expect(f.log()).toEqual([
+      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1", "ROLLBACK",
+    ]);
+    await f.db.close();
+  });
+});
+
+describe("savepoint cleanup failure preservation", () => {
+  it("can recover after a RELEASE error when rollback-to and its RELEASE succeed", async () => {
+    const f = await fixture();
+    f.held.add("RELEASE SAVEPOINT fsqlite_sdk_1");
+    await f.db.transaction(async (parent) => {
+      const child = observe(parent.transaction(async (tx) => { await tx.execute("CHILD"); }));
+      await drain();
+      f.failures.set("RELEASE SAVEPOINT fsqlite_sdk_1", "first release failed");
+      f.release("RELEASE SAVEPOINT fsqlite_sdk_1");
+      f.failures.clear();
+      await child.settled;
+      expect((rejected(child) as Error).message).toContain("first release failed");
+      await parent.execute("RECOVERED");
+    });
+    expect(f.log()).toEqual([
+      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "RECOVERED", "COMMIT",
+    ]);
+    await f.db.close();
+  });
+
+  it("retains the child, rollback and cleanup errors even when the parent catches the child", async () => {
+    const f = await fixture();
+    f.failures.set("ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "rollback-to failed");
+    const cause = new Error("child failed");
+    const cleanupError = new Error("terminate failed");
+    f.worker.onTerminate = () => { throw cleanupError; };
+    const transaction = observe(f.db.transaction(async (parent) => {
+      await parent.transaction(() => { throw cause; }).catch(() => {});
+    }));
+    await transaction.settled;
+    const error = rejected(transaction);
+    expect(error instanceof AggregateError).toBe(true);
+    expect((error as AggregateError).cause).toBe(cause);
+    expect((error as AggregateError).errors[0]).toBe(cause);
+    expect(((error as AggregateError).errors[1] as Error).message).toContain("rollback-to failed");
+    expect((error as AggregateError).errors[2]).toBe(cleanupError);
+    expect(f.worker.terminateCount).toBe(1);
+    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1"]);
+  });
+});
