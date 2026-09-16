@@ -68,6 +68,20 @@ export interface SerializedFrankenError {
 
 interface WorkerRequestBase {
   requestId: number;
+  /** Explicit worker-side ownership; absent for manually managed operations. */
+  transactionId?: string;
+}
+
+export interface TransactionRequest extends WorkerRequestBase {
+  kind: "transaction";
+  transactionId: string;
+  action: "begin" | "commit" | "rollback";
+  /** Required for a nested begin, absent for a top-level begin. */
+  parentId?: string;
+}
+
+export interface TransactionResponse extends WorkerResponseBase {
+  kind: "transaction-result";
 }
 
 interface WorkerResponseBase {
@@ -151,6 +165,7 @@ export interface CheckpointRequest extends WorkerRequestBase {
 }
 
 export type WorkerRequest =
+  | TransactionRequest
   | InitRequest
   | ExecuteRequest
   | ExecuteBatchRequest
@@ -225,6 +240,7 @@ export interface ErrorResponse extends WorkerResponseBase {
 }
 
 export type WorkerResponse =
+  | TransactionResponse
   | ReadyResponse
   | ExecuteResponse
   | ExecuteBatchResponse

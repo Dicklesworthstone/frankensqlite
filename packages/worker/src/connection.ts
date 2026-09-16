@@ -26,6 +26,7 @@ import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, vali
 import type { SnapshotMetadata } from "./snapshot-store";
 import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
 import type { RequestLimits, RequestQueueStats } from "./admission";
+import { ManagedTransactionError, ManagedTransactions, validateManagedSql } from "./transactions";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
@@ -90,6 +91,8 @@ export class WorkerConnectionHost {
   #db: CoreDatabaseHandle | null = null;
   #nextStatementId = 1;
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
+  readonly #statementOwners = new Map<string, string>();
+  readonly #transactions = new ManagedTransactions();
   #requestTail: Promise<void> = Promise.resolve();
   #nextBulkSavepoint = 1n;
   #terminalError: Error | null = null;
@@ -186,7 +189,26 @@ export class WorkerConnectionHost {
       if (this.#terminalError !== null && request.kind !== "close") {
         throw this.#terminalError;
       }
+      if (request.kind !== "transaction" && request.kind !== "close") {
+        this.#transactions.assertOwner(request.transactionId, request.kind === "statement-finalize");
+        if ("statementId" in request && this.#statementOwners.get(request.statementId) !== request.transactionId) {
+          throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Prepared statement belongs to another scope");
+        }
+        if (request.transactionId !== undefined) {
+          if (request.kind === "init" || request.kind === "export" || request.kind === "checkpoint") {
+            throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Finish the transaction before replacing or exporting its database");
+          }
+          if ("sql" in request) validateManagedSql(request.sql, request.kind === "execute-batch");
+          else if ("statementId" in request && request.kind !== "statement-finalize") {
+            validateManagedSql(this.#requireStatement(request.statementId).sql);
+          }
+        }
+      }
       switch (request.kind) {
+        case "transaction":
+          await this.#transactions.boundary(this.#requireDatabase(), request,
+            id => this.#finalizeTransactionStatements(id));
+          return { kind: "transaction-result", requestId: request.requestId };
         case "init":
           return await this.#initialize(request.requestId, request.config);
         case "execute":
@@ -210,7 +232,7 @@ export class WorkerConnectionHost {
             request.params ?? [],
           );
         case "prepare":
-          return await this.#prepare(request.requestId, request.sql);
+          return await this.#prepare(request.requestId, request.sql, request.transactionId);
         case "statement-execute":
           return await this.#statementExecute(
             request.requestId,
@@ -233,7 +255,11 @@ export class WorkerConnectionHost {
           return this.#close(request.requestId);
       }
     } catch (error: unknown) {
-      if (error instanceof BulkExecutionError && error.connectionUnusable && this.#terminalError === null) {
+      // Set the failure fence before the FIFO advances, not after a client has
+      // observed the rejection. Queued writes must not escape after OR ROLLBACK.
+      if (request.kind !== "transaction") this.#transactions.fail(request.transactionId, error);
+      if ((error instanceof BulkExecutionError || error instanceof ManagedTransactionError) &&
+          error.connectionUnusable && this.#terminalError === null) {
         this.#terminalError = error;
         try {
           this.#disposeDatabase();
@@ -358,10 +384,11 @@ export class WorkerConnectionHost {
     };
   }
 
-  async #prepare(requestId: number, sql: string): Promise<PrepareResponse> {
+  async #prepare(requestId: number, sql: string, transactionId?: string): Promise<PrepareResponse> {
     const stmt = await this.#requireDatabase().prepare(sql);
     const statementId = String(this.#nextStatementId++);
     this.#statements.set(statementId, stmt);
+    if (transactionId !== undefined) this.#statementOwners.set(statementId, transactionId);
     return {
       kind: "prepare-result",
       requestId,
@@ -414,6 +441,7 @@ export class WorkerConnectionHost {
   ): StatementFinalizeResponse {
     const stmt = this.#requireStatement(statementId);
     this.#statements.delete(statementId);
+    this.#statementOwners.delete(statementId);
     stmt.free();
     return {
       kind: "statement-finalize-result",
@@ -474,6 +502,8 @@ export class WorkerConnectionHost {
   #disposeDatabase(): void {
     const statements = [...this.#statements.values()];
     this.#statements.clear();
+    this.#statementOwners.clear();
+    this.#transactions.clear();
     const db = this.#db;
     this.#db = null;
     const snapshotStore = this.#snapshotStore;
@@ -512,6 +542,16 @@ export class WorkerConnectionHost {
       throw new Error("FrankenSQLite worker is not initialized");
     }
     return this.#db;
+  }
+
+  #finalizeTransactionStatements(transactionId: string): void {
+    const errors: unknown[] = [];
+    for (const [statementId, owner] of this.#statementOwners) {
+      if (owner !== transactionId) continue;
+      try { this.#statementFinalize(0, statementId); }
+      catch (error: unknown) { errors.push(error); }
+    }
+    if (errors.length !== 0) throw new AggregateError(errors, "Managed statement cleanup failed");
   }
 
   #requireStatement(statementId: string): CorePreparedStatementHandle {
@@ -594,6 +634,13 @@ export function serializeFrankenError(
     serialized.userRecoverable = false;
     serialized.cleanupErrors = depth < 4
       ? error.cleanupErrors.map((item) => serializeFrankenError(item, depth + 1)) : [];
+  }
+  if (error instanceof ManagedTransactionError) {
+    if (depth < 4 && error.cause !== undefined) serialized.cause = serializeFrankenError(error.cause, depth + 1);
+    if (error.connectionUnusable) serialized.userRecoverable = false;
+    if (error.cleanupErrors.length > 0 && depth < 4) {
+      serialized.cleanupErrors = error.cleanupErrors.map(item => serializeFrankenError(item, depth + 1));
+    }
   }
 
   return serialized;

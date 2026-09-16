@@ -1,5 +1,6 @@
 import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
 import type { InitConfig, SqlScalar, WorkerRequest } from "./protocol";
+import { validateTransactionId } from "./transactions";
 
 export interface RequestLimits {
   /** Active plus queued ordinary requests. Close/cancel use a separate lane. */
@@ -122,8 +123,22 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
   const requestId = input.requestId;
   validateRequestId(requestId);
   const kind = input.kind;
+  const transactionId = input.transactionId;
+  if (transactionId !== undefined) { validateTransactionId(transactionId); text(transactionId); }
   let request: WorkerRequest;
   switch (kind) {
+    case "transaction": {
+      if (transactionId === undefined) invalid("Managed boundaries require a transaction id");
+      const action = input.action, parentId = input.parentId;
+      if (action !== "begin" && action !== "commit" && action !== "rollback") invalid("Invalid transaction action");
+      request = { kind, requestId, transactionId, action };
+      if (parentId !== undefined) {
+        if (action !== "begin") invalid("Only begin accepts a parent transaction id");
+        validateTransactionId(parentId);
+        request.parentId = text(parentId);
+      }
+      break;
+    }
     case "init": {
       const source = input.config;
       const config: InitConfig = {};
@@ -167,6 +182,7 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     default:
       invalid("Unsupported ordinary request kind");
   }
+  if (transactionId !== undefined) request.transactionId = transactionId;
   return { request, bytes };
 }
 
