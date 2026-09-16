@@ -10,6 +10,15 @@ export type SqlScalar =
 
 export type SqlParams = SqlScalar[];
 
+/** A batch is never silently split: all executions share one savepoint. */
+export const MAX_EXECUTE_MANY_ROWS = 10_000;
+
+export interface ExecuteManyResult {
+  executions: number;
+  changes: number;
+  changesPerExecution: number[];
+}
+
 export interface QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> {
   columns: string[];
   columnCount: number;
@@ -47,6 +56,10 @@ export interface SerializedFrankenError {
   userRecoverable?: boolean;
   suggestion?: string;
   stack?: string;
+  /** Zero-based input row that failed; absent for boundary/cleanup failures. */
+  batchIndex?: number;
+  cause?: SerializedFrankenError;
+  cleanupErrors?: SerializedFrankenError[];
 }
 
 interface WorkerRequestBase {
@@ -71,6 +84,18 @@ export interface ExecuteRequest extends WorkerRequestBase {
 export interface ExecuteBatchRequest extends WorkerRequestBase {
   kind: "execute-batch";
   sql: string;
+}
+
+export interface ExecuteManyRequest extends WorkerRequestBase {
+  kind: "execute-many";
+  sql: string;
+  parameterSets: SqlParams[];
+}
+
+export interface StatementExecuteManyRequest extends WorkerRequestBase {
+  kind: "statement-execute-many";
+  statementId: string;
+  parameterSets: SqlParams[];
 }
 
 export interface QueryRequest extends WorkerRequestBase {
@@ -113,9 +138,11 @@ export type WorkerRequest =
   | InitRequest
   | ExecuteRequest
   | ExecuteBatchRequest
+  | ExecuteManyRequest
   | QueryRequest
   | PrepareRequest
   | StatementExecuteRequest
+  | StatementExecuteManyRequest
   | StatementQueryRequest
   | StatementFinalizeRequest
   | ExportRequest
@@ -133,6 +160,11 @@ export interface ExecuteResponse extends WorkerResponseBase {
 
 export interface ExecuteBatchResponse extends WorkerResponseBase {
   kind: "execute-batch-result";
+}
+
+export interface ExecuteManyResponse extends WorkerResponseBase {
+  kind: "execute-many-result";
+  data: ExecuteManyResult;
 }
 
 export interface QueryResponse extends WorkerResponseBase {
@@ -167,6 +199,7 @@ export type WorkerResponse =
   | ReadyResponse
   | ExecuteResponse
   | ExecuteBatchResponse
+  | ExecuteManyResponse
   | QueryResponse
   | PrepareResponse
   | StatementFinalizeResponse

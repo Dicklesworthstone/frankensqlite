@@ -29,6 +29,80 @@ console.log(result.rows);
 await db.close();
 ```
 
+## Transactions and connection ownership
+
+Use the callback's `tx` handle for every operation in a managed transaction:
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.execute("INSERT INTO users(name) VALUES (?)", ["Grace"]);
+  const statement = await tx.prepare("SELECT id FROM users WHERE name = ?");
+  const result = await statement.query(["Grace"]);
+  console.log(result.rows);
+});
+```
+
+Ownership starts before `BEGIN` and lasts until commit or rollback settles.
+Calls through `db`, or statements prepared outside that callback, reject with
+`ERR_FSQLITE_TRANSACTION_OWNERSHIP` during this interval. They are not queued:
+queueing a mistakenly awaited `db.execute()` inside the callback would deadlock.
+Independent database connections are unaffected. Close the database after the
+transaction finishes, not from inside its callback.
+
+Transaction handles and their statements cannot be used after the callback
+finishes (`ERR_FSQLITE_TRANSACTION_CLOSED`). Transaction-owned prepared
+statements are finalized automatically before commit or rollback. Explicit
+`finalize()` is also supported and idempotent once admitted.
+
+Await every operation. The SDK nevertheless drains already-admitted work
+before commit and fails closed if any scoped SQL operation failed, even if its
+rejection was ignored or caught. A callback failure rolls back; simultaneous
+callback/rollback errors are preserved in an `AggregateError` with the original
+error as `cause`. If rollback fails, the worker is disposed because its
+transaction state is no longer trustworthy. Do not issue manual transaction
+control SQL (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, or `RELEASE`) inside a
+managed callback; its transaction boundaries belong to the SDK.
+
+### Nested transactions
+
+Use `tx.transaction()` for a child savepoint. Catch a child's failure after its
+rollback completes to continue the parent without discarding successful siblings:
+
+```ts
+await db.transaction(async (parent) => {
+  await parent.execute("INSERT INTO users(name) VALUES (?)", ["Ada"]);
+  try {
+    await parent.transaction(async (child) => {
+      await child.execute("INSERT INTO users(name) VALUES (?)", ["Temporary"]);
+      throw new Error("Discard this child only");
+    });
+  } catch {
+    // Ada remains in the parent; Temporary was rolled back.
+  }
+  await parent.execute("INSERT INTO users(name) VALUES (?)", ["Grace"]);
+});
+```
+
+Children use unique SDK-generated `SAVEPOINT` names. Success releases the
+savepoint; failure performs `ROLLBACK TO` followed by `RELEASE`. A released
+child is still part of its parent: an outer rollback also undoes released
+children. Nesting can span multiple levels, but only the deepest active child
+may issue operations. Await siblings sequentially, and use the child's handle
+inside its callback, not the parent or a parent's prepared statement.
+
+Always await each child. If a parent callback returns with an active child,
+the SDK drains that child and rolls back the parent with
+`ERR_FSQLITE_TRANSACTION_UNAWAITED`, rather than committing early. A failed
+rollback-to or cleanup release makes the entire connection unusable; the SDK
+does not release an unsuccessfully rolled-back child into its parent.
+
+### Closing
+
+`close()` stops admitting new requests, completes previously admitted worker
+requests, and shares one completion promise across repeated calls. A worker
+crash or disposal rejects pending and future calls rather than leaving promises
+unsettled. Failed initialization also releases the worker's resources.
+
 ## Manual npm Release
 
 For v0.2.0, release preparation and publication are manual. No GitHub Actions
