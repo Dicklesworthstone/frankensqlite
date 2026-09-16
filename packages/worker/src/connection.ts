@@ -1,5 +1,6 @@
 import type {
   ExecuteBatchResponse,
+  ExecuteManyResponse,
   ExecuteResponse,
   ExportResponse,
   InitConfig,
@@ -8,6 +9,7 @@ import type {
   ReadyResponse,
   SerializedFrankenError,
   StatementFinalizeResponse,
+  SqlScalar,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
@@ -18,6 +20,7 @@ import {
   resolvePersistenceMode,
   UnsupportedPersistenceModeError,
 } from "./vfs-init";
+import { BulkExecutionError, executeMany } from "./bulk";
 
 export interface CorePreparedStatementHandle {
   readonly sql: string;
@@ -75,6 +78,8 @@ export class WorkerConnectionHost {
   #nextStatementId = 1;
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
   #requestTail: Promise<void> = Promise.resolve();
+  #nextBulkSavepoint = 1n;
+  #terminalError: BulkExecutionError | null = null;
 
   constructor(loader: CoreModuleLoader = defaultCoreModuleLoader) {
     this.#loader = loader;
@@ -93,6 +98,9 @@ export class WorkerConnectionHost {
 
   async #handle(request: WorkerRequest): Promise<WorkerResponse> {
     try {
+      if (this.#terminalError !== null && request.kind !== "close") {
+        throw this.#terminalError;
+      }
       switch (request.kind) {
         case "init":
           return await this.#initialize(request.requestId, request.config);
@@ -104,6 +112,12 @@ export class WorkerConnectionHost {
           );
         case "execute-batch":
           return await this.#executeBatch(request.requestId, request.sql);
+        case "execute-many":
+          return await this.#executeMany(request.requestId, request.sql, request.parameterSets);
+        case "statement-execute-many": {
+          const statement = this.#requireStatement(request.statementId);
+          return await this.#executeMany(request.requestId, statement.sql, request.parameterSets, statement);
+        }
         case "query":
           return await this.#query(
             request.requestId,
@@ -132,6 +146,14 @@ export class WorkerConnectionHost {
           return this.#close(request.requestId);
       }
     } catch (error: unknown) {
+      if (error instanceof BulkExecutionError && error.connectionUnusable && this.#terminalError === null) {
+        this.#terminalError = error;
+        try {
+          this.#disposeDatabase();
+        } catch (cleanupError: unknown) {
+          error.cleanupErrors.push(cleanupError);
+        }
+      }
       return {
         kind: "error",
         requestId: request.requestId,
@@ -205,6 +227,20 @@ export class WorkerConnectionHost {
       kind: "query-result",
       requestId,
       data,
+    };
+  }
+
+  async #executeMany(
+    requestId: number,
+    sql: string,
+    parameterSets: SqlScalar[][],
+    prepared?: CorePreparedStatementHandle,
+  ): Promise<ExecuteManyResponse> {
+    return {
+      kind: "execute-many-result",
+      requestId,
+      data: await executeMany(this.#requireDatabase(), sql, parameterSets,
+        `fsqlite_bulk_${this.#nextBulkSavepoint++}`, prepared),
     };
   }
 
@@ -336,7 +372,25 @@ export class WorkerConnectionHost {
 
 export function serializeFrankenError(
   error: unknown,
+  depth = 0,
 ): SerializedFrankenError {
+  if (error instanceof BulkExecutionError && depth < 4) {
+    const cause = serializeFrankenError(error.cause, depth + 1);
+    const serialized: SerializedFrankenError = {
+      ...cause,
+      message: `${error.message}: ${cause.message}`,
+      cause,
+      cleanupErrors: error.cleanupErrors.map((item) => serializeFrankenError(item, depth + 1)),
+    };
+    if (error.batchIndex !== undefined) serialized.batchIndex = error.batchIndex;
+    if (error.connectionUnusable) {
+      serialized.code = "ERR_FSQLITE_BULK_CONNECTION_UNUSABLE";
+      serialized.transient = false;
+      serialized.userRecoverable = false;
+      serialized.suggestion = "Reopen the database; do not retry on this connection. Inspect the original failure and rollback errors.";
+    }
+    return serialized;
+  }
   const code =
     error instanceof UnsupportedPersistenceModeError
       ? error.code
