@@ -1020,6 +1020,157 @@ fn gh19_public_readonly_schema_open_requires_valid_shm_without_storage_mutation(
     });
 }
 
+/// Build two real stock WAL generations on a separate seed inode. The target
+/// receives generation B's database/WAL and generation A's complete SHM. In
+/// the contention case stock first owns BEGIN IMMEDIATE on the target, then
+/// deliberately reinstates the stale derived fixture while retaining WRITE.
+#[cfg(all(unix, feature = "native"))]
+fn stale_generation_fixture(path: &Path, writer: bool, header_only: bool) -> PublicReaderProcess {
+    let script = r#"
+import os, pathlib, shutil, sqlite3, sys
+p = pathlib.Path(sys.argv[1])
+seed = str(p) + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40], 'fixture must span distinct WAL salt generations'
+if sys.argv[3] == 'header-only':
+    checkpoint = c.execute('PRAGMA wal_checkpoint(FULL)').fetchone()
+    assert checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
+for suffix in ['', '-wal']:
+    shutil.copyfile(seed + suffix, str(p) + suffix)
+if sys.argv[3] == 'header-only':
+    header = pathlib.Path(seed + '-wal').read_bytes()[:32]
+    assert len(header) == 32
+    pathlib.Path(str(p) + '-wal').write_bytes(header)
+pathlib.Path(str(p) + '-shm').write_bytes(old)
+c.close()
+if sys.argv[2] == 'writer':
+    c = sqlite3.connect(str(p), timeout=0)
+    shm_fd = os.open(str(p) + '-shm', os.O_RDWR)
+    c.execute('BEGIN IMMEDIATE')
+    assert os.pwrite(shm_fd, old, 0) == len(old)
+print('stale-generation-ready', flush=True)
+sys.stdin.readline()
+if sys.argv[2] == 'writer':
+    c.rollback()
+    print('writer-released', flush=True)
+    sys.stdin.readline()
+    c.close()
+    os.close(shm_fd)
+"#;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(path)
+        .arg(if writer { "writer" } else { "idle" })
+        .arg(if header_only { "header-only" } else { "committed-frames" })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Python sqlite3 creates real WAL generations");
+    let stdout = child.stdout.take().unwrap();
+    let (sender, output) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let fixture = PublicReaderProcess {
+        child, output, reader_thread: Some(reader_thread), kind: "stale-generation",
+    };
+    fixture.witness("stale-generation-ready");
+    if writer {
+        // Closing any SHM descriptor in the writer process would drop all of
+        // its POSIX locks. Verify WRITE from an independent process before
+        // using this fixture as a recovery-contention oracle.
+        let probe = r#"
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 120, os.SEEK_SET)
+except BlockingIOError:
+    sys.exit(0)
+sys.exit('stock writer does not own WAL_WRITE_LOCK')
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", probe])
+            .arg(sidecar(path, "-shm"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    fixture
+}
+
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn cass_gh477_explicit_index_recovery_preserves_database_and_wal() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        for (writer, header_only) in [(false, false), (true, false), (false, true), (true, true)] {
+            let path = directory.path().join(format!("generation-{writer}-{header_only}.db"));
+            let mut fixture = stale_generation_fixture(&path, writer, header_only);
+            let fingerprint = |suffix: &str| {
+                let file = sidecar(&path, suffix);
+                (std::fs::read(&file).unwrap(), std::fs::metadata(file).unwrap().modified().unwrap())
+            };
+            let main_before = fingerprint("");
+            let wal_before = fingerprint("-wal");
+            if header_only {
+                assert_eq!(wal_before.0.len(), 32, "valid empty WAL retains its complete header");
+            }
+            let shm_before = fingerprint("-shm");
+            let started = std::time::Instant::now();
+            let strict = Connection::open_schema_only(path.to_str().unwrap()).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "strict refusal must be prompt");
+            assert!(matches!(strict, Err(fsqlite_error::FrankenError::BusyRecovery)));
+            assert_eq!(fingerprint("-shm"), shm_before, "strict readonly refusal is byte neutral");
+            let started = std::time::Instant::now();
+            let result = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await;
+            if writer {
+                assert!(started.elapsed() < std::time::Duration::from_secs(5), "writer refusal must be prompt");
+                match result {
+                    Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery) => {}
+                    Err(error) => panic!("unexpected writer recovery refusal: {error}"),
+                    Ok(connection) => {
+                        connection.close_without_checkpoint().await.unwrap();
+                        panic!("a genuine foreign writer must prevent derived-index recovery");
+                    }
+                }
+                assert_eq!(fingerprint("-shm"), shm_before, "lock refusal cannot modify SHM");
+                assert_eq!(fingerprint(""), main_before);
+                assert_eq!(fingerprint("-wal"), wal_before);
+                fixture.signal("release");
+                fixture.witness("writer-released");
+                let connection = Connection::open_schema_only_with_wal_index_recovery(path.to_str().unwrap()).await
+                    .expect("the same stale fixture recovers after its writer releases WRITE");
+                assert_eq!(scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                connection.close_without_checkpoint().await.unwrap();
+            } else {
+                let connection = result.expect("explicit recovery accepts the current WAL generation");
+                assert_eq!(scalar_i64(&connection.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                assert!(matches!(connection.execute("INSERT INTO t VALUES(99)").await,
+                    Err(fsqlite_error::FrankenError::ReadOnly)));
+                connection.close_without_checkpoint().await.unwrap();
+                assert_ne!(fingerprint("-shm").0, shm_before.0, "derived index was rebuilt");
+                let strict = Connection::open_schema_only(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(scalar_i64(&strict.query("SELECT sum(n) FROM t").await.unwrap()), 30);
+                strict.close_without_checkpoint().await.unwrap();
+            }
+            assert_eq!(fingerprint(""), main_before, "main bytes and mtime preserved");
+            assert_eq!(fingerprint("-wal"), wal_before, "WAL bytes and mtime preserved");
+            fixture.signal("exit");
+            fixture.wait_success();
+        }
+    });
+}
+
 /// Preserve the attachment-lifetime boundary when
 /// the writer closes before the pinned stock reader releases its snapshot.
 /// Keep both close orders in the default regression suite.

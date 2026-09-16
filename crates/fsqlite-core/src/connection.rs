@@ -4647,6 +4647,7 @@ impl PagerBackend {
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
+        recover_wal_index: bool,
     ) -> Result<Self> {
         if path == ":memory:" {
             if expected_identity.is_some() {
@@ -4667,7 +4668,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4683,7 +4688,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4699,7 +4708,11 @@ impl PagerBackend {
                 &db_path,
                 PageSize::DEFAULT,
                 page_buffer_max,
-                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+                if recover_wal_index {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+                } else {
+                    ConnectionPagerOpenMode::ReadOnly(expected_identity)
+                },
             )
             .await?;
             let _ = pager.enable_single_connection_cache_fast_path();
@@ -4707,7 +4720,7 @@ impl PagerBackend {
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
-            let _ = expected_identity;
+            let _ = (expected_identity, recover_wal_index);
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
             ))
@@ -14126,6 +14139,7 @@ impl Drop for MaterializedTablesCleanupGuard<'_> {
 #[derive(Debug, Clone, Copy)]
 enum SchemaOnlyPagerDisposition {
     Ordinary,
+    RecoverWalIndex,
     #[cfg(not(target_arch = "wasm32"))]
     ReservedEmptyRollback(FileIdentity),
 }
@@ -14254,6 +14268,34 @@ impl Connection {
     /// ```
     pub async fn open_schema_only(path: impl Into<String>) -> Result<Self> {
         Self::open_schema_only_with_env(path, ConnectionEnv::default()).await
+    }
+
+    /// Open an existing database read-only, explicitly allowing reconstruction
+    /// of its derived WAL index under the native recovery locks.
+    ///
+    /// Unlike [`Self::open_schema_only`], this may modify the SHM sidecar when
+    /// its publication is missing, invalid, or belongs to an older WAL
+    /// generation. It does not authorize database/WAL writes, checkpoints,
+    /// rollback-journal recovery, or SQL writes. A live conflicting owner
+    /// causes a retryable error rather than forced recovery.
+    pub async fn open_schema_only_with_wal_index_recovery(path: impl Into<String>) -> Result<Self> {
+        Self::open_schema_only_with_wal_index_recovery_and_env(path, ConnectionEnv::default()).await
+    }
+
+    /// Explicit derived WAL-index recovery with a caller-selected runtime.
+    pub async fn open_schema_only_with_wal_index_recovery_and_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+            path,
+            None,
+            env,
+            false,
+            false,
+            SchemaOnlyPagerDisposition::RecoverWalIndex,
+        )
+        .await
     }
 
     /// Open an existing file-backed database for reading and writing while
@@ -14434,6 +14476,8 @@ impl Connection {
         let path = path.into();
         if path.is_empty()
             || (writable && path == ":memory:")
+            || (matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex)
+                && path == ":memory:")
             || (expected_identity.is_some() && path == ":memory:")
         {
             return Err(FrankenError::CannotOpen {
@@ -14456,7 +14500,7 @@ impl Connection {
                 })
                 .await?
             }
-            SchemaOnlyPagerDisposition::Ordinary => {
+            SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex => {
                 retry_busy_connection_bootstrap(|| {
                     PagerBackend::open_readonly_with_page_buffer_max(
                         &path,
@@ -14464,6 +14508,7 @@ impl Connection {
                         expected_identity,
                         env.page_buffer_max(),
                         env.memory_vfs_config(),
+                        matches!(disposition, SchemaOnlyPagerDisposition::RecoverWalIndex),
                     )
                 })
                 .await?
@@ -62067,9 +62112,13 @@ impl Connection {
                                     "canonical autoindex layout lost a validated column",
                                 ));
                             };
-                            mem_table.add_unique_column_group_with_collations(
+                            mem_table.add_unique_column_group_labeled(
                                 col_indices,
                                 slot.definition.key_collations.clone(),
+                                qualified_unique_constraint_label(
+                                    &table_name,
+                                    slot.definition.columns.iter().map(String::as_str),
+                                ),
                             );
                         }
                     }
@@ -66083,7 +66132,14 @@ impl Connection {
                     name: table_name.clone(),
                 })?;
             if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
-                table.add_unique_column_group_with_collations(columns, key_collations.clone());
+                table.add_unique_column_group_labeled(
+                    columns,
+                    key_collations.clone(),
+                    qualified_unique_constraint_label(
+                        table_name,
+                        col_names.iter().map(String::as_str),
+                    ),
+                );
             }
         }
 
@@ -78958,9 +79014,13 @@ impl Connection {
                         continue;
                     };
                     if !columns.is_empty() {
-                        mem_table.add_unique_column_group_with_collations(
+                        mem_table.add_unique_column_group_labeled(
                             columns,
                             index.key_collations.clone(),
+                            qualified_unique_constraint_label(
+                                &temp_schema.name,
+                                index.columns.iter().map(String::as_str),
+                            ),
                         );
                     }
                 }
@@ -96268,9 +96328,13 @@ impl Connection {
                                 });
                             };
                             if !column_indices.is_empty() {
-                                mem_table.add_unique_column_group_with_collations(
+                                mem_table.add_unique_column_group_labeled(
                                     column_indices,
                                     slot.key_collations().to_vec(),
+                                    qualified_unique_constraint_label(
+                                        name.as_str(),
+                                        slot.columns().iter().map(String::as_str),
+                                    ),
                                 );
                             }
                         }
@@ -147792,6 +147856,29 @@ fn for_each_column_ref_in_expr(expr: &Expr, visit: &mut impl FnMut(&ColumnRef)) 
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => {}
     }
+}
+
+/// bd-towj6: the qualified label stock SQLite reports for a UNIQUE violation —
+/// `t.a` for one column, `t.a, t.b` for a composite constraint.
+///
+/// `MemTable` stores column positions and knows no names, so this is built
+/// where the constraint is registered and carried on the constraint itself.
+/// Returns `None` for an empty column list, which leaves the engine's previous
+/// wording in place rather than reporting an empty label.
+pub(crate) fn qualified_unique_constraint_label<'a>(
+    table_name: &str,
+    column_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut label = String::new();
+    for name in column_names {
+        if !label.is_empty() {
+            label.push_str(", ");
+        }
+        label.push_str(table_name);
+        label.push('.');
+        label.push_str(name);
+    }
+    (!label.is_empty()).then_some(label)
 }
 
 fn find_column_index_case_insensitive(column_names: &[String], target: &str) -> Option<usize> {

@@ -52,7 +52,7 @@ use crate::connection::{
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-use crate::connection::{eval_join_expr, is_sqlite_truthy};
+use crate::connection::{eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label};
 use fsqlite_types::{
     DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
 };
@@ -1995,9 +1995,13 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     });
                 };
                 if !column_indices.is_empty() {
-                    mem_table.add_unique_column_group_with_collations(
+                    mem_table.add_unique_column_group_labeled(
                         column_indices,
                         slot.key_collations().to_vec(),
+                        qualified_unique_constraint_label(
+                            &table_name_for_err,
+                            slot.columns().iter().map(String::as_str),
+                        ),
                     );
                 }
             }

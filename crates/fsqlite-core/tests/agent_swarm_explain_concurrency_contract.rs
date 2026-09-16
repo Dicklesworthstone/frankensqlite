@@ -1,3 +1,12 @@
+// bd-ltoge: this target overflows the trait solver's default query depth, which
+// aborts `cargo clippy -p fsqlite-core --all-targets` before it reaches any
+// other target in the crate — so the failure was masking every remaining lint,
+// not just this file's. The depth comes from the deeply nested async blocks and
+// closures this integration test is built from, which is inherent to the test
+// style rather than a production smell, so raise the limit as rustc suggests
+// rather than restructuring the tests.
+#![recursion_limit = "256"]
+
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 

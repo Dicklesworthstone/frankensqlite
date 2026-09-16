@@ -579,6 +579,14 @@ struct UniqueConstraintState {
     columns: Vec<usize>,
     collations: Vec<Option<String>>,
     index: Option<BTreeMap<Vec<u8>, BTreeSet<i64>>>,
+    /// bd-towj6: qualified `t.a` / `t.a, t.b` label for this constraint, so a
+    /// violation can name the columns that actually conflicted.
+    ///
+    /// `MemTable` knows only `num_columns` — no table or column names — so the
+    /// label has to be supplied where the constraint is registered, by the
+    /// caller that does have the schema. `None` keeps the previous behaviour
+    /// (the caller falls back to whatever it reported before).
+    label: Option<String>,
 }
 
 fn unique_constraint_collation_is_indexable(collation: Option<&str>) -> bool {
@@ -663,7 +671,11 @@ fn append_unique_constraint_key_component(
 }
 
 impl UniqueConstraintState {
-    fn new(columns: Vec<usize>, mut collations: Vec<Option<String>>) -> Self {
+    fn new(
+        columns: Vec<usize>,
+        mut collations: Vec<Option<String>>,
+        label: Option<String>,
+    ) -> Self {
         if collations.len() < columns.len() {
             collations.resize(columns.len(), None);
         } else if collations.len() > columns.len() {
@@ -674,6 +686,7 @@ impl UniqueConstraintState {
             columns,
             collations,
             index,
+            label,
         }
     }
 }
@@ -725,7 +738,21 @@ impl MemTable {
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
     ) {
-        let mut constraint = UniqueConstraintState::new(cols, collations);
+        self.add_unique_column_group_labeled(cols, collations, None);
+    }
+
+    /// As [`Self::add_unique_column_group_with_collations`], plus the qualified
+    /// `t.a` / `t.a, t.b` label a violation of this constraint should report
+    /// (bd-towj6). Callers that know the table and column names should use this
+    /// form; without a label the violation falls back to naming the IPK column,
+    /// which is wrong for any constraint that is not the rowid alias.
+    pub fn add_unique_column_group_labeled(
+        &mut self,
+        cols: Vec<usize>,
+        collations: Vec<Option<String>>,
+        label: Option<String>,
+    ) {
+        let mut constraint = UniqueConstraintState::new(cols, collations, label);
         if let Some(index) = constraint.index.as_mut() {
             for row in &self.rows {
                 if let Some(key) = Self::unique_key_for_constraint(
@@ -750,7 +777,9 @@ impl MemTable {
         cols: &[usize],
         collations: &[Option<String>],
     ) -> bool {
-        let normalized = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        // Normalization only (columns + collations); the label plays no part
+        // in identifying which installed constraint this retires.
+        let normalized = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
         let Some(position) = self.unique_constraints.iter().rposition(|constraint| {
             constraint.columns == normalized.columns
                 && constraint.collations.len() == normalized.collations.len()
@@ -780,7 +809,8 @@ impl MemTable {
         cols: &[usize],
         collations: &[Option<String>],
     ) -> bool {
-        let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        // Normalization only; validity does not depend on the label.
+        let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
         if constraint.index.is_some() {
             let mut seen = HashSet::new();
             for row in &self.rows {
@@ -852,6 +882,48 @@ impl MemTable {
             }
         }
         conflicts.into_iter().collect()
+    }
+
+    /// bd-towj6: the label of the first UNIQUE constraint `new_values` violates.
+    ///
+    /// Error path only — callers use [`Self::find_unique_conflicts`] to decide
+    /// *whether* there is a conflict, and reach for this only once they are
+    /// already reporting a violation, so the second pass costs nothing on the
+    /// success path. Returns `None` when the conflicting constraint was
+    /// registered without a label, leaving the caller's previous wording in
+    /// place.
+    #[must_use]
+    pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<&str> {
+        let mut collations = None;
+        for constraint in &self.unique_constraints {
+            let violated = if let Some(index) = &constraint.index {
+                Self::unique_key_for_constraint(
+                    new_values,
+                    &constraint.columns,
+                    &constraint.collations,
+                )
+                .is_some_and(|key| index.contains_key(&key))
+            } else {
+                let registry = collations.get_or_insert_with(|| {
+                    self.collation_registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                });
+                self.rows.iter().any(|row| {
+                    Self::unique_constraint_matches_row(
+                        &row.values,
+                        new_values,
+                        &constraint.columns,
+                        &constraint.collations,
+                        registry,
+                    )
+                })
+            };
+            if violated {
+                return constraint.label.as_deref();
+            }
+        }
+        None
     }
 
     /// Allocate a new unique rowid.
@@ -11239,13 +11311,44 @@ impl VdbeEngine {
                                             // bd-977wx: name the IPK column so a
                                             // rowid/IPK collision reads as
                                             // `UNIQUE constraint failed: t.k`.
-                                            let message =
-                                                self.ipk_label_by_root_page.get(&root).map_or_else(
-                                                    || "PRIMARY KEY constraint failed".to_owned(),
-                                                    |label| {
-                                                        format!("UNIQUE constraint failed: {label}")
-                                                    },
-                                                );
+                                            //
+                                            // bd-towj6: but only when the rowid
+                                            // is what actually collided. The two
+                                            // conflict sources are OR-ed into
+                                            // `has_conflict`, so a secondary
+                                            // UNIQUE constraint used to be
+                                            // reported against the IPK column
+                                            // too. Prefer that constraint's own
+                                            // label when it is the one violated.
+                                            let unique_label = (!rowid_conflict)
+                                                .then(|| {
+                                                    self.db.as_ref().and_then(|db| {
+                                                        db.get_table(root).and_then(|table| {
+                                                            table
+                                                                .find_unique_conflict_label(&values)
+                                                                .map(str::to_owned)
+                                                        })
+                                                    })
+                                                })
+                                                .flatten();
+                                            let message = unique_label.map_or_else(
+                                                || {
+                                                    self.ipk_label_by_root_page
+                                                        .get(&root)
+                                                        .map_or_else(
+                                                            || {
+                                                                "PRIMARY KEY constraint failed"
+                                                                    .to_owned()
+                                                            },
+                                                            |label| {
+                                                                format!(
+                                                                    "UNIQUE constraint failed: {label}"
+                                                                )
+                                                            },
+                                                        )
+                                                },
+                                                |label| format!("UNIQUE constraint failed: {label}"),
+                                            );
                                             return Ok(Some(ExecOutcome::Error {
                                                 code: ErrorCode::Constraint as i32,
                                                 message,
@@ -14681,9 +14784,20 @@ impl VdbeEngine {
                         .map(|table| table.find_unique_conflicts(&values))
                         .unwrap_or_default();
                     if !unique_conflicts.is_empty() {
-                        return Err(FrankenError::UniqueViolation {
-                            columns: "TEMP table unique constraint".to_owned(),
-                        });
+                        // bd-towj6: report the constraint that actually
+                        // conflicted rather than a placeholder. The other TEMP
+                        // insert path names the IPK column here, so without this
+                        // the two paths report differently for the same defect.
+                        let columns = self
+                            .db
+                            .as_ref()
+                            .and_then(|db| db.get_table(root_page))
+                            .and_then(|table| table.find_unique_conflict_label(&values))
+                            .map_or_else(
+                                || "TEMP table unique constraint".to_owned(),
+                                str::to_owned,
+                            );
+                        return Err(FrankenError::UniqueViolation { columns });
                     }
                     let db = self.db.as_mut().ok_or_else(|| {
                         FrankenError::internal(
