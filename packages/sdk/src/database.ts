@@ -10,6 +10,7 @@ import { resolveRequestLimits } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 
 interface TransactionScope {
+  readonly id: string;
   accepting: boolean;
   pending: Set<Promise<unknown>>;
   statements: Set<string>;
@@ -24,7 +25,7 @@ export class FrankenDB {
   #snapshotRevision: string | null;
   #transactionScope: TransactionScope | null = null;
   #transactionFailure: Error | null = null;
-  #nextSavepointId = 1n;
+  #nextTransactionId = 1n;
 
   private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null) {
     this.#client = client;
@@ -132,7 +133,11 @@ export class FrankenDB {
       // awaits its prepare, chunks, source cleanup and finalize itself, so SQL
       // errors retain their global stream index instead of being double-wrapped
       // by per-operation callback bookkeeping.
-      const consume = () => executeRowStream(this.#client, sql, rows, config);
+      const consume = (_tx: FrankenTransaction, scope: TransactionScope) => executeRowStream({
+        prepare: (statementSql) => this.#client.prepare(statementSql, scope.id),
+        executePreparedMany: (id, values, settings) => this.#client.executePreparedMany(id, values, settings, scope.id),
+        finalizePrepared: (id) => this.#client.finalizePrepared(id, scope.id),
+      }, sql, rows, config);
       const beforeCommit = () => checkStreamCancellation(config);
       return parent === null
         ? this.#transaction(null, consume, beforeCommit)
@@ -159,7 +164,7 @@ export class FrankenDB {
     sql: string,
     scope: TransactionScope | null,
   ): Promise<FrankenPreparedStatement<Row>> {
-    const metadata = await this.#client.prepare(sql);
+    const metadata = await this.#client.prepare(sql, scope?.id);
     scope?.statements.add(metadata.statementId);
     return new FrankenPreparedStatement<Row>(
       this.#client,
@@ -169,6 +174,7 @@ export class FrankenDB {
       metadata.columnNames,
       (operation) => this.#run(scope, operation),
       () => { scope?.statements.delete(metadata.statementId); },
+      scope?.id,
     );
   }
 
@@ -188,45 +194,39 @@ export class FrankenDB {
   transaction<T>(
     work: (tx: FrankenTransaction) => T | Promise<T>,
   ): Promise<T> {
-    return this.#transaction(null, work);
+    // Never expose the internal scope/capability as a second callback argument.
+    return this.#transaction(null, tx => work(tx));
   }
 
   async #transaction<T>(
     parent: TransactionScope | null,
-    work: (tx: FrankenTransaction) => T | Promise<T>,
+    work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
     beforeCommit?: () => void,
   ): Promise<T> {
     this.#assertOwner(parent);
     const scope: TransactionScope = {
+      id: String(this.#nextTransactionId++),
       accepting: true, pending: new Set(), statements: new Set(), errors: [],
       children: new Set(),
     };
-    const savepoint = parent === null ? null : `fsqlite_sdk_${this.#nextSavepointId++}`;
     // Claim before the first await so foreign operations cannot enter between
     // BEGIN and the callback, or while the callback awaits application work.
     this.#transactionScope = scope;
     let began = false;
     try {
-      await this.#client.executeBatch(savepoint === null ? "BEGIN" : `SAVEPOINT ${savepoint}`);
+      await this.#client.transaction("begin", scope.id, parent?.id);
       began = true;
       const result = await this.#finishScope(scope, work);
       // Last synchronous cancellation boundary, after all source/handle cleanup.
       // Once COMMIT/RELEASE dispatch starts, its actual outcome is authoritative.
       beforeCommit?.();
-      await this.#client.executeBatch(savepoint === null ? "COMMIT" : `RELEASE SAVEPOINT ${savepoint}`);
+      await this.#client.transaction("commit", scope.id);
       return result;
     } catch (error: unknown) {
       // A failed BEGIN does not authorize rolling back an existing transaction.
       if (began && this.#transactionFailure === null) {
         try {
-          if (savepoint === null) {
-            await this.#client.executeBatch("ROLLBACK");
-          } else {
-            // ROLLBACK TO keeps the savepoint on the stack. RELEASE it only
-            // after rollback succeeds, never after a failed rollback-to.
-            await this.#client.executeBatch(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-            await this.#client.executeBatch(`RELEASE SAVEPOINT ${savepoint}`);
-          }
+          await this.#client.transaction("rollback", scope.id);
         } catch (rollbackError: unknown) {
           const failure = new AggregateError([error, rollbackError],
             "FrankenSQLite transaction and rollback both failed", { cause: error });
@@ -253,7 +253,7 @@ export class FrankenDB {
 
   #nestedTransaction<T>(
     parent: TransactionScope,
-    work: (tx: FrankenTransaction) => T | Promise<T>,
+    work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
     beforeCommit?: () => void,
   ): Promise<T> {
     try {
@@ -314,21 +314,22 @@ export class FrankenDB {
 
   async #finishScope<T>(
     scope: TransactionScope,
-    work: (tx: FrankenTransaction) => T | Promise<T>,
+    work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
   ): Promise<T> {
     const tx = new FrankenTransaction({
-      execute: (sql, params) => this.#run(scope, () => this.#client.execute(sql, params)),
-      executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets, options)),
+      execute: (sql, params) => this.#run(scope, () => this.#client.execute(sql, params, scope.id)),
+      executeBatch: (sql) => this.#run(scope, () => this.#client.executeBatch(sql, scope.id)),
+      executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets, options, scope.id)),
       executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
       query: <Row extends Record<string, unknown>>(sql: string, params: readonly SqlScalar[] = []) =>
-        this.#run(scope, () => this.#client.query<Row>(sql, params)),
+        this.#run(scope, () => this.#client.query<Row>(sql, params, scope.id)),
       prepare: <Row extends Record<string, unknown>>(sql: string) =>
         this.#run(scope, () => this.#prepare<Row>(sql, scope)),
-    }, (nestedWork) => this.#nestedTransaction(scope, nestedWork));
+    }, (nestedWork) => this.#nestedTransaction(scope, tx => nestedWork(tx)));
     let result!: T;
     let callbackErrors: unknown[] = [];
     try {
-      result = await work(tx);
+      result = await work(tx, scope);
     } catch (error: unknown) {
       callbackErrors = [error];
     } finally {
@@ -346,7 +347,7 @@ export class FrankenDB {
     }
     for (const statementId of scope.statements) {
       try {
-        await this.#client.finalizePrepared(statementId);
+        await this.#client.finalizePrepared(statementId, scope.id);
       } catch (error: unknown) {
         scope.errors.push(error);
       }

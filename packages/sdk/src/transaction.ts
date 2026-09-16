@@ -5,7 +5,7 @@ import { FrankenPreparedStatement } from "./statement";
 
 type TransactionCapableDb = Pick<
   FrankenDB,
-  "execute" | "executeMany" | "executeStream" | "query" | "prepare"
+  "execute" | "executeBatch" | "executeMany" | "executeStream" | "query" | "prepare"
 >;
 
 type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>) => Promise<T>;
@@ -21,6 +21,11 @@ export class FrankenTransaction {
 
   execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     return this.#db.execute(sql, params);
+  }
+
+  /** Run a script in this scope; the worker rejects manual transaction boundaries. */
+  executeBatch(sql: string): Promise<void> {
+    return this.#db.executeBatch(sql);
   }
 
   executeMany(

@@ -106,21 +106,32 @@ export class FrankenWorkerClient {
     return ensureKind(response, "ready").data;
   }
 
-  async execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
+  /** Boundaries are worker operations, never SQL supplied through a public handle. */
+  async transaction(action: "begin" | "commit" | "rollback", transactionId: string, parentId?: string): Promise<void> {
+    const response = await this.#send({
+      kind: "transaction", requestId: this.#nextId(), transactionId, action,
+      ...(parentId === undefined ? {} : { parentId }),
+    });
+    ensureKind(response, "transaction-result");
+  }
+
+  async execute(sql: string, params: readonly SqlScalar[] = [], transactionId?: string): Promise<number> {
     const response = await this.#send({
       kind: "execute",
       requestId: this.#nextId(),
       sql,
       params,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     return ensureKind(response, "execute-result").changes;
   }
 
-  async executeBatch(sql: string): Promise<void> {
+  async executeBatch(sql: string, transactionId?: string): Promise<void> {
     const response = await this.#send({
       kind: "execute-batch",
       requestId: this.#nextId(),
       sql,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     ensureKind(response, "execute-batch-result");
   }
@@ -129,12 +140,14 @@ export class FrankenWorkerClient {
     sql: string,
     parameterSets: readonly (readonly SqlScalar[])[],
     options: ExecuteManyOptions = {},
+    transactionId?: string,
   ): Promise<ExecuteManyResult> {
     const response = await this.#sendBulk({
       kind: "execute-many",
       requestId: this.#nextId(),
       sql,
       parameterSets,
+      ...(transactionId === undefined ? {} : { transactionId }),
     }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
@@ -143,12 +156,14 @@ export class FrankenWorkerClient {
     statementId: string,
     parameterSets: readonly (readonly SqlScalar[])[],
     options: ExecuteManyOptions = {},
+    transactionId?: string,
   ): Promise<ExecuteManyResult> {
     const response = await this.#sendBulk({
       kind: "statement-execute-many",
       requestId: this.#nextId(),
       statementId,
       parameterSets,
+      ...(transactionId === undefined ? {} : { transactionId }),
     }, options.signal);
     return ensureKind(response, "execute-many-result").data;
   }
@@ -156,21 +171,24 @@ export class FrankenWorkerClient {
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
     params: readonly SqlScalar[] = [],
+    transactionId?: string,
   ): Promise<QueryResult<Row>> {
     const response = await this.#send({
       kind: "query",
       requestId: this.#nextId(),
       sql,
       params,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
 
-  async prepare(sql: string) {
+  async prepare(sql: string, transactionId?: string) {
     const response = await this.#send({
       kind: "prepare",
       requestId: this.#nextId(),
       sql,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     return ensureKind(response, "prepare-result").data;
   }
@@ -178,12 +196,14 @@ export class FrankenWorkerClient {
   async executePrepared(
     statementId: string,
     params: readonly SqlScalar[] = [],
+    transactionId?: string,
   ): Promise<number> {
     const response = await this.#send({
       kind: "statement-execute",
       requestId: this.#nextId(),
       statementId,
       params,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     return ensureKind(response, "execute-result").changes;
   }
@@ -191,21 +211,24 @@ export class FrankenWorkerClient {
   async queryPrepared<Row extends Record<string, unknown> = Record<string, unknown>>(
     statementId: string,
     params: readonly SqlScalar[] = [],
+    transactionId?: string,
   ): Promise<QueryResult<Row>> {
     const response = await this.#send({
       kind: "statement-query",
       requestId: this.#nextId(),
       statementId,
       params,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
 
-  async finalizePrepared(statementId: string): Promise<void> {
+  async finalizePrepared(statementId: string, transactionId?: string): Promise<void> {
     const response = await this.#send({
       kind: "statement-finalize",
       requestId: this.#nextId(),
       statementId,
+      ...(transactionId === undefined ? {} : { transactionId }),
     });
     ensureKind(response, "statement-finalize-result");
   }
