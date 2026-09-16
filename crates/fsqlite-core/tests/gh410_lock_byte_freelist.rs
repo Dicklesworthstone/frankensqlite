@@ -81,8 +81,17 @@ fn build_sparse_archive(path: &Path, free: &[u32], journal_version: u8) {
         conn.execute_batch("CREATE TABLE seed(x); VACUUM;")
             .expect("seed");
     }
+    extend_sparse_archive(path, free, journal_version);
+}
+
+/// Preserve an existing two-page seed while installing the synthetic chain.
+fn extend_sparse_archive(path: &Path, free: &[u32], journal_version: u8) {
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 2 * PAGE_SIZE);
     assert_eq!(
-        free.iter().copied().collect::<std::collections::HashSet<_>>().len(),
+        free.iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
         free.len(),
         "the fixture freelist must contain unique pages"
     );
@@ -102,7 +111,11 @@ fn build_sparse_archive(path: &Path, free: &[u32], journal_version: u8) {
 
     let mut header = [0_u8; 100];
     file.read_exact(&mut header).expect("read header");
-    assert_eq!(&header[..16], b"SQLite format 3\0", "fixture is a SQLite file");
+    assert_eq!(
+        &header[..16],
+        b"SQLite format 3\0",
+        "fixture is a SQLite file"
+    );
     // A checkpointed WAL database can have no WAL sidecar. Persist the mode
     // before the first FrankenSQLite open so its migration repair uses WAL.
     header[18] = journal_version;
@@ -162,7 +175,10 @@ fn durable_freelist(path: &Path) -> Vec<u32> {
         pages.push(trunk);
         let next = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let leaves = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        assert!(leaves <= MAX_LEAF_ENTRIES, "trunk {trunk} leaf count {leaves}");
+        assert!(
+            leaves <= MAX_LEAF_ENTRIES,
+            "trunk {trunk} leaf count {leaves}"
+        );
         for i in 0..leaves {
             let base = 8 + i * 4;
             pages.push(u32::from_be_bytes([
@@ -267,7 +283,9 @@ fn gh462_wal_open_repairs_reserved_freelist_trunks_and_leaves() {
             );
             conn.execute("BEGIN IMMEDIATE;").await.unwrap();
             conn.execute("COMMIT;").await.unwrap();
-            conn.execute("INSERT INTO seed VALUES (462);").await.unwrap();
+            conn.execute("INSERT INTO seed VALUES (462);")
+                .await
+                .unwrap();
             assert_eq!(
                 texts(&conn.query("PRAGMA integrity_check;").await.unwrap()),
                 vec!["ok".to_owned()]
@@ -279,7 +297,10 @@ fn gh462_wal_open_repairs_reserved_freelist_trunks_and_leaves() {
             let expected: Vec<u32> = (3..=PAGE_COUNT)
                 .filter(|page| *page != LOCK_BYTE_PAGE)
                 .collect();
-            assert_eq!(durable, expected, "repair must preserve every legal free page");
+            assert_eq!(
+                durable, expected,
+                "repair must preserve every legal free page"
+            );
 
             let reopened = Connection::open(&db_str).await.unwrap();
             assert_eq!(
@@ -287,10 +308,145 @@ fn gh462_wal_open_repairs_reserved_freelist_trunks_and_leaves() {
                 462
             );
             assert_eq!(
-                scalar_i64(&reopened.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+                scalar_i64(
+                    &reopened
+                        .query("PRAGMA fsqlite.repair_freelist;")
+                        .await
+                        .unwrap()
+                ),
                 0
             );
             reopened.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn gh462_schema_only_readers_leave_repair_for_a_real_writer() {
+    fn durable_digest(path: &Path) -> Vec<Option<(u64, blake3::Hash)>> {
+        ["", "-wal", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let mut name = path.as_os_str().to_owned();
+                name.push(suffix);
+                let mut file = match std::fs::File::open(Path::new(&name)) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                    Err(error) => panic!("open durable fixture: {error}"),
+                };
+                let size = file.metadata().unwrap().len();
+                let mut hasher = blake3::Hasher::new();
+                let mut buffer = vec![0_u8; 65536];
+                loop {
+                    let count = file.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                Some((size, hasher.finalize()))
+            })
+            .collect()
+    }
+
+    asupersync::test_utils::run_test(|| async {
+        for reserved_is_leaf in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("gh462_schema_only.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+            let seed = Connection::open(&db_str).await.unwrap();
+            seed.execute("PRAGMA journal_mode=DELETE;").await.unwrap();
+            seed.execute("CREATE TABLE seed(x);").await.unwrap();
+            seed.execute("INSERT INTO seed VALUES (462), (463);")
+                .await
+                .unwrap();
+            seed.close().await.unwrap();
+            let mut free: Vec<u32> = (3..=PAGE_COUNT).rev().collect();
+            if reserved_is_leaf {
+                let last = free.len() - 1;
+                free.swap(1, last);
+            }
+            extend_sparse_archive(&db_path, &free, 2);
+            let before_open = durable_digest(&db_path);
+            let damaged_free = durable_freelist(&db_path);
+            assert!(damaged_free.contains(&LOCK_BYTE_PAGE));
+
+            let conn = Connection::open_existing_schema_only(&db_str)
+                .await
+                .unwrap();
+            // Writable schema-only open may initialize the WAL header, but
+            // must preserve the main database and leave its repair pending.
+            let before = durable_digest(&db_path);
+            assert_eq!(
+                before[0], before_open[0],
+                "open must preserve the main file"
+            );
+            assert_eq!(durable_freelist(&db_path), damaged_free);
+            let rows_before = conn.query("SELECT x FROM seed ORDER BY x;").await.unwrap();
+            assert_eq!(rows_before.len(), 2);
+            assert_eq!(rows_before[0].values(), &[SqliteValue::Integer(462)]);
+            assert_eq!(rows_before[1].values(), &[SqliteValue::Integer(463)]);
+            conn.execute("CREATE TABLE IF NOT EXISTS seed(x);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            let initial_seq = conn.current_concurrent_snapshot_seq().unwrap();
+            assert_eq!(
+                scalar_i64(&conn.query("SELECT COUNT(*) FROM seed;").await.unwrap()),
+                2
+            );
+            conn.execute("COMMIT;").await.unwrap();
+            assert_eq!(
+                durable_digest(&db_path),
+                before,
+                "read/no-op paths must not publish a repair"
+            );
+            assert_eq!(
+                durable_freelist(&db_path),
+                damaged_free,
+                "repair must remain pending"
+            );
+
+            // This eager writer really publishes the pending metadata, even
+            // though the SQL transaction contains no row mutation.
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            let repaired_seq = conn
+                .last_local_commit_seq()
+                .expect("repair commit sequence");
+            assert!(
+                repaired_seq > initial_seq,
+                "repair must advance durable publication"
+            );
+            assert!(std::fs::metadata(format!("{db_str}-wal")).unwrap().len() > 32);
+            assert_eq!(
+                scalar_i64(&conn.query("PRAGMA fsqlite.repair_freelist;").await.unwrap()),
+                0,
+                "the eager writer must consume the pending repair"
+            );
+            let rows_after = conn.query("SELECT x FROM seed ORDER BY x;").await.unwrap();
+            assert_eq!(
+                rows_after.iter().map(Row::values).collect::<Vec<_>>(),
+                rows_before.iter().map(Row::values).collect::<Vec<_>>()
+            );
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            assert!(conn.current_concurrent_snapshot_seq().unwrap() >= repaired_seq);
+            conn.execute("COMMIT;").await.unwrap();
+            assert_eq!(
+                texts(&conn.query("PRAGMA integrity_check;").await.unwrap()),
+                vec!["ok".to_owned()]
+            );
+            conn.close().await.unwrap();
+            let mut actual = durable_freelist(&db_path);
+            actual.sort_unstable();
+            let expected: Vec<_> = (3..=PAGE_COUNT)
+                .filter(|page| *page != LOCK_BYTE_PAGE)
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                std::fs::metadata(&db_path).unwrap().len(),
+                u64::from(PAGE_COUNT) * PAGE_SIZE
+            );
         }
     });
 }
@@ -306,7 +462,10 @@ fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
         // way — before the fix, `repair_orphaned_pages` enumerated the
         // reserved page as an orphan (it is owned by nobody by design) and
         // freed it, which is how page 262145 reached the archive's freelist.
-        let free: Vec<u32> = (3..=PAGE_COUNT).rev().filter(|p| *p != LOCK_BYTE_PAGE).collect();
+        let free: Vec<u32> = (3..=PAGE_COUNT)
+            .rev()
+            .filter(|p| *p != LOCK_BYTE_PAGE)
+            .collect();
         build_sparse_archive(&db_path, &free, 1);
         assert!(!durable_freelist(&db_path).contains(&LOCK_BYTE_PAGE));
         let db_str = db_path.to_string_lossy().into_owned();
@@ -323,7 +482,9 @@ fn gh410_orphan_repair_and_write_churn_never_free_the_reserved_page() {
         }
         // Free a run of pages and take them again, so the free/allocate round
         // trip runs against a freelist that spans the reserved page.
-        conn.execute("DELETE FROM t WHERE k % 2 = 0;").await.unwrap();
+        conn.execute("DELETE FROM t WHERE k % 2 = 0;")
+            .await
+            .unwrap();
         for k in 100..140_i64 {
             conn.execute(&format!("INSERT INTO t(k, v) VALUES ({k}, '{payload}');"))
                 .await

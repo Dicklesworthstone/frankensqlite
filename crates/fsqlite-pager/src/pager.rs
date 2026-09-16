@@ -21556,10 +21556,7 @@ where
     #[must_use]
     fn page_one_in_pending_commit_surface_with_inner(&self, inner: &PagerInner<V::File>) -> bool {
         let committed_db_size = self.committed_db_size_with_inner(inner);
-        let durable_freelist =
-            self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size);
-        let freelist_dirty =
-            self.committed_durable_freelist_pages_with_inner(inner) != durable_freelist;
+        let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
         let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
 
         if self.journal_mode == JournalMode::Wal {
@@ -21574,8 +21571,7 @@ where
         let committed_db_size = self.committed_db_size_with_inner(inner);
         let durable_freelist =
             self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size);
-        let freelist_dirty =
-            self.committed_durable_freelist_pages_with_inner(inner) != durable_freelist;
+        let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
 
         if freelist_dirty && !durable_freelist.is_empty() {
             let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
@@ -27411,7 +27407,10 @@ where
             || self.rollback_commit_finalization_pending
             || !self.write_set.is_empty()
             || !self.reclaimed_abandoned_reservations.is_empty()
-            || self.freelist_metadata_dirty()
+            // A global repair belongs to the next actual writer. Read-only
+            // and lazy concurrent transactions do not publish it on commit;
+            // advertising it here would finalize an unadvanced pager sequence.
+            || (self.is_writer && self.freelist_metadata_dirty())
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
@@ -27448,6 +27447,14 @@ where
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
         if self.has_pending_recovery_barrier() {
             return vec![PageNumber::ONE];
+        }
+        // Repair can rewrite an entire trunk chain even with no local writes
+        // or frees. Include the full synthesized surface, not only page 1.
+        if self.is_writer
+            && let Ok(inner) = self.inner.lock()
+            && inner.freelist_repair_pending
+        {
+            return self.predicted_conflict_pages_with_inner(&inner);
         }
         let mut pages = Vec::with_capacity(
             self.write_pages_sorted
@@ -46329,6 +46336,80 @@ mod tests {
                 2,
                 "bead_id=bd-3wop3.1.2 case=disjoint_writers_commit_all_frames"
             );
+        });
+    }
+
+    #[test]
+    fn test_gh462_repair_pending_is_writer_owned_and_tracks_all_trunks() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = SimplePager::open(
+                MemoryVfs::new(),
+                Path::new("/gh462_repair_pending.db"),
+                PageSize::MIN,
+            )
+            .await
+            .unwrap();
+            let page_size = PageSize::MIN.as_usize();
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let mut free = Vec::new();
+            // At 512 bytes, 128 free pages require two freelist trunks.
+            for _ in 0..128 {
+                let page = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page, &vec![0x33; page_size])
+                    .await
+                    .unwrap();
+                free.push(page);
+            }
+            seed.commit(&cx).await.unwrap();
+            let mut release = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            for &page in &free {
+                release.free_page(&cx, page).await.unwrap();
+            }
+            release.commit(&cx).await.unwrap();
+            free.sort_unstable_by(|left, right| right.cmp(left));
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                inner.freelist_repair_pending = true;
+                inner.freelist_repair_dropped = 1;
+            }
+            let before = pager.published_snapshot().visible_commit_seq;
+            for mode in [
+                TransactionMode::ReadOnly,
+                TransactionMode::Deferred,
+                TransactionMode::Concurrent,
+            ] {
+                let mut reader = pager.begin(&cx, mode).await.unwrap();
+                assert!(!reader.is_writer());
+                assert!(!reader.has_pending_writes(), "mode={mode:?}");
+                assert!(reader.pending_commit_pages().unwrap().is_empty());
+                reader.commit(&cx).await.unwrap();
+                assert_eq!(pager.published_snapshot().visible_commit_seq, before);
+                assert_eq!(pager.pending_freelist_repair(), 1);
+            }
+            for mode in [TransactionMode::Immediate, TransactionMode::Concurrent] {
+                {
+                    let mut inner = pager.inner.lock().unwrap();
+                    inner.freelist_repair_pending = true;
+                    inner.freelist_repair_dropped = 1;
+                }
+                let writer_before = pager.published_snapshot().visible_commit_seq;
+                let mut writer = pager.begin(&cx, mode).await.unwrap();
+                if mode == TransactionMode::Concurrent {
+                    writer.ensure_writer(&cx).await.unwrap();
+                }
+                assert!(writer.has_pending_writes());
+                let expected = {
+                    let mut pages = vec![PageNumber::ONE, free[0], free[1]];
+                    pages.sort_unstable();
+                    pages
+                };
+                assert_eq!(writer.pending_commit_pages().unwrap(), expected);
+                assert_eq!(writer.pending_conflict_pages_conservative(), expected);
+                writer.commit(&cx).await.unwrap();
+                assert_eq!(pager.pending_freelist_repair(), 0);
+                assert!(pager.published_snapshot().visible_commit_seq > writer_before);
+            }
         });
     }
 
