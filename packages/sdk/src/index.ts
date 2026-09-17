@@ -1,4 +1,6 @@
 export { FrankenDB } from "./database";
+export { scanTable } from "./table-scan";
+export type { TableScan, TableScanOptions, TableScanStats } from "./table-scan";
 export { FrankenSnapshotPool, FrankenPoolError } from "./snapshot-pool";
 export type { SnapshotPoolOptions, SnapshotQueryOptions, SnapshotPoolStats, SnapshotPoolIdentity, SnapshotQueryResult, SnapshotRefreshResult } from "./snapshot-pool";
 export { FrankenSQLiteError } from "./errors";
@@ -29,3 +31,6 @@ export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type { WorkerLike } from "./worker-client";
 export { FrankenDBQueue } from "./queue";
 export type { JobQueueOptions, JobQueueStats, QueuedJobOptions, QueuedTransactionOptions } from "./queue";
+export type { CommittedTableChange, TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
+export { watchQuery } from "./live-query";
+export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";

@@ -10,6 +10,15 @@ import { resolveRequestLimits, resolveResultEncoding } from "@frankensqlite/work
 import type { RequestQueueStats } from "./types";
 import type { TransactionOptions } from "./types";
 
+const databaseClients = new WeakMap<FrankenDB, FrankenWorkerClient>();
+
+/** Internal lifecycle subscription for owners of a private connection. */
+export function observeDatabaseFailure(db: FrankenDB, listener: (error: Error) => void): () => void {
+  const client = databaseClients.get(db);
+  if (client === undefined) throw new TypeError("A FrankenDB connection is required");
+  return client.observeFailure(listener);
+}
+
 interface TransactionScope {
   readonly id: string;
   readonly signal: AbortSignal;
@@ -32,6 +41,7 @@ export class FrankenDB {
 
   private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null) {
     this.#client = client;
+    databaseClients.set(this, client);
     this.#path = path;
     this.#persistence = persistence;
     this.#snapshotRevision = snapshotRevision;
