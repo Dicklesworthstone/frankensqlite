@@ -18,6 +18,7 @@ export type {
   RequestQueueStats,
   SerializedFrankenError,
   SqlScalar,
+  SqlBindings,
   SqlRowSource,
   SnapshotMetadata,
   TransactionOptions,

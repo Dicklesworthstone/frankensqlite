@@ -20,7 +20,7 @@ test('layout matches independent SQLite parameter metadata including holes and a
     'SELECT ?01,?1,?', 'SELECT $::name(suffix), :a::b, @a(z), :a$b',
     'SELECT :世界, @UPPER, @upper, $a::b::c(x-y)',
     `SELECT '?' AS ":ignored", :x AS [@ignored], '@inside' AS \`$inside\` /*?9*/ --:no\n, :x`,
-    'SELECT 1 AS foo$bar', 'SELECT ?32766',
+    'SELECT 1 AS foo$bar', 'SELECT ?32766', 'SELECT \ufeff$x', 'SELECT $a(semi;colon)',
   ]) {
     const oracle=await f.rpc({op:'prepare',sql}), layout=parameterLayout(sql);
     assert.equal(layout.count,oracle.parameterNames.length,sql);

@@ -1,6 +1,6 @@
 import { FrankenPreparedStatement } from "./statement";
 import { combineTransactionSignals, FrankenTransaction } from "./transaction";
-import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SnapshotMetadata } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SqlBindings, SnapshotMetadata } from "./types";
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
@@ -104,7 +104,7 @@ export class FrankenDB {
     return this.#client.requestQueue;
   }
 
-  execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
+  execute(sql: string, params: SqlBindings = []): Promise<number> {
     return this.#run(null, () => this.#client.execute(sql, params));
   }
 
@@ -162,7 +162,7 @@ export class FrankenDB {
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
-    params: readonly SqlScalar[] = [],
+    params: SqlBindings = [],
   ): Promise<QueryResult<Row>> {
     return this.#run(null, () => this.#client.query<Row>(sql, params));
   }
@@ -382,7 +382,7 @@ export class FrankenDB {
       executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets,
         { signal: combineTransactionSignals(scope.signal, options?.signal)! }, scope.id)),
       executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
-      query: <Row extends Record<string, unknown>>(sql: string, params: readonly SqlScalar[] = []) =>
+      query: <Row extends Record<string, unknown>>(sql: string, params: SqlBindings = []) =>
         this.#run(scope, () => this.#client.query<Row>(sql, params, scope.id)),
       prepare: <Row extends Record<string, unknown>>(sql: string) =>
         this.#run(scope, () => this.#prepare<Row>(sql, scope)),

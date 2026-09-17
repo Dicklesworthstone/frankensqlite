@@ -5,6 +5,7 @@ import type {
   QueryResult as WorkerQueryResult,
   SerializedFrankenError,
   SqlScalar,
+  SqlBindings,
   SnapshotMetadata,
   RequestLimits,
   RequestQueueStats,
@@ -13,7 +14,7 @@ import type {
 
 import type { WorkerLike } from "./worker-client";
 
-export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SnapshotMetadata };
+export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SqlBindings, SnapshotMetadata };
 export type { RequestLimits, RequestQueueStats };
 export type { ResultEncoding };
 

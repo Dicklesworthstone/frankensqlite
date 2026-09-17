@@ -1,4 +1,4 @@
-import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar, TransactionOptions } from "./types";
+import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar, SqlBindings, TransactionOptions } from "./types";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import type { FrankenDB } from "./database";
 import type { FrankenPreparedStatement } from "./statement";
@@ -28,7 +28,7 @@ export class FrankenTransaction {
     this.signal = signal;
   }
 
-  execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
+  execute(sql: string, params: SqlBindings = []): Promise<number> {
     return this.#db.execute(sql, params);
   }
 
@@ -56,7 +56,7 @@ export class FrankenTransaction {
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
-    params: readonly SqlScalar[] = [],
+    params: SqlBindings = [],
   ): Promise<QueryResult<Row>> {
     return this.#db.query<Row>(sql, params);
   }

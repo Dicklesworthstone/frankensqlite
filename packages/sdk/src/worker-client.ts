@@ -8,13 +8,15 @@ import type {
   QueryResult,
   QueryResponse,
   SqlScalar,
+  SqlBindings,
   SnapshotMetadata,
   WorkerRequest,
   WorkerResponse,
   RequestLimits,
   RequestQueueStats,
 } from "@frankensqlite/worker";
-import { RequestAdmissionError, RequestBudget } from "@frankensqlite/worker";
+import { BindingError, RequestAdmissionError, RequestBudget, resolveBindings } from "@frankensqlite/worker";
+import type { ParameterLayout } from "@frankensqlite/worker";
 
 import { FrankenSQLiteError } from "./errors";
 import { decodeQueryResult, resolveResultEncoding, ResultCodecError } from "@frankensqlite/worker";
@@ -104,6 +106,52 @@ export class FrankenWorkerClient {
     return this.#resultEncoding;
   }
 
+  /** Local handle operations must also reject after close/crash/disposal. */
+  assertOpen(): void {
+    if (this.#terminalError !== null) throw this.#terminalError;
+    if (this.#closing) throw new Error("FrankenSQLite worker client is closing");
+  }
+
+  /** Validate/capture one complete binding without posting or reserving queue capacity. */
+  captureBindings(statementId: string, values: SqlBindings, layout: ParameterLayout, copyBlobs = false): readonly SqlScalar[] {
+    this.assertOpen();
+    try {
+      if (values === null || values === undefined) {
+        throw new BindingError("ERR_FSQLITE_BINDING_INPUT", "Bindings must be an array or a named object");
+      }
+      // Retained bindings are bounded per handle by the request byte limit;
+      // they are not outstanding requests and do not inflate queue metrics.
+      const budget = new RequestBudget({ maxPendingBytes: this.#budget.stats.maxPendingBytes });
+      const admitted = budget.admit({ kind: "statement-query", requestId: 0, statementId, params: values });
+      try {
+        const request = admitted.request as Extract<WorkerRequest, { kind: "statement-query" }>;
+        const resolved = resolveBindings(layout, request.params!);
+        // Named ?NNN bindings can expand into a dense positional array. Check
+        // that representation too, independently of the incoming map budget.
+        const output = new RequestBudget({ maxPendingBytes: this.#budget.stats.maxPendingBytes })
+          .admit({ kind: "statement-query", requestId: 0, statementId, params: resolved });
+        output.release();
+        if (!copyBlobs) return resolved;
+        const copies = new Map<ArrayBufferLike, ArrayBuffer>();
+        return Object.freeze(resolved.map(value => {
+          if (!(value instanceof Uint8Array)) return value;
+          let copy = copies.get(value.buffer);
+          if (copy === undefined) {
+            copy = new Uint8Array(value.buffer).slice().buffer;
+            copies.set(value.buffer, copy);
+          }
+          return new Uint8Array(copy, value.byteOffset, value.byteLength);
+        }));
+      } finally { admitted.release(); }
+    } catch (error: unknown) {
+      if (error instanceof BindingError || error instanceof RequestAdmissionError) {
+        throw new FrankenSQLiteError({ code: error.code, message: error.message,
+          transient: error.transient, userRecoverable: error.userRecoverable });
+      }
+      throw error;
+    }
+  }
+
   async init(config: InitConfig) {
     const requested = resolveResultEncoding(config.resultEncoding);
     const response = await this.#send({
@@ -144,7 +192,7 @@ export class FrankenWorkerClient {
     }
   }
 
-  async execute(sql: string, params: readonly SqlScalar[] = [], transactionId?: string): Promise<number> {
+  async execute(sql: string, params: SqlBindings = [], transactionId?: string): Promise<number> {
     const response = await this.#send({
       kind: "execute",
       requestId: this.#nextId(),
@@ -199,7 +247,7 @@ export class FrankenWorkerClient {
 
   async query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
-    params: readonly SqlScalar[] = [],
+    params: SqlBindings = [],
     transactionId?: string,
   ): Promise<QueryResult<Row>> {
     const response = await this.#send({
@@ -224,7 +272,7 @@ export class FrankenWorkerClient {
 
   async executePrepared(
     statementId: string,
-    params: readonly SqlScalar[] = [],
+    params: SqlBindings = [],
     transactionId?: string,
   ): Promise<number> {
     const response = await this.#send({
@@ -239,7 +287,7 @@ export class FrankenWorkerClient {
 
   async queryPrepared<Row extends Record<string, unknown> = Record<string, unknown>>(
     statementId: string,
-    params: readonly SqlScalar[] = [],
+    params: SqlBindings = [],
     transactionId?: string,
   ): Promise<QueryResult<Row>> {
     const response = await this.#send({
@@ -424,6 +472,8 @@ export class FrankenWorkerClient {
             transient: error.transient, userRecoverable: error.userRecoverable, suggestion: error.suggestion,
             ...(error.batchIndex === undefined ? {} : { batchIndex: error.batchIndex }) }));
         }
+        if (error instanceof BindingError) return Promise.reject(new FrankenSQLiteError({
+          code: error.code, message: error.message, transient: false, userRecoverable: true }));
         return Promise.reject(error);
       }
     }

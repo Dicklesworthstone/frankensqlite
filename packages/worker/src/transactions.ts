@@ -1,5 +1,6 @@
 import type { CoreDatabaseHandle } from "./connection";
 import type { TransactionRequest } from "./protocol";
+import { namedParameterEnd } from "./bindings";
 
 export class ManagedTransactionError extends Error {
   readonly cleanupErrors: unknown[] = [];
@@ -62,7 +63,11 @@ export function validateManagedSql(sql: string, script = false): void {
       continue;
     }
     let word = "";
-    if (char === "'" || char === '"' || char === "`" || char === "[") {
+    if (char === ":" || char === "@" || char === "$") {
+      // A parameter suffix may contain semicolons and quote characters. It is
+      // one opaque token, not a transaction boundary or quoted SQL fragment.
+      i = namedParameterEnd(sql, i);
+    } else if (char === "'" || char === '"' || char === "`" || char === "[") {
       const end = char === "[" ? "]" : char;
       let closed = false;
       for (i++; i < sql.length; i++) {

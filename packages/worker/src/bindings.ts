@@ -34,6 +34,24 @@ function identifier(code: number): boolean {
     (code >= 48 && code <= 57) || code === 95 || code === 36;
 }
 
+/** End of a :/@/$ token, including its opaque Tcl-style suffix. */
+export function namedParameterEnd(sql: string, start: number): number {
+  let i = start + 1, characters = 0;
+  while (i < sql.length) {
+    if (identifier(sql.charCodeAt(i))) { i++; characters++; }
+    else if (sql.startsWith("::", i)) i += 2;
+    else break;
+  }
+  if (characters === 0) inputError("Named SQL parameters require a name");
+  if (sql[i] === "(") {
+    i++;
+    while (i < sql.length && sql[i] !== ")" && !/[\t\n\v\f\r ]/.test(sql[i]!)) i++;
+    if (sql[i] !== ")") inputError("Unterminated or whitespace-containing parameter suffix");
+    i++;
+  }
+  return i;
+}
+
 /**
  * Lexical bind layout, not a SQL parser. Strings, identifiers and comments are
  * skipped; the core still validates statement syntax and owns query semantics.
@@ -47,6 +65,7 @@ export function parameterLayout(sql: string): ParameterLayout {
   let count = 0;
   for (let i = 0; i < sql.length;) {
     const c = sql[i]!;
+    if (c === "\uFEFF") { i++; continue; }
     if (sql.startsWith("--", i)) {
       const end = sql.indexOf("\n", i + 2);
       i = end < 0 ? sql.length : end + 1;
@@ -87,19 +106,7 @@ export function parameterLayout(sql: string): ParameterLayout {
     } else {
       // SQLite's named-token grammar also accepts Tcl :: segments and a
       // whitespace-free parenthesized suffix. All three sigils use it.
-      let characters = 0;
-      while (i < sql.length) {
-        if (identifier(sql.charCodeAt(i))) { i++; characters++; }
-        else if (sql.startsWith("::", i)) i += 2;
-        else break;
-      }
-      if (characters === 0) inputError("Named SQL parameters require a name");
-      if (sql[i] === "(") {
-        i++;
-        while (i < sql.length && sql[i] !== ")" && !/[\t\n\v\f\r ]/.test(sql[i]!)) i++;
-        if (sql[i] !== ")") inputError("Unterminated or whitespace-containing parameter suffix");
-        i++;
-      }
+      i = namedParameterEnd(sql, start);
       name = sql.slice(start, i);
       slot = aliases[name] ?? count + 1;
     }
