@@ -18,7 +18,7 @@ import type {
 import { BindingError, RequestAdmissionError, RequestBudget, resolveBindings } from "@frankensqlite/worker";
 import type { ParameterLayout } from "@frankensqlite/worker";
 
-import { FrankenSQLiteError } from "./errors";
+import { decodeFrankenError, FrankenSQLiteError } from "./errors";
 import { decodeQueryResult, resolveResultEncoding, ResultCodecError } from "@frankensqlite/worker";
 import type { ResultEncoding } from "@frankensqlite/worker";
 import type { ExecuteManyOptions } from "./types";
@@ -57,6 +57,7 @@ interface PendingRequest {
   reject: (reason?: unknown) => void;
   release: () => void;
   isClose: boolean;
+  requestKind: WorkerRequest["kind"];
 }
 
 export class FrankenWorkerClient {
@@ -74,14 +75,25 @@ export class FrankenWorkerClient {
   #resultEncoding: ResultEncoding = "structured-clone";
 
   readonly #onMessage = (event: WorkerMessageEvent): void => {
-    const pending = this.#pending.get(event.data.requestId);
-    if (pending === undefined) {
-      return;
-    }
-    this.#pending.delete(event.data.requestId);
-    pending.release();
-    if (event.data.kind === "error") {
-      const error = new FrankenSQLiteError(event.data.error);
+    if (this.#disposed) return;
+    let pending: PendingRequest | undefined;
+    let requestId: number | undefined;
+    try {
+      const source = responseObject(event.data);
+      const id = source.requestId;
+      if (!safeCount(id)) throw new TypeError("Worker response has no valid request id");
+      requestId = id;
+      pending = this.#pending.get(id);
+      // Late responses and acknowledgements without retained promises are inert.
+      if (pending === undefined) return;
+      const kind = source.kind;
+      const error = kind === "error" ? decodeFrankenError(source.error) : null;
+      const response = error === null ? captureResponse(source, kind, id, pending.requestKind) : null;
+      // A custom transport getter can synchronously dispose or fail this client.
+      if (this.#pending.get(id) !== pending) return;
+      this.#pending.delete(id);
+      pending.release();
+      if (error === null) { pending.resolve(response!); return; }
       pending.reject(error);
       // These are the host's explicit terminal contracts, not ordinary SQL,
       // quota, schema or admission failures. A live message channel does not
@@ -96,21 +108,35 @@ export class FrankenWorkerClient {
         this.#rejectPending(this.#terminalError, true);
         this.#notifyFailure(this.#terminalError);
       }
-      return;
+    } catch (cause: unknown) {
+      const error = responseFailure(cause);
+      if (pending !== undefined && requestId !== undefined) {
+        if (this.#pending.get(requestId) !== pending) return;
+        this.#pending.delete(requestId);
+        pending.release();
+        pending.reject(error);
+      } else {
+        // Without correlation, any outstanding operation might own the lost
+        // result. Fail all of them; never guess an id or replay a write.
+        this.#failTransport(error);
+      }
     }
-    pending.resolve(event.data);
   };
 
   readonly #onError = (event: WorkerErrorEventLike): void => {
     if (this.#disposed) return;
-    this.#hostTerminal = false;
     const error = new Error(
       `FrankenSQLite worker crashed: ${event.message || "unknown error"}`,
     );
+    this.#failTransport(error);
+  };
+
+  #failTransport(error: Error): void {
+    this.#hostTerminal = false;
     this.#terminalError ??= error;
     this.#rejectPending(this.#terminalError);
     this.#notifyFailure(this.#terminalError);
-  };
+  }
 
   constructor(worker: WorkerLike, limits: Partial<RequestLimits> = {}) {
     this.#budget = new RequestBudget(limits);
@@ -530,7 +556,7 @@ export class FrankenWorkerClient {
       return Promise.reject(this.#terminalError ?? new Error("FrankenSQLite worker client is closing"));
     }
     return new Promise<WorkerResponse>((resolve, reject) => {
-      this.#pending.set(request.requestId, { resolve, reject, release, isClose: request.kind === "close" });
+      this.#pending.set(request.requestId, { resolve, reject, release, isClose: request.kind === "close", requestKind: request.kind });
       try {
         if (request.kind === "init" && request.config.snapshot) {
           this.#worker.postMessage(request, [request.config.snapshot.buffer]);
@@ -558,4 +584,98 @@ function ensureKind<K extends WorkerResponse["kind"]>(
     );
   }
   return response as Extract<WorkerResponse, { kind: K }>;
+}
+
+function responseObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid worker response object");
+  return value as Record<string, unknown>;
+}
+function safeCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function responseFailure(cause: unknown): FrankenSQLiteError {
+  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_WORKER_RESPONSE", transient: false,
+    message: "FrankenSQLite returned an invalid operation response",
+    suggestion: "SQL or snapshot publication may have executed. Inspect authoritative state; do not blindly retry the operation." });
+  error.cause = cause;
+  return error;
+}
+function captureResponse(source: Record<string, unknown>, kind: unknown, requestId: number,
+  request: WorkerRequest["kind"]): WorkerResponse {
+  const expected: Record<WorkerRequest["kind"], string> = {
+    init: "ready", execute: "execute-result", "execute-batch": "execute-batch-result",
+    "execute-many": "execute-many-result", query: "query-result", prepare: "prepare-result",
+    "statement-execute": "execute-result", "statement-execute-many": "execute-many-result",
+    "statement-query": "query-result", "statement-finalize": "statement-finalize-result",
+    transaction: "transaction-result", "cancel-transaction": "cancel-transaction-result",
+    "cancel-bulk": "cancel-bulk-result", export: "export-result", checkpoint: "checkpoint-result", close: "close-result",
+  };
+  if (kind !== expected[request] && !(kind === "query-binary-result" && expected[request] === "query-result")) {
+    throw new TypeError(`Unexpected response kind for ${request}`);
+  }
+  switch (kind) {
+    case "ready": {
+      const data = responseObject(source.data);
+      if (typeof data.path !== "string" || !["memory", "opfs", "indexeddb", "indexeddb-snapshot"].includes(data.persistence as string)) {
+        throw new TypeError("Invalid initialization result");
+      }
+      return { kind, requestId, data: data as unknown as import("@frankensqlite/worker").InitResult };
+    }
+    case "execute-result": {
+      const changes = source.changes;
+      if (!safeCount(changes)) throw new TypeError("Invalid affected-row count");
+      return { kind, requestId, changes };
+    }
+    case "execute-many-result": {
+      const data = responseObject(source.data), executions = data.executions, changes = data.changes;
+      const counts = data.changesPerExecution;
+      if (!safeCount(executions) || executions > 10000 || !safeCount(changes) || !Array.isArray(counts) ||
+          counts.length !== executions) throw new TypeError("Invalid bulk result");
+      let total = 0;
+      for (let i = 0; i < counts.length; i++) {
+        if (!safeCount(counts[i])) throw new TypeError("Invalid bulk affected-row count");
+        total += counts[i];
+      }
+      if (!Number.isSafeInteger(total) || total !== changes) throw new TypeError("Inconsistent bulk counts");
+      return { kind, requestId, data: { executions, changes, changesPerExecution: counts as number[] } };
+    }
+    case "query-result": {
+      const data = responseObject(source.data);
+      if (!safeCount(data.columnCount) || !Array.isArray(data.columns) || data.columns.length !== data.columnCount ||
+          !Array.isArray(data.columnTypes) || !Array.isArray(data.rows) || !Array.isArray(data.rowArrays) ||
+          data.rows.length !== data.rowArrays.length) throw new TypeError("Invalid query result envelope");
+      // Preserve extension metadata; the core and binary codec own SQL value
+      // validation. Do not duplicate or traverse an entire large result here.
+      return { kind, requestId, data: data as unknown as QueryResult };
+    }
+    case "query-binary-result":
+      // Keep the existing codec error/negotiation contract and zero-copy input.
+      return { kind, requestId, encoding: source.encoding as "fqr1", data: source.data as ArrayBuffer };
+    case "prepare-result": {
+      const data = responseObject(source.data);
+      if (typeof data.statementId !== "string" || data.statementId.length === 0 || typeof data.sql !== "string" ||
+          !safeCount(data.columnCount) || !Array.isArray(data.columnNames) || data.columnNames.length !== data.columnCount) {
+        throw new TypeError("Invalid prepared statement metadata");
+      }
+      return { kind, requestId, data: data as unknown as PrepareResponse["data"] };
+    }
+    case "export-result": {
+      const data = source.data;
+      if (!(data instanceof Uint8Array)) throw new TypeError("Invalid export bytes");
+      return { kind, requestId, data };
+    }
+    case "checkpoint-result": {
+      const data = responseObject(source.data);
+      if (typeof data.revision !== "string" || typeof data.sha256 !== "string" || !safeCount(data.byteLength) ||
+          (data.parentRevision !== null && typeof data.parentRevision !== "string")) throw new TypeError("Invalid checkpoint metadata");
+      return { kind, requestId, data: data as unknown as SnapshotMetadata };
+    }
+    case "cancel-bulk-result": case "cancel-transaction-result": {
+      if (typeof source.accepted !== "boolean") throw new TypeError("Invalid cancellation acknowledgement");
+      return { kind, requestId, accepted: source.accepted };
+    }
+    case "execute-batch-result": case "transaction-result": case "statement-finalize-result": case "close-result":
+      return { kind, requestId };
+    default: throw new TypeError("Unknown worker response");
+  }
 }
