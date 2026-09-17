@@ -24,6 +24,28 @@ export interface JobQueueOptions {
   maxPendingJobs?: number;
   /** Active or still-finishing subscriptions, 1..1024. Defaults to 64. */
   maxSubscriptions?: number;
+  /**
+   * In indexeddb-snapshot mode, acknowledge transaction jobs only after their
+   * committed image is checkpointed. Defaults to false. Not a page-level VFS.
+   */
+  checkpointOnCommit?: boolean;
+}
+
+/** SQL committed, but snapshot publication was not acknowledged. Never replay. */
+export class FrankenCheckpointCommitError<T = unknown> extends Error {
+  readonly code = "ERR_FSQLITE_COMMITTED_CHECKPOINT_FAILED";
+  readonly sqlCommitted = true;
+  readonly checkpointConfirmed = false;
+  readonly transient = false;
+
+  constructor(
+    readonly value: T,
+    readonly previousRevision: string | null,
+    cause: unknown,
+  ) {
+    super("SQL committed, but its checkpoint was not acknowledged. Retry checkpoint(), not the transaction callback; export before closing if recovery is impossible.", { cause });
+    this.name = "FrankenCheckpointCommitError";
+  }
 }
 
 export interface QueuedJobOptions {
@@ -63,6 +85,8 @@ export interface JobQueueStats {
   readonly maxSubscriptions: number;
   readonly pendingNotifications: number;
   readonly activeListeners: number;
+  /** A committed image needs checkpoint recovery before transaction jobs resume. */
+  readonly checkpointRecoveryRequired: boolean;
 }
 
 interface Job {
@@ -90,6 +114,8 @@ export class FrankenDBQueue {
   readonly #db: FrankenDB;
   readonly #maxPendingJobs: number;
   readonly #maxSubscriptions: number;
+  readonly #checkpointOnCommit: boolean;
+  #checkpointFailure: FrankenCheckpointCommitError | null = null;
   readonly #subscriptions = new Set<ChangeObserver>();
   readonly #observers = new Set<ChangeObserver>();
   readonly #closeListeners = new Set<CloseListener>();
@@ -112,10 +138,11 @@ export class FrankenDBQueue {
   #timedOut = 0;
   #rejected = 0;
 
-  private constructor(db: FrankenDB, maxPendingJobs: number, maxSubscriptions: number) {
+  private constructor(db: FrankenDB, maxPendingJobs: number, maxSubscriptions: number, checkpointOnCommit: boolean) {
     this.#db = db;
     this.#maxPendingJobs = maxPendingJobs;
     this.#maxSubscriptions = maxSubscriptions;
+    this.#checkpointOnCommit = checkpointOnCommit;
     queueClosers.set(this, listener => {
       if (this.#state !== "open") { listener(this.#terminalFailure); return () => {}; }
       this.#closeListeners.add(listener);
@@ -135,13 +162,27 @@ export class FrankenDBQueue {
     // Capture and validate before constructing a worker or importing bytes.
     const maxPendingJobs = queueOptions?.maxPendingJobs ?? 64;
     const maxSubscriptions = queueOptions?.maxSubscriptions ?? 64;
+    const checkpointOnCommit = queueOptions?.checkpointOnCommit;
+    if (checkpointOnCommit !== undefined && typeof checkpointOnCommit !== "boolean") {
+      throw new TypeError("checkpointOnCommit must be a boolean");
+    }
     if (!Number.isInteger(maxPendingJobs) || maxPendingJobs < 1 || maxPendingJobs > 4096) {
       throw new RangeError("maxPendingJobs must be an integer in 1..4096");
     }
     if (!Number.isInteger(maxSubscriptions) || maxSubscriptions < 1 || maxSubscriptions > 1024) {
       throw new RangeError("maxSubscriptions must be an integer in 1..1024");
     }
-    const queue = new FrankenDBQueue(await FrankenDB.open(databaseOptions), maxPendingJobs, maxSubscriptions);
+    const db = await FrankenDB.open(databaseOptions);
+    if (checkpointOnCommit === true && db.persistence !== "indexeddb-snapshot") {
+      const cause = new FrankenSQLiteError({ code: "ERR_FSQLITE_CHECKPOINT_MODE",
+        message: "checkpointOnCommit requires indexeddb-snapshot persistence", transient: false });
+      try { await db.close(); }
+      catch (cleanup: unknown) {
+        throw new AggregateError([cause, cleanup], "Invalid checkpoint mode and database cleanup failed", { cause });
+      }
+      throw cause;
+    }
+    const queue = new FrankenDBQueue(db, maxPendingJobs, maxSubscriptions, checkpointOnCommit === true);
     if (queue.#terminalFailure !== null) {
       const cause = queue.#terminalFailure;
       try { await queue.close(); } catch (cleanup: unknown) {
@@ -155,6 +196,7 @@ export class FrankenDBQueue {
   get path(): string { return this.#db.path; }
   get persistence() { return this.#db.persistence; }
   get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
+  get checkpointOnCommit(): boolean { return this.#checkpointOnCommit; }
   /** Local watched-write sequence, not a native commit sequence or saved revision. */
   get changeSequence(): bigint { return this.#changeSequence; }
 
@@ -172,6 +214,7 @@ export class FrankenDBQueue {
       maxSubscriptions: this.#maxSubscriptions,
       pendingNotifications: [...this.#observers].filter(observer => observer.pending).length,
       activeListeners: [...this.#observers].filter(observer => observer.running).length,
+      checkpointRecoveryRequired: this.#checkpointFailure !== null,
     });
   }
 
@@ -202,11 +245,12 @@ export class FrankenDBQueue {
       const transactionOptions: TransactionOptions = {};
       if (signal !== undefined) transactionOptions.signal = signal;
       if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
-      if (this.#journal === null) return this.#db.transaction(work, transactionOptions);
+      if (this.#journal === null) {
+        return this.#finishTransaction(await this.#db.transaction(work, transactionOptions), []);
+      }
       const result = await this.#journal.run(this.#db, work, transactionOptions);
-      this.#publishTables(result.tables);
-      return result.value;
-    }, admission, work);
+      return this.#finishTransaction(result.value, result.tables);
+    }, admission, work, true);
   }
 
   /**
@@ -237,11 +281,41 @@ export class FrankenDBQueue {
     return this.#enqueue(async signal => {
       const retryOptions: TransactionRetryOptions = { ...policy };
       if (signal !== undefined) retryOptions.signal = signal;
-      if (this.#journal === null) return this.#db.transactionWithRetry(work, retryOptions);
+      if (this.#journal === null) {
+        return this.#finishTransaction(await this.#db.transactionWithRetry(work, retryOptions), []);
+      }
       const result = await this.#journal.runWithRetry(this.#db, work, retryOptions);
-      this.#publishTables(result.tables);
-      return result.value;
-    }, admission, work);
+      return this.#finishTransaction(result.value, result.tables);
+    }, admission, work, true);
+  }
+
+  async #finishTransaction<T>(value: T, tables: readonly string[]): Promise<T> {
+    // These are LOCAL SQL-commit notifications, not persistence receipts. A
+    // failed checkpoint does not undo committed rows or their dirty-table bits.
+    this.#publishTables(tables);
+    if (this.#checkpointOnCommit) {
+      const previousRevision = this.#db.snapshotRevision;
+      try {
+        // Outside the retry loop and SQL transaction, but inside the SAME FIFO
+        // job. An abort after COMMIT cannot abandon or falsely cancel saving it.
+        await this.#db.checkpoint();
+      } catch (cause: unknown) {
+        const failure = new FrankenCheckpointCommitError(value, previousRevision, cause);
+        this.#checkpointFailure = failure;
+        throw failure;
+      }
+    }
+    return value;
+  }
+
+  #assertCheckpointReady(): void {
+    if (this.#checkpointFailure === null) return;
+    const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED",
+      message: "A prior SQL commit needs checkpoint recovery; this job executed no SQL",
+      transient: false,
+      suggestion: "Await checkpoint(), or export the committed image and reopen/merge. Do not replay the committed callback." });
+    error.cause = this.#checkpointFailure;
+    throw error;
   }
 
   #publishTables(tables: readonly string[]): void {
@@ -285,7 +359,7 @@ export class FrankenDBQueue {
       observer.activate(signal);
       if (this.#state !== "open") observer.stop();
       return observer.handle;
-    }, options, listener);
+    }, options, listener, true);
   }
 
   /** One buffered invalidation range and one outstanding next(), never row results. */
@@ -308,7 +382,13 @@ export class FrankenDBQueue {
    * Preceding job failures do not implicitly cancel this independent barrier.
    */
   checkpoint(options?: QueuedJobOptions): Promise<SnapshotMetadata> {
-    const operation = () => this.#db.checkpoint();
+    const operation = async () => {
+      const saved = await this.#db.checkpoint();
+      // Clear the fence ONLY after publication acknowledgement. Failed CAS,
+      // quota/transport errors and rejected/aborted waiting jobs cannot clear it.
+      this.#checkpointFailure = null;
+      return saved;
+    };
     return this.#enqueue(operation, options, operation);
   }
 
@@ -349,11 +429,13 @@ export class FrankenDBQueue {
     operation: (signal: AbortSignal | undefined) => Promise<T>,
     options: QueuedJobOptions | undefined,
     callback: unknown,
+    requiresPublished = false,
   ): Promise<T> {
     let signal: AbortSignal | undefined;
     let waitTimeoutMs: number | undefined;
     try {
       this.#assertAdmission();
+      if (requiresPublished) this.#assertCheckpointReady();
       if (typeof callback !== "function") throw new TypeError("A transaction callback is required");
       const requestedSignal = options?.signal;
       waitTimeoutMs = options?.waitTimeoutMs;
@@ -369,6 +451,7 @@ export class FrankenDBQueue {
       }
       // Caller option getters can close/fill this queue; they grant no reservation.
       this.#assertAdmission();
+      if (requiresPublished) this.#assertCheckpointReady();
       if (signal?.aborted) throw cancelled(signal);
     } catch (error: unknown) {
       this.#rejected++;
@@ -381,7 +464,13 @@ export class FrankenDBQueue {
         state: "waiting", signal, deadline, reject, stopWaiting: () => {},
         start: () => {
           let result: Promise<T>;
-          try { result = this.#reconcileSubscriptions().then(() => operation(signal)); }
+          try {
+            // Jobs accepted before a publication failure are fenced too. Do
+            // not execute even journal-maintenance SQL before this check.
+            if (requiresPublished) this.#assertCheckpointReady();
+            result = (this.#checkpointFailure === null ? this.#reconcileSubscriptions() : Promise.resolve())
+              .then(() => operation(signal));
+          }
           catch (error: unknown) { result = Promise.reject(error); }
           // Release capacity only after the real operation (including cleanup)
           // settles. Never race running SQL or a callback against a timer/abort.
@@ -485,14 +574,17 @@ export class FrankenDBQueue {
         this.#stopObservingFailure?.();
         this.#stopObservingFailure = null;
         this.#state = "closed";
-        this.#resolveClose!();
+        if (this.#checkpointFailure === null) this.#resolveClose!();
+        else this.#rejectClose!(this.#checkpointFailure);
         this.#resolveClose = null;
         this.#rejectClose = null;
       }, (error: unknown) => {
         this.#stopObservingFailure?.();
         this.#stopObservingFailure = null;
         this.#state = "closed";
-        this.#rejectClose!(error);
+        this.#rejectClose!(this.#checkpointFailure === null ? error : new AggregateError(
+          [this.#checkpointFailure, error], "Unacknowledged checkpoint and database close both failed",
+          { cause: this.#checkpointFailure }));
         this.#resolveClose = null;
         this.#rejectClose = null;
       });
