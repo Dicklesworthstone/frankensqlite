@@ -10858,7 +10858,10 @@ impl VdbeEngine {
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
-                    let index_collations = self.index_collations_for_cursor(cursor_id);
+                    let mut index_collations = self.index_collations_for_cursor(cursor_id);
+                    // A built-in name is not proof of built-in semantics:
+                    // callers may override BINARY itself (hfdt-gbou9l review).
+                    let builtins_overridden = self.builtin_collations_overridden();
 
                     // NULL short-circuit: NULL != NULL for UNIQUE purposes.
                     if key_val.is_null() {
@@ -10874,7 +10877,20 @@ impl VdbeEngine {
                                 pc = op.p2 as usize;
                                 continue;
                             }
-                            cursor.target_vals_buf.iter().enumerate().any(|(idx, _)| {
+                            if builtins_overridden {
+                                index_collations.resize_with(
+                                    index_collations.len().max(cursor.target_vals_buf.len()),
+                                    || None,
+                                );
+                                for collation in &mut index_collations {
+                                    // The collated helper treats None as raw bytes.
+                                    // Make implicit BINARY use the registry too.
+                                    if collation.is_none() {
+                                        *collation = Some("BINARY".to_owned());
+                                    }
+                                }
+                            }
+                            builtins_overridden || cursor.target_vals_buf.iter().enumerate().any(|(idx, _)| {
                                 index_collations
                                     .get(idx)
                                     .and_then(|collation| collation.as_deref())

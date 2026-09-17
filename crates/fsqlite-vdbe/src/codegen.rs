@@ -3905,7 +3905,7 @@ pub fn codegen_select(
         && let Some((pk_targets, residual_filter)) =
             wr_pk_point_seek_targets(table, where_clause.as_deref(), table_alias)
     {
-        return codegen_select_without_rowid_pk_seek(
+        return codegen_select_without_rowid_unique_seek(
             b,
             cursor,
             table,
@@ -3921,6 +3921,46 @@ pub fn codegen_select(
             stmt.limit.as_ref(),
             &pk_targets,
             residual_filter,
+            None,
+        );
+    }
+
+    // hfdt-gbou9l: a complete UNIQUE secondary key on a WITHOUT ROWID table
+    // identifies at most one row. A leading-column scan here makes repeated
+    // duplicate checks quadratic when all rows share that leading value.
+    if table.without_rowid
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !has_window_columns(columns)
+        && let Some((index, targets)) = wr_unique_index_point_seek_targets(
+            table,
+            where_clause.as_deref(),
+            table_alias,
+            schema,
+        )
+    {
+        return codegen_select_without_rowid_unique_seek(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            stmt.limit.as_ref(),
+            &targets,
+            true,
+            Some(index),
         );
     }
 
@@ -4846,8 +4886,8 @@ fn codegen_select_without_rowid_pk_lookup(
     Ok(())
 }
 
-/// Point lookup on a WITHOUT ROWID table's (possibly composite) PRIMARY KEY,
-/// with an optional per-row residual filter (bd-nd2ju / #377, L2).
+/// Point lookup on a WITHOUT ROWID table's PRIMARY KEY or a complete UNIQUE
+/// secondary key, with an optional residual filter (bd-nd2ju / hfdt-gbou9l).
 ///
 /// Generalizes [`codegen_select_without_rowid_pk_lookup`] (L1's sole
 /// single-column `pk = const` shape) to two further shapes the L1 hoist leaves
@@ -4868,8 +4908,11 @@ fn codegen_select_without_rowid_pk_lookup(
 /// `residual_filter` re-runs the whole `where_clause` — including the PK
 /// equalities, which are then redundant but harmless — so the seek only has to
 /// *narrow* candidates, never fully implement the predicate.
+/// A secondary-key probe first positions its index, then resolves the actual
+/// PK using the index's deduplicated key/suffix layout. Its full WHERE is always
+/// reapplied, so extra conditions and contradictory equalities remain enforced.
 #[allow(clippy::too_many_arguments)]
-fn codegen_select_without_rowid_pk_seek(
+fn codegen_select_without_rowid_unique_seek(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
@@ -4883,16 +4926,31 @@ fn codegen_select_without_rowid_pk_seek(
     done_label: crate::Label,
     end_label: crate::Label,
     limit_clause: Option<&LimitClause>,
-    pk_targets: &[&Expr],
+    key_targets: &[&Expr],
     residual_filter: bool,
+    unique_index: Option<&IndexSchema>,
 ) -> Result<(), CodegenError> {
     let pk_indices = without_rowid_pk_indices(table)?;
-    if pk_indices.len() != pk_targets.len() {
+    let key_indices = if let Some(index) = unique_index {
+        index
+            .columns
+            .iter()
+            .map(|name| {
+                table.column_index(name).ok_or_else(|| CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        pk_indices.clone()
+    };
+    if key_indices.len() != key_targets.len() {
         return Err(CodegenError::Unsupported(
-            "WITHOUT ROWID PK point seek requires one equality target per PK column".to_owned(),
+            "WITHOUT ROWID unique point seek requires one equality target per key column".to_owned(),
         ));
     }
-    let n_pk = pk_indices.len();
+    let n_pk = key_indices.len();
 
     // Capture the anon-placeholder counter BEFORE emitting the seek keys /
     // LIMIT, mirroring `codegen_select_index_equality_scan`: the residual
@@ -4906,7 +4964,7 @@ fn codegen_select_without_rowid_pk_seek(
     let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
     let pk_regs = b.alloc_regs(n_pk as i32);
-    for (j, (&col_idx, &target)) in pk_indices.iter().zip(pk_targets.iter()).enumerate() {
+    for (j, (&col_idx, &target)) in key_indices.iter().zip(key_targets.iter()).enumerate() {
         let dst = pk_regs + j as i32;
         emit_expr(b, target, dst, None);
         // Match the stored key's storage class (see the L1 lookup's affinity
@@ -4961,7 +5019,27 @@ fn codegen_select_without_rowid_pk_seek(
     );
     // `NoConflict` jumps when no row carries this full PK; a match falls through
     // with the table cursor positioned on that row.
-    b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
+    if let Some(index) = unique_index {
+        let index_cursor = cursor + 1;
+        b.emit_op(
+            Opcode::OpenRead,
+            index_cursor,
+            index.root_page,
+            0,
+            P4::Index(index.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::NoConflict, index_cursor, pk_rec, done_label, P4::None, 0,
+        );
+        // Secondary records append only PK columns absent from the index key.
+        // Reuse the layout-aware reader rather than assuming a rowid suffix.
+        emit_without_rowid_index_to_table_seek(
+            b, table, cursor, index_cursor, index, &pk_indices, done_label,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::NoConflict, cursor, pk_rec, done_label, P4::None, 0);
+    }
 
     // Residual: re-apply the FULL WHERE on the positioned row so `pk = <const>
     // AND <residual>` (and any duplicate-column equality) stays enforced. The
@@ -4990,6 +5068,9 @@ fn codegen_select_without_rowid_pk_seek(
     }
     b.resolve_label(skip_label);
     b.resolve_label(done_label);
+    if unique_index.is_some() {
+        b.emit_op(Opcode::Close, cursor + 1, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
@@ -31246,31 +31327,50 @@ fn extract_labeled_eq_conjunct_target<'a>(
     None
 }
 
+/// Complete, binary-collated UNIQUE secondary keys can be probed without a
+/// duplicate-run scan. Keep partial/expression/descending indexes and probes
+/// whose affinity or parameter numbering cannot be preserved on the old path.
+fn wr_unique_index_point_seek_targets<'a>(
+    table: &'a TableSchema,
+    where_clause: Option<&'a Expr>,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+) -> Option<(&'a IndexSchema, Vec<&'a Expr>)> {
+    for index in &table.indexes {
+        if !index.is_unique
+            || !index.supports_direct_column_lookup()
+            || index.key_term_count() < 2
+            || (0..index.key_term_count()).any(|pos| {
+                index.key_term_descending(pos)
+                    || index.key_term_collation(pos).is_some_and(|name| {
+                        !name.eq_ignore_ascii_case("BINARY")
+                    })
+            })
+        {
+            continue;
+        }
+        let targets = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+        if targets.len() != index.key_term_count()
+            || !index.columns.iter().zip(&targets).all(|(column, target)| {
+                matches!(target, Expr::Literal(..)
+                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _))
+                    && index_range_bound_is_seek_safe(table, table_alias, schema, column, target)
+            })
+        {
+            continue;
+        }
+        return Some((index, targets));
+    }
+    None
+}
+
 /// Resolve a WITHOUT ROWID PRIMARY KEY point-seek plan from a WHERE clause
 /// (bd-nd2ju / #377, L2).
 ///
-/// A WITHOUT ROWID table's rows live in a b-tree keyed by the *full* PRIMARY
-/// KEY, so a `NoConflict` point probe requires an equality target for EVERY
-/// primary-key column — a partial-key prefix (`WHERE a = ?` on `PRIMARY KEY
-/// (a, b)`) is a b-tree range, not a point probe, and stays a scan (future
-/// scope). This walks the AND-tree for one `<pk-col> = <simple constant>`
-/// conjunct per PK column (via [`extract_labeled_eq_conjunct_target`], in
-/// PRIMARY KEY declared order to match [`without_rowid_pk_indices`] /
-/// `emit_wr_record` storage order); it returns `None` the moment any PK column
-/// is unconstrained.
-///
-/// The second tuple element is the residual-filter flag. Each PK column matched
-/// a *distinct* AND-leaf, so the flattened conjunct count is at least the PK
-/// width: it equals the width exactly when the WHERE is one equality per PK
-/// column and nothing else (the seek then fully implements the predicate,
-/// `residual = false`); a strict excess means extra conjunct(s) — `pk = <const>
-/// AND <residual>`, or a composite key with a trailing filter — that the caller
-/// re-applies per positioned row (`residual = true`). Residual re-application is
-/// always correctness-preserving (the point probe only narrows candidates), so
-/// `false` is reserved for the provably-complete shape.
-///
-/// The single-column bare `pk = const` shape is claimed earlier by the L1 hoist
-/// (`codegen_select_without_rowid_pk_lookup`) and never reaches here.
+/// Every PK column must have an equality target, in declared PK order. Partial
+/// keys remain ranges. Extra conjuncts require reapplying the complete WHERE;
+/// the returned boolean is false only when there is exactly one term per key.
+/// The bare single-column shape is claimed earlier by the L1 lookup.
 fn wr_pk_point_seek_targets<'a>(
     table: &TableSchema,
     where_clause: Option<&'a Expr>,

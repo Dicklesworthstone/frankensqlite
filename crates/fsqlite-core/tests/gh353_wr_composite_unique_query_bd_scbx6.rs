@@ -10,6 +10,68 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
 
+struct AsciiCaseFoldBinary;
+
+impl fsqlite_func::collation::CollationFunction for AsciiCaseFoldBinary {
+    fn name(&self) -> &str {
+        "BINARY"
+    }
+
+    fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    }
+}
+
+#[test]
+fn wr_unique_point_probe_honors_overridden_binary() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for setup in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,a TEXT,b INTEGER,UNIQUE(a,b)) WITHOUT ROWID",
+            "INSERT INTO t VALUES(1,'stored',7)",
+        ] {
+            f.execute(setup).await.unwrap();
+            r.execute_batch(setup).unwrap();
+        }
+        let sql = "SELECT id FROM t WHERE a='STORED' AND b=7";
+        let prepared = f.prepare(sql).await.unwrap();
+        assert!(prepared.query().await.unwrap().is_empty());
+        f.register_collation_function(AsciiCaseFoldBinary);
+        // FrankenSQLite permits overriding BINARY. Match that declared ASCII
+        // comparison against explicit stock NOCASE, not SQLite's built-in
+        // BINARY override behavior (which differs on some SQLite versions).
+        let expected = stock_rows(
+            &r,
+            "SELECT id FROM t WHERE a='STORED' COLLATE NOCASE AND b=7",
+        )
+        .unwrap();
+        assert!(matches!(
+            prepared.query().await.unwrap_err(),
+            fsqlite_error::FrankenError::SchemaChanged
+        ));
+        for rows in [
+            f.prepare(sql).await.unwrap().query().await.unwrap(),
+            f.query(sql).await.unwrap(),
+        ] {
+            let actual: Vec<Vec<String>> = rows
+                .iter()
+                .map(|row| row.values().iter().map(render).collect())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "overridden BINARY must govern the index probe"
+            );
+        }
+        assert!(
+            f.query("SELECT id FROM t WHERE a='STORED' AND b=8")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
 const SCHEMA: &str = "CREATE TABLE members(\
     a TEXT, b INTEGER, c INTEGER, \
     PRIMARY KEY(a, b), UNIQUE(a, c)\
@@ -60,6 +122,92 @@ fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>
     .map_err(|e| e.to_string())?
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| e.to_string())
+}
+
+// hfdt-gbou9l: complete unique keys must not scan all rows sharing the first
+// term. Exercise the actual VM and stock oracle, including a PK column shared
+// with the secondary key (its physical suffix is deduplicated).
+#[test]
+fn wr_composite_unique_point_seek_preserves_results_and_avoids_scan() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            SCHEMA,
+            "INSERT INTO members VALUES ('shared', 0, 100), ('shared', 1, 101), ('shared', 2, NULL), ('other', 3, 101)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for sql in [
+            "SELECT b FROM members WHERE a='shared' AND c=101",
+            "SELECT b FROM members WHERE c=101 AND a='shared'",
+            "SELECT b FROM members WHERE a='shared' AND c=999",
+            "SELECT b FROM members WHERE a='missing' AND c=101",
+            "SELECT b FROM members WHERE a='shared' AND c=NULL",
+            "SELECT b FROM members WHERE a='shared' AND c=101 AND b=0",
+            "SELECT b FROM members WHERE a='shared' AND c=101 AND c=100",
+            "SELECT b FROM members WHERE a='shared' AND c=101 LIMIT 0",
+            "SELECT b FROM members WHERE a='shared' AND c=101 LIMIT 1 OFFSET 1",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql).await.unwrap(),
+                stock_rows(&r, sql).unwrap(),
+                "{sql}"
+            );
+        }
+        let sql = "SELECT b FROM members WHERE c=?1 AND a=?2";
+        for (ordinal, prefix) in [("101", "shared"), ("999", "shared"), ("101", "other")] {
+            let rows = f
+                .query_with_params(
+                    sql,
+                    &[SqliteValue::from(ordinal), SqliteValue::from(prefix)],
+                )
+                .await
+                .unwrap();
+            let actual: Vec<Vec<String>> = rows
+                .iter()
+                .map(|row| row.values().iter().map(render).collect())
+                .collect();
+            let mut stmt = r.prepare(sql).unwrap();
+            let expected: Vec<Vec<String>> = stmt
+                .query_map([ordinal, prefix], |row| {
+                    Ok(vec![row.get::<_, i64>(0)?.to_string()])
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "numbered parameters and affinity: {ordinal}, {prefix}"
+            );
+        }
+        let plan = f
+            .query("EXPLAIN SELECT b FROM members WHERE a='shared' AND c=101")
+            .await
+            .unwrap();
+        let opcodes: Vec<String> = plan
+            .iter()
+            .map(|row| match &row.values()[1] {
+                SqliteValue::Text(op) => op.to_string(),
+                other => panic!("unexpected opcode {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|op| op.as_str() == "NoConflict")
+                .count(),
+            2,
+            "one full secondary-key probe and one primary-key probe: {opcodes:?}"
+        );
+        assert!(
+            !opcodes
+                .iter()
+                .any(|op| matches!(op.as_str(), "Rewind" | "Next" | "IdxRowid")),
+            "a unique point lookup must not scan a duplicate prefix or assume a rowid: {opcodes:?}"
+        );
+    });
 }
 
 #[test]
@@ -176,5 +324,107 @@ fn wr_composite_unique_index_scan_and_constraint_bd_scbx6() {
             r.execute_batch(reins).is_ok(),
             "bd-scbx6 re-insert after DELETE freed (a,c)"
         );
+    });
+}
+
+#[test]
+fn wr_unique_probe_with_separate_pk_and_trigger_guard() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE records(id TEXT PRIMARY KEY, batch TEXT, ordinal INTEGER, digest TEXT, body TEXT, UNIQUE(batch,ordinal), UNIQUE(batch,digest,body)) WITHOUT ROWID",
+            "CREATE TRIGGER duplicate_record BEFORE INSERT ON records WHEN EXISTS(SELECT 1 FROM records WHERE batch=NEW.batch AND ordinal=NEW.ordinal) BEGIN SELECT RAISE(ABORT,'duplicate record guard'); END",
+            "INSERT INTO records VALUES ('first','group',1,'hash','body'), ('second','group',2,'hash','different body')",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for sql in [
+            "SELECT id FROM records WHERE batch='group' AND ordinal=2",
+            "SELECT id FROM records WHERE batch='group' AND digest='hash' AND body='different body'",
+            "SELECT id FROM records WHERE batch='group' AND digest='hash' AND body='absent'",
+        ] {
+            assert_eq!(
+                frank_rows(&f, sql).await.unwrap(),
+                stock_rows(&r, sql).unwrap(),
+                "{sql}"
+            );
+            let plan = f.query(&format!("EXPLAIN {sql}")).await.unwrap();
+            let opcodes: Vec<_> = plan.iter().map(|row| render(&row.values()[1])).collect();
+            assert_eq!(
+                opcodes
+                    .iter()
+                    .filter(|op| op.as_str() == "'NoConflict'")
+                    .count(),
+                2,
+                "{sql}: {opcodes:?}"
+            );
+            assert!(
+                !opcodes.iter().any(|op| op == "'Next'" || op == "'Rewind'"),
+                "{sql}: {opcodes:?}"
+            );
+        }
+        let duplicate = "INSERT INTO records VALUES ('third','group',2,'other hash','other body')";
+        let frank_error = f.execute(duplicate).await.unwrap_err().to_string();
+        let stock_error = r.execute_batch(duplicate).unwrap_err().to_string();
+        assert!(
+            frank_error.contains("duplicate record guard"),
+            "{frank_error}"
+        );
+        assert!(
+            stock_error.contains("duplicate record guard"),
+            "{stock_error}"
+        );
+        assert_eq!(
+            frank_rows(&f, "SELECT count(*) FROM records")
+                .await
+                .unwrap(),
+            stock_rows(&r, "SELECT count(*) FROM records").unwrap()
+        );
+    });
+}
+
+#[test]
+fn wr_unique_seek_declines_unsafe_index_shapes() {
+    asupersync::test_utils::run_test(|| async {
+        for (schema, index, inserts, query) in [
+            (
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a TEXT,b INTEGER) WITHOUT ROWID",
+                "CREATE INDEX idx ON t(a,b)",
+                "INSERT INTO t VALUES(1,'x',2),(2,'x',2)",
+                "SELECT id FROM t WHERE a='x' AND b=2",
+            ),
+            (
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a TEXT,b INTEGER) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX idx ON t(a,b) WHERE id>1",
+                "INSERT INTO t VALUES(1,'x',2),(2,'x',2)",
+                "SELECT id FROM t WHERE a='x' AND b=2",
+            ),
+            (
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a TEXT COLLATE NOCASE,b INTEGER) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX idx ON t(a,b)",
+                "INSERT INTO t VALUES(1,'X',2),(2,'Y',2)",
+                "SELECT id FROM t WHERE a='x' AND b=2",
+            ),
+            (
+                "CREATE TABLE t(id INTEGER PRIMARY KEY,a TEXT,b INTEGER) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX idx ON t(a DESC,b DESC)",
+                "INSERT INTO t VALUES(1,'x',2),(2,'x',3)",
+                "SELECT id FROM t WHERE a='x' AND b=2",
+            ),
+        ] {
+            let f = Connection::open(":memory:").await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [schema, index, inserts] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            let mut actual = frank_rows(&f, query).await.unwrap();
+            let mut expected = stock_rows(&r, query).unwrap();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected, "{schema}; {index}; {query}");
+        }
     });
 }
