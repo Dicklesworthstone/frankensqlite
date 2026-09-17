@@ -79365,6 +79365,13 @@ impl Connection {
             rowid_alias_col_idx: None,
             index_ordered_scan_reliable: true,
             planner_select_directive,
+            collation_semantics: if lock_unpoisoned(self.collation_registry.as_ref())
+                .any_builtin_overridden()
+            {
+                fsqlite_vdbe::codegen::CollationSemantics::Unverified
+            } else {
+                fsqlite_vdbe::codegen::CollationSemantics::Builtin
+            },
             reverse_unordered_selects: self.pragma_state.borrow().reverse_unordered_selects,
             ..CodegenContext::default()
         };

@@ -2254,6 +2254,15 @@ fn emit_upsert_expr(
     }
 }
 
+/// Whether the connection has verified the built-in comparison semantics.
+/// A collation named BINARY can still be an application override.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CollationSemantics {
+    #[default]
+    Unverified,
+    Builtin,
+}
+
 /// Configuration for the code generator.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CodegenContext {
@@ -2276,6 +2285,9 @@ pub struct CodegenContext {
     /// Set to false for MemDatabase backends where indexes don't maintain
     /// key-sorted iteration order.
     pub index_ordered_scan_reliable: bool,
+    /// Connection-verified built-in comparison semantics. Defaults to unverified:
+    /// the name BINARY alone does not exclude an application override.
+    pub collation_semantics: CollationSemantics,
     /// Optional planner-produced lowering directive for simple single-table
     /// SELECT access paths. When present, lowering either honors it or emits
     /// an explicit bypass reason before falling back to heuristic selection.
@@ -3964,6 +3976,64 @@ pub fn codegen_select(
         );
     }
 
+    // hfdt-gbou9l: trigger EXISTS probes project a constant and stop after one
+    // match. Prefer the longest safe literal prefix instead of repeatedly
+    // scanning every row sharing the first key. Retain the complete predicate.
+    if ctx.index_ordered_scan_reliable
+        && ctx.collation_semantics == CollationSemantics::Builtin
+        && !table.without_rowid
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.body.compounds.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && matches!(
+            columns.as_slice(),
+            [ResultColumn::Expr {
+                expr: Expr::Literal(Literal::Integer(1), _), ..
+            }]
+        )
+        && stmt.limit.as_ref().is_some_and(|limit| {
+            limit.offset.is_none()
+                && matches!(limit.limit, Expr::Literal(Literal::Integer(1), _))
+        })
+        && where_clause.as_deref().is_some_and(|expr| {
+            where_is_plain_scan_safe(expr) && !expr_contains_non_numbered_placeholder(expr)
+        })
+        && let Some((index, targets)) = literal_exists_index_prefix(
+            table,
+            table_alias,
+            schema,
+            where_clause.as_deref(),
+        )
+    {
+        let plan = OrderByIndexPlan {
+            index: index.clone(),
+            descending: false,
+            equality_prefix_len: targets.len(),
+            covering_output: None,
+        };
+        return codegen_select_index_ordered_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            &plan,
+            Some(&targets),
+        );
+    }
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
@@ -4016,6 +4086,7 @@ pub fn codegen_select(
                             done_label,
                             end_label,
                             &plan,
+                            None,
                         );
                     }
                     log_planner_select_directive_outcome(
@@ -4541,6 +4612,7 @@ pub fn codegen_select(
                 done_label,
                 end_label,
                 &index_plan,
+                None,
             );
         }
 
@@ -4673,6 +4745,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             &plan,
+            None,
         )
     } else {
         // --- Full table scan ---
@@ -9009,11 +9082,14 @@ fn codegen_select_index_ordered_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     index_plan: &OrderByIndexPlan,
+    explicit_prefix: Option<&[&Expr]>,
 ) -> Result<(), CodegenError> {
     let index_cursor = cursor + 1;
     let needs_table_lookup = index_plan.covering_output.is_none() || where_clause.is_some();
     let where_placeholder_base = b.current_anon_placeholder();
-    let equality_prefix_exprs = if index_plan.equality_prefix_len == 0 {
+    let equality_prefix_exprs = if let Some(targets) = explicit_prefix {
+        targets.to_vec()
+    } else if index_plan.equality_prefix_len == 0 {
         Vec::new()
     } else {
         extract_index_equality_prefix_exprs(&index_plan.index, table, table_alias, where_clause)
@@ -30148,6 +30224,59 @@ fn normalize_table_local_expression(
         Expr::RowValue(items, _) => items.iter_mut().all(normalize),
         Expr::Exists { .. } | Expr::Subquery(..) | Expr::Raise { .. } => false,
     }
+}
+
+/// Non-NULL literal `IS` has equality semantics; Boolean `IS` does not. Only
+/// native-class literals are admitted because this emitter performs no affinity
+/// conversion on its seek key. Stop at an unsafe/DESC term, preserving a useful
+/// earlier prefix (e.g. an ASC taxonomy/tag prefix before a DESC period).
+fn literal_exists_index_prefix<'a, 's>(
+    table: &'s TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    where_clause: Option<&'a Expr>,
+) -> Option<(&'s IndexSchema, Vec<&'a Expr>)> {
+    let mut terms = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut terms);
+    table.indexes.iter().filter_map(|index| {
+        if !index.supports_direct_column_lookup() {
+            return None;
+        }
+        let mut targets = Vec::new();
+        for (pos, column) in index.columns.iter().enumerate() {
+            if index.key_term_descending(pos)
+                || index.key_term_collation(pos)
+                    .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+            {
+                break;
+            }
+            let target = terms.iter().find_map(|term| {
+                let Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::Eq | BinaryOp::Is,
+                    right,
+                    ..
+                } = term else {
+                    return None;
+                };
+                let target = if expr_matches_index_column(left, table, table_alias, column) {
+                    right.as_ref()
+                } else if expr_matches_index_column(right, table, table_alias, column) {
+                    left.as_ref()
+                } else {
+                    return None;
+                };
+                (matches!(target, Expr::Literal(
+                    Literal::Integer(_) | Literal::Float(_)
+                        | Literal::String(_) | Literal::Blob(_), _))
+                    && index_range_bound_is_seek_safe(table, table_alias, schema, column, target))
+                    .then_some(target)
+            });
+            let Some(target) = target else { break };
+            targets.push(target);
+        }
+        (targets.len() >= 2).then_some((index, targets))
+    }).max_by_key(|(_, targets)| targets.len())
 }
 
 fn extract_index_column_equality_expr<'a>(

@@ -511,10 +511,11 @@ impl ScalarFunction for DecimalFunc {
                 |value| SqliteValue::Text(SmallText::from_string(value)),
             ));
         }
-        Ok(decimal_ext::value_to_decimal(&args[0]).map_or(
-            SqliteValue::Null,
-            |value| SqliteValue::Text(SmallText::from_string(value)),
-        ))
+        Ok(
+            decimal_ext::value_to_decimal(&args[0]).map_or(SqliteValue::Null, |value| {
+                SqliteValue::Text(SmallText::from_string(value))
+            }),
+        )
     }
 
     fn num_args(&self) -> i32 {

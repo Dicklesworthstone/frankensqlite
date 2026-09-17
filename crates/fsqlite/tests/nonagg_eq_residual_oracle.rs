@@ -11,6 +11,206 @@ use fsqlite_types::SqliteValue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+async fn has_composite_exists_seek(c: &Connection, sql: &str, width: i64) -> bool {
+    c.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| {
+            matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.as_str() == "IdxGT")
+                && row.values().get(6) == Some(&SqliteValue::Integer(width))
+        })
+}
+
+#[test]
+fn composite_literal_exists_prefix_and_residual_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE probe(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT, stamp INTEGER, flag INTEGER)",
+            "CREATE INDEX short_prefix ON probe(a)",
+            "CREATE INDEX medium_prefix ON probe(a,b)",
+            "CREATE INDEX long_prefix ON probe(a,b,c,stamp DESC)",
+            "INSERT INTO probe VALUES(1,'group','kind','tag',9,0),(2,'group','kind','tag',8,1),\
+             (3,'group','kind','other',7,1),(4,'group',NULL,'tag',6,1),\
+             (5,'group','2','tag',5,1),(6,'else','kind','tag',4,1)",
+        ]).await;
+        for (predicate, expected) in [
+            ("a='group' AND b IS 'kind' AND c IS 'tag' AND flag=1", true),
+            ("a='group' AND b IS 'kind' AND c IS 'tag' AND flag=2", false),
+            ("a='group' AND b IS 'missing' AND c IS 'tag'", false),
+            (
+                "a='group' AND 'kind' IS b AND 'tag'=c AND stamp=8 AND flag=1",
+                true,
+            ),
+            (
+                "a='group' AND b IS 'kind' AND c IS 'tag' AND c='other'",
+                false,
+            ),
+        ] {
+            let sql = format!("SELECT 1 FROM probe WHERE {predicate} LIMIT 1");
+            cmp(&f, &r, &sql, "composite-exists").await;
+            assert_eq!(!frank_rows(&f, &sql).await.is_empty(), expected, "{sql}");
+            assert!(has_composite_exists_seek(&f, &sql, 3).await, "{sql}");
+        }
+        // NULL and Boolean IS cannot be converted to equality seeks; numeric
+        // literals on TEXT need affinity conversion this bounded path lacks.
+        for predicate in [
+            "a='group' AND b IS NULL AND c='tag'",
+            "a='group' AND b IS TRUE AND c='tag'",
+            "a='group' AND b IS FALSE AND c='tag'",
+            "a='group' AND b IS 2 AND c='tag'",
+            "a='group' AND b IS 'kind' AND c IS NULL",
+        ] {
+            let sql = format!("SELECT 1 FROM probe WHERE {predicate} LIMIT 1");
+            cmp(&f, &r, &sql, "unsafe-prefix-tail").await;
+            assert!(!has_composite_exists_seek(&f, &sql, 3).await, "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM probe WHERE a='group' AND b IS 'kind' AND c IS 'tag' LIMIT 1",
+            "SELECT 1 FROM probe WHERE a='group' AND b IS 'kind' AND c IS 'tag' LIMIT 2",
+            "SELECT 1 FROM probe WHERE a='group' AND b IS 'kind' AND c IS 'tag' LIMIT 1 OFFSET 1",
+            "SELECT 1 FROM probe NOT INDEXED WHERE a='group' AND b IS 'kind' AND c IS 'tag' LIMIT 1",
+        ] {
+            cmp(&f, &r, sql, "outside-existence-lane").await;
+            assert!(!has_composite_exists_seek(&f, sql, 3).await, "{sql}");
+        }
+        for sql in [
+            "SELECT 1 FROM probe WHERE a='group' AND b IS ?1 AND c IS 'tag' LIMIT 1",
+            "SELECT 1 FROM probe WHERE a='group' AND b IS 'kind' AND c IS 'tag' AND flag IS ?1 LIMIT 1",
+        ] {
+            for (frank_value, sqlite_value) in [
+                (SqliteValue::Null, rusqlite::types::Value::Null),
+                (
+                    SqliteValue::from("kind"),
+                    rusqlite::types::Value::Text("kind".to_owned()),
+                ),
+                (SqliteValue::Integer(1), rusqlite::types::Value::Integer(1)),
+            ] {
+                cmp_params(
+                    &f,
+                    &r,
+                    sql,
+                    &[frank_value],
+                    &[sqlite_value],
+                    "bound-residual",
+                )
+                .await;
+            }
+        }
+        for sql in [
+            "CREATE TRIGGER duplicate_guard BEFORE INSERT ON probe WHEN EXISTS (\
+             SELECT 1 FROM probe AS existing WHERE existing.a=NEW.a \
+             AND existing.b IS NEW.b AND existing.c IS NEW.c AND existing.flag=NEW.flag) \
+             BEGIN SELECT RAISE(ABORT,'duplicate probe'); END",
+            "INSERT INTO probe VALUES(7,'group','kind','fresh',3,1)",
+        ] {
+            ins(&f, &r, sql).await;
+        }
+        both_reject_params(
+            &f,
+            &r,
+            "INSERT INTO probe VALUES(8,'group','kind','fresh',2,1)",
+            &[],
+            &[],
+            "trigger-duplicate",
+        )
+        .await;
+        cmp(&f, &r, "SELECT * FROM probe ORDER BY id", "trigger-state").await;
+    });
+}
+
+struct ExistsCaseFoldBinary;
+
+#[test]
+fn composite_literal_exists_declines_unsafe_index_shapes() {
+    asupersync::test_utils::run_test(|| async {
+        for index in [
+            "CREATE INDEX prefix ON probe(a,b DESC)",
+            "CREATE INDEX prefix ON probe(a,b COLLATE NOCASE)",
+            "CREATE INDEX prefix ON probe(a,b) WHERE flag=0",
+            "CREATE INDEX prefix ON probe(a,lower(b))",
+        ] {
+            let (f, r) = setup(&[
+                "CREATE TABLE probe(a TEXT,b TEXT,flag INTEGER)",
+                index,
+                "INSERT INTO probe VALUES('group','kind',1)",
+            ])
+            .await;
+            let sql = "SELECT 1 FROM probe WHERE a IS 'group' AND b IS 'kind' AND flag=1 LIMIT 1";
+            cmp(&f, &r, sql, index).await;
+            assert!(!frank_rows(&f, sql).await.is_empty(), "{index}");
+            assert!(!has_composite_exists_seek(&f, sql, 2).await, "{index}");
+        }
+        let (f, r) = setup(&[
+            "CREATE TABLE probe(a TEXT,b TEXT COLLATE NOCASE,flag INTEGER)",
+            "CREATE INDEX prefix ON probe(a,b COLLATE BINARY)",
+            "INSERT INTO probe VALUES('group','kind',1)",
+        ])
+        .await;
+        let sql = "SELECT 1 FROM probe WHERE a IS 'group' AND b IS 'KIND' AND flag=1 LIMIT 1";
+        cmp(&f, &r, sql, "declared-nocase").await;
+        assert!(!frank_rows(&f, sql).await.is_empty());
+        assert!(!has_composite_exists_seek(&f, sql, 2).await);
+        let (f, r) = setup(&[
+            "CREATE TABLE probe(a INTEGER,b BLOB,c REAL,flag INTEGER)",
+            "CREATE INDEX prefix ON probe(a,b,c)",
+            "INSERT INTO probe VALUES(7,X'0102',2.5,1),(7,X'0103',2.5,0)",
+        ])
+        .await;
+        for (sql, expected) in [
+            (
+                "SELECT 1 FROM probe WHERE a IS 7 AND b IS X'0102' AND c IS 2.5 AND flag=1 LIMIT 1",
+                true,
+            ),
+            (
+                "SELECT 1 FROM probe WHERE a IS 7 AND b IS X'0103' AND c IS 2.5 AND flag=1 LIMIT 1",
+                false,
+            ),
+        ] {
+            cmp(&f, &r, sql, "native-literal-types").await;
+            assert_eq!(!frank_rows(&f, sql).await.is_empty(), expected);
+            assert!(has_composite_exists_seek(&f, sql, 3).await, "{sql}");
+        }
+    });
+}
+
+impl fsqlite_func::collation::CollationFunction for ExistsCaseFoldBinary {
+    fn name(&self) -> &str {
+        "BINARY"
+    }
+    fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    }
+}
+
+#[test]
+fn composite_literal_exists_declines_overridden_binary() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE probe(a TEXT,b TEXT,flag INTEGER)",
+            "CREATE INDEX prefix ON probe(a,b)",
+            "INSERT INTO probe VALUES('group','kind',1)",
+        ])
+        .await;
+        let sql = "SELECT 1 FROM probe WHERE a IS 'GROUP' AND b IS 'KIND' AND flag=1 LIMIT 1";
+        let prepared = f.prepare(sql).await.unwrap();
+        assert!(prepared.query().await.unwrap().is_empty());
+        assert!(has_composite_exists_seek(&f, sql, 2).await);
+        f.register_collation_function(ExistsCaseFoldBinary);
+        assert!(matches!(
+            prepared.query().await.unwrap_err(),
+            fsqlite_error::FrankenError::SchemaChanged
+        ));
+        assert!(!has_composite_exists_seek(&f, sql, 2).await);
+        let expected = sqlite_rows(
+            &r,
+            "SELECT 1 FROM probe WHERE a IS 'GROUP' COLLATE NOCASE AND b IS 'KIND' COLLATE NOCASE AND flag=1 LIMIT 1",
+        );
+        assert!(!expected.is_empty());
+        assert_eq!(frank_rows(&f, sql).await, expected);
+    });
+}
+
 struct CountingIdentity {
     calls: Arc<AtomicUsize>,
 }

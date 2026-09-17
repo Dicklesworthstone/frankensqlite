@@ -15,7 +15,7 @@ use super::{decimal_normalize, format_decimal};
 // "1e9223372036854775807" must not request an unbounded allocation.
 const MAX_DECIMAL_DIGITS: usize = 1_000_000;
 
-pub(super) fn parse_decimal(s: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
+pub fn parse_decimal(s: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     let s = s.trim();
     let (negative, s) = if let Some(rest) = s.strip_prefix('-') {
         (true, rest)
@@ -145,7 +145,7 @@ fn exact_binary64(bits: u64) -> Option<String> {
     Some(scaled_digits(digits, bits >> 63 != 0, scale))
 }
 
-pub(super) fn value_to_decimal(value: &SqliteValue) -> Option<String> {
+pub fn value_to_decimal(value: &SqliteValue) -> Option<String> {
     match value {
         SqliteValue::Null => None,
         SqliteValue::Integer(value) => Some(value.to_string()),
@@ -242,7 +242,7 @@ impl ScalarFunction for DecimalPow2Func {
     }
 }
 
-pub(super) fn register(registry: &mut FunctionRegistry) {
+pub fn register(registry: &mut FunctionRegistry) {
     registry.register_scalar(DecimalExpFunc);
     registry.register_scalar(DecimalPow2Func);
 }
@@ -272,11 +272,15 @@ mod tests {
             text("1000000000000000000000000000001")
         );
         assert_eq!(
-            DecimalSubFunc.invoke(&[text("1e-3"), text("2e-3")]).unwrap(),
+            DecimalSubFunc
+                .invoke(&[text("1e-3"), text("2e-3")])
+                .unwrap(),
             text("-0.001")
         );
         assert_eq!(
-            DecimalMulFunc.invoke(&[text("12.5e-3"), text("8e1")]).unwrap(),
+            DecimalMulFunc
+                .invoke(&[text("12.5e-3"), text("8e1")])
+                .unwrap(),
             text("1")
         );
         for (left, right) in [("123e-2", "1.230"), (".5", "0.5"), ("1e-1", "0.1")] {
