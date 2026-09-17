@@ -58,8 +58,10 @@ impl CollationFunction for BinaryCollation {
 
 /// NOCASE collation: ASCII case-insensitive comparison.
 ///
-/// Only folds ASCII letters (`a-z` → `A-Z`). Non-ASCII bytes are compared
-/// as-is. For full Unicode case folding, use the ICU extension (§14.6).
+/// Only folds ASCII letters (`A-Z` → `a-z`). Non-ASCII bytes are compared
+/// as-is. A shared NUL terminates byte comparison; otherwise equal strings
+/// are ordered by their original byte lengths, including any NUL suffix.
+/// For full Unicode case folding, use the ICU extension (§14.6).
 pub struct NoCaseCollation;
 
 impl CollationFunction for NoCaseCollation {
@@ -68,9 +70,19 @@ impl CollationFunction for NoCaseCollation {
     }
 
     fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
-        let l = left.iter().map(u8::to_ascii_uppercase);
-        let r = right.iter().map(u8::to_ascii_uppercase);
-        l.cmp(r)
+        // SQLite's NOCASE uses sqlite3_strnicmp followed by a length tie-break.
+        // Uppercasing preserves letter equality but reverses ordering against
+        // punctuation in the ASCII gap between 'Z' and 'a'.
+        for (&l, &r) in left.iter().zip(right) {
+            let order = l.to_ascii_lowercase().cmp(&r.to_ascii_lowercase());
+            if order != Ordering::Equal {
+                return order;
+            }
+            if l == 0 {
+                break;
+            }
+        }
+        left.len().cmp(&right.len())
     }
 }
 
@@ -349,8 +361,59 @@ mod tests {
         let coll = NoCaseCollation;
         assert_eq!(coll.compare(b"ABC", b"abc"), Ordering::Equal);
         assert_eq!(coll.compare(b"Alice", b"alice"), Ordering::Equal);
-        // `[` (0x5B) < `a` (0x61) normally, but NOCASE: `[` (0x5B) > `A` (0x41)
-        assert_eq!(coll.compare(b"[", b"a"), Ordering::Greater);
+        // SQLite folds to lowercase, so '[' (0x5B) remains before 'a' (0x61).
+        assert_eq!(coll.compare(b"[", b"a"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_collation_nocase_all_single_bytes() {
+        let coll = NoCaseCollation;
+        let fold = |byte: u8| match byte {
+            b'A'..=b'Z' => byte + (b'a' - b'A'),
+            _ => byte,
+        };
+        for left in u8::MIN..=u8::MAX {
+            for right in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    coll.compare(&[left], &[right]),
+                    fold(left).cmp(&fold(right)),
+                    "NOCASE byte pair {left:#04x}, {right:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_collation_nocase_nul_and_length_tiebreak() {
+        // SQLite stops at a shared NUL, but its final tie-break uses the full
+        // byte lengths, not the lengths of the prefixes before that NUL.
+        let cases: &[(&[u8], &[u8], Ordering)] = &[
+            (b"", b"", Ordering::Equal),
+            (b"", b"\0", Ordering::Less),
+            (b"A", b"a\0", Ordering::Less),
+            (b"A\0B", b"a\0z", Ordering::Equal),
+            (b"A\0\xff", b"a\0\x01", Ordering::Equal),
+            (b"a\0zz", b"A\0b", Ordering::Greater),
+            (b"A\0", b"a\x01", Ordering::Less),
+            (b"A\x01", b"a\0", Ordering::Greater),
+            (b"A\0zzzz", b"B\0", Ordering::Less),
+            (b"\0a", b"\0z", Ordering::Equal),
+        ];
+        let coll = NoCaseCollation;
+        for &(left, right, expected) in cases {
+            assert_eq!(coll.compare(left, right), expected, "{left:?}, {right:?}");
+            assert_eq!(coll.compare(right, left), expected.reverse());
+        }
+    }
+
+    #[test]
+    fn test_registry_nocase_punctuation_order() {
+        let registry = CollationRegistry::new();
+        let coll = registry.find("nocase").expect("built-in NOCASE");
+        let mut values: Vec<&[u8]> = vec![b"Z", b"a", b"`", b"_", b"^", b"]", b"\\", b"[", b"{"];
+        values.sort_by(|left, right| coll.compare(left, right));
+        let expected: Vec<&[u8]> = vec![b"[", b"\\", b"]", b"^", b"_", b"`", b"a", b"Z", b"{"];
+        assert_eq!(values, expected);
     }
 
     #[test]
