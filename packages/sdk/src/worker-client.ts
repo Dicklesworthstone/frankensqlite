@@ -56,6 +56,7 @@ interface PendingRequest {
   resolve: (value: WorkerResponse) => void;
   reject: (reason?: unknown) => void;
   release: () => void;
+  isClose: boolean;
 }
 
 export class FrankenWorkerClient {
@@ -64,6 +65,9 @@ export class FrankenWorkerClient {
   readonly #pending = new Map<number, PendingRequest>();
   #nextRequestId = 1;
   #terminalError: Error | null = null;
+  #hostTerminal = false;
+  #failure: Error | null = null;
+  readonly #failureListeners = new Set<(error: Error) => void>();
   #closing = false;
   #disposed = false;
   #closePromise: Promise<void> | null = null;
@@ -77,18 +81,35 @@ export class FrankenWorkerClient {
     this.#pending.delete(event.data.requestId);
     pending.release();
     if (event.data.kind === "error") {
-      pending.reject(new FrankenSQLiteError(event.data.error));
+      const error = new FrankenSQLiteError(event.data.error);
+      pending.reject(error);
+      // These are the host's explicit terminal contracts, not ordinary SQL,
+      // quota, schema or admission failures. A live message channel does not
+      // imply that its database remains usable after failed rollback.
+      if (error.code === "ERR_FSQLITE_SNAPSHOT_CONNECTION_UNUSABLE" ||
+          error.code === "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE" ||
+          error.code === "ERR_FSQLITE_BULK_CONNECTION_UNUSABLE") {
+        this.#terminalError ??= error;
+        this.#hostTerminal = true;
+        // The host has closed its database but still accepts its close fence.
+        // Keep an admitted close awaiting that real acknowledgement.
+        this.#rejectPending(this.#terminalError, true);
+        this.#notifyFailure(this.#terminalError);
+      }
       return;
     }
     pending.resolve(event.data);
   };
 
   readonly #onError = (event: WorkerErrorEventLike): void => {
+    if (this.#disposed) return;
+    this.#hostTerminal = false;
     const error = new Error(
       `FrankenSQLite worker crashed: ${event.message || "unknown error"}`,
     );
     this.#terminalError ??= error;
     this.#rejectPending(this.#terminalError);
+    this.#notifyFailure(this.#terminalError);
   };
 
   constructor(worker: WorkerLike, limits: Partial<RequestLimits> = {}) {
@@ -104,6 +125,27 @@ export class FrankenWorkerClient {
 
   get resultEncoding(): ResultEncoding {
     return this.#resultEncoding;
+  }
+
+  /** Internal owner lifecycle, including faults observed before registration. */
+  observeFailure(listener: (error: Error) => void): () => void {
+    if (this.#failure !== null) {
+      listener(this.#failure);
+      return () => {};
+    }
+    if (this.#disposed) return () => {};
+    this.#failureListeners.add(listener);
+    return () => { this.#failureListeners.delete(listener); };
+  }
+
+  #notifyFailure(error: Error): void {
+    this.#failure ??= error;
+    const listeners = [...this.#failureListeners];
+    this.#failureListeners.clear();
+    // Bookkeeping must not interfere with the original request settlement.
+    for (const listener of listeners) {
+      try { listener(this.#failure); } catch { /* Internal owner already has the error. */ }
+    }
   }
 
   /** Local handle operations must also reject after close/crash/disposal. */
@@ -377,6 +419,8 @@ export class FrankenWorkerClient {
     this.#terminalError ??= reason;
     // Settle promises BEFORE detaching listeners, including when cleanup throws.
     this.#rejectPending(this.#terminalError);
+    if (!this.#closing) this.#notifyFailure(this.#terminalError);
+    this.#failureListeners.clear();
     const errors: unknown[] = [];
     for (const cleanup of [
       () => this.#worker.removeEventListener("message", this.#onMessage),
@@ -395,12 +439,13 @@ export class FrankenWorkerClient {
     }
   }
 
-  #rejectPending(error: Error): void {
-    for (const pending of this.#pending.values()) {
+  #rejectPending(error: Error, keepClose = false): void {
+    for (const [id, pending] of this.#pending) {
+      if (keepClose && pending.isClose) continue;
       pending.release();
       pending.reject(error);
+      this.#pending.delete(id);
     }
-    this.#pending.clear();
   }
 
   #nextId(): number {
@@ -454,7 +499,8 @@ export class FrankenWorkerClient {
   }
 
   #send(request: WorkerRequest, allowClosing = false, onPosted?: () => void): Promise<WorkerResponse> {
-    if (this.#terminalError !== null) {
+    const canCloseHost = (): boolean => allowClosing && request.kind === "close" && this.#hostTerminal && !this.#disposed;
+    if (this.#terminalError !== null && !canCloseHost()) {
       return Promise.reject(this.#terminalError);
     }
     if (this.#closing && !allowClosing) {
@@ -479,12 +525,12 @@ export class FrankenWorkerClient {
     }
     // Capture can invoke application getters which may have closed/disposed
     // this client. Recheck before posting, and return the unused reservation.
-    if (this.#terminalError !== null || (this.#closing && !allowClosing)) {
+    if ((this.#terminalError !== null && !canCloseHost()) || (this.#closing && !allowClosing)) {
       release();
       return Promise.reject(this.#terminalError ?? new Error("FrankenSQLite worker client is closing"));
     }
     return new Promise<WorkerResponse>((resolve, reject) => {
-      this.#pending.set(request.requestId, { resolve, reject, release });
+      this.#pending.set(request.requestId, { resolve, reject, release, isClose: request.kind === "close" });
       try {
         if (request.kind === "init" && request.config.snapshot) {
           this.#worker.postMessage(request, [request.config.snapshot.buffer]);
