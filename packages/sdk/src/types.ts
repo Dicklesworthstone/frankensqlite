@@ -29,6 +29,12 @@ export interface ExecuteManyOptions {
 export interface TransactionOptions {
   /** Cancel the whole scope; settles after callback, SQL and rollback drain. */
   signal?: AbortSignal;
+  /**
+   * Cooperative scope budget, integer 1..2147483647 milliseconds. No default
+   * deadline. Children inherit the parent's remaining budget and may shorten
+   * it, never extend it. Expiry stops new SQL and rolls back before rejecting.
+   */
+  timeoutMs?: number;
 }
 
 /** A pull-based source. Each yielded value is one positional parameter set. */

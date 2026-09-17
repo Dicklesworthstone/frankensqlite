@@ -1,5 +1,5 @@
 import { FrankenPreparedStatement } from "./statement";
-import { combineTransactionSignals, FrankenTransaction } from "./transaction";
+import { captureTransactionOptions, combineTransactionSignals, FrankenTransaction, TransactionBudget } from "./transaction";
 import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SqlBindings, SnapshotMetadata } from "./types";
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
@@ -24,6 +24,7 @@ export function observeDatabaseFailure(db: FrankenDB, listener: (error: Error) =
 interface TransactionScope {
   readonly id: string;
   readonly signal: AbortSignal;
+  readonly budget: TransactionBudget;
   cancellationError: FrankenSQLiteError | null;
   accepting: boolean;
   pending: Set<Promise<unknown>>;
@@ -263,31 +264,24 @@ export class FrankenDB {
     retry?: { owner: object; recovery: RetryRecovery },
   ): Promise<T> {
     this.#assertOwner(parent, retry?.owner);
-    const requestedSignal = options?.signal;
-    const signals: AbortSignal[] = [];
-    if (parent !== null) signals.push(parent.signal);
-    if (requestedSignal !== undefined) {
-      // Use the native getter's brand check, not duck typing. Some runtimes'
-      // any() silently ignore plain { aborted: false } objects.
-      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(requestedSignal);
-      signals.push(requestedSignal);
-    }
-    const signal = AbortSignal.any(signals);
+    const policy = captureTransactionOptions(options);
     // Reading caller options can re-enter this connection. Check again before
     // capturing authority; a child always inherits its parent's abort signal.
     this.#assertOwner(parent, retry?.owner);
+    const budget = new TransactionBudget(parent?.budget, policy, retry?.recovery.checkpoint);
+    const signal = budget.signal;
     const scope: TransactionScope = {
       id: String(this.#nextTransactionId++),
-      signal, cancellationError: null,
+      signal, budget, cancellationError: null,
       accepting: true, pending: new Set(), statements: new Set(), errors: [],
       children: new Set(),
       cleanupFailed: false,
     };
-    this.#checkCancellation(scope);
     // Claim before the first await so foreign operations cannot enter between
     // BEGIN and the callback, or while the callback awaits application work.
     this.#transactionScope = scope;
     let began = false;
+    let beginDispatched = false;
     let settling = false;
     let cancelSent = false;
     const cancel = (): void => {
@@ -297,7 +291,9 @@ export class FrankenDB {
       }
     };
     try {
+      this.#checkCancellation(scope);
       signal.addEventListener("abort", cancel, { once: true });
+      beginDispatched = true;
       await this.#client.transaction("begin", scope.id, parent?.id);
       began = true;
       // An abort during BEGIN must wait for its actual result before rollback.
@@ -339,7 +335,7 @@ export class FrankenDB {
       // started transaction must first acknowledge its full rollback. Unknown
       // cleanup/transport outcomes never reach the retry scheduler as safe.
       if (retry !== undefined && this.#transactionFailure === null && !scope.cleanupFailed &&
-          (began || isTransactionConflict(error))) {
+          (began || !beginDispatched || isTransactionConflict(error))) {
         retry.recovery.recovered = true;
         retry.recovery.retryAllowed = isTransactionConflict(error);
       }
@@ -351,6 +347,7 @@ export class FrankenDB {
       if (scope.cleanupFailed && parent !== null) parent.cleanupFailed = true;
       this.#transactionScope = parent;
       signal.removeEventListener("abort", cancel);
+      budget.finish();
     }
   }
 
@@ -398,10 +395,13 @@ export class FrankenDB {
   }
 
   #checkCancellation(scope: TransactionScope): void {
+    scope.budget.checkpoint();
     if (!scope.signal.aborted) return;
     if (scope.cancellationError === null) {
-      scope.cancellationError = new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_CANCELLED",
-        message: "This managed transaction was cancelled", transient: false });
+      scope.cancellationError = new FrankenSQLiteError({
+        code: scope.budget.timedOut ? "ERR_FSQLITE_TRANSACTION_TIMEOUT" : "ERR_FSQLITE_TRANSACTION_CANCELLED",
+        message: scope.budget.timedOut ? "This managed transaction exceeded its deadline" : "This managed transaction was cancelled",
+        transient: false });
       // Keep the caller's exact reason locally; it need not be structured-cloneable.
       scope.cancellationError.cause = scope.signal.reason;
     }

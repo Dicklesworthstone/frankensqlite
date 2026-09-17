@@ -636,3 +636,262 @@ test('queued retries remain usable after the last subscription is removed', asyn
   assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
   assert.equal(raw.prepare("SELECT count(*) n FROM temp.sqlite_master WHERE type='trigger'").get().n, 0);
 });
+
+for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 2 ** 31, '10', null]) {
+  test(`deadline contract rejects invalid timeout ${String(timeoutMs)} before BEGIN`, async t => {
+    const { db, state } = await fixture(t);
+    await assert.rejects(db.transaction(() => {}, { timeoutMs }), e => e.code === 'ERR_FSQLITE_TRANSACTION_INPUT');
+    assert.equal(state.attempts, 0);
+  });
+}
+
+test('deadline contract rolls back writes when the clock expires before timers run', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await assert.rejects(db.transaction(async tx => {
+    await tx.execute('UPDATE counts SET value=1');
+    now = 120; // No task yield: the timer has not fired.
+  }, { timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 0);
+  assert.ok(!actions(state).includes('commit'));
+  await db.execute('UPDATE counts SET value=2');
+});
+
+test('deadline contract checks delayed BEGIN before entering application callback', async t => {
+  const { db, state } = await fixture(t); let now = 100, callbacks = 0;
+  t.mock.method(performance, 'now', () => now);
+  state.afterBoundary = action => { if (action === 'begin') now = 120; };
+  await assert.rejects(db.transaction(() => { callbacks++; }, { timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(callbacks, 0); assert.deepEqual(actions(state), ['begin', 'cancel', 'rollback']);
+});
+
+test('deadline contract gives a child a shorter recoverable budget without aborting its parent', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await db.transaction(async tx => {
+    await assert.rejects(tx.transaction(async child => {
+      await child.execute('UPDATE counts SET value=9'); now = 120;
+    }, { timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+    await tx.execute('UPDATE counts SET value=2');
+  }, { timeoutMs: 100 });
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 2);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 1);
+  assert.equal(state.attempts, 1);
+});
+
+test('deadline contract enforces the retry deadline before COMMIT even without a timer turn', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await assert.rejects(db.transactionWithRetry(async tx => {
+    await tx.execute('UPDATE counts SET value=1'); now = 120;
+  }, { ...fast, timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT');
+  assert.equal(state.attempts, 1); assert.ok(!actions(state).includes('commit'));
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract blocks new direct and prepared SQL even when the callback catches expiry', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100, executions = 0;
+  t.mock.method(performance, 'now', () => now);
+  state.beforeExecute = () => { executions++; };
+  await assert.rejects(db.transaction(async tx => {
+    const statement = await tx.prepare('UPDATE counts SET value=5');
+    now = 120;
+    await assert.rejects(tx.execute('UPDATE counts SET value=9'), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+    await assert.rejects(statement.execute(), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  }, { timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(executions, 0); assert.equal(state.statements.size, 0);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract cannot be extended or swallowed by a child with a longer budget', async t => {
+  const { db, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await assert.rejects(db.transaction(async tx => {
+    await assert.rejects(tx.transaction(async child => {
+      await child.execute('UPDATE counts SET value=9'); now = 120;
+    }, { timeoutMs: 1000 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+    await assert.rejects(tx.execute('UPDATE counts SET value=2'), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  }, { timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract inherits retry expiry through nested scopes and joins both rollbacks', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await assert.rejects(db.transactionWithRetry(tx => tx.transaction(async child => {
+    await child.execute('UPDATE counts SET value=1'); now = 120;
+  }, { timeoutMs: 1000 }), { ...fast, timeoutMs: 10 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT');
+  assert.equal(state.attempts, 1);
+  assert.equal(actions(state).filter(action => action === 'rollback').length, 2);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract waits for an active callback before rolling back', async t => {
+  const { db, state, raw } = await fixture(t); const entered = deferred(), release = deferred();
+  let settled = false, signal;
+  const pending = db.transaction(async tx => {
+    signal = tx.signal; await tx.execute('UPDATE counts SET value=1'); entered.resolve(); await release.promise;
+  }, { timeoutMs: 10 });
+  pending.then(() => { settled = true; }, () => { settled = true; });
+  await entered.promise;
+  try {
+    await sleep(25); assert.equal(signal.aborted, true); assert.equal(settled, false);
+    assert.ok(!actions(state).includes('rollback'));
+  } finally { release.resolve(); }
+  await assert.rejects(pending, e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract drains unawaited in-flight SQL before rollback and rejection', async t => {
+  const { db, state, raw } = await fixture(t); const entered = deferred(), release = deferred();
+  state.beforeExecute = async () => { entered.resolve(); await release.promise; };
+  let settled = false;
+  const pending = db.transaction(tx => { void tx.execute('UPDATE counts SET value=1'); }, { timeoutMs: 10 });
+  pending.then(() => { settled = true; }, () => { settled = true; });
+  await entered.promise;
+  try {
+    await sleep(25); assert.equal(settled, false); assert.ok(!actions(state).includes('rollback'));
+  } finally { release.resolve(); }
+  await assert.rejects(pending, e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 0);
+});
+
+test('deadline contract preserves a successful COMMIT dispatched before expiry', async t => {
+  const { db, state, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  state.afterBoundary = action => { if (action === 'commit') now = 120; };
+  assert.equal(await db.transaction(async tx => {
+    await tx.execute('UPDATE counts SET value=1'); return 'committed';
+  }, { timeoutMs: 10 }), 'committed');
+  assert.ok(!actions(state).includes('rollback'));
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+});
+
+test('deadline contract preserves application failures instead of replacing them with a timeout', async t => {
+  const { db, raw } = await fixture(t); let now = 100; const application = new Error('application failure');
+  t.mock.method(performance, 'now', () => now);
+  await assert.rejects(db.transaction(async tx => {
+    await tx.execute('UPDATE counts SET value=1'); now = 120; throw application;
+  }, { timeoutMs: 10 }), error => {
+    assert.ok(error instanceof AggregateError); assert.ok(error.errors.includes(application));
+    assert.ok(error.errors.some(e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT')); return true;
+  });
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract gives rollback failure precedence and fences the connection', async t => {
+  const { db, state } = await fixture(t); let now = 100; const rollback = new Error('rollback failed');
+  t.mock.method(performance, 'now', () => now);
+  state.beforeBoundary = action => { if (action === 'rollback') throw rollback; };
+  let failure;
+  await assert.rejects(db.transaction(async tx => {
+    await tx.execute('UPDATE counts SET value=1'); now = 120;
+  }, { timeoutMs: 10 }), error => {
+    failure = error; assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors[0].code, 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+    assert.equal(error.errors[1], rollback); return true;
+  });
+  assert.equal(actions(state).filter(action => action === 'dispose').length, 1);
+  await assert.rejects(db.execute('SELECT 1'), e => e === failure);
+});
+
+test('deadline contract preserves nested caller cancellation reasons after both rollbacks', async t => {
+  const { db, state, raw } = await fixture(t); const control = new AbortController(); const reason = () => 'local reason';
+  await assert.rejects(db.transactionWithRetry(tx => tx.transaction(async child => {
+    await child.execute('UPDATE counts SET value=1'); control.abort(reason);
+  }), { ...fast, signal: control.signal }), error => {
+    assert.equal(error.code, 'ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED'); assert.equal(error.cause, reason); return true;
+  });
+  assert.equal(actions(state).filter(action => action === 'rollback').length, 2);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract never hides a mixed application failure under nested retry cancellation', async t => {
+  const { db, raw } = await fixture(t); const control = new AbortController(); const application = new Error('retain me');
+  await assert.rejects(db.transactionWithRetry(tx => tx.transaction(async child => {
+    await child.execute('UPDATE counts SET value=1'); control.abort('cancel'); throw application;
+  }), { ...fast, signal: control.signal }), error => {
+    assert.ok(error instanceof AggregateError);
+    const leaves = e => e instanceof AggregateError ? e.errors.flatMap(leaves) : [e];
+    assert.ok(leaves(error).includes(application)); return true;
+  });
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract captures queued timeouts at submission, not after waiting', async t => {
+  const { queue, state, raw } = await queueFixture(t); const entered = deferred(), release = deferred(); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  const blocker = queue.transaction(async () => { entered.resolve(); await release.promise; }); await entered.promise;
+  let reads = 0, limit = 10;
+  const pending = queue.transaction(async tx => {
+    await tx.execute('UPDATE counts SET value=1'); now += 20;
+  }, { get timeoutMs() { reads++; return limit; } });
+  const rejected = assert.rejects(pending, e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  limit = 1000; now = 1000; release.resolve(); await blocker; await rejected;
+  assert.equal(reads, 1); assert.equal(state.attempts, 2); assert.equal(queue.stats.failedJobs, 1);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('deadline contract starts the queued active budget after waiting, not at submission', async t => {
+  const { queue, raw } = await queueFixture(t); const entered = deferred(), release = deferred(); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  const blocker = queue.transaction(async () => { entered.resolve(); await release.promise; }); await entered.promise;
+  const pending = queue.transaction(tx => tx.execute('UPDATE counts SET value=1'), { timeoutMs: 10 });
+  now = 1000; release.resolve(); await blocker; await pending;
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+  assert.equal(queue.stats.completedJobs, 2);
+});
+
+test('deadline contract rolls back watched writes when journal postlude exceeds the budget', async t => {
+  const { queue, state, raw } = await queueFixture(t); const events = []; let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await queue.subscribe(['counts'], change => { events.push(change); });
+  state.beforeQuery = sql => { if (sql.startsWith('SELECT id, dirty')) now = 120; };
+  await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=1'), { timeoutMs: 10 }),
+    e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  state.beforeQuery = undefined;
+  await queue.transaction(tx => tx.query('SELECT value FROM counts')); await sleep(5);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 0);
+  assert.deepEqual(events, []); assert.equal(queue.changeSequence, 0n);
+});
+
+test('deadline contract holds queue ownership through slow rollback before starting the next job', async t => {
+  const { queue, state } = await queueFixture(t, { maxPendingJobs: 2 }); const rolling = deferred(), release = deferred(); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  state.afterBoundary = async action => { if (action === 'rollback') { rolling.resolve(); await release.promise; } };
+  const first = queue.transaction(async tx => { await tx.execute('UPDATE counts SET value=1'); now = 120; }, { timeoutMs: 10 });
+  const rejected = assert.rejects(first, e => e.code === 'ERR_FSQLITE_TRANSACTION_TIMEOUT');
+  await rolling.promise; let secondStarted = false;
+  const second = queue.transaction(async tx => { secondStarted = true; return (await tx.query('SELECT value FROM counts')).rows[0].value; });
+  try {
+    await turn(); assert.equal(secondStarted, false); assert.equal(queue.stats.pendingJobs, 2);
+    await assert.rejects(queue.transaction(() => {}), e => e.code === 'ERR_FSQLITE_JOB_QUEUE_FULL');
+  } finally { release.resolve(); }
+  await rejected; assert.equal(await second, 0); assert.equal(queue.stats.failedJobs, 1);
+});
+
+test('deadline contract rejects invalid queued policies without a slot or any SQL', async t => {
+  const { queue, state } = await queueFixture(t);
+  await assert.rejects(queue.transaction(() => {}, { timeoutMs: 0 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_INPUT');
+  assert.equal(state.attempts, 0); assert.equal(queue.stats.acceptedJobs, 0); assert.equal(queue.stats.rejectedJobs, 1);
+});
+
+test('deadline contract rechecks ownership after a reentrant timeout getter', async t => {
+  const { db, state } = await fixture(t); const release = deferred(); let other;
+  await assert.rejects(db.transaction(() => {}, { get timeoutMs() {
+    other = db.transaction(async () => { await release.promise; }); return 10;
+  } }), e => e.code === 'ERR_FSQLITE_TRANSACTION_OWNERSHIP');
+  release.resolve(); await other; assert.equal(state.attempts, 1);
+});
+
+test('deadline contract does not introduce a default timeout for ordinary transactions', async t => {
+  const { db, raw } = await fixture(t); let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  await db.transaction(async tx => {
+    now = 1_000_000; await tx.execute('UPDATE counts SET value=1');
+  });
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+});

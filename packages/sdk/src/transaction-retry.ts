@@ -38,6 +38,8 @@ export class FrankenTransactionRetryError extends Error {
 export interface RetryRecovery {
   recovered: boolean;
   retryAllowed: boolean;
+  /** Poll the enclosing deadline before admitting work or committing. */
+  readonly checkpoint: () => void;
 }
 
 export interface ResolvedTransactionRetryOptions {
@@ -120,6 +122,36 @@ export function isTransactionConflict(error: unknown): boolean {
   catch { return false; } // Caller-created Error getters are not retry authority.
 }
 
+/** A cancelled child and its parent may independently report the same abort. */
+function isCancellationFailure(error: unknown, reason: unknown): boolean {
+  const ancestors = new Set<object>();
+  let remaining = 64;
+  const visit = (value: unknown, depth: number): boolean => {
+    if (--remaining < 0 || depth > 8 || !(value instanceof Error) || ancestors.has(value)) return false;
+    ancestors.add(value);
+    try {
+      if (value instanceof AggregateError) {
+        const children = value.errors;
+        if (!Array.isArray(children) || children.length === 0 || children.length > remaining) return false;
+        for (let i = 0; i < children.length; i++) {
+          if (!Object.hasOwn(children, i) || !visit(children[i], depth + 1)) return false;
+        }
+        return true;
+      }
+      if (!(value instanceof FrankenSQLiteError) || value.cleanupErrors.length !== 0 || value.userRecoverable === false) return false;
+      if (value.code === "ERR_FSQLITE_TRANSACTION_ABORTED") return visit(value.cause, depth + 1);
+      // Local cancellation retains the exact caller reason. Worker cancellation
+      // has no clone of that reason. An unrelated cause is not ours to discard.
+      return value.code === "ERR_FSQLITE_TRANSACTION_CANCELLED" &&
+        (value.cause === undefined || value.cause === reason);
+    } finally {
+      ancestors.delete(value);
+    }
+  };
+  try { return visit(error, 0); }
+  catch { return false; }
+}
+
 /** Internal scheduler. Never returns while an attempt/rollback is outstanding. */
 export async function runTransactionRetry<T>(
   attempt: (signal: AbortSignal, info: TransactionRetryAttempt, recovery: RetryRecovery) => Promise<T>,
@@ -132,8 +164,11 @@ export async function runTransactionRetry<T>(
   let attempts = 0;
   let lastError: unknown;
   const timer = setTimeout(() => timeout.abort(timeoutReason), options.timeoutMs);
-  const check = (): void => {
+  const checkpoint = (): void => {
     if (performance.now() >= deadline && !timeout.signal.aborted) timeout.abort(timeoutReason);
+  };
+  const check = (): void => {
+    checkpoint();
     if (!signal.aborted) return;
     if (signal.reason === timeoutReason) {
       throw new FrankenTransactionRetryError("ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT",
@@ -147,7 +182,7 @@ export async function runTransactionRetry<T>(
   try {
     while (true) {
       check();
-      const recovery: RetryRecovery = { recovered: false, retryAllowed: false };
+      const recovery: RetryRecovery = { recovered: false, retryAllowed: false, checkpoint };
       attempts++;
       try {
         // Do not recheck the signal after success: an acknowledged COMMIT wins
@@ -157,8 +192,7 @@ export async function runTransactionRetry<T>(
         // Failed cleanup/uncertain outcomes remain authoritative even if abort
         // fired. Never hide them under a convenient cancellation/timeout error.
         if (!recovery.recovered) throw error;
-        if (signal.aborted && error instanceof FrankenSQLiteError &&
-            error.code === "ERR_FSQLITE_TRANSACTION_CANCELLED") {
+        if (signal.aborted && isCancellationFailure(error, signal.reason)) {
           lastError = error;
           check();
         }

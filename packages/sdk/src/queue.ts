@@ -3,8 +3,9 @@ import { FrankenSQLiteError } from "./errors";
 import { TableChangeJournal, captureTables } from "./change-journal";
 import { ChangeObserver, createChangeStream } from "./subscriptions";
 import type { TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
+import { captureTransactionOptions } from "./transaction";
 import type { FrankenTransaction } from "./transaction";
-import type { FrankenDbOpenOptions, SnapshotMetadata } from "./types";
+import type { FrankenDbOpenOptions, SnapshotMetadata, TransactionOptions } from "./types";
 import { resolveTransactionRetryOptions } from "./transaction-retry";
 import type { TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
@@ -32,7 +33,7 @@ export interface QueuedJobOptions {
   waitTimeoutMs?: number;
 }
 
-export interface QueuedTransactionOptions extends QueuedJobOptions {
+export interface QueuedTransactionOptions extends QueuedJobOptions, TransactionOptions {
   /** Active transaction cancellation also drains callback, SQL and rollback. */
   signal?: AbortSignal;
 }
@@ -183,13 +184,29 @@ export class FrankenDBQueue {
     work: (tx: FrankenTransaction) => T | Promise<T>,
     options?: QueuedTransactionOptions,
   ): Promise<T> {
+    let timeoutMs: number | undefined;
+    const admission: QueuedJobOptions = {};
+    try {
+      this.#assertAdmission();
+      if (typeof work !== "function") throw new TypeError("A transaction callback is required");
+      const policy = captureTransactionOptions(options);
+      timeoutMs = policy.timeoutMs;
+      const waitTimeoutMs = options?.waitTimeoutMs;
+      if (policy.signal !== undefined) admission.signal = policy.signal;
+      if (waitTimeoutMs !== undefined) admission.waitTimeoutMs = waitTimeoutMs;
+    } catch (error: unknown) {
+      this.#rejected++;
+      return Promise.reject(error);
+    }
     return this.#enqueue(async signal => {
-      const transactionOptions = signal === undefined ? undefined : { signal };
+      const transactionOptions: TransactionOptions = {};
+      if (signal !== undefined) transactionOptions.signal = signal;
+      if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
       if (this.#journal === null) return this.#db.transaction(work, transactionOptions);
       const result = await this.#journal.run(this.#db, work, transactionOptions);
       this.#publishTables(result.tables);
       return result.value;
-    }, options, work);
+    }, admission, work);
   }
 
   /**

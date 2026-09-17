@@ -78,6 +78,60 @@ recovered conflict when available. Exhausting attempts rethrows the last
 conflict itself, preserving SQLite codes, causes and batch indexes. Fatal
 cleanup errors take precedence over cancellation/timeout wrappers.
 
+## Deadlines for ordinary and nested transactions
+
+The single-attempt `db.transaction()` and nested `tx.transaction()` APIs also
+accept `{ timeoutMs }` through `TransactionOptions`. This is opt-in: ordinary
+transactions have no default deadline. Values must be integer milliseconds in
+1..2147483647 and are validated before BEGIN or a queue reservation.
+
+```ts
+await db.transaction(async tx => {
+  await tx.execute("UPDATE counters SET value = value + 1 WHERE id = ?", [1]);
+  try {
+    await tx.transaction(async child => {
+      // A shorter child budget is recoverable after its SAVEPOINT rollback.
+      await child.execute("INSERT INTO audit(message) VALUES (?)", ["updated"]);
+    }, { timeoutMs: 100 });
+  } catch (error) {
+    if (!(error instanceof FrankenSQLiteError) ||
+        error.code !== "ERR_FSQLITE_TRANSACTION_TIMEOUT") throw error;
+  }
+}, { timeoutMs: 2000 });
+```
+
+Each child inherits its parent's remaining budget, including a containing
+retry operation's deadline. A longer child timeout cannot extend that budget;
+starting another child or retry attempt cannot reset it. A child-only expiry
+can be caught after rollback while a still-live parent continues. Catching a
+parent expiry never restores permission to execute or commit that parent.
+
+Timers abort `tx.signal` to wake cooperative work. Synchronous checks of the
+monotonic deadline additionally run before new transaction-scoped SQL and
+before commit, so delayed timer tasks or resolved-Promise chains cannot permit
+a late commit. Expiry during BEGIN waits for its acknowledgement, then rolls
+back without starting the callback. Admitted SQL, callbacks, child scopes and
+prepared-handle cleanup are joined before rollback and rejection. Nothing
+returns early via a timeout/SQL promise race. Timers are released on every
+finished scope. This does not interrupt a long-running core operation or an
+uncooperative callback and does not guarantee settlement within the budget.
+
+An ordinary or child deadline reports `ERR_FSQLITE_TRANSACTION_TIMEOUT`;
+caller cancellation retains `ERR_FSQLITE_TRANSACTION_CANCELLED` and its exact
+local reason. A containing retry deadline reports
+`ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT` after confirmed recovery, including
+when both parent and child report cancellation. Mixed application failures
+and failed cleanup retain their original error tree instead of being hidden
+under a timeout. Successful COMMIT dispatched before expiry remains successful
+even when its acknowledgement arrives after the deadline.
+
+`queue.transaction(work, { timeoutMs, waitTimeoutMs })` separates time waiting
+to start from the active transaction budget, just like queued retries. Policy
+is captured at submission; the active budget starts after queue-boundary
+subscription reconciliation. Journal verification and dirty-bit collection
+are inside that budget. Expiry rolls back watched writes without advancing
+`changeSequence`, and the FIFO slot stays occupied until recovery finishes.
+
 ## FIFO jobs and subscriptions
 
 `FrankenDBQueue.transactionWithRetry(work, options)` exposes the same opt-in
