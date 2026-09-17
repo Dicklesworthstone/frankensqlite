@@ -767,7 +767,7 @@ Result: the TUI waits on "Waiting for background terminal" **indefinitely** whil
 
 Avoid it:
 - Run long/verification commands in the **foreground** with a reaper: `timeout <N>s <command>`.
-- Bypass the wrapper for long or background compiles: `RCH_CARGO_WRAPPER_BYPASS=1 <command>` (returns immediately, no wrapper wait to strand) — the default in this repo's build guidance.
+- Bypass the wrapper for long or background compiles: `RCH_CARGO_WRAPPER_BYPASS=1 <command>` (returns immediately, no wrapper wait to strand). NOT the default: as of 2026-09-17 bypassing by default melted trj (load 148, 150+ runnable threads on 128 CPUs, execve 29x slower than css) because every pane compiled locally. Prefer offload; bypass only when the wrapper is actually stranding you, and bound it with `timeout`.
 - Or bound the wait: `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=<N> <command>`.
 
 If already wedged: `rch status`/`rch queue` to confirm the remote is idle, then
