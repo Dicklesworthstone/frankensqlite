@@ -4,6 +4,8 @@ export {
   WorkerConnectionHost,
 } from "./connection";
 export * from "./protocol";
+export { BindingError, MAX_BIND_PARAMETERS, parameterLayout, resolveBindings } from "./bindings";
+export type { ParameterLayout } from "./bindings";
 export { BINARY_RESULT_THRESHOLD, MAX_BINARY_RESULT_BYTES, ResultCodecError,
   decodeQueryResult, resolveResultEncoding, responseTransferList } from "./result-codec";
 export type { ResultEncoding } from "./result-codec";

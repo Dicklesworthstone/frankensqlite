@@ -12,6 +12,7 @@ import type {
   SerializedFrankenError,
   StatementFinalizeResponse,
   SqlScalar,
+  SqlBindings,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
@@ -30,6 +31,8 @@ import type { RequestLimits, RequestQueueStats } from "./admission";
 import { ManagedTransactionError, ManagedTransactions, validateManagedSql } from "./transactions";
 import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
 import type { ResultEncoding } from "./result-codec";
+import { parameterLayout, resolveBindings } from "./bindings";
+import type { ParameterLayout } from "./bindings";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
@@ -94,6 +97,7 @@ export class WorkerConnectionHost {
   #db: CoreDatabaseHandle | null = null;
   #nextStatementId = 1;
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
+  readonly #parameterLayouts = new Map<string, ParameterLayout>();
   readonly #statementOwners = new Map<string, string>();
   readonly #transactions = new ManagedTransactions();
   #requestTail: Promise<void> = Promise.resolve();
@@ -343,9 +347,10 @@ export class WorkerConnectionHost {
   async #execute(
     requestId: number,
     sql: string,
-    params: readonly unknown[],
+    bindings: SqlBindings,
   ): Promise<ExecuteResponse> {
     const db = this.#requireDatabase();
+    const params = this.#parameters(sql, bindings);
     const changes =
       params.length === 0
         ? await db.execute(sql)
@@ -371,9 +376,10 @@ export class WorkerConnectionHost {
   async #query(
     requestId: number,
     sql: string,
-    params: readonly unknown[],
+    bindings: SqlBindings,
   ): Promise<QueryResponse | BinaryQueryResponse> {
     const db = this.#requireDatabase();
+    const params = this.#parameters(sql, bindings);
     const data =
       params.length === 0
         ? await db.query(sql)
@@ -397,9 +403,11 @@ export class WorkerConnectionHost {
   }
 
   async #prepare(requestId: number, sql: string, transactionId?: string): Promise<PrepareResponse> {
+    const layout = parameterLayout(sql);
     const stmt = await this.#requireDatabase().prepare(sql);
     const statementId = String(this.#nextStatementId++);
     this.#statements.set(statementId, stmt);
+    this.#parameterLayouts.set(statementId, layout);
     if (transactionId !== undefined) this.#statementOwners.set(statementId, transactionId);
     return {
       kind: "prepare-result",
@@ -409,6 +417,8 @@ export class WorkerConnectionHost {
         sql: stmt.sql,
         columnCount: stmt.columnCount,
         columnNames: stmt.columnNames(),
+        parameterCount: layout.count,
+        parameterNames: layout.names,
       },
     };
   }
@@ -416,9 +426,10 @@ export class WorkerConnectionHost {
   async #statementExecute(
     requestId: number,
     statementId: string,
-    params: readonly unknown[],
+    bindings: SqlBindings,
   ): Promise<ExecuteResponse> {
     const stmt = this.#requireStatement(statementId);
+    const params = this.#parameters(stmt.sql, bindings, this.#parameterLayouts.get(statementId));
     const changes =
       params.length === 0
         ? await stmt.execute()
@@ -433,9 +444,10 @@ export class WorkerConnectionHost {
   async #statementQuery(
     requestId: number,
     statementId: string,
-    params: readonly unknown[],
+    bindings: SqlBindings,
   ): Promise<QueryResponse | BinaryQueryResponse> {
     const stmt = this.#requireStatement(statementId);
+    const params = this.#parameters(stmt.sql, bindings, this.#parameterLayouts.get(statementId));
     const data =
       params.length === 0
         ? await stmt.query()
@@ -449,6 +461,7 @@ export class WorkerConnectionHost {
   ): StatementFinalizeResponse {
     const stmt = this.#requireStatement(statementId);
     this.#statements.delete(statementId);
+    this.#parameterLayouts.delete(statementId);
     this.#statementOwners.delete(statementId);
     stmt.free();
     return {
@@ -510,6 +523,7 @@ export class WorkerConnectionHost {
   #disposeDatabase(): void {
     const statements = [...this.#statements.values()];
     this.#statements.clear();
+    this.#parameterLayouts.clear();
     this.#statementOwners.clear();
     this.#transactions.clear();
     const db = this.#db;
@@ -568,6 +582,14 @@ export class WorkerConnectionHost {
       throw new Error(`Unknown prepared statement id \`${statementId}\``);
     }
     return stmt;
+  }
+
+  #parameters(sql: string, bindings: SqlBindings, layout?: ParameterLayout): readonly SqlScalar[] {
+    // Existing positional calls keep the core's unbound-value semantics.
+    // Named objects are complete bindings; refuse scripts before any SQL runs.
+    if (Array.isArray(bindings)) return bindings;
+    validateManagedSql(sql);
+    return resolveBindings(layout ?? parameterLayout(sql), bindings);
   }
 }
 

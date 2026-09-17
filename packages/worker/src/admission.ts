@@ -1,5 +1,6 @@
 import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
-import type { InitConfig, SqlScalar, WorkerRequest } from "./protocol";
+import type { InitConfig, SqlBindings, SqlScalar, WorkerRequest } from "./protocol";
+import { BindingError, isNamedBindings } from "./bindings";
 import { validateTransactionId } from "./transactions";
 import { resolveResultEncoding } from "./result-codec";
 
@@ -121,6 +122,23 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     for (let i = 0; i < length; i += 1) captured.push(params(values[i]!, i));
     return captured;
   }
+  function bindings(values: SqlBindings): SqlBindings {
+    if (Array.isArray(values)) return params(values);
+    if (!isNamedBindings(values)) {
+      throw new BindingError("ERR_FSQLITE_BINDING_INPUT", "Bindings must be an array or a plain named object");
+    }
+    charge(16);
+    const captured: Record<string, SqlScalar> = Object.create(null);
+    // Charge incrementally before cloning. Do not invoke a custom iterator or
+    // copy unrelated/inherited properties into the worker message.
+    for (const key in values) {
+      if (!Object.hasOwn(values, key)) continue;
+      const name = text(key);
+      const value = params([values[key]!])[0]!;
+      captured[name] = value;
+    }
+    return captured;
+  }
   const requestId = input.requestId;
   validateRequestId(requestId);
   const kind = input.kind;
@@ -158,7 +176,7 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     }
     case "execute": case "query": {
       const sql = text(input.sql), values = input.params;
-      request = { kind, requestId, sql, params: params(values ?? []) };
+      request = { kind, requestId, sql, params: bindings(values ?? []) };
       break;
     }
     case "execute-batch": case "prepare":
@@ -166,7 +184,7 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       break;
     case "statement-query": case "statement-execute": {
       const statementId = text(input.statementId), values = input.params;
-      request = { kind, requestId, statementId, params: params(values ?? []) };
+      request = { kind, requestId, statementId, params: bindings(values ?? []) };
       break;
     }
     case "execute-many": case "statement-execute-many": {

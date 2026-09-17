@@ -13,6 +13,9 @@ export type SqlScalar =
 
 export type SqlParams = readonly SqlScalar[];
 
+/** Complete named bindings use exact SQL prefixes or unambiguous bare names. */
+export type SqlBindings = SqlParams | Readonly<Record<string, SqlScalar>>;
+
 /** A batch is never silently split: all executions share one savepoint. */
 export const MAX_EXECUTE_MANY_ROWS = 10_000;
 
@@ -54,6 +57,8 @@ export interface PreparedStatementMetadata {
   sql: string;
   columnCount: number;
   columnNames: string[];
+  parameterCount?: number;
+  parameterNames?: readonly (string | null)[];
 }
 
 export interface SerializedFrankenError {
@@ -101,7 +106,7 @@ export interface InitRequest extends WorkerRequestBase {
 export interface ExecuteRequest extends WorkerRequestBase {
   kind: "execute";
   sql: string;
-  params?: SqlParams;
+  params?: SqlBindings;
 }
 
 export interface ExecuteBatchRequest extends WorkerRequestBase {
@@ -138,7 +143,7 @@ export interface CancelTransactionRequest extends WorkerRequestBase {
 export interface QueryRequest extends WorkerRequestBase {
   kind: "query";
   sql: string;
-  params?: SqlParams;
+  params?: SqlBindings;
 }
 
 export interface PrepareRequest extends WorkerRequestBase {
@@ -149,13 +154,13 @@ export interface PrepareRequest extends WorkerRequestBase {
 export interface StatementExecuteRequest extends WorkerRequestBase {
   kind: "statement-execute";
   statementId: string;
-  params?: SqlParams;
+  params?: SqlBindings;
 }
 
 export interface StatementQueryRequest extends WorkerRequestBase {
   kind: "statement-query";
   statementId: string;
-  params?: SqlParams;
+  params?: SqlBindings;
 }
 
 export interface StatementFinalizeRequest extends WorkerRequestBase {
