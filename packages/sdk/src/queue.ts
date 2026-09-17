@@ -6,6 +6,16 @@ import type { TableChangeListener, TableChangeStream, TableSubscription } from "
 import type { FrankenTransaction } from "./transaction";
 import type { FrankenDbOpenOptions, SnapshotMetadata } from "./types";
 
+type CloseListener = (failure: Error | null) => void;
+const queueClosers = new WeakMap<FrankenDBQueue, (listener: CloseListener) => () => void>();
+
+/** Internal close-intent observation for long-lived, privately owned reads. */
+export function observeQueueClose(queue: FrankenDBQueue, listener: CloseListener): () => void {
+  const observe = queueClosers.get(queue);
+  if (observe === undefined) throw new TypeError("A FrankenDBQueue is required");
+  return observe(listener);
+}
+
 export interface JobQueueOptions {
   /** Active plus waiting jobs, 1..4096. Defaults to 64. No overflow waiters. */
   maxPendingJobs?: number;
@@ -74,6 +84,7 @@ export class FrankenDBQueue {
   readonly #maxSubscriptions: number;
   readonly #subscriptions = new Set<ChangeObserver>();
   readonly #observers = new Set<ChangeObserver>();
+  readonly #closeListeners = new Set<CloseListener>();
   #journal: TableChangeJournal | null = null;
   #changeSequence = 0n;
   #terminalFailure: Error | null = null;
@@ -97,6 +108,11 @@ export class FrankenDBQueue {
     this.#db = db;
     this.#maxPendingJobs = maxPendingJobs;
     this.#maxSubscriptions = maxSubscriptions;
+    queueClosers.set(this, listener => {
+      if (this.#state !== "open") { listener(this.#terminalFailure); return () => {}; }
+      this.#closeListeners.add(listener);
+      return () => { this.#closeListeners.delete(listener); };
+    });
     this.#stopObservingFailure = observeDatabaseFailure(db, error => {
       this.#terminalFailure ??= error;
       for (const observer of this.#subscriptions) observer.fail(error);
@@ -238,11 +254,18 @@ export class FrankenDBQueue {
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
     this.#state = "closing";
-    for (const observer of this.#subscriptions) observer.stop();
     this.#closePromise = new Promise<void>((resolve, reject) => {
       this.#resolveClose = resolve;
       this.#rejectClose = reject;
     });
+    // A retained scan may be waiting for its consumer, not for SQL. Wake it
+    // before draining jobs; ordinary transaction callbacks are not cancelled.
+    const listeners = [...this.#closeListeners];
+    this.#closeListeners.clear();
+    for (const listener of listeners) {
+      try { listener(this.#terminalFailure); } catch { /* Internal cleanup cannot suppress close. */ }
+    }
+    for (const observer of this.#subscriptions) observer.stop();
     this.#schedule();
     return this.#closePromise;
   }

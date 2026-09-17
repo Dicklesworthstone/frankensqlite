@@ -5,11 +5,11 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { FrankenDBQueue } from '../src/queue.ts';
-import { watchQuery } from '../src/index.ts';
+import { watchQuery, scanTable } from '../src/index.ts';
 import { observe, drain } from './helpers/controlled-worker.ts';
 const limits={timeout:20000};
 
-async function threaded(t) {
+async function threaded(t, wal = false) {
   const helper=new URL('../../worker/tests/helpers/result-worker.mjs',import.meta.url).href;
   const script=`
     import {parentPort} from 'node:worker_threads';
@@ -21,8 +21,11 @@ async function threaded(t) {
       const original=constructor[method];
       constructor[method]=async(...args)=>{
         const core=await original(...args),batch=core.executeBatch.bind(core),execute=core.executeWithParams.bind(core);
+        if(${JSON.stringify(wal)})await core.query('PRAGMA journal_mode=WAL');
         const query=core.query.bind(core);
         core.query=async sql=>{if(config.query===sql)await pause();return query(sql);};
+        const parameterQuery=core.queryWithParams.bind(core);
+        core.queryWithParams=async(sql,params)=>{if(config.scan&&sql.startsWith('SELECT s.'))await pause();return parameterQuery(sql,params);};
         core.executeBatch=async sql=>{if(config.commit&&sql==='COMMIT')await pause();return batch(sql);};
         core.executeWithParams=async(sql,values)=>{
           if(config.row!==undefined&&sql.startsWith('INSERT INTO items')&&values[0]===config.row)await pause();
@@ -180,4 +183,57 @@ test('real production worker: idle live-query demand and done both reject on an 
   assert.equal(read.outcome.status,'rejected');assert.match(read.outcome.reason.message,/intentional subscription worker crash/);
   assert.equal(done.outcome.reason,read.outcome.reason);assert.equal(live.closed,true);
   await q.close().catch(()=>{});onDisk(q,[]);
+});
+
+test('real production worker: scan 20001 exact rows with int64, blobs, Unicode and bounded transferred pages',limits,async t=>{
+  const f=await threaded(t),q=f.queue;
+  await q.transaction(tx=>tx.executeBatch('ALTER TABLE items ADD COLUMN payload BLOB;'+
+    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20001) INSERT INTO items SELECT x,'λ🙂-' || x,x'00ff' FROM n;"));
+  const scan=scanTable(q,'items',{batchSize:73});let n=0;
+  for await(const row of scan){
+    assert.equal(row.id,BigInt(++n));assert.equal(row.value,`λ🙂-${n}`);assert.deepEqual(row.payload,Uint8Array.of(0,255));
+    assert.ok(scan.stats.bufferedRows<=73);
+  }
+  await scan.done;assert.equal(n,20001);assert.equal(scan.stats.maxBufferedRows,73);assert.equal(scan.stats.bufferedRows,0);
+  assert.ok(f.history.some(m=>m.audit&&m.kind==='query-binary-result'&&m.before[0]>0&&m.after[0]===0));
+  await q.close();const db=new DatabaseSync(q.path);try{assert.deepEqual(db.prepare('PRAGMA integrity_check').all().map(Object.values),[['ok']]);}finally{db.close();}
+});
+
+test('real production worker: cancelled scan drains SQL and rollback before successor write',limits,async t=>{
+  const f=await threaded(t),q=f.queue;await q.transaction(tx=>tx.execute("INSERT INTO items VALUES(1,'before')"));
+  await f.configure({scan:true});const signal=new AbortController(),scan=scanTable(q,'items',{signal:signal.signal});
+  const next=observe(scan.next());await f.paused();signal.abort();await f.cancelAck();
+  const done=observe(scan.done),write=observe(q.transaction(tx=>tx.execute("INSERT INTO items VALUES(2,'after')")));
+  await drain();assert.equal(next.outcome.status,'pending');assert.equal(done.outcome.status,'pending');assert.equal(write.outcome.status,'pending');
+  f.resume();await Promise.all([next.settled,done.settled,write.settled]);
+  assert.equal(next.outcome.reason.code,'ERR_FSQLITE_SCAN_CANCELLED');assert.equal(done.outcome.status,'rejected');assert.equal(write.outcome.status,'fulfilled');
+  await q.close();onDisk(q,[[1,'before'],[2,'after']]);
+});
+
+test('real production worker: idle scan sees an actual worker crash without needing another query',limits,async t=>{
+  const f=await threaded(t),q=f.queue;await q.transaction(tx=>tx.execute("INSERT INTO items VALUES(1,'before'),(2,'second')"));
+  const scan=scanTable(q,'items',{batchSize:1});assert.equal((await scan.next()).value.id,1n);
+  const done=observe(scan.done);f.crash();await done.settled;assert.equal(done.outcome.status,'rejected');
+  await assert.rejects(scan.next());assert.ok(scan.closed);assert.equal(scan.stats.bufferedRows,0);
+  await q.close().catch(()=>{});assert.equal(f.wrappers.size,0);onDisk(q,[[1,'before'],[2,'second']]);
+});
+
+test('real production worker: close cancels its long-lived read but awaits actual SQL completion',limits,async t=>{
+  const f=await threaded(t),q=f.queue;await q.transaction(tx=>tx.execute("INSERT INTO items VALUES(1,'before')"));
+  await f.configure({scan:true});const scan=scanTable(q,'items'),next=observe(scan.next());await f.paused();
+  const close=observe(q.close());await f.cancelAck();await drain();assert.equal(close.outcome.status,'pending');assert.equal(next.outcome.status,'pending');
+  f.resume();await Promise.all([close.settled,next.settled,assert.rejects(scan.done,error=>error.code==='ERR_FSQLITE_SCAN_CANCELLED')]);
+  assert.equal(close.outcome.status,'fulfilled');assert.equal(next.outcome.reason.code,'ERR_FSQLITE_SCAN_CANCELLED');
+  onDisk(q,[[1,'before']]);
+});
+
+test('real production worker: pages keep one snapshot across external WAL commits',limits,async t=>{
+  const f=await threaded(t,true),q=f.queue;await q.transaction(tx=>tx.execute("INSERT INTO items VALUES(1,'a'),(2,'b'),(3,'c')"));
+  const other=new DatabaseSync(q.path);t.after(()=>other.close());
+  const scan=scanTable(q,'items',{batchSize:1}),first=(await scan.next()).value;
+  other.exec("BEGIN;UPDATE items SET value='new' WHERE id=2;DELETE FROM items WHERE id=3;INSERT INTO items VALUES(4,'later');COMMIT;");
+  const rows=[first];for await(const row of scan)rows.push(row);await scan.done;
+  assert.deepEqual(rows,[{id:1n,value:'a'},{id:2n,value:'b'},{id:3n,value:'c'}]);
+  assert.deepEqual((await q.transaction(tx=>tx.query('SELECT id,value FROM items ORDER BY id'))).rowArrays,[[1n,'a'],[2n,'new'],[4n,'later']]);
+  await q.close();const file=new DatabaseSync(q.path);try{assert.deepEqual(file.prepare('PRAGMA integrity_check').all().map(Object.values),[['ok']]);}finally{file.close();}
 });

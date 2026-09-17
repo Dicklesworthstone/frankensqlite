@@ -1,4 +1,6 @@
 import { FrankenSQLiteError } from "./errors";
+import { observeQueueClose } from "./queue";
+import type { FrankenDBQueue, QueuedJobOptions } from "./queue";
 import type { FrankenTransaction } from "./transaction";
 import type { SqlScalar } from "./types";
 
@@ -201,4 +203,192 @@ export async function createTablePageReader(tx: FrankenTransaction, settings: Se
       return rows;
     },
   };
+}
+
+export interface TableScanOptions extends TableScanPageOptions, QueuedJobOptions {
+  /** Consumer inactivity while retaining a snapshot; default 30s, 0 disables. */
+  idleTimeoutMs?: number;
+}
+export interface TableScanStats {
+  readonly pagesRead: number;
+  readonly pageQueries: number;
+  readonly rowsRead: number;
+  readonly rowsYielded: number;
+  readonly bufferedRows: number;
+  readonly maxBufferedRows: number;
+}
+export interface TableScan<Row extends Record<string, unknown> = Record<string, unknown>> extends AsyncIterableIterator<Row> {
+  readonly closed: boolean;
+  readonly stats: Readonly<TableScanStats>;
+  /** Joins the retained transaction and cleanup; drain iteration or call return(). */
+  readonly done: Promise<void>;
+  return(): Promise<IteratorResult<Row>>;
+  throw(cause?: unknown): Promise<IteratorResult<Row>>;
+}
+function cancelledOnly(cause: unknown): boolean {
+  if (cause instanceof AggregateError) return cause.errors.length > 0 && cause.errors.every(cancelledOnly);
+  return cause instanceof FrankenSQLiteError &&
+    (cause.code === "ERR_FSQLITE_TRANSACTION_CANCELLED" || cause.code === "ERR_FSQLITE_JOB_CANCELLED");
+}
+
+/**
+ * Stream rows from one main table in stable storage-key order. Starts on next(),
+ * retains one managed snapshot, and never fetches the next page ahead of demand.
+ * Not a general SQL cursor; independent connections retain their own concurrency.
+ */
+export function scanTable<Row extends Record<string, unknown> = Record<string, unknown>>(
+  queue: FrankenDBQueue, table: string, options: TableScanOptions = {},
+): TableScan<Row> {
+  const settings = captureTableScan(table, options);
+  const callerSignal = options.signal, waitTimeoutMs = options.waitTimeoutMs;
+  const idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
+  if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < 0 || idleTimeoutMs > 2147483647 ||
+      (waitTimeoutMs !== undefined && (!Number.isInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 2147483647))) {
+    throw invalid("Use idleTimeoutMs in 0..2147483647 and integer waitTimeoutMs in 1..2147483647");
+  }
+  if (callerSignal !== undefined) Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(callerSignal);
+  const controller = new AbortController();
+  const signal = AbortSignal.any(callerSignal === undefined ? [controller.signal] : [controller.signal, callerSignal]);
+  const jobOptions = { signal, ...(waitTimeoutMs === undefined ? {} : { waitTimeoutMs }) };
+  let started = false, running = false, stopped = false, finished = false, sourceComplete = false;
+  let failure: { cause: unknown } | null = null;
+  let buffered: (Record<string, unknown> | undefined)[] = [], position = 0;
+  let pagesRead = 0, pageQueries = 0, rowsRead = 0, rowsYielded = 0, maxBufferedRows = 0;
+  let pending: { resolve: (result: IteratorResult<Row>) => void; reject: (cause: unknown) => void } | null = null;
+  let wake: (() => void) | null = null, unobserve: (() => void) | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined, idleDeadline: number | undefined;
+  let resolveDone!: () => void, rejectDone!: (cause: unknown) => void;
+  const done = new Promise<void>((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
+  void done.catch(() => {});
+
+  function fail(cause: unknown): void {
+    if (failure === null) failure = { cause };
+    else if (failure.cause !== cause) failure = { cause: new AggregateError([failure.cause, cause],
+      "Table scan and cleanup both failed", { cause: failure.cause }) };
+  }
+  function clearIdle(): void {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = undefined; idleDeadline = undefined;
+  }
+  function expired(): void {
+    stop({ cause: new FrankenSQLiteError({ code: "ERR_FSQLITE_SCAN_IDLE_TIMEOUT", transient: false,
+      message: "Table scan consumer was inactive; its retained snapshot was released. This is not successful EOF." }) });
+  }
+  function touchIdle(): void {
+    clearIdle();
+    if (wake !== null && !stopped && idleTimeoutMs > 0) {
+      idleDeadline = performance.now() + idleTimeoutMs;
+      idleTimer = setTimeout(expired, idleTimeoutMs);
+    }
+  }
+  function notify(): void {
+    const resume = wake; wake = null; clearIdle(); resume?.();
+  }
+  function park(): Promise<void> {
+    if (stopped) return Promise.resolve();
+    return new Promise<void>(resolve => { wake = resolve; touchIdle(); });
+  }
+  function flush(): void {
+    if (pending === null || stopped) return;
+    if (position < buffered.length) {
+      const row = buffered[position]!;
+      buffered[position++] = undefined; // Release consumed rows even inside a large page.
+      rowsYielded++;
+      const demand = pending; pending = null;
+      demand.resolve({ done: false, value: row as Row });
+    }
+    if (position === buffered.length) { buffered = []; position = 0; notify(); }
+  }
+  function settle(): void {
+    if (running || (!stopped && !finished)) return;
+    finished = true; clearIdle();
+    signal.removeEventListener("abort", onAbort);
+    unobserve?.(); unobserve = null;
+    buffered = []; position = 0;
+    const demand = pending; pending = null;
+    if (failure !== null) { demand?.reject(failure.cause); rejectDone(failure.cause); }
+    else { demand?.resolve({ done: true, value: undefined }); resolveDone(); }
+  }
+  function stop(error: { cause: unknown } | null = null): void {
+    if (finished) return;
+    if (error !== null) fail(error.cause);
+    stopped = true; buffered = []; position = 0;
+    controller.abort(); notify(); settle();
+  }
+  function cancellation(cause: unknown): FrankenSQLiteError {
+    const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_SCAN_CANCELLED", transient: false,
+      message: "Table scan cancelled before completion; delivered rows are only a prefix, not successful EOF" });
+    error.cause = cause;
+    return error;
+  }
+  function onAbort(): void {
+    // Explicit return() already set stopped before aborting our controller.
+    // Once every row is delivered, the actual final transaction outcome wins.
+    if (!stopped && !finished && !sourceComplete) stop({ cause: cancellation(signal.reason) });
+  }
+
+  async function produce(tx: FrankenTransaction): Promise<void> {
+    if (stopped) return;
+    const reader = await createTablePageReader(tx, settings);
+    while (!stopped) {
+      // A full consumed page alone does not authorize another query. Require
+      // demand, including the final empty probe for an exact-sized last page.
+      while (!stopped && pending === null) await park();
+      if (stopped) break;
+      const rows = await reader.read();
+      pageQueries = reader.queries;
+      if (stopped) break;
+      pagesRead++; rowsRead += rows.length;
+      maxBufferedRows = Math.max(maxBufferedRows, rows.length);
+      buffered = rows; position = 0; flush();
+      while (!stopped && position < buffered.length) await park();
+      if (reader.exhausted) break;
+    }
+    if (!stopped) sourceComplete = true;
+  }
+  function start(): void {
+    started = true; running = true;
+    try {
+      let observing = false;
+      unobserve = observeQueueClose(queue, error => {
+        if (sourceComplete && error === null) return;
+        stop({ cause: error ?? (observing ? cancellation("Owning queue is closing") :
+          new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_CLOSED", transient: false,
+            message: "The scan did not start because its queue was already closing or closed" })) });
+      });
+      observing = true;
+      if (stopped) { running = false; settle(); return; }
+      void queue.transaction(produce, jobOptions).then(() => {
+        running = false; finished = true; settle();
+      }, (cause: unknown) => {
+        if (!stopped || !cancelledOnly(cause)) fail(cause);
+        running = false; stopped = true; notify(); settle();
+      });
+    } catch (cause: unknown) { fail(cause); running = false; stopped = true; settle(); }
+  }
+
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  const iterator: TableScan<Row> = Object.freeze({
+    get closed() { return stopped || finished; },
+    get stats() { return Object.freeze({ pagesRead, pageQueries, rowsRead, rowsYielded,
+      bufferedRows: buffered.length - position, maxBufferedRows }); },
+    done,
+    next(): Promise<IteratorResult<Row>> {
+      // Recheck elapsed idle time even when event-loop work delayed its timer.
+      if (idleDeadline !== undefined && performance.now() >= idleDeadline) expired();
+      if (stopped || finished) return done.then(() => ({ done: true, value: undefined }));
+      if (pending !== null) return Promise.reject(new FrankenSQLiteError({ code: "ERR_FSQLITE_SCAN_NEXT_PENDING",
+        message: "Await the outstanding scan next() before requesting another row", transient: false }));
+      const result = new Promise<IteratorResult<Row>>((resolve, reject) => { pending = { resolve, reject }; });
+      touchIdle(); flush();
+      if (!started) start();
+      else if (pending !== null) notify();
+      return result;
+    },
+    async return(): Promise<IteratorResult<Row>> { stop(); await done; return { done: true, value: undefined }; },
+    async throw(cause?: unknown): Promise<IteratorResult<Row>> { stop({ cause }); await done; throw cause; },
+    [Symbol.asyncIterator]() { return iterator; },
+  });
+  return iterator;
 }

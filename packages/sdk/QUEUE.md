@@ -379,3 +379,117 @@ node --loader ./packages/sdk/tests/helpers/source-loader.mjs --test \
 ```
 
 This does not certify the FrankenSQLite WASM artifact or browser execution.
+
+## Snapshot-consistent table streaming
+
+`scanTable(queue, tableName, options)` streams individual rows from an ordinary
+`main` table without issuing one unbounded full-table query:
+
+```ts
+import { scanTable } from "@frankensqlite/sdk";
+
+const controller = new AbortController();
+const scan = scanTable<{ id: bigint; value: string }>(queue, "items", {
+  columns: ["id", "value"],
+  batchSize: 256,
+  signal: controller.signal,
+});
+try {
+  for await (const row of scan) {
+    await consumeRow(row);
+  }
+  await scan.done;
+} finally {
+  await scan.return();
+}
+```
+
+Construction captures arguments but does not admit a job or execute SQL. The
+first `next()` starts one managed transaction at its FIFO position. Schema
+inspection and every page use that **same transaction snapshot**, rather than
+reopening a transaction between pages. Independent connections can still write
+according to their native storage/MVCC rules. Later jobs on this queue, including
+checkpoints and exports, wait until the scan releases its snapshot. Never await
+another job on this same queue from the row consumer; use another connection or
+finish/return the scan first.
+
+### Indexed continuation and bounds
+
+Ordinary rowid tables use an unshadowed hidden rowid. `WITHOUT ROWID` tables use
+their full primary key, with its actual collations and individual ASC/DESC
+ordering. `reverse: true` reverses the complete order. Continuation keys stay
+bound values; signed 64-bit rowids require no addition or lossy conversion.
+Composite continuation is split into disjoint equality-prefix/range seeks,
+including mixed sort directions. There is no `OFFSET` or broad OR continuation
+filter. The reference-engine tests inspect actual continuation query plans for
+index searches without temporary sorting; native-engine plan/performance
+qualification remains separate.
+
+`batchSize` defaults to 256 and accepts 1..4096. The reader retains at most one
+page of projected rows, releases consumed rows, and does not fetch another page
+until a `next()` needs it. At most one unresolved `next()` is accepted; overlapping
+demand rejects with `ERR_FSQLITE_SCAN_NEXT_PENDING`, not another hidden queue.
+A composite page can require up to one SQL query per primary-key column. An
+exact-sized final page requires a subsequent empty probe to establish EOF.
+The frozen `scan.stats` reports successful pages, page query count, rows fetched,
+rows yielded, current buffered rows and maximum buffered rows. These are counts,
+not a JavaScript-heap measurement.
+
+This bounds result **row count**, not bytes or total memory. Each core query
+still materializes its bounded page, and transport/projection may temporarily
+hold additional representations. A single text/blob value can be large. Engine
+page caches, fallback execution, retained snapshot history and consumer-retained
+rows are not bounded by this API. The continuation key is copied separately
+before rows are exposed, capped at 1 MiB, so mutating a yielded key blob cannot
+change the next page. Table metadata is capped at 1024 columns and a WITHOUT
+ROWID primary key at 16 columns.
+
+Projection entries are plain validated column names; omitted projection includes
+all visible columns, including generated columns. Hidden key columns are not
+added to the returned rows. Tables with every hidden rowid alias shadowed reject.
+Views, virtual/shadow tables, other schemas, filters, joins and arbitrary SQL
+expressions are not accepted. Unsupported or malformed metadata fails closed;
+there is no fallback to an unbounded query. This is restricted table streaming,
+not an arbitrary SELECT/VDBE cursor or an SQL security sandbox. Existing SQL
+functions used by generated columns remain the application's responsibility.
+
+### Completion, cancellation and snapshot release
+
+Drain iteration or explicitly `return()` it. `for await` calls `return()` on a
+loop break. Explicit return is a deliberate successful stop; caller signal abort
+and queue close instead reject unfinished scans with
+`ERR_FSQLITE_SCAN_CANCELLED`. They never silently report a truncated export as
+successful EOF. Already delivered rows are only a prefix until normal completion.
+When every row has been delivered and the final transaction is settling, its
+actual outcome remains authoritative, including late abort after COMMIT dispatch.
+
+A stopped scan discards buffered rows and waits for admitted SQL plus rollback
+and handle cleanup before `done` settles. Cancelling a queued scan removes it
+without BEGIN. Queue close wakes active scans even when their consumers are idle,
+then drains their cleanup and other accepted jobs; ordinary queued transaction
+callbacks retain their existing drain contract. SQL/rollback/transport failures
+reject `next()` and `done`, retain causes, and are never automatically replayed.
+The caller's own output or effects from already consumed rows are not rolled back.
+
+To prevent an abandoned iterator from retaining a snapshot indefinitely,
+`idleTimeoutMs` defaults to 30,000 milliseconds. It measures waiting for consumer
+activity, not time spent inside SQL. `0` explicitly disables this lease; otherwise
+use an integer in 1..2147483647. Expiry rejects with
+`ERR_FSQLITE_SCAN_IDLE_TIMEOUT`, never successful EOF, and releases the snapshot.
+Each new row request renews the idle lease. `waitTimeoutMs` remains an optional
+integer start deadline in 1..2147483647, not an active SQL timeout. Cancellation
+cannot interrupt one core operation that never settles.
+
+The focused source tests are runnable from the repository root with the existing
+TypeScript loader (set `FSQLITE_TYPESCRIPT_MODULE` when using a global compiler):
+
+```sh
+node --loader ./packages/sdk/tests/helpers/source-loader.mjs --test \
+  packages/sdk/tests/table-scan.test.mjs \
+  packages/sdk/tests/subscriptions-thread.test.mjs
+```
+
+These exercise production SDK/worker source against real SQLite reference files,
+including actual Node worker threads and external WAL writers. They are not
+FrankenSQLite WASM/browser execution, native MVCC/throughput certification, or
+the full arbitrary-query streaming acceptance of `bd-o0s0h`.
