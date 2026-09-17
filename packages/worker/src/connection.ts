@@ -119,6 +119,15 @@ export class WorkerConnectionHost {
     return this.#budget.stats;
   }
 
+  /** Fence queued SQL immediately; close only after active work has settled. */
+  failTransport(error: Error): Promise<WorkerResponse> {
+    this.#terminalError ??= error;
+    for (const cancellation of this.#bulkCancellations.values()) cancellation.request();
+    // This internal response is not a client acknowledgement. A later client
+    // close joins the same fence and receives its own correlated response.
+    return this.handle({ kind: "close", requestId: 0 });
+  }
+
   handle(request: WorkerRequest): Promise<WorkerResponse> {
     try {
       validateRequestId(request.requestId);

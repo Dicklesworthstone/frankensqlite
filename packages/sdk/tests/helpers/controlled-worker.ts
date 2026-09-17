@@ -1,4 +1,4 @@
-import type { WorkerRequest, WorkerResponse } from "@frankensqlite/worker";
+import type { WorkerMessage, WorkerRequest } from "@frankensqlite/worker";
 import type {
   WorkerErrorEventLike,
   WorkerLike,
@@ -11,18 +11,22 @@ export class ControlledWorker implements WorkerLike {
   readonly requests: WorkerRequest[] = [];
   readonly messages = new Set<(event: WorkerMessageEvent) => void>();
   readonly errors = new Set<(event: WorkerErrorEventLike) => void>();
+  readonly messageErrors = new Set<() => void>();
   onPost: ((request: WorkerRequest) => void) | undefined;
   onTerminate: (() => void) | undefined;
   terminateCount = 0;
 
   addEventListener(type: "message", listener: (event: WorkerMessageEvent) => void): void;
   addEventListener(type: "error", listener: (event: WorkerErrorEventLike) => void): void;
+  addEventListener(type: "messageerror", listener: () => void): void;
   addEventListener(
-    type: "message" | "error",
+    type: "message" | "error" | "messageerror",
     listener: ((event: WorkerMessageEvent) => void) | ((event: WorkerErrorEventLike) => void),
   ): void {
     if (type === "message") {
       this.messages.add(listener as (event: WorkerMessageEvent) => void);
+    } else if (type === "messageerror") {
+      this.messageErrors.add(listener as () => void);
     } else {
       this.errors.add(listener as (event: WorkerErrorEventLike) => void);
     }
@@ -30,12 +34,15 @@ export class ControlledWorker implements WorkerLike {
 
   removeEventListener(type: "message", listener: (event: WorkerMessageEvent) => void): void;
   removeEventListener(type: "error", listener: (event: WorkerErrorEventLike) => void): void;
+  removeEventListener(type: "messageerror", listener: () => void): void;
   removeEventListener(
-    type: "message" | "error",
+    type: "message" | "error" | "messageerror",
     listener: ((event: WorkerMessageEvent) => void) | ((event: WorkerErrorEventLike) => void),
   ): void {
     if (type === "message") {
       this.messages.delete(listener as (event: WorkerMessageEvent) => void);
+    } else if (type === "messageerror") {
+      this.messageErrors.delete(listener as () => void);
     } else {
       this.errors.delete(listener as (event: WorkerErrorEventLike) => void);
     }
@@ -51,12 +58,16 @@ export class ControlledWorker implements WorkerLike {
     this.onTerminate?.();
   }
 
-  reply(response: WorkerResponse): void {
+  reply(response: WorkerMessage): void {
     for (const listener of this.messages) listener({ data: response });
   }
 
   crash(message: string): void {
     for (const listener of this.errors) listener({ message });
+  }
+
+  messageError(): void {
+    for (const listener of this.messageErrors) listener();
   }
 }
 

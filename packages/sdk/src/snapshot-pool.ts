@@ -3,7 +3,7 @@ import {
   validateManagedSql, validateSnapshotBytes,
 } from "@frankensqlite/worker";
 import type { QueryRequest } from "@frankensqlite/worker";
-import { FrankenDB } from "./database";
+import { FrankenDB, observeDatabaseFailure } from "./database";
 import type { QueryResult, ResultEncoding, SqlBindings } from "./types";
 import type { WorkerLike, WorkerErrorEventLike } from "./worker-client";
 
@@ -71,8 +71,9 @@ interface Replica {
   busy: boolean;
   watch: {
     failure: FrankenPoolError | null;
-    notify: ((message: string) => void) | null;
+    notify: ((error: FrankenPoolError) => void) | null;
     onError: (event: WorkerErrorEventLike) => void;
+    stopFailure: () => void;
   };
 }
 interface QueryJob {
@@ -133,8 +134,8 @@ export class FrankenSnapshotPool {
     this.#configuration = configuration;
     this.#seen = seen;
     for (const replica of replicas) {
-      replica.watch.notify = message => this.#crashed(message);
-      if (replica.watch.failure !== null) this.#crashed(replica.watch.failure.message);
+      replica.watch.notify = error => this.#crashed(error);
+      if (replica.watch.failure !== null) this.#crashed(replica.watch.failure);
     }
   }
 
@@ -264,8 +265,8 @@ export class FrankenSnapshotPool {
     if (this.#state !== "open") throw new FrankenPoolError("ERR_FSQLITE_POOL_CLOSED", "Snapshot pool is closing or closed");
   }
 
-  #crashed(message: string): void {
-    this.#terminal ??= new FrankenPoolError("ERR_FSQLITE_POOL_UNUSABLE", `A snapshot worker crashed: ${message}`);
+  #crashed(error: FrankenPoolError): void {
+    this.#terminal ??= error;
     for (const job of [...this.#waiting]) this.#remove(job, this.#terminal);
     // No transparent replay/replacement. Other active reads drain on their own
     // replicas, and every listener/worker is eventually released by close.
@@ -350,7 +351,7 @@ export class FrankenSnapshotPool {
       this.#replicas = staged;
       this.#identity = Object.freeze(opened.identity);
       staged = null;
-      for (const replica of this.#replicas) replica.watch.notify = message => this.#crashed(message);
+      for (const replica of this.#replicas) replica.watch.notify = error => this.#crashed(error);
       const cleanupErrors = await closeReplicas(previous);
       // Publication already happened. An old-worker close failure must not look
       // like a failed refresh or justify silently falling back to the old image.
@@ -391,7 +392,7 @@ async function closeReplicas(replicas: Replica[]): Promise<unknown[]> {
   const results = await Promise.allSettled(replicas.map(async replica => {
     replica.watch.notify = null;
     try { await replica.db.close(); }
-    finally { replica.worker.removeEventListener("error", replica.watch.onError); }
+    finally { replica.watch.stopFailure(); replica.worker.removeEventListener("error", replica.watch.onError); }
   }));
   return results.flatMap(result => result.status === "rejected" ? [result.reason as unknown] : []);
 }
@@ -404,10 +405,10 @@ async function openReplicas(image: Uint8Array<ArrayBuffer>, config: PoolConfigur
     const worker = config.factory();
     if (seen.has(worker)) throw new FrankenPoolError("ERR_FSQLITE_POOL_INPUT", "Each generation requires new, dedicated workers");
     seen.add(worker);
-    const watch: Replica["watch"] = { failure: null, notify: null, onError: () => {} };
+    const watch: Replica["watch"] = { failure: null, notify: null, onError: () => {}, stopFailure: () => {} };
     watch.onError = event => {
       watch.failure ??= new FrankenPoolError("ERR_FSQLITE_POOL_UNUSABLE", `A snapshot worker crashed: ${event.message}`);
-      watch.notify?.(event.message);
+      watch.notify?.(watch.failure);
     };
     worker.addEventListener("error", watch.onError);
     let db: FrankenDB | null = null;
@@ -415,6 +416,10 @@ async function openReplicas(image: Uint8Array<ArrayBuffer>, config: PoolConfigur
       db = await FrankenDB.open({ worker, snapshot: image.slice(), persistence: "memory", resultEncoding: config.resultEncoding,
         ...(config.wasmUrl === undefined ? {} : { wasmUrl: config.wasmUrl }),
         requestLimits: { maxPendingRequests: 1, maxPendingBytes: Math.max(config.maxPendingBytes, image.byteLength + 4096) } });
+      watch.stopFailure = observeDatabaseFailure(db, cause => {
+        watch.failure ??= new FrankenPoolError("ERR_FSQLITE_POOL_UNUSABLE", `A snapshot connection failed: ${cause.message}`, { cause });
+        watch.notify?.(watch.failure);
+      });
       await db.execute("PRAGMA query_only = ON");
       const mode = await db.query("PRAGMA query_only");
       if (mode.rowArrays?.length !== 1 || mode.rowArrays[0]?.length !== 1 ||
@@ -426,7 +431,7 @@ async function openReplicas(image: Uint8Array<ArrayBuffer>, config: PoolConfigur
     } catch (cause: unknown) {
       try { if (db !== null) await db.close(); }
       catch (cleanup: unknown) { throw new AggregateError([cause, cleanup], "Replica initialization and cleanup failed", { cause }); }
-      finally { worker.removeEventListener("error", watch.onError); }
+      finally { watch.stopFailure(); worker.removeEventListener("error", watch.onError); }
       throw cause;
     }
   }));

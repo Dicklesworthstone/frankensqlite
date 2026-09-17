@@ -12,6 +12,7 @@ import type {
   SnapshotMetadata,
   WorkerRequest,
   WorkerResponse,
+  WorkerMessage,
   RequestLimits,
   RequestQueueStats,
 } from "@frankensqlite/worker";
@@ -24,7 +25,7 @@ import type { ResultEncoding } from "@frankensqlite/worker";
 import type { ExecuteManyOptions } from "./types";
 
 export interface WorkerMessageEvent {
-  readonly data: WorkerResponse;
+  readonly data: WorkerMessage;
 }
 
 export interface WorkerErrorEventLike {
@@ -40,6 +41,7 @@ export interface WorkerLike {
     type: "error",
     listener: (event: WorkerErrorEventLike) => void,
   ): void;
+  addEventListener(type: "messageerror", listener: () => void): void;
   removeEventListener(
     type: "message",
     listener: (event: WorkerMessageEvent) => void,
@@ -48,6 +50,7 @@ export interface WorkerLike {
     type: "error",
     listener: (event: WorkerErrorEventLike) => void,
   ): void;
+  removeEventListener(type: "messageerror", listener: () => void): void;
   postMessage(message: WorkerRequest, transfer?: Transferable[]): void;
   terminate?(): void;
 }
@@ -67,6 +70,7 @@ export class FrankenWorkerClient {
   #nextRequestId = 1;
   #terminalError: Error | null = null;
   #hostTerminal = false;
+  #remoteTransportFailure = false;
   #failure: Error | null = null;
   readonly #failureListeners = new Set<(error: Error) => void>();
   #closing = false;
@@ -80,6 +84,12 @@ export class FrankenWorkerClient {
     let requestId: number | undefined;
     try {
       const source = responseObject(event.data);
+      if (source.kind === "worker-fatal") {
+        const cause = decodeFrankenError(source.error);
+        this.#remoteTransportFailure = true;
+        this.#failTransport(transportFailure("Worker could not receive or deliver an operation message", cause), true);
+        return;
+      }
       const id = source.requestId;
       if (!safeCount(id)) throw new TypeError("Worker response has no valid request id");
       requestId = id;
@@ -125,24 +135,36 @@ export class FrankenWorkerClient {
 
   readonly #onError = (event: WorkerErrorEventLike): void => {
     if (this.#disposed) return;
-    const error = new Error(
+    const error = transportFailure(
       `FrankenSQLite worker crashed: ${event.message || "unknown error"}`,
     );
     this.#failTransport(error);
   };
 
-  #failTransport(error: Error): void {
-    this.#hostTerminal = false;
+  readonly #onMessageError = (): void => {
+    if (!this.#disposed) this.#failTransport(transportFailure("Worker response could not be deserialized"));
+  };
+
+  #failTransport(error: Error, canCloseHost = false): void {
+    // A late notice cannot resurrect a channel already known to have crashed.
+    this.#hostTerminal = canCloseHost && (this.#terminalError === null || this.#hostTerminal);
     this.#terminalError ??= error;
-    this.#rejectPending(this.#terminalError);
+    this.#rejectPending(this.#terminalError, this.#hostTerminal);
     this.#notifyFailure(this.#terminalError);
   }
 
   constructor(worker: WorkerLike, limits: Partial<RequestLimits> = {}) {
     this.#budget = new RequestBudget(limits);
     this.#worker = worker;
-    this.#worker.addEventListener("message", this.#onMessage);
-    this.#worker.addEventListener("error", this.#onError);
+    try {
+      this.#worker.addEventListener("message", this.#onMessage);
+      this.#worker.addEventListener("error", this.#onError);
+      this.#worker.addEventListener("messageerror", this.#onMessageError);
+    } catch (cause: unknown) {
+      try { this.dispose(); }
+      catch (cleanup: unknown) { throw new AggregateError([cause, cleanup], "Worker setup and cleanup failed", { cause }); }
+      throw cause;
+    }
   }
 
   get requestQueue(): RequestQueueStats {
@@ -451,6 +473,7 @@ export class FrankenWorkerClient {
     for (const cleanup of [
       () => this.#worker.removeEventListener("message", this.#onMessage),
       () => this.#worker.removeEventListener("error", this.#onError),
+      () => this.#worker.removeEventListener("messageerror", this.#onMessageError),
       () => this.#worker.terminate?.(),
     ]) {
       try {
@@ -555,7 +578,7 @@ export class FrankenWorkerClient {
       release();
       return Promise.reject(this.#terminalError ?? new Error("FrankenSQLite worker client is closing"));
     }
-    return new Promise<WorkerResponse>((resolve, reject) => {
+    const response = new Promise<WorkerResponse>((resolve, reject) => {
       this.#pending.set(request.requestId, { resolve, reject, release, isClose: request.kind === "close", requestKind: request.kind });
       try {
         if (request.kind === "init" && request.config.snapshot) {
@@ -570,6 +593,20 @@ export class FrankenWorkerClient {
         release();
         reject(error);
       }
+    });
+    return response.catch(async (error: unknown) => {
+      // A receiver-side fatal notice fences SQL but the worker may still own an
+      // active operation. Join its close fence before returning a failure that
+      // would make a managed transaction dispose that still-active worker.
+      // This is cleanup acknowledgement, never proof of the operation outcome.
+      if (this.#remoteTransportFailure && request.kind !== "close") {
+        try { await this.close(); }
+        catch (cleanup: unknown) {
+          if (cleanup !== error) throw new AggregateError([error, cleanup],
+            "Worker operation response and transport cleanup both failed", { cause: error });
+        }
+      }
+      throw error;
     });
   }
 }
@@ -598,6 +635,13 @@ function responseFailure(cause: unknown): FrankenSQLiteError {
     message: "FrankenSQLite returned an invalid operation response",
     suggestion: "SQL or snapshot publication may have executed. Inspect authoritative state; do not blindly retry the operation." });
   error.cause = cause;
+  return error;
+}
+function transportFailure(message: string, cause?: unknown): FrankenSQLiteError {
+  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_WORKER_TRANSPORT", transient: false,
+    userRecoverable: false, message,
+    suggestion: "Connection outcomes are unknown: SQL or snapshot publication may have executed. Reopen and reconcile authoritative data; do not blindly retry writes." });
+  if (cause !== undefined) error.cause = cause;
   return error;
 }
 function captureResponse(source: Record<string, unknown>, kind: unknown, requestId: number,

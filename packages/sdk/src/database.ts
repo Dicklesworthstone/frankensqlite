@@ -344,6 +344,10 @@ export class FrankenDB {
         message: "A transaction owns this connection; use its transaction handle or wait until it finishes" });
     }
     if (scope !== null) this.#checkCancellation(scope);
+    // The client may already retain the host's rollback error. Preserve the
+    // richer local failure (callback/cancellation plus cleanup) on every later
+    // handle operation instead of silently dropping its original cause.
+    if (this.#transactionFailure !== null) throw this.#transactionFailure;
   }
 
   #checkCancellation(scope: TransactionScope): void {

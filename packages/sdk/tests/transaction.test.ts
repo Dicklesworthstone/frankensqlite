@@ -9,7 +9,7 @@ class TransactionWorker implements WorkerLike {
   readonly #listeners = new Set<(event: WorkerMessageEvent) => void>();
 
   addEventListener(
-    type: "message" | "error",
+    type: "message" | "error" | "messageerror",
     listener: ((event: WorkerMessageEvent) => void) | ((event: { message: string }) => void),
   ): void {
     if (type === "message") {
@@ -18,7 +18,7 @@ class TransactionWorker implements WorkerLike {
   }
 
   removeEventListener(
-    type: "message" | "error",
+    type: "message" | "error" | "messageerror",
     listener: ((event: WorkerMessageEvent) => void) | ((event: { message: string }) => void),
   ): void {
     if (type === "message") {

@@ -269,6 +269,14 @@ export interface ErrorResponse extends WorkerResponseBase {
   error: SerializedFrankenError;
 }
 
+/** A connection-wide transport failure cannot be attributed to a request id. */
+export interface WorkerFatalMessage {
+  kind: "worker-fatal";
+  error: SerializedFrankenError;
+}
+
+export type WorkerMessage = WorkerResponse | WorkerFatalMessage;
+
 export type WorkerResponse =
   | TransactionResponse
   | ReadyResponse

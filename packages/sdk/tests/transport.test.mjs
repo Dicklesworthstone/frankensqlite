@@ -133,3 +133,85 @@ test('reply decoding: corrupt write response in a managed transaction rolls back
   assert.equal(other.prepare('SELECT count(*) n FROM items').get().n,0);assert.equal(writes,1);
   assert.deepEqual(other.prepare('PRAGMA integrity_check').all().map(Object.values),[['ok']]);
 });
+
+const fatal = () => ({kind:'worker-fatal',error:{code:'ERR_FSQLITE_WORKER_TRANSPORT',message:'receiver lost a message',transient:false}});
+const uncertain = error => error?.code === 'ERR_FSQLITE_WORKER_TRANSPORT' && error.transient === false;
+
+test('channel failure: messageerror rejects every pending call and notifies owners only once',limits,async t=>{
+  const {worker,client}=fixture(t),failures=[];
+  client.observeFailure(error=>failures.push(error));
+  const a=observe(client.execute('write')),b=observe(client.query('read'));
+  worker.messageError();worker.messageError();await Promise.all([a.settled,b.settled]);
+  assert.ok(uncertain(a.outcome.reason));assert.equal(a.outcome.reason,b.outcome.reason);
+  assert.equal(failures.length,1);assert.equal(client.requestQueue.pendingBytes,0);
+  await assert.rejects(client.query('later'),error=>error===a.outcome.reason);
+  await assert.rejects(client.close(),error=>error===a.outcome.reason);
+  assert.equal(worker.terminateCount,1);assert.equal(worker.messageErrors.size,0);
+  assert.equal(worker.requests.length,2); // Never guessed/replayed the lost request.
+});
+
+test('channel failure: fatal worker notice leaves close joined to the actual host cleanup acknowledgement',limits,async t=>{
+  const {worker,client}=fixture(t);worker.onPost=()=>{};
+  const write=observe(client.execute('write')),closed=observe(client.close());
+  worker.reply(fatal());await drain();
+  assert.equal(write.outcome.status,'pending');assert.equal(closed.outcome.status,'pending');
+  worker.reply({kind:'close-result',requestId:worker.requests.at(-1).requestId});
+  await Promise.all([write.settled,closed.settled]);assert.ok(uncertain(write.outcome.reason));
+  assert.equal(closed.outcome.status,'fulfilled');assert.equal(worker.terminateCount,1);
+});
+
+test('channel failure: close after a fatal notice is admitted but ordinary SQL is not',limits,async t=>{
+  const {worker,client}=fixture(t);worker.reply(fatal());
+  await assert.rejects(client.query('read'),uncertain);await client.close();
+  assert.deepEqual(worker.requests.map(r=>r.kind),['close']);assert.equal(worker.terminateCount,1);
+});
+
+test('channel failure: actual crash or messageerror during the close fence cannot be reversed by a late fatal notice',limits,async t=>{
+  for(const event of ['crash','messageerror']){
+    const {worker,client}=fixture(t);worker.onPost=()=>{};
+    const close=observe(client.close());
+    if(event==='crash')worker.crash('channel gone');else worker.messageError();
+    worker.reply(fatal());await close.settled;
+    assert.equal(close.outcome.status,'rejected');assert.equal(worker.terminateCount,1);
+    assert.equal(worker.requests.length,1);assert.equal(worker.messages.size,0);
+  }
+});
+
+test('channel failure: failing listener registration releases partially attached resources and retains the cause',()=>{
+  const worker=new ControlledWorker(),add=worker.addEventListener.bind(worker),reason=Error('registration failed');
+  worker.addEventListener=(type,listener)=>{add(type,listener);if(type==='messageerror')throw reason;};
+  assert.throws(()=>new FrankenWorkerClient(worker),error=>error===reason);
+  assert.equal(worker.messages.size,0);assert.equal(worker.errors.size,0);assert.equal(worker.messageErrors.size,0);
+  assert.equal(worker.terminateCount,1);
+});
+
+test('channel failure: setup and cleanup failures are both retained without stopping other cleanup',()=>{
+  const worker=new ControlledWorker(),add=worker.addEventListener.bind(worker),remove=worker.removeEventListener.bind(worker);
+  const reason=Error('setup'),cleanup=Error('cleanup');
+  worker.addEventListener=(type,listener)=>{add(type,listener);if(type==='messageerror')throw reason;};
+  worker.removeEventListener=(type,listener)=>{remove(type,listener);if(type==='message')throw cleanup;};
+  assert.throws(()=>new FrankenWorkerClient(worker),error=>error instanceof AggregateError&&error.cause===reason&&error.errors.includes(cleanup));
+  assert.equal(worker.errors.size,0);assert.equal(worker.messageErrors.size,0);assert.equal(worker.terminateCount,1);
+});
+
+test('channel failure: invalid fatal payload still fails pending work instead of escaping the event callback',limits,async t=>{
+  const {worker,client}=fixture(t);const call=observe(client.execute('write'));
+  assert.doesNotThrow(()=>worker.reply({kind:'worker-fatal',error:null}));await call.settled;
+  assert.ok(invalid(call.outcome.reason));await assert.rejects(client.close(),invalid);
+});
+
+test('terminal cause: later operations retain callback and failed rollback instead of only the host error',limits,async t=>{
+  const callback=Error('original callback failure');
+  const f=sqliteSnapshotWorker({beforeBatch(sql){if(sql==='ROLLBACK')throw Error('rollback failed');}});
+  const db=await FrankenDB.open({worker:f.worker});t.after(()=>f.handles[0].close());
+  await db.execute('CREATE TABLE items(id)');let failure;
+  await assert.rejects(db.transaction(async tx=>{await tx.execute('INSERT INTO items VALUES(1)');throw callback;}),error=>{
+    failure=error;return error instanceof AggregateError&&error.cause===callback&&error.errors[1].cause.message==='rollback failed';
+  });
+  const count=f.worker.requests.length;
+  for(const operation of [()=>db.execute('INSERT INTO items VALUES(2)'),()=>db.query('SELECT 1'),()=>db.prepare('SELECT 1'),
+    ()=>db.transaction(()=>{}),()=>db.export(),()=>db.checkpoint(),()=>db.close()]) {
+    await assert.rejects(operation(),error=>error===failure);
+  }
+  assert.equal(f.worker.requests.length,count);assert.equal(f.worker.terminateCount,1);
+});

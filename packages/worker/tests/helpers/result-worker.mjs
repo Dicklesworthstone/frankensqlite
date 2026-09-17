@@ -22,21 +22,6 @@ async function open(bytes) {
   const path = workerData?.path ?? join(directory,'db.sqlite');
   if (bytes !== undefined) await writeFile(path,bytes);
   const db = new DatabaseSync(path);
-  if (workerData?.poolBarrier !== undefined) {
-    // Test-only rendezvous INSIDE SQLite execution. Multiple callbacks must be
-    // concurrently active on distinct threads before the parent releases them.
-    const gate = new Int32Array(workerData.poolBarrier);
-    db.function('__pool_hold', value => {
-      Atomics.add(gate, 1, 1);
-      Atomics.notify(gate, 1);
-      if (Atomics.load(gate, 0) === 0 && Atomics.wait(gate, 0, 0, 10000) === 'timed-out') {
-        throw new Error('Pool SQL rendezvous timed out');
-      }
-      // These fixtures pass integer row ids. Node numbers returned from a SQL
-      // function become SQLite REALs; return bigint to preserve INTEGER type.
-      return BigInt(value);
-    });
-  }
   let closed=false, exports=0;
   const parameters = values => values.map(v => typeof v === 'boolean' ? Number(v) : v);
   function prepared(sql) {
@@ -79,7 +64,9 @@ async function open(bytes) {
 }
 globalThis.__resultReferenceCore={create:()=>open(),import:bytes=>open(bytes)};
 globalThis.addEventListener=(type,listener)=>{
-  if(type==='message') parentPort.on('message',data=>listener({data}));
+  // Test controls use a separate logical channel, never the production wire.
+  if(type==='message') parentPort.on('message',data=>{if(data?.fixture===undefined)listener({data});});
+  if(type==='messageerror') parentPort.on('messageerror',()=>listener({data:undefined}));
 };
 globalThis.postMessage=(response,transfer=[])=>{
   const before=transfer.map(buffer=>buffer.byteLength);
