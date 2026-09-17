@@ -1,4 +1,6 @@
 export { FrankenDB } from "./database";
+export { FrankenSnapshotPool, FrankenPoolError } from "./snapshot-pool";
+export type { SnapshotPoolOptions, SnapshotQueryOptions, SnapshotPoolStats, SnapshotPoolIdentity } from "./snapshot-pool";
 export { FrankenSQLiteError } from "./errors";
 export { FrankenStreamError } from "./stream";
 export type { StreamFailurePhase } from "./stream";
