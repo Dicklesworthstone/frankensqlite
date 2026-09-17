@@ -9,6 +9,8 @@ import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./
 import { resolveRequestLimits, resolveResultEncoding } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 import type { TransactionOptions } from "./types";
+import { isTransactionConflict, resolveTransactionRetryOptions, runTransactionRetry } from "./transaction-retry";
+import type { RetryRecovery, TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
 const databaseClients = new WeakMap<FrankenDB, FrankenWorkerClient>();
 
@@ -28,6 +30,7 @@ interface TransactionScope {
   statements: Set<string>;
   errors: unknown[];
   children: Set<Promise<unknown>>;
+  cleanupFailed: boolean;
 }
 
 export class FrankenDB {
@@ -38,6 +41,7 @@ export class FrankenDB {
   #transactionScope: TransactionScope | null = null;
   #transactionFailure: Error | null = null;
   #nextTransactionId = 1n;
+  #retryOwner: object | null = null;
 
   private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null) {
     this.#client = client;
@@ -196,7 +200,10 @@ export class FrankenDB {
       metadata.columnCount,
       metadata.columnNames,
       (operation) => this.#run(scope, operation),
-      () => { scope?.statements.delete(metadata.statementId); },
+      (failed) => {
+        scope?.statements.delete(metadata.statementId);
+        if (scope !== null && failed) scope.cleanupFailed = true;
+      },
       scope?.id,
       scope?.signal,
     );
@@ -223,13 +230,39 @@ export class FrankenDB {
     return this.#transaction(null, tx => work(tx), undefined, options);
   }
 
+  /**
+   * Opt-in whole-transaction replay for confirmed SQLite BUSY conflicts.
+   * Each callback runs in a fresh transaction after the preceding rollback.
+   * Recreate input streams in the callback and keep external effects idempotent.
+   * This connection stays exclusively owned during backoff as well as SQL.
+   */
+  async transactionWithRetry<T>(
+    work: (tx: FrankenTransaction, attempt: TransactionRetryAttempt) => T | Promise<T>,
+    options?: TransactionRetryOptions,
+  ): Promise<T> {
+    this.#assertOwner(null);
+    if (typeof work !== "function") throw new TypeError("Transaction work must be a function");
+    const config = resolveTransactionRetryOptions(options);
+    // Options/getters may re-enter the database; never capture stale authority.
+    this.#assertOwner(null);
+    const owner = {};
+    this.#retryOwner = owner;
+    try {
+      return await runTransactionRetry((signal, attempt, recovery) =>
+        this.#transaction(null, tx => work(tx, attempt), undefined, { signal }, { owner, recovery }), config);
+    } finally {
+      this.#retryOwner = null;
+    }
+  }
+
   async #transaction<T>(
     parent: TransactionScope | null,
     work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
     beforeCommit?: () => void,
     options?: TransactionOptions,
+    retry?: { owner: object; recovery: RetryRecovery },
   ): Promise<T> {
-    this.#assertOwner(parent);
+    this.#assertOwner(parent, retry?.owner);
     const requestedSignal = options?.signal;
     const signals: AbortSignal[] = [];
     if (parent !== null) signals.push(parent.signal);
@@ -242,12 +275,13 @@ export class FrankenDB {
     const signal = AbortSignal.any(signals);
     // Reading caller options can re-enter this connection. Check again before
     // capturing authority; a child always inherits its parent's abort signal.
-    this.#assertOwner(parent);
+    this.#assertOwner(parent, retry?.owner);
     const scope: TransactionScope = {
       id: String(this.#nextTransactionId++),
       signal, cancellationError: null,
       accepting: true, pending: new Set(), statements: new Set(), errors: [],
       children: new Set(),
+      cleanupFailed: false,
     };
     this.#checkCancellation(scope);
     // Claim before the first await so foreign operations cannot enter between
@@ -300,9 +334,21 @@ export class FrankenDB {
           throw failure;
         }
       }
+      // This is recovery evidence, not a guess from an error's `transient`
+      // flag. A failed BEGIN is eligible only for a known core conflict; every
+      // started transaction must first acknowledge its full rollback. Unknown
+      // cleanup/transport outcomes never reach the retry scheduler as safe.
+      if (retry !== undefined && this.#transactionFailure === null && !scope.cleanupFailed &&
+          (began || isTransactionConflict(error))) {
+        retry.recovery.recovered = true;
+        retry.recovery.retryAllowed = isTransactionConflict(error);
+      }
       throw error;
     } finally {
       scope.accepting = false;
+      // A child's cleanup failure remains unsafe to replay even when the
+      // parent's callback catches it or a later parent operation conflicts.
+      if (scope.cleanupFailed && parent !== null) parent.cleanupFailed = true;
       this.#transactionScope = parent;
       signal.removeEventListener("abort", cancel);
     }
@@ -334,12 +380,13 @@ export class FrankenDB {
     return this.#run(null, () => this.#client.close());
   }
 
-  #assertOwner(scope: TransactionScope | null): void {
+  #assertOwner(scope: TransactionScope | null, retryOwner?: object): void {
     if (scope !== null && !scope.accepting) {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_CLOSED",
         message: "This FrankenSQLite transaction callback has finished" });
     }
-    if (this.#transactionScope !== scope) {
+    if (this.#transactionScope !== scope ||
+        (scope === null && this.#retryOwner !== null && this.#retryOwner !== retryOwner)) {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
         message: "A transaction owns this connection; use its transaction handle or wait until it finishes" });
     }
@@ -424,6 +471,7 @@ export class FrankenDB {
       try {
         await this.#client.finalizePrepared(statementId, scope.id);
       } catch (error: unknown) {
+        scope.cleanupFailed = true;
         scope.errors.push(error);
       }
     }
