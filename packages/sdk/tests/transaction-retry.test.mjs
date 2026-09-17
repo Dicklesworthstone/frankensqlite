@@ -92,9 +92,11 @@ class SqliteTransport {
   }
   async query(sql, params = []) {
     this.assertOpen();
+    await this.state.beforeQuery?.(sql);
     try {
       const stmt = this.state.raw.prepare(sql);
-      return { columns: stmt.columns().map(c => c.name), rows: stmt.all(...params) };
+      const columns = stmt.columns().map(c => c.name), rows = stmt.all(...params);
+      return { columns, rows, rowArrays: rows.map(row => columns.map(name => row[name])) };
     } catch (error) { throw sqliteError(error); }
   }
   async prepare(sql) {
@@ -149,6 +151,7 @@ replacements.set('@frankensqlite/worker', {
   },
 });
 const { FrankenDB } = production('database');
+const { FrankenDBQueue } = production('queue');
 const fast = { maxAttempts: 4, timeoutMs: 5000, initialDelayMs: 0, maxDelayMs: 0 };
 async function fixture(t, file = false) {
   const path = file ? join(mkdtempSync(join(tmpdir(), 'fsqlite-retry-')), 'db.sqlite') : ':memory:';
@@ -453,4 +456,183 @@ test('scheduler requires explicit recovery evidence; a BUSY-shaped rejection alo
   let calls = 0; const error = busy();
   await assert.rejects(runTransactionRetry(async () => { calls++; throw error; }, resolveTransactionRetryOptions(fast)), e => e === error);
   assert.equal(calls, 1);
+});
+
+async function queueFixture(t, options = {}, file = false) {
+  const path = file ? join(mkdtempSync(join(tmpdir(), 'fsqlite-queue-retry-')), 'db.sqlite') : ':memory:';
+  const raw = new DatabaseSync(path);
+  const state = { raw, path, stack: [], events: [], attempts: 0, statements: new Map(), nextStatement: 0 };
+  const queue = await FrankenDBQueue.open({ worker: state }, options);
+  t.after(async () => { await queue.close(); });
+  raw.exec('CREATE TABLE counts(value INTEGER); INSERT INTO counts VALUES(0); CREATE TABLE other(value INTEGER); INSERT INTO other VALUES(0); CREATE TABLE audit(v); CREATE TRIGGER log_update AFTER UPDATE ON counts BEGIN INSERT INTO audit VALUES(new.value); END');
+  return { queue, state, raw };
+}
+
+test('queued retry publishes only the final attempt\'s tables, not rolled-back dirty bits', async t => {
+  const { queue, state, raw } = await queueFixture(t); const events = [], delivered = deferred();
+  await queue.subscribe(['counts', 'other'], change => { events.push(change); delivered.resolve(); });
+  const base = state.attempts;
+  state.beforeBoundary = action => {
+    if (action === 'commit' && state.stack.at(-1)?.parentId === undefined && state.attempts === base + 1) throw busy();
+  };
+  const attempts = [];
+  const result = await queue.transactionWithRetry(async (tx, info) => {
+    attempts.push(info.attempt);
+    await tx.execute(info.attempt === 1 ? 'UPDATE counts SET value=9' : 'UPDATE other SET value=1');
+    return info.attempt;
+  }, fast);
+  await delivered.promise;
+  assert.equal(result, 2); assert.deepEqual(attempts, [1, 2]); assert.equal(events.length, 1);
+  assert.deepEqual(events[0].tables, ['other']); assert.equal(events[0].commits, 1n);
+  assert.equal(queue.changeSequence, 1n); assert.equal(queue.stats.failedJobs, 0);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 0);
+});
+
+test('queued journal postlude conflict replays the callback and postlude in a new outer transaction', async t => {
+  const { queue, state, raw } = await queueFixture(t); const delivered = deferred();
+  await queue.subscribe(['counts'], change => delivered.resolve(change));
+  let failRead = true, callbacks = 0;
+  state.beforeQuery = sql => { if (failRead && sql.startsWith('SELECT id, dirty')) { failRead = false; throw busy(); } };
+  await queue.transactionWithRetry(async tx => { callbacks++; await tx.execute('UPDATE counts SET value=value+1'); }, fast);
+  const change = await delivered.promise;
+  assert.equal(callbacks, 2); assert.equal(change.commits, 1n);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 1);
+});
+
+test('queued watched transaction recovers a REAL SQLite WAL snapshot conflict', async t => {
+  const { queue, state, raw } = await queueFixture(t, {}, true);
+  raw.exec('PRAGMA journal_mode=WAL'); const peer = new DatabaseSync(state.path); t.after(() => peer.close());
+  const delivered = deferred(); await queue.subscribe(['counts'], change => delivered.resolve(change));
+  const reads = [];
+  await queue.transactionWithRetry(async (tx, info) => {
+    const value = (await tx.query('SELECT value FROM counts')).rows[0].value; reads.push(value);
+    if (info.attempt === 1) peer.exec('UPDATE counts SET value=10');
+    await tx.execute('UPDATE counts SET value=?', [value + 1]);
+  }, fast);
+  assert.deepEqual(reads, [0, 10]); assert.equal(peer.prepare('SELECT value FROM counts').get().value, 11);
+  assert.equal((await delivered.promise).commits, 1n); assert.equal(queue.changeSequence, 1n);
+});
+
+test('queued retry retains FIFO capacity through rollback/backoff; close drains all accepted work', async t => {
+  const { queue, state } = await queueFixture(t, { maxPendingJobs: 2 });
+  const rolling = deferred(), release = deferred(); let secondStarted = false, closed = false;
+  state.beforeBoundary = action => { if (action === 'commit' && state.attempts === 1) throw busy(); };
+  state.afterBoundary = async action => { if (action === 'rollback') { rolling.resolve(); await release.promise; } };
+  const first = queue.transactionWithRetry(tx => tx.execute('UPDATE counts SET value=value+1'), fast);
+  await rolling.promise;
+  const second = queue.transaction(async tx => { secondStarted = true; return (await tx.query('SELECT value FROM counts')).rows[0].value; });
+  await assert.rejects(queue.transactionWithRetry(() => {}, fast), e => e.code === 'ERR_FSQLITE_JOB_QUEUE_FULL');
+  const closing = queue.close().then(() => { closed = true; });
+  await turn(); assert.equal(secondStarted, false); assert.equal(closed, false);
+  assert.equal(queue.stats.activeJobs, 1); assert.equal(queue.stats.waitingJobs, 1);
+  release.resolve(); await first; assert.equal(await second, 1); await closing;
+  assert.equal(queue.stats.completedJobs, 2); assert.equal(queue.stats.acceptedJobs, 2);
+  assert.equal(queue.stats.failedJobs, 0); assert.equal(queue.stats.state, 'closed');
+});
+
+for (const mode of ['abort', 'timeout']) {
+  test(`waiting retry job ${mode} starts no transaction or callback`, async t => {
+    const { queue, state } = await queueFixture(t); const entered = deferred(), release = deferred();
+    const blocker = queue.transaction(async () => { entered.resolve(); await release.promise; }); await entered.promise;
+    let callbacks = 0; const controller = new AbortController();
+    const waiting = queue.transactionWithRetry(() => { callbacks++; },
+      { ...fast, signal: controller.signal, ...(mode === 'timeout' ? { waitTimeoutMs: 5 } : {}) });
+    const rejection = assert.rejects(waiting, e => e.code === (mode === 'timeout' ? 'ERR_FSQLITE_JOB_WAIT_TIMEOUT' : 'ERR_FSQLITE_JOB_CANCELLED'));
+    if (mode === 'abort') controller.abort('not started');
+    await rejection; assert.equal(callbacks, 0); assert.equal(state.attempts, 1);
+    release.resolve(); await blocker;
+    assert.equal(queue.stats[mode === 'timeout' ? 'timedOutJobs' : 'cancelledJobs'], 1);
+  });
+}
+
+test('active queued cancellation publishes nothing and later jobs still run', async t => {
+  const { queue, state, raw } = await queueFixture(t); const events = [], controller = new AbortController();
+  await queue.subscribe(['counts'], change => { events.push(change); });
+  state.beforeBoundary = action => { if (action === 'commit' && state.stack.at(-1)?.parentId === undefined) throw busy(); };
+  state.afterBoundary = action => { if (action === 'rollback') controller.abort('stop retries'); };
+  await assert.rejects(queue.transactionWithRetry(tx => tx.execute('UPDATE counts SET value=5'),
+    { ...fast, signal: controller.signal }), e => e.code === 'ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED');
+  state.beforeBoundary = undefined; state.afterBoundary = undefined;
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0); assert.equal(queue.changeSequence, 0n);
+  await queue.transaction(tx => tx.query('SELECT value FROM counts')); await sleep(5);
+  assert.deepEqual(events, []); assert.equal(queue.stats.failedJobs, 1);
+});
+
+test('queued exhaustion counts one failed job and emits no phantom later notification', async t => {
+  const { queue, state, raw } = await queueFixture(t); const events = []; let failures = 2;
+  await queue.subscribe(['counts'], change => { events.push(change); });
+  state.beforeBoundary = action => { if (action === 'commit' && state.stack.at(-1)?.parentId === undefined && failures-- > 0) throw busy(); };
+  await assert.rejects(queue.transactionWithRetry(tx => tx.execute('UPDATE counts SET value=5'), { ...fast, maxAttempts: 2 }), e => e.code === 'SQLITE_BUSY_SNAPSHOT');
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+  await queue.transactionWithRetry(tx => tx.query('SELECT value FROM counts'), fast); await sleep(5);
+  assert.deepEqual(events, []); assert.equal(queue.changeSequence, 0n); assert.equal(queue.stats.failedJobs, 1);
+});
+
+test('queued retry policy is captured once before admission and cannot change while waiting', async t => {
+  const { queue, state } = await queueFixture(t); const entered = deferred(), release = deferred();
+  const blocker = queue.transaction(async () => { entered.resolve(); await release.promise; }); await entered.promise;
+  let reads = 0, value = 2;
+  const policy = { ...fast, get maxAttempts() { reads++; return value; } };
+  const pending = queue.transactionWithRetry(tx => tx.execute('UPDATE counts SET value=1'), policy);
+  const rejected = assert.rejects(pending, e => e.code === 'SQLITE_BUSY_SNAPSHOT');
+  state.beforeBoundary = action => { if (action === 'commit' && state.attempts > 1) throw busy(); };
+  value = 100; release.resolve(); await blocker;
+  await rejected; assert.equal(reads, 1); assert.equal(state.attempts, 3);
+});
+
+test('queued invalid or reentrant policy rejects before reserving a job', async t => {
+  const { queue } = await queueFixture(t);
+  await assert.rejects(queue.transactionWithRetry(() => {}, { maxAttempts: 101 }), e => e.code === 'ERR_FSQLITE_TRANSACTION_RETRY_INPUT');
+  assert.equal(queue.stats.acceptedJobs, 0); assert.equal(queue.stats.rejectedJobs, 1);
+  let closing;
+  await assert.rejects(queue.transactionWithRetry(() => {}, { get maxAttempts() { closing = queue.close(); return 4; } }), e => e.code === 'ERR_FSQLITE_JOB_QUEUE_CLOSED');
+  await closing; assert.equal(queue.stats.acceptedJobs, 0); assert.equal(queue.stats.rejectedJobs, 2);
+});
+
+test('listener failure after queued commit never causes transaction replay', async t => {
+  const { queue, raw } = await queueFixture(t); const failure = new Error('listener failed'); let callbacks = 0;
+  const subscription = await queue.subscribe(['counts'], () => { throw failure; });
+  const done = assert.rejects(subscription.done, e => e === failure);
+  assert.equal(await queue.transactionWithRetry(async tx => {
+    callbacks++; await tx.execute('UPDATE counts SET value=1'); return 'committed';
+  }, fast), 'committed');
+  await done; assert.equal(callbacks, 1); assert.equal(queue.stats.failedJobs, 0);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+});
+
+test('ordinary watched transactions retain child rollback and one-commit notifications', async t => {
+  const { queue, raw } = await queueFixture(t); const delivered = deferred();
+  await queue.subscribe(['counts', 'other'], change => delivered.resolve(change));
+  await queue.transaction(async tx => {
+    try { await tx.transaction(async child => { await child.execute('UPDATE other SET value=7'); throw new Error('undo child'); }); } catch {}
+    await tx.execute('UPDATE counts SET value=1');
+  });
+  assert.deepEqual((await delivered.promise).tables, ['counts']);
+  assert.equal(raw.prepare('SELECT value FROM other').get().value, 0);
+});
+
+test('watched schema mutation refuses replay and restores the table', async t => {
+  const { queue, raw } = await queueFixture(t); let callbacks = 0;
+  await queue.subscribe(['counts'], () => { throw new Error('must not notify'); });
+  await assert.rejects(queue.transactionWithRetry(async tx => {
+    callbacks++; await tx.execute('DROP TABLE counts');
+  }, fast), e => e.code === 'ERR_FSQLITE_SUBSCRIPTION_SCHEMA');
+  assert.equal(callbacks, 1); assert.equal(queue.changeSequence, 0n);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 0);
+});
+
+test('queued retries remain usable after the last subscription is removed', async t => {
+  const { queue, raw } = await queueFixture(t);
+  const subscription = await queue.subscribe(['counts'], () => { throw new Error('unsubscribed'); });
+  subscription.unsubscribe(); await subscription.done;
+  const result = await queue.transactionWithRetry(async (tx, info) => {
+    await tx.execute('UPDATE counts SET value=value+1');
+    if (info.attempt === 1) throw busy();
+    return info.attempt;
+  }, fast);
+  assert.equal(result, 2); assert.equal(queue.changeSequence, 0n);
+  assert.equal(raw.prepare('SELECT value FROM counts').get().value, 1);
+  assert.equal(raw.prepare("SELECT count(*) n FROM temp.sqlite_master WHERE type='trigger'").get().n, 0);
 });

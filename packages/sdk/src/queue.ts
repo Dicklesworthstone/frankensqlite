@@ -5,6 +5,8 @@ import { ChangeObserver, createChangeStream } from "./subscriptions";
 import type { TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
 import type { FrankenTransaction } from "./transaction";
 import type { FrankenDbOpenOptions, SnapshotMetadata } from "./types";
+import { resolveTransactionRetryOptions } from "./transaction-retry";
+import type { TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
 type CloseListener = (failure: Error | null) => void;
 const queueClosers = new WeakMap<FrankenDBQueue, (listener: CloseListener) => () => void>();
@@ -33,6 +35,11 @@ export interface QueuedJobOptions {
 export interface QueuedTransactionOptions extends QueuedJobOptions {
   /** Active transaction cancellation also drains callback, SQL and rollback. */
   signal?: AbortSignal;
+}
+
+export interface QueuedTransactionRetryOptions extends TransactionRetryOptions {
+  /** Queue-wait budget, separate from timeoutMs for the started retry operation. */
+  waitTimeoutMs?: number;
 }
 
 export interface JobQueueStats {
@@ -180,15 +187,53 @@ export class FrankenDBQueue {
       const transactionOptions = signal === undefined ? undefined : { signal };
       if (this.#journal === null) return this.#db.transaction(work, transactionOptions);
       const result = await this.#journal.run(this.#db, work, transactionOptions);
-      if (result.tables.length !== 0) {
-        const sequence = ++this.#changeSequence;
-        for (const observer of this.#subscriptions) {
-          try { observer.publish(result.tables, sequence); }
-          catch (cause: unknown) { observer.fail(cause); }
-        }
-      }
+      this.#publishTables(result.tables);
       return result.value;
     }, options, work);
+  }
+
+  /**
+   * Retry a complete transaction in one FIFO job, including its change journal.
+   * Failed attempts never notify listeners, release capacity or admit siblings.
+   * The callback must be safe to replay; ordinary transaction() never retries.
+   */
+  transactionWithRetry<T>(
+    work: (tx: FrankenTransaction, attempt: TransactionRetryAttempt) => T | Promise<T>,
+    options?: QueuedTransactionRetryOptions,
+  ): Promise<T> {
+    let policy: Omit<TransactionRetryOptions, "signal">;
+    const admission: QueuedJobOptions = {};
+    try {
+      this.#assertAdmission();
+      if (typeof work !== "function") throw new TypeError("A transaction callback is required");
+      // Capture every caller getter at admission, not after waiting behind
+      // another job. Enqueue rechecks capacity/close after any reentrant getter.
+      const { signal, ...captured } = resolveTransactionRetryOptions(options);
+      policy = captured;
+      const waitTimeoutMs = options?.waitTimeoutMs;
+      if (signal !== undefined) admission.signal = signal;
+      if (waitTimeoutMs !== undefined) admission.waitTimeoutMs = waitTimeoutMs;
+    } catch (error: unknown) {
+      this.#rejected++;
+      return Promise.reject(error);
+    }
+    return this.#enqueue(async signal => {
+      const retryOptions: TransactionRetryOptions = { ...policy };
+      if (signal !== undefined) retryOptions.signal = signal;
+      if (this.#journal === null) return this.#db.transactionWithRetry(work, retryOptions);
+      const result = await this.#journal.runWithRetry(this.#db, work, retryOptions);
+      this.#publishTables(result.tables);
+      return result.value;
+    }, admission, work);
+  }
+
+  #publishTables(tables: readonly string[]): void {
+    if (tables.length === 0) return;
+    const sequence = ++this.#changeSequence;
+    for (const observer of this.#subscriptions) {
+      try { observer.publish(tables, sequence); }
+      catch (cause: unknown) { observer.fail(cause); }
+    }
   }
 
   /** Register at a FIFO boundary; only later successful local commits notify. */

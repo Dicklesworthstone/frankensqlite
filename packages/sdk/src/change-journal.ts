@@ -2,6 +2,7 @@ import type { FrankenDB } from "./database";
 import { FrankenSQLiteError } from "./errors";
 import type { FrankenTransaction } from "./transaction";
 import type { TransactionOptions } from "./types";
+import type { TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
 const MAX_TABLES = 64;
 const EVENTS = ["INSERT", "UPDATE", "DELETE"] as const;
@@ -118,27 +119,40 @@ export class TableChangeJournal {
   /** Return dirty tables only after the enclosing SQL COMMIT has succeeded. */
   async run<T>(db: FrankenDB, work: (tx: FrankenTransaction) => T | Promise<T>, options?: TransactionOptions):
     Promise<{ value: T; tables: readonly string[] }> {
-    if (this.#watches.size === 0) return { value: await db.transaction(work, options), tables: [] };
-    return db.transaction(async outer => {
-      await this.#verify(outer, this.#watches);
-      // The user's handle must expire when their callback ends, not after our
-      // asynchronous journal read. A private parent owns that postlude.
-      const value = await outer.transaction(work);
-      await this.#verify(outer, this.#watches);
-      const result = await outer.query(`SELECT id, dirty FROM temp.${quote(this.#name)} ORDER BY id`);
-      const byId = new Map([...this.#watches.values()].map(watch => [watch.id, watch.name]));
-      if (result.rowArrays.length !== byId.size) throw changed();
-      const tables: string[] = [];
-      for (const row of result.rowArrays) {
-        const id = row[0];
-        const name = typeof id === "number" ? byId.get(id) : typeof id === "bigint" && id <= BigInt(Number.MAX_SAFE_INTEGER) ? byId.get(Number(id)) : undefined;
-        if (name === undefined) throw changed();
-        if (row[1] === 1 || row[1] === 1n) tables.push(name);
-        else if (row[1] !== 0 && row[1] !== 0n) throw changed();
-      }
-      if (tables.length !== 0) await outer.execute(`UPDATE temp.${quote(this.#name)} SET dirty = 0 WHERE dirty = 1`);
-      return { value, tables: Object.freeze(tables) };
-    }, options);
+    return db.transaction(outer => this.#collect(outer, work), options);
+  }
+
+  /** Replay the journal and callback together, never a child on a stale snapshot. */
+  runWithRetry<T>(db: FrankenDB,
+    work: (tx: FrankenTransaction, attempt: TransactionRetryAttempt) => T | Promise<T>,
+    options?: TransactionRetryOptions): Promise<{ value: T; tables: readonly string[] }> {
+    return db.transactionWithRetry((outer, attempt) =>
+      this.#collect(outer, tx => work(tx, attempt)), options);
+  }
+
+  async #collect<T>(outer: FrankenTransaction, work: (tx: FrankenTransaction) => T | Promise<T>):
+    Promise<{ value: T; tables: readonly string[] }> {
+    if (this.#watches.size === 0) return { value: await work(outer), tables: [] };
+    await this.#verify(outer, this.#watches);
+    // The user's handle must expire when their callback ends, not after our
+    // asynchronous journal read. A private parent owns that postlude. Dirty
+    // bits and their clearing roll back with the attempt; only a successful
+    // outer COMMIT exposes this attempt's result to the queue's publisher.
+    const value = await outer.transaction(work);
+    await this.#verify(outer, this.#watches);
+    const result = await outer.query(`SELECT id, dirty FROM temp.${quote(this.#name)} ORDER BY id`);
+    const byId = new Map([...this.#watches.values()].map(watch => [watch.id, watch.name]));
+    if (result.rowArrays.length !== byId.size) throw changed();
+    const tables: string[] = [];
+    for (const row of result.rowArrays) {
+      const id = row[0];
+      const name = typeof id === "number" ? byId.get(id) : typeof id === "bigint" && id <= BigInt(Number.MAX_SAFE_INTEGER) ? byId.get(Number(id)) : undefined;
+      if (name === undefined) throw changed();
+      if (row[1] === 1 || row[1] === 1n) tables.push(name);
+      else if (row[1] !== 0 && row[1] !== 0n) throw changed();
+    }
+    if (tables.length !== 0) await outer.execute(`UPDATE temp.${quote(this.#name)} SET dirty = 0 WHERE dirty = 1`);
+    return { value, tables: Object.freeze(tables) };
   }
 
   async #verify(tx: FrankenTransaction, watches: ReadonlyMap<string, Watch>): Promise<void> {

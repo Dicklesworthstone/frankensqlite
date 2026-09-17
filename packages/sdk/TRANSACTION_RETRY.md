@@ -78,6 +78,30 @@ recovered conflict when available. Exhausting attempts rethrows the last
 conflict itself, preserving SQLite codes, causes and batch indexes. Fatal
 cleanup errors take precedence over cancellation/timeout wrappers.
 
+## FIFO jobs and subscriptions
+
+`FrankenDBQueue.transactionWithRetry(work, options)` exposes the same opt-in
+policy without giving callers the queue's private connection. It reserves one
+job slot for the whole operation, including every retry, rollback and backoff.
+Accepted/completed/failed job counters count jobs, not attempts. Later jobs and
+export/checkpoint barriers cannot overtake a retrying job. `close()` drains
+accepted work rather than cutting an attempt short.
+
+`QueuedTransactionRetryOptions` adds `waitTimeoutMs`, the existing queue-start
+budget. It is separate from `timeoutMs`, which begins when the retry operation
+starts after queue-boundary subscription reconciliation. Neither timer abandons
+active SQL. Cancelling while waiting prevents all attempt callbacks; cancelling
+after start drains the active attempt. Options are captured and validated at
+submission, so mutating them while a job waits cannot change its retry policy.
+
+For watched tables, schema verification, callback execution, dirty-bit
+collection and clearing all belong to the same retry attempt. Failed attempts
+roll back their dirty bits. Only the final acknowledged COMMIT advances
+`changeSequence` and publishes its actual dirty table set; rolled-back writes
+and postlude failures produce no phantom notifications. Listener failure after
+commit cannot replay SQL. These remain local queue invalidations, not a durable
+changefeed or notifications of another connection's writes.
+
 ## Executable verification
 
 ```sh
