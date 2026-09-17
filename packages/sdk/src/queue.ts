@@ -1,0 +1,277 @@
+import { FrankenDB } from "./database";
+import { FrankenSQLiteError } from "./errors";
+import type { FrankenTransaction } from "./transaction";
+import type { FrankenDbOpenOptions, TransactionOptions } from "./types";
+
+export interface JobQueueOptions {
+  /** Active plus waiting jobs, 1..4096. Defaults to 64. No overflow waiters. */
+  maxPendingJobs?: number;
+}
+
+export interface QueuedTransactionOptions extends TransactionOptions {
+  /** Maximum time waiting to start, in milliseconds. Never times out live SQL. */
+  waitTimeoutMs?: number;
+}
+
+export interface JobQueueStats {
+  readonly state: "open" | "closing" | "closed";
+  readonly maxPendingJobs: number;
+  readonly pendingJobs: number;
+  readonly waitingJobs: number;
+  readonly activeJobs: number;
+  readonly acceptedJobs: number;
+  readonly completedJobs: number;
+  /** Started jobs that failed, including cooperative active cancellation. */
+  readonly failedJobs: number;
+  /** Accepted jobs cancelled while waiting; their callbacks never ran. */
+  readonly cancelledJobs: number;
+  readonly timedOutJobs: number;
+  /** Admission refusals, including invalid arguments and calls after close. */
+  readonly rejectedJobs: number;
+}
+
+interface Job {
+  state: "waiting" | "active" | "settled";
+  readonly start: () => void;
+  readonly reject: (error: unknown) => void;
+  readonly signal: AbortSignal | undefined;
+  readonly deadline: number | undefined;
+  stopWaiting: () => void;
+}
+
+function cancelled(signal: AbortSignal): FrankenSQLiteError {
+  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_CANCELLED",
+    message: "Queued job cancelled before starting; no SQL was executed", transient: false });
+  // The local reason need not be serializable across the worker boundary.
+  error.cause = signal.reason;
+  return error;
+}
+
+/**
+ * A bounded FIFO of whole transactions on one privately owned connection.
+ * Not a multi-worker pool: memory/snapshot connections do not share live data.
+ */
+export class FrankenDBQueue {
+  readonly #db: FrankenDB;
+  readonly #maxPendingJobs: number;
+  readonly #waiting = new Set<Job>();
+  #active: Job | null = null;
+  #state: JobQueueStats["state"] = "open";
+  #pumpScheduled = false;
+  #closeStarted = false;
+  #closePromise: Promise<void> | null = null;
+  #resolveClose: (() => void) | null = null;
+  #rejectClose: ((error: unknown) => void) | null = null;
+  #accepted = 0;
+  #completed = 0;
+  #failed = 0;
+  #cancelled = 0;
+  #timedOut = 0;
+  #rejected = 0;
+
+  private constructor(db: FrankenDB, maxPendingJobs: number) {
+    this.#db = db;
+    this.#maxPendingJobs = maxPendingJobs;
+  }
+
+  static async open(
+    databaseOptions?: FrankenDbOpenOptions | string,
+    queueOptions?: JobQueueOptions,
+  ): Promise<FrankenDBQueue> {
+    // Capture and validate before constructing a worker or importing bytes.
+    const maxPendingJobs = queueOptions?.maxPendingJobs ?? 64;
+    if (!Number.isInteger(maxPendingJobs) || maxPendingJobs < 1 || maxPendingJobs > 4096) {
+      throw new RangeError("maxPendingJobs must be an integer in 1..4096");
+    }
+    return new FrankenDBQueue(await FrankenDB.open(databaseOptions), maxPendingJobs);
+  }
+
+  get path(): string { return this.#db.path; }
+  get persistence() { return this.#db.persistence; }
+  get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
+
+  /** Frozen scheduler accounting, not a database-health or memory measurement. */
+  get stats(): JobQueueStats {
+    const activeJobs = this.#active === null ? 0 : 1;
+    return Object.freeze({
+      state: this.#state, maxPendingJobs: this.#maxPendingJobs,
+      pendingJobs: activeJobs + this.#waiting.size,
+      waitingJobs: this.#waiting.size, activeJobs,
+      acceptedJobs: this.#accepted, completedJobs: this.#completed,
+      failedJobs: this.#failed, cancelledJobs: this.#cancelled,
+      timedOutJobs: this.#timedOut, rejectedJobs: this.#rejected,
+    });
+  }
+
+  /**
+   * Submit a complete transaction. Only the callback's tx may use the connection.
+   * Await nested work through tx.transaction(), not through this queue: a queued
+   * sibling cannot start while this callback owns the connection.
+   */
+  transaction<T>(
+    work: (tx: FrankenTransaction) => T | Promise<T>,
+    options?: QueuedTransactionOptions,
+  ): Promise<T> {
+    return this.#enqueue(signal => this.#db.transaction(work,
+      signal === undefined ? undefined : { signal }), options, work);
+  }
+
+  /** Stop admission, drain accepted jobs, then close. Idempotent shared promise. */
+  close(): Promise<void> {
+    if (this.#closePromise !== null) return this.#closePromise;
+    this.#state = "closing";
+    this.#closePromise = new Promise<void>((resolve, reject) => {
+      this.#resolveClose = resolve;
+      this.#rejectClose = reject;
+    });
+    this.#schedule();
+    return this.#closePromise;
+  }
+
+  #assertAdmission(): void {
+    if (this.#state !== "open") {
+      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_CLOSED",
+        message: "This job queue no longer accepts work" });
+    }
+    if (this.#waiting.size + (this.#active === null ? 0 : 1) >= this.#maxPendingJobs) {
+      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_FULL", transient: true,
+        message: "Job queue is full; no SQL was executed",
+        suggestion: "Await an accepted job before retrying the complete transaction" });
+    }
+  }
+
+  #enqueue<T>(
+    operation: (signal: AbortSignal | undefined) => Promise<T>,
+    options: QueuedTransactionOptions | undefined,
+    callback: unknown,
+  ): Promise<T> {
+    let signal: AbortSignal | undefined;
+    let waitTimeoutMs: number | undefined;
+    try {
+      this.#assertAdmission();
+      if (typeof callback !== "function") throw new TypeError("A transaction callback is required");
+      const requestedSignal = options?.signal;
+      waitTimeoutMs = options?.waitTimeoutMs;
+      if (waitTimeoutMs !== undefined && (!Number.isInteger(waitTimeoutMs)
+        || waitTimeoutMs < 1 || waitTimeoutMs > 2_147_483_647)) {
+        throw new RangeError("waitTimeoutMs must be an integer in 1..2147483647");
+      }
+      if (requestedSignal !== undefined) {
+        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(requestedSignal);
+        // A dependent native signal is private. A caller's abort listener cannot
+        // stopImmediatePropagation() and hide cancellation from this queue.
+        signal = AbortSignal.any([requestedSignal]);
+      }
+      // Caller option getters can close/fill this queue; they grant no reservation.
+      this.#assertAdmission();
+      if (signal?.aborted) throw cancelled(signal);
+    } catch (error: unknown) {
+      this.#rejected++;
+      return Promise.reject(error);
+    }
+
+    const deadline = waitTimeoutMs === undefined ? undefined : performance.now() + waitTimeoutMs;
+    return new Promise<T>((resolve, reject) => {
+      const job: Job = {
+        state: "waiting", signal, deadline, reject, stopWaiting: () => {},
+        start: () => {
+          let result: Promise<T>;
+          try { result = operation(signal); }
+          catch (error: unknown) { result = Promise.reject(error); }
+          // Release capacity only after the real transaction (including cleanup)
+          // settles. Never race running SQL or a callback against a timer/abort.
+          void result.then(value => {
+            this.#finish(job, true);
+            resolve(value);
+          }, (error: unknown) => {
+            this.#finish(job, false);
+            reject(error);
+          });
+        },
+      };
+      const onAbort = () => this.#discard(job, "cancelled", cancelled(signal!));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      job.stopWaiting = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      this.#accepted++;
+      this.#waiting.add(job);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (waitTimeoutMs !== undefined) {
+        timer = setTimeout(() => this.#expire(job), waitTimeoutMs);
+      }
+      this.#schedule();
+    });
+  }
+
+  #expire(job: Job): void {
+    this.#discard(job, "timeout", new FrankenSQLiteError({
+      code: "ERR_FSQLITE_JOB_WAIT_TIMEOUT", transient: true,
+      message: "Queued job exceeded its start deadline; no SQL was executed",
+      suggestion: "Retry the complete job after queue pressure subsides",
+    }));
+  }
+
+  #discard(job: Job, reason: "cancelled" | "timeout", error: unknown): void {
+    if (job.state !== "waiting") return;
+    job.state = "settled";
+    job.stopWaiting();
+    this.#waiting.delete(job);
+    if (reason === "cancelled") this.#cancelled++;
+    else this.#timedOut++;
+    job.reject(error);
+    this.#schedule();
+  }
+
+  #finish(job: Job, success: boolean): void {
+    job.state = "settled";
+    this.#active = null;
+    if (success) this.#completed++;
+    else this.#failed++;
+    this.#schedule();
+  }
+
+  #schedule(): void {
+    if (this.#pumpScheduled || this.#state === "closed") return;
+    this.#pumpScheduled = true;
+    queueMicrotask(() => {
+      this.#pumpScheduled = false;
+      this.#pump();
+    });
+  }
+
+  #pump(): void {
+    if (this.#active !== null) return;
+    for (const job of this.#waiting) {
+      // Timers can be delayed behind promise continuations or a blocked event
+      // loop. Recheck the deadline here before permitting any BEGIN or callback.
+      if (job.signal?.aborted) {
+        this.#discard(job, "cancelled", cancelled(job.signal));
+      } else if (job.deadline !== undefined && performance.now() >= job.deadline) {
+        this.#expire(job);
+      } else {
+        this.#waiting.delete(job);
+        job.stopWaiting();
+        job.state = "active";
+        this.#active = job;
+        job.start();
+        return;
+      }
+    }
+    if (this.#state === "closing" && !this.#closeStarted) {
+      this.#closeStarted = true;
+      void this.#db.close().then(() => {
+        this.#state = "closed";
+        this.#resolveClose!();
+        this.#resolveClose = null;
+        this.#rejectClose = null;
+      }, (error: unknown) => {
+        this.#state = "closed";
+        this.#rejectClose!(error);
+        this.#resolveClose = null;
+        this.#rejectClose = null;
+      });
+    }
+  }
+}
