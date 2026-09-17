@@ -1,4 +1,6 @@
 export { FrankenDB } from "./database";
+export { FrankenMigrationPlan, FrankenMigrationError, MIGRATION_HISTORY_TABLE } from "./migrations";
+export type { SchemaMigration, MigrationIdentity, MigrationStatus, MigrationResult } from "./migrations";
 export { FrankenTransactionRetryError } from "./transaction-retry";
 export type { TransactionRetryOptions, TransactionRetryAttempt } from "./transaction-retry";
 export { scanTable } from "./table-scan";
