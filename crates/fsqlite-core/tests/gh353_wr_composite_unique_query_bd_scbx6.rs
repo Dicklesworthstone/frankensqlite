@@ -10,6 +10,39 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
 
+#[test]
+fn named_index_record_key_probe_is_search() {
+    use fsqlite_core::explain::program_seeks_named_index;
+    use fsqlite_types::opcode::{Opcode, P4};
+    use fsqlite_vdbe::ProgramBuilder;
+
+    for opcode in [Opcode::NoConflict, Opcode::NotFound, Opcode::Rewind] {
+        for cursor in [0, 1] {
+            let mut b = ProgramBuilder::new();
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::Table("facts".to_owned()), 0);
+            b.emit_op(
+                Opcode::OpenRead,
+                1,
+                3,
+                0,
+                P4::Index("facts_unique".to_owned()),
+                0,
+            );
+            b.emit_op(opcode, cursor, 0, 2, P4::Int(2), 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let program = b.finish().unwrap();
+            // Neither a table PK probe nor an index scan proves a named
+            // secondary-index SEARCH, even when that index is open.
+            assert_eq!(
+                program_seeks_named_index(&program, "facts_unique"),
+                cursor == 1 && opcode != Opcode::Rewind,
+                "{opcode:?} on cursor {cursor}"
+            );
+            assert!(!program_seeks_named_index(&program, "another_index"));
+        }
+    }
+}
+
 struct AsciiCaseFoldBinary;
 
 impl fsqlite_func::collation::CollationFunction for AsciiCaseFoldBinary {

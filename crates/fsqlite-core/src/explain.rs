@@ -318,7 +318,7 @@ pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
 }
 
 /// True when the emitted program positions a cursor opened on `index_name`
-/// with a key seek (`SeekGE`/`SeekGT`/`SeekLE`/`SeekLT`).
+/// with a range seek or an exact record-key probe (`NoConflict`/`NotFound`).
 ///
 /// bd-jyyae: `EXPLAIN QUERY PLAN` renders the planner directive, but codegen
 /// can decline the directive's access path — `IN (SELECT ...)` predicates
@@ -346,7 +346,12 @@ pub fn program_seeks_named_index(program: &VdbeProgram, index_name: &str) -> boo
     ops.iter().any(|op| {
         matches!(
             op.opcode,
-            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+            Opcode::SeekGE
+                | Opcode::SeekGT
+                | Opcode::SeekLE
+                | Opcode::SeekLT
+                | Opcode::NoConflict
+                | Opcode::NotFound
         ) && index_cursors.contains(&op.p1)
     })
 }
