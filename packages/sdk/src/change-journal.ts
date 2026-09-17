@@ -60,7 +60,7 @@ export class TableChangeJournal {
   }
 
   /** Install/remove atomically. JS configuration changes only after COMMIT. */
-  async configure(db: FrankenDB, requested: readonly string[]): Promise<readonly string[]> {
+  async configure(db: FrankenDB, requested: readonly string[], options?: TransactionOptions): Promise<readonly string[]> {
     const names = requested.length === 0 ? [] : captureTables(requested);
     const next = new Map<string, Watch>();
     let nextId = this.#nextId;
@@ -108,7 +108,7 @@ export class TableChangeJournal {
         next.set(definition.name, { ...definition, id, triggers });
       }
       await this.#verify(tx, next);
-    });
+    }, options);
     this.#initialized = true;
     this.#nextId = nextId;
     this.#watches = next;

@@ -144,3 +144,146 @@ threads. IndexedDB tests are explicitly labeled transactional **models**, not
 browser storage tests. Real browser/FrankenSQLite WASM and broader release gates
 remain separate; no shared-database pool or page-level persistence is certified
 by this suite.
+
+## Committed table subscriptions
+
+`await queue.subscribe(tables, listener, options)` installs connection-local TEMP
+triggers at an ordered queue boundary. The returned subscription observes only
+**later successful transactions on this queue**. It does not replay existing
+rows, poll other connections, observe snapshot-pool replicas, or deliver a native
+row-level update log. Names identify ordinary persistent `main` tables, not SQL
+fragments. Views, virtual tables, reserved names and competing application TEMP
+triggers on watched tables are refused.
+
+```ts
+const subscription = await queue.subscribe(["items", "audit"], async change => {
+  console.log(change.tables, change.firstSequence, change.lastSequence);
+  const current = await queue.transaction(tx => tx.query("SELECT * FROM items"));
+  render(current.rows);
+});
+subscription.done.catch(reportListenerFailure);
+await queue.transaction(tx => tx.execute("INSERT INTO items(id) VALUES (?)", [1]));
+// Later, for example when the view unmounts:
+subscription.unsubscribe();
+await subscription.done;
+```
+
+Every notification is a frozen `CommittedTableChange` with frozen `tables` and
+BigInt `firstSequence`, `lastSequence`, and `commits`. Sequences are local to this
+queue, advance only for committed transactions that dirty a watched table, and
+are **not native MVCC commit IDs, checkpoint revisions or durable acknowledgments**.
+The table list is the intersection with that subscription's canonical names.
+A notification means rows were affected, not necessarily that their final values
+differ; an UPDATE to the same value or insert-then-delete may still invalidate.
+Reads, no-row writes and writes to unobserved tables do not notify.
+
+Dirty bits participate in real SQL transactions and savepoints. Rollback removes
+both earlier writes and their invalidations, including trigger effects and a
+failed later streaming-import chunk. A released child remains provisional until
+the outer COMMIT succeeds. Deferred-constraint or cancellation rollback emits no
+notification. Once COMMIT dispatch makes cancellation too late, a successful
+commit still notifies. Only `checkpoint()` publishes snapshot-mode data; a
+notification is not a browser persistence guarantee.
+
+### Delivery, coalescing and lifecycle
+
+Listeners run in a later task, outside transaction ownership. They may submit
+and await new queued work. An async listener never holds up the writer queue.
+Each subscription has **at most one running callback and one coalesced pending
+notification**. A slow listener receives the union of dirty tables, sequence
+range and matching-commit count; it does not receive an unbounded list of every
+commit. Sequence gaps may represent commits affecting only other subscribers.
+This is an invalidation API, not a lossless audit/event log. Requerying observes
+current state, which may be newer than the delivered range.
+
+A thrown/rejected listener fails only that subscription. Its original error is
+available as `failure`, `state` becomes `failed`, and `done` rejects. The already
+committed writer result is not changed and other listeners continue. Attach
+error handling to `done`. No automatic listener replay or retry occurs.
+
+`unsubscribe()` is synchronous and idempotent: it prevents future deliveries,
+drops the pending notification, and works even with a full SQL queue. `done`
+waits for an already-running listener to settle. The optional `signal` cancels
+waiting/active registration using the existing queue/transaction contract; once
+registered, it stops the subscription. A registration whose COMMIT already
+succeeded may return a stopped handle after a late abort, never a false rollback
+claim. `waitTimeoutMs` is only the registration's start deadline.
+
+`close()` stops subscriptions immediately and drains accepted SQL/image jobs as
+usual. It does **not** await listener code: a listener might itself await close
+or queued work. Use a subscription's `done` separately to join its callback.
+Never await your own `done` from inside that callback.
+
+Unneeded TEMP triggers are removed before the next accepted SQL/image/registration
+job, or destroyed with the private connection at close. Unsubscribe never
+creates a hidden queue of cleanup jobs. Until that next boundary, unused trigger
+resources remain bounded. Schema changes to watched tables fail closed before
+commit; unsubscribe and then enqueue the schema migration. Do not modify the
+reserved `__fsqlite_watch_` instrumentation: it is internal state, not a security
+boundary against application SQL.
+
+`maxSubscriptions` (second `open` argument) defaults to 64 and accepts 1..1024.
+It counts active subscriptions **and stopped callbacks still running**, so rapid
+unsubscribe/resubscribe cannot accumulate unbounded suspended listeners. Their
+combined watch set is limited to 64 distinct tables; duplicate subscribers reuse
+the table's three triggers and single dirty bit. `stats` exposes subscriptions,
+reservedSubscriptions, maxSubscriptions, pendingNotifications and activeListeners.
+These bounds do not cap user callback allocations, result sizes or process memory.
+No subscription means no journal SQL or extra transaction boundary.
+
+### Pull-based consumption
+
+`await queue.changes(tables, options)` returns a `TableChangeStream` implementing
+`AsyncIterableIterator<CommittedTableChange>` over the same commit-only feed:
+
+```ts
+const controller = new AbortController();
+const changes = await queue.changes(["items"], { signal: controller.signal });
+for await (const change of changes) {
+  await refreshView(change.tables);
+  if (viewIsClosed()) break; // for-await calls return(), unsubscribing.
+}
+```
+
+The iterator owns one coalesced unread record in addition to the underlying
+subscription's bounded delivery state. Slow consumers do not block SQL or
+accumulate a result per transaction. Only one unresolved `next()` is admitted;
+another rejects with `ERR_FSQLITE_SUBSCRIPTION_NEXT_PENDING`. Await it instead
+of building an unbounded list of pending reads. `return()` immediately discards
+buffered notices, unsubscribes and resolves a waiting `next()` as done. `throw()`
+retains the supplied error and rejects a waiting `next()`. Lifetime abort and
+normal queue close end iteration, even when no table has changed. These are
+**change invalidations, not streaming SQL rows**.
+
+A worker crash or an unrecoverable transaction rollback fails active
+subscriptions and rejects waiting iterators without requiring a follow-up SQL
+request. Original connection and listener errors are retained when both fail.
+There is no transparent reconnection or replay. Queue opening also rejects a
+worker that became ready and then failed before queue initialization completed.
+A fault or close can discard undelivered notices of already committed work:
+this local feed is not a durable log. Reopen/requery authoritative data to recover.
+
+Register subscriptions/iterators outside transaction callbacks. Registration is
+queued work, so awaiting it from a callback that already owns the same queue
+would wait on itself. Notification listeners themselves are outside that
+ownership and may register new observers or await SQL. A synchronous callback
+still runs on the application's JavaScript thread; it has no database queue
+reservation, but expensive callback code can block that thread.
+
+### Executable subscription checks
+
+With the repository's TypeScript dependency installed, run from its root:
+
+```sh
+node --loader ./packages/sdk/tests/helpers/source-loader.mjs --test \
+  packages/sdk/tests/subscriptions.test.mjs \
+  packages/sdk/tests/subscriptions-thread.test.mjs
+```
+
+`FSQLITE_TYPESCRIPT_MODULE` optionally selects an installed TypeScript module.
+These tests exercise the production queue, client, transaction journal and worker
+host against Node's SQLite reference. The real-thread suite imports production
+`worker.ts` and uses its transferable binary-result path; its Web Worker event
+bridge and native SQLite core remain explicitly test-only. This is not a browser,
+FrankenSQLite WASM, cross-connection feed or release certificate. The exact core's
+TEMP-trigger and schema behavior still needs browser/WASM validation.
