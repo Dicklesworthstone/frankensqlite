@@ -7,10 +7,12 @@
 //!
 //! 2. **Decimal arithmetic**: exact string-based decimal operations that avoid
 //!    floating-point precision loss. Functions: `decimal`, `decimal_add`,
-//!    `decimal_sub`, `decimal_mul`, `decimal_cmp`.
+//!    `decimal_sub`, `decimal_mul`, `decimal_cmp`, `decimal_exp`, `decimal_pow2`.
 //!
 //! 3. **UUID generation**: `uuid()` generates random UUID v4 strings,
 //!    `uuid_str` converts blob to string, `uuid_blob` converts string to blob.
+
+mod decimal_ext;
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -184,35 +186,7 @@ fn decimal_normalize(s: &str) -> Option<String> {
 
 /// Parse a decimal string into (negative, integer_digits, fractional_digits).
 fn parse_decimal(s: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
-    let s = s.trim();
-    let (negative, s) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else if let Some(stripped) = s.strip_prefix('+') {
-        (false, stripped)
-    } else {
-        (false, s)
-    };
-
-    if s.is_empty() {
-        return None;
-    }
-
-    let (int_str, frac_str) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-
-    if !int_str.is_empty() && !int_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if !frac_str.is_empty() && !frac_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-
-    let int_digits: Vec<u8> = int_str.bytes().map(|b| b - b'0').collect();
-    let frac_digits: Vec<u8> = frac_str.bytes().map(|b| b - b'0').collect();
-
-    Some((negative, int_digits, frac_digits))
+    decimal_ext::parse_decimal(s)
 }
 
 /// Add two non-negative decimal digit sequences (aligned by decimal point).
@@ -528,10 +502,19 @@ impl ScalarFunction for DecimalFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let text = args[0].to_text();
-        Ok(SqliteValue::Text(SmallText::from_string(
-            decimal_normalize(&text).unwrap_or_else(|| text.clone()),
-        )))
+        // REAL and eight-byte BLOB inputs describe a binary64 value, not
+        // its rounded display text. Preserve the legacy TEXT normalization
+        // contract (including pass-through for malformed text) separately.
+        if let SqliteValue::Text(text) = &args[0] {
+            return Ok(decimal_normalize(text).map_or_else(
+                || args[0].clone(),
+                |value| SqliteValue::Text(SmallText::from_string(value)),
+            ));
+        }
+        Ok(decimal_ext::value_to_decimal(&args[0]).map_or(
+            SqliteValue::Null,
+            |value| SqliteValue::Text(SmallText::from_string(value)),
+        ))
     }
 
     fn num_args(&self) -> i32 {
@@ -892,6 +875,7 @@ pub fn register_misc_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(DecimalSubFunc);
     registry.register_scalar(DecimalMulFunc);
     registry.register_scalar(DecimalCmpFunc);
+    decimal_ext::register(registry);
     registry.register_scalar(UuidFunc);
     registry.register_scalar(UuidStrFunc);
     registry.register_scalar(UuidBlobFunc);
@@ -1217,7 +1201,7 @@ mod tests {
         assert_eq!(product, Some("28.5".to_owned()));
     }
 
-    // ── uuid ─────────────────────────────────────────────────────────
+    // ── uuid ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_uuid_v4_format() {
