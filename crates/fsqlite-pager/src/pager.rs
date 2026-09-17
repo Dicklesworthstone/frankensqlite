@@ -25976,12 +25976,27 @@ where
                     // A connection-local backend view can lag peers' commits;
                     // the no-committed-frame test is only meaningful against
                     // the refreshed publication horizon.
-                    if wal.native_reader_required() {
-                        // Preparation owns a reader, not native WRITE. Keep
-                        // candidates queued until a later fenced reclamation;
-                        // do not widen the pin or fail before orphan preflight.
-                        inner.abandoned_eof_reservations.append(&mut abandoned_candidates);
-                    } else {
+                    //
+                    // bd-u2kmg: skip ONLY the refresh on the native path.
+                    // Preparation owns a reader there, not native WRITE, so
+                    // refreshing would widen that pin (or fail before the orphan
+                    // preflight) — that is what this guard is for. The
+                    // reclamation below must still run: it does not read the
+                    // published plane at all. `read_page_at_appended_tail` reads
+                    // the PHYSICAL appended tail under the backend write lock
+                    // held here, which is exactly why bd-dw8oe introduced it.
+                    //
+                    // Draining the candidates into the abandonment pool instead
+                    // (`Vec::append` empties its argument) left the loop below
+                    // iterating an empty vec, so the pages never reached
+                    // `pending_free_pages` — the only route into durable page-1
+                    // freelist metadata, which only a commit writes. The
+                    // checkpoint-fold cannot rescue them: it returns pages to the
+                    // in-memory `inner.freelist`, which the next committed-state
+                    // refresh wholesale-replaces. They cycled pool -> volatile
+                    // freelist -> pool and were lost at close, surfacing as
+                    // "page N is never used" to stock SQLite's integrity check.
+                    if !wal.native_reader_required() {
                         let _ = wal.refresh_published_snapshot(cx).await?;
                     }
                     let mut dw8oe_reclaimed = 0_usize;
