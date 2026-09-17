@@ -30,3 +30,5 @@ export type { WorkerLike } from "./worker-client";
 export { FrankenDBQueue } from "./queue";
 export type { JobQueueOptions, JobQueueStats, QueuedJobOptions, QueuedTransactionOptions } from "./queue";
 export type { CommittedTableChange, TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
+export { watchQuery } from "./live-query";
+export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";

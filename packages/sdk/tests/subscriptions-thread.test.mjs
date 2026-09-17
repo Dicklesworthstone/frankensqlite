@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { FrankenDBQueue } from '../src/queue.ts';
+import { watchQuery } from '../src/index.ts';
 import { observe, drain } from './helpers/controlled-worker.ts';
 const limits={timeout:20000};
 
@@ -20,6 +21,8 @@ async function threaded(t) {
       const original=constructor[method];
       constructor[method]=async(...args)=>{
         const core=await original(...args),batch=core.executeBatch.bind(core),execute=core.executeWithParams.bind(core);
+        const query=core.query.bind(core);
+        core.query=async sql=>{if(config.query===sql)await pause();return query(sql);};
         core.executeBatch=async sql=>{if(config.commit&&sql==='COMMIT')await pause();return batch(sql);};
         core.executeWithParams=async(sql,values)=>{
           if(config.row!==undefined&&sql.startsWith('INSERT INTO items')&&values[0]===config.row)await pause();
@@ -139,4 +142,42 @@ test('real production worker: crash in a write rejects later jobs, emits no comm
   assert.equal(next.outcome.status,'rejected');assert.equal(job.outcome.status,'rejected');assert.equal(later.outcome.status,'rejected');
   assert.equal(laterRan,false);assert.equal(q.changeSequence,0n);await q.close().catch(()=>{});
   assert.equal(q.stats.pendingJobs,0);assert.equal(q.stats.subscriptions,0);onDisk(q,[]);
+});
+
+test('real production worker: live reads transfer 12000 exact rows and refresh only on demand',limits,async t=>{
+  const f=await threaded(t),q=f.queue;
+  const live=await watchQuery(q,'SELECT id,value,9223372036854775807 AS big,x\'00FF\' AS blob FROM items ORDER BY id',{tables:['items']});
+  t.after(()=>live.return().catch(()=>{}));
+  await q.transaction(tx=>tx.executeStream('INSERT INTO items VALUES(?,?)',
+    Array.from({length:12000},(_,i)=>[i,`雪-${i}`]),{batchSize:256}));
+  const first=await live.next();assert.equal(first.value.throughSequence,1n);
+  assert.deepEqual(first.value.rowArrays,Array.from({length:12000},(_,i)=>[BigInt(i),`雪-${i}`,9223372036854775807n,Uint8Array.of(0,255)]));
+  assert.ok(f.history.some(m=>m.audit&&m.kind==='query-binary-result'&&m.before[0]>65536&&m.after[0]===0));
+  await q.transaction(tx=>tx.execute("UPDATE items SET value='changed' WHERE id=11999"));
+  const second=await live.next();assert.equal(second.value.throughSequence,2n);
+  assert.equal(second.value.rowArrays[11999][1],'changed');
+  await live.return();await q.close();
+  onDisk(q,Array.from({length:12000},(_,i)=>[i,i===11999?'changed':`雪-${i}`]));
+});
+
+test('real production worker: live-query return awaits active SQL cancellation and permits successor writes',limits,async t=>{
+  const f=await threaded(t),q=f.queue,sql='SELECT id,value FROM items ORDER BY id';
+  const live=await watchQuery(q,sql,{tables:['items']});await f.configure({query:sql});
+  const read=observe(live.next());await f.paused();const stopped=observe(live.return());
+  assert.equal((await f.cancelAck()).accepted,true);assert.equal(stopped.outcome.status,'pending');
+  let ran=false;const successor=q.transaction(tx=>{ran=true;return tx.execute("INSERT INTO items VALUES(1,'successor')");});
+  await drain();assert.equal(ran,false);f.resume();await Promise.all([read.settled,stopped.settled,successor]);
+  assert.equal(read.outcome.status,'fulfilled');assert.equal(read.outcome.value.done,true);
+  assert.equal(stopped.outcome.status,'fulfilled');assert.equal(q.stats.subscriptions,0);
+  await q.close();onDisk(q,[[1,'successor']]);
+});
+
+test('real production worker: idle live-query demand and done both reject on an actual crash',limits,async t=>{
+  const f=await threaded(t),q=f.queue,live=await watchQuery(q,'SELECT * FROM items',{tables:['items']});
+  await live.next();const read=observe(live.next()),done=observe(live.done);
+  const exited=new Promise(resolve=>f.native.once('exit',resolve));f.crash();
+  await Promise.all([read.settled,done.settled,exited]);
+  assert.equal(read.outcome.status,'rejected');assert.match(read.outcome.reason.message,/intentional subscription worker crash/);
+  assert.equal(done.outcome.reason,read.outcome.reason);assert.equal(live.closed,true);
+  await q.close().catch(()=>{});onDisk(q,[]);
 });

@@ -287,3 +287,95 @@ host against Node's SQLite reference. The real-thread suite imports production
 bridge and native SQLite core remain explicitly test-only. This is not a browser,
 FrankenSQLite WASM, cross-connection feed or release certificate. The exact core's
 TEMP-trigger and schema behavior still needs browser/WASM validation.
+
+## Demand-driven live queries
+
+`watchQuery(queue, sql, options)` registers a table subscription and returns a
+`LiveQuery<Row>` async iterator of complete `QueryResult<Row>` snapshots. It is
+useful for lists, aggregates and views that should refresh after local commits:
+
+```ts
+import { watchQuery } from "@frankensqlite/sdk";
+
+const controller = new AbortController();
+const live = await watchQuery<{ id: number; value: string }>(queue,
+  "SELECT id, value FROM items WHERE id >= ? ORDER BY id",
+  { tables: ["items"], params: [1], signal: controller.signal },
+);
+try {
+  for await (const result of live) {
+    render(result.rows);
+    // A UI unmount action can call controller.abort().
+  }
+} finally {
+  await live.return?.();
+}
+```
+
+The dependency subscription is installed **before the initial read**, so a
+commit between registration and first demand cannot fall into a read/subscribe
+gap. The first `next()` queues the initial read. Later `next()` calls wait for a
+matching committed invalidation, then queue a fresh SELECT. Explicit `tables`
+must include every ordinary main table the query depends on, including tables
+behind joins, views and subqueries. Dependencies are not inferred from SQL.
+This observes only the owning queue's writes, not other connections or replicas.
+
+There is no polling, timer-based query loop, or prefetch without demand. While
+a consumer is busy with one result, commits coalesce into a sequence marker,
+not a backlog of result sets. The iterator admits only one unresolved `next()`
+and one active read. Each read runs as a complete managed queue transaction,
+using the normal request admission, cancellation and rollback contracts.
+`ERR_FSQLITE_LIVE_QUERY_NEXT_PENDING` rejects a second unresolved `next()`.
+
+Results retain `rows`, `rowArrays`, column metadata and negotiated binary
+transport. The frozen outer result additionally reports `throughSequence`,
+the queue's watched-commit high-water captured inside that read's ownership.
+Delayed invalidations already covered by this high-water do not cause redundant
+reads. This is a queue-local BigInt marker, not a native snapshot ID or durable
+checkpoint. Results are current at their read, not a promise to reproduce every
+intermediate commit. Rows can change again before application code uses them.
+No deep-equality check suppresses an unchanged result after a real invalidation.
+
+Only a single top-level `SELECT` is accepted. Scripts, `WITH`, transaction
+controls, `PRAGMA`, and DML/`RETURNING` are rejected before registration rather
+than replayed automatically. Queries still need to parse and execute in the
+core. Application-defined SELECT functions must be side-effect free; lexical
+preflight is **not a security sandbox** or proof against side effects in an
+extension. This is whole-result requerying, **not incremental query evaluation or
+streaming rows from the SQL engine**. A large result still materializes fully.
+
+SQL and positional/named parameters are captured before registration awaits.
+Blob data is copied, preserving aliases without retaining caller-mutated bytes.
+`maxInputBytes` defaults to 1 MiB and accepts 256 bytes..64 MiB; it accounts for
+the SQL/request envelope, scalar values and entire blob backing buffers. Shared
+backing buffers are refused. This per-watch input bound and the queue's existing
+subscription/job bounds are not limits on result size, consumer allocations,
+engine memory, or aggregate process heap. Captured request data is released
+when a stopped read finishes. The returned row objects belong to the consumer;
+mutating them cannot alter the retained query parameters.
+
+`return()` or `for await` break stops notifications, cancels this iterator's
+waiting/active read, and **awaits that read's actual settlement and rollback**.
+`done` provides the same join boundary. Lifetime abort and normal queue close
+end iteration; SQL, admission/deadline, rollback and worker failures reject the
+pending read and `done`, and stop only this iterator unless the connection itself
+is unusable. An unrelated SQL or rollback failure is not suppressed merely
+because cancellation happened at the same time. There is no automatic retry of
+a failed read. A pre-aborted signal rejects registration. `waitTimeoutMs` applies
+to registration and each read's start deadline, not running SQL duration.
+Cancellation is cooperative; one nonsettling core operation can delay shutdown.
+As with subscriptions, register/consume outside a callback owning the same queue.
+
+The live-query tests use the public SDK entrypoint with the production queue,
+worker and journal, plus a SQLite reference core. The actual Node-thread cases
+reuse `subscriptions-thread.test.mjs`, exercise binary transfer, 12,000 exact
+rows, cancellation cleanup and an actual worker crash. Run them alongside the
+subscription suite using the source loader:
+
+```sh
+node --loader ./packages/sdk/tests/helpers/source-loader.mjs --test \
+  packages/sdk/tests/live-query.test.mjs \
+  packages/sdk/tests/subscriptions-thread.test.mjs
+```
+
+This does not certify the FrankenSQLite WASM artifact or browser execution.
