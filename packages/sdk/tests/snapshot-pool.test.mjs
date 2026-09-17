@@ -3,8 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { FrankenDB, FrankenSnapshotPool } from '../src/index.ts';
 import { sqliteSnapshotWorker } from '../../worker/tests/helpers/snapshot-sqlite-core.mjs';
+import { sqliteBindingFixture } from '../../worker/tests/helpers/bindings-core.mjs';
+import { WorkerConnectionHost } from '../../worker/src/connection.ts';
 
 const opts = { timeout: 15000 };
 const turn = () => new Promise(resolve => setImmediate(resolve));
@@ -19,7 +24,8 @@ async function image() {
 async function fixture(t, options = {}) {
   const bytes = await image(), fixtures = [];
   const pool = await FrankenSnapshotPool.open(bytes, { ...options, worker: () => {
-    const f = sqliteSnapshotWorker(); fixtures.push(f); return f.worker;
+    const f = sqliteSnapshotWorker(options.hooks?.(fixtures.length) ?? {});
+    fixtures.push(f); options.configure?.(f, fixtures.length - 1); return f.worker;
   } });
   t.after(() => pool.close().catch(() => {}));
   return { bytes, pool, fixtures };
@@ -237,4 +243,200 @@ test('missing query_only enforcement fails initialization rather than admitting 
   assert.ok(error instanceof AggregateError);
   assert.equal(error.cause.code, 'ERR_FSQLITE_POOL_READ_ONLY');
   assert.equal(f.worker.terminateCount, 1); assert.deepEqual(f.events.slice(-2), ['close','free']);
+});
+
+async function changedImage() {
+  const f = sqliteSnapshotWorker();
+  const db = await FrankenDB.open({ worker: f.worker });
+  await db.executeBatch("CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT);INSERT INTO items VALUES(10,'new'),(20,'generation'),(30,'three');");
+  const bytes = await db.export(); await db.close(); return bytes;
+}
+
+test('refresh waits for every old read and atomically publishes all replacement replicas', opts, async t => {
+  const { pool, fixtures } = await fixture(t, { workers: 2 });
+  const replacement = await changedImage(), initial = pool.snapshot;
+  const a = block(fixtures[0]), b = block(fixtures[1]);
+  const old = [pool.query('SELECT count(*) AS n FROM items'), pool.query('SELECT count(*) AS n FROM items')];
+  await Promise.all([a.started,b.started]);
+  const refresh = pool.refresh(replacement);
+  const later = Array.from({length:6}, () => pool.query('SELECT count(*) AS n FROM items'));
+  await turn(); assert.equal(fixtures.length,2); assert.equal(pool.stats.refreshing,true);
+  b.release(); await old[1]; assert.equal(fixtures.length,2); assert.equal(pool.snapshot,initial);
+  a.release();
+  const refreshed = await refresh;
+  assert.equal(refreshed.snapshot.generation,2); assert.equal(refreshed.cleanupErrors.length,0);
+  assert.equal(refreshed.snapshot.sha256,createHash('sha256').update(replacement).digest('hex'));
+  for(const result of await Promise.all(old)) { assert.equal(result.rows[0].n,2); assert.equal(result.snapshot,initial); }
+  for(const result of await Promise.all(later)) { assert.equal(result.rows[0].n,3); assert.equal(result.snapshot,refreshed.snapshot); }
+  assert.equal(fixtures.length,4); assert.ok(fixtures.slice(0,2).every(f=>f.worker.terminateCount===1));
+  assert.equal(pool.stats.pendingSnapshotBytes,0); assert.equal(pool.stats.refreshing,false);
+});
+
+test('pending refresh owns its copied image and only one refresh may be admitted', opts, async t => {
+  const { pool, fixtures } = await fixture(t,{workers:1});
+  const replacement = await changedImage(), expected = createHash('sha256').update(replacement).digest('hex');
+  const gate = block(fixtures[0]), old = pool.query('SELECT 1'); await gate.started;
+  const pending = pool.refresh(replacement); replacement.fill(0);
+  await assert.rejects(pool.refresh(await image()), {code:'ERR_FSQLITE_POOL_REFRESH_BUSY'});
+  gate.release(); await old;
+  assert.equal((await pending).snapshot.sha256,expected);
+  assert.equal((await pool.query('SELECT count(*) AS n FROM items')).rows[0].n,3);
+});
+
+test('failed refresh preserves the old generation but refuses queries waiting for the new one', opts, async t => {
+  const { pool, fixtures } = await fixture(t,{workers:2,hooks:index=>index===3?{
+    beforeImport(){throw new Error('injected import failure');},
+  }:{}});
+  const old = pool.snapshot;
+  const refresh = observed(pool.refresh(await changedImage()));
+  const later = observed(pool.query('SELECT count(*) AS n FROM items'));
+  const failure = (await refresh).error; assert.ok(failure instanceof AggregateError);
+  assert.equal((await later).error.code,'ERR_FSQLITE_POOL_REFRESH_FAILED');
+  assert.equal(pool.snapshot,old); assert.equal(pool.stats.pendingQueries,0);
+  assert.equal((await pool.query('SELECT count(*) AS n FROM items')).rows[0].n,2);
+  assert.ok(fixtures.slice(2).every(f=>f.worker.terminateCount===1));
+  assert.ok(fixtures.slice(0,2).every(f=>f.worker.terminateCount===0));
+});
+
+test('successful refresh reports old cleanup errors without pretending publication failed', opts, async t => {
+  const { pool } = await fixture(t,{workers:2,hooks:index=>index<2?{
+    beforeClose(){throw new Error('old close failed');},
+  }:{}});
+  const result = await pool.refresh(await changedImage());
+  assert.equal(result.snapshot.generation,2); assert.equal(result.cleanupErrors.length,2);
+  assert.ok(result.cleanupErrors.every(error=>/old close failed/.test(error.message)));
+  assert.ok(Object.isFrozen(result)); assert.ok(Object.isFrozen(result.cleanupErrors));
+  assert.equal((await pool.query('SELECT count(*) AS n FROM items')).rows[0].n,3);
+});
+
+test('close drains an accepted refresh, then closes its new workers too', opts, async t => {
+  const stage = deferred(), started = deferred();
+  const { pool, fixtures } = await fixture(t,{workers:1,hooks:index=>index===1?{
+    async beforeImport(){started.resolve();await stage.promise;},
+  }:{}});
+  const refreshed = pool.refresh(await changedImage()), read = pool.query('SELECT count(*) AS n FROM items');
+  await started.promise;
+  const closed = pool.close(); assert.equal(pool.close(),closed);
+  await assert.rejects(pool.refresh(await image()),{code:'ERR_FSQLITE_POOL_CLOSED'});
+  assert.equal(pool.stats.state,'closing'); assert.equal(fixtures[0].worker.terminateCount,0);
+  stage.resolve(); await refreshed; assert.equal((await read).rows[0].n,3); await closed;
+  assert.ok(fixtures.every(f=>f.worker.terminateCount===1)); assert.equal(pool.stats.state,'closed');
+});
+
+test('queries can expire or cancel behind an in-flight refresh without cancelling the refresh', opts, async t => {
+  const stage = deferred(), started = deferred();
+  const { pool } = await fixture(t,{workers:1,hooks:index=>index===1?{
+    async beforeImport(){started.resolve();await stage.promise;},
+  }:{}});
+  const refresh=pool.refresh(await changedImage()); await started.promise;
+  const c=new AbortController(), cancelled=observed(pool.query('SELECT 9',[],{signal:c.signal}));
+  const expired=observed(pool.query('SELECT 8',[],{waitTimeoutMs:1})); c.abort();
+  assert.equal((await cancelled).error.code,'ERR_FSQLITE_POOL_CANCELLED');
+  assert.equal((await expired).error.code,'ERR_FSQLITE_POOL_TIMEOUT');
+  assert.equal(pool.stats.pendingQueries,0);assert.equal(pool.stats.refreshing,true);
+  stage.resolve();assert.equal((await refresh).snapshot.generation,2);
+});
+
+test('a reused worker on refresh is refused before disturbing its old connection', opts, async () => {
+  const bytes=await image(), f=sqliteSnapshotWorker();
+  const pool=await FrankenSnapshotPool.open(bytes,{workers:1,worker:()=>f.worker});
+  try {
+    await assert.rejects(pool.refresh(await changedImage()),AggregateError);
+    assert.equal(f.counts().imports,1); assert.equal(f.worker.terminateCount,0);
+    assert.equal((await pool.query('SELECT count(*) AS n FROM items')).rows[0].n,2);
+  } finally { await pool.close(); }
+});
+
+test('invalid refresh input creates no barrier and leaves later queries usable', opts, async t => {
+  const {pool}=await fixture(t,{workers:1});const identity=pool.snapshot;
+  await assert.rejects(pool.refresh(new Uint8Array(100)));
+  const result=await pool.query('SELECT 1');assert.equal(result.snapshot,identity);
+  assert.equal(pool.stats.refreshing,false);assert.equal(pool.stats.pendingSnapshotBytes,0);
+});
+
+test('repeated successful refreshes advance identity even for byte-identical images', opts, async t => {
+  const {pool,bytes,fixtures}=await fixture(t,{workers:2});const hash=pool.snapshot.sha256;
+  for(let generation=2;generation<=4;generation++) {
+    const result=await pool.refresh(bytes);
+    assert.equal(result.snapshot.generation,generation);assert.equal(result.snapshot.sha256,hash);
+  }
+  await pool.close(); assert.equal(fixtures.length,8);assert.ok(fixtures.every(f=>f.worker.terminateCount===1));
+});
+
+test('a replica crashing while another replica initializes cannot produce a successful open', opts, async () => {
+  const bytes=await image(), gate=deferred(), ready=deferred(), fixtures=[], listeners=[];
+  const pending=observed(FrankenSnapshotPool.open(bytes,{workers:2,worker(){
+    const index=fixtures.length, f=sqliteSnapshotWorker(index===1?{beforeImport:()=>gate.promise}:{});
+    const add=f.worker.addEventListener.bind(f.worker),remove=f.worker.removeEventListener.bind(f.worker);
+    const errors=new Set();listeners.push(errors);
+    f.worker.addEventListener=(type,fn)=>{if(type==='error')errors.add(fn);add(type,fn);};
+    f.worker.removeEventListener=(type,fn)=>{if(type==='error')errors.delete(fn);remove(type,fn);};
+    if(index===0)f.worker.addEventListener('message',event=>{if(event.data.kind==='query-result')ready.resolve();});
+    fixtures.push(f);return f.worker;
+  }}));
+  await ready.promise;await turn();
+  for(const listener of [...listeners[0]])listener({message:'crashed during peer init'});
+  gate.resolve();const result=await pending;
+  if(result.value)await result.value.close().catch(()=>{}); // Also bound the old-code negative control.
+  assert.ok(result.error instanceof AggregateError);
+  assert.ok(fixtures.every(f=>f.worker.terminateCount===1));assert.ok(listeners.every(set=>set.size===0));
+});
+
+test('named bindings execute unchanged SQL by native SQLite slots across snapshot generations', opts, async t => {
+  const references=[], stops=[];
+  let pool;
+  t.after(async()=>{if(pool)await pool.close().catch(()=>{});await Promise.all(stops);});
+  const worker=()=>{
+    const listeners={message:new Set(),error:new Set()};
+    let reference, stopped;
+    const host=new WorkerConnectionHost({async load(){return {FrankenDB:{
+      async import(bytes){
+        const path=join(await mkdtemp(join(tmpdir(),'fsqlite-pool-bindings-')),'db.sqlite');
+        await writeFile(path,bytes);
+        reference=sqliteBindingFixture(path);references.push(reference);return reference.core;
+      },
+    }};}});
+    return {
+      addEventListener(type,fn){listeners[type].add(fn);},
+      removeEventListener(type,fn){listeners[type].delete(fn);},
+      postMessage(request){void host.handle(structuredClone(request)).then(response=>{
+        for(const listener of listeners.message)listener({data:structuredClone(response)});
+      },cause=>{for(const listener of listeners.error)listener({message:String(cause)});});},
+      terminate(){if(reference&&!stopped){stopped=reference.shutdown();stops.push(stopped);}},
+    };
+  };
+  pool=await FrankenSnapshotPool.open(await image(),{workers:2,worker,resultEncoding:'binary'});
+  const sql='SELECT :id AS id, :id AS again, :text AS text, @blob AS blob, $large AS large';
+  const params={id:2,text:'NUL\0λ',blob:Uint8Array.of(0,255),large:9223372036854775807n};
+  const results=await Promise.all(Array.from({length:8},()=>pool.query(sql,params)));
+  for(const result of results)assert.deepEqual(result.rowArrays,[[2,2,'NUL\0λ',Uint8Array.of(0,255),9223372036854775807n]]);
+  assert.equal(references.length,2);
+  assert.ok(references.every(reference=>reference.requests.some(request=>request.sql===sql)));
+  await assert.rejects(pool.query('SELECT :x, @x',{x:1}),/ambiguous/i);
+  const refresh=await pool.refresh(await changedImage());
+  const next=await pool.query('SELECT value FROM items WHERE id=:id',{id:20});
+  assert.deepEqual(next.rowArrays,[['generation']]);assert.equal(next.snapshot,refresh.snapshot);
+  await pool.close();await Promise.all(stops);assert.equal(stops.length,4);
+});
+
+test('an old worker crashing during staged refresh closes both generations without publishing', opts, async t => {
+  const staged=deferred(), release=deferred(), errors=[];
+  const {pool,fixtures}=await fixture(t,{workers:1,
+    hooks:index=>index===1?{async beforeImport(){staged.resolve();await release.promise;}}:{},
+    configure(f,index){
+      const add=f.worker.addEventListener.bind(f.worker),remove=f.worker.removeEventListener.bind(f.worker);
+      errors[index]=new Set();
+      f.worker.addEventListener=(type,fn)=>{if(type==='error')errors[index].add(fn);add(type,fn);};
+      f.worker.removeEventListener=(type,fn)=>{if(type==='error')errors[index].delete(fn);remove(type,fn);};
+    },
+  });
+  const initial=pool.snapshot;
+  const refresh=observed(pool.refresh(await changedImage()));await staged.promise;
+  const queued=observed(pool.query('SELECT count(*) AS n FROM items'));
+  for(const listener of [...errors[0]])listener({message:'old worker failed during refresh'});
+  assert.equal((await queued).error.code,'ERR_FSQLITE_POOL_UNUSABLE');
+  release.resolve();assert.ok((await refresh).error);await pool.close().catch(()=>{});
+  assert.equal(pool.snapshot,initial);assert.equal(pool.stats.state,'closed');
+  assert.equal(pool.stats.pendingQueries,0);assert.equal(pool.stats.pendingSnapshotBytes,0);
+  assert.ok(fixtures.every(f=>f.worker.terminateCount===1));assert.ok(errors.every(set=>set.size===0));
 });

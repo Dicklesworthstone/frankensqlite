@@ -66,5 +66,5 @@ export function sqliteBindingFixture(path = ':memory:') {
     },error=>{for(const fn of errors)fn({message:String(error)});});},
     terminate(){},
   };
-  return {host,worker,rpc,requests,async shutdown(){process.stdin.end();await exit;}};
+  return {core,host,worker,rpc,requests,async shutdown(){process.stdin.end();await exit;}};
 }

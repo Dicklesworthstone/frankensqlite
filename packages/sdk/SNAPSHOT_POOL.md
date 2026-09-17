@@ -23,11 +23,66 @@ console.log(totals.rows, recent.rows, readers.snapshot.sha256);
 await readers.close();
 ```
 
-Later writes on the original database do not appear in these replicas. All
-replicas import identical, independently owned bytes. `snapshot` exposes a
-frozen `{ sha256, byteLength }` identity; hashing is identity/corruption evidence,
-not authentication. The caller's image is neither transferred nor detached.
-A secure-context Web Crypto implementation is required to hash the image.
+Later writes on the original database do not appear until an explicit refresh.
+All replicas import identical, independently owned bytes. `snapshot` exposes a
+frozen `{ sha256, byteLength, generation }` identity; the generation starts at 1.
+Every query result also has `result.snapshot`, identifying the generation that
+actually executed that query, even if a refresh completed before the caller
+examines the result. Hashing is identity/corruption evidence, not authentication.
+The caller's image is neither transferred nor detached. A secure-context Web
+Crypto implementation is required to hash it.
+
+## Atomic refresh
+
+```ts
+// Finish the writer's SQL transaction before exporting. With FrankenDBQueue,
+// export() is itself an ordered barrier after preceding queued transactions.
+const nextImage = await writer.export();
+const refresh = readers.refresh(nextImage);
+const nextRead = readers.query("SELECT count(*) AS total FROM items");
+const published = await refresh;
+const result = await nextRead;
+console.log(published.snapshot, result.snapshot); // Same generation.
+for (const error of published.cleanupErrors) console.error(error);
+```
+
+`refresh(image)` reserves one **pool-wide FIFO barrier**. All earlier reads
+finish on the old image. The pool then imports the copied replacement into new
+workers and verifies every replica's read-only policy. Only after every replica
+is ready does it publish the complete generation in one step. Queries admitted
+after the barrier cannot run until it settles. There is no per-worker gradual
+rollout, mixed generation, transparent query replay, or partial database merge.
+
+If import/validation fails before publication, the old generation is retained
+and staged workers are closed. Queries queued behind the failed refresh reject
+with `ERR_FSQLITE_POOL_REFRESH_FAILED` **without running** rather than silently
+serving old data. Subsequent, explicitly submitted queries may still read the
+old snapshot, or the application can retry refresh with a valid image. A worker
+crash instead makes the pool unusable; failed workers are not silently replaced.
+
+A successful refresh returns `{ snapshot, cleanupErrors }`. If retiring an old
+replica fails after publication, the new generation remains published and the
+error is included in `cleanupErrors`; it does not falsely report a failed
+refresh that callers might blindly retry. The returned object and error array
+are frozen. A byte-identical refresh still advances the local generation.
+
+Only one refresh can be pending; another rejects with
+`ERR_FSQLITE_POOL_REFRESH_BUSY`. The barrier has its own single-image admission
+slot, separate from query count/payload capacity. The replacement obeys the same
+per-image and aggregate replica-input limits as open. During staging both old
+and new generations coexist: their combined replicated image bytes can reach
+256 MiB, plus the source copy, engine/import/cache/result memory. This is not a
+heap bound. `stats.refreshing` and `pendingSnapshotBytes` expose the barrier and
+owned replacement-image byte count, not total staging memory.
+
+Refresh has no forced cancellation. Cancelling a read waiting behind it removes
+only that read. Close drains any accepted refresh and then closes the published
+generation too. A custom worker factory must return new dedicated workers for
+each generation; reusing an earlier worker is rejected before reinitializing it.
+
+Snapshot refresh does not publish IndexedDB data, make a writer commit durable,
+or automatically observe external writes. Those boundaries remain the writer's
+SQL commit and, for `indexeddb-snapshot`, its explicit checkpoint.
 
 ## Read-only contract
 
@@ -111,6 +166,16 @@ npm run test:snapshot-pool --workspace @frankensqlite/sdk
 ```
 
 The tests use production SDK/worker source and real SQLite reference files with
-controlled worker delivery. They are not a FrankenSQLite WASM/browser certificate
-or a throughput benchmark. The browser/WASM and wider pooling acceptance on
-`bd-36fvl` remain separate gates; GitHub Actions remains off.
+both controlled delivery and actual Node worker threads. The real-thread cases
+load the production `worker.ts` entry point and its transfer-list path, replacing
+only the core with Node SQLite. A test-only function inside SQLite establishes
+actual simultaneous execution on three threads before allowing any to finish.
+Other cases check exact large results, cancellation, abrupt worker termination,
+file integrity and generation refresh. The thread bridge translates an unexpected
+Node exit into a browser-style error event; that is not browser crash evidence.
+Named binding tests use a separate Python/system SQLite C-API oracle.
+
+These are not a FrankenSQLite WASM/browser certificate or a throughput benchmark.
+Read-only enforcement still needs validation against the exact shipped core
+artifact. The browser/WASM and wider pooling acceptance on `bd-36fvl` remain
+separate gates; GitHub Actions remains off.
