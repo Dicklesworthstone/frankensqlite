@@ -356,3 +356,192 @@ test('table rebuild preserves rows and installs the new constraints atomically',
   assert.throws(() => raw.prepare('INSERT INTO items(id,name) VALUES(2,?)').run('Ada'));
   assert.equal(raw.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
 });
+
+const { FrankenDBQueue, FrankenCheckpointCommitError } = sdk('queue');
+const fast = { maxAttempts: 4, timeoutMs: 5000, initialDelayMs: 0, maxDelayMs: 0 };
+async function openQueue(t, name, options = {}, persistent = false) {
+  const state = stateFor(t);
+  const queue = await FrankenDBQueue.open({ worker: state, dbName: name,
+    persistence: persistent ? 'indexeddb-snapshot' : 'memory' }, options);
+  t.after(async () => { await queue.close().catch(() => {}); });
+  return { queue, state, raw: state.raw };
+}
+
+test('REAL WAL race: losing initializer rereads winner history and does not repeat seed writes', async t => {
+  const { db, state, raw } = await fixture(t); raw.exec('PRAGMA journal_mode=WAL');
+  const other = stateFor(t); other.path = state.path;
+  const peer = await FrankenDB.open({ worker: other }); const scanned = deferred(), resume = deferred();
+  let held = false;
+  state.afterSql = async sql => {
+    if (!held && sql.startsWith('SELECT name, type, sql FROM main.sqlite_master')) {
+      held = true; scanned.resolve(); await resume.promise;
+    }
+  };
+  const losing = plan().applyWithRetry(db, fast); await scanned.promise;
+  const winner = await plan().apply(peer); resume.resolve(); const result = await losing;
+  assert.equal(winner.applied.length, 2); assert.equal(result.applied.length, 0);
+  assert.equal(result.previousVersion, 10); assert.equal(state.attempts, 2);
+  assert.equal(raw.prepare('SELECT count(*) n FROM items').get().n, 1);
+  assert.deepEqual(state.events, ['begin', 'rollback', 'begin', 'commit']);
+});
+test('competing initializer with a different definition causes drift refusal after fresh-snapshot retry', async t => {
+  const { db, state, raw } = await fixture(t); raw.exec('PRAGMA journal_mode=WAL');
+  const other = stateFor(t); other.path = state.path; const peer = await FrankenDB.open({ worker: other });
+  const scanned = deferred(), resume = deferred(); let held = false;
+  state.afterSql = async sql => { if (!held && sql.startsWith('SELECT name, type, sql FROM main.sqlite_master')) {
+    held = true; scanned.resolve(); await resume.promise;
+  } };
+  const losing = plan().applyWithRetry(db, fast); const observed = assert.rejects(losing, code('ERR_FSQLITE_MIGRATION_DRIFT'));
+  await scanned.promise;
+  await new FrankenMigrationPlan([{ ...base[0], name: 'another application' }, base[1]]).apply(peer);
+  resume.resolve(); await observed; assert.equal(state.attempts, 2);
+  assert.equal(history(raw)[0].name, 'another application');
+});
+test('REAL COMMIT BUSY rolls back the complete schema upgrade before one clean retry', async t => {
+  const { db, state, raw } = await fixture(t);
+  raw.exec('CREATE TABLE audit(v)'); const reader = new DatabaseSync(state.path); t.after(() => reader.close());
+  reader.exec('BEGIN'); reader.prepare('SELECT * FROM audit').all();
+  state.afterBoundary = action => { if (action === 'rollback') reader.exec('ROLLBACK'); };
+  const p = new FrankenMigrationPlan([...base, migration(20, ['INSERT INTO audit VALUES(1)'])]);
+  await p.applyWithRetry(db, fast);
+  assert.equal(state.attempts, 2); assert.equal(history(raw).length, 3);
+  assert.equal(raw.prepare('SELECT count(*) n FROM audit').get().n, 1);
+  assert.deepEqual(state.events, ['begin', 'commit', 'rollback', 'begin', 'commit']);
+});
+test('ordinary apply stays single-attempt while bounded retries preserve final conflict and roll back', async t => {
+  const { db, state, raw } = await fixture(t); const conflict = busy();
+  state.beforeBoundary = action => { if (action === 'commit') throw conflict; };
+  await assert.rejects(plan().apply(db), e => e === conflict); assert.equal(state.attempts, 1);
+  await assert.rejects(plan().applyWithRetry(db, { ...fast, maxAttempts: 3 }), e => e === conflict);
+  assert.equal(state.attempts, 4); assert.equal(exists(raw, H), false); assert.equal(exists(raw, 'items'), false);
+});
+test('lost COMMIT acknowledgement does not replay already committed migration SQL', async t => {
+  const { db, state, raw } = await fixture(t);
+  state.afterBoundary = action => { if (action === 'commit') throw busy(); };
+  await assert.rejects(plan().applyWithRetry(db, fast), AggregateError);
+  assert.equal(state.attempts, 1); assert.equal(state.closed, true);
+  const other = stateFor(t); other.path = state.path; const reopened = await FrankenDB.open({ worker: other });
+  assert.equal((await plan().apply(reopened)).applied.length, 0);
+  assert.equal(other.raw.prepare('SELECT count(*) n FROM items').get().n, 1);
+});
+test('queued migration reserves its FIFO slot before hashing and precedes immediately submitted application SQL', async t => {
+  const { queue, raw } = await openQueue(t);
+  const upgrade = plan().applyQueued(queue);
+  const write = queue.transaction(tx => tx.execute("INSERT INTO items(id,name) VALUES(2,'Grace')"));
+  const closing = queue.close(); await upgrade; await write; await closing;
+  const stats = queue.stats; assert.equal(stats.completedJobs, 2); assert.equal(stats.failedJobs, 0);
+});
+test('two queued initializers cannot duplicate migrations', async t => {
+  const { queue, raw } = await openQueue(t); const p = plan();
+  const results = await Promise.all([p.applyQueued(queue), p.applyQueued(queue)]);
+  assert.deepEqual(results.map(r => r.applied.length), [2, 0]);
+  assert.equal(raw.prepare('SELECT count(*) n FROM items').get().n, 1);
+});
+test('queued conflict recovery does not release capacity or admit later jobs between attempts', async t => {
+  const { queue, state, raw } = await openQueue(t, undefined, { maxPendingJobs: 2 });
+  const rolling = deferred(), release = deferred();
+  state.beforeBoundary = action => { if (action === 'commit' && state.attempts === 1) throw busy(); };
+  state.afterBoundary = async action => { if (action === 'rollback') { rolling.resolve(); await release.promise; } };
+  const upgrade = plan().applyQueuedWithRetry(queue, fast); let ran = false;
+  const next = queue.transaction(() => { ran = true; }); await rolling.promise;
+  assert.equal(queue.stats.pendingJobs, 2); assert.equal(ran, false);
+  await assert.rejects(plan().applyQueued(queue), code('ERR_FSQLITE_JOB_QUEUE_FULL'));
+  release.resolve(); await upgrade; await next;
+  assert.equal(queue.stats.completedJobs, 2); assert.equal(history(raw).length, 2);
+});
+test('queued wait timeout never begins a migration and active timeout rolls the complete upgrade back', async t => {
+  const { queue, state, raw } = await openQueue(t); const hold = deferred(), entered = deferred();
+  const first = queue.transaction(async () => { entered.resolve(); await hold.promise; }); await entered.promise;
+  await assert.rejects(plan().applyQueued(queue, { waitTimeoutMs: 10 }), code('ERR_FSQLITE_JOB_WAIT_TIMEOUT'));
+  assert.equal(state.attempts, 1); assert.equal(exists(raw, H), false); hold.resolve(); await first;
+  state.afterSql = async sql => { if (sql.startsWith('CREATE TABLE items')) await sleep(120); };
+  await assert.rejects(plan().applyQueued(queue, { timeoutMs: 100 }), code('ERR_FSQLITE_TRANSACTION_TIMEOUT'));
+  assert.equal(exists(raw, H), false); assert.equal(exists(raw, 'items'), false);
+});
+test('queued cancellation between attempts rolls back schema and preserves the queue for later work', async t => {
+  const { queue, state, raw } = await openQueue(t); const control = new AbortController();
+  state.beforeBoundary = action => { if (action === 'commit') throw busy(); };
+  state.afterBoundary = action => { if (action === 'rollback') control.abort('stop upgrading'); };
+  await assert.rejects(plan().applyQueuedWithRetry(queue, { ...fast, signal: control.signal }), code('ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED'));
+  assert.equal(state.attempts, 1); assert.equal(exists(raw, H), false);
+  state.beforeBoundary = undefined; state.afterBoundary = undefined;
+  await plan().applyQueued(queue); assert.equal(history(raw).length, 2);
+});
+test('successful durable queued migration acknowledges one checkpoint and restores schema plus history on reopen', async t => {
+  installIndexedDbModel(); const name = crypto.randomUUID();
+  const { queue, state } = await openQueue(t, name, { checkpointOnCommit: true }, true);
+  const result = await plan().applyQueuedWithRetry(queue, fast); assert.equal(result.currentVersion, 10);
+  assert.equal(state.checkpoints, 1); await queue.close();
+  const other = stateFor(t); const db = await FrankenDB.open({ worker: other, dbName: name, persistence: 'indexeddb-snapshot' });
+  assert.equal((await plan().inspect(db)).currentVersion, 10); assert.equal(history(other.raw).length, 2);
+  assert.equal(other.raw.prepare('SELECT name FROM items').get().name, 'Ada');
+  assert.equal(other.raw.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+});
+test('snapshot publication failure after migration SQL commit is never retried and fences later upgrades', async t => {
+  installIndexedDbModel(); const { queue, state, raw } = await openQueue(t, crypto.randomUUID(), { checkpointOnCommit: true }, true);
+  const storageFailure = busy(); state.beforeSave = () => { throw storageFailure; };
+  await assert.rejects(plan().applyQueuedWithRetry(queue, fast), e => e instanceof FrankenCheckpointCommitError &&
+    e.sqlCommitted === true && e.value.currentVersion === 10 && e.cause === storageFailure);
+  assert.equal(state.attempts, 1); assert.equal(history(raw).length, 2); assert.equal(state.checkpoints, 1);
+  const sql = state.sql.length;
+  await assert.rejects(plan().applyQueuedWithRetry(queue, fast), code('ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED'));
+  assert.equal(state.sql.length, sql);
+  state.beforeSave = undefined; await queue.checkpoint();
+  assert.equal((await plan().applyQueued(queue)).applied.length, 0);
+  assert.equal(raw.prepare('SELECT count(*) n FROM items').get().n, 1);
+});
+test('competing browser snapshot initializer keeps loser SQL separate and exposes CAS conflict instead of merging histories', async t => {
+  installIndexedDbModel(); const name = crypto.randomUUID();
+  const a = await openQueue(t, name, { checkpointOnCommit: true }, true);
+  const b = await openQueue(t, name, { checkpointOnCommit: true }, true);
+  await plan().applyQueued(a.queue);
+  await assert.rejects(plan().applyQueuedWithRetry(b.queue, fast), e => e instanceof FrankenCheckpointCommitError &&
+    e.cause.code === 'ERR_FSQLITE_SNAPSHOT_CONFLICT' && e.value.applied.length === 2);
+  assert.equal(b.state.attempts, 1); assert.equal(b.queue.stats.checkpointRecoveryRequired, true);
+});
+test('queue holds the migration through publication and late cancellation cannot undo acknowledged SQL commit', async t => {
+  installIndexedDbModel(); const { queue, state } = await openQueue(t, crypto.randomUUID(), { checkpointOnCommit: true }, true);
+  const saving = deferred(), resume = deferred(), controller = new AbortController();
+  let first = true;
+  state.beforeSave = async () => { if (first) { first = false; saving.resolve(); await resume.promise; } };
+  const upgrade = plan().applyQueued(queue, { signal: controller.signal }); await saving.promise;
+  let later = false; const next = queue.transaction(() => { later = true; });
+  controller.abort('too late'); const closing = queue.close(); await turn();
+  assert.equal(later, false); assert.equal(state.closed, undefined);
+  resume.resolve(); assert.equal((await upgrade).currentVersion, 10); await next; await closing;
+  assert.equal(state.checkpoints, 2); assert.equal(state.closed, true);
+});
+test('data-backfill migrations publish one actual change notification across retry, with no phantom events', async t => {
+  const { queue, state, raw } = await openQueue(t);
+  raw.exec('CREATE TABLE counts(v); INSERT INTO counts VALUES(0)'); const notices = [];
+  const sub = await queue.subscribe(['counts'], value => { notices.push(value); });
+  const before = state.attempts; let fail = true;
+  state.beforeBoundary = (action, parent) => { if (action === 'commit' && parent === undefined && fail) { fail = false; throw busy(); } };
+  const p = new FrankenMigrationPlan([migration(1, ['UPDATE counts SET v=v+1'])]);
+  await p.applyQueuedWithRetry(queue, fast); await sleep(20);
+  assert.equal(state.attempts - before, 2); assert.equal(raw.prepare('SELECT v FROM counts').get().v, 1);
+  assert.equal(notices.length, 1); assert.deepEqual(notices[0].tables, ['counts']);
+  await p.applyQueued(queue); await sleep(20); assert.equal(notices.length, 1);
+  sub.unsubscribe(); await sub.done;
+});
+test('schema upgrades of actively watched tables fail safely until subscribers release their schema contract', async t => {
+  const { queue, state, raw } = await openQueue(t);
+  await new FrankenMigrationPlan(base.slice(0, 1)).applyQueued(queue);
+  const sub = await queue.subscribe(['items'], () => {}); const original = history(raw);
+  await assert.rejects(plan().applyQueued(queue), e => ['ERR_FSQLITE_SUBSCRIPTION_SCHEMA', 'ERR_FSQLITE_MIGRATION_HISTORY'].includes(e.code));
+  assert.deepEqual(history(raw), original); assert.equal(exists(raw, 'item_name'), false);
+  sub.unsubscribe(); await sub.done;
+  assert.equal((await plan().applyQueued(queue)).currentVersion, 10);
+});
+test('invalid queued retry policy rejects before the job is admitted and before any ledger SQL', async t => {
+  const { queue, state } = await openQueue(t);
+  await assert.rejects(plan().applyQueuedWithRetry(queue, { maxAttempts: 0 }), code('ERR_FSQLITE_TRANSACTION_RETRY_INPUT'));
+  assert.equal(queue.stats.acceptedJobs, 0); assert.equal(state.sql.length, 0);
+});
+test('migration API refuses transaction-scoped duck types rather than acknowledging a savepoint as an outer commit', async t => {
+  const { db } = await fixture(t); const p = plan();
+  await db.transaction(async tx => {
+    await assert.rejects(p.apply(tx), TypeError); await assert.rejects(p.applyWithRetry(tx), TypeError);
+    await assert.rejects(p.applyQueued(tx), TypeError); await assert.rejects(p.applyQueuedWithRetry(tx), TypeError);
+  });
+});

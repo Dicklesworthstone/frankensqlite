@@ -1,7 +1,10 @@
 import { parameterLayout, validateManagedSql } from "@frankensqlite/worker";
 import { FrankenDB } from "./database";
+import { FrankenDBQueue } from "./queue";
+import type { QueuedTransactionOptions, QueuedTransactionRetryOptions } from "./queue";
 import type { FrankenTransaction } from "./transaction";
 import type { TransactionOptions } from "./types";
+import type { TransactionRetryOptions } from "./transaction-retry";
 
 /** Distinct from the native Rust runner's legacy _schema_migrations format. */
 export const MIGRATION_HISTORY_TABLE = "_fsqlite_sdk_migrations_v1";
@@ -232,6 +235,24 @@ export class FrankenMigrationPlan {
     // Claim connection authority synchronously. Hashing stays inside the owned
     // scope and its deadline; no detached preflight can be overtaken by SQL.
     return db.transaction(tx => this.#apply(tx), options);
+  }
+
+  /** Opt-in restart after confirmed conflict rollback; history is reread each time. */
+  applyWithRetry(db: FrankenDB, options?: TransactionRetryOptions): Promise<MigrationResult> {
+    if (!(db instanceof FrankenDB)) return Promise.reject(new TypeError("applyWithRetry requires a FrankenDB connection"));
+    return db.transactionWithRetry(tx => this.#apply(tx), options);
+  }
+
+  /** One ordered queue job, including the queue's checkpoint-on-commit barrier. */
+  applyQueued(queue: FrankenDBQueue, options?: QueuedTransactionOptions): Promise<MigrationResult> {
+    if (!(queue instanceof FrankenDBQueue)) return Promise.reject(new TypeError("applyQueued requires a FrankenDBQueue"));
+    return queue.transaction(tx => this.#apply(tx), options);
+  }
+
+  /** All conflict retries retain the same FIFO job; publication is never replayed. */
+  applyQueuedWithRetry(queue: FrankenDBQueue, options?: QueuedTransactionRetryOptions): Promise<MigrationResult> {
+    if (!(queue instanceof FrankenDBQueue)) return Promise.reject(new TypeError("applyQueuedWithRetry requires a FrankenDBQueue"));
+    return queue.transactionWithRetry(tx => this.#apply(tx), options);
   }
 
   async #manifest(): Promise<readonly MigrationIdentity[]> {

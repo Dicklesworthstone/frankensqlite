@@ -112,3 +112,74 @@ against an explicitly injected Node-SQLite transport. They exercise real DDL,
 constraints, trigger effects, rollback, reopening, prefix/drift checks and
 lifetime failures. They do not certify native FrankenSQLite SQL parity, worker
 IPC, WASM or actual browser storage. Transpilation is not a workspace typecheck.
+
+## Contention, FIFO queues and checkpoint-on-commit
+
+The plan also exposes:
+
+- `applyWithRetry(db, TransactionRetryOptions)` for opt-in whole-transaction
+  conflict recovery. Ordinary `apply()` still runs once.
+- `applyQueued(queue, QueuedTransactionOptions)` to apply at one FIFO job
+  boundary, preserving wait/active deadlines, cancellation and close draining.
+- `applyQueuedWithRetry(queue, QueuedTransactionRetryOptions)` to retain one
+  bounded queue slot across every attempt, rollback, backoff and publication.
+
+```ts
+import { FrankenDBQueue, FrankenMigrationPlan } from "@frankensqlite/sdk";
+
+const schema = new FrankenMigrationPlan([
+  { version: 1, name: "notes", statements: [
+    "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+  ] },
+]);
+const queue = await FrankenDBQueue.open(
+  { dbName: "offline-notes", persistence: "indexeddb-snapshot" },
+  { checkpointOnCommit: true },
+);
+const upgrade = schema.applyQueuedWithRetry(queue, {
+  maxAttempts: 4, timeoutMs: 5000, waitTimeoutMs: 1000,
+});
+// This job cannot overtake migration hashing, SQL, rollback or publication.
+const write = queue.transaction(tx => tx.execute("INSERT INTO notes(body) VALUES (?)", ["hello"]));
+await upgrade;
+await write;
+await queue.close();
+```
+
+A retry rereads history in its new transaction; no previously computed pending
+list is reused. If another initializer won the race, its matching history makes
+the new attempt a no-op rather than replaying seed rows or data backfills. A
+winner with different migration definitions produces a drift refusal. Only the
+existing SDK's typed BUSY-family errors and confirmed rollback authorize replay;
+constraint/drift/history errors and uncertain commit outcomes do not. SQL which
+calls external side-effecting functions must be safe to replay before opting in.
+
+On a `checkpointOnCommit` queue the migration result is returned only after
+snapshot publication completes. The entire upgrade publishes once, not once per
+version or retry. Publication is outside SQL retries: a failure after SQL COMMIT
+is a `FrankenCheckpointCommitError` whose `value` is the `MigrationResult` and
+whose `sqlCommitted` is true. Later jobs are fenced before any SQL. Export and
+explicit checkpoint recovery retain the existing queue contract; never rerun
+the committed migration to repair a failed publication. Ordinary memory queues
+and queues without this option acknowledge SQL commit only.
+
+Separate browser workers still have independent in-memory databases, not native
+cross-tab MVCC. If they loaded the same stored revision, a losing snapshot CAS
+is a committed-state publication failure, not permission to merge schemas or
+replay SQL. Reopen/reconcile authoritative state. These APIs do not change the
+storage conflict contract or make browser retention unconditional.
+
+A queued migration uses the queue's normal change journal. Data backfills notify
+only for the successful local SQL commit, not for rolled-back attempts or an
+idempotent history-only rerun. Existing subscriptions protect their schema:
+unsubscribe and await `done` before upgrading a watched table. Do not subscribe
+to the reserved history table. The runner does not silently remove application
+subscriptions. Direct `inspect(db)` remains a database operation, not a queued
+checkpoint-producing dry run; no inspection method is exposed on a child
+transaction or on the queue's private connection.
+
+The migration tests additionally reproduce real SQLite WAL snapshot conflicts
+between two initializer connections and rollback-journal COMMIT contention.
+Queue, notification, export/reopen and checkpoint failure tests execute their
+production implementations with the repository's explicit IndexedDB transaction
+model. They are not browser IndexedDB, worker IPC or native engine certification.
