@@ -1,4 +1,6 @@
 export { FrankenDB } from "./database";
+export { FrankenTransactionRetryError } from "./transaction-retry";
+export type { TransactionRetryOptions, TransactionRetryAttempt } from "./transaction-retry";
 export { scanTable } from "./table-scan";
 export type { TableScan, TableScanOptions, TableScanStats } from "./table-scan";
 export { FrankenSnapshotPool, FrankenPoolError } from "./snapshot-pool";

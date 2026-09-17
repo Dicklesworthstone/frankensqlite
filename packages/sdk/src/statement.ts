@@ -14,7 +14,7 @@ export class FrankenPreparedStatement<
   readonly #transactionId: string | undefined;
   readonly #statementId: string;
   readonly #run: StatementOperation;
-  readonly #onFinalize: (() => void) | undefined;
+  readonly #onFinalize: ((failed: boolean) => void) | undefined;
   readonly #signal: AbortSignal | undefined;
   readonly #layout: ParameterLayout;
   #bindings: readonly SqlScalar[] | null = null;
@@ -30,7 +30,7 @@ export class FrankenPreparedStatement<
     columnCount: number,
     columnNames: readonly string[],
     run: StatementOperation = (operation) => operation(),
-    onFinalize?: () => void,
+    onFinalize?: (failed: boolean) => void,
     transactionId?: string,
     signal?: AbortSignal,
   ) {
@@ -136,7 +136,7 @@ export class FrankenPreparedStatement<
       // Admission refusals run no SQL and must leave the handle retryable (or
       // available to the owning transaction's drain/cleanup after overload).
       this.#finalizePromise = this.#client.finalizePrepared(this.#statementId, this.#transactionId).then(
-        () => { this.#bindings = null; this.#onFinalize?.(); },
+        () => { this.#bindings = null; this.#onFinalize?.(false); },
         (error: unknown) => {
           if (error instanceof FrankenSQLiteError &&
             (error.code === "ERR_FSQLITE_QUEUE_FULL" || error.code === "ERR_FSQLITE_REQUEST_TOO_LARGE" ||
@@ -146,7 +146,7 @@ export class FrankenPreparedStatement<
             // A free() error can occur after the worker removed the handle;
             // that outcome is not a license to finalize the same handle twice.
             this.#bindings = null;
-            this.#onFinalize?.();
+            this.#onFinalize?.(true);
           }
           throw error;
         },
