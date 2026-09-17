@@ -1,6 +1,7 @@
 import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "./connection";
 import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
 import type { ExecuteManyResult, SqlScalar } from "./protocol";
+import { namedParameterEnd, parameterLayout, resolveBindings } from "./bindings";
 
 export class BulkExecutionError extends Error {
   readonly batchIndex: number | undefined;
@@ -73,6 +74,9 @@ export class BulkCancellation {
  * WITH is admitted, but its prepared column count must also be zero.
  */
 export function validateBulkSql(sql: string): void {
+  if (typeof sql !== "string" || sql.includes("\0")) {
+    throw invalid("Bulk SQL must be a string without NUL bytes");
+  }
   let firstWord: string | undefined;
   let ended = false;
   for (let i = 0; i < sql.length;) {
@@ -114,8 +118,14 @@ export function validateBulkSql(sql: string): void {
           }
         }
         if (!closed) throw invalid("Unterminated SQL quote in bulk statement");
+      } else if (char === ":" || char === "@" || char === "$") {
+        // Tcl-style parameter suffixes are opaque SQL tokens. Their quotes and
+        // semicolons must neither split this statement nor hide a script tail.
+        i = namedParameterEnd(sql, i);
+      } else if (/[A-Za-z_\u0080-\uFFFF]/.test(char)) {
+        // '$' inside an unquoted identifier is not a parameter prefix.
+        for (i++; i < sql.length && /[A-Za-z0-9_$\u0080-\uFFFF]/.test(sql[i]!); i++);
       } else {
-        if (char === "\0") throw invalid("NUL bytes are not allowed in bulk SQL");
         i += 1;
       }
     }
@@ -148,6 +158,19 @@ export async function executeMany(
   validateParameterSets(parameterSets);
   if (prepared !== undefined && prepared.columnCount !== 0) {
     throw invalid("Bulk execution does not accept result rows; use query for RETURNING/SELECT");
+  }
+  // Match ordinary/prepared execution's complete-binding contract. Native
+  // SQLite permits unbound slots to become NULL, so delegating this check to
+  // the core can silently commit incomplete import rows. Validate ALL rows
+  // before prepare/SAVEPOINT, retaining the failing input index. Discard each
+  // temporary resolved row rather than duplicating the entire admitted batch.
+  const layout = parameterLayout(sql);
+  for (let index = 0; index < parameterSets.length; index++) {
+    try {
+      resolveBindings(layout, parameterSets[index]!);
+    } catch (cause: unknown) {
+      throw new BulkExecutionError(cause, index);
+    }
   }
   const result: ExecuteManyResult = { executions: 0, changes: 0, changesPerExecution: [] };
   if (parameterSets.length === 0) {
