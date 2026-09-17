@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::Duration;
 
 #[cfg(test)]
-use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
+use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking, yield_now};
 #[cfg(test)]
 use asupersync::time::{sleep, wall_now};
 use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken, sync_primitives::Instant};
@@ -1101,13 +1101,22 @@ fn bd_ncivz_2_append_during_epoch_fence_stays_in_previous_epoch_lane() {
             })
             .expect("advance task should spawn");
 
+        // bd-lvy4c: yield to the EXECUTOR, not the OS. `test_runtime()` is a
+        // `current_thread` runtime, so this loop runs on the only thread the
+        // runtime has. `std::thread::yield_now()` hands control to the OS
+        // scheduler and never lets the runtime poll `advance`, so the spawned
+        // task could only make progress while the runtime happened to dispatch
+        // it eagerly at spawn time. Asupersync 0.4.11 (fdffd1c2e) stopped doing
+        // that, at which point the task was never polled at all and this
+        // deadline expired every single run. Awaiting `yield_now()` returns
+        // control to the executor, which is what the loop actually needs.
         let deadline = Instant::now() + Duration::from_millis(200);
         while coordinator.current_epoch() != 1 {
             assert!(
                 Instant::now() < deadline,
                 "advance should publish epoch 1 before timing out"
             );
-            std::thread::yield_now();
+            yield_now().await;
         }
         assert_eq!(
             coordinator.current_append_epoch(),

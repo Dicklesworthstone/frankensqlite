@@ -16078,6 +16078,22 @@ mod tests {
         // the final delete that empties the leaf triggers the rebalance.
         // Held across the whole test body; acquired outside the async block so the
         // guard never enters the coroutine interior.
+        //
+        // bd-pyygd: this test asserts on `balance_for_delete_calls`, which lives on
+        // the LEAF-REUSE snapshot, not the metrics snapshot — so the metrics gate
+        // lock alone does not serialize it. Any sibling holding only the leaf-reuse
+        // locks can perform an emptying delete between this test's before/after
+        // reads and inflate the delta (observed: expected 0, got 5, under the
+        // default parallel test run). Take the same cursor -> leaf-reuse -> metrics
+        // chain, in that order, that the other leaf-reuse tests in this module use;
+        // the order matters because a different order between siblings would
+        // deadlock.
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _leaf_shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
