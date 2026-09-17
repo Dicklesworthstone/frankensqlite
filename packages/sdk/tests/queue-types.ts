@@ -11,6 +11,8 @@ export async function queueTypes(): Promise<void> {
   }, { signal: new AbortController().signal, waitTimeoutMs: 1000 }));
   accepts<Promise<string>>(queue.transaction(() => "value"));
   accepts<JobQueueStats>(queue.stats);
+  accepts<Promise<Uint8Array>>(queue.export({ waitTimeoutMs: 1000 }));
+  accepts<Promise<import("../src/types").SnapshotMetadata>>(queue.checkpoint({ signal: new AbortController().signal }));
   accepts<Promise<void>>(queue.close());
   // @ts-expect-error callbacks receive a scoped transaction, not the raw queue/db
   queue.transaction(tx => tx.close());

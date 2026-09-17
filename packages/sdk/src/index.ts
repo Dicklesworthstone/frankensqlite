@@ -26,4 +26,4 @@ export type {
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type { WorkerLike } from "./worker-client";
 export { FrankenDBQueue } from "./queue";
-export type { JobQueueOptions, JobQueueStats, QueuedTransactionOptions } from "./queue";
+export type { JobQueueOptions, JobQueueStats, QueuedJobOptions, QueuedTransactionOptions } from "./queue";

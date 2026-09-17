@@ -1,16 +1,23 @@
 import { FrankenDB } from "./database";
 import { FrankenSQLiteError } from "./errors";
 import type { FrankenTransaction } from "./transaction";
-import type { FrankenDbOpenOptions, TransactionOptions } from "./types";
+import type { FrankenDbOpenOptions, SnapshotMetadata } from "./types";
 
 export interface JobQueueOptions {
   /** Active plus waiting jobs, 1..4096. Defaults to 64. No overflow waiters. */
   maxPendingJobs?: number;
 }
 
-export interface QueuedTransactionOptions extends TransactionOptions {
+export interface QueuedJobOptions {
+  /** Cancel waiting work. Active export/checkpoint publication is not interruptible. */
+  signal?: AbortSignal;
   /** Maximum time waiting to start, in milliseconds. Never times out live SQL. */
   waitTimeoutMs?: number;
+}
+
+export interface QueuedTransactionOptions extends QueuedJobOptions {
+  /** Active transaction cancellation also drains callback, SQL and rollback. */
+  signal?: AbortSignal;
 }
 
 export interface JobQueueStats {
@@ -116,6 +123,25 @@ export class FrankenDBQueue {
       signal === undefined ? undefined : { signal }), options, work);
   }
 
+  /**
+   * An ordered image barrier outside all managed transactions. Once started,
+   * export's actual outcome wins over a late abort; no work is abandoned.
+   */
+  export(options?: QueuedJobOptions): Promise<Uint8Array> {
+    const operation = () => this.#db.export();
+    return this.#enqueue(operation, options, operation);
+  }
+
+  /**
+   * Publish the current committed image in indexeddb-snapshot mode. Includes
+   * earlier successful jobs, excludes later jobs, and waits for publication.
+   * Preceding job failures do not implicitly cancel this independent barrier.
+   */
+  checkpoint(options?: QueuedJobOptions): Promise<SnapshotMetadata> {
+    const operation = () => this.#db.checkpoint();
+    return this.#enqueue(operation, options, operation);
+  }
+
   /** Stop admission, drain accepted jobs, then close. Idempotent shared promise. */
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
@@ -136,13 +162,13 @@ export class FrankenDBQueue {
     if (this.#waiting.size + (this.#active === null ? 0 : 1) >= this.#maxPendingJobs) {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_FULL", transient: true,
         message: "Job queue is full; no SQL was executed",
-        suggestion: "Await an accepted job before retrying the complete transaction" });
+        suggestion: "Await an accepted job before retrying the complete operation" });
     }
   }
 
   #enqueue<T>(
     operation: (signal: AbortSignal | undefined) => Promise<T>,
-    options: QueuedTransactionOptions | undefined,
+    options: QueuedJobOptions | undefined,
     callback: unknown,
   ): Promise<T> {
     let signal: AbortSignal | undefined;
@@ -178,7 +204,7 @@ export class FrankenDBQueue {
           let result: Promise<T>;
           try { result = operation(signal); }
           catch (error: unknown) { result = Promise.reject(error); }
-          // Release capacity only after the real transaction (including cleanup)
+          // Release capacity only after the real operation (including cleanup)
           // settles. Never race running SQL or a callback against a timer/abort.
           void result.then(value => {
             this.#finish(job, true);

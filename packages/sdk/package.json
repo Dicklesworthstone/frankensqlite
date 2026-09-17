@@ -24,6 +24,7 @@
   "files": [
     "dist",
     "README.md",
+    "QUEUE.md",
     "LICENSE"
   ],
   "peerDependencies": {
@@ -36,6 +37,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:queue": "node --experimental-loader=./tests/helpers/source-loader.mjs --test --test-concurrency=1 tests/queue.test.mjs tests/queue-persistence.test.mjs tests/queue-thread.test.mjs",
     "prepack": "npm run typecheck && npm run test && npm run build"
   },
   "publishConfig": {
