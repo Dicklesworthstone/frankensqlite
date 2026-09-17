@@ -14,6 +14,45 @@ import type { RetryRecovery, TransactionRetryAttempt, TransactionRetryOptions } 
 
 const databaseClients = new WeakMap<FrankenDB, FrankenWorkerClient>();
 
+function snapshotReceiptFailure(cause: unknown): FrankenSQLiteError {
+  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECEIPT",
+    message: "Snapshot acknowledgement is invalid or its revision lineage is unknown",
+    transient: false, userRecoverable: false,
+    suggestion: "Publication may have completed. Export the live image, reopen the authoritative snapshot and reconcile; do not replay committed SQL or blindly publish again." });
+  error.cause = cause;
+  return error;
+}
+
+/** Wire metadata must be own data fields, not callbacks or inherited claims. */
+function snapshotDataField(record: object, key: string, required = true): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (descriptor === undefined && !required) return undefined;
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+    throw new TypeError(`Invalid snapshot metadata field: ${key}`);
+  }
+  return descriptor.value;
+}
+
+/** Validate a receipt, not the image: the worker/store still owns byte hashing. */
+function captureSnapshotReceipt(value: unknown): SnapshotMetadata {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Invalid snapshot acknowledgement");
+  }
+  const revision = snapshotDataField(value, "revision");
+  const parentRevision = snapshotDataField(value, "parentRevision");
+  const byteLength = snapshotDataField(value, "byteLength");
+  const sha256 = snapshotDataField(value, "sha256");
+  const validRevision = (token: unknown): token is string => typeof token === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token);
+  if (!validRevision(revision) || (parentRevision !== null && !validRevision(parentRevision)) ||
+      revision === parentRevision || typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256) ||
+      typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) ||
+      byteLength < 512 || byteLength > 64 * 1024 * 1024 || byteLength % 512 !== 0) {
+    throw new TypeError("Malformed snapshot acknowledgement metadata");
+  }
+  return Object.freeze({ revision, parentRevision, byteLength, sha256 });
+}
+
 /** Internal lifecycle subscription for owners of a private connection. */
 export function observeDatabaseFailure(db: FrankenDB, listener: (error: Error) => void): () => void {
   const client = databaseClients.get(db);
@@ -39,6 +78,7 @@ export class FrankenDB {
   readonly #path: string;
   readonly #persistence: PersistenceMode;
   #snapshotRevision: string | null;
+  #snapshotReceiptFailure: FrankenSQLiteError | null = null;
   #transactionScope: TransactionScope | null = null;
   #transactionFailure: Error | null = null;
   #nextTransactionId = 1n;
@@ -74,7 +114,17 @@ export class FrankenDB {
     }
     try {
       const ready = await client.init(config);
-      return new FrankenDB(client, ready.path, ready.persistence, ready.snapshot?.revision ?? null);
+      let snapshot: SnapshotMetadata | null = null;
+      try {
+        const saved = snapshotDataField(ready, "snapshot", false);
+        if (saved !== undefined && saved !== null) {
+          if (ready.persistence !== "indexeddb-snapshot") {
+            throw new TypeError("Only snapshot persistence can return saved snapshot metadata");
+          }
+          snapshot = captureSnapshotReceipt(saved);
+        }
+      } catch (cause: unknown) { throw snapshotReceiptFailure(cause); }
+      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null);
     } catch (error: unknown) {
       try {
         client.dispose();
@@ -217,9 +267,34 @@ export class FrankenDB {
   /** Publish an explicit whole-image checkpoint after all SQL transactions end. */
   checkpoint(): Promise<SnapshotMetadata> {
     return this.#run(null, async () => {
-      const saved = await this.#client.checkpoint();
-      this.#snapshotRevision = saved.revision;
-      return saved;
+      if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
+      let response: unknown;
+      try { response = await this.#client.checkpoint(); }
+      catch (cause: unknown) {
+        // The transport can reject a correlated malformed response before it
+        // reaches metadata capture. That is not a recoverable quota/CAS error.
+        if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
+          this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+          throw this.#snapshotReceiptFailure;
+        }
+        throw cause;
+      }
+      // A different in-flight acknowledgement may already have lost lineage.
+      // A late response cannot erase that uncertainty or regress the revision.
+      if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
+      try {
+        const saved = captureSnapshotReceipt(response);
+        // Compare at acceptance, not dispatch: normal FIFO checkpoints may be
+        // queued together and form a chain as each response is acknowledged.
+        if (saved.parentRevision !== this.#snapshotRevision) {
+          throw new TypeError("Snapshot acknowledgement does not extend the last acknowledged revision");
+        }
+        this.#snapshotRevision = saved.revision;
+        return saved;
+      } catch (cause: unknown) {
+        this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+        throw this.#snapshotReceiptFailure;
+      }
     });
   }
 

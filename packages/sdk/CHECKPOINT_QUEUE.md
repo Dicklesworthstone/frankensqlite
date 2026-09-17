@@ -97,6 +97,30 @@ export the losing connection's image, reopen the authoritative checkpoint and
 merge application changes. A fatal transport failure may make export/recovery
 unavailable, and a lost acknowledgement may leave publication unknown.
 
+### Validated receipts and uncertain revision lineage
+
+The public `FrankenDB` boundary validates saved metadata during initialization
+and checkpoint acknowledgement. Revision tokens must be UUID v4, hashes must
+be 64 lowercase hexadecimal characters, and image lengths must be whole
+512-byte units between 512 bytes and 64 MiB. Own scalar fields are captured
+into an immutable receipt; accessor fields are rejected without calling them.
+Each checkpoint's parent must equal the last acknowledged revision at response
+acceptance. Normally queued checkpoints extend that chain in FIFO order.
+
+Malformed or out-of-order receipts reject with `ERR_FSQLITE_SNAPSHOT_RECEIPT`
+and preserve the last acknowledged revision. A lost earlier acknowledgement
+can also cause a later receipt to skip a parent. Once lineage is unknown, this
+database refuses further checkpoint requests until reopened; even an older
+in-flight response cannot clear that uncertainty. Export the live image, reopen
+the authoritative stored snapshot and reconcile. An automatic queue checkpoint
+wraps this error in `FrankenCheckpointCommitError` and retains its recovery fence.
+Ordinary quota failures and known failed CAS publications keep their existing
+recovery behavior; a valid receipt is still required before clearing the fence.
+
+These checks validate the acknowledgement contract, not its authenticity or
+the exported bytes. The worker/store still owns image validation and hashing.
+A syntactically valid hash is not independent proof of storage publication.
+
 `close()` drains accepted work and releases resources. It does not silently
 retry publication. With unresolved checkpoint recovery, close REJECTS with the
 committed-checkpoint error after cleanup; if cleanup also fails, an aggregate

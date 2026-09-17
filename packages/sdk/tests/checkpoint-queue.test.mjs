@@ -57,7 +57,9 @@ class SqliteTransport {
       const path = join(s.dir, 'restored.sqlite'); writeFileSync(path, saved.bytes);
       s.raw = new DatabaseSync(path); s.revision = saved.revision;
     } else s.raw = new DatabaseSync(':memory:');
-    return { path: config.dbName ?? ':memory:', persistence: s.persistence, snapshot: saved };
+    const ready = { path: config.dbName ?? ':memory:', persistence: s.persistence, snapshot: saved };
+    s.afterReady?.(ready);
+    return ready;
   }
   async transaction(action, id, parentId) {
     this.assertOpen(); const s = this.state;
@@ -114,6 +116,7 @@ replacements.set('./stream', { checkStreamCancellation() { throw new Error('not 
 replacements.set('@frankensqlite/worker', { resolveRequestLimits: x => x,
   resolveResultEncoding: x => x ?? 'structured-clone' });
 const { FrankenDBQueue, FrankenCheckpointCommitError } = sdk('queue');
+const { FrankenDB } = sdk('database');
 function stateFor(t) {
   const s = { dir: mkdtempSync(join(tmpdir(), 'fsqlite-checkpoint-queue-')), inits: 0,
     stack: [], events: [], attempts: 0, checkpoints: 0, exports: 0, sql: 0, revision: null };
@@ -293,13 +296,22 @@ test('competing snapshot queues preserve CAS winner and expose the losing commit
   await assert.rejects(loser.checkpoint(), e => e.code === 'ERR_FSQLITE_SNAPSHOT_CONFLICT');
   const image = await loser.export(); assert.ok(image.length > 0); assert.equal(loser.snapshotRevision, baseline);
 });
-test('lost publication acknowledgement is unknown, never evidence that nothing was saved', async t => {
+test('lost publication acknowledgement remains unknown until authoritative reopen reconciles lineage', async t => {
   const { queue, state, name } = await fixture(t); state.afterSave = () => { throw new Error('response lost'); };
   let failure;
   await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=3')), e => { failure = e; return e instanceof FrankenCheckpointCommitError; });
   assert.equal(failure.checkpointConfirmed, false); assert.equal((await savedValue(t, name)).value, 3);
   assert.equal(queue.snapshotRevision, null); assert.equal(queue.stats.checkpointRecoveryRequired, true);
-  state.afterSave = undefined; await queue.checkpoint(); assert.equal(queue.stats.checkpointRecoveryRequired, false);
+  state.afterSave = undefined;
+  // The worker advanced its revision while the SDK did not. A subsequent
+  // publication may succeed, but its skipped parent is not a valid receipt.
+  await assert.rejects(queue.checkpoint(), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(queue.stats.checkpointRecoveryRequired, true);
+  assert.ok((await queue.export()).length > 0);
+  const { queue: reopened, state: restored } = await openQueue(t, name);
+  assert.equal(value(restored), 3);
+  const receipt = await reopened.checkpoint();
+  assert.equal(reopened.snapshotRevision, receipt.revision);
   assert.equal((await savedValue(t, name)).effects, 1);
 });
 test('late cancellation cannot abandon saving an acknowledged COMMIT', async t => {
@@ -396,4 +408,122 @@ test('callback return values from a failed SQL attempt are never exposed as comm
   state.beforeBoundary = action => { if (action === 'commit') throw failed; };
   await assert.rejects(queue.transaction(async tx => { await tx.execute('UPDATE counts SET value=2'); return { doNotPublish: true }; }), e => e === failed);
   assert.equal(state.checkpoints, 0); assert.equal(value(state), 0); assert.equal(queue.stats.checkpointRecoveryRequired, false);
+});
+
+const unrelatedRevision = '00000000-0000-4000-8000-000000000001';
+for (const [name, change] of [
+  ['empty revision', saved => { saved.revision = ''; }],
+  ['non-UUID revision', saved => { saved.revision = 'saved'; }],
+  ['non-v4 revision', saved => { saved.revision = '00000000-0000-1000-8000-000000000001'; }],
+  ['empty digest', saved => { saved.sha256 = ''; }],
+  ['non-hex digest', saved => { saved.sha256 = 'g'.repeat(64); }],
+  ['zero length', saved => { saved.byteLength = 0; }],
+  ['unaligned length', saved => { saved.byteLength = 513; }],
+  ['oversized length', saved => { saved.byteLength = 64 * 1024 * 1024 + 512; }],
+  ['non-finite length', saved => { saved.byteLength = NaN; }],
+  ['malformed parent', saved => { saved.parentRevision = ''; }],
+  ['self-parent', saved => { saved.parentRevision = saved.revision; }],
+]) {
+  test(`receipt rejects ${name} without acknowledging or replaying the committed write`, async t => {
+    const { queue, state, name: dbName } = await fixture(t);
+    state.afterSave = change;
+    await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=1')), error => {
+      assert.ok(error instanceof FrankenCheckpointCommitError);
+      assert.equal(error.cause.code, 'ERR_FSQLITE_SNAPSHOT_RECEIPT'); return true;
+    });
+    assert.equal(queue.snapshotRevision, null); assert.equal(queue.stats.checkpointRecoveryRequired, true);
+    assert.equal((await savedValue(t, dbName)).value, 1); // Invalid ack is NOT proof of failed storage.
+    state.afterSave = undefined;
+    await assert.rejects(queue.checkpoint(), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+    assert.equal(state.checkpoints, 1); // Unknown lineage requires reopen, not another blind publication.
+    assert.ok((await queue.export()).length > 0);
+  });
+}
+test('receipt binds parent to the last acknowledged snapshot and cannot silently skip a generation', async t => {
+  const { queue, state } = await fixture(t);
+  await queue.transaction(tx => tx.execute('UPDATE counts SET value=1'));
+  const previous = queue.snapshotRevision;
+  state.afterSave = saved => { saved.parentRevision = unrelatedRevision; };
+  await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=2')), e => e.cause?.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(queue.snapshotRevision, previous); assert.equal(value(state), 2);
+});
+test('receipt capture owns frozen scalar metadata rather than returning transport-owned aliases', async t => {
+  const { queue, state } = await fixture(t); let wire;
+  state.afterSave = saved => { wire = saved; };
+  const receipt = await queue.checkpoint();
+  const revision = receipt.revision; assert.ok(Object.isFrozen(receipt));
+  assert.notEqual(receipt, wire); wire.revision = unrelatedRevision; wire.sha256 = '';
+  assert.equal(receipt.revision, revision); assert.equal(queue.snapshotRevision, revision);
+  assert.match(receipt.sha256, /^[0-9a-f]{64}$/);
+});
+test('receipt accessors are rejected without executing transport-defined getters', async t => {
+  const { queue, state } = await fixture(t); let getters = 0;
+  state.afterSave = saved => Object.defineProperty(saved, 'sha256', { get() { getters++; return '0'.repeat(64); } });
+  await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=1')), e => e.cause?.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(getters, 0); assert.equal(queue.snapshotRevision, null);
+});
+test('initialization rejects malformed saved metadata and closes its worker before exposing a database', async t => {
+  installIndexedDbModel(); const state = stateFor(t);
+  state.afterReady = ready => { ready.snapshot = { revision: '', parentRevision: null, byteLength: 0, sha256: '' }; };
+  await assert.rejects(FrankenDB.open({ worker: state, dbName: crypto.randomUUID(), persistence: 'indexeddb-snapshot' }), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(state.closed, true); assert.equal(state.attempts, 0);
+});
+test('initialization refuses saved-snapshot claims in memory mode', async t => {
+  const state = stateFor(t);
+  state.afterReady = ready => { ready.snapshot = { revision: unrelatedRevision, parentRevision: null, byteLength: 512, sha256: '0'.repeat(64) }; };
+  await assert.rejects(FrankenDB.open({ worker: state }), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(state.closed, true);
+});
+test('invalid correlated worker responses leave checkpoint lineage unknown, not retryable', async t => {
+  const { queue, state } = await fixture(t);
+  state.beforeSave = () => { throw new FrankenSQLiteError({ code: 'ERR_FSQLITE_WORKER_RESPONSE', message: 'malformed reply' }); };
+  await assert.rejects(queue.transaction(tx => tx.execute('UPDATE counts SET value=1')), e => e.cause?.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  state.beforeSave = undefined;
+  await assert.rejects(queue.checkpoint(), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  assert.equal(state.checkpoints, 1); assert.equal(value(state), 1);
+});
+test('out-of-order checkpoint acknowledgements cannot advance or roll back acknowledged lineage', async t => {
+  installIndexedDbModel(); const state = stateFor(t), firstSaved = deferred(), release = deferred();
+  const db = await FrankenDB.open({ worker: state, dbName: crypto.randomUUID(), persistence: 'indexeddb-snapshot' });
+  state.raw.exec('CREATE TABLE counts(value); INSERT INTO counts VALUES(1)');
+  let replies = 0;
+  state.afterSave = async () => { if (++replies === 1) { firstSaved.resolve(); await release.promise; } };
+  const first = db.checkpoint(); const rejected = assert.rejects(first, e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+  await firstSaved.promise;
+  try { await assert.rejects(db.checkpoint(), e => e.code === 'ERR_FSQLITE_SNAPSHOT_RECEIPT'); }
+  finally { release.resolve(); await rejected; }
+  assert.equal(db.snapshotRevision, null); assert.equal(state.checkpoints, 2);
+  await db.close();
+});
+
+test('normal concurrent checkpoint calls acknowledge their FIFO parent chain without false conflict', async t => {
+  installIndexedDbModel(); const state = stateFor(t);
+  const db = await FrankenDB.open({ worker: state, dbName: crypto.randomUUID(), persistence: 'indexeddb-snapshot' });
+  state.raw.exec('CREATE TABLE counts(value); INSERT INTO counts VALUES(1)');
+  // The production worker owns a FIFO. Reproduce that transport scheduling,
+  // not simultaneous calls to the fixture's unsynchronized core connection.
+  const checkpoint = SqliteTransport.prototype.checkpoint;
+  let tail = Promise.resolve();
+  t.mock.method(SqliteTransport.prototype, 'checkpoint', function() {
+    const result = tail.then(() => checkpoint.call(this));
+    tail = result.then(() => {}, () => {});
+    return result;
+  });
+  const [first, second, third] = await Promise.all([db.checkpoint(), db.checkpoint(), db.checkpoint()]);
+  assert.equal(first.parentRevision, null);
+  assert.equal(second.parentRevision, first.revision);
+  assert.equal(third.parentRevision, second.revision);
+  assert.equal(db.snapshotRevision, third.revision); assert.equal(state.checkpoints, 3);
+  await db.close();
+});
+test('initialization rejects snapshot getters without invoking them, retaining cleanup errors', async t => {
+  installIndexedDbModel(); const state = stateFor(t); let invoked = false;
+  state.closeError = new Error('cleanup failed');
+  state.afterReady = ready => Object.defineProperty(ready, 'snapshot', { get() { invoked = true; return null; } });
+  await assert.rejects(FrankenDB.open({ worker: state, dbName: crypto.randomUUID(), persistence: 'indexeddb-snapshot' }), e => {
+    assert.ok(e instanceof AggregateError);
+    assert.equal(e.errors[0].code, 'ERR_FSQLITE_SNAPSHOT_RECEIPT');
+    assert.equal(e.errors[1], state.closeError); return true;
+  });
+  assert.equal(invoked, false); assert.equal(state.closed, true);
 });
