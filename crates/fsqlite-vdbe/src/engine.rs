@@ -4645,6 +4645,12 @@ pub struct MemDatabase {
     /// replays each source row as its own statement; triggers and FK cascades
     /// do the same), so this is a stack, not a single token.
     statement_undo_marks: Vec<usize>,
+    /// bd-ndm28: true between `begin_undo` (BEGIN) and `commit_undo`
+    /// (COMMIT/ROLLBACK). While set, a successful statement must NOT discard its
+    /// undo records: the enclosing transaction may still roll back and needs
+    /// them. Outside a transaction the records die with the statement, which is
+    /// what keeps the log from growing for the life of the connection.
+    in_explicit_txn: bool,
 }
 
 impl MemDatabase {
@@ -4656,6 +4662,7 @@ impl MemDatabase {
             undo_enabled: true,
             undo_log: Vec::new(),
             statement_undo_marks: Vec::new(),
+            in_explicit_txn: false,
         }
     }
 
@@ -4756,15 +4763,24 @@ impl MemDatabase {
     }
 
     /// Begin a new undo region (transaction start).
+    ///
+    /// bd-ndm28: also marks an explicit transaction open, so statement-scoped
+    /// cleanup stops discarding records this transaction may need to roll back.
     pub fn begin_undo(&mut self) {
         self.undo_enabled = true;
         self.undo_log.clear();
+        self.in_explicit_txn = true;
     }
 
     /// End the undo region (transaction committed/finished).
+    ///
+    /// bd-5bq6u: recording stays ON afterwards. Autocommit statements need it for
+    /// statement-scoped atomicity, and outside a transaction `end_statement`
+    /// discards each statement's records as it completes, so the log stays bounded.
     pub fn commit_undo(&mut self) {
-        self.undo_enabled = false;
+        self.undo_enabled = true;
         self.undo_log.clear();
+        self.in_explicit_txn = false;
     }
 
     /// bd-5bq6u: mark the start of a statement.
@@ -4787,7 +4803,10 @@ impl MemDatabase {
         };
         if rollback {
             self.rollback_to(MemDbVersionToken(mark));
-        } else if self.statement_undo_marks.is_empty() {
+        } else if !self.in_explicit_txn && self.statement_undo_marks.is_empty() {
+            // bd-ndm28: only outside an explicit transaction. Inside one, every
+            // top-level statement is outermost, so truncating here would throw
+            // away precisely the records a later ROLLBACK has to replay.
             self.undo_log.truncate(mark);
         }
     }
