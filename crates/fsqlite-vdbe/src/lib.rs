@@ -1187,6 +1187,11 @@ fn storage_root_usage_for_op(pc: usize, op: &VdbeOp) -> Option<StorageRootUsage>
 
 /// A finalized VDBE bytecode program ready for execution.
 #[derive(Debug, Clone, PartialEq)]
+// bd-5bq6u: the precomputed execution flags are genuinely independent booleans
+// (has_insert, requires_attached_memdb, requires_version_store,
+// preserves_rows_on_constraint). They are read on hot execution paths, so packing
+// them into a bitfield would trade clarity for nothing measurable.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VdbeProgram {
     /// The instruction sequence.
     ops: smallvec::SmallVec<[VdbeOp; 64]>,
