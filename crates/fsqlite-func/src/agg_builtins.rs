@@ -506,8 +506,8 @@ impl AggregateFunction for MedianFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            state.push(args[0].to_float());
+        if let Some(value) = percentile_input(&args[0], self.name())? {
+            state.push(value);
         }
         Ok(())
     }
@@ -516,9 +516,8 @@ impl AggregateFunction for MedianFunc {
         if state.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        state.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let result = percentile_cont_impl(&state, 0.5);
-        Ok(SqliteValue::Float(result))
+        state.sort_unstable_by(f64::total_cmp);
+        Ok(SqliteValue::Float(percentile_cont_impl(&state, 0.5)))
     }
 
     fn num_args(&self) -> i32 {
@@ -536,6 +535,8 @@ impl AggregateFunction for MedianFunc {
 
 pub struct PercentileState {
     values: Vec<f64>,
+    /// The first row's fraction, normalized to [0, 1] for all three functions.
+    /// NULL Y rows still establish and validate the fraction.
     p: Option<f64>,
 }
 
@@ -552,27 +553,11 @@ impl AggregateFunction for PercentileFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            state.values.push(args[0].to_float());
-        }
-        // Capture P from the second argument (constant expression).
-        if state.p.is_none() && args.len() > 1 && !args[1].is_null() {
-            state.p = Some(args[1].to_float());
-        }
-        Ok(())
+        percentile_step(state, args, 100.0, self.name())
     }
 
-    fn finalize(&self, mut state: Self::State) -> Result<SqliteValue> {
-        if state.values.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        let p = state.p.unwrap_or(50.0);
-        state
-            .values
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Convert P from 0-100 to 0-1 for the shared implementation.
-        let result = percentile_cont_impl(&state.values, p / 100.0);
-        Ok(SqliteValue::Float(result))
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        percentile_finalize(state, false)
     }
 
     fn num_args(&self) -> i32 {
@@ -601,25 +586,11 @@ impl AggregateFunction for PercentileContFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            state.values.push(args[0].to_float());
-        }
-        if state.p.is_none() && args.len() > 1 && !args[1].is_null() {
-            state.p = Some(args[1].to_float());
-        }
-        Ok(())
+        percentile_step(state, args, 1.0, self.name())
     }
 
-    fn finalize(&self, mut state: Self::State) -> Result<SqliteValue> {
-        if state.values.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        let p = state.p.unwrap_or(0.5);
-        state
-            .values
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let result = percentile_cont_impl(&state.values, p);
-        Ok(SqliteValue::Float(result))
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        percentile_finalize(state, false)
     }
 
     fn num_args(&self) -> i32 {
@@ -648,30 +619,11 @@ impl AggregateFunction for PercentileDiscFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            state.values.push(args[0].to_float());
-        }
-        if state.p.is_none() && args.len() > 1 && !args[1].is_null() {
-            state.p = Some(args[1].to_float());
-        }
-        Ok(())
+        percentile_step(state, args, 1.0, self.name())
     }
 
-    fn finalize(&self, mut state: Self::State) -> Result<SqliteValue> {
-        if state.values.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
-        let p = state.p.unwrap_or(0.5);
-        let p = if p.is_nan() { 0.5 } else { p.clamp(0.0, 1.0) };
-        state
-            .values
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Discrete: pick the value at the ceiling index.
-        let n = state.values.len();
-        let idx = ((p * n as f64).ceil() as usize)
-            .saturating_sub(1)
-            .min(n - 1);
-        Ok(SqliteValue::Float(state.values[idx]))
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        percentile_finalize(state, true)
     }
 
     fn num_args(&self) -> i32 {
@@ -683,23 +635,93 @@ impl AggregateFunction for PercentileDiscFunc {
     }
 }
 
-// ── Shared percentile helper ──────────────────────────────────────────────
+// ── Shared percentile helpers ─────────────────────────────────────────────
+
+/// Percentile data must have numeric storage class: unlike SUM, numeric text
+/// and blobs are not coerced. SQLite normalizes an input NaN to NULL.
+fn percentile_input(value: &SqliteValue, name: &str) -> Result<Option<f64>> {
+    match value {
+        SqliteValue::Null => Ok(None),
+        SqliteValue::Integer(value) => Ok(Some(*value as f64)),
+        SqliteValue::Float(value) if value.is_nan() => Ok(None),
+        SqliteValue::Float(value) if value.is_finite() => Ok(Some(*value)),
+        SqliteValue::Float(_) => Err(FrankenError::FunctionError(format!(
+            "Inf input to {name}()"
+        ))),
+        SqliteValue::Text(_) | SqliteValue::Blob(_) => Err(FrankenError::FunctionError(format!(
+            "input to {name}() is not numeric"
+        ))),
+    }
+}
+
+fn percentile_step(
+    state: &mut PercentileState,
+    args: &[SqliteValue],
+    scale: f64,
+    name: &str,
+) -> Result<()> {
+    // P follows SQLite's numeric-type conversion (which accepts fully numeric
+    // TEXT), not SUM's permissive prefix conversion or Y's storage-class rule.
+    let p = match args[1].apply_affinity('E') {
+        SqliteValue::Integer(value) => value as f64 / scale,
+        SqliteValue::Float(value) => value / scale,
+        SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => f64::NAN,
+    };
+    if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        return Err(FrankenError::FunctionError(format!(
+            "the fraction argument to {name}() is not between 0.0 and {scale:.1}"
+        )));
+    }
+    // SQLite compares normalized fractions against the FIRST row, including
+    // rows whose Y is NULL. Do not update the baseline and allow gradual drift.
+    if state.p.is_some_and(|first| (first - p).abs() > 0.001) {
+        return Err(FrankenError::FunctionError(format!(
+            "the fraction argument to {name}() is not the same for all input rows"
+        )));
+    }
+    let value = percentile_input(&args[0], name)?;
+    if state.p.is_none() {
+        state.p = Some(p);
+    }
+    if let Some(value) = value {
+        state.values.push(value);
+    }
+    Ok(())
+}
+
+fn percentile_finalize(mut state: PercentileState, discrete: bool) -> Result<SqliteValue> {
+    if state.values.is_empty() {
+        return Ok(SqliteValue::Null);
+    }
+    let p = state.p.ok_or_else(|| {
+        FrankenError::FunctionError("percentile fraction was not initialized".to_owned())
+    })?;
+    state.values.sort_unstable_by(f64::total_cmp);
+    let result = if discrete {
+        // SQLite takes the lower endpoint of the continuous rank, not the
+        // nearest-rank definition ceil(P*N)-1 used by some other databases.
+        let index = (p * (state.values.len() - 1) as f64).floor() as usize;
+        state.values[index]
+    } else {
+        percentile_cont_impl(&state.values, p)
+    };
+    Ok(SqliteValue::Float(result))
+}
 
 /// Continuous percentile with linear interpolation.
-/// `sorted` must be sorted ascending. `p` is in [0, 1].
+/// `sorted` must be nonempty and sorted ascending; `p` has been validated.
 fn percentile_cont_impl(sorted: &[f64], p: f64) -> f64 {
-    let n = sorted.len();
-    if n == 1 {
-        return sorted[0];
-    }
-    let p = if p.is_nan() { 0.5 } else { p.clamp(0.0, 1.0) };
-    let rank = p * (n - 1) as f64;
+    debug_assert!(!sorted.is_empty());
+    debug_assert!((0.0..=1.0).contains(&p));
+    let rank = p * (sorted.len() - 1) as f64;
     let lower = rank.floor() as usize;
     let upper = rank.ceil() as usize;
     if lower == upper {
         sorted[lower]
     } else {
         let frac = rank - lower as f64;
+        // Weighted endpoints avoid overflowing the difference between large
+        // finite values of opposite signs.
         sorted[lower] * (1.0 - frac) + sorted[upper] * frac
     }
 }
@@ -1446,6 +1468,252 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── percentile validation and SQLite rank semantics ───────────────
+
+    #[test]
+    fn test_percentile_invalid_fractions_error_even_for_null_data() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, maximum) in [
+            ("percentile", 100.0),
+            ("percentile_cont", 1.0),
+            ("percentile_disc", 1.0),
+        ] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            for p in [
+                null(),
+                text("not numeric"),
+                text("0.5xyz"),
+                text(""),
+                SqliteValue::Blob(vec![b'0'].into()),
+                float(f64::NAN),
+                float(f64::INFINITY),
+                float(f64::NEG_INFINITY),
+                float(-1.0),
+                float(maximum + 1.0),
+            ] {
+                for y in [null(), int(10)] {
+                    let mut state = aggregate.initial_state();
+                    let error = aggregate.step(&mut state, &[y, p.clone()]).unwrap_err();
+                    assert!(matches!(error, FrankenError::FunctionError(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_percentile_numeric_text_fraction_is_not_numeric_text_data() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, fraction) in [
+            ("percentile", " \t5e1\r\n"),
+            ("percentile_cont", " \t.5\r\n"),
+            ("percentile_disc", " \t.5\r\n"),
+        ] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            let mut state = aggregate.initial_state();
+            for value in [10, 20, 30] {
+                aggregate
+                    .step(&mut state, &[int(value), text(fraction)])
+                    .unwrap();
+            }
+            assert_eq!(aggregate.finalize(state).unwrap(), float(20.0));
+            let mut state = aggregate.initial_state();
+            assert!(
+                aggregate
+                    .step(&mut state, &[text("10"), text(fraction)])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_median_and_percentiles_reject_non_numeric_and_infinite_data() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, arity) in [
+            ("median", 1),
+            ("percentile", 2),
+            ("percentile_cont", 2),
+            ("percentile_disc", 2),
+        ] {
+            let aggregate = registry.find_aggregate(name, arity).unwrap();
+            for value in [
+                text("12"),
+                text("invalid"),
+                SqliteValue::Blob(vec![b'1', b'2'].into()),
+                float(f64::INFINITY),
+                float(f64::NEG_INFINITY),
+            ] {
+                let mut state = aggregate.initial_state();
+                let args = if arity == 1 {
+                    vec![value]
+                } else {
+                    vec![value, float(0.5)]
+                };
+                let error = aggregate.step(&mut state, &args).unwrap_err();
+                assert!(matches!(error, FrankenError::FunctionError(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_percentile_fraction_is_checked_on_null_rows() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, scale) in [
+            ("percentile", 100.0),
+            ("percentile_cont", 1.0),
+            ("percentile_disc", 1.0),
+        ] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            for (first, second) in [(null(), int(10)), (int(10), null())] {
+                let mut state = aggregate.initial_state();
+                aggregate
+                    .step(&mut state, &[first, float(0.5 * scale)])
+                    .unwrap();
+                assert!(
+                    aggregate
+                        .step(&mut state, &[second, float(0.6 * scale)])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_percentile_fraction_tolerance_is_normalized_and_does_not_drift() {
+        for (name, scale) in [
+            ("percentile", 100.0),
+            ("percentile_cont", 1.0),
+            ("percentile_disc", 1.0),
+        ] {
+            let mut state = PercentileState {
+                values: Vec::new(),
+                p: None,
+            };
+            percentile_step(&mut state, &[null(), float(0.5 * scale)], scale, name).unwrap();
+            percentile_step(
+                &mut state,
+                &[int(10), float(0.50075 * scale)],
+                scale,
+                name,
+            )
+            .unwrap();
+            assert!(
+                percentile_step(
+                    &mut state,
+                    &[int(20), float(0.5015 * scale)],
+                    scale,
+                    name,
+                )
+                .is_err()
+            );
+            assert_eq!(state.p, Some(0.5));
+            assert_eq!(state.values, vec![10.0]);
+        }
+    }
+
+    #[test]
+    fn test_percentile_disc_uses_lower_continuous_rank() {
+        for (p, expected) in [
+            (0.0, 10.0),
+            (0.26, 10.0),
+            (0.5, 20.0),
+            (0.75, 30.0),
+            (0.99, 30.0),
+            (1.0, 40.0),
+        ] {
+            let rows: Vec<_> = [40, 10, 30, 20]
+                .into_iter()
+                .map(|y| (int(y), float(p)))
+                .collect();
+            assert_eq!(run_agg2(&PercentileDiscFunc, &rows), float(expected));
+        }
+        let rows = [(int(10), float(0.99)), (int(20), float(0.99))];
+        assert_eq!(run_agg2(&PercentileDiscFunc, &rows), float(10.0));
+    }
+
+    #[test]
+    fn test_percentile_cont_interpolation_and_percent_scale_agree() {
+        for (p, expected) in [(0.0, 10.0), (0.25, 17.5), (0.5, 25.0), (1.0, 40.0)] {
+            let rows: Vec<_> = [40, 10, 30, 20]
+                .into_iter()
+                .map(|y| (int(y), float(p)))
+                .collect();
+            assert_eq!(run_agg2(&PercentileContFunc, &rows), float(expected));
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(y, _)| (y, float(p * 100.0)))
+                .collect();
+            assert_eq!(run_agg2(&PercentileFunc, &rows), float(expected));
+        }
+    }
+
+    #[test]
+    fn test_percentile_empty_singleton_and_nan_data() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, arity) in [
+            ("median", 1),
+            ("percentile", 2),
+            ("percentile_cont", 2),
+            ("percentile_disc", 2),
+        ] {
+            let aggregate = registry.find_aggregate(name, arity).unwrap();
+            assert_eq!(aggregate.finalize(aggregate.initial_state()).unwrap(), null());
+            let mut state = aggregate.initial_state();
+            for value in [null(), float(f64::NAN)] {
+                let args = if arity == 1 {
+                    vec![value]
+                } else {
+                    vec![value, float(0.5)]
+                };
+                aggregate.step(&mut state, &args).unwrap();
+            }
+            assert_eq!(aggregate.finalize(state).unwrap(), null());
+            let mut state = aggregate.initial_state();
+            for value in [null(), float(f64::NAN), int(7)] {
+                let args = if arity == 1 {
+                    vec![value]
+                } else {
+                    vec![value, float(0.5)]
+                };
+                aggregate.step(&mut state, &args).unwrap();
+            }
+            assert_eq!(aggregate.finalize(state).unwrap(), float(7.0));
+        }
+    }
+
+    #[test]
+    fn test_median_finite_extreme_values_do_not_overflow_interpolation() {
+        let rows = [float(-f64::MAX), float(f64::MAX)];
+        assert_eq!(run_agg(&MedianFunc, &rows), float(0.0));
+        let rows = [
+            (float(-f64::MAX), float(0.5)),
+            (float(f64::MAX), float(0.5)),
+        ];
+        assert_eq!(run_agg2(&PercentileContFunc, &rows), float(0.0));
+    }
+
+    #[test]
+    fn test_percentile_rejected_row_does_not_change_state() {
+        let mut state = PercentileContFunc.initial_state();
+        assert!(
+            PercentileContFunc
+                .step(&mut state, &[text("invalid"), float(0.25)])
+                .is_err()
+        );
+        assert_eq!(state.p, None);
+        assert!(state.values.is_empty());
+        PercentileContFunc
+            .step(&mut state, &[int(10), float(0.5)])
+            .unwrap();
+        assert!(PercentileContFunc.step(&mut state, &[int(20), null()]).is_err());
+        assert_eq!(state.p, Some(0.5));
+        assert_eq!(state.values, vec![10.0]);
     }
 
     // ── string_agg (alias) ────────────────────────────────────────────
