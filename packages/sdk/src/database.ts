@@ -101,21 +101,26 @@ export class FrankenDB {
   readonly #path: string;
   readonly #persistence: PersistenceMode;
   readonly #preparedStatementLimits: Readonly<PreparedStatementLimits> | null;
+  readonly #checkpointRecoverySupported: boolean;
   #snapshotRevision: string | null;
   #snapshotReceiptFailure: FrankenSQLiteError | null = null;
+  #checkpointCandidate: { publicationId: string; parentRevision: string | null } | null = null;
+  #checkpointInFlight = 0;
+  #checkpointRecoveryPromise: Promise<SnapshotMetadata> | null = null;
   #transactionScope: TransactionScope | null = null;
   #transactionFailure: Error | null = null;
   #nextTransactionId = 1n;
   #retryOwner: object | null = null;
 
   private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null,
-    preparedStatementLimits: Readonly<PreparedStatementLimits> | null) {
+    preparedStatementLimits: Readonly<PreparedStatementLimits> | null, checkpointRecoverySupported: boolean) {
     this.#client = client;
     databaseClients.set(this, client);
     this.#path = path;
     this.#persistence = persistence;
     this.#snapshotRevision = snapshotRevision;
     this.#preparedStatementLimits = preparedStatementLimits;
+    this.#checkpointRecoverySupported = checkpointRecoverySupported;
   }
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
@@ -159,7 +164,11 @@ export class FrankenDB {
         throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", message: "Invalid worker prepared-statement policy" });
       }
       const effectiveStatements = captureStatementPolicy(policy?.value, statementLimits);
-      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null, effectiveStatements);
+      const recovery = snapshotDataField(ready, "checkpointRecovery", false);
+      if (recovery !== undefined && (recovery !== 1 || ready.persistence !== "indexeddb-snapshot")) {
+        throw snapshotReceiptFailure(new TypeError("Invalid checkpoint recovery capability"));
+      }
+      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null, effectiveStatements, recovery === 1);
     } catch (error: unknown) {
       try {
         client.dispose();
@@ -306,33 +315,105 @@ export class FrankenDB {
   checkpoint(): Promise<SnapshotMetadata> {
     return this.#run(null, async () => {
       if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
-      let response: unknown;
-      try { response = await this.#client.checkpoint(); }
-      catch (cause: unknown) {
-        // The transport can reject a correlated malformed response before it
-        // reaches metadata capture. That is not a recoverable quota/CAS error.
-        if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
+      if (this.#checkpointRecoveryPromise !== null) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
+          message: "Await checkpoint recovery before publishing another image", transient: false });
+      }
+      const publicationId = this.#checkpointRecoverySupported ? crypto.randomUUID() : undefined;
+      const remember = (): void => {
+        if (publicationId !== undefined && this.#snapshotReceiptFailure === null) {
+          // Capture the last ACKNOWLEDGED parent, not a guessed dispatch-time
+          // parent. Concurrent FIFO publications may extend earlier receipts.
+          this.#checkpointCandidate = { publicationId, parentRevision: this.#snapshotRevision };
+        }
+      };
+      this.#checkpointInFlight++;
+      try {
+        let response: unknown;
+        try { response = await this.#client.checkpoint(publicationId); }
+        catch (cause: unknown) {
+          remember();
+          if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
+            this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+            throw this.#snapshotReceiptFailure;
+          }
+          throw cause;
+        }
+        // Another in-flight response may already have lost lineage. Never
+        // erase that uncertainty using a later acknowledgement alone.
+        if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
+        try {
+          const saved = captureSnapshotReceipt(response);
+          if (saved.parentRevision !== this.#snapshotRevision ||
+              (publicationId !== undefined && saved.revision !== publicationId)) {
+            throw new TypeError("Snapshot acknowledgement does not match its publication and acknowledged parent");
+          }
+          this.#snapshotRevision = saved.revision;
+          this.#checkpointCandidate = null;
+          return saved;
+        } catch (cause: unknown) {
+          remember();
           this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
           throw this.#snapshotReceiptFailure;
         }
-        throw cause;
+      } finally {
+        this.#checkpointInFlight--;
       }
-      // A different in-flight acknowledgement may already have lost lineage.
-      // A late response cannot erase that uncertainty or regress the revision.
-      if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
-      try {
-        const saved = captureSnapshotReceipt(response);
-        // Compare at acceptance, not dispatch: normal FIFO checkpoints may be
-        // queued together and form a chain as each response is acknowledged.
-        if (saved.parentRevision !== this.#snapshotRevision) {
-          throw new TypeError("Snapshot acknowledgement does not extend the last acknowledged revision");
+    });
+  }
+
+  /** Whether this worker can confirm publication by identity without writing. */
+  get checkpointRecoverySupported(): boolean { return this.#checkpointRecoverySupported; }
+
+  /**
+   * Reconcile one failed checkpoint acknowledgement against stored bytes.
+   * This does NOT save later memory writes or rerun the committed transaction.
+   * A missing/replaced/corrupt head remains uncertain and leaves fences intact.
+   */
+  recoverCheckpoint(): Promise<SnapshotMetadata> {
+    return this.#run(null, () => {
+      if (!this.#checkpointRecoverySupported) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_UNAVAILABLE",
+          message: "This worker cannot confirm checkpoint publications; reopen and reconcile", transient: false });
+      }
+      if (this.#checkpointRecoveryPromise !== null) return this.#checkpointRecoveryPromise;
+      if (this.#checkpointInFlight !== 0) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
+          message: "Await outstanding checkpoint results before recovery", transient: false });
+      }
+      const candidate = this.#checkpointCandidate;
+      if (candidate === null) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_EMPTY",
+          message: "There is no failed checkpoint publication to confirm", transient: false });
+      }
+      // Publish the shared promise BEFORE dispatch, including for reentrant
+      // custom transports. Recovery attempts retain just one bounded identity.
+      this.#checkpointRecoveryPromise = Promise.resolve().then(async () => {
+        let response: unknown;
+        try { response = await this.#client.recoverCheckpoint(candidate.publicationId, candidate.parentRevision); }
+        catch (cause: unknown) {
+          if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
+            this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+            throw this.#snapshotReceiptFailure;
+          }
+          throw cause;
         }
-        this.#snapshotRevision = saved.revision;
-        return saved;
-      } catch (cause: unknown) {
-        this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
-        throw this.#snapshotReceiptFailure;
-      }
+        try {
+          const saved = captureSnapshotReceipt(response);
+          if (this.#checkpointCandidate !== candidate || this.#snapshotRevision !== candidate.parentRevision ||
+              saved.revision !== candidate.publicationId || saved.parentRevision !== candidate.parentRevision) {
+            throw new TypeError("Recovery receipt does not confirm the pending publication and its parent");
+          }
+          this.#snapshotRevision = saved.revision;
+          this.#checkpointCandidate = null;
+          this.#snapshotReceiptFailure = null;
+          return saved;
+        } catch (cause: unknown) {
+          this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+          throw this.#snapshotReceiptFailure;
+        }
+      }).finally(() => { this.#checkpointRecoveryPromise = null; });
+      return this.#checkpointRecoveryPromise;
     });
   }
 

@@ -49,6 +49,8 @@ export interface InitConfig {
 export interface InitResult {
   path: string;
   persistence: PersistenceMode;
+  /** Version 1 supports client publication identities and read-only recovery. */
+  checkpointRecovery?: 1;
   /** Last explicit checkpoint; absent for non-snapshot modes. */
   snapshot?: SnapshotMetadata | null;
   /** Absent on older workers, which only return structured-clone query results. */
@@ -183,6 +185,14 @@ export interface CloseRequest extends WorkerRequestBase {
 
 export interface CheckpointRequest extends WorkerRequestBase {
   kind: "checkpoint";
+  /** UUID-v4 selected before dispatch, retained across a lost acknowledgement. */
+  publicationId?: string;
+}
+
+export interface CheckpointRecoverRequest extends WorkerRequestBase {
+  kind: "checkpoint-recover";
+  publicationId: string;
+  parentRevision: string | null;
 }
 
 export type WorkerRequest =
@@ -201,6 +211,7 @@ export type WorkerRequest =
   | StatementFinalizeRequest
   | ExportRequest
   | CheckpointRequest
+  | CheckpointRecoverRequest
   | CloseRequest;
 
 export interface ReadyResponse extends WorkerResponseBase {

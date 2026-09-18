@@ -43,7 +43,7 @@ export class FrankenCheckpointCommitError<T = unknown> extends Error {
     readonly previousRevision: string | null,
     cause: unknown,
   ) {
-    super("SQL committed, but its checkpoint was not acknowledged. Retry checkpoint(), not the transaction callback; export before closing if recovery is impossible.", { cause });
+    super("SQL committed, but its checkpoint was not acknowledged. Confirm with recoverCheckpoint(), or retry checkpoint() for a known publication failure; never replay the callback. Export before closing if recovery is impossible.", { cause });
     this.name = "FrankenCheckpointCommitError";
   }
 }
@@ -197,6 +197,7 @@ export class FrankenDBQueue {
   get persistence() { return this.#db.persistence; }
   get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
   get checkpointOnCommit(): boolean { return this.#checkpointOnCommit; }
+  get checkpointRecoverySupported(): boolean { return this.#db.checkpointRecoverySupported; }
   /** Local watched-write sequence, not a native commit sequence or saved revision. */
   get changeSequence(): bigint { return this.#changeSequence; }
 
@@ -392,6 +393,18 @@ export class FrankenDBQueue {
     return this.#enqueue(operation, options, operation);
   }
 
+  /** Read-only confirmation of a failed publication; never replay a SQL job. */
+  recoverCheckpoint(options?: QueuedJobOptions): Promise<SnapshotMetadata> {
+    const operation = async () => {
+      const saved = await this.#db.recoverCheckpoint();
+      // The database clears receipt uncertainty only after exact readback.
+      // No dirty-bit maintenance, callback, export or duplicate notification.
+      this.#checkpointFailure = null;
+      return saved;
+    };
+    return this.#enqueue(operation, options, operation, false, "skip");
+  }
+
   /** Stop admission, drain accepted jobs, then close. Idempotent shared promise. */
   close(): Promise<void> {
     if (this.#closePromise !== null) return this.#closePromise;
@@ -430,6 +443,7 @@ export class FrankenDBQueue {
     options: QueuedJobOptions | undefined,
     callback: unknown,
     requiresPublished = false,
+    maintenance: "reconcile" | "skip" = "reconcile",
   ): Promise<T> {
     let signal: AbortSignal | undefined;
     let waitTimeoutMs: number | undefined;
@@ -468,7 +482,7 @@ export class FrankenDBQueue {
             // Jobs accepted before a publication failure are fenced too. Do
             // not execute even journal-maintenance SQL before this check.
             if (requiresPublished) this.#assertCheckpointReady();
-            result = (this.#checkpointFailure === null ? this.#reconcileSubscriptions() : Promise.resolve())
+            result = (maintenance === "reconcile" && this.#checkpointFailure === null ? this.#reconcileSubscriptions() : Promise.resolve())
               .then(() => operation(signal));
           }
           catch (error: unknown) { result = Promise.reject(error); }
