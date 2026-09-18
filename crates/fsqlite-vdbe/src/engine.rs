@@ -31643,7 +31643,10 @@ mod tests {
                     SqliteValue::Text("é水".repeat(80).into()),
                     SqliteValue::Integer(3),
                 ],
-                vec![SqliteValue::Text("水é".repeat(80).into()), SqliteValue::Null],
+                vec![
+                    SqliteValue::Text("水é".repeat(80).into()),
+                    SqliteValue::Null,
+                ],
                 vec![SqliteValue::Blob(Arc::from(vec![0_u8, 255]))],
                 vec![SqliteValue::Null, SqliteValue::Float(2.5)],
                 Vec::new(),
