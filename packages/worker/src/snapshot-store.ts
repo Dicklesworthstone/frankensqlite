@@ -113,17 +113,20 @@ export class IndexedDbSnapshotStore {
    * so origin eviction/recreation cannot cause a stale-writer ABA match.
    * Completion means IDBTransaction.complete, never merely put().success.
    */
-  async save(bytes: Uint8Array, expectedRevision: string | null): Promise<SnapshotMetadata> {
+  async save(bytes: Uint8Array, expectedRevision: string | null, publicationId?: string): Promise<SnapshotMetadata> {
     this.#assertOpen();
     if (expectedRevision !== null && !validRevision(expectedRevision)) {
       throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Invalid expected snapshot revision");
+    }
+    if (publicationId !== undefined && (!validRevision(publicationId) || publicationId === expectedRevision)) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Invalid checkpoint publication identity");
     }
     validateSnapshotBytes(bytes);
     // Own an exact-size copy before yielding. Do not detach the caller's data,
     // persist a view's unrelated backing bytes, or race caller buffer mutation.
     const owned = new Uint8Array(bytes);
     const record: SnapshotRecord = {
-      format: FORMAT, name: this.#name, revision: crypto.randomUUID(), parentRevision: expectedRevision,
+      format: FORMAT, name: this.#name, revision: publicationId ?? crypto.randomUUID(), parentRevision: expectedRevision,
       byteLength: owned.byteLength, sha256: await checksum(owned), bytes: owned.buffer,
     };
     this.#assertOpen();
@@ -157,6 +160,25 @@ export class IndexedDbSnapshotStore {
       };
     });
     return metadata(record);
+  }
+
+  /**
+   * Reconstruct a lost receipt by reading and hashing authoritative storage.
+   * Never exports SQL, republishes bytes, or changes the stored head. Failure
+   * does NOT prove this publication never happened: it may have been replaced.
+   */
+  async confirmPublication(revision: string, parentRevision: string | null): Promise<SnapshotMetadata> {
+    if (!validRevision(revision) || (parentRevision !== null && !validRevision(parentRevision)) ||
+        revision === parentRevision) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Invalid checkpoint recovery identity");
+    }
+    const saved = await this.load();
+    if (saved === null || saved.revision !== revision || saved.parentRevision !== parentRevision) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED",
+        "The stored checkpoint does not confirm this publication. Export and reconcile; never replay committed SQL.");
+    }
+    return Object.freeze({ revision: saved.revision, parentRevision: saved.parentRevision,
+      byteLength: saved.byteLength, sha256: saved.sha256 });
   }
 
   /** Closes admission; already-started IDB transactions finish normally. */
