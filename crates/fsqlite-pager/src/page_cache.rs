@@ -636,7 +636,24 @@ impl S3FifoEvictionTracker {
         if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
             return;
         }
-        self.access_trace.retain(|candidate| *candidate != page_no);
+        let Some(mut write) = self
+            .access_trace
+            .iter()
+            .position(|candidate| *candidate == page_no)
+        else {
+            return;
+        };
+        // PageNumber is Copy: fill each hole directly rather than swapping a
+        // discarded entry through the entire remaining history. Preserve the
+        // exact retained order, including when the deque wraps around.
+        for read in write + 1..self.access_trace.len() {
+            let candidate = self.access_trace[read];
+            if candidate != page_no {
+                self.access_trace[write] = candidate;
+                write += 1;
+            }
+        }
+        self.access_trace.truncate(write);
     }
 
     fn clear_history(&mut self) {
@@ -7721,6 +7738,53 @@ mod tests {
         assert!(!cache.contains(overflow_page));
         drop(reclaimed);
         assert_eq!(cache.pool().available(), 1);
+    }
+
+    #[test]
+    fn test_s3_fifo_forget_preserves_wrapped_history_and_duplicates() {
+        let pages: Vec<_> = (1..=5).map(|n| PageNumber::new(n).unwrap()).collect();
+        let mut wrapped_cases = 0;
+        for len in 0..=32 {
+            for rotation in 0..64 {
+                for forgotten in &pages {
+                    let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(8));
+                    let capacity = tracker.access_trace.capacity();
+                    // Move the deque head before populating it, exercising both
+                    // contiguous and split physical layouts with the same oracle.
+                    tracker.access_trace.extend((0..capacity).map(|_| pages[0]));
+                    for _ in 0..rotation {
+                        tracker.access_trace.pop_front();
+                        tracker.access_trace.push_back(pages[0]);
+                    }
+                    tracker.access_trace.truncate(len);
+                    for (i, page) in tracker.access_trace.iter_mut().enumerate() {
+                        *page = pages[i % 4];
+                    }
+                    wrapped_cases += usize::from(!tracker.access_trace.as_slices().1.is_empty());
+                    let expected: Vec<_> = tracker
+                        .access_trace
+                        .iter()
+                        .copied()
+                        .filter(|page| page != forgotten)
+                        .collect();
+                    tracker.forget(*forgotten);
+                    assert_eq!(
+                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(tracker.access_trace.capacity(), capacity);
+                    tracker.forget(*forgotten);
+                    assert_eq!(
+                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+            }
+        }
+        assert!(
+            wrapped_cases > 0,
+            "the regression must exercise split deque storage"
+        );
     }
 
     #[test]
