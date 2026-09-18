@@ -662,7 +662,10 @@ fn percentile_step(
 ) -> Result<()> {
     // P follows SQLite's numeric-type conversion (which accepts fully numeric
     // TEXT), not SUM's permissive prefix conversion or Y's storage-class rule.
-    let p = match args[1].apply_affinity('E') {
+    let p = match args[1]
+        .clone()
+        .apply_affinity(fsqlite_types::TypeAffinity::Numeric)
+    {
         SqliteValue::Integer(value) => value as f64 / scale,
         SqliteValue::Float(value) => value / scale,
         SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => f64::NAN,
@@ -1714,6 +1717,40 @@ mod tests {
         assert!(PercentileContFunc.step(&mut state, &[int(20), null()]).is_err());
         assert_eq!(state.p, Some(0.5));
         assert_eq!(state.values, vec![10.0]);
+    }
+
+    #[test]
+    fn test_percentile_typed_affinity_keeps_group_fractions_independent() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for (name, scale) in [
+            ("percentile", 100.0),
+            ("percentile_cont", 1.0),
+            ("percentile_disc", 1.0),
+        ] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            let mut first = aggregate.initial_state();
+            let mut second = aggregate.initial_state();
+            let first_p = text(&(0.25 * scale).to_string());
+            let second_p = text(&(0.75 * scale).to_string());
+            for (a, b) in [(10, 100), (20, 200)] {
+                aggregate
+                    .step(&mut first, &[int(a), first_p.clone()])
+                    .unwrap();
+                aggregate
+                    .step(&mut second, &[int(b), second_p.clone()])
+                    .unwrap();
+            }
+            assert!(matches!(first_p, SqliteValue::Text(_)));
+            assert!(matches!(second_p, SqliteValue::Text(_)));
+            let (expected_first, expected_second) = if name == "percentile_disc" {
+                (10.0, 100.0)
+            } else {
+                (12.5, 175.0)
+            };
+            assert_eq!(aggregate.finalize(first).unwrap(), float(expected_first));
+            assert_eq!(aggregate.finalize(second).unwrap(), float(expected_second));
+        }
     }
 
     // ── string_agg (alias) ────────────────────────────────────────────
