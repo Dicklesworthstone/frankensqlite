@@ -36,6 +36,14 @@ use crate::{AggregateFunction, FunctionRegistry};
 fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
     let s = *sum;
     let t = s + value;
+    // Compensation is only meaningful for finite arithmetic. In particular,
+    // inf - inf in the error term must not turn a valid infinite sum into NaN.
+    // Opposite infinities still produce NaN, normalized to SQL NULL at output.
+    if !t.is_finite() {
+        *sum = t;
+        *compensation = 0.0;
+        return;
+    }
     if s.abs() > value.abs() {
         *compensation += (s - t) + value;
     } else {
@@ -44,13 +52,42 @@ fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
     *sum = t;
 }
 
+/// Preserve the low bits of an i64 when entering floating-point accumulation.
+/// Removing 14 low bits leaves at most 49 significant bits, exactly representable
+/// in f64. Subtracting the signed remainder is safe even for i64::MIN/MAX.
+#[inline]
+fn split_sum_integer(value: i64) -> (f64, f64) {
+    if (-4_503_599_627_370_496..4_503_599_627_370_496).contains(&value) {
+        (value as f64, 0.0)
+    } else {
+        let low = value % 16_384;
+        ((value - low) as f64, low as f64)
+    }
+}
+
+#[inline]
+fn kahan_add_integer(sum: &mut f64, compensation: &mut f64, value: i64) {
+    let (high, low) = split_sum_integer(value);
+    kahan_add(sum, compensation, high);
+    if low != 0.0 {
+        kahan_add(sum, compensation, low);
+    }
+}
+
+fn aggregate_float(value: f64) -> SqliteValue {
+    if value.is_nan() {
+        SqliteValue::Null
+    } else {
+        SqliteValue::Float(value)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // avg(X)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct AvgState {
-    sum: f64,
-    compensation: f64,
+    sum: SumState,
     count: i64,
 }
 
@@ -61,15 +98,13 @@ impl AggregateFunction for AvgFunc {
 
     fn initial_state(&self) -> Self::State {
         AvgState {
-            sum: 0.0,
-            compensation: 0.0,
+            sum: SumFunc.initial_state(),
             count: 0,
         }
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            kahan_add(&mut state.sum, &mut state.compensation, args[0].to_float());
+        if state.sum.add_value(&args[0]) {
             state.count += 1;
         }
         Ok(())
@@ -79,9 +114,7 @@ impl AggregateFunction for AvgFunc {
         if state.count == 0 {
             Ok(SqliteValue::Null)
         } else {
-            Ok(SqliteValue::Float(
-                (state.sum + state.compensation) / state.count as f64,
-            ))
+            Ok(aggregate_float(state.sum.real_total() / state.count as f64))
         }
     }
 
@@ -332,6 +365,50 @@ pub struct SumState {
     overflowed: bool,
 }
 
+impl SumState {
+    /// Return whether a non-NULL input was accumulated. SUM, TOTAL and AVG
+    /// share both numeric coercion and the exact-integer prefix; AVG alone
+    /// counts inputs, and SUM alone reports an all-integer overflow.
+    fn add_value(&mut self, value: &SqliteValue) -> bool {
+        let value = value.to_sum_numeric_value();
+        if value.is_null() || matches!(value, SqliteValue::Float(v) if v.is_nan()) {
+            return false;
+        }
+        self.has_values = true;
+        let exact = self.all_integer && !self.overflowed;
+        match value {
+            SqliteValue::Integer(value) => {
+                if exact {
+                    if let Some(total) = self.int_sum.checked_add(value) {
+                        self.int_sum = total;
+                        return true;
+                    }
+                    (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
+                    self.overflowed = true;
+                }
+                kahan_add_integer(&mut self.float_sum, &mut self.float_compensation, value);
+            }
+            SqliteValue::Float(value) => {
+                if exact {
+                    (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
+                }
+                self.all_integer = false;
+                kahan_add(&mut self.float_sum, &mut self.float_compensation, value);
+            }
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
+        }
+        true
+    }
+
+    fn real_total(&self) -> f64 {
+        if self.all_integer && !self.overflowed {
+            self.int_sum as f64
+        } else {
+            self.float_sum + self.float_compensation
+        }
+    }
+}
+
 pub struct SumFunc;
 
 impl AggregateFunction for SumFunc {
@@ -349,31 +426,7 @@ impl AggregateFunction for SumFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        let value = args[0].to_sum_numeric_value();
-        if value.is_null() {
-            return Ok(());
-        }
-        state.has_values = true;
-        match value {
-            SqliteValue::Integer(i) => {
-                if state.all_integer && !state.overflowed {
-                    match state.int_sum.checked_add(i) {
-                        Some(s) => state.int_sum = s,
-                        None => state.overflowed = true,
-                    }
-                }
-                kahan_add(
-                    &mut state.float_sum,
-                    &mut state.float_compensation,
-                    i as f64,
-                );
-            }
-            SqliteValue::Float(f) => {
-                state.all_integer = false;
-                kahan_add(&mut state.float_sum, &mut state.float_compensation, f);
-            }
-            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
-        }
+        state.add_value(&args[0]);
         Ok(())
     }
 
@@ -387,9 +440,7 @@ impl AggregateFunction for SumFunc {
         if state.all_integer {
             Ok(SqliteValue::Integer(state.int_sum))
         } else {
-            Ok(SqliteValue::Float(
-                state.float_sum + state.float_compensation,
-            ))
+            Ok(aggregate_float(state.real_total()))
         }
     }
 
@@ -408,10 +459,10 @@ impl AggregateFunction for SumFunc {
 
 pub struct TotalFunc;
 
-/// State for `total()`: Kahan compensated accumulator.
+/// State for `total()`: the shared exact/compensated accumulator without SUM's
+/// integer-overflow error at finalization.
 pub struct TotalState {
-    sum: f64,
-    compensation: f64,
+    sum: SumState,
 }
 
 impl AggregateFunction for TotalFunc {
@@ -419,20 +470,17 @@ impl AggregateFunction for TotalFunc {
 
     fn initial_state(&self) -> Self::State {
         TotalState {
-            sum: 0.0,
-            compensation: 0.0,
+            sum: SumFunc.initial_state(),
         }
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if !args[0].is_null() {
-            kahan_add(&mut state.sum, &mut state.compensation, args[0].to_float());
-        }
+        state.sum.add_value(&args[0]);
         Ok(())
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        Ok(SqliteValue::Float(state.sum + state.compensation))
+        Ok(aggregate_float(state.sum.real_total()))
     }
 
     fn num_args(&self) -> i32 {
@@ -1091,6 +1139,177 @@ mod tests {
         // total uses f64 and never overflows.
         let r = run_agg(&TotalFunc, &[int(i64::MAX), int(i64::MAX)]);
         assert!(matches!(r, SqliteValue::Float(_)));
+    }
+
+    // ── shared numeric accumulation ──────────────────────────────────
+
+    #[test]
+    fn test_numeric_aggregates_preserve_large_integer_cancellation() {
+        // SQLite 3.46.1 oracle: converting each input to f64 first loses the
+        // unit difference, even though the exact integer prefix fits in i64.
+        for rows in [
+            vec![int(i64::MAX), int(i64::MIN), float(0.0)],
+            vec![float(0.0), int(i64::MAX), int(i64::MIN)],
+            vec![int(i64::MAX), float(0.0), int(i64::MIN)],
+            vec![
+                text("9223372036854775807"),
+                text("-9223372036854775808"),
+                float(0.0),
+            ],
+        ] {
+            assert_eq!(run_agg(&SumFunc, &rows), float(-1.0));
+            assert_eq!(run_agg(&TotalFunc, &rows), float(-1.0));
+            assert_eq!(run_agg(&AvgFunc, &rows), float(-1.0 / 3.0));
+        }
+        let rows = [
+            int(9_007_199_254_740_993),
+            int(-9_007_199_254_740_992),
+            float(0.0),
+        ];
+        assert_eq!(run_agg(&SumFunc, &rows), float(1.0));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(1.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(1.0 / 3.0));
+    }
+
+    #[test]
+    fn test_total_and_avg_keep_exact_integer_prefix() {
+        let rows = [int(i64::MAX), int(i64::MIN)];
+        assert_eq!(run_agg(&SumFunc, &rows), int(-1));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(-1.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(-0.5));
+    }
+
+    #[test]
+    fn test_numeric_aggregates_recover_low_bits_after_integer_overflow() {
+        for (rows, expected) in [
+            (
+                vec![int(i64::MAX), int(1), int(i64::MIN), float(0.5)],
+                0.5,
+            ),
+            (
+                vec![int(i64::MIN), int(-1), int(i64::MAX), float(0.5)],
+                -1.5,
+            ),
+        ] {
+            assert_eq!(run_agg(&SumFunc, &rows), float(expected));
+            assert_eq!(run_agg(&TotalFunc, &rows), float(expected));
+            assert_eq!(run_agg(&AvgFunc, &rows), float(expected / 4.0));
+        }
+    }
+
+    #[test]
+    fn test_all_integer_overflow_remains_an_error_after_cancellation() {
+        let rows = [int(i64::MAX), int(1), int(i64::MIN)];
+        let mut state = SumFunc.initial_state();
+        for row in &rows {
+            SumFunc.step(&mut state, std::slice::from_ref(row)).unwrap();
+        }
+        assert!(matches!(
+            SumFunc.finalize(state),
+            Err(FrankenError::IntegerOverflow)
+        ));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(0.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(0.0));
+    }
+
+    #[test]
+    fn test_numeric_aggregates_preserve_signed_infinities() {
+        for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
+            for rows in [
+                vec![float(infinity)],
+                vec![float(infinity), float(infinity)],
+                vec![int(1), float(infinity), int(-1)],
+            ] {
+                assert_eq!(run_agg(&SumFunc, &rows), float(infinity));
+                assert_eq!(run_agg(&TotalFunc, &rows), float(infinity));
+                assert_eq!(run_agg(&AvgFunc, &rows), float(infinity));
+            }
+        }
+    }
+
+    #[test]
+    fn test_indeterminate_numeric_aggregates_return_null_not_nan() {
+        for rows in [
+            vec![float(f64::INFINITY), float(f64::NEG_INFINITY)],
+            vec![
+                int(1),
+                float(f64::NEG_INFINITY),
+                int(2),
+                float(f64::INFINITY),
+                int(3),
+            ],
+        ] {
+            assert_eq!(run_agg(&SumFunc, &rows), null());
+            assert_eq!(run_agg(&TotalFunc, &rows), null());
+            assert_eq!(run_agg(&AvgFunc, &rows), null());
+        }
+    }
+
+    #[test]
+    fn test_finite_numeric_overflow_preserves_infinity() {
+        for sign in [1.0, -1.0] {
+            let rows = [
+                float(sign * 1e308),
+                float(sign * 1e308),
+                float(-sign * 1e308),
+            ];
+            let expected = float(sign * f64::INFINITY);
+            assert_eq!(run_agg(&SumFunc, &rows), expected);
+            assert_eq!(run_agg(&TotalFunc, &rows), expected);
+            assert_eq!(run_agg(&AvgFunc, &rows), expected);
+        }
+    }
+
+    #[test]
+    fn test_nan_inputs_have_null_numeric_aggregate_semantics() {
+        let rows = [float(f64::NAN), null()];
+        assert_eq!(run_agg(&SumFunc, &rows), null());
+        assert_eq!(run_agg(&TotalFunc, &rows), float(0.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), null());
+        let rows = [float(f64::NAN), int(2), null(), int(4)];
+        assert_eq!(run_agg(&SumFunc, &rows), int(6));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(6.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(3.0));
+    }
+
+    #[test]
+    fn test_numeric_aggregate_text_and_blob_coercion_counts_non_numeric_values() {
+        let rows = [
+            SqliteValue::Blob(vec![b'2'].into()),
+            text("3xyz"),
+            text("not numeric"),
+            null(),
+            int(5),
+        ];
+        assert_eq!(run_agg(&SumFunc, &rows), float(10.0));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(10.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(2.5));
+    }
+
+    #[test]
+    fn test_numeric_aggregate_registry_states_are_independent() {
+        let mut registry = FunctionRegistry::new();
+        register_aggregate_builtins(&mut registry);
+        for name in ["sum", "total", "avg"] {
+            let aggregate = registry.find_aggregate(name, 1).unwrap();
+            let mut first = aggregate.initial_state();
+            let mut second = aggregate.initial_state();
+            aggregate.step(&mut first, &[int(i64::MAX)]).unwrap();
+            aggregate.step(&mut second, &[float(f64::INFINITY)]).unwrap();
+            aggregate.step(&mut first, &[int(i64::MIN)]).unwrap();
+            aggregate.step(&mut first, &[float(0.0)]).unwrap();
+            assert_eq!(aggregate.finalize(second).unwrap(), float(f64::INFINITY));
+            let expected = if name == "avg" { -1.0 / 3.0 } else { -1.0 };
+            assert_eq!(aggregate.finalize(first).unwrap(), float(expected));
+        }
+    }
+
+    #[test]
+    fn test_numeric_aggregates_retain_compensated_fractional_residue() {
+        let rows = [float(1e16), float(1.0), float(-1e16)];
+        assert_eq!(run_agg(&SumFunc, &rows), float(1.0));
+        assert_eq!(run_agg(&TotalFunc, &rows), float(1.0));
+        assert_eq!(run_agg(&AvgFunc, &rows), float(1.0 / 3.0));
     }
 
     // ── median ────────────────────────────────────────────────────────
