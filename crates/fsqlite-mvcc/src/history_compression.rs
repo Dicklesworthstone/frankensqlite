@@ -31,6 +31,8 @@ use crate::physical_merge::StructuredPagePatch;
 
 pub mod compact;
 mod structured_codec;
+#[cfg(test)]
+mod certificate_tests;
 
 // ---------------------------------------------------------------------------
 // §5.10.6: Compressed PageHistory
@@ -839,6 +841,48 @@ pub struct MergeCertificate {
     pub verifier_version: u32,
 }
 
+/// Trusted replay context supplied independently of the certificate being checked.
+///
+/// Do not construct this from untrusted certificate fields. The caller still
+/// owns replay and B-tree validation; matching hashes alone is not a replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeCertificateContext {
+    /// The merge path selected by the caller's policy and replay.
+    pub merge_kind: MergeKind,
+    /// The actual base snapshot used for that replay.
+    pub base_commit_seq: u64,
+    /// The schema epoch under which the replay was performed.
+    pub schema_epoch: u64,
+}
+
+impl MergeCertificate {
+    /// Verify complete evidence against independently supplied replay context.
+    ///
+    /// `post_merge_pages` must contain every affected page produced by replay,
+    /// and `btree_invariant_hash` must come from the caller's invariant checks.
+    /// This method neither executes replay nor authenticates a certificate.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched context, unsupported verifier versions, inconsistent
+    /// manifests, schema epochs, intent evidence or reconstructed page hashes.
+    pub fn verify_in_context(
+        &self,
+        context: MergeCertificateContext,
+        intent_ops: &[IntentOp],
+        post_merge_pages: &[(PageNumber, Vec<u8>)],
+        btree_invariant_hash: [u8; 16],
+    ) -> Result<(), CertificateVerificationError> {
+        if self.merge_kind != context.merge_kind
+            || self.base_commit_seq != context.base_commit_seq
+            || self.schema_epoch != context.schema_epoch
+        {
+            return Err(CertificateVerificationError::ContextMismatch);
+        }
+        verify_merge_certificate(intent_ops, post_merge_pages, btree_invariant_hash, self)
+    }
+}
+
 /// Current verifier version.
 pub const VERIFIER_VERSION: u32 = 1;
 
@@ -854,6 +898,16 @@ fn digest_bytes_equal(left: &[u8; 16], right: &[u8; 16]) -> bool {
 /// Errors from merge certificate verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertificateVerificationError {
+    /// This verifier cannot interpret the certificate's algorithm version.
+    UnsupportedVerifierVersion { expected: u32, actual: u32 },
+    /// Certificate metadata disagrees with the independently supplied replay.
+    ContextMismatch,
+    /// An intent belongs to a different schema epoch.
+    SchemaEpochMismatch { expected: u64, actual: u64 },
+    /// A page appears more than once in a manifest or in the replay output.
+    DuplicatePage { page: PageNumber },
+    /// Declared pages, supplied hashes and replay output do not cover one set.
+    PageSetMismatch,
     /// Recomputed op digests do not match the certificate.
     OpDigestMismatch {
         expected: Vec<[u8; 16]>,
@@ -883,6 +937,15 @@ impl std::fmt::Display for CertificateVerificationError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedVerifierVersion { expected, actual } => {
+                write!(f, "unsupported merge verifier version {actual}; expected {expected}")
+            }
+            Self::ContextMismatch => f.write_str("merge certificate replay context mismatch"),
+            Self::SchemaEpochMismatch { expected, actual } => {
+                write!(f, "merge intent schema epoch {actual} differs from {expected}")
+            }
+            Self::DuplicatePage { page } => write!(f, "duplicate page {page} in merge evidence"),
+            Self::PageSetMismatch => f.write_str("merge certificate page coverage mismatch"),
             Self::OpDigestMismatch { .. } => f.write_str("op digest mismatch in merge certificate"),
             Self::FootprintDigestMismatch { .. } => {
                 f.write_str("footprint digest mismatch in merge certificate")
@@ -899,6 +962,31 @@ impl std::fmt::Display for CertificateVerificationError {
 }
 
 impl std::error::Error for CertificateVerificationError {}
+
+fn unique_certificate_pages(
+    pages: impl IntoIterator<Item = PageNumber>,
+) -> Result<BTreeSet<PageNumber>, CertificateVerificationError> {
+    let mut unique = BTreeSet::new();
+    for page in pages {
+        if !unique.insert(page) {
+            return Err(CertificateVerificationError::DuplicatePage { page });
+        }
+    }
+    Ok(unique)
+}
+
+fn validate_certificate_epochs(
+    intent_ops: &[IntentOp],
+    schema_epoch: u64,
+) -> Result<(), CertificateVerificationError> {
+    if let Some(op) = intent_ops.iter().find(|op| op.schema_epoch != schema_epoch) {
+        return Err(CertificateVerificationError::SchemaEpochMismatch {
+            expected: schema_epoch,
+            actual: op.schema_epoch,
+        });
+    }
+    Ok(())
+}
 
 /// A circuit breaker event emitted when merge verification fails.
 ///
@@ -927,8 +1015,7 @@ pub struct CircuitBreakerEvent {
 ///
 /// # Errors
 ///
-/// This function does not currently return errors, but the signature allows
-/// for future validation during generation.
+/// Rejects duplicate affected pages or intents from another schema epoch.
 pub fn generate_merge_certificate(
     merge_kind: MergeKind,
     base_commit_seq: u64,
@@ -937,6 +1024,9 @@ pub fn generate_merge_certificate(
     affected_pages: &[(PageNumber, Vec<u8>)],
     btree_invariant_hash: [u8; 16],
 ) -> Result<MergeCertificate, CertificateVerificationError> {
+    // Refuse ambiguous evidence before hashing it or building a dependency graph.
+    unique_certificate_pages(affected_pages.iter().map(|(page, _)| *page))?;
+    validate_certificate_epochs(intent_ops, schema_epoch)?;
     // Compute op digests (unordered set).
     let intent_op_digests: Vec<[u8; 16]> = intent_ops.iter().map(compute_op_digest).collect();
 
@@ -976,13 +1066,20 @@ pub fn generate_merge_certificate(
     })
 }
 
-/// Verify a merge certificate by replaying the merge and comparing hashes.
+/// Verify certificate evidence against caller-supplied replay results.
 ///
-/// Given `(base snapshot data, intent operations, certificate)`, this function:
+/// This function does NOT replay a merge or validate B-tree structure itself.
+/// The caller must supply the complete replay output and invariant-check hash.
+/// It rejects unsupported versions and requires identical, duplicate-free page
+/// sets in the declaration, page hashes and replay output. It then:
 /// 1. Recomputes all op digests from canonical intent encodings.
 /// 2. Recomputes the footprint digest.
 /// 3. Validates the normal form.
 /// 4. Compares page hashes and B-tree invariant hash.
+///
+/// The legacy signature cannot independently bind `base_commit_seq` or
+/// `merge_kind`. Use [`MergeCertificate::verify_in_context`] when accepting
+/// evidence from another replay/context; never take those values on trust.
 ///
 /// # Errors
 ///
@@ -993,6 +1090,21 @@ pub fn verify_merge_certificate(
     btree_invariant_hash: [u8; 16],
     certificate: &MergeCertificate,
 ) -> Result<(), CertificateVerificationError> {
+    if certificate.verifier_version != VERIFIER_VERSION {
+        return Err(CertificateVerificationError::UnsupportedVerifierVersion {
+            expected: VERIFIER_VERSION,
+            actual: certificate.verifier_version,
+        });
+    }
+    validate_certificate_epochs(intent_ops, certificate.schema_epoch)?;
+    let declared = unique_certificate_pages(certificate.pages.iter().copied())?;
+    let hashed = unique_certificate_pages(
+        certificate.post_state.page_hashes.iter().map(|(page, _)| *page),
+    )?;
+    let replayed = unique_certificate_pages(post_merge_pages.iter().map(|(page, _)| *page))?;
+    if declared != hashed || declared != replayed {
+        return Err(CertificateVerificationError::PageSetMismatch);
+    }
     // Step 1: Recompute op digests and compare (order-insensitive).
     let mut recomputed_digests: Vec<[u8; 16]> = intent_ops.iter().map(compute_op_digest).collect();
     let mut cert_digests = certificate.intent_op_digests.clone();
@@ -1033,10 +1145,10 @@ pub fn verify_merge_certificate(
         .collect();
 
     for &(pgno, expected_hash) in &certificate.post_state.page_hashes {
-        let actual_hash = recomputed_page_hashes
+        // Missing evidence is never represented by a synthetic all-zero hash.
+        let actual_hash = *recomputed_page_hashes
             .get(&pgno)
-            .copied()
-            .unwrap_or([0u8; 16]);
+            .ok_or(CertificateVerificationError::PageSetMismatch)?;
         if actual_hash != expected_hash {
             return Err(CertificateVerificationError::PageHashMismatch {
                 page: pgno,
