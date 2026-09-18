@@ -15,8 +15,12 @@
 //! State of the three symptoms originally filed as bd-29phg:
 //!   1. upsert inserting a duplicate — FIXED, guarded by
 //!      `temp_table_upsert_on_rowid_alias_matches_stock_sqlite` (runs by default);
-//!   2. a failed statement leaving partial rows — open as **bd-5bq6u**,
-//!      `temp_table_failed_multi_row_insert_is_atomic_like_stock` (`#[ignore]`d);
+//!   2. a failed statement leaving partial rows — FIXED as **bd-5bq6u**
+//!      (e1d15a527 wired MemDatabase's existing undo log to a statement
+//!      boundary; 9e56b36e9 made that boundary nesting-aware and extended it to
+//!      `INSERT ... SELECT`), guarded by
+//!      `temp_table_failed_multi_row_insert_is_atomic_like_stock` (runs by
+//!      default);
 //!   3. a UNIQUE violation naming the wrong column — open as **bd-towj6**,
 //!      visible in the Q5 line of `temp_table_constraint_lane_diagnostic`.
 //!
@@ -136,7 +140,6 @@ fn temp_table_upsert_on_rowid_alias_matches_stock_sqlite() {
 /// bd-fjieg.5. It is the plain-NOT-NULL analogue of the divergence the .5
 /// oracle hits on its TEMP arm with `INSERT INTO g(v) VALUES(19),(0)`.
 #[test]
-#[ignore = "bd-5bq6u: a failed statement leaves partial rows on a TEMP table"]
 fn temp_table_failed_multi_row_insert_is_atomic_like_stock() {
     asupersync::test_utils::run_test(|| async {
         for temporary in [false, true] {
