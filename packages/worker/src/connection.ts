@@ -33,6 +33,8 @@ import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
 import type { ResultEncoding } from "./result-codec";
 import { parameterLayout, resolveBindings } from "./bindings";
 import type { ParameterLayout } from "./bindings";
+import { PreparedStatementBudget, PreparedStatementError } from "./statement-budget";
+import type { PreparedStatementLimits, PreparedStatementStats, StatementReservation } from "./statement-budget";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
@@ -99,6 +101,8 @@ export class WorkerConnectionHost {
   readonly #statements = new Map<string, CorePreparedStatementHandle>();
   readonly #parameterLayouts = new Map<string, ParameterLayout>();
   readonly #statementOwners = new Map<string, string>();
+  readonly #statementReservations = new Map<string, StatementReservation>();
+  readonly #statementBudget: PreparedStatementBudget;
   readonly #transactions = new ManagedTransactions();
   #requestTail: Promise<void> = Promise.resolve();
   #nextBulkSavepoint = 1n;
@@ -110,14 +114,19 @@ export class WorkerConnectionHost {
   #closePromise: Promise<WorkerResponse> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
 
-  constructor(loader: CoreModuleLoader = defaultCoreModuleLoader, limits: Partial<RequestLimits> = {}) {
+  constructor(loader: CoreModuleLoader = defaultCoreModuleLoader, limits: Partial<RequestLimits> = {},
+    statementLimits: Partial<PreparedStatementLimits> = {}) {
     this.#loader = loader;
     this.#budget = new RequestBudget(limits);
+    this.#statementBudget = new PreparedStatementBudget(statementLimits);
   }
 
   get requestQueue(): RequestQueueStats {
     return this.#budget.stats;
   }
+
+  /** Includes an in-flight prepare; capacity is held until actual cleanup. */
+  get preparedStatements(): PreparedStatementStats { return this.#statementBudget.stats; }
 
   /** Fence queued SQL immediately; close only after active work has settled. */
   failTransport(error: Error): Promise<WorkerResponse> {
@@ -460,24 +469,65 @@ export class WorkerConnectionHost {
   }
 
   async #prepare(requestId: number, sql: string, transactionId?: string): Promise<PrepareResponse> {
-    const layout = parameterLayout(sql);
-    const stmt = await this.#requireDatabase().prepare(sql);
-    const statementId = String(this.#nextStatementId++);
-    this.#statements.set(statementId, stmt);
-    this.#parameterLayouts.set(statementId, layout);
-    if (transactionId !== undefined) this.#statementOwners.set(statementId, transactionId);
-    return {
-      kind: "prepare-result",
-      requestId,
-      data: {
-        statementId,
-        sql: stmt.sql,
-        columnCount: stmt.columnCount,
-        columnNames: stmt.columnNames(),
-        parameterCount: layout.count,
-        parameterNames: layout.names,
-      },
-    };
+    const db = this.#requireDatabase();
+    const reservation = this.#statementBudget.reserve(sql);
+    let candidate: CorePreparedStatementHandle | null = null;
+    let published = false;
+    try {
+      const layout = parameterLayout(sql);
+      reservation.grow(layout.count * 16);
+      candidate = await db.prepare(sql);
+      // A core adapter must transfer a new handle, not alias a retained one.
+      // Never finalize that alias while recovering from a failed preparation.
+      if ([...this.#statements.values()].includes(candidate)) {
+        candidate = null;
+        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Preparation returned an already owned statement");
+      }
+      if (this.#terminalError !== null) throw this.#terminalError;
+      this.#transactions.assertOwner(transactionId);
+      const preparedSql = candidate.sql, columnCount = candidate.columnCount;
+      if (typeof preparedSql !== "string" || !Number.isSafeInteger(columnCount) || columnCount < 0 || columnCount > 32768) {
+        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared statement metadata");
+      }
+      reservation.grow(preparedSql.length * 2);
+      const names = candidate.columnNames();
+      if (!Array.isArray(names) || names.length !== columnCount) {
+        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared column names");
+      }
+      const columnNames: string[] = [];
+      for (let i = 0; i < columnCount; i++) {
+        const name = names[i];
+        if (typeof name !== "string") throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared column name");
+        reservation.grow(16 + name.length * 2);
+        columnNames.push(name);
+      }
+      // Metadata callbacks may re-enter cancellation/transport control. Do not
+      // publish a handle after its owner was fenced during this request.
+      if (this.#terminalError !== null) throw this.#terminalError;
+      this.#transactions.assertOwner(transactionId);
+      const statementId = String(this.#nextStatementId++);
+      const response: PrepareResponse = { kind: "prepare-result", requestId, data: {
+        statementId, sql: preparedSql, columnCount, columnNames,
+        parameterCount: layout.count, parameterNames: layout.names,
+      } };
+      this.#statements.set(statementId, candidate);
+      this.#parameterLayouts.set(statementId, layout);
+      this.#statementReservations.set(statementId, reservation);
+      if (transactionId !== undefined) this.#statementOwners.set(statementId, transactionId);
+      published = true;
+      return response;
+    } catch (cause: unknown) {
+      try { candidate?.free(); }
+      catch (cleanup: unknown) {
+        const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+          "Failed to clean up an unpublished prepared statement; reopen the connection", { cause }, true);
+        failure.cleanupErrors.push(cleanup);
+        throw failure;
+      }
+      throw cause;
+    } finally {
+      if (!published) reservation.release();
+    }
   }
 
   async #statementExecute(
@@ -520,7 +570,13 @@ export class WorkerConnectionHost {
     this.#statements.delete(statementId);
     this.#parameterLayouts.delete(statementId);
     this.#statementOwners.delete(statementId);
-    stmt.free();
+    const reservation = this.#statementReservations.get(statementId)!;
+    this.#statementReservations.delete(statementId);
+    try { stmt.free(); }
+    catch (cause: unknown) {
+      throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+        "Prepared statement cleanup failed; reopen the connection", { cause }, true);
+    } finally { reservation.release(); }
     return {
       kind: "statement-finalize-result",
       requestId,
@@ -579,7 +635,9 @@ export class WorkerConnectionHost {
 
   #disposeDatabase(): void {
     const statements = [...this.#statements.values()];
+    const reservations = [...this.#statementReservations.values()];
     this.#statements.clear();
+    this.#statementReservations.clear();
     this.#parameterLayouts.clear();
     this.#statementOwners.clear();
     this.#transactions.clear();
@@ -592,12 +650,12 @@ export class WorkerConnectionHost {
     const errors: unknown[] = [];
     try { snapshotStore?.close(); }
     catch (error: unknown) { errors.push(error); }
-    for (const stmt of statements) {
+    for (let i = 0; i < statements.length; i++) {
       try {
-        stmt.free();
+        statements[i]!.free();
       } catch (error: unknown) {
         errors.push(error);
-      }
+      } finally { reservations[i]!.release(); }
     }
     if (db !== null) {
       try {
