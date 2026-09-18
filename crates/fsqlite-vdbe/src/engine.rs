@@ -31613,10 +31613,17 @@ mod tests {
     fn test_storage_index_decode_reuses_slots_across_encodings_and_types() {
         let (mut engine, _, _) = build_storage_index_engine_with_duplicate_prefixes();
         let cursor = engine.storage_cursors.get_mut(&0).expect("index cursor");
-        for encoding in [TextEncoding::Utf8, TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
+        for encoding in [
+            TextEncoding::Utf8,
+            TextEncoding::Utf16le,
+            TextEncoding::Utf16be,
+        ] {
             cursor.text_encoding = encoding;
             for expected in [
-                vec![SqliteValue::Text("é水".repeat(80).into()), SqliteValue::Integer(3)],
+                vec![
+                    SqliteValue::Text("é水".repeat(80).into()),
+                    SqliteValue::Integer(3),
+                ],
                 vec![SqliteValue::Text("水é".repeat(80).into()), SqliteValue::Null],
                 vec![SqliteValue::Blob(Arc::from(vec![0_u8, 255]))],
                 vec![SqliteValue::Null, SqliteValue::Float(2.5)],
@@ -31624,7 +31631,9 @@ mod tests {
             ] {
                 let record = encode_record_with_encoding(&expected, encoding);
                 for _ in 0..2 {
-                    assert!(try_decode_storage_cursor_target_index_record(cursor, &record));
+                    assert!(try_decode_storage_cursor_target_index_record(
+                        cursor, &record
+                    ));
                     assert_eq!(cursor.target_vals_buf, expected);
                 }
             }
