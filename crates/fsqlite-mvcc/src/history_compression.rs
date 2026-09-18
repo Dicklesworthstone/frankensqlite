@@ -4,9 +4,10 @@
 //!
 //! 1. **`PageHistory` Objects (§5.10.6):** Compressed version chains where the
 //!    newest committed version is stored as a full page image. Older versions are
-//!    currently stored as full images too; patch variants remain representable but
-//!    are not generated until their lossless wire decoders exist. Encoded as ECS
-//!    objects for repair and remote fetching.
+//!    currently stored as full images too. Structured patches have a lossless
+//!    wire codec, but are not generated automatically: semantic replay alone
+//!    does not preserve every byte of a historical page. Encoded as ECS objects
+//!    for repair and remote fetching.
 //!
 //! 2. **Intent Commutativity (§5.10.7):** Mazurkiewicz trace-monoid formalization
 //!    of when intent operations commute. Defines the independence relation
@@ -27,6 +28,8 @@ use fsqlite_types::{
 };
 
 use crate::physical_merge::StructuredPagePatch;
+
+mod structured_codec;
 
 // ---------------------------------------------------------------------------
 // §5.10.6: Compressed PageHistory
@@ -97,8 +100,8 @@ impl std::error::Error for HistoryCompressionError {}
 ///
 /// The input `full_images` must be ordered newest-first; each entry is
 /// `(commit_seq, page_bytes)`. Patch-shaped variants remain part of the
-/// serialized type, but this encoder does not emit them until their lossless
-/// wire decoders are implemented.
+/// serialized type, but this encoder does not emit them: reconstructing the
+/// exact original image requires more than semantic cell-level replay.
 ///
 /// # Errors
 ///
@@ -155,12 +158,44 @@ const TAG_STRUCTURED_PATCH: u8 = 2;
 
 impl CompressedPageHistory {
     /// Encode this compressed page history to canonical ECS bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this history cannot be encoded losslessly. Use
+    /// [`Self::try_to_bytes`] for caller-supplied histories or patch payloads.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes()
+            .expect("page history must have a lossless wire representation")
+    }
+
+    /// Encode without dropping unsupported mutation evidence or truncating lengths.
+    /// Full-image and empty-placeholder wire bytes remain unchanged. Nonempty
+    /// structured patches use the versioned SPP1 payload; old readers reject it.
+    /// The intent digest encoding is not a reversible serialization of a full
+    /// `IntentOp`, so nonempty intent patches are refused, not written as history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty history, a non-full newest version,
+    /// unrepresentable lengths, oversized structured patches, or nonempty intent
+    /// patches whose lossless wire representation is not implemented.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, HistoryCompressionError> {
+        let newest = self
+            .versions
+            .first()
+            .ok_or(HistoryCompressionError::EmptyHistory)?;
+        if !matches!(newest.data, CompressedVersionData::FullImage(_)) {
+            return Err(HistoryCompressionError::NewestNotFullImage);
+        }
+        let wire_len = |length: usize| {
+            u32::try_from(length).map_err(|_| {
+                HistoryCompressionError::DecodeError("history length exceeds u32".to_owned())
+            })
+        };
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&self.pgno.get().to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        let version_count = self.versions.len() as u32;
+        let version_count = wire_len(self.versions.len())?;
         buf.extend_from_slice(&version_count.to_le_bytes());
 
         for v in &self.versions {
@@ -168,31 +203,31 @@ impl CompressedPageHistory {
             match &v.data {
                 CompressedVersionData::FullImage(img) => {
                     buf.push(TAG_FULL_IMAGE);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = img.len() as u32;
+                    let len = wire_len(img.len())?;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(img);
                 }
                 CompressedVersionData::IntentLogPatch(ops) => {
+                    if !ops.is_empty() {
+                        return Err(HistoryCompressionError::DecodeError(
+                            "nonempty intent history cannot be serialized losslessly".to_owned(),
+                        ));
+                    }
                     buf.push(TAG_INTENT_LOG_PATCH);
                     let payload = canonical_intent_ops_bytes(ops);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len = payload.len() as u32;
+                    let len = wire_len(payload.len())?;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(&payload);
                 }
-                CompressedVersionData::StructuredPatch(_patch) => {
+                CompressedVersionData::StructuredPatch(patch) => {
                     buf.push(TAG_STRUCTURED_PATCH);
-                    // StructuredPagePatch serialization is not yet implemented.
-                    // This variant is not currently generated by
-                    // compress_page_history (which stores full images for all
-                    // versions). When structured patches are used, their ECS
-                    // wire format must be defined and round-trip tested.
-                    buf.extend_from_slice(&0u32.to_le_bytes());
+                    let payload = structured_codec::encode(patch)?;
+                    buf.extend_from_slice(&wire_len(payload.len())?.to_le_bytes());
+                    buf.extend_from_slice(&payload);
                 }
             }
         }
-        buf
+        Ok(buf)
     }
 
     /// Decode a compressed page history from canonical ECS bytes.
@@ -275,10 +310,7 @@ impl CompressedPageHistory {
                     CompressedVersionData::IntentLogPatch(Vec::new())
                 }
                 TAG_STRUCTURED_PATCH => {
-                    if !payload.is_empty() {
-                        return Err(err("structured patch payload decode not implemented"));
-                    }
-                    CompressedVersionData::StructuredPatch(StructuredPagePatch::default())
+                    CompressedVersionData::StructuredPatch(structured_codec::decode(payload)?)
                 }
                 other => return Err(err(&format!("unknown version data tag: {other}"))),
             };
