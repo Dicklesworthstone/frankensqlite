@@ -29,6 +29,7 @@ use fsqlite_types::{
 
 use crate::physical_merge::StructuredPagePatch;
 
+pub mod compact;
 mod structured_codec;
 
 // ---------------------------------------------------------------------------
