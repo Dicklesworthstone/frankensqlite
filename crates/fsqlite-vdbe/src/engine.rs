@@ -18224,18 +18224,23 @@ fn try_decode_storage_cursor_target_index_record(
     cursor: &mut StorageCursor,
     key_bytes: &[u8],
 ) -> bool {
-    cursor.target_vals_buf.clear();
+    // Keep decoded slots alive: the record decoder reuses their TEXT/BLOB
+    // storage and avoids copying unchanged fields on repeated probes.
     // bd-oqglk / bd-spsnt: decode the cursor-side index key with the cursor's DB
     // text encoding, matching the probe-side decode. A UTF-8-hardcoded decode
     // here leaves TEXT columns as raw NUL-interleaved bytes on a UTF-16 DB, so a
     // later `compare_index_prefix_keys` (which decodes the probe canonically)
     // mis-compares and the REPLACE-conflict re-seek finds the wrong entry.
-    fsqlite_types::record::parse_record_into_with_encoding(
+    let decoded = fsqlite_types::record::parse_record_into_with_encoding(
         key_bytes,
         &mut cursor.target_vals_buf,
         cursor.text_encoding,
     )
-    .is_some()
+    .is_some();
+    if !decoded {
+        cursor.target_vals_buf.clear();
+    }
+    decoded
 }
 
 fn decode_storage_cursor_target_index_record_strict(
@@ -18258,7 +18263,6 @@ async fn try_decode_storage_cursor_current_index_record(
         .cursor
         .payload_into(&cursor.cx, &mut cursor.payload_buf)
         .await?;
-    cursor.cur_vals_buf.clear();
     // bd-oqglk (P0) / bd-spsnt: decode the cursor's CURRENT index key under the
     // cursor's DB text encoding, matching the canonical probe-side decode at the
     // IdxGT/GE/LT/LE general branch. Previously this was a raw UTF-8 decode, so
@@ -18271,6 +18275,9 @@ async fn try_decode_storage_cursor_current_index_record(
         cursor.text_encoding,
     )
     .is_some();
+    if !decoded {
+        cursor.cur_vals_buf.clear();
+    }
     cursor.cached_rowid = if decoded {
         cursor.cur_vals_buf.last().and_then(SqliteValue::as_integer)
     } else {
@@ -31521,6 +31528,107 @@ mod tests {
             root_page,
             "cursor metadata and published root-page map must stay in sync"
         );
+    }
+
+    #[test]
+    fn test_storage_index_decode_retains_values_without_stale_or_shared_mutation() {
+        let (mut engine, _, _) = build_storage_index_engine_with_duplicate_prefixes();
+        let cursor = engine.storage_cursors.get_mut(&0).expect("index cursor");
+        let original = SqliteValue::Blob(Arc::from(vec![77_u8; 8192]));
+        let record = encode_record(&[original.clone(), SqliteValue::Integer(123)]);
+
+        assert!(try_decode_storage_cursor_target_index_record(
+            cursor, &record
+        ));
+        let SqliteValue::Blob(target_blob) = cursor.target_vals_buf[0].clone() else {
+            panic!("expected decoded BLOB");
+        };
+        assert!(try_decode_storage_cursor_target_index_record(
+            cursor, &record
+        ));
+        let SqliteValue::Blob(reused) = &cursor.target_vals_buf[0] else {
+            panic!("expected decoded BLOB");
+        };
+        // Holding the old Arc prevents allocator address reuse from making
+        // this pass when the decoder actually allocated a replacement.
+        assert!(Arc::ptr_eq(&target_blob, reused));
+
+        let changed = SqliteValue::Blob(Arc::from(vec![88_u8; 8192]));
+        let changed_record = encode_record(&[changed.clone(), SqliteValue::Integer(124)]);
+        assert!(try_decode_storage_cursor_target_index_record(
+            cursor,
+            &changed_record
+        ));
+        assert_eq!(
+            cursor.target_vals_buf,
+            vec![changed.clone(), SqliteValue::Integer(124)]
+        );
+        assert_eq!(target_blob.as_ref(), &[77_u8; 8192]);
+
+        let short_record = encode_record(&[SqliteValue::Integer(125)]);
+        assert!(try_decode_storage_cursor_target_index_record(
+            cursor,
+            &short_record
+        ));
+        assert_eq!(cursor.target_vals_buf, vec![SqliteValue::Integer(125)]);
+        assert!(!try_decode_storage_cursor_target_index_record(
+            cursor,
+            &[0x80]
+        ));
+        assert!(cursor.target_vals_buf.is_empty());
+        assert!(try_decode_storage_cursor_target_index_record(
+            cursor, &record
+        ));
+        assert!(!try_decode_storage_cursor_target_index_record(
+            cursor,
+            &record[..record.len() - 1],
+        ));
+        assert!(cursor.target_vals_buf.is_empty());
+
+        run_async(cursor.cursor.index_insert(&cursor.cx, &record)).expect("insert index key");
+        run_async(cursor.cursor.index_move_to(&cursor.cx, &record)).expect("seek index key");
+        assert!(run_async(try_decode_storage_cursor_current_index_record(0, cursor)).unwrap());
+        let SqliteValue::Blob(current_blob) = cursor.cur_vals_buf[0].clone() else {
+            panic!("expected current BLOB");
+        };
+        assert!(run_async(try_decode_storage_cursor_current_index_record(0, cursor)).unwrap());
+        let SqliteValue::Blob(reused) = &cursor.cur_vals_buf[0] else {
+            panic!("expected current BLOB");
+        };
+        assert!(Arc::ptr_eq(&current_blob, reused));
+        assert_eq!(cursor.cached_rowid, Some(123));
+
+        run_async(cursor.cursor.index_insert(&cursor.cx, &changed_record))
+            .expect("insert changed index key");
+        run_async(cursor.cursor.index_move_to(&cursor.cx, &changed_record))
+            .expect("seek changed index key");
+        assert!(run_async(try_decode_storage_cursor_current_index_record(0, cursor)).unwrap());
+        assert_eq!(cursor.cur_vals_buf[0], changed);
+        assert_eq!(cursor.cur_vals_buf[1], SqliteValue::Integer(124));
+        assert_eq!(current_blob.as_ref(), &[77_u8; 8192]);
+        assert_eq!(cursor.cached_rowid, Some(124));
+    }
+
+    #[test]
+    fn test_storage_index_decode_reuses_slots_across_encodings_and_types() {
+        let (mut engine, _, _) = build_storage_index_engine_with_duplicate_prefixes();
+        let cursor = engine.storage_cursors.get_mut(&0).expect("index cursor");
+        for encoding in [TextEncoding::Utf8, TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
+            cursor.text_encoding = encoding;
+            for expected in [
+                vec![SqliteValue::Text("é水".repeat(80).into()), SqliteValue::Integer(3)],
+                vec![SqliteValue::Text("水é".repeat(80).into()), SqliteValue::Null],
+                vec![SqliteValue::Blob(Arc::from(vec![0_u8, 255]))],
+                vec![SqliteValue::Null, SqliteValue::Float(2.5)],
+                Vec::new(),
+            ] {
+                let record = encode_record_with_encoding(&expected, encoding);
+                for _ in 0..2 {
+                    assert!(try_decode_storage_cursor_target_index_record(cursor, &record));
+                    assert_eq!(cursor.target_vals_buf, expected);
+                }
+            }
+        }
     }
 
     #[test]
