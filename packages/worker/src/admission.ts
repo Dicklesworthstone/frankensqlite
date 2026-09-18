@@ -3,6 +3,7 @@ import type { InitConfig, SqlBindings, SqlScalar, WorkerRequest } from "./protoc
 import { BindingError, isNamedBindings } from "./bindings";
 import { validateTransactionId } from "./transactions";
 import { resolveResultEncoding } from "./result-codec";
+import { resolvePreparedStatementLimits } from "./statement-budget";
 
 export interface RequestLimits {
   /** Active plus queued ordinary requests. Close/cancel use a separate lane. */
@@ -170,6 +171,11 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       if (resultEncoding !== undefined) {
         config.resultEncoding = resolveResultEncoding(resultEncoding);
         text(config.resultEncoding);
+      }
+      const statementLimits = source.preparedStatementLimits;
+      if (statementLimits !== undefined) {
+        charge(48);
+        config.preparedStatementLimits = resolvePreparedStatementLimits(statementLimits);
       }
       request = { kind, requestId, config };
       break;

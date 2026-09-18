@@ -11,6 +11,8 @@ export { BINARY_RESULT_THRESHOLD, MAX_BINARY_RESULT_BYTES, ResultCodecError,
 export type { ResultEncoding } from "./result-codec";
 export { DEFAULT_REQUEST_LIMITS, RequestAdmissionError, RequestBudget, resolveRequestLimits } from "./admission";
 export type { RequestLimits, RequestQueueStats } from "./admission";
+export { DEFAULT_PREPARED_STATEMENT_LIMITS, PreparedStatementError, resolvePreparedStatementLimits } from "./statement-budget";
+export type { PreparedStatementLimits, PreparedStatementStats } from "./statement-budget";
 export { validateBulkSql } from "./bulk";
 export { IndexedDbSnapshotStore, MAX_SNAPSHOT_BYTES, SnapshotStoreError, validateSnapshotBytes } from "./snapshot-store";
 export { validateManagedSql } from "./transactions";

@@ -10,6 +10,7 @@ import type {
   RequestLimits,
   RequestQueueStats,
   ResultEncoding,
+  PreparedStatementLimits,
 } from "@frankensqlite/worker";
 
 import type { WorkerLike } from "./worker-client";
@@ -17,6 +18,7 @@ import type { WorkerLike } from "./worker-client";
 export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SqlBindings, SnapshotMetadata };
 export type { RequestLimits, RequestQueueStats };
 export type { ResultEncoding };
+export type { PreparedStatementLimits };
 
 export type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> =
   WorkerQueryResult<Row>;
