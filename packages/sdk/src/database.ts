@@ -6,7 +6,8 @@ import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
 import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
-import { resolveRequestLimits, resolveResultEncoding } from "@frankensqlite/worker";
+import { resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
+import type { PreparedStatementLimits } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 import type { TransactionOptions } from "./types";
 import { isTransactionConflict, resolveTransactionRetryOptions, runTransactionRetry } from "./transaction-retry";
@@ -53,6 +54,28 @@ function captureSnapshotReceipt(value: unknown): SnapshotMetadata {
   return Object.freeze({ revision, parentRevision, byteLength, sha256 });
 }
 
+/** A requested policy must be acknowledged, not silently ignored by an old worker. */
+function captureStatementPolicy(value: unknown, requested: Readonly<PreparedStatementLimits> | undefined):
+  Readonly<PreparedStatementLimits> | null {
+  if (value === undefined && requested === undefined) return null;
+  const reject = (): never => {
+    throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", transient: false,
+      message: "The worker did not acknowledge a valid prepared-statement policy within the requested limits",
+      suggestion: "Use a worker that supports preparedStatementLimits; no SQL has been submitted by this database handle." });
+  };
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return reject();
+  const count = Object.getOwnPropertyDescriptor(value, "maxStatements");
+  const bytes = Object.getOwnPropertyDescriptor(value, "maxBytes");
+  if (count === undefined || bytes === undefined || !Object.hasOwn(count, "value") || !Object.hasOwn(bytes, "value")) return reject();
+  let effective: Readonly<PreparedStatementLimits>;
+  try { effective = resolvePreparedStatementLimits({ maxStatements: count.value, maxBytes: bytes.value }); }
+  catch { return reject(); }
+  // Missing values must not become locally supplied defaults in an acknowledgement.
+  if (count.value !== effective.maxStatements || bytes.value !== effective.maxBytes ||
+      (requested !== undefined && (effective.maxStatements > requested.maxStatements || effective.maxBytes > requested.maxBytes))) return reject();
+  return effective;
+}
+
 /** Internal lifecycle subscription for owners of a private connection. */
 export function observeDatabaseFailure(db: FrankenDB, listener: (error: Error) => void): () => void {
   const client = databaseClients.get(db);
@@ -77,6 +100,7 @@ export class FrankenDB {
   readonly #client: FrankenWorkerClient;
   readonly #path: string;
   readonly #persistence: PersistenceMode;
+  readonly #preparedStatementLimits: Readonly<PreparedStatementLimits> | null;
   #snapshotRevision: string | null;
   #snapshotReceiptFailure: FrankenSQLiteError | null = null;
   #transactionScope: TransactionScope | null = null;
@@ -84,12 +108,14 @@ export class FrankenDB {
   #nextTransactionId = 1n;
   #retryOwner: object | null = null;
 
-  private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null) {
+  private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null,
+    preparedStatementLimits: Readonly<PreparedStatementLimits> | null) {
     this.#client = client;
     databaseClients.set(this, client);
     this.#path = path;
     this.#persistence = persistence;
     this.#snapshotRevision = snapshotRevision;
+    this.#preparedStatementLimits = preparedStatementLimits;
   }
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
@@ -97,8 +123,12 @@ export class FrankenDB {
     // Validate before allocating a worker or transferring a snapshot buffer.
     const limits = resolveRequestLimits(normalized.requestLimits);
     const resultEncoding = resolveResultEncoding(normalized.resultEncoding);
+    const requestedStatementLimits = normalized.preparedStatementLimits;
+    const statementLimits = requestedStatementLimits === undefined
+      ? undefined : resolvePreparedStatementLimits(requestedStatementLimits);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
+    if (statementLimits !== undefined) config.preparedStatementLimits = statementLimits;
     if (normalized.resultEncoding !== undefined) config.resultEncoding = resultEncoding;
     if (normalized.dbName !== undefined) {
       config.dbName = normalized.dbName;
@@ -124,7 +154,12 @@ export class FrankenDB {
           snapshot = captureSnapshotReceipt(saved);
         }
       } catch (cause: unknown) { throw snapshotReceiptFailure(cause); }
-      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null);
+      const policy = Object.getOwnPropertyDescriptor(ready, "preparedStatementLimits");
+      if (policy !== undefined && !Object.hasOwn(policy, "value")) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", message: "Invalid worker prepared-statement policy" });
+      }
+      const effectiveStatements = captureStatementPolicy(policy?.value, statementLimits);
+      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null, effectiveStatements);
     } catch (error: unknown) {
       try {
         client.dispose();
@@ -153,6 +188,9 @@ export class FrankenDB {
   get persistence(): PersistenceMode {
     return this.#persistence;
   }
+
+  /** Acknowledged worker limits; null means an older worker supplied no policy. */
+  get preparedStatementLimits(): Readonly<PreparedStatementLimits> | null { return this.#preparedStatementLimits; }
 
   /** Effective worker policy; individual noncanonical results may still fall back. */
   get resultEncoding() {

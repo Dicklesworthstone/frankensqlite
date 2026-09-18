@@ -21,6 +21,7 @@ export type {
   ExecuteStreamResult,
   FrankenDbOpenOptions,
   PersistenceMode,
+  PreparedStatementLimits,
   QueryResult,
   RequestLimits,
   RequestQueueStats,

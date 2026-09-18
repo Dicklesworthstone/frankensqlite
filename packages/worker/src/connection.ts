@@ -33,7 +33,7 @@ import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
 import type { ResultEncoding } from "./result-codec";
 import { parameterLayout, resolveBindings } from "./bindings";
 import type { ParameterLayout } from "./bindings";
-import { PreparedStatementBudget, PreparedStatementError } from "./statement-budget";
+import { PreparedStatementBudget, PreparedStatementError, resolvePreparedStatementLimits } from "./statement-budget";
 import type { PreparedStatementLimits, PreparedStatementStats, StatementReservation } from "./statement-budget";
 
 class CheckpointRollbackError extends SnapshotStoreError {
@@ -102,7 +102,8 @@ export class WorkerConnectionHost {
   readonly #parameterLayouts = new Map<string, ParameterLayout>();
   readonly #statementOwners = new Map<string, string>();
   readonly #statementReservations = new Map<string, StatementReservation>();
-  readonly #statementBudget: PreparedStatementBudget;
+  #statementBudget: PreparedStatementBudget;
+  readonly #statementCeiling: Readonly<PreparedStatementLimits>;
   readonly #transactions = new ManagedTransactions();
   #requestTail: Promise<void> = Promise.resolve();
   #nextBulkSavepoint = 1n;
@@ -119,6 +120,7 @@ export class WorkerConnectionHost {
     this.#loader = loader;
     this.#budget = new RequestBudget(limits);
     this.#statementBudget = new PreparedStatementBudget(statementLimits);
+    this.#statementCeiling = this.#statementBudget.limits;
   }
 
   get requestQueue(): RequestQueueStats {
@@ -319,6 +321,12 @@ export class WorkerConnectionHost {
     const ready = createReadyResult(config);
     assertSupportedPersistenceMode(ready.persistence);
     const resultEncoding = resolveResultEncoding(config.resultEncoding);
+    const requestedStatements = config.preparedStatementLimits === undefined
+      ? this.#statementCeiling : resolvePreparedStatementLimits(config.preparedStatementLimits);
+    const stagedStatementBudget = new PreparedStatementBudget({
+      maxStatements: Math.min(requestedStatements.maxStatements, this.#statementCeiling.maxStatements),
+      maxBytes: Math.min(requestedStatements.maxBytes, this.#statementCeiling.maxBytes),
+    });
 
     let stagedStore: IndexedDbSnapshotStore | null = null;
     let stagedDb: CoreDatabaseHandle | null = null;
@@ -370,12 +378,14 @@ export class WorkerConnectionHost {
       stagedStore = null; // Ownership transfers only after core initialization.
       this.#snapshotRevision = saved?.revision ?? null;
       this.#resultEncoding = resultEncoding;
+      this.#statementBudget = stagedStatementBudget;
       return {
         kind: "ready", requestId,
         data: {
           path,
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
+          preparedStatementLimits: stagedStatementBudget.limits,
           ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved } : {}),
         },
       };
@@ -490,6 +500,10 @@ export class WorkerConnectionHost {
         throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared statement metadata");
       }
       reservation.grow(preparedSql.length * 2);
+      // The SDK constructs a lexical binding layout from the returned SQL.
+      // Refuse malformed adapter SQL here, while the candidate is still owned
+      // privately, rather than leaving an unconstructible public SDK handle.
+      if (preparedSql !== sql) parameterLayout(preparedSql);
       const names = candidate.columnNames();
       if (!Array.isArray(names) || names.length !== columnCount) {
         throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared column names");

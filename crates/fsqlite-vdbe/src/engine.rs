@@ -4640,6 +4640,11 @@ pub struct MemDatabase {
     undo_enabled: bool,
     /// Undo log. A version token is the log length at the snapshot point.
     undo_log: Vec<MemDbUndoOp>,
+    /// bd-5bq6u: one entry per statement currently in flight, holding the undo
+    /// log length at that statement's entry. Statements nest (INSERT ... SELECT
+    /// replays each source row as its own statement; triggers and FK cascades
+    /// do the same), so this is a stack, not a single token.
+    statement_undo_marks: Vec<usize>,
 }
 
 impl MemDatabase {
@@ -4650,6 +4655,7 @@ impl MemDatabase {
             next_root_page: 2, // Page 1 is reserved for sqlite_master.
             undo_enabled: true,
             undo_log: Vec::new(),
+            statement_undo_marks: Vec::new(),
         }
     }
 
@@ -4759,6 +4765,31 @@ impl MemDatabase {
     pub fn commit_undo(&mut self) {
         self.undo_enabled = false;
         self.undo_log.clear();
+    }
+
+    /// bd-5bq6u: mark the start of a statement.
+    ///
+    /// Pairs with [`Self::end_statement`]. Nesting-aware: only the OUTERMOST
+    /// statement may discard records on success, because an inner statement's
+    /// records are exactly what an outer failure needs to unwind.
+    pub fn begin_statement(&mut self) {
+        self.statement_undo_marks.push(self.undo_log.len());
+    }
+
+    /// bd-5bq6u: end a statement, unwinding it when `rollback` is set.
+    ///
+    /// On success only the outermost statement truncates, which keeps the log
+    /// bounded by the statement in flight without destroying records an
+    /// enclosing statement still needs.
+    pub fn end_statement(&mut self, rollback: bool) {
+        let Some(mark) = self.statement_undo_marks.pop() else {
+            return;
+        };
+        if rollback {
+            self.rollback_to(MemDbVersionToken(mark));
+        } else if self.statement_undo_marks.is_empty() {
+            self.undo_log.truncate(mark);
+        }
     }
 
     /// bd-5bq6u: discard undo records above `token` WITHOUT applying them.

@@ -1,5 +1,6 @@
 import type { SnapshotMetadata } from "./snapshot-store";
 import type { ResultEncoding } from "./result-codec";
+import type { PreparedStatementLimits } from "./statement-budget";
 
 export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot";
 
@@ -41,6 +42,8 @@ export interface InitConfig {
   snapshot?: Uint8Array;
   /** Opt in to FQR1 transfer; unsupported result shapes still use structured clone. */
   resultEncoding?: ResultEncoding;
+  /** Request retained-handle limits. The worker may enforce tighter ceilings. */
+  preparedStatementLimits?: Partial<PreparedStatementLimits>;
 }
 
 export interface InitResult {
@@ -50,6 +53,8 @@ export interface InitResult {
   snapshot?: SnapshotMetadata | null;
   /** Absent on older workers, which only return structured-clone query results. */
   resultEncoding?: ResultEncoding;
+  /** Absent on older workers: no prepared-resource policy was acknowledged. */
+  preparedStatementLimits?: Readonly<PreparedStatementLimits>;
 }
 
 export interface PreparedStatementMetadata {

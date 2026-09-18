@@ -40525,11 +40525,25 @@ impl Connection {
     ) -> Result<InsertSelectReplayOutcome> {
         let preserve_constraint_failure_rows =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
-        self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
-            self.execute_insert_select_fallback_outcome_scoped(insert, select_stmt, params)
-                .await
-        })
-        .await
+        // bd-5bq6u: INSERT ... SELECT does not reach the `_with_db` statement
+        // boundary. It replays each source row as its OWN inner statement, so
+        // without an enclosing boundary an earlier row's successful insert
+        // survives a later row's failure. The boundary is nesting-aware, so the
+        // inner per-row statements keep their undo records for this one to unwind.
+        self.db.borrow_mut().begin_statement();
+        let outcome = self
+            .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                self.execute_insert_select_fallback_outcome_scoped(insert, select_stmt, params)
+                    .await
+            })
+            .await;
+        let unwind = outcome.as_ref().is_err_and(|error| {
+            let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
+                || (preserve_constraint_failure_rows && error_is_constraint_violation(error));
+            !preserve_rows
+        });
+        self.db.borrow_mut().end_statement(unwind);
+        outcome
     }
 
     async fn execute_insert_select_fallback_outcome_scoped(
@@ -129857,7 +129871,7 @@ async fn execute_table_program_with_db(
     // partway used to leave its earlier row writes permanently applied.
     // MemDatabase already carries a full undo log; capture the version on entry
     // so a failed statement can be unwound to exactly what it wrote.
-    let memdb_undo_token = db.borrow().undo_version();
+    db.borrow_mut().begin_statement();
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
         .then(|| {
             let span = tracing::span!(
@@ -130097,19 +130111,16 @@ async fn execute_table_program_with_db(
     // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
     // the rows already written. That is the same rule
     // `with_statement_fk_validation_scope` applies to retained-row validation.
-    if let Err(failure) = result.as_ref() {
+    let unwind = result.as_ref().is_err_and(|failure| {
+        // OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP the rows
+        // already written, which is the rule with_statement_fk_validation_scope
+        // applies to retained-row validation.
         let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
             || (program.preserves_rows_on_constraint()
                 && error_is_constraint_violation(&failure.error));
-        if !preserve_rows {
-            db.borrow_mut().rollback_to(memdb_undo_token);
-        }
-    } else {
-        // Keep the undo log bounded by the statement in flight rather than by the
-        // life of the session: a statement that succeeded can never need its own
-        // records for a statement-level unwind.
-        db.borrow_mut().forget_undo_to(memdb_undo_token);
-    }
+        !preserve_rows
+    });
+    db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
 }
 
@@ -130150,7 +130161,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     // partway used to leave its earlier row writes permanently applied.
     // MemDatabase already carries a full undo log; capture the version on entry
     // so a failed statement can be unwound to exactly what it wrote.
-    let memdb_undo_token = db.borrow().undo_version();
+    db.borrow_mut().begin_statement();
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
         .then(|| {
             let span = tracing::span!(
@@ -130320,19 +130331,16 @@ async fn execute_table_program_exactly_one_row_with_db(
     // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
     // the rows already written. That is the same rule
     // `with_statement_fk_validation_scope` applies to retained-row validation.
-    if let Err(failure) = result.as_ref() {
+    let unwind = result.as_ref().is_err_and(|failure| {
+        // OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP the rows
+        // already written, which is the rule with_statement_fk_validation_scope
+        // applies to retained-row validation.
         let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
             || (program.preserves_rows_on_constraint()
                 && error_is_constraint_violation(&failure.error));
-        if !preserve_rows {
-            db.borrow_mut().rollback_to(memdb_undo_token);
-        }
-    } else {
-        // Keep the undo log bounded by the statement in flight rather than by the
-        // life of the session: a statement that succeeded can never need its own
-        // records for a statement-level unwind.
-        db.borrow_mut().forget_undo_to(memdb_undo_token);
-    }
+        !preserve_rows
+    });
+    db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
 }
 

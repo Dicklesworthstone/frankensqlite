@@ -179,6 +179,14 @@ test('column metadata is captured once, copied by index and isolated from later 
   assert.deepEqual(response.data.columnNames, ['value']); assert.equal(calls, 1);
 });
 
+for (const returnedSql of ['SELECT \0', "SELECT 'unterminated", 'SELECT ?0']) {
+  test(`invalid returned SQL cannot strand a handle during SDK layout construction: ${JSON.stringify(returnedSql)}`, async t => {
+    const f = await fixture(t, {}, { sql: () => returnedSql });
+    error(await f.send({ kind: 'prepare', sql: 'SELECT 1' }), 'ERR_FSQLITE_BINDING_INPUT');
+    assert.equal(f.statements[0].freeCount, 1); assert.equal(f.host.preparedStatements.statements, 0);
+  });
+}
+
 test('cancellation while prepare is awaited frees the candidate before rollback and permits later reuse', async t => {
   const started = deferred(), release = deferred();
   const hooks = { async afterPrepare() { started.resolve(); await release.promise; } };
