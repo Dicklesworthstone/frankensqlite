@@ -4648,7 +4648,7 @@ impl MemDatabase {
         Self {
             tables: SwissIndex::new(),
             next_root_page: 2, // Page 1 is reserved for sqlite_master.
-            undo_enabled: false,
+            undo_enabled: true,
             undo_log: Vec::new(),
         }
     }
@@ -4759,6 +4759,15 @@ impl MemDatabase {
     pub fn commit_undo(&mut self) {
         self.undo_enabled = false;
         self.undo_log.clear();
+    }
+
+    /// bd-5bq6u: discard undo records above `token` WITHOUT applying them.
+    ///
+    /// A statement that SUCCEEDED can never need its own records for a
+    /// statement-level unwind, so dropping them keeps the log bounded by the
+    /// statement in flight rather than by the life of the session.
+    pub fn forget_undo_to(&mut self, token: MemDbVersionToken) {
+        self.undo_log.truncate(token.0);
     }
 
     /// Restore the database to a previously captured undo-version token.

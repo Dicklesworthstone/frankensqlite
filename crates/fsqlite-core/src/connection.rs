@@ -129790,6 +129790,15 @@ async fn execute_table_program_with_db(
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
 ) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
+    // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
+    //
+    // Main-schema statements are atomic because they run inside the pager's
+    // implicit transaction. TEMP tables are not in the pager -- they live in this
+    // MemDatabase image under sentinel root pages -- so a statement that failed
+    // partway used to leave its earlier row writes permanently applied.
+    // MemDatabase already carries a full undo log; capture the version on entry
+    // so a failed statement can be unwound to exactly what it wrote.
+    let memdb_undo_token = db.borrow().undo_version();
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
         .then(|| {
             let span = tracing::span!(
@@ -130024,6 +130033,24 @@ async fn execute_table_program_with_db(
             last_insert_rowid: engine_rowid,
         }),
     };
+    // bd-5bq6u: unwind this statement's MemDatabase writes when it failed, so a
+    // partially applied TEMP statement does not survive. Not every failure
+    // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
+    // the rows already written. That is the same rule
+    // `with_statement_fk_validation_scope` applies to retained-row validation.
+    if let Err(failure) = result.as_ref() {
+        let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
+            || (program.preserves_rows_on_constraint()
+                && error_is_constraint_violation(&failure.error));
+        if !preserve_rows {
+            db.borrow_mut().rollback_to(memdb_undo_token);
+        }
+    } else {
+        // Keep the undo log bounded by the statement in flight rather than by the
+        // life of the session: a statement that succeeded can never need its own
+        // records for a statement-level unwind.
+        db.borrow_mut().forget_undo_to(memdb_undo_token);
+    }
     ((result, txn_back), Some(engine))
 }
 
@@ -130056,6 +130083,15 @@ async fn execute_table_program_exactly_one_row_with_db(
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
 ) -> (TableProgramSingleRowExecOutcome, Option<VdbeEngine>) {
+    // bd-5bq6u: statement-scoped atomicity for the MemDatabase (TEMP) lane.
+    //
+    // Main-schema statements are atomic because they run inside the pager's
+    // implicit transaction. TEMP tables are not in the pager -- they live in this
+    // MemDatabase image under sentinel root pages -- so a statement that failed
+    // partway used to leave its earlier row writes permanently applied.
+    // MemDatabase already carries a full undo log; capture the version on entry
+    // so a failed statement can be unwound to exactly what it wrote.
+    let memdb_undo_token = db.borrow().undo_version();
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
         .then(|| {
             let span = tracing::span!(
@@ -130220,6 +130256,24 @@ async fn execute_table_program_exactly_one_row_with_db(
             last_insert_rowid: engine_rowid,
         }),
     };
+    // bd-5bq6u: unwind this statement's MemDatabase writes when it failed, so a
+    // partially applied TEMP statement does not survive. Not every failure
+    // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
+    // the rows already written. That is the same rule
+    // `with_statement_fk_validation_scope` applies to retained-row validation.
+    if let Err(failure) = result.as_ref() {
+        let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
+            || (program.preserves_rows_on_constraint()
+                && error_is_constraint_violation(&failure.error));
+        if !preserve_rows {
+            db.borrow_mut().rollback_to(memdb_undo_token);
+        }
+    } else {
+        // Keep the undo log bounded by the statement in flight rather than by the
+        // life of the session: a statement that succeeded can never need its own
+        // records for a statement-level unwind.
+        db.borrow_mut().forget_undo_to(memdb_undo_token);
+    }
     ((result, txn_back), Some(engine))
 }
 

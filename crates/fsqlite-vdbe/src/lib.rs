@@ -577,6 +577,9 @@ pub struct ProgramBuilder {
     schema_evaluation_context: Option<SchemaEvaluationContext>,
     /// Allocated only when expanding a VIRTUAL generated column.
     generated_column_emission: Option<Box<GeneratedColumnEmission>>,
+    /// bd-5bq6u: true when this statement is `OR FAIL`, whose semantics keep the
+    /// rows already written when a later row violates a constraint.
+    preserves_rows_on_constraint: bool,
 }
 
 impl ProgramBuilder {
@@ -591,7 +594,14 @@ impl ProgramBuilder {
             table_index_meta: HashMap::new(),
             schema_evaluation_context: None,
             generated_column_emission: None,
+            preserves_rows_on_constraint: false,
         }
+    }
+
+    /// bd-5bq6u: record that this statement preserves prior rows on a constraint
+    /// failure (`OR FAIL`). Consulted by the MemDatabase statement boundary.
+    pub fn set_preserves_rows_on_constraint(&mut self, preserves: bool) {
+        self.preserves_rows_on_constraint = preserves;
     }
 
     /// Reserve a contiguous range of auxiliary cursor identifiers.
@@ -942,6 +952,7 @@ impl ProgramBuilder {
             has_insert,
             requires_attached_memdb,
             requires_version_store,
+            preserves_rows_on_constraint: self.preserves_rows_on_constraint,
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1196,9 +1207,19 @@ pub struct VdbeProgram {
     requires_attached_memdb: bool,
     /// Precomputed flag: true when execution can request historical pages.
     requires_version_store: bool,
+    /// bd-5bq6u: true for `OR FAIL`, whose semantics keep rows already written
+    /// when a later row violates a constraint.
+    preserves_rows_on_constraint: bool,
 }
 
 impl VdbeProgram {
+    /// bd-5bq6u: does a constraint failure in this statement keep the rows it
+    /// already wrote? True for `OR FAIL`; false for the default ABORT.
+    #[must_use]
+    pub fn preserves_rows_on_constraint(&self) -> bool {
+        self.preserves_rows_on_constraint
+    }
+
     /// Route storage-root opens for connection-local TEMP objects through
     /// SQLite's database-number 1 namespace.
     ///

@@ -20717,6 +20717,9 @@ pub fn codegen_insert(
     // 3.35+). Stock enforces candidate NOT NULL/CHECK even for a row that will
     // conflict, so these are NOT blanket-IGNORE'd (bd-aap9u).
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
     let stmt_level: Option<ConflictAction> = stmt.or_conflict;
     // Validate every clause's conflict target + DO UPDATE assignment/WHERE
     // columns up front for error parity.
@@ -23089,6 +23092,9 @@ pub fn codegen_update(
     // otherwise default to OE_ABORT (standard UPDATE raises constraint error
     // on PK/UNIQUE conflicts rather than silently replacing).
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
     b.emit_op(
         Opcode::Insert,
         table_cursor,
@@ -23875,6 +23881,9 @@ fn codegen_update_from(
 
     // Insert updated row.
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
     b.emit_op(
         Opcode::Insert,
         target_cursor,
@@ -26285,6 +26294,9 @@ fn codegen_insert_without_rowid(
     // these are NOT blanket-IGNORE'd (bd-xa2qv, mirrors bd-aap9u on the rowid
     // path).
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
     let stmt_level: Option<ConflictAction> = stmt.or_conflict;
     // Validate every clause's conflict target + DO UPDATE assignment/WHERE
     // columns up front for error parity. Every emittable target shape is covered
@@ -26928,6 +26940,9 @@ fn codegen_update_without_rowid(
     let n_cols = table.columns.len();
     let n_pk = pk_indices.len();
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
 
     let end_label = b.emit_label();
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -27221,6 +27236,9 @@ fn codegen_update_from_without_rowid(
     let n_indexes = table.indexes.len();
     let target_cursor = 0_i32;
     let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
+    // constraint, so the MemDatabase statement boundary must not unwind them.
+    b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
 
     // Cursor allocation: 0 = target (write), 1..=n_indexes = target indexes,
     // then one read cursor per FROM source, then the sorter.
