@@ -206,7 +206,20 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     case "statement-finalize":
       request = { kind, requestId, statementId: text(input.statementId) };
       break;
-    case "checkpoint": case "export":
+    case "checkpoint": {
+      request = { kind, requestId };
+      const publicationId = input.publicationId;
+      if (publicationId !== undefined) request.publicationId = revision(publicationId);
+      break;
+    }
+    case "checkpoint-recover": {
+      const publicationId = revision(input.publicationId), parentRevision = input.parentRevision;
+      request = { kind, requestId, publicationId,
+        parentRevision: parentRevision === null ? null : revision(parentRevision) };
+      if (publicationId === parentRevision) invalid("Recovery revision must differ from its parent");
+      break;
+    }
+    case "export":
       request = { kind, requestId };
       break;
     default:
@@ -214,6 +227,14 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
   }
   if (transactionId !== undefined) request.transactionId = transactionId;
   return { request, bytes };
+
+  function revision(value: string): string {
+    const captured = text(value);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(captured)) {
+      invalid("Checkpoint identities must be UUID-v4 revisions");
+    }
+    return captured;
+  }
 }
 
 /** Leases are held until settlement, not merely until execution starts. */

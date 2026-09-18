@@ -232,7 +232,7 @@ export class WorkerConnectionHost {
           throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Prepared statement belongs to another scope");
         }
         if (request.transactionId !== undefined) {
-          if (request.kind === "init" || request.kind === "export" || request.kind === "checkpoint") {
+          if (request.kind === "init" || request.kind === "export" || request.kind === "checkpoint" || request.kind === "checkpoint-recover") {
             throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Finish the transaction before replacing or exporting its database");
           }
           // Managed batches perform the same complete preflight in their
@@ -289,7 +289,9 @@ export class WorkerConnectionHost {
         case "export":
           return await this.#exportSnapshot(request.requestId);
         case "checkpoint":
-          return await this.#checkpoint(request.requestId);
+          return await this.#checkpoint(request.requestId, request.publicationId);
+        case "checkpoint-recover":
+          return await this.#recoverCheckpoint(request.requestId, request.publicationId, request.parentRevision);
         case "close":
           return this.#close(request.requestId);
       }
@@ -386,7 +388,7 @@ export class WorkerConnectionHost {
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           preparedStatementLimits: stagedStatementBudget.limits,
-          ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved } : {}),
+          ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved, checkpointRecovery: 1 as const } : {}),
         },
       };
     } catch (cause: unknown) {
@@ -605,7 +607,7 @@ export class WorkerConnectionHost {
     };
   }
 
-  async #checkpoint(requestId: number): Promise<CheckpointResponse> {
+  async #checkpoint(requestId: number, publicationId?: string): Promise<CheckpointResponse> {
     const db = this.#requireDatabase();
     const store = this.#snapshotStore;
     if (store === null) {
@@ -634,7 +636,23 @@ export class WorkerConnectionHost {
     // Remain in the same host FIFO slot through export, hash, CAS and commit.
     // Quota/conflict/export failures leave both the prior durable checkpoint
     // and this session's expected revision unchanged; memory remains usable.
-    const saved = await store.save(await db.export(), this.#snapshotRevision);
+    const saved = await store.save(await db.export(), this.#snapshotRevision, publicationId);
+    this.#snapshotRevision = saved.revision;
+    return { kind: "checkpoint-result", requestId, data: saved };
+  }
+
+  async #recoverCheckpoint(requestId: number, publicationId: string, parentRevision: string | null): Promise<CheckpointResponse> {
+    const store = this.#snapshotStore;
+    if (store === null) throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
+      "Checkpoint recovery requires persistence: indexeddb-snapshot");
+    // Do not roll back the host's revision if another local checkpoint has
+    // advanced it. It may be at the parent (lost store acknowledgement) or
+    // at this publication (lost worker acknowledgement), and nowhere else.
+    if (this.#snapshotRevision !== publicationId && this.#snapshotRevision !== parentRevision) {
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED", "The live session has advanced beyond this publication");
+    }
+    const saved = await store.confirmPublication(publicationId, parentRevision);
+    if (this.#terminalError !== null) throw this.#terminalError;
     this.#snapshotRevision = saved.revision;
     return { kind: "checkpoint-result", requestId, data: saved };
   }

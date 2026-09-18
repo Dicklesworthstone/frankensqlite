@@ -427,8 +427,14 @@ export class FrankenWorkerClient {
     return ensureKind(response, "export-result").data;
   }
 
-  async checkpoint(): Promise<SnapshotMetadata> {
-    const response = await this.#send({ kind: "checkpoint", requestId: this.#nextId() });
+  async checkpoint(publicationId?: string): Promise<SnapshotMetadata> {
+    const response = await this.#send({ kind: "checkpoint", requestId: this.#nextId(),
+      ...(publicationId === undefined ? {} : { publicationId }) });
+    return ensureKind(response, "checkpoint-result").data;
+  }
+
+  async recoverCheckpoint(publicationId: string, parentRevision: string | null): Promise<SnapshotMetadata> {
+    const response = await this.#send({ kind: "checkpoint-recover", requestId: this.#nextId(), publicationId, parentRevision });
     return ensureKind(response, "checkpoint-result").data;
   }
 
@@ -652,7 +658,8 @@ function captureResponse(source: Record<string, unknown>, kind: unknown, request
     "statement-execute": "execute-result", "statement-execute-many": "execute-many-result",
     "statement-query": "query-result", "statement-finalize": "statement-finalize-result",
     transaction: "transaction-result", "cancel-transaction": "cancel-transaction-result",
-    "cancel-bulk": "cancel-bulk-result", export: "export-result", checkpoint: "checkpoint-result", close: "close-result",
+    "cancel-bulk": "cancel-bulk-result", export: "export-result", checkpoint: "checkpoint-result",
+    "checkpoint-recover": "checkpoint-result", close: "close-result",
   };
   if (kind !== expected[request] && !(kind === "query-binary-result" && expected[request] === "query-result")) {
     throw new TypeError(`Unexpected response kind for ${request}`);
