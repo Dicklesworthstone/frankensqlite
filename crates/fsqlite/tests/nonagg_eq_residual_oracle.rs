@@ -119,6 +119,182 @@ fn composite_literal_exists_prefix_and_residual_match_sqlite() {
     });
 }
 
+// hfdt-gbou9l: repeated member checks must stay on the WR table cursor.
+async fn has_direct_wr_prefix(c: &Connection, sql: &str) -> bool {
+    let rows = c.query(&format!("EXPLAIN {sql}")).await.unwrap();
+    let op = |name: &str| {
+        rows.iter().filter(|row| {
+        matches!(row.values().get(1), Some(SqliteValue::Text(value)) if value.as_str() == name)
+    }).count()
+    };
+    op("OpenRead") == 1
+        && op("SeekGE") == 1
+        && op("IdxGT") == 1
+        && op("Next") == 1
+        && op("NoConflict") == 0
+}
+
+#[test]
+fn without_rowid_literal_exists_prefix_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        // Non-leading, reordered PK catches accidental physical/logical column
+        // confusion. The secondary key reproduces the previous double seek.
+        let (f, r) = setup(&[
+            "CREATE TABLE member(flag TEXT, ordinal INTEGER, group_id TEXT, PRIMARY KEY(group_id,ordinal), UNIQUE(group_id,flag,ordinal)) WITHOUT ROWID",
+            "INSERT INTO member VALUES('same',1,'group'),('same',2,'group'),('different',3,'group'),('different',1,'other'),('same',1,'uniform'),('same',2,'uniform')",
+        ]).await;
+        for (predicate, expected) in [
+            ("group_id='group' AND flag <> 'same'", true),
+            ("group_id='uniform' AND flag <> 'same'", false),
+            ("group_id='missing' AND flag <> 'same'", false),
+            ("group_id='group' AND flag <> 'different'", true),
+            ("group_id='group' AND group_id='other'", false),
+            ("'group' IS group_id AND flag IS NULL", false),
+            ("group_id='group' AND flag <> NULL", false),
+        ] {
+            let sql = format!("SELECT 1 FROM member AS existing WHERE {predicate} LIMIT 1");
+            cmp(&f, &r, &sql, "direct-wr-prefix").await;
+            assert_eq!(!frank_rows(&f, &sql).await.is_empty(), expected, "{sql}");
+            assert!(has_direct_wr_prefix(&f, &sql).await, "{sql}");
+        }
+        let sql = "SELECT 1 FROM member WHERE group_id='uniform' AND flag <> ?1 LIMIT 1";
+        for value in ["same", "different"] {
+            cmp_params(
+                &f,
+                &r,
+                sql,
+                &[SqliteValue::from(value)],
+                &[rusqlite::types::Value::Text(value.to_owned())],
+                "wr-bound-residual",
+            )
+            .await;
+        }
+        assert!(has_direct_wr_prefix(&f, sql).await);
+        for sql in [
+            "SELECT 1 FROM member NOT INDEXED WHERE group_id='group' AND flag='same' LIMIT 1",
+            "SELECT 1 FROM member WHERE group_id='group' AND flag='same' LIMIT 1 OFFSET 1",
+            "SELECT 1 FROM member WHERE group_id='group' AND flag='same' LIMIT 2",
+        ] {
+            cmp(&f, &r, sql, "outside-wr-existence").await;
+            assert!(!has_direct_wr_prefix(&f, sql).await, "{sql}");
+        }
+        ins(&f, &r, "CREATE TRIGGER member_guard BEFORE INSERT ON member WHEN EXISTS (SELECT 1 FROM member AS existing WHERE existing.group_id=NEW.group_id AND existing.flag <> NEW.flag) BEGIN SELECT RAISE(ABORT,'inconsistent member'); END").await;
+        ins(&f, &r, "INSERT INTO member VALUES('same',3,'uniform')").await;
+        both_reject_params(
+            &f,
+            &r,
+            "INSERT INTO member VALUES('different',4,'uniform')",
+            &[],
+            &[],
+            "member-consistency",
+        )
+        .await;
+        cmp(
+            &f,
+            &r,
+            "SELECT * FROM member ORDER BY group_id,ordinal",
+            "trigger-rows",
+        )
+        .await;
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
+fn without_rowid_literal_exists_declines_unsafe_comparators() {
+    asupersync::test_utils::run_test(|| async {
+        for ddl in [
+            "CREATE TABLE member(group_id TEXT, ordinal INTEGER, flag TEXT, PRIMARY KEY(group_id DESC,ordinal)) WITHOUT ROWID",
+            "CREATE TABLE member(group_id TEXT, ordinal INTEGER, flag TEXT, PRIMARY KEY(group_id COLLATE NOCASE,ordinal)) WITHOUT ROWID",
+            "CREATE TABLE member(group_id TEXT COLLATE NOCASE, ordinal INTEGER, flag TEXT, PRIMARY KEY(group_id,ordinal)) WITHOUT ROWID",
+        ] {
+            let (f, r) = setup(&[
+                ddl,
+                "INSERT INTO member VALUES('group',1,'same'),('group',2,'different')",
+            ])
+            .await;
+            let sql = "SELECT 1 FROM member WHERE group_id='group' AND flag <> 'same' LIMIT 1";
+            cmp(&f, &r, sql, ddl).await;
+            assert!(!has_direct_wr_prefix(&f, sql).await, "{ddl}");
+            f.close().await.unwrap();
+        }
+        let (f, _) = setup(&[
+            "CREATE TABLE member(group_id TEXT, ordinal INTEGER, flag TEXT, PRIMARY KEY(group_id,ordinal)) WITHOUT ROWID",
+            "INSERT INTO member VALUES('group',1,'same')",
+        ]).await;
+        let sql = "SELECT 1 FROM member WHERE group_id='group' AND flag='same' LIMIT 1";
+        assert!(has_direct_wr_prefix(&f, sql).await);
+        f.register_collation_function(ExistsCaseFoldBinary);
+        assert!(!has_direct_wr_prefix(&f, sql).await);
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
+fn without_rowid_literal_exists_reopens_sqlite_database() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("members.sqlite");
+        let r = rusqlite::Connection::open(&path).unwrap();
+        r.execute_batch("CREATE TABLE member(flag TEXT, ordinal INTEGER, group_id TEXT, PRIMARY KEY(group_id,ordinal)) WITHOUT ROWID;
+            WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<512)
+            INSERT INTO member SELECT CASE WHEN n=512 THEN 'different' ELSE 'same' END,n,'group' FROM seq;
+            INSERT INTO member VALUES('different',1,'other'),('same',1,'uniform');").unwrap();
+        for _ in 0..2 {
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (prefix, expected) in [("group", true), ("uniform", false), ("absent", false)] {
+                let sql = format!(
+                    "SELECT 1 FROM member WHERE group_id='{prefix}' AND flag <> 'same' LIMIT 1"
+                );
+                cmp(&f, &r, &sql, "reopened-wr-prefix").await;
+                assert_eq!(!frank_rows(&f, &sql).await.is_empty(), expected);
+                assert!(has_direct_wr_prefix(&f, &sql).await);
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn without_rowid_literal_exists_preserves_other_index_choice() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE member(group_id TEXT, ordinal INTEGER, flag TEXT UNIQUE, PRIMARY KEY(group_id,ordinal)) WITHOUT ROWID",
+            "INSERT INTO member VALUES('group',1,'common'),('group',2,'rare'),('other',1,'outside')",
+        ]).await;
+        // The unique flag index narrows this to one row. A PK-prefix override
+        // would scan the entire group to reach a late/absent match.
+        for (flag, expected) in [("rare", true), ("outside", false), ("missing", false)] {
+            let sql =
+                format!("SELECT 1 FROM member WHERE group_id='group' AND flag='{flag}' LIMIT 1");
+            cmp(&f, &r, &sql, "preserve-selective-index").await;
+            assert_eq!(!frank_rows(&f, &sql).await.is_empty(), expected);
+            assert!(!has_direct_wr_prefix(&f, &sql).await);
+        }
+        f.close().await.unwrap();
+    });
+}
+
+#[test]
+fn without_rowid_literal_exists_bounds_multiple_pk_terms() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE member(flag TEXT, ordinal INTEGER, seq INTEGER, group_id TEXT, PRIMARY KEY(group_id,ordinal,seq)) WITHOUT ROWID",
+            "INSERT INTO member VALUES('different',1,1,'group'),('same',2,1,'group'),('same',2,2,'group'),('different',3,1,'group'),('different',2,1,'other')",
+        ]).await;
+        for (ordinal, expected) in [(1, true), (2, false), (3, true), (4, false)] {
+            let sql = format!(
+                "SELECT 1 FROM member WHERE group_id='group' AND ordinal={ordinal} AND flag <> 'same' LIMIT 1"
+            );
+            cmp(&f, &r, &sql, "multiple-pk-prefix").await;
+            assert_eq!(!frank_rows(&f, &sql).await.is_empty(), expected);
+            assert!(has_direct_wr_prefix(&f, &sql).await);
+            assert!(has_composite_exists_seek(&f, &sql, 2).await);
+        }
+        f.close().await.unwrap();
+    });
+}
+
 struct ExistsCaseFoldBinary;
 
 #[test]

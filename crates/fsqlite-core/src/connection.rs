@@ -11815,6 +11815,8 @@ struct PlannerDirectiveCacheEntry {
 #[derive(Clone)]
 struct TableExecutionMetadataCacheEntry {
     schema_generation: u64,
+    /// Original DDL proves an ASC/BINARY primary key; unknown schemas decline.
+    wr_binary_ascending_roots: Vec<i32>,
     autoincrement_table_name_by_root_page: Arc<HbHashMap<i32, String>>,
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
@@ -61365,6 +61367,9 @@ impl Connection {
         let rowid_alias_columns = self.rowid_alias_columns.borrow();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let without_rowid_pk_desc = self.without_rowid_pk_desc.borrow();
+        let original_ddl = self.original_ddl_sql.borrow();
+        let temp_names = self.temp_table_names.borrow();
+        let mut wr_binary_ascending_roots = Vec::new();
         let mut autoincrement_table_name_by_root_page = HbHashMap::new();
         let mut rowid_alias_col_by_root_page = HbHashMap::new();
         let mut table_column_count_by_root_page = HbHashMap::with_capacity(schema.len());
@@ -61381,6 +61386,55 @@ impl Connection {
 
         for table in schema.iter() {
             let table_name_key = table.name.to_ascii_lowercase();
+            // Inspect the original AST, not column names alone: table-level PK
+            // terms can override column collation and direction. Cache this
+            // once per schema generation, not once per trigger invocation.
+            // TEMP shadowing has a separate DDL namespace; decline it here.
+            if table.without_rowid
+                && !temp_names.contains(&table_name_key)
+                && let Some(sql) = original_ddl.get(&table_name_key)
+                && let Ok(Statement::CreateTable(create)) = parse_single_statement(sql)
+                && create.without_rowid
+                && let CreateTableBody::Columns {
+                    columns,
+                    constraints,
+                } = &create.body
+                && let Ok(slots) = implicit_autoindex_layout(columns, constraints, true)
+                && let Some(pk) = slots
+                    .iter()
+                    .find(|slot| slot.hidden_without_rowid_primary_key)
+                && table.primary_key_constraints.first() == Some(&pk.definition.columns)
+                && pk
+                    .definition
+                    .key_sort_directions
+                    .iter()
+                    .all(|direction| *direction == SortDirection::Asc)
+                && pk.definition.key_collations.iter().all(|collation| {
+                    collation
+                        .as_deref()
+                        .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                })
+                && without_rowid_pk_desc
+                    .get(&table_name_key)
+                    .is_some_and(|flags| {
+                        flags.len() == pk.definition.columns.len()
+                            && flags.iter().all(|descending| !descending)
+                    })
+                && pk.definition.columns.iter().all(|name| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                        .is_some_and(|column| {
+                            column
+                                .collation
+                                .as_deref()
+                                .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                        })
+                })
+            {
+                wr_binary_ascending_roots.push(table.root_page);
+            }
             if autoincrement_tables.contains(&table_name_key) {
                 autoincrement_table_name_by_root_page
                     .insert(table.root_page, table_name_key.clone());
@@ -61515,6 +61569,7 @@ impl Connection {
 
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
             schema_generation,
+            wr_binary_ascending_roots,
             autoincrement_table_name_by_root_page,
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
@@ -79364,6 +79419,10 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
             index_ordered_scan_reliable: true,
+            wr_binary_ascending_roots: self
+                .table_execution_metadata()
+                .wr_binary_ascending_roots
+                .clone(),
             planner_select_directive,
             collation_semantics: if lock_unpoisoned(self.collation_registry.as_ref())
                 .any_builtin_overridden()

@@ -2288,6 +2288,9 @@ pub struct CodegenContext {
     /// Connection-verified built-in comparison semantics. Defaults to unverified:
     /// the name BINARY alone does not exclude an application override.
     pub collation_semantics: CollationSemantics,
+    /// Connection-proven ASC/BINARY WITHOUT ROWID primary-key table roots.
+    /// Empty by default: column names alone are not a comparator proof.
+    pub wr_binary_ascending_roots: Vec<i32>,
     /// Optional planner-produced lowering directive for simple single-table
     /// SELECT access paths. When present, lowering either honors it or emits
     /// an explicit bypass reason before falling back to heuristic selection.
@@ -3973,6 +3976,68 @@ pub fn codegen_select(
             &targets,
             true,
             Some(index),
+        );
+    }
+
+    // HFDT's member-consistency probe has a partial PK and a residual. Walk
+    // the table's PK range directly instead of resolving a secondary-index
+    // entry back to the same table for every candidate row.
+    if table.without_rowid
+        && ctx.index_ordered_scan_reliable
+        && ctx.collation_semantics == CollationSemantics::Builtin
+        && ctx.wr_binary_ascending_roots.contains(&table.root_page)
+        // Preserve planner choices that may narrow candidates further: a
+        // different key, an expression/partial index, or a range.
+        && ctx.planner_select_directive.as_ref().is_none_or(|directive| {
+            directive.table_name.eq_ignore_ascii_case(&table.name)
+                && match directive.access_kind {
+                    PlannerSelectAccessKind::FullTableScan => true,
+                    PlannerSelectAccessKind::IndexEquality => {
+                        !directive.index_key_is_expression
+                            && table.primary_key_constraints.first().and_then(|pk| pk.first())
+                                .is_some_and(|first| directive.index_key_label.as_deref()
+                                    .is_some_and(|key| key.eq_ignore_ascii_case(first)))
+                            && directive.index_name.as_deref()
+                                .and_then(|name| find_index_named(table, name))
+                                .is_some_and(IndexSchema::supports_direct_column_lookup)
+                    }
+                    PlannerSelectAccessKind::RowidLookup | PlannerSelectAccessKind::IndexRange => false,
+                }
+        })
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.body.compounds.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && matches!(
+            columns.as_slice(),
+            [ResultColumn::Expr {
+                expr: Expr::Literal(Literal::Integer(1), _),
+                ..
+            }]
+        )
+        && stmt.limit.as_ref().is_some_and(|limit| {
+            limit.offset.is_none() && matches!(limit.limit, Expr::Literal(Literal::Integer(1), _))
+        })
+        && let Some(predicate) = where_clause.as_deref()
+        && where_is_plain_scan_safe(predicate)
+        && !expr_contains_non_numbered_placeholder(predicate)
+        && let Some(targets) = literal_exists_pk_prefix(table, table_alias, schema, predicate)
+    {
+        return codegen_select_without_rowid_exists_prefix(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            predicate,
+            &targets,
+            out_regs,
+            done_label,
+            end_label,
         );
     }
 
@@ -30295,6 +30360,107 @@ fn literal_exists_index_prefix<'a, 's>(
         }
         (targets.len() >= 2).then_some((index, targets))
     }).max_by_key(|(_, targets)| targets.len())
+}
+
+/// Admit only a proper leading PK prefix with native-class literal keys.
+/// Keep the complete predicate in the loop, including conflicting equalities.
+fn literal_exists_pk_prefix<'a>(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    predicate: &'a Expr,
+) -> Option<Vec<&'a Expr>> {
+    let pk = table.primary_key_constraints.first()?;
+    let mut terms = Vec::new();
+    collect_conjunctive_terms(predicate, &mut terms);
+    let mut targets = Vec::new();
+    for column in pk {
+        let target = terms.iter().find_map(|term| {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq | BinaryOp::Is,
+                right,
+                ..
+            } = term
+            else {
+                return None;
+            };
+            let target = if expr_matches_index_column(left, table, table_alias, column) {
+                right.as_ref()
+            } else if expr_matches_index_column(right, table, table_alias, column) {
+                left.as_ref()
+            } else {
+                return None;
+            };
+            (matches!(
+                target,
+                Expr::Literal(
+                    Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_),
+                    _
+                )
+            ) && index_range_bound_is_seek_safe(table, table_alias, schema, column, target))
+            .then_some(target)
+        });
+        let Some(target) = target else { break };
+        targets.push(target);
+    }
+    (!targets.is_empty() && targets.len() < pk.len() && u16::try_from(targets.len()).is_ok())
+        .then_some(targets)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_without_rowid_exists_prefix(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    predicate: &Expr,
+    targets: &[&Expr],
+    out_reg: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let width = i32::try_from(targets.len())
+        .map_err(|_| CodegenError::Unsupported("primary key prefix too wide".to_owned()))?;
+    let bound_width = u16::try_from(targets.len())
+        .map_err(|_| CodegenError::Unsupported("primary key prefix too wide".to_owned()))?;
+    let keys = b.alloc_regs(width);
+    for (offset, target) in targets.iter().enumerate() {
+        emit_expr(b, target, keys + offset as i32, None);
+    }
+    let record = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, keys, width, record, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(Opcode::SeekGE, cursor, record, done_label, P4::None, 0);
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::IdxGT,
+        cursor,
+        record,
+        done_label,
+        P4::None,
+        bound_width,
+    );
+    let skip_row = b.emit_label();
+    emit_where_filter(b, predicate, cursor, table, table_alias, schema, skip_row);
+    b.emit_op(Opcode::Integer, 1, out_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_reg, 1, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(skip_row);
+    b.emit_op(Opcode::Next, cursor, loop_start as i32, 0, P4::None, 0);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
 }
 
 fn extract_index_column_equality_expr<'a>(

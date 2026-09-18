@@ -952,7 +952,11 @@ impl ProgramBuilder {
             has_insert,
             requires_attached_memdb,
             requires_version_store,
-            preserves_rows_on_constraint: self.preserves_rows_on_constraint,
+            constraint_failure_rows: if self.preserves_rows_on_constraint {
+                ConstraintFailureRows::Preserve
+            } else {
+                ConstraintFailureRows::Discard
+            },
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1185,6 +1189,13 @@ fn storage_root_usage_for_op(pc: usize, op: &VdbeOp) -> Option<StorageRootUsage>
     })
 }
 
+/// Whether a constraint failure retains rows written earlier in the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintFailureRows {
+    Discard,
+    Preserve,
+}
+
 /// A finalized VDBE bytecode program ready for execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VdbeProgram {
@@ -1207,9 +1218,9 @@ pub struct VdbeProgram {
     requires_attached_memdb: bool,
     /// Precomputed flag: true when execution can request historical pages.
     requires_version_store: bool,
-    /// bd-5bq6u: true for `OR FAIL`, whose semantics keep rows already written
-    /// when a later row violates a constraint.
-    preserves_rows_on_constraint: bool,
+    /// bd-5bq6u: `OR FAIL` keeps rows already written when a later row
+    /// violates a constraint; ABORT discards them.
+    constraint_failure_rows: ConstraintFailureRows,
 }
 
 impl VdbeProgram {
@@ -1217,7 +1228,7 @@ impl VdbeProgram {
     /// already wrote? True for `OR FAIL`; false for the default ABORT.
     #[must_use]
     pub fn preserves_rows_on_constraint(&self) -> bool {
-        self.preserves_rows_on_constraint
+        self.constraint_failure_rows == ConstraintFailureRows::Preserve
     }
 
     /// Route storage-root opens for connection-local TEMP objects through
