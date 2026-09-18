@@ -7785,6 +7785,15 @@ mod tests {
             wrapped_cases > 0,
             "the regression must exercise split deque storage"
         );
+        for len in [64, 4096, 4097] {
+            let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(1024));
+            tracker.access_trace.extend((0..len).map(|_| pages[0]));
+            tracker.forget(pages[0]);
+            assert_eq!(
+                tracker.access_trace.len(),
+                if len <= 4096 { 0 } else { len }
+            );
+        }
     }
 
     #[test]
