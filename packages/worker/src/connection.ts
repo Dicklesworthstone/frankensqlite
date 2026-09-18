@@ -28,7 +28,7 @@ import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, vali
 import type { SnapshotMetadata } from "./snapshot-store";
 import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
 import type { RequestLimits, RequestQueueStats } from "./admission";
-import { ManagedTransactionError, ManagedTransactions, validateManagedSql } from "./transactions";
+import { ManagedTransactionError, ManagedTransactions, executeManagedBatch, validateManagedSql } from "./transactions";
 import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
 import type { ResultEncoding } from "./result-codec";
 import { parameterLayout, resolveBindings } from "./bindings";
@@ -224,7 +224,9 @@ export class WorkerConnectionHost {
           if (request.kind === "init" || request.kind === "export" || request.kind === "checkpoint") {
             throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Finish the transaction before replacing or exporting its database");
           }
-          if ("sql" in request) validateManagedSql(request.sql, request.kind === "execute-batch");
+          // Managed batches perform the same complete preflight in their
+          // cancellable runner, before any script statement is dispatched.
+          if ("sql" in request && request.kind !== "execute-batch") validateManagedSql(request.sql);
           else if ("statementId" in request && request.kind !== "statement-finalize") {
             validateManagedSql(this.#requireStatement(request.statementId).sql);
           }
@@ -244,7 +246,7 @@ export class WorkerConnectionHost {
             request.params ?? [],
           );
         case "execute-batch":
-          return await this.#executeBatch(request.requestId, request.sql);
+          return await this.#executeBatch(request.requestId, request.sql, request.transactionId);
         case "execute-many":
           return await this.#executeMany(request.requestId, request.sql, request.parameterSets, undefined, cancellation);
         case "statement-execute-many": {
@@ -374,8 +376,18 @@ export class WorkerConnectionHost {
   async #executeBatch(
     requestId: number,
     sql: string,
+    transactionId?: string,
   ): Promise<ExecuteBatchResponse> {
-    await this.#requireDatabase().executeBatch(sql);
+    const db = this.#requireDatabase();
+    if (transactionId === undefined) {
+      // Manual scripts may own their own BEGIN/COMMIT and keep core semantics.
+      await db.executeBatch(sql);
+    } else {
+      await executeManagedBatch(db, sql, () => {
+        if (this.#terminalError !== null) throw this.#terminalError;
+        this.#transactions.assertOwner(transactionId);
+      });
+    }
     return {
       kind: "execute-batch-result",
       requestId,

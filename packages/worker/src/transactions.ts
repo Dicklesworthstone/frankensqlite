@@ -31,6 +31,14 @@ export function validateTransactionId(id: string): void {
  * internal body semicolon. Syntax and object semantics remain the core's job.
  */
 export function validateManagedSql(sql: string, script = false): void {
+  // Exhaust the scanner before executing ANY part of a managed script. A
+  // transaction boundary or malformed token in its tail must not be hidden
+  // behind an earlier statement with externally observable function effects.
+  for (const _end of managedStatementEnds(sql, script)) { /* validation only */ }
+}
+
+/** Statement end offsets, sharing exactly the managed preflight's lexer. */
+function* managedStatementEnds(sql: string, script: boolean): Generator<number> {
   const reject = (message: string): never => {
     throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_SQL", message);
   };
@@ -56,6 +64,7 @@ export function validateManagedSql(sql: string, script = false): void {
     if (char === ";") {
       i++;
       if (trigger && triggerTail !== 2) { triggerTail = 1; continue; }
+      if (!start) yield i;
       trigger = false;
       triggerTail = 0;
       createPrefix = 0;
@@ -100,6 +109,48 @@ export function validateManagedSql(sql: string, script = false): void {
     if (trigger) triggerTail = triggerTail === 1 && word === "END" ? 2 : 0;
   }
   if (count === 0) reject("Managed SQL must contain a statement");
+  if (!start) yield sql.length;
+}
+
+/**
+ * Execute only inside a caller-owned transaction and the host's FIFO slot.
+ * The owner supplies a checkpoint that rejects cancellation/transport failure.
+ * Rollback belongs to that owner: this routine never starts or commits a txn.
+ * A trigger body stays one statement; no array proportional to script length
+ * is built. One long SQL statement still requires core-level interruption.
+ */
+export async function executeManagedBatch(
+  db: Pick<CoreDatabaseHandle, "executeBatch">,
+  sql: string,
+  checkpoint: () => void,
+): Promise<void> {
+  checkpoint();
+  let remaining = 0;
+  for (const _end of managedStatementEnds(sql, true)) remaining++;
+  checkpoint();
+  const yieldTask = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0); });
+  // Give already-arriving cancellation controls a task turn before a script
+  // starts. Keep ordinary single-statement calls on their existing fast path.
+  if (remaining > 1) { await yieldTask(); checkpoint(); }
+  let start = 0;
+  let sinceYield = 0;
+  let lastYield = performance.now();
+  for (const end of managedStatementEnds(sql, true)) {
+    checkpoint();
+    await db.executeBatch(sql.slice(start, end));
+    // Do not report a script successful or admit its next statement after a
+    // cancellation that arrived while the current core operation was awaited.
+    checkpoint();
+    start = end;
+    remaining--;
+    sinceYield++;
+    if (remaining > 0 && (sinceYield >= 32 || performance.now() - lastYield >= 4)) {
+      await yieldTask();
+      checkpoint();
+      sinceYield = 0;
+      lastYield = performance.now();
+    }
+  }
 }
 
 interface Frame {
