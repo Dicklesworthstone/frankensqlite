@@ -312,6 +312,8 @@ export class WorkerConnectionHost {
     const resultEncoding = resolveResultEncoding(config.resultEncoding);
 
     let stagedStore: IndexedDbSnapshotStore | null = null;
+    let stagedDb: CoreDatabaseHandle | null = null;
+    let disposingPrevious = false;
     try {
       let image = config.snapshot;
       let saved: SnapshotMetadata | null = null;
@@ -330,13 +332,31 @@ export class WorkerConnectionHost {
             byteLength: loaded.byteLength, sha256: loaded.sha256 };
         }
       }
-      // Validate storage before disposing the old session. Failed or corrupt
-      // loads must neither erase the old image nor initialize an empty DB.
+      // Import/open and capture candidate metadata BEFORE touching the current
+      // session. A rejected import must not erase unsaved data, prepared handles,
+      // a manual transaction, or the previous snapshot publication lineage.
       const core = await this.#loader.load(config.wasmUrl);
-      this.#disposeDatabase();
-      this.#db = image !== undefined
+      stagedDb = image !== undefined
         ? await core.FrankenDB.import(image)
         : await core.FrankenDB.create(resolveDatabasePath(config));
+      if (stagedDb === this.#db) {
+        // A loader may not transfer the live handle back as a new allocation.
+        // In particular, never close that alias while cleaning up a candidate.
+        stagedDb = null;
+        throw new Error("Database initialization must return a separately owned handle");
+      }
+      const path = ready.persistence === "indexeddb-snapshot" ? ready.path : stagedDb.path || ready.path;
+      if (typeof path !== "string") throw new Error("Invalid initialized database path");
+      if (this.#terminalError !== null) throw this.#terminalError;
+
+      // No await or user callback follows the ownership transfer. If retiring
+      // the old session fails, the candidate is NOT published and all later SQL
+      // is fenced using the established fatal connection-cleanup contract.
+      disposingPrevious = true;
+      this.#disposeDatabase();
+      if (this.#terminalError !== null) throw this.#terminalError;
+      this.#db = stagedDb;
+      stagedDb = null;
       this.#snapshotStore = stagedStore;
       stagedStore = null; // Ownership transfers only after core initialization.
       this.#snapshotRevision = saved?.revision ?? null;
@@ -344,14 +364,30 @@ export class WorkerConnectionHost {
       return {
         kind: "ready", requestId,
         data: {
-          path: ready.persistence === "indexeddb-snapshot" ? ready.path : this.#db.path || ready.path,
+          path,
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved } : {}),
         },
       };
-    } finally {
-      stagedStore?.close();
+    } catch (cause: unknown) {
+      const cleanupErrors: unknown[] = [];
+      // Close and free independently, even after a throwing close. Retain all
+      // causes (including thrown undefined) without retrying any destructor.
+      for (const cleanup of [() => stagedDb?.close(), () => stagedDb?.free(), () => stagedStore?.close()]) {
+        try { cleanup(); } catch (error: unknown) { cleanupErrors.push(error); }
+      }
+      if (disposingPrevious || cleanupErrors.length !== 0) {
+        const failure = new ManagedTransactionError(disposingPrevious
+          ? "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE" : "ERR_FSQLITE_WORKER_INITIALIZATION",
+          disposingPrevious
+            ? "Database replacement cleanup failed; reopen the connection"
+            : "Database initialization and candidate cleanup failed; the previous session was retained",
+          { cause }, disposingPrevious);
+        failure.cleanupErrors.push(...cleanupErrors);
+        throw failure;
+      }
+      throw cause;
     }
   }
 
@@ -553,30 +589,33 @@ export class WorkerConnectionHost {
     this.#snapshotStore = null;
     this.#snapshotRevision = null;
 
-    let firstError: unknown;
+    const errors: unknown[] = [];
     try { snapshotStore?.close(); }
-    catch (error: unknown) { firstError = error; }
+    catch (error: unknown) { errors.push(error); }
     for (const stmt of statements) {
       try {
         stmt.free();
       } catch (error: unknown) {
-        firstError ??= error;
+        errors.push(error);
       }
     }
     if (db !== null) {
       try {
         db.close();
       } catch (error: unknown) {
-        firstError ??= error;
+        errors.push(error);
       }
       try {
         db.free();
       } catch (error: unknown) {
-        firstError ??= error;
+        errors.push(error);
       }
     }
-    if (firstError !== undefined) {
-      throw firstError;
+    if (errors.length !== 0) {
+      const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+        "Database resource cleanup failed; the connection is unusable", { cause: errors[0] }, true);
+      failure.cleanupErrors.push(...errors.slice(1));
+      throw failure;
     }
   }
 
