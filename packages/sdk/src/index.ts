@@ -44,3 +44,5 @@ export { DurableJobQueue, DurableJobError, DURABLE_JOBS_TABLE } from "./durable-
 export type { DurableJobDatabase, DurableJobTransaction, DurableJobQueueOptions, DurableClaimOptions, EnqueueJob, DurableJobState, DurableJob, DurableJobLease, DurableEnqueueResult, DurableEnqueueWorkResult, DurableJobStats } from "./durable-jobs";
 export { DurableJobWorker, DurableJobWorkerError } from "./durable-job-worker";
 export type { DurableWorkerQueue, DurableJobHandler, DurableJobContext, DurableJobCompletion, DurableJobWorkerOptions, DurableJobWorkerStopOptions, DurableJobWorkerStats, DurableJobWorkerPhase } from "./durable-job-worker";
+export { ChangesetError, decodeChangeset, encodeChangeset, invertChangeset } from "./changeset-codec";
+export type { ChangesetValue, ChangesetField, ChangesetChange, ChangesetTable, ChangesetLimits } from "./changeset-codec";
