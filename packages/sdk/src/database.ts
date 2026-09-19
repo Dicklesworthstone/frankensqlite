@@ -8,6 +8,7 @@ import { checkStreamCancellation, executeRowStream, streamOptions } from "./stre
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import { isSnapshotPersistenceMode, resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
 import type { PreparedStatementLimits } from "@frankensqlite/worker";
+import { resolveSnapshotOwnership, SnapshotOwnershipError } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 import type { CheckpointRecoveryIdentity, TransactionOptions } from "./types";
 import { isTransactionConflict, resolveTransactionRetryOptions, runTransactionRetry } from "./transaction-retry";
@@ -126,6 +127,11 @@ export class FrankenDB {
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
     const normalized = normalizeOpenOptions(options);
     const requiredCheckpoint = captureRequiredCheckpoint(normalized);
+    const ownership = resolveSnapshotOwnership(normalized.snapshotOwnership);
+    if (ownership !== undefined && !isSnapshotPersistenceMode(normalized.persistence)) {
+      throw new SnapshotOwnershipError("ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
+        "snapshotOwnership requires snapshot persistence");
+    }
     // Validate before allocating a worker or transferring a snapshot buffer.
     const limits = resolveRequestLimits(normalized.requestLimits);
     const resultEncoding = resolveResultEncoding(normalized.resultEncoding);
@@ -134,6 +140,7 @@ export class FrankenDB {
       ? undefined : resolvePreparedStatementLimits(requestedStatementLimits);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
+    if (ownership !== undefined) config.snapshotOwnership = ownership;
     if (statementLimits !== undefined) config.preparedStatementLimits = statementLimits;
     if (normalized.resultEncoding !== undefined) config.resultEncoding = resultEncoding;
     if (normalized.dbName !== undefined) {
@@ -208,6 +215,9 @@ export class FrankenDB {
   get persistence(): PersistenceMode {
     return this.#persistence;
   }
+
+  /** Negotiated session policy, not proof that a closed/crashed worker is live. */
+  get snapshotOwnership() { return this.#client.snapshotOwnership; }
 
   /** Acknowledged worker limits; null means an older worker supplied no policy. */
   get preparedStatementLimits(): Readonly<PreparedStatementLimits> | null { return this.#preparedStatementLimits; }
