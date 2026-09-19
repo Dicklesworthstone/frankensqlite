@@ -197,32 +197,63 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
                     "CREATE TABLE guarded(owner TEXT NOT NULL, ordinal INTEGER NOT NULL,
                  category TEXT NOT NULL, PRIMARY KEY(owner,ordinal)){suffix};
                  CREATE INDEX guarded_category ON guarded(category,ordinal,owner);
-                 CREATE TRIGGER guard_before BEFORE INSERT ON guarded
-                 WHEN EXISTS(SELECT 1 FROM guarded AS old
-                     WHERE old.owner=NEW.owner AND old.category<>NEW.category)
-                 BEGIN SELECT RAISE(ABORT,'mixed category'); END;
-                 CREATE TRIGGER guard_after AFTER INSERT ON guarded
-                 WHEN EXISTS(SELECT 1 FROM guarded AS old
-                     WHERE old.owner=NEW.owner AND old.category<>NEW.category)
-                 BEGIN SELECT RAISE(ABORT,'mixed category'); END;
-                 INSERT INTO guarded VALUES ('group',0,'middle'),('group',1,'middle');"
+                 INSERT INTO guarded VALUES {values};"
                 ),
             )
             .await;
-            for bad in [
-                "INSERT INTO guarded VALUES ('group',2,'other')",
-                "INSERT INTO guarded VALUES ('new',0,'middle'),('new',1,'other')",
-            ] {
-                assert!(
-                    oracle.execute_batch(bad).is_err(),
-                    "stock must reject: {bad}"
-                );
-                assert!(
-                    conn.execute_batch(bad).await.is_err(),
-                    "engine must reject: {bad}"
-                );
+            let mut trigger_costs = Vec::new();
+            for (ordinal, hint) in [(512, ""), (513, " NOT INDEXED")] {
+                execute_both(
+                    &conn,
+                    &oracle,
+                    &format!(
+                        "DROP TRIGGER IF EXISTS guard_before;
+                         DROP TRIGGER IF EXISTS guard_after;
+                         CREATE TRIGGER guard_before BEFORE INSERT ON guarded
+                         WHEN EXISTS(SELECT 1 FROM guarded AS member{hint}
+                             WHERE member.owner=NEW.owner AND member.category<>NEW.category)
+                         BEGIN SELECT RAISE(ABORT,'mixed category'); END;
+                         CREATE TRIGGER guard_after AFTER INSERT ON guarded
+                         WHEN EXISTS(SELECT 1 FROM guarded AS member{hint}
+                             WHERE member.owner=NEW.owner AND member.category<>NEW.category)
+                         BEGIN SELECT RAISE(ABORT,'mixed category'); END;"
+                    ),
+                )
+                .await;
+                set_hot_path_profile_enabled(true);
+                let guard = ProfileGuard;
+                let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
+                compare(
+                    &conn,
+                    &oracle,
+                    &format!(
+                        "INSERT INTO guarded VALUES ('group',{ordinal},'middle') RETURNING ordinal"
+                    ),
+                    1,
+                )
+                .await;
+                trigger_costs
+                    .push(hot_path_profile_snapshot().vdbe.opcodes_executed_total - before);
+                drop(guard);
+                for bad in [
+                    "INSERT INTO guarded VALUES ('group',514,'other') RETURNING ordinal",
+                    "INSERT INTO guarded VALUES ('new',0,'middle'),('new',1,'other') RETURNING ordinal",
+                ] {
+                    assert!(
+                        oracle.execute_batch(bad).is_err(),
+                        "stock must reject: {bad}"
+                    );
+                    assert!(
+                        conn.execute_batch(bad).await.is_err(),
+                        "engine must reject: {bad}"
+                    );
+                }
+                compare(&conn, &oracle, "SELECT COUNT(*) FROM guarded", 1).await;
             }
-            compare(&conn, &oracle, "SELECT COUNT(*) FROM guarded", 1).await;
+            eprintln!("trigger_exclusion suffix={suffix:?} bounded_and_scan_ops={trigger_costs:?}");
+            assert!((1..512).contains(&trigger_costs[0]), "{trigger_costs:?}");
+            assert!(trigger_costs[1] > 512 && trigger_costs[1] > trigger_costs[0]);
+            conn.close().await.expect("close engine connection");
         }
     });
 }
