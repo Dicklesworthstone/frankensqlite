@@ -94,7 +94,7 @@ thread_local! {
 /// still wrap the shared counter and allow later reservations to overlap.
 fn reserve_id_range(shared: &AtomicU64, size: u64) -> LocalBatch {
     let start = shared
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |start| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |start| {
             start.checked_add(size)
         })
         .expect("MVCC identifier range exhausted");
@@ -151,16 +151,14 @@ impl ReadTsBatcher {
             return key;
         }
         let candidate = NEXT_READ_TS_CACHE_KEY
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("read timestamp cache identity space exhausted");
-        match self.cache_key.compare_exchange(
-            0,
-            candidate,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match self
+            .cache_key
+            .compare_exchange(0, candidate, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => candidate,
             Err(installed) => installed,
         }
