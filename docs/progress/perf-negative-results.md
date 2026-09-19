@@ -12,6 +12,47 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-09-19 - Insufficient for HFDT persistence: index-extrema EXISTS exclusion (hfdt-gbou9l)
+
+- Target: the original populated schema-116 HFDT store, the complete retained
+  provider capture (6,187 facts), unchanged production triggers, four original
+  filters, six-table preservation, and the original 1,800-second runtime bound.
+- Engine change: `crates/fsqlite-vdbe/src/codegen.rs`, published in
+  `b235e6853`. A complete ordered index with equal minimum/maximum leading keys
+  can prove an exclusion probe empty; inconclusive probes retain the ordinary
+  plan and complete predicate. Regression coverage is in `35c8fe037` and
+  `388ba65a9`, `crates/fsqlite-core/tests/hfdt_gbou9l_index_exclusion.rs`.
+- The bounded SQL improvement is established on both rowid and WITHOUT ROWID
+  tables: 16/17 executed VM instructions versus 5,128 for a forced scan. Actual
+  BEFORE/AFTER triggers with `INSERT ... RETURNING` use 62/67 instructions versus
+  10,316/10,319 with `NOT INDEXED`; stock results and rejection/rollback controls
+  pass. These are generic engine tests, not provider or HFDT persistence proof.
+- Consumer: HFDT `27d83c97d693f7d1a0d2646fab61c9fca200dc6a`, engine
+  `da6d46d59066ba085145e61d19a077b5a925c722` plus codegen overlay SHA256
+  `4dec8a03f93b419b1d28df671e7f6195f1c55b29320a1bbc7b0acf993af4a8aa`.
+  Binary SHA256 `8bacf327315cc121b37ecabfb96ac4af841cf4e7b5f4d481fcc7959c12606079`.
+  Strict remote build passed; execution exited 124 at 1,800.222 seconds.
+  All facts decoded, but no persistence or migration completion was reported.
+  Fresh-process stock readback found schema 116 and zero committed rows in all
+  six SEC graph tables; integrity/quick checks passed, foreign-key check was
+  empty. The three remaining controls passed separately; aggregate acceptance
+  remains false. No end-to-end speedup is established and no HFDT dependency
+  promotion or issue closure is justified by this attempt.
+- One GDB sample took 2.023 seconds inside that unchanged deadline, detached
+  cleanly, and showed index-key decoding/seeking beneath trigger evaluation
+  during projection-member insertion. This is an instrumented attempt, not an
+  uninstrumented timing comparison; one stack cannot establish a dominant
+  hotspot. Check lookup frequency and full-record decoding before choosing the
+  next optimization. Existing prefix/header decoders are investigation leads,
+  not a validated replacement for the comparator's semantics.
+- Artifacts: `/data/projects/hfdt_nobleridge_scratch/20260919-index-exclusion`,
+  `20260919-trigger-exclusion`, and `20260919-index-exclusion-consumer` under
+  that scratch root. The last directory retains source/binary identity,
+  `execution.json`, `result.json`, `controls-result.json`, `postmortem.json`,
+  and the stack with its sampling metadata. Retry the original consumer after
+  another measured runtime change; do not rerun this same candidate expecting
+  acceptance, reduce the capture, remove triggers, or extend the deadline.
+
 ## 2026-09-11 - Not implemented: dropping the WAL adapter read pin at publication (GH#402, bd-sde05.3)
 
 - Target: growing page-index copy work during sequential table/index DDL in
