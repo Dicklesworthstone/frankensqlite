@@ -44,8 +44,9 @@ fn main_foreign_key_check_seeks_and_still_reports_orphans() {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("foreign-keys.db");
             let stock = rusqlite::Connection::open(&path).expect("stock producer");
-            stock.execute_batch(&format!(
-                "PRAGMA foreign_keys=OFF;
+            stock
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys=OFF;
                  CREATE TABLE parent(owner TEXT NOT NULL, ordinal INTEGER NOT NULL,
                      PRIMARY KEY(owner,ordinal)){suffix};
                  CREATE TABLE child(id INTEGER PRIMARY KEY, owner TEXT, ordinal INTEGER,
@@ -54,21 +55,50 @@ fn main_foreign_key_check_seeks_and_still_reports_orphans() {
                      INSERT INTO parent SELECT 'group',i FROM n;
                  INSERT INTO child SELECT ordinal+1,owner,ordinal FROM parent;
                  INSERT INTO child VALUES(257,'group',256),(258,NULL,256),(259,'group',NULL);"
-            )).expect("stock schema and rows");
+                ))
+                .expect("stock schema and rows");
             let expected = stock_rows(&stock, "PRAGMA foreign_key_check");
             assert_eq!(expected.len(), 1, "exactly one deliberately orphaned row");
             stock.close().expect("close producer");
-            let conn = Connection::open(path.to_string_lossy()).await.expect("engine open");
+            let conn = Connection::open(path.to_string_lossy())
+                .await
+                .expect("engine open");
             set_hot_path_profile_enabled(true);
             let guard = ProfileGuard;
             let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
-            let rows = conn.query("PRAGMA foreign_key_check").await.expect("engine FK check");
+            let rows = conn
+                .query("PRAGMA foreign_key_check")
+                .await
+                .expect("engine FK check");
             let ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
             drop(guard);
-            let actual = rows.iter().map(|row| row.values().to_vec()).collect::<Vec<_>>();
+            let actual = rows
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>();
             assert_eq!(actual, expected, "FK violations {suffix:?}");
             eprintln!("main_fk suffix={suffix:?} children=259 parents=256 opcodes={ops}");
-            assert!(ops < 256 * 200, "qualified parent lookup scanned repeatedly: {ops}");
+            assert!(
+                ops < 256 * 200,
+                "qualified parent lookup scanned repeatedly: {ops}"
+            );
+            // A same-named TEMP parent must not replace the MAIN parent or
+            // donate its different affinity/collation to the optimization.
+            conn.execute("CREATE TEMP TABLE parent(owner INTEGER, ordinal TEXT COLLATE NOCASE)")
+                .await
+                .expect("TEMP shadow");
+            let shadowed = conn
+                .query("PRAGMA main.foreign_key_check")
+                .await
+                .expect("shadowed FK check");
+            assert_eq!(
+                shadowed
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                expected,
+                "explicit MAIN must preserve the original parent despite TEMP shadowing"
+            );
             conn.close().await.expect("engine close");
         }
     });

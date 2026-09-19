@@ -82810,14 +82810,15 @@ impl Connection {
     /// interpreted per-row fallback still evaluates it correctly, just without
     /// the seek. NULL targets are left alone.
     ///
-    /// Scope is a single unqualified MAIN FROM table (no joins/CTE/compound)
+    /// Scope is a single unshadowed MAIN FROM table (no joins/CTE/compound),
+    /// including explicit `main` qualification used by foreign-key checks,
     /// with an AND-conjunction WHERE; each qualifying `col = bound` / `bound =
     /// col` conjunct is relaxed in place.
     fn relax_correlated_exists_equalities_for_seek(&self, select: &mut SelectStatement) {
         if select.with.is_some() || !select.body.compounds.is_empty() {
             return;
         }
-        // Extract the single unqualified MAIN FROM table + binding name.
+        // Preserve qualification while admitting the same MAIN schema metadata.
         let (table_name, alias) = {
             let SelectCore::Select {
                 from: Some(from),
@@ -82831,7 +82832,12 @@ impl Connection {
                 return;
             }
             match &from.source {
-                TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+                TableOrSubquery::Table { name, alias, .. }
+                    if name
+                        .schema
+                        .as_deref()
+                        .is_none_or(|schema| schema.eq_ignore_ascii_case("main")) =>
+                {
                     (name.name.clone(), alias.clone())
                 }
                 _ => return,
@@ -82839,7 +82845,7 @@ impl Connection {
         };
         let table_key = table_name.to_ascii_lowercase();
         // Namespace-shadowed / TEMP names need the resolver's routing; keep this
-        // to plain unshadowed MAIN tables (mirrors `try_direct_exists_probe`).
+        // to unshadowed MAIN tables even when MAIN is explicitly qualified.
         if self.temp_table_names.borrow().contains(&table_key)
             || self.shadowed_main_tables.borrow().contains_key(&table_key)
         {
