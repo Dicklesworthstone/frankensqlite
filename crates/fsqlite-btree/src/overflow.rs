@@ -394,7 +394,100 @@ async fn free_allocated_pages_best_effort<W: PageWriter>(
     }
 }
 
+/// Reserve all bookkeeping and the serialization buffer before allocating
+/// database pages. A backend must not hand out the header or the same page
+/// twice; otherwise writing the chain would overwrite unrelated data or
+/// create a cycle. Only validated, distinct reservations enter `pages`, so
+/// error cleanup never frees the header or frees a reservation twice.
+#[derive(Debug)]
+struct OverflowWriteState {
+    pages: Vec<PageNumber>,
+    seen: HashSet<PageNumber>,
+    page_buf: PageData,
+    bytes_per_page: usize,
+    num_pages: usize,
+}
+
+impl OverflowWriteState {
+    fn new(overflow_len: usize, usable_size: u32, full_page_size: u32) -> Result<Self> {
+        if overflow_len == 0 {
+            return Err(FrankenError::internal(
+                "write_overflow_chain called with empty data",
+            ));
+        }
+        if overflow_len > MAX_ALLOCATION_SIZE as usize {
+            return Err(FrankenError::TooBig);
+        }
+        if usable_size <= 4 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("invalid usable page size {usable_size} for overflow chain"),
+            });
+        }
+        if full_page_size < usable_size {
+            return Err(FrankenError::internal(format!(
+                "full_page_size ({full_page_size}) < usable_size ({usable_size})"
+            )));
+        }
+        let bytes_per_page = (usable_size - 4) as usize;
+        let num_pages = overflow_len.div_ceil(bytes_per_page);
+        if num_pages > MAX_OVERFLOW_CHAIN {
+            return Err(FrankenError::TooBig);
+        }
+
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(num_pages)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(num_pages)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(full_page_size as usize)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        bytes.resize(full_page_size as usize, 0);
+        Ok(Self {
+            pages,
+            seen,
+            page_buf: PageData::from_vec(bytes),
+            bytes_per_page,
+            num_pages,
+        })
+    }
+
+    fn push_page(&mut self, page_no: PageNumber) -> Result<()> {
+        if page_no.get() == 1 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "overflow allocator returned the database header page".to_owned(),
+            });
+        }
+        if !self.seen.insert(page_no) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("overflow allocator returned duplicate page {}", page_no.get()),
+            });
+        }
+        self.pages.push(page_no);
+        Ok(())
+    }
+
+    fn prepare_page(&mut self, index: usize, overflow_data: &[u8]) {
+        let start = index * self.bytes_per_page;
+        let end = start + self.bytes_per_page.min(overflow_data.len() - start);
+        let chunk = &overflow_data[start..end];
+        let next = self.pages.get(index + 1).map_or(0, |page| page.get());
+        let bytes = self.page_buf.as_bytes_mut();
+        bytes.fill(0);
+        bytes[..4].copy_from_slice(&next.to_be_bytes());
+        bytes[4..4 + chunk.len()].copy_from_slice(chunk);
+    }
+}
+
 /// Write an overflow chain through an async page backend.
+///
+/// When driven to an error, including cooperative cancellation between page
+/// allocations, release every known reservation under a masked cleanup
+/// context. Cleanup is best-effort; the owning transaction must roll back on
+/// error (and when a caller abandons this future without driving it to completion).
 pub(crate) async fn write_overflow_chain_async<W: PageWriter>(
     cx: &Cx,
     overflow_data: &[u8],
@@ -402,74 +495,32 @@ pub(crate) async fn write_overflow_chain_async<W: PageWriter>(
     full_page_size: u32,
     writer: &mut W,
 ) -> Result<PageNumber> {
-    if overflow_data.is_empty() {
-        return Err(FrankenError::internal(
-            "write_overflow_chain_async called with empty data",
-        ));
-    }
-    if usable_size <= 4 {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "invalid usable page size {} for overflow chain",
-                usable_size
-            ),
-        });
-    }
-
-    let bytes_per_page = usable_size.saturating_sub(4) as usize;
-    if bytes_per_page == 0 {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: "usable page size too small for overflow data".to_owned(),
-        });
-    }
-    if full_page_size < usable_size {
-        return Err(FrankenError::internal(format!(
-            "full_page_size ({full_page_size}) < usable_size ({usable_size})"
-        )));
-    }
-    let page_size = full_page_size as usize;
-    let num_pages = overflow_data.len().div_ceil(bytes_per_page);
-    if num_pages > MAX_OVERFLOW_CHAIN {
-        return Err(FrankenError::TooBig);
-    }
-
-    let mut pages = Vec::with_capacity(num_pages);
-    for _ in 0..num_pages {
-        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
-        match writer.allocate_page(cx).await {
-            Ok(page_no) => pages.push(page_no),
-            Err(error) => {
-                free_allocated_pages_best_effort(cx, writer, &pages).await;
-                return Err(error);
-            }
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+    let mut state = OverflowWriteState::new(overflow_data.len(), usable_size, full_page_size)?;
+    // One error exit owns compensation for both phases. In particular, a
+    // checkpoint failure during allocation must not bypass cleanup of the
+    // pages successfully allocated in earlier iterations.
+    let result: Result<PageNumber> = async {
+        for _ in 0..state.num_pages {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let page_no = writer.allocate_page(cx).await?;
+            state.push_page(page_no)?;
         }
-    }
-
-    let mut page_buf = PageData::from_vec(vec![0; page_size]);
-    for (index, &page_no) in pages.iter().enumerate() {
-        if let Err(error) = cx.checkpoint().map_err(|_| FrankenError::Abort) {
-            free_allocated_pages_best_effort(cx, writer, &pages).await;
-            return Err(error);
+        for index in 0..state.pages.len() {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let page_no = state.pages[index];
+            state.prepare_page(index, overflow_data);
+            writer
+                .write_page_data(cx, page_no, state.page_buf.clone())
+                .await?;
         }
-        let data_start = index * bytes_per_page;
-        let data_end = ((index + 1) * bytes_per_page).min(overflow_data.len());
-        let chunk = &overflow_data[data_start..data_end];
-        let next_page = pages.get(index + 1).map_or(0, |next| next.get());
-
-        let page_bytes = page_buf.as_bytes_mut();
-        page_bytes.fill(0);
-        page_bytes[0..4].copy_from_slice(&next_page.to_be_bytes());
-        page_bytes[4..4 + chunk.len()].copy_from_slice(chunk);
-        if let Err(error) = writer.write_page_data(cx, page_no, page_buf.clone()).await {
-            free_allocated_pages_best_effort(cx, writer, &pages).await;
-            return Err(error);
-        }
+        Ok(state.pages[0])
     }
-
-    pages
-        .first()
-        .copied()
-        .ok_or_else(|| FrankenError::internal("overflow allocation produced no pages"))
+    .await;
+    if result.is_err() {
+        free_allocated_pages_best_effort(cx, writer, &state.pages).await;
+    }
+    result
 }
 
 /// Write a payload to an overflow chain, allocating pages as needed.
@@ -482,6 +533,8 @@ pub(crate) async fn write_overflow_chain_async<W: PageWriter>(
 /// `write_page` writes data to a given page number.
 ///
 /// Returns the page number of the first overflow page.
+/// The callbacks must belong to a transaction that rolls back on error: this
+/// interface has no deallocation callback with which to compensate failures.
 pub fn write_overflow_chain<A, W>(
     overflow_data: &[u8],
     usable_size: u32,
@@ -493,69 +546,16 @@ where
     A: FnMut() -> Result<PageNumber>,
     W: FnMut(PageNumber, &[u8]) -> Result<()>,
 {
-    if overflow_data.is_empty() {
-        return Err(FrankenError::internal(
-            "write_overflow_chain called with empty data",
-        ));
+    let mut state = OverflowWriteState::new(overflow_data.len(), usable_size, full_page_size)?;
+    for _ in 0..state.num_pages {
+        state.push_page(allocate_page()?)?;
     }
-    if usable_size <= 4 {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "invalid usable page size {} for overflow chain",
-                usable_size
-            ),
-        });
+    for index in 0..state.pages.len() {
+        let page_no = state.pages[index];
+        state.prepare_page(index, overflow_data);
+        write_page(page_no, state.page_buf.as_bytes())?;
     }
-
-    let bytes_per_page = usable_size.saturating_sub(4) as usize;
-    if bytes_per_page == 0 {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: "usable page size too small for overflow data".to_owned(),
-        });
-    }
-    if full_page_size < usable_size {
-        return Err(FrankenError::internal(format!(
-            "full_page_size ({full_page_size}) < usable_size ({usable_size})"
-        )));
-    }
-    let page_size = full_page_size as usize;
-
-    // Calculate number of overflow pages needed.
-    let num_pages = overflow_data.len().div_ceil(bytes_per_page);
-    if num_pages > MAX_OVERFLOW_CHAIN {
-        return Err(FrankenError::TooBig);
-    }
-
-    // Allocate all pages first so we know the chain.
-    let mut pages = Vec::with_capacity(num_pages);
-    for _ in 0..num_pages {
-        pages.push(allocate_page()?);
-    }
-
-    let mut page_buf = vec![0u8; page_size];
-    // Write each page with its next pointer and data chunk.
-    for (i, &pgno) in pages.iter().enumerate() {
-        let data_start = i * bytes_per_page;
-        let data_end = ((i + 1) * bytes_per_page).min(overflow_data.len());
-        let chunk = &overflow_data[data_start..data_end];
-
-        let next_pgno: u32 = if i + 1 < pages.len() {
-            pages[i + 1].get()
-        } else {
-            0 // End of chain.
-        };
-
-        page_buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
-        page_buf[4..4 + chunk.len()].copy_from_slice(chunk);
-        if chunk.len() < bytes_per_page {
-            // Ensure tail is zeroed if the chunk didn't fill the space.
-            page_buf[4 + chunk.len()..].fill(0);
-        }
-
-        write_page(pgno, &page_buf)?;
-    }
-
-    Ok(pages[0])
+    Ok(state.pages[0])
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +669,256 @@ mod tests {
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum WriteFault {
+        None,
+        CancelAfterAllocation(usize),
+        FailAllocation(usize),
+        FailWrite(usize),
+        DuplicateAllocation(usize),
+        HeaderAllocation(usize),
+    }
+
+    #[derive(Debug)]
+    struct FaultPageStore {
+        store: TestPageStore,
+        fault: WriteFault,
+        allocations: usize,
+        writes: usize,
+        freed: Vec<PageNumber>,
+    }
+
+    impl FaultPageStore {
+        fn new(fault: WriteFault) -> Self {
+            Self {
+                store: TestPageStore::allocating_from(5),
+                fault,
+                allocations: 0,
+                writes: 0,
+                freed: Vec::new(),
+            }
+        }
+    }
+
+    impl PageReader for FaultPageStore {
+        fn read_page<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            self.store.read_page(cx, page_no)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageWriter for FaultPageStore {
+        fn allocate_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            async move {
+                let call = self.allocations;
+                self.allocations += 1;
+                match self.fault {
+                    WriteFault::FailAllocation(index) if index == call => {
+                        return Err(FrankenError::Busy);
+                    }
+                    WriteFault::DuplicateAllocation(index) if index == call => {
+                        return Ok(PageNumber::new(5).unwrap());
+                    }
+                    WriteFault::HeaderAllocation(index) if index == call => {
+                        return Ok(PageNumber::new(1).unwrap());
+                    }
+                    _ => {}
+                }
+                let page = self.store.allocate_page(cx).await?;
+                if matches!(self.fault, WriteFault::CancelAfterAllocation(n) if n == call + 1) {
+                    cx.cancel();
+                }
+                Ok(page)
+            }
+        }
+
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                let call = self.writes;
+                self.writes += 1;
+                // Inject after mutation as well as after earlier successful
+                // writes: an error does not imply the backend wrote no bytes.
+                self.store.write_page(cx, page_no, data).await?;
+                if matches!(self.fault, WriteFault::FailWrite(index) if index == call) {
+                    return Err(FrankenError::Busy);
+                }
+                Ok(())
+            }
+        }
+
+        fn free_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            async move {
+                assert!(cx.checkpoint().is_ok(), "cleanup cancellation must be masked");
+                assert!(!self.freed.contains(&page_no), "double free during compensation");
+                assert_ne!(page_no.get(), 1, "must never free the database header");
+                self.freed.push(page_no);
+                self.store.free_page(cx, page_no).await
+            }
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[test]
+    fn overflow_write_cancellation_releases_each_allocated_prefix() {
+        run_async(async {
+            for allocated in 0..=4 {
+                let cx = Cx::new();
+                let mut store = FaultPageStore::new(WriteFault::CancelAfterAllocation(allocated));
+                if allocated == 0 {
+                    cx.cancel();
+                }
+                let result = write_overflow_chain_async(&cx, &[0x42; 50], 20, 32, &mut store)
+                    .await;
+                assert!(matches!(result, Err(FrankenError::Abort)));
+                assert_eq!(store.allocations, allocated);
+                assert_eq!(store.writes, 0);
+                assert_eq!(store.freed.len(), allocated);
+                assert!(store.store.pages.is_empty());
+                assert!(cx.checkpoint().is_err(), "cleanup must not uncancel its parent");
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_write_allocation_failures_release_only_owned_pages() {
+        run_async(async {
+            for index in 0..4 {
+                let mut store = FaultPageStore::new(WriteFault::FailAllocation(index));
+                let result = write_overflow_chain_async(
+                    &Cx::new(), &[0x42; 50], 20, 32, &mut store,
+                )
+                .await;
+                assert!(matches!(result, Err(FrankenError::Busy)));
+                assert_eq!(store.allocations, index + 1);
+                assert_eq!(store.writes, 0);
+                assert_eq!(store.freed.len(), index);
+                assert!(store.store.pages.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_write_failures_release_complete_reservation() {
+        run_async(async {
+            for index in 0..4 {
+                let mut store = FaultPageStore::new(WriteFault::FailWrite(index));
+                let result = write_overflow_chain_async(
+                    &Cx::new(), &[0x42; 50], 20, 32, &mut store,
+                )
+                .await;
+                assert!(matches!(result, Err(FrankenError::Busy)));
+                assert_eq!(store.allocations, 4);
+                assert_eq!(store.writes, index + 1);
+                assert_eq!(store.freed.len(), 4);
+                assert!(store.store.pages.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_write_rejects_aliases_before_any_page_write() {
+        run_async(async {
+            for index in 0..4 {
+                let mut faults = vec![WriteFault::HeaderAllocation(index)];
+                if index > 0 {
+                    faults.push(WriteFault::DuplicateAllocation(index));
+                }
+                for fault in faults {
+                    let mut store = FaultPageStore::new(fault);
+                    let result = write_overflow_chain_async(
+                        &Cx::new(), &[0x42; 50], 20, 32, &mut store,
+                    )
+                    .await;
+                    assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+                    assert_eq!(store.allocations, index + 1);
+                    assert_eq!(store.writes, 0);
+                    assert_eq!(store.freed.len(), index);
+                    assert!(store.store.pages.is_empty());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_write_preflight_rejects_invalid_sizes_without_backend_calls() {
+        run_async(async {
+            for (usable, full) in [(0, 16), (4, 16), (16, 8)] {
+                let mut store = FaultPageStore::new(WriteFault::None);
+                assert!(write_overflow_chain_async(
+                    &Cx::new(), &[0x42; 50], usable, full, &mut store,
+                )
+                .await
+                .is_err());
+                assert_eq!(store.allocations, 0);
+                assert_eq!(store.writes, 0);
+                assert!(store.freed.is_empty());
+            }
+            assert!(matches!(
+                OverflowWriteState::new(MAX_OVERFLOW_CHAIN + 1, 5, 5),
+                Err(FrankenError::TooBig)
+            ));
+            assert!(matches!(
+                OverflowWriteState::new(MAX_ALLOCATION_SIZE as usize + 1, 4096, 4096),
+                Err(FrankenError::TooBig)
+            ));
+        });
+    }
+
+    #[test]
+    fn overflow_callback_writer_validates_reservations_and_roundtrips() {
+        for candidates in [vec![1], vec![5, 1], vec![5, 5]] {
+            let mut candidates = candidates.into_iter();
+            let mut allocate = || Ok(PageNumber::new(candidates.next().unwrap()).unwrap());
+            let mut writes = 0;
+            let mut write = |_page: PageNumber, _bytes: &[u8]| {
+                writes += 1;
+                Ok(())
+            };
+            assert!(matches!(
+                write_overflow_chain(&[0x42; 50], 20, 32, &mut allocate, &mut write),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert_eq!(writes, 0);
+        }
+
+        let data: Vec<u8> = (0..25).collect();
+        let mut next = 5;
+        let mut allocate = || {
+            let page = PageNumber::new(next).unwrap();
+            next += 1;
+            Ok(page)
+        };
+        let mut pages = HashMap::new();
+        let mut write = |page: PageNumber, bytes: &[u8]| {
+            pages.insert(page.get(), bytes.to_vec());
+            Ok(())
+        };
+        let first = write_overflow_chain(&data, 16, 32, &mut allocate, &mut write).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert!(pages.values().all(|page| page[16..].iter().all(|&b| b == 0)));
+        let mut read = |page: PageNumber| {
+            pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+        };
+        assert_eq!(read_overflow_chain(&[], first, 25, 16, &mut read).unwrap(), data);
     }
 
     fn linked_page(next: u32) -> Vec<u8> {
