@@ -1,6 +1,7 @@
 import { applyChangeset } from "./changeset-apply";
 import type { ApplyChangesetOptions, ApplyChangesetResult, ChangesetTarget } from "./changeset-apply";
 import { decodeChangeset } from "./changeset-codec";
+import type { ChangesetOutbox, OutboxDelivery } from "./changeset-outbox";
 
 export const CHANGESET_DELIVERY_PROTOCOL = "fsqlite-changeset-v1";
 export interface ChangesetEnvelope {
@@ -26,7 +27,8 @@ export interface ChangesetDeliveryOptions {
   /** Total monotonic budget, 1..2147483647 ms; never races a commit against a timer. */
   timeoutMs?: number;
 }
-export type ChangesetDeliveryPhase = "admission" | "validate" | "receiver-apply" | "receiver-confirm";
+export type ChangesetDeliveryPhase = "admission" | "validate" | "receiver-apply" | "receiver-confirm" |
+  "source-read" | "source-confirm" | "transport" | "receipt" | "source-ack";
 export class ChangesetDeliveryError extends Error {
   constructor(readonly code: "ERR_FSQLITE_DELIVERY_INPUT" | "ERR_FSQLITE_DELIVERY_BUSY" |
     "ERR_FSQLITE_DELIVERY_FAILED" | "ERR_FSQLITE_DELIVERY_RECEIPT" |
@@ -200,6 +202,148 @@ export class ChangesetReceiver {
       await this.#confirm(); budget.checkpoint();
       return Object.freeze({ protocol: CHANGESET_DELIVERY_PROTOCOL, receiverId: this.#id,
         deliveryId: id, sha256, byteLength: bytes.byteLength, ...result, confirmed: true });
+    } catch (cause: unknown) { throw failure(cause, phase, id); }
+    finally { budget?.finish(); this.#active = false; }
+  }
+}
+
+/** Transport framing/authentication are caller-owned; success must return a receipt. */
+export type ChangesetTransport = (message: ChangesetEnvelope, options: ChangesetDeliveryOptions) => Promise<unknown>;
+export interface ChangesetPumpOptions {
+  /** One fixed recipient for this outbox. Its acknowledgement state is not multicast. */
+  receiverId: string;
+  deliver: ChangesetTransport;
+  /** Confirm the SAME source after reads and acknowledgements; recover snapshots here. */
+  confirmSource: () => Promise<unknown>;
+  maxMessageBytes?: number;
+  /** Default false: retained receiver omissions require explicit sender acceptance. */
+  allowOmissions?: boolean;
+}
+export interface ChangesetPumpRunOptions extends ChangesetDeliveryOptions {
+  /** Maximum selected entries, including acknowledgement races. Default 100, max 10,000. */
+  maxDeliveries?: number;
+  /** Total payload bytes per run. Default 64 MiB, maximum 1 GiB. */
+  maxBytes?: number;
+}
+export interface ChangesetPumpResult {
+  readonly deliveries: number;
+  readonly bytes: number;
+  /** Original receipt decisions, including replayed deliveries; not new-write counts. */
+  readonly applied: number;
+  readonly omitted: number;
+  readonly replays: number;
+  readonly alreadyAcknowledged: number;
+  /** empty means no pending row at the last read, not a permanent emptiness guarantee. */
+  readonly stopped: "empty" | "limit";
+}
+function deliveryMetadata(value: unknown): OutboxDelivery {
+  const sequence = field(value, "sequence"), byteLength = field(value, "byteLength"), changes = field(value, "changes");
+  const deliveryId = identity(field(value, "deliveryId"), 512), sha256 = digest(field(value, "sha256"));
+  const acknowledged = field(value, "acknowledged");
+  if (typeof sequence !== "bigint" || sequence < 1n || sequence >= 1n << 63n ||
+      typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > HARD_BYTES ||
+      typeof changes !== "number" || !Number.isSafeInteger(changes) || changes < 0 || changes > 100_000 ||
+      typeof acknowledged !== "boolean") input("Invalid outbox delivery metadata");
+  return Object.freeze({ sequence, byteLength, changes, deliveryId, sha256, acknowledged });
+}
+function sameDelivery(a: OutboxDelivery, b: OutboxDelivery): boolean {
+  return a.sequence === b.sequence && a.deliveryId === b.deliveryId && a.sha256 === b.sha256 &&
+    a.byteLength === b.byteLength && a.changes === b.changes;
+}
+function verifyReceipt(value: unknown, delivery: OutboxDelivery, receiverId: string): ApplyChangesetResult {
+  if (field(value, "protocol") !== CHANGESET_DELIVERY_PROTOCOL || field(value, "receiverId") !== receiverId ||
+      field(value, "deliveryId") !== delivery.deliveryId || field(value, "sha256") !== delivery.sha256 ||
+      field(value, "byteLength") !== delivery.byteLength || field(value, "confirmed") !== true) {
+    reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Receiver did not confirm this exact delivery");
+  }
+  return resultCounts(value, delivery.changes);
+}
+
+/**
+ * One bounded, awaited outbox drain. No transaction is held across transport.
+ * Every new run starts at the oldest pending entry; no cursor can skip a failure.
+ * The source payload is reclaimed only after a matching confirmed receiver ACK.
+ */
+export class ChangesetDeliveryPump {
+  readonly #outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">;
+  readonly #id: string;
+  readonly #deliver: ChangesetTransport;
+  readonly #confirm: () => Promise<unknown>;
+  readonly #maxBytes: number;
+  readonly #allowOmissions: boolean;
+  #active = false;
+  constructor(outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">, options: ChangesetPumpOptions) {
+    this.#outbox = outbox; this.#id = identity(options?.receiverId, 256);
+    const deliver = options?.deliver, confirm = options?.confirmSource;
+    const allowOmissions = options?.allowOmissions ?? false;
+    if (typeof deliver !== "function" || typeof confirm !== "function" || typeof allowOmissions !== "boolean") input("Delivery requires a transport, source confirmation and explicit omission policy");
+    this.#deliver = deliver; this.#confirm = confirm; this.#allowOmissions = allowOmissions;
+    this.#maxBytes = bound(options?.maxMessageBytes, 8 * 1024 * 1024, HARD_BYTES);
+  }
+
+  async run(options: ChangesetPumpRunOptions = {}): Promise<ChangesetPumpResult> {
+    if (this.#active) throw new ChangesetDeliveryError("ERR_FSQLITE_DELIVERY_BUSY", "admission", null, new Error("This pump is active; no run was queued"));
+    this.#active = true;
+    let budget: DeliveryBudget | undefined, phase: ChangesetDeliveryPhase = "admission", id: string | null = null;
+    const counts = { deliveries: 0, bytes: 0, applied: 0, omitted: 0, replays: 0, alreadyAcknowledged: 0 };
+    const result = (stopped: "empty" | "limit"): ChangesetPumpResult => Object.freeze({ ...counts, stopped });
+    try {
+      const maxDeliveries = bound(options.maxDeliveries, 100, 10_000), maxBytes = bound(options.maxBytes, HARD_BYTES, 1024 * 1024 * 1024);
+      budget = new DeliveryBudget(options); budget.checkpoint();
+      phase = "source-confirm";
+      // A previous acknowledgement can be committed in memory but not yet
+      // checkpointed. Even an empty pending list must not bypass its recovery.
+      await this.#confirm(); budget.checkpoint();
+      let lastSequence = 0n;
+      for (let selected = 0; selected < maxDeliveries; selected++) {
+        id = null; phase = "source-read"; budget.checkpoint();
+        const pending = await this.#outbox.pending({ limit: 1 }); budget.checkpoint();
+        if (!Array.isArray(pending) || pending.length > 1) input("Outbox exceeded its requested page bound");
+        if (pending.length === 0) return result("empty");
+        const next = deliveryMetadata(pending[0]); id = next.deliveryId;
+        if (next.acknowledged || next.sequence <= lastSequence) input("Outbox did not advance past confirmed acknowledgements");
+        if (next.byteLength > this.#maxBytes) reject("ERR_FSQLITE_DELIVERY_LIMIT", "Pending message exceeds maxMessageBytes; it was not skipped");
+        if (next.byteLength > maxBytes - counts.bytes) {
+          if (counts.deliveries === 0) reject("ERR_FSQLITE_DELIVERY_LIMIT", "The oldest message cannot fit this run's byte budget");
+          return result("limit");
+        }
+        const loaded = await this.#outbox.read(id); budget.checkpoint();
+        if (loaded === null) input("Selected outbox delivery disappeared; reconcile its retention state");
+        const current = deliveryMetadata(field(loaded, "delivery")), data = field(loaded, "changeset");
+        if (!sameDelivery(next, current)) input("Outbox delivery changed between selection and read");
+        if (current.acknowledged) {
+          if (data !== null) input("An acknowledged outbox entry retained unexpected payload bytes");
+          phase = "source-confirm"; await this.#confirm(); budget.checkpoint();
+          counts.alreadyAcknowledged++; lastSequence = current.sequence; continue;
+        }
+        const bytes = ownBytes(data, this.#maxBytes);
+        if (bytes.byteLength !== current.byteLength || await hash(bytes) !== current.sha256 ||
+            decodeChangeset(bytes).reduce((n, t) => n + t.changes.length, 0) !== current.changes) {
+          input("Outbox payload disagrees with the selected identity/digest/count");
+        }
+        budget.checkpoint(); phase = "source-confirm";
+        // Confirm AFTER reading: a concurrent record committed after the initial
+        // confirmation must not be sent while its source image is still volatile.
+        await this.#confirm(); budget.checkpoint(); phase = "transport";
+        const transportOptions: ChangesetDeliveryOptions = { signal: budget.signal };
+        const remaining = budget.remainingMs(); if (remaining !== undefined) transportOptions.timeoutMs = remaining;
+        const response = await this.#deliver(Object.freeze({ protocol: CHANGESET_DELIVERY_PROTOCOL,
+          receiverId: this.#id, deliveryId: id, sha256: current.sha256, changeset: bytes }), transportOptions);
+        budget.checkpoint(); phase = "receipt";
+        const receipt = verifyReceipt(response, current, this.#id);
+        if (receipt.omitted !== 0 && !this.#allowOmissions) reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Receiver omissions require explicit sender acceptance");
+        budget.checkpoint(); phase = "source-ack";
+        const acknowledged = await this.#outbox.acknowledge(id, current.sha256);
+        if (typeof acknowledged !== "boolean") input("Invalid outbox acknowledgement result");
+        // Once ack starts, finish its confirmation even if cancellation arrived.
+        // A throwing/uncertain ack is instead reconciled at the next run's start.
+        phase = "source-confirm"; await this.#confirm(); budget.checkpoint();
+        counts.deliveries++; counts.bytes += current.byteLength;
+        counts.applied += receipt.applied; counts.omitted += receipt.omitted;
+        if (receipt.replayed) counts.replays++;
+        lastSequence = current.sequence;
+      }
+      return result("limit");
     } catch (cause: unknown) { throw failure(cause, phase, id); }
     finally { budget?.finish(); this.#active = false; }
   }
