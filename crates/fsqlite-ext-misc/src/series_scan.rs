@@ -31,6 +31,10 @@ fn missing_start() -> FrankenError {
     FrankenError::FunctionError("generate_series: start argument is required".to_owned())
 }
 
+fn is_sql_null(value: &SqliteValue) -> bool {
+    value.is_null() || matches!(value, SqliteValue::Float(number) if number.is_nan())
+}
+
 pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
     if info.constraint_usage.len() != info.constraints.len() {
         return Err(invalid_plan());
@@ -115,7 +119,7 @@ pub(super) fn filter(
         if args.len() > 3 {
             return Err(invalid_plan());
         }
-        if args.iter().any(SqliteValue::is_null) {
+        if args.iter().any(is_sql_null) {
             return Ok(());
         }
         return cursor.init(
@@ -133,7 +137,7 @@ pub(super) fn filter(
         return Err(invalid_plan());
     }
     // All selected predicates are ordinary comparisons, so NULL cannot match.
-    if args.iter().any(SqliteValue::is_null) {
+    if args.iter().any(is_sql_null) {
         return Ok(());
     }
     let mut position = 0;
@@ -152,8 +156,17 @@ pub(super) fn filter(
     let mut lower = i128::from(i64::MIN);
     let mut upper = i128::from(i64::MAX);
     for flag in [EQUAL, GREATER, AT_LEAST, LESS, AT_MOST] {
-        if let Some(SqliteValue::Integer(value)) = argument(flag) {
-            intersect_integer_bound(&mut lower, &mut upper, flag, i128::from(*value));
+        match argument(flag) {
+            Some(SqliteValue::Integer(value)) => {
+                intersect_integer_bound(&mut lower, &mut upper, flag, i128::from(*value));
+            }
+            Some(SqliteValue::Float(value)) => {
+                intersect_real_bound(&mut lower, &mut upper, flag, *value);
+            }
+            // Do not impose numeric coercion on TEXT/BLOB comparisons. The
+            // core still evaluates every selected visible predicate, including
+            // its affinity and collation, because best_index left omit=false.
+            _ => {}
         }
     }
     cursor.init(start, stop, step)?;
@@ -168,6 +181,38 @@ fn intersect_integer_bound(lower: &mut i128, upper: &mut i128, flag: i32, value:
         LESS => *upper = (*upper).min(value - 1),
         AT_MOST => *upper = (*upper).min(value),
         _ => unreachable!("only value-bound plan bits reach interval intersection"),
+    }
+}
+
+/// Convert a REAL comparison to exact integer endpoints. Never round an i64
+/// sequence member to f64: above 2^53 adjacent members can compare differently
+/// even though converting them to f64 would produce the same number.
+#[allow(clippy::cast_possible_truncation)] // Only rounded finite values in the checked i64 domain are cast.
+fn intersect_real_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: f64) {
+    const MINIMUM: f64 = -9_223_372_036_854_775_808.0;
+    const END_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_nan() {
+        *lower = 1;
+        *upper = 0;
+    } else if value >= END_EXCLUSIVE {
+        // Includes +infinity. A one-past-domain sentinel has the same ordering
+        // as every larger REAL against every possible generated integer.
+        intersect_integer_bound(lower, upper, flag, i128::from(i64::MAX) + 1);
+    } else if value < MINIMUM {
+        // Includes -infinity; never let a saturating cast invent MIN as a match.
+        intersect_integer_bound(lower, upper, flag, i128::from(i64::MIN) - 1);
+    } else {
+        let floor = value.floor() as i128;
+        let ceil = value.ceil() as i128;
+        match flag {
+            EQUAL if floor != ceil => { *lower = 1; *upper = 0; }
+            EQUAL => intersect_integer_bound(lower, upper, EQUAL, floor),
+            GREATER => intersect_integer_bound(lower, upper, AT_LEAST, floor + 1),
+            AT_LEAST => intersect_integer_bound(lower, upper, AT_LEAST, ceil),
+            LESS => intersect_integer_bound(lower, upper, AT_MOST, ceil - 1),
+            AT_MOST => intersect_integer_bound(lower, upper, AT_MOST, floor),
+            _ => unreachable!("only value-bound plan bits reach REAL intersection"),
+        }
     }
 }
 
@@ -438,6 +483,117 @@ mod tests {
         );
         assert_eq!(cursor.step, 1);
         assert_eq!(values(cursor), vec![5, 6, 7]);
+    }
+
+    fn real_bound(start: i64, stop: i64, op: ConstraintOp, bound: f64) -> GenerateSeriesCursor {
+        planned(
+            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(0, op)],
+            &[SqliteValue::Integer(start), SqliteValue::Integer(stop), SqliteValue::Float(bound)],
+            Vec::new(),
+        ).0
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact integer/quarter comparisons are the predicate being tested.
+    fn fractional_real_bounds_use_mathematical_floor_and_ceiling() {
+        for quarter in -28..=28_i32 {
+            let bound = f64::from(quarter) / 4.0;
+            for op in [ConstraintOp::Eq, ConstraintOp::Gt, ConstraintOp::Ge, ConstraintOp::Lt, ConstraintOp::Le] {
+                let expected = (-6..=6_i32).filter(|value| {
+                    let value = f64::from(*value);
+                    match op {
+                        ConstraintOp::Eq => value == bound,
+                        ConstraintOp::Gt => value > bound,
+                        ConstraintOp::Ge => value >= bound,
+                        ConstraintOp::Lt => value < bound,
+                        ConstraintOp::Le => value <= bound,
+                        _ => unreachable!(),
+                    }
+                }).map(i64::from).collect::<Vec<_>>();
+                assert_eq!(values(real_bound(-6, 6, op, bound)), expected,
+                    "quarter={quarter}, op={op:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_bound_does_not_round_adjacent_large_integer_rows() {
+        const ORIGIN: i64 = 9_007_199_254_740_992;
+        assert_eq!(values(real_bound(ORIGIN - 1, ORIGIN + 3, ConstraintOp::Eq, 9_007_199_254_740_992.0)),
+            vec![ORIGIN]);
+        assert_eq!(values(real_bound(ORIGIN - 1, ORIGIN + 3, ConstraintOp::Gt, 9_007_199_254_740_992.0)),
+            vec![ORIGIN + 1, ORIGIN + 2, ORIGIN + 3]);
+        assert_eq!(values(real_bound(-ORIGIN - 3, -ORIGIN + 1, ConstraintOp::Lt, -9_007_199_254_740_992.0)),
+            vec![-ORIGIN - 3, -ORIGIN - 2, -ORIGIN - 1]);
+    }
+
+    #[test]
+    fn real_domain_edges_and_infinities_do_not_invent_endpoint_matches() {
+        for bound in [9_223_372_036_854_775_808.0, f64::INFINITY] {
+            for op in [ConstraintOp::Eq, ConstraintOp::Gt, ConstraintOp::Ge] {
+                assert!(real_bound(i64::MAX - 2, i64::MAX, op, bound).eof());
+            }
+            for op in [ConstraintOp::Lt, ConstraintOp::Le] {
+                assert_eq!(values(real_bound(i64::MAX - 2, i64::MAX, op, bound)),
+                    vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]);
+            }
+        }
+        for bound in [-9_223_372_036_854_777_856.0, f64::NEG_INFINITY] {
+            for op in [ConstraintOp::Eq, ConstraintOp::Lt, ConstraintOp::Le] {
+                assert!(real_bound(i64::MIN, i64::MIN + 2, op, bound).eof());
+            }
+            for op in [ConstraintOp::Gt, ConstraintOp::Ge] {
+                assert_eq!(values(real_bound(i64::MIN, i64::MIN + 2, op, bound)),
+                    vec![i64::MIN, i64::MIN + 1, i64::MIN + 2]);
+            }
+        }
+        assert_eq!(values(real_bound(i64::MIN, i64::MIN + 2, ConstraintOp::Eq, -9_223_372_036_854_775_808.0)),
+            vec![i64::MIN]);
+        assert!(real_bound(i64::MIN, i64::MIN + 2, ConstraintOp::Lt, -9_223_372_036_854_775_808.0).eof());
+    }
+
+    #[test]
+    fn numeric_looking_text_and_blobs_remain_core_comparisons() {
+        for value in [SqliteValue::Text("4".into()), SqliteValue::Blob(vec![b'4'].into())] {
+            let (cursor, info) = planned(
+                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge)],
+                &[SqliteValue::Integer(1), SqliteValue::Integer(5), value], Vec::new(),
+            );
+            assert!(!info.constraint_usage[2].omit);
+            assert_eq!(values(cursor), vec![1, 2, 3, 4, 5], "do not prune on guessed text affinity");
+        }
+    }
+
+    #[test]
+    fn nan_inputs_empty_scans_instead_of_becoming_zero() {
+        for nan_at in 0..3 {
+            let mut args = [SqliteValue::Integer(1), SqliteValue::Integer(5), SqliteValue::Integer(1)];
+            args[nan_at] = SqliteValue::Float(f64::NAN);
+            let mut cursor = GenerateSeriesTable.open().unwrap();
+            cursor.filter(&Cx::new(), 0, None, &args).unwrap();
+            assert!(cursor.eof());
+            let (cursor, _) = planned(
+                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(3, ConstraintOp::Eq)],
+                &args, Vec::new(),
+            );
+            assert!(cursor.eof());
+        }
+        for op in [ConstraintOp::Eq, ConstraintOp::Gt, ConstraintOp::Ge, ConstraintOp::Lt, ConstraintOp::Le] {
+            assert!(real_bound(0, 5, op, f64::NAN).eof());
+        }
+    }
+
+    #[test]
+    fn intersected_real_bounds_keep_negative_step_alignment_when_reversed() {
+        let (cursor, _) = planned(
+            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(3, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Gt), constraint(0, ConstraintOp::Le)],
+            &[SqliteValue::Integer(10), SqliteValue::Integer(-10), SqliteValue::Integer(-3),
+                SqliteValue::Float(-4.5), SqliteValue::Float(6.25)],
+            vec![IndexOrderBy { column: 0, desc: false }],
+        );
+        assert_eq!((cursor.start, cursor.stop, cursor.step), (10, -10, -3));
+        assert_eq!(values(cursor), vec![-2, 1, 4]);
     }
 
     #[test]
