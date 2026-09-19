@@ -8,6 +8,8 @@ mod connection;
 mod flags;
 mod optional;
 mod params;
+#[cfg(all(feature = "native", not(target_arch = "wasm32"), unix))]
+pub mod recovery;
 mod row;
 mod transaction;
 
