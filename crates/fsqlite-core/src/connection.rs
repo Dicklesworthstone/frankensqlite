@@ -82523,6 +82523,21 @@ impl Connection {
                     right,
                     ..
                 } => pending.extend([left.as_ref(), right.as_ref()]),
+                // Truth tests keep the same child AST alive for this WHERE
+                // loop. Admit its lazy IN memo without evaluating either side
+                // early or changing NULL/affinity/collation semantics.
+                Expr::BinaryOp {
+                    op: BinaryOp::Is | BinaryOp::IsNot,
+                    left,
+                    right,
+                    ..
+                } if matches!(
+                    right.as_ref(),
+                    Expr::Literal(Literal::True | Literal::False, _)
+                ) =>
+                {
+                    pending.push(left.as_ref());
+                }
                 Expr::UnaryOp {
                     op: UnaryOp::Not,
                     expr,
