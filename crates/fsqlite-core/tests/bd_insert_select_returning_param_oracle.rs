@@ -76,6 +76,87 @@ async fn agree_p(setup: &[&str], sql: &str, fparams: &[SqliteValue], rvals: &[i6
 }
 
 #[test]
+fn insert_select_upsert_replay_preserves_original_parameters() {
+    asupersync::test_utils::run_test(|| async {
+        for returning in [false, true] {
+            for cutoff in [5, 50] {
+                let f = Connection::open(":memory:").await.unwrap();
+                let r = rusqlite::Connection::open_in_memory().unwrap();
+                for sql in [
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)",
+                    "CREATE TABLE src(id INTEGER, a INTEGER)",
+                    "INSERT INTO t VALUES (1, 10)",
+                    "INSERT INTO src VALUES (1, 20), (2, 30)",
+                ] {
+                    f.execute(sql).await.unwrap();
+                    r.execute(sql, []).unwrap();
+                }
+                let mut sql = "INSERT INTO t SELECT id, a FROM src WHERE id >= ? \
+                    ON CONFLICT(id) DO UPDATE SET a = excluded.a + ? WHERE t.a <= ?"
+                    .to_owned();
+                let mut values = vec![1, 100, cutoff];
+                if returning {
+                    sql.push_str(" RETURNING id, a, ?");
+                    values.push(777);
+                }
+                let params: Vec<_> = values.iter().copied().map(iv).collect();
+                if returning {
+                    assert_eq!(fq_p(&f, &sql, &params).await, rq_p(&r, &sql, &values));
+                } else {
+                    f.execute_with_params(&sql, &params).await.unwrap();
+                    r.execute(&sql, rusqlite::params_from_iter(values)).unwrap();
+                }
+                let query = "SELECT id, a FROM t ORDER BY id";
+                let actual = fq_p(&f, query, &[]).await;
+                assert_eq!(actual, rq_p(&r, query, &[]));
+                assert_eq!(
+                    actual,
+                    vec![
+                        vec!["1".to_owned(), if cutoff == 5 { "10" } else { "120" }.to_owned()],
+                        vec!["2".to_owned(), "30".to_owned()],
+                    ],
+                    "returning={returning}, cutoff={cutoff}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn attached_insert_select_upsert_preserves_original_parameters() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "ATTACH DATABASE ':memory:' AS aux",
+            "CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a INTEGER)",
+            "CREATE TABLE src(id INTEGER, a INTEGER)",
+            "INSERT INTO aux.t VALUES (1, 10)",
+            "INSERT INTO src VALUES (1, 20), (2, 30)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let sql = "INSERT INTO aux.t SELECT id, a FROM src WHERE id >= ?1 \
+            ON CONFLICT(id) DO UPDATE SET a = excluded.a + ?2 WHERE t.a <= ?3";
+        f.execute_with_params(sql, &[iv(1), iv(100), iv(50)])
+            .await
+            .unwrap();
+        r.execute(sql, [1, 100, 50]).unwrap();
+        let query = "SELECT id, a FROM aux.t ORDER BY id";
+        let actual = fq_p(&f, query, &[]).await;
+        assert_eq!(actual, rq_p(&r, query, &[]));
+        assert_eq!(
+            actual,
+            vec![
+                vec!["1".to_owned(), "120".to_owned()],
+                vec!["2".to_owned(), "30".to_owned()],
+            ]
+        );
+    });
+}
+
+#[test]
 fn insert_select_returning_param_numbers_globally() {
     asupersync::test_utils::run_test(|| async {
         // SELECT ?=5, ?=6 (source), RETURNING id, a, ?=7. The RETURNING ? is param#3,
