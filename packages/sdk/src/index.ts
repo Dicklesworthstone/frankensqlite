@@ -46,5 +46,5 @@ export { DurableJobWorker, DurableJobWorkerError } from "./durable-job-worker";
 export type { DurableWorkerQueue, DurableJobHandler, DurableJobContext, DurableJobCompletion, DurableJobWorkerOptions, DurableJobWorkerStopOptions, DurableJobWorkerStats, DurableJobWorkerPhase } from "./durable-job-worker";
 export { ChangesetError, decodeChangeset, encodeChangeset, invertChangeset } from "./changeset-codec";
 export type { ChangesetValue, ChangesetField, ChangesetChange, ChangesetTable, ChangesetLimits } from "./changeset-codec";
-export { applyChangeset, ChangesetApplyError } from "./changeset-apply";
+export { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
 export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, ChangesetConflict, ApplyChangesetOptions, ApplyChangesetResult } from "./changeset-apply";

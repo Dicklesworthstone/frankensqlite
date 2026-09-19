@@ -94,6 +94,60 @@ rebasing, automatically capture changes, or provide a replication transport.
 For snapshot persistence, SQL commit still requires an explicit checkpoint to
 publish durable browser storage; applying a changeset does not checkpoint.
 
+## Duplicate delivery and lost acknowledgements
+
+Supply a stable, source-qualified `deliveryId` to record a local inbox receipt
+in the same transaction as the application rows:
+
+```ts
+const result = await applyChangeset(db, receivedBytes, {
+  tables: ['notes', 'tags'],
+  deliveryId: 'trusted-source-42:changeset-108',
+});
+if (result.replayed) {
+  // This exact payload was already applied; no row SQL or resolver ran again.
+}
+```
+
+The helper captures the bytes, hashes them with Web Crypto SHA-256, and stores
+the identity, digest, byte length and applied/omitted counts in the reserved
+`__fsqlite_changeset_receipts` table (exported as `CHANGESET_RECEIPTS_TABLE`).
+IDs are case-sensitive, valid UTF-8, 1..512 bytes, without NUL. This option
+requires Web Crypto; it hashes the bytes rather than accepting a caller digest.
+The default path does not create an inbox or require Web Crypto.
+
+A repeated ID with the same bytes returns the original counts and
+`replayed: true`, without applying rows or invoking `onConflict` again. A new
+application returns `replayed: false`. Reusing an ID for different bytes rejects
+with `ERR_FSQLITE_CHANGESET_DELIVERY_REUSE`, even when byte lengths are equal.
+Omissions are part of the original decision: changing a conflict policy on a
+redelivery does not reconsider them. Authorization is still checked every time.
+
+The receipt is an application-history record, not a claim that later SQL has
+left the target rows unchanged. It remains usable after later schema changes.
+Invalid receipt metadata or an incompatible inbox schema fails closed. The
+inbox cannot be a direct changeset target; its primary key must use BINARY
+collation, and inbox triggers/foreign keys are rejected. Application tables,
+triggers, SQL adapters and the local database itself must still be trusted.
+Hashes bind identities to bytes; they do not authenticate the sender or prevent
+an authorized SQL writer from tampering with application data or receipts.
+
+Rows and receipt commit or roll back together, including deferred commit errors
+and a later rollback of an enclosing transaction. Concurrent conflicts are
+surfaced through the existing transaction engine, not retried or serialized by
+this helper. After an uncertain acknowledgement, resubmit the same ID and exact
+bytes to the authoritative database: a retained receipt avoids repeating SQL.
+This is not a guarantee about external callback side effects, replica consensus,
+or durability beyond the target's own transaction/storage contract. In snapshot
+modes, both rows and inbox still need the same explicit durable checkpoint.
+
+Receipts are retained, not automatically expired or bounded in persistent row
+count. Removing a receipt removes its duplicate-delivery protection. Retention
+must follow the application's delivery/retry horizon; restoring an older backup
+also restores an older inbox. Only a digest and fixed counters are retained per
+ID, not the entire changeset. Hashing temporarily copies the already byte-bounded
+input; this is not a streaming ingestion API or a process-RSS bound.
+
 ## Verification
 
 ```sh
@@ -114,3 +168,6 @@ They exercise atomic multi-table rollback, nested savepoints, explicit omissions
 constraint/trigger failures, schema preflight, quoted names, cancellation,
 deadlines and wide before-images. These run the shipped TypeScript helper over
 Node's SQLite SQL adapter; they do not claim a built FrankenSQLite WASM test.
+Inbox tests cover duplicate delivery, same-ID payload substitution, lost commit
+acknowledgements, rollback/constraint/cancellation cuts, retained omissions,
+invalid schema/receipts, and a separate process reopening a real database file.
