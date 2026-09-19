@@ -110,3 +110,120 @@ node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
 
 This is client/network and reference-SQLite evidence, not FrankenSQLite engine,
 Rust/WASM, browser CORS or physical power-loss certification.
+
+## Fetch-standard receiver endpoint
+
+`createChangesetHttpHandler` mounts an existing `ChangesetReceiver` on an
+application-owned route. It does not create an HTTP listener, select a database,
+provision certificates or invent an authentication policy.
+
+```ts
+import { ChangesetReceiver, createChangesetHttpHandler } from '@frankensqlite/sdk';
+
+const receiver = new ChangesetReceiver(destination, {
+  receiverId: 'replica-42',
+  tables: ['notes', 'tags'],
+  confirmCommit: () => destination.checkpoint(),
+});
+const handleChangesets = createChangesetHttpHandler(receiver, {
+  authorize: request => authorizeReceiverToken(
+    request.headers.get('authorization'), request.receiverId, request.signal,
+  ),
+  authorizeDelivery: (request, delivery) => authorizeSourceIdentity(
+    request.headers.get('authorization'), delivery.deliveryId,
+  ),
+  allowedOrigins: ['https://app.example'],
+  maxMessageBytes: 8 * 1024 * 1024,
+  maxInFlight: 1,
+  timeoutMs: 30_000,
+});
+// Your server/router forwards its streaming Request to handleChangesets and
+// returns the resulting Response. The two authorization functions are your policy.
+```
+
+Authorization is mandatory and must return literal `true`. Missing credentials,
+false/truthy non-boolean results and thrown authorization errors deny access.
+The first callback runs before the handler acquires a body reader or invokes the
+receiver. Its context contains a detached Headers copy, routing identity, URL,
+method and cancellation signal, but no body. Optional `authorizeDelivery` runs
+after bounded frame parsing and before SQL; it can bind a source-qualified
+operation ID to the authenticated sender's namespace. Configure the receiver's
+fixed table allowlist as well. Identity strings and hashes are not credentials.
+The application must trust its authorization callbacks and target schema; SQL
+triggers/foreign-key effects are still governed by the receiver's SQL contract.
+
+The endpoint accepts POST with the exact request media type. It enforces both
+actual body bytes and declared lengths, validates framing/routing metadata, and
+passes the owned binary payload to the real receiver. The receiver performs
+codec/hash validation, transactional application and retained-receipt handling.
+No HTTP 200 is constructed until its commit-confirmation callback has completed.
+An unconfirmed or mismatched return value is rejected, including on replay.
+
+### Admission, cancellation and errors
+
+`maxInFlight` counts authorization, upload, policy checking and receiver execution
+together, not only active SQL. It defaults to one and permits at most 64. Excess
+requests receive 503 without entering an application queue. One ordinary
+ChangesetReceiver still admits one call; increasing HTTP admission does not
+create a database pool or override receiver ownership. This is per-handler
+backpressure, not a global writer lock or a change to Rust MVCC defaults.
+
+The slot remains held until started receiver work and body cleanup settle,
+including after client cancellation. The handler forwards Request cancellation
+and the remaining server-side monotonic budget to the receiver. It never races
+away from SQL or storage confirmation. A trusted authorization callback, receiver
+or host stream that ignores cancellation can delay settlement; it cannot create
+an unbounded waiting queue inside this handler.
+
+Unauthorized/rejected bodies are cancelled rather than read into application
+buffers. The HTTP host must preserve streaming, propagate peer disconnects into
+Request.signal, and handle early body cancellation correctly. Do not eagerly
+buffer uploads before invoking the handler. TLS termination, trusted Host/proxy
+handling, connection/header limits and process-level admission remain host
+responsibilities. Body limits bound retained protocol bytes, not SQL memory,
+network-stack buffering or total process RSS.
+
+Method/media errors return 405/415; authorization/CORS failures return 403;
+malformed/oversized wire input returns 400/413; local cancellation/deadline
+expiry can return 408; admission/receiver busy returns 503; receiver execution,
+confirmation or receipt validation failure returns 500. A disconnected client
+may observe no status at all. These responses use a constant, redacted error
+record and never include SQL errors, credentials, routing IDs or stack traces.
+They do not prove rollback. The client treats every post-dispatch error as an
+unknown outcome and keeps the original identity for reconciliation.
+
+### Browser origins
+
+Originless and same-origin requests still require authorization. Cross-origin
+browser calls require an exact entry in `allowedOrigins` (maximum 64). Wildcards,
+opaque/null origins, credentials and origin URLs with paths are rejected. A valid
+OPTIONS preflight does not invoke authorization or SQL: it merely permits a
+subsequent authenticated POST. Allowed preflight headers default to `content-type`
+and `authorization`; up to 32 additional exact names can be configured with
+`allowedHeaders`. Unlisted names/methods reject. Responses never opt into cookies
+with Access-Control-Allow-Credentials, never use wildcard origins, and include
+no-store, nosniff and appropriate Vary headers. CORS is not authentication, and
+an originless non-browser client must not gain authority merely by omitting Origin.
+
+## Combined executed verification
+
+On Node 22.16.0 / SQLite 3.49.1, the complete suite passes **112 tests**, with no
+failures or skipped tests. It exercises the actual existing capture, outbox,
+pump, receiver, application and codec modules over real loopback HTTP, alongside
+adversarial stream/protocol tests. All six changeset modules (including HTTP)
+also pass strict TypeScript 5.8.3 checks with exact optional properties and
+unchecked-index checking. This does not constitute a full SDK/worker build.
+
+The complete-path test drops the first successful HTTP acknowledgement, verifies
+that both ordered source deliveries remain pending, retries without rerunning
+source callbacks, and obtains the correct final receiver rows and acknowledged
+outbox state. A separate HTTP receiver child is actually SIGKILLed after its
+SQLite commit but before returning a response. Another connection reopens the
+file, receives the same delivery over HTTP, and returns its retained receipt
+without inserting the row again. Constraint failures roll back earlier rows and
+the inbox; failed confirmation returns no success and is retried on replay.
+
+These are Node HTTP, reference-SQLite and process-death results. Browser CORS
+headers are tested through standards-based Request/Response objects, not a real
+browser. Production TLS/proxy deployments, Rust/WASM, browser persistent stores,
+physical power loss, consensus and the native RaptorQ protocol are not certified.

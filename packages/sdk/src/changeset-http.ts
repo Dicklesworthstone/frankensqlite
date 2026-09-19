@@ -272,3 +272,154 @@ export function createChangesetHttpTransport(url: string | URL, options: Changes
     }
   };
 }
+
+export interface ChangesetHttpAuthorization {
+  readonly method: string;
+  readonly url: string;
+  /** Detached header copy; no body access is handed to authorization code. */
+  readonly headers: Headers;
+  readonly receiverId: string;
+  readonly signal: AbortSignal;
+}
+export interface ChangesetHttpHandlerOptions {
+  /** Required, fail-closed authentication/authorization for this fixed receiver. */
+  authorize: (request: ChangesetHttpAuthorization) => boolean | Promise<boolean>;
+  /** Optional sender-namespace/business policy, after framing and before SQL. */
+  authorizeDelivery?: (request: ChangesetHttpAuthorization, delivery: Readonly<Omit<ChangesetEnvelope, "changeset">>) => boolean | Promise<boolean>;
+  maxMessageBytes?: number;
+  /** Bounds admission, authorization, upload and awaited receiver execution; default 30s. */
+  timeoutMs?: number;
+  /** Active authorization + upload + receive calls. Default 1; no waiting queue. */
+  maxInFlight?: number;
+  /** Exact additional browser origins. Same-origin and originless requests are admitted. */
+  allowedOrigins?: readonly string[];
+  /** Additional preflight header names; content-type and authorization are always allowed. */
+  allowedHeaders?: readonly string[];
+}
+export type ChangesetHttpHandler = (request: Request) => Promise<Response>;
+
+function origins(input: readonly string[] | undefined): ReadonlySet<string> {
+  if (input !== undefined && (!Array.isArray(input) || input.length > 64)) fail("INPUT", "Configure at most 64 exact origins");
+  const result = new Set<string>();
+  for (const item of input ?? []) {
+    let url: URL;
+    try { url = new URL(item); } catch { return fail("INPUT", "Invalid allowed origin"); }
+    if (typeof item !== "string" || item.length > 2048 || url.origin !== item ||
+        !["https:", "http:"].includes(url.protocol)) fail("INPUT", "Origins must be exact HTTP(S) origins, without paths, credentials or wildcards");
+    result.add(item);
+  }
+  return result;
+}
+function corsHeaders(input: readonly string[] | undefined): ReadonlySet<string> {
+  if (input !== undefined && (!Array.isArray(input) || input.length > 32)) fail("INPUT", "Configure at most 32 additional CORS header names");
+  const result = new Set(["authorization", "content-type"]);
+  for (const header of input ?? []) {
+    if (typeof header !== "string" || header.length > 128 || !/^[!#$%&'+.^_`|~0-9a-z-]+$/i.test(header)) fail("INPUT", "Invalid CORS header name");
+    const name = header.toLowerCase();
+    if (["cookie", "cookie2", "host", "origin", "connection", "transfer-encoding"].includes(name) || name.startsWith("sec-") || name.startsWith("proxy-")) fail("INPUT", "CORS cannot authorize ambient credentials or connection headers");
+    result.add(name);
+  }
+  return result;
+}
+function httpResponse(status: number, value: unknown, origin: string | null, extra?: HeadersInit): Response {
+  const headers = new Headers(extra);
+  headers.set("cache-control", "no-store"); headers.set("x-content-type-options", "nosniff");
+  headers.set("vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+  if (origin !== null) headers.set("access-control-allow-origin", origin);
+  if (status === 204) return new Response(null, { status, headers });
+  headers.set("content-type", status === 200 ? CHANGESET_HTTP_RECEIPT_TYPE : "application/json");
+  return new Response(JSON.stringify(value), { status, headers });
+}
+function errorResponse(status: number, origin: string | null, extra?: HeadersInit): Response {
+  // Never serialize authentication errors, SQL errors, routing IDs or stack traces.
+  // Even errors that predate this request's SQL cannot describe another attempt.
+  return httpResponse(status, { error: "ERR_FSQLITE_HTTP_REJECTED", outcome: "unknown" }, origin, extra);
+}
+
+/**
+ * Fetch-standard endpoint for an existing verified receiver. Its slot is held
+ * through cancellation/confirmation drain; transport disconnect is NOT rollback.
+ * Mount on an exact application route behind HTTPS and trusted host/proxy policy.
+ */
+export function createChangesetHttpHandler(receiver: Pick<ChangesetReceiver, "receiverId" | "receive">,
+  options: ChangesetHttpHandlerOptions): ChangesetHttpHandler {
+  const id = identity(receiver?.receiverId, 256), method = receiver?.receive;
+  const authorize = options?.authorize, authorizeDelivery = options?.authorizeDelivery;
+  if (typeof method !== "function" || typeof authorize !== "function" ||
+      (authorizeDelivery !== undefined && typeof authorizeDelivery !== "function")) fail("INPUT", "A receiver and explicit authorization callback are required");
+  const receive = method.bind(receiver);
+  const maximum = bound(options.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
+  const timeout = bound(options.timeoutMs, 30_000, 2_147_483_647);
+  const capacity = bound(options.maxInFlight, 1, 64);
+  const allowed = origins(options.allowedOrigins), allowedHeaders = corsHeaders(options.allowedHeaders);
+  let active = 0;
+  return async request => {
+    let admitted = false, budget: Budget | undefined, origin: string | null = null, receiving = false;
+    try {
+      if (!(request instanceof Request) || request.url.length > 8192) return errorResponse(400, null);
+      const requestedOrigin = request.headers.get("origin");
+      if (requestedOrigin !== null) {
+        let parsed: URL;
+        try { parsed = new URL(requestedOrigin); } catch { return errorResponse(403, null); }
+        if (parsed.origin !== requestedOrigin || !["https:", "http:"].includes(parsed.protocol) ||
+            (requestedOrigin !== new URL(request.url).origin && !allowed.has(requestedOrigin))) return errorResponse(403, null);
+        origin = requestedOrigin;
+      }
+      if (request.method === "OPTIONS") {
+        const names = request.headers.get("access-control-request-headers") ?? "";
+        if (origin === null || request.headers.get("access-control-request-method") !== "POST" || names.length > 4096) return errorResponse(403, origin);
+        const requested = names === "" ? [] : names.split(",").map(name => name.trim().toLowerCase());
+        if (requested.length > 34 || requested.some(name => !allowedHeaders.has(name))) return errorResponse(403, origin);
+        return httpResponse(204, null, origin, { "access-control-allow-methods": "POST",
+          "access-control-allow-headers": [...new Set(requested)].join(", ") });
+      }
+      if (request.method !== "POST") return errorResponse(405, origin, { allow: "POST, OPTIONS" });
+      if (!contentType(request.headers, CHANGESET_HTTP_CONTENT_TYPE)) return errorResponse(415, origin);
+      if (active >= capacity) return errorResponse(503, origin);
+      active++; admitted = true;
+      budget = new Budget({ signal: request.signal, timeoutMs: timeout }); budget.checkpoint();
+      const context = Object.freeze({ method: request.method, url: request.url,
+        headers: new Headers(request.headers), receiverId: id, signal: budget.signal });
+      let permitted: boolean;
+      try { permitted = await authorize(context) === true; }
+      catch { permitted = false; }
+      budget.checkpoint();
+      if (!permitted) return errorResponse(403, origin);
+      const wire = await readBody(request.body, request.headers, 8 + MAX_METADATA + maximum, budget);
+      const envelope = decode(wire, maximum); budget.checkpoint();
+      if (envelope.receiverId !== id) return errorResponse(400, origin);
+      const meta = Object.freeze({ protocol: envelope.protocol, receiverId: id, deliveryId: envelope.deliveryId,
+        sha256: envelope.sha256, byteLength: envelope.changeset.byteLength });
+      if (authorizeDelivery !== undefined) {
+        try { permitted = await authorizeDelivery(context, meta) === true; }
+        catch { permitted = false; }
+        budget.checkpoint();
+        if (!permitted) return errorResponse(403, origin);
+      }
+      budget.checkpoint(); receiving = true;
+      // Await the real receiver, including its same-target commit confirmation.
+      // Do not race SQL/confirmation against a timer or release this admission
+      // slot while abandoned work could still commit on the connection.
+      const result = await receive(envelope, { signal: budget.signal, timeoutMs: budget.remaining() });
+      budget.checkpoint();
+      return httpResponse(200, receipt(result, meta), origin);
+    } catch (cause: unknown) {
+      if (cause instanceof ChangesetHttpError) {
+        if (cause.code.endsWith("TIMEOUT") || cause.code.endsWith("CANCELLED")) return errorResponse(408, origin);
+        if (cause.code.endsWith("LIMIT")) return errorResponse(413, origin);
+        return errorResponse(receiving ? 500 : 400, origin);
+      }
+      const code = typeof cause === "object" && cause !== null
+        ? Object.getOwnPropertyDescriptor(cause, "code")?.value : undefined;
+      return errorResponse(code === "ERR_FSQLITE_DELIVERY_BUSY" ? 503 : 500, origin);
+    } finally {
+      try {
+        // A denied request never acquires a reader or buffers its payload. Cancel
+        // rather than draining arbitrary unauthorized uploads into application RAM.
+        if (request instanceof Request && request.body !== null && !request.body.locked) await request.body.cancel().catch(() => {});
+      } finally {
+        budget?.finish(); if (admitted) active--;
+      }
+    }
+  };
+}

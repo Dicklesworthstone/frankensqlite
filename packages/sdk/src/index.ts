@@ -55,5 +55,5 @@ export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, Outbo
 export { ChangesetReceiver, ChangesetDeliveryPump, ChangesetDeliveryError, CHANGESET_DELIVERY_PROTOCOL } from "./changeset-delivery";
 export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOptions, ChangesetDeliveryPhase, ChangesetReceiverOptions } from "./changeset-delivery";
 export type { ChangesetTransport, ChangesetPumpOptions, ChangesetPumpRunOptions, ChangesetPumpResult } from "./changeset-delivery";
-export { createChangesetHttpTransport, ChangesetHttpError, CHANGESET_HTTP_CONTENT_TYPE, CHANGESET_HTTP_RECEIPT_TYPE } from "./changeset-http";
-export type { ChangesetHttpTransportOptions } from "./changeset-http";
+export { createChangesetHttpTransport, createChangesetHttpHandler, ChangesetHttpError, CHANGESET_HTTP_CONTENT_TYPE, CHANGESET_HTTP_RECEIPT_TYPE } from "./changeset-http";
+export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttpHandlerOptions, ChangesetHttpAuthorization } from "./changeset-http";
