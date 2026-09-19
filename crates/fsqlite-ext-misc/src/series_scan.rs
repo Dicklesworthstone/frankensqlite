@@ -35,6 +35,28 @@ fn is_sql_null(value: &SqliteValue) -> bool {
     value.is_null() || matches!(value, SqliteValue::Float(number) if number.is_nan())
 }
 
+const fn bound_code(op: ConstraintOp) -> Option<u8> {
+    match op {
+        ConstraintOp::Eq => Some(b'='),
+        ConstraintOp::Gt => Some(b'>'),
+        ConstraintOp::Ge => Some(b'G'),
+        ConstraintOp::Lt => Some(b'<'),
+        ConstraintOp::Le => Some(b'L'),
+        _ => None,
+    }
+}
+
+const fn bound_flag(code: u8) -> Option<i32> {
+    match code {
+        b'=' => Some(EQUAL),
+        b'>' => Some(GREATER),
+        b'G' => Some(AT_LEAST),
+        b'<' => Some(LESS),
+        b'L' => Some(AT_MOST),
+        _ => None,
+    }
+}
+
 pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
     if info.constraint_usage.len() != info.constraints.len() {
         return Err(invalid_plan());
@@ -49,9 +71,19 @@ pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
     // Keep the unplanned positional protocol for table-function callers that
     // pass their 1..=3 arguments directly to filter(0, None, args). Without a
     // usable start equality, do not consume unrelated WHERE arguments as START.
-    if !info.constraints.iter().any(|constraint| {
-        constraint.usable && constraint.column == 1 && constraint.op == ConstraintOp::Eq
-    }) {
+    let hidden = [1, 2, 3].map(|column| {
+        info.constraints.iter().any(|constraint| {
+            constraint.usable && constraint.column == column && constraint.op == ConstraintOp::Eq
+        })
+    });
+    let unavailable_parameter = info.constraints.iter().any(|constraint| {
+        let slot = match constraint.column { 1 => 0, 2 => 1, 3 => 2, _ => return false };
+        constraint.op == ConstraintOp::Eq && !constraint.usable && !hidden[slot]
+    });
+    if !hidden[0] || unavailable_parameter {
+        // An unavailable correlated STOP/STEP is not an omitted argument.
+        // Preserve positional routing instead of inventing a default and
+        // claiming a partially bound plan or ordering guarantee.
         return Ok(());
     }
 
@@ -65,9 +97,8 @@ pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
         (LESS, 0, ConstraintOp::Lt),
         (AT_MOST, 0, ConstraintOp::Le),
     ];
-    let mut argument = 0;
+    let mut argument = 0_i32;
     info.idx_num = PLANNED;
-    info.idx_str = Some(PLAN_NAME.to_owned());
     for (flag, column, op) in slots {
         let selected = info.constraints.iter().position(|constraint| {
             constraint.usable && constraint.op == op
@@ -83,6 +114,25 @@ pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
             info.idx_num |= flag;
         }
     }
+    // The bitmask describes one argument per operator. Append any additional
+    // VALUE/rowid comparisons after that canonical prefix and describe their
+    // operators in the plan string. A loose first bound must not hide a much
+    // tighter duplicate or a contradiction. Hidden duplicates stay residual.
+    let mut name = PLAN_NAME.to_owned();
+    for (index, constraint) in info.constraints.iter().enumerate() {
+        if !constraint.usable || !matches!(constraint.column, -1 | 0)
+            || info.constraint_usage[index].argv_index != 0
+        {
+            continue;
+        }
+        if let Some(code) = bound_code(constraint.op) {
+            argument = argument.checked_add(1).ok_or(FrankenError::TooBig)?;
+            info.constraint_usage[index].argv_index = argument;
+            if name.len() == PLAN_NAME.len() { name.push(':'); }
+            name.push(char::from(code));
+        }
+    }
+    info.idx_str = Some(name);
     if let [order] = info.order_by.as_slice()
         && matches!(order.column, -1 | 0)
     {
@@ -128,11 +178,23 @@ pub(super) fn filter(
             args.get(2).map_or(1, SqliteValue::to_integer),
         );
     }
-    if name != Some(PLAN_NAME)
-        || index & (PLANNED | START) != (PLANNED | START)
+    let extra_bounds = if name == Some(PLAN_NAME) {
+        &[][..]
+    } else {
+        name.and_then(|name| name.strip_prefix(PLAN_NAME))
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .filter(|suffix| !suffix.is_empty())
+            .ok_or_else(invalid_plan)?.as_bytes()
+    };
+    let base_arguments = usize::try_from((index & ARGUMENTS).count_ones())
+        .map_err(|_| invalid_plan())?;
+    if index & (PLANNED | START) != (PLANNED | START)
         || index & !(ARGUMENTS | PLANNED | ASCENDING | DESCENDING) != 0
         || index & (ASCENDING | DESCENDING) == (ASCENDING | DESCENDING)
-        || usize::try_from((index & ARGUMENTS).count_ones()).ok() != Some(args.len())
+        || base_arguments.checked_add(extra_bounds.len()) != Some(args.len())
+        || extra_bounds.iter().any(|code| {
+            bound_flag(*code).is_none_or(|flag| index & flag == 0)
+        })
     {
         return Err(invalid_plan());
     }
@@ -156,21 +218,26 @@ pub(super) fn filter(
     let mut lower = i128::from(i64::MIN);
     let mut upper = i128::from(i64::MAX);
     for flag in [EQUAL, GREATER, AT_LEAST, LESS, AT_MOST] {
-        match argument(flag) {
-            Some(SqliteValue::Integer(value)) => {
-                intersect_integer_bound(&mut lower, &mut upper, flag, i128::from(*value));
-            }
-            Some(SqliteValue::Float(value)) => {
-                intersect_real_bound(&mut lower, &mut upper, flag, *value);
-            }
-            // Do not impose numeric coercion on TEXT/BLOB comparisons. The
-            // core still evaluates every selected visible predicate, including
-            // its affinity and collation, because best_index left omit=false.
-            _ => {}
+        if let Some(value) = argument(flag) {
+            intersect_value_bound(&mut lower, &mut upper, flag, value);
         }
+    }
+    for (code, value) in extra_bounds.iter().zip(&args[base_arguments..]) {
+        let flag = bound_flag(*code).ok_or_else(invalid_plan)?;
+        intersect_value_bound(&mut lower, &mut upper, flag, value);
     }
     cursor.init(start, stop, step)?;
     intersect_sequence(cursor, lower, upper, index)
+}
+
+fn intersect_value_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: &SqliteValue) {
+    match value {
+        SqliteValue::Integer(value) => intersect_integer_bound(lower, upper, flag, i128::from(*value)),
+        SqliteValue::Float(value) => intersect_real_bound(lower, upper, flag, *value),
+        // The core rechecks every visible comparison. Never guess TEXT/BLOB
+        // affinity, including when an opaque operand precedes a numeric bound.
+        _ => {}
+    }
 }
 
 fn intersect_integer_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: i128) {
@@ -344,7 +411,7 @@ mod tests {
         let mut info = IndexInfo::new(constraints, Vec::new());
         best_index(&mut info).unwrap();
         assert_eq!(info.constraints, original);
-        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(), vec![1, 0, 0, 0, 2]);
+        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(), vec![0, 0, 0, 0, 0]);
         assert!(info.constraint_usage[1..].iter().all(|usage| !usage.omit));
         // Repeated planning must not retain old mappings or ordering promises.
         info.constraints[0].usable = false;
@@ -363,6 +430,114 @@ mod tests {
         assert!(!info.order_by_consumed);
         assert_eq!(info.constraint_usage[0].argv_index, 0);
         assert!(info.estimated_cost >= 1.0e9);
+    }
+
+    #[test]
+    fn unavailable_hidden_parameters_are_not_replaced_with_defaults() {
+        for column in [2, 3] {
+            let mut info = IndexInfo::new(
+                vec![constraint(1, ConstraintOp::Eq),
+                    IndexConstraint { column, op: ConstraintOp::Eq, usable: false }],
+                vec![IndexOrderBy { column: 0, desc: true }],
+            );
+            best_index(&mut info).unwrap();
+            assert_eq!(info.idx_num, 0);
+            assert!(info.idx_str.is_none());
+            assert!(!info.order_by_consumed);
+            assert!(info.constraint_usage.iter().all(|usage| usage.argv_index == 0 && !usage.omit));
+            // A usable equality for the same hidden column can bind it; the
+            // unavailable duplicate is still evaluated by the core.
+            info.constraints.push(constraint(column, ConstraintOp::Eq));
+            info.constraint_usage.push(Default::default());
+            best_index(&mut info).unwrap();
+            assert_ne!(info.idx_num & PLANNED, 0);
+            assert_eq!(info.constraint_usage[1].argv_index, 0);
+            assert!(!info.constraint_usage[1].omit);
+            assert_eq!(info.constraint_usage[2].argv_index, 2);
+        }
+    }
+
+    #[test]
+    fn duplicate_visible_bounds_intersect_but_hidden_duplicates_stay_residual() {
+        let (cursor, info) = planned(
+            vec![constraint(1, ConstraintOp::Eq), constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Ge), constraint(0, ConstraintOp::Le)],
+            &[0, 2, 10, 4, 6, 5].map(SqliteValue::Integer), Vec::new(),
+        );
+        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(),
+            vec![1, 0, 2, 3, 5, 4]);
+        assert!(!info.constraint_usage[1].omit);
+        assert!(info.constraint_usage[3..].iter().all(|usage| !usage.omit));
+        assert_eq!(info.idx_str.as_deref(), Some("series-range-v1:G"));
+        assert!(cursor.eof(), "the second lower bound contradicts the upper bound");
+    }
+
+    #[test]
+    fn repeated_value_and_rowid_bounds_jump_directly_in_either_order() {
+        for reverse in [false, true] {
+            let mut constraints = vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge), constraint(-1, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Le), constraint(-1, ConstraintOp::Le)];
+            let mut operands = [i64::MIN, i64::MAX, i64::MIN, 41, i64::MAX, 43]
+                .map(SqliteValue::Integer).to_vec();
+            if reverse { constraints.reverse(); operands.reverse(); }
+            let (cursor, info) = planned(constraints, &operands,
+                vec![IndexOrderBy { column: -1, desc: true }]);
+            assert!(info.order_by_consumed);
+            assert_eq!(cursor.current, 43, "filter must not walk the discarded prefix");
+            assert_eq!(values(cursor), vec![43, 42, 41]);
+        }
+        // Every repeat is represented, not just the second of each operator.
+        let mut constraints = vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq)];
+        let mut operands = vec![SqliteValue::Integer(0), SqliteValue::Integer(100)];
+        for lower in 0..=99 {
+            constraints.push(constraint(0, ConstraintOp::Ge));
+            operands.push(SqliteValue::Integer(lower));
+        }
+        let (cursor, _) = planned(constraints, &operands, Vec::new());
+        assert_eq!(values(cursor), vec![99, 100]);
+    }
+
+    #[test]
+    fn opaque_and_null_duplicate_operands_do_not_mask_numeric_bounds() {
+        for opaque in [SqliteValue::Text("0".into()), SqliteValue::Blob(vec![b'0'].into())] {
+            let (cursor, info) = planned(
+                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Ge), constraint(0, ConstraintOp::Ge)],
+                &[SqliteValue::Integer(0), SqliteValue::Integer(5), opaque, SqliteValue::Float(3.5)],
+                Vec::new(),
+            );
+            assert!(info.constraint_usage[2..].iter().all(|usage| !usage.omit));
+            assert_eq!(values(cursor), vec![4, 5]);
+        }
+        for null in [SqliteValue::Null, SqliteValue::Float(f64::NAN)] {
+            let (cursor, _) = planned(
+                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Eq), constraint(-1, ConstraintOp::Eq)],
+                &[SqliteValue::Integer(0), SqliteValue::Integer(5), SqliteValue::Integer(3), null],
+                Vec::new(),
+            );
+            assert!(cursor.eof());
+        }
+    }
+
+    #[test]
+    fn extra_bound_shape_is_validated_before_the_null_shortcut() {
+        for (index, name, count) in [
+            (PLANNED | START | EQUAL, "series-range-v1:", 2),
+            (PLANNED | START | EQUAL, "series-range-v1:?", 3),
+            (PLANNED | START | EQUAL, "series-range-v1:G", 3),
+            (PLANNED | START | EQUAL, "series-range-v1:=", 2),
+            (PLANNED | START | EQUAL, "series-range-v1:=", 4),
+            (PLANNED | START | EQUAL, "series-range-v1:=G", 4),
+        ] {
+            let mut cursor = GenerateSeriesTable.open().unwrap();
+            cursor.init(1, 3, 1).unwrap();
+            assert!(cursor.filter(&Cx::new(), index, Some(name), &vec![SqliteValue::Null; count]).is_err());
+            assert!(cursor.eof());
+            assert_eq!(cursor.rowid().unwrap(), 0);
+        }
     }
 
     #[test]
