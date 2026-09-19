@@ -112,10 +112,10 @@ where
     }
 }
 
-/// Diagnostic emitted when a committed marker's capsule cannot be decoded.
+/// Diagnostic emitted when a committed marker or its capsule fails recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurabilityViolation {
-    /// The commit sequence of the undecipherable marker.
+    /// The commit sequence of the invalid marker or undecipherable capsule.
     pub commit_seq: CommitSeq,
     /// The capsule ObjectId referenced by the marker.
     pub capsule_object_id: ObjectId,
@@ -137,9 +137,9 @@ pub struct CheckpointRef {
 pub struct RecoverySummary {
     /// The ECS epoch from the RootManifest.
     pub ecs_epoch: u64,
-    /// The highest commit_seq recovered from the marker stream.
+    /// The end of the contiguous verified prefix, including the checkpoint.
     pub commit_seq_recovered: CommitSeq,
-    /// Number of markers replayed.
+    /// Number of successfully verified markers replayed after the checkpoint.
     pub markers_replayed: u64,
     /// Number of capsules that required RaptorQ repair.
     pub capsules_repaired: u32,
@@ -165,17 +165,21 @@ pub struct RootManifest {
 /// Recovers committed state from the marker stream, starting from the
 /// latest checkpoint (or genesis if none exists). Capsules are decoded
 /// via systematic fast path or RaptorQ repair.
+///
+/// This state machine tracks replay eligibility. The caller remains responsible
+/// for restoring the referenced checkpoint, applying decoded capsules, and
+/// validating the stream's object links against its trusted manifest.
 #[derive(Debug)]
 pub struct NativeRecovery {
     /// Root manifest loaded in step 1.
     root_manifest: Option<RootManifest>,
-    /// Markers replayed during step 3-4.
+    /// Successfully verified markers replayed during step 3-4.
     replayed_markers: Vec<CommitMarker>,
-    /// Capsule decode outcomes for audit.
+    /// Capsule decode outcomes for audit, including a terminal failure.
     decode_outcomes: Vec<(CommitSeq, CapsuleDecodeOutcome)>,
-    /// Highest commit_seq recovered.
+    /// End of the contiguous verified prefix.
     recovered_tip: CommitSeq,
-    /// Any durability violations.
+    /// Any durability violations; a nonempty list blocks further replay.
     violations: Vec<DurabilityViolation>,
 }
 
@@ -192,13 +196,25 @@ impl NativeRecovery {
         }
     }
 
-    /// Step 1: Load `RootManifest` from `ecs/root`.
+    /// Step 1: Load `RootManifest` from `ecs/root` and start a fresh attempt.
+    ///
+    /// The referenced checkpoint is the replay baseline, even when there are
+    /// no later markers. Loading another manifest discards the prior attempt's
+    /// replay accounting and failure state; the caller must restore that
+    /// manifest's checkpoint before applying any newly decoded capsules.
     pub fn load_root_manifest(&mut self, manifest: RootManifest) {
         info!(
             ecs_epoch = manifest.ecs_epoch,
             has_checkpoint = manifest.latest_checkpoint.is_some(),
             "recovery step 1: loaded RootManifest"
         );
+        self.recovered_tip = manifest
+            .latest_checkpoint
+            .as_ref()
+            .map_or(CommitSeq::ZERO, |checkpoint| checkpoint.commit_seq);
+        self.replayed_markers.clear();
+        self.decode_outcomes.clear();
+        self.violations.clear();
         self.root_manifest = Some(manifest);
     }
 
@@ -226,19 +242,46 @@ impl NativeRecovery {
     /// `decode_capsule` is a closure that attempts to decode a capsule given
     /// its ObjectId, returning the decode outcome.
     ///
-    /// For each marker, the closure is called to decode the capsule. Failed
-    /// decodes are recorded as durability violations per the spec.
+    /// Checkpoint-covered markers are skipped. New markers must extend the
+    /// verified prefix without gaps and pass their integrity checks before
+    /// invoking the decoder. The first failure is terminal for this attempt:
+    /// neither that marker nor its suffix advances the tip, including when
+    /// the caller supplies the suffix in a later invocation.
     pub fn replay_markers<F>(&mut self, markers: &[CommitMarker], mut decode_capsule: F)
     where
         F: FnMut(ObjectId) -> CapsuleDecodeOutcome,
     {
+        if self.has_violations() {
+            warn!("recovery replay blocked by an earlier durability violation");
+            return;
+        }
         info!(
             marker_count = markers.len(),
             "recovery step 3-4: scanning marker stream"
         );
+        let checkpoint_tip = self.locate_checkpoint().get();
 
         for marker in markers {
-            let outcome = decode_capsule(marker.capsule_object_id);
+            if checkpoint_tip > 0 && marker.commit_seq.get() <= checkpoint_tip {
+                continue;
+            }
+            let outcome = if self.recovered_tip.get().checked_add(1)
+                != Some(marker.commit_seq.get())
+            {
+                CapsuleDecodeOutcome::Failed {
+                    reason: format!(
+                        "non-contiguous marker stream: expected commit after {}, got {}",
+                        self.recovered_tip.get(),
+                        marker.commit_seq.get(),
+                    ),
+                }
+            } else if !marker.verify_integrity() {
+                CapsuleDecodeOutcome::Failed {
+                    reason: "commit marker integrity check failed".to_owned(),
+                }
+            } else {
+                decode_capsule(marker.capsule_object_id)
+            };
 
             match &outcome {
                 CapsuleDecodeOutcome::Systematic => {
@@ -259,7 +302,7 @@ impl NativeRecovery {
                     error!(
                         commit_seq = marker.commit_seq.get(),
                         reason = reason.as_str(),
-                        "DURABILITY CONTRACT VIOLATED: capsule undecodable — unrecoverable corruption"
+                        "DURABILITY CONTRACT VIOLATED: marker or capsule invalid — recovery stopped"
                     );
                     self.violations.push(DurabilityViolation {
                         commit_seq: marker.commit_seq,
@@ -269,7 +312,11 @@ impl NativeRecovery {
                 }
             }
 
+            let failed = matches!(&outcome, CapsuleDecodeOutcome::Failed { .. });
             self.decode_outcomes.push((marker.commit_seq, outcome));
+            if failed {
+                break;
+            }
             self.replayed_markers.push(marker.clone());
             self.recovered_tip = marker.commit_seq;
         }
@@ -278,6 +325,7 @@ impl NativeRecovery {
     /// Step 5: Finalize recovery and return summary.
     ///
     /// `duration_ms` is the elapsed wall-clock time for the entire recovery.
+    /// A summary with violations is not a successful recovery receipt.
     #[must_use]
     pub fn finalize(self, duration_ms: u64) -> RecoverySummary {
         let capsules_repaired = self
@@ -305,7 +353,7 @@ impl NativeRecovery {
             capsules_repaired,
             violations = self.violations.len(),
             duration_ms,
-            "recovery complete"
+            "recovery scan finished"
         );
 
         #[allow(clippy::cast_possible_truncation)]
@@ -332,7 +380,7 @@ impl NativeRecovery {
         }
     }
 
-    /// The highest commit_seq recovered so far.
+    /// The end of the contiguous verified prefix recovered so far.
     #[must_use]
     pub const fn recovered_tip(&self) -> CommitSeq {
         self.recovered_tip
@@ -658,6 +706,9 @@ impl CompactionSaga {
     ///
     /// - Before publish: temp segments garbage-collected, old segments valid.
     /// - After publish: must complete or rollback to pre-compaction view.
+    ///
+    /// Cancellation fences off publication and retirement in this instance.
+    /// After-publish compensation must preserve the old segments it may need.
     pub fn cancel(&mut self) -> CompactionCompensation {
         self.cancelled = true;
         if self.published {
@@ -669,6 +720,8 @@ impl CompactionSaga {
                 "compaction cancelled before publish — temp segments discarded"
             );
             self.new_segments.clear();
+            self.new_segments_synced = false;
+            self.new_locator_synced = false;
             CompactionCompensation::TempSegmentsDiscarded
         }
     }
@@ -743,6 +796,11 @@ impl CompactionSaga {
         let new_total_size: u64 = new_segments.iter().map(|s| s.size_bytes).sum();
 
         self.new_segments = new_segments;
+        // A sync receipt covers a particular candidate, not every later
+        // replacement submitted while the saga is still in Compact phase.
+        self.new_segments_synced = false;
+        self.new_locator_synced = false;
+        self.space_amp_after = 0.0;
 
         if new_total_size > 0 {
             // space_amp_after = new_total_size / live_data_size.
@@ -779,10 +837,17 @@ impl CompactionSaga {
     /// 2. fdatasync(locator.tmp), rename(locator.tmp -> locator), fsync dir
     ///
     /// Old segments MUST NOT be retired until both new segments AND new locator
-    /// are durable.
+    /// are durable. Every live object in the selected old segments must have
+    /// a replacement, and replacement segment identities must not alias files
+    /// that retirement will remove. Object coverage here is a logical guard;
+    /// the caller still must verify and durably copy the actual symbol bytes.
     ///
-    /// Returns `true` if publish succeeded.
+    /// Returns `true` if publish succeeded. A cancelled saga never publishes.
     pub fn publish(&mut self) -> bool {
+        if self.cancelled {
+            warn!("cannot publish a cancelled compaction");
+            return false;
+        }
         assert_eq!(
             self.phase,
             CompactionPhase::Publish,
@@ -791,6 +856,34 @@ impl CompactionSaga {
 
         if !self.new_segments_synced || !self.new_locator_synced {
             warn!("cannot publish: segments or locator not yet synced");
+            return false;
+        }
+
+        let old_segment_ids: HashSet<ObjectId> = self
+            .old_segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .collect();
+        if self
+            .new_segments
+            .iter()
+            .any(|segment| old_segment_ids.contains(&segment.segment_id))
+        {
+            warn!("cannot publish: replacement aliases a segment selected for retirement");
+            return false;
+        }
+        let copied_objects: HashSet<ObjectId> = self
+            .new_segments
+            .iter()
+            .flat_map(|segment| segment.object_ids.iter().copied())
+            .collect();
+        if self
+            .old_segments
+            .iter()
+            .flat_map(|segment| &segment.object_ids)
+            .any(|id| self.live_set.contains(id) && !copied_objects.contains(id))
+        {
+            warn!("cannot publish: a live object has no replacement in the compacted segments");
             return false;
         }
 
@@ -812,9 +905,12 @@ impl CompactionSaga {
     }
 
     /// Check which old segments can be safely retired (no active leases).
+    ///
+    /// Already retired segments and segments needed by cancellation
+    /// compensation are never returned.
     #[must_use]
     pub fn retirable_segments(&self) -> Vec<ObjectId> {
-        if !self.published {
+        if !self.published || self.cancelled {
             return Vec::new();
         }
 
@@ -823,10 +919,14 @@ impl CompactionSaga {
             .iter()
             .flat_map(|lease| &lease.segment_ids)
             .collect();
+        let retired_segments: HashSet<&ObjectId> = self.retired_segments.iter().collect();
 
         self.old_segments
             .iter()
-            .filter(|seg| !leased_segments.contains(&seg.segment_id))
+            .filter(|seg| {
+                !leased_segments.contains(&seg.segment_id)
+                    && !retired_segments.contains(&seg.segment_id)
+            })
             .map(|seg| seg.segment_id)
             .collect()
     }
@@ -847,7 +947,7 @@ impl CompactionSaga {
         self.retired_segments.extend_from_slice(&retirable);
 
         if retirable.is_empty() {
-            debug!("compaction phase 4 (retire): no segments retirable yet (leases active)");
+            debug!("compaction phase 4 (retire): no segments retirable yet");
         } else {
             info!(
                 retired_count = retirable.len(),
@@ -1099,9 +1199,11 @@ mod tests {
         let markers: Vec<_> = (1_u64..=3)
             .map(|i| make_marker(i, u8::try_from(i).expect("marker id fits in u8")))
             .collect();
+        let mut decoded = Vec::new();
 
-        // Marker 2 fails to decode
+        // Marker 2 fails to decode. Marker 3 must never reach the decoder.
         recovery.replay_markers(&markers, |oid| {
+            decoded.push(oid);
             if oid == make_oid(2) {
                 CapsuleDecodeOutcome::Failed {
                     reason: "insufficient symbols: 2 of 5 needed".to_owned(),
@@ -1112,8 +1214,14 @@ mod tests {
         });
 
         assert!(recovery.has_violations());
+        assert_eq!(decoded, vec![make_oid(1), make_oid(2)]);
+        recovery.replay_markers(&markers[2..], |_| {
+            panic!("replay after a durability failure must stay blocked")
+        });
 
         let summary = recovery.finalize(50);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(1));
+        assert_eq!(summary.markers_replayed, 1);
         assert_eq!(summary.violations.len(), 1);
         assert_eq!(summary.violations[0].commit_seq, CommitSeq::new(2));
         assert_eq!(summary.violations[0].capsule_object_id, make_oid(2));
@@ -1593,7 +1701,7 @@ mod tests {
         });
 
         assert!(recovery.has_violations());
-        assert_eq!(recovery.recovered_tip(), CommitSeq::new(2));
+        assert_eq!(recovery.recovered_tip(), CommitSeq::new(1));
     }
 
     #[test]
@@ -1860,5 +1968,248 @@ mod tests {
         assert_eq!(cloned.size_bytes, 4096);
         let dbg = format!("{seg:?}");
         assert!(dbg.contains("SegmentRef"));
+    }
+
+    #[test]
+    fn recovery_without_post_checkpoint_markers_preserves_checkpoint_tip() {
+        let mut recovery = NativeRecovery::new();
+        recovery.load_root_manifest(RootManifest {
+            ecs_epoch: 2,
+            latest_checkpoint: Some(CheckpointRef {
+                commit_seq: CommitSeq::new(100),
+                manifest_object_id: make_oid(0xCC),
+            }),
+            manifest: ManifestSegment::new(Vec::new()),
+        });
+        recovery.replay_markers(&[], |_| panic!("empty replay must not decode"));
+        let summary = recovery.finalize(0);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(100));
+        assert_eq!(summary.markers_replayed, 0);
+        assert!(summary.violations.is_empty());
+    }
+
+    #[test]
+    fn recovery_skips_checkpoint_covered_markers() {
+        let mut recovery = NativeRecovery::new();
+        recovery.load_root_manifest(RootManifest {
+            ecs_epoch: 2,
+            latest_checkpoint: Some(CheckpointRef {
+                commit_seq: CommitSeq::new(100),
+                manifest_object_id: make_oid(0xCC),
+            }),
+            manifest: ManifestSegment::new(Vec::new()),
+        });
+        let markers = [
+            make_marker(99, 99),
+            make_marker(100, 100),
+            make_marker(101, 101),
+            make_marker(102, 102),
+        ];
+        let mut decoded = Vec::new();
+        recovery.replay_markers(&markers, |oid| {
+            decoded.push(oid);
+            CapsuleDecodeOutcome::Systematic
+        });
+        assert_eq!(decoded, vec![make_oid(101), make_oid(102)]);
+        let summary = recovery.finalize(0);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(102));
+        assert_eq!(summary.markers_replayed, 2);
+        assert!(summary.violations.is_empty());
+    }
+
+    #[test]
+    fn recovery_rejects_gaps_duplicates_and_backwards_markers_before_decode() {
+        for next_seq in [0, 1, 3] {
+            let mut recovery = NativeRecovery::new();
+            recovery.replay_markers(&[make_marker(1, 1)], |_| {
+                CapsuleDecodeOutcome::Systematic
+            });
+            recovery.replay_markers(&[make_marker(next_seq, 2)], |_| {
+                panic!("a non-contiguous marker must not reach the decoder")
+            });
+            let summary = recovery.finalize(0);
+            assert_eq!(summary.commit_seq_recovered, CommitSeq::new(1));
+            assert_eq!(summary.markers_replayed, 1);
+            assert_eq!(summary.violations.len(), 1);
+            assert!(summary.violations[0].reason.contains("non-contiguous"));
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_damaged_marker_before_decoding_its_capsule() {
+        let mut recovery = NativeRecovery::new();
+        let mut damaged = make_marker(2, 2);
+        damaged.capsule_object_id = make_oid(99);
+        assert!(!damaged.verify_integrity());
+        let mut decoded = Vec::new();
+        recovery.replay_markers(&[make_marker(1, 1), damaged, make_marker(3, 3)], |oid| {
+            decoded.push(oid);
+            CapsuleDecodeOutcome::Systematic
+        });
+        assert_eq!(decoded, vec![make_oid(1)]);
+        let summary = recovery.finalize(0);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(1));
+        assert_eq!(summary.markers_replayed, 1);
+        assert_eq!(summary.violations.len(), 1);
+        assert!(summary.violations[0].reason.contains("integrity"));
+    }
+
+    #[test]
+    fn recovery_accepts_contiguous_replay_across_calls() {
+        let mut recovery = NativeRecovery::new();
+        recovery.replay_markers(&[make_marker(1, 1)], |_| CapsuleDecodeOutcome::Systematic);
+        recovery.replay_markers(&[make_marker(2, 2), make_marker(3, 3)], |_| {
+            CapsuleDecodeOutcome::Repaired {
+                repair_symbols_used: 1,
+            }
+        });
+        let summary = recovery.finalize(0);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(3));
+        assert_eq!(summary.markers_replayed, 3);
+        assert_eq!(summary.capsules_repaired, 2);
+        assert!(summary.violations.is_empty());
+    }
+
+    #[test]
+    fn loading_a_new_root_starts_fresh_recovery_accounting() {
+        let mut recovery = NativeRecovery::new();
+        recovery.replay_markers(&[make_marker(1, 1)], |_| CapsuleDecodeOutcome::Failed {
+            reason: "old attempt failed".to_owned(),
+        });
+        assert!(recovery.has_violations());
+        recovery.load_root_manifest(RootManifest {
+            ecs_epoch: 7,
+            latest_checkpoint: Some(CheckpointRef {
+                commit_seq: CommitSeq::new(20),
+                manifest_object_id: make_oid(0xCC),
+            }),
+            manifest: ManifestSegment::new(Vec::new()),
+        });
+        recovery.replay_markers(&[make_marker(21, 21)], |_| CapsuleDecodeOutcome::Systematic);
+        let summary = recovery.finalize(0);
+        assert_eq!(summary.ecs_epoch, 7);
+        assert_eq!(summary.commit_seq_recovered, CommitSeq::new(21));
+        assert_eq!(summary.markers_replayed, 1);
+        assert!(summary.violations.is_empty());
+    }
+
+    #[test]
+    fn cancelled_compaction_cannot_publish_in_any_prepublication_phase() {
+        for stage in 0..4 {
+            let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+            if stage >= 1 {
+                saga.mark(vec![make_oid(10)]);
+            }
+            if stage >= 2 {
+                saga.compact(vec![make_segment(2, &[10], 80)]);
+                saga.mark_segments_synced();
+            }
+            if stage >= 3 {
+                saga.mark_locator_synced();
+            }
+            assert_eq!(saga.cancel(), CompactionCompensation::TempSegmentsDiscarded);
+            assert!(!saga.publish());
+            assert!(!saga.is_published());
+            assert!(saga.retirable_segments().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_published_compaction_preserves_rollback_segments() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+        saga.mark(vec![make_oid(10)]);
+        saga.compact(vec![make_segment(2, &[10], 80)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(saga.publish());
+        assert_eq!(saga.cancel(), CompactionCompensation::RollbackRequired);
+        assert!(saga.retirable_segments().is_empty());
+        assert!(saga.retire().is_empty());
+        assert_eq!(saga.summary().retired_segments, 0);
+    }
+
+    #[test]
+    fn replacement_compaction_candidate_requires_its_own_sync_receipt() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+        saga.mark(vec![make_oid(10)]);
+        saga.compact(vec![make_segment(2, &[10], 80)]);
+        saga.mark_segments_synced();
+        saga.compact(vec![make_segment(3, &[10], 70)]);
+        saga.mark_locator_synced();
+        assert!(!saga.publish());
+        assert!(saga.retirable_segments().is_empty());
+        saga.mark_segments_synced();
+        assert!(saga.publish());
+    }
+
+    #[test]
+    fn compaction_cannot_publish_when_a_live_object_would_be_lost() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10, 20], 100)], 2.0);
+        saga.mark(vec![make_oid(10), make_oid(20)]);
+        saga.compact(vec![make_segment(2, &[10], 50)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(!saga.publish());
+        assert!(!saga.is_published());
+        assert!(saga.retirable_segments().is_empty());
+    }
+
+    #[test]
+    fn compaction_coverage_is_scoped_to_selected_old_segments() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+        // Object 20 is live elsewhere, outside this compaction's inputs.
+        saga.mark(vec![make_oid(10), make_oid(20)]);
+        saga.compact(vec![make_segment(2, &[10], 80)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(saga.publish());
+        assert_eq!(saga.retire(), vec![make_oid(1)]);
+    }
+
+    #[test]
+    fn compaction_rejects_replacement_segment_identity_aliasing() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+        saga.mark(vec![make_oid(10)]);
+        saga.compact(vec![make_segment(1, &[10], 80)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(!saga.publish());
+        assert!(saga.retirable_segments().is_empty());
+    }
+
+    #[test]
+    fn compaction_retirement_is_idempotent_across_reader_drain() {
+        let mut saga = CompactionSaga::new(
+            vec![make_segment(1, &[10], 100), make_segment(2, &[20], 100)],
+            2.0,
+        );
+        saga.mark(vec![make_oid(10), make_oid(20)]);
+        saga.compact(vec![make_segment(3, &[10, 20], 150)]);
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(saga.publish());
+        saga.register_reader_leases(vec![ReaderLease {
+            lease_id: 1,
+            segment_ids: vec![make_oid(1)],
+        }]);
+        assert_eq!(saga.retire(), vec![make_oid(2)]);
+        assert!(saga.retire().is_empty());
+        saga.register_reader_leases(Vec::new());
+        assert_eq!(saga.retire(), vec![make_oid(1)]);
+        assert!(saga.retirable_segments().is_empty());
+        assert!(saga.retire().is_empty());
+        assert_eq!(saga.summary().retired_segments, 2);
+    }
+
+    #[test]
+    fn compaction_of_only_dead_objects_can_publish_an_empty_replacement() {
+        let mut saga = CompactionSaga::new(vec![make_segment(1, &[10], 100)], 2.0);
+        saga.mark(Vec::new());
+        saga.compact(Vec::new());
+        saga.mark_segments_synced();
+        saga.mark_locator_synced();
+        assert!(saga.publish());
+        assert_eq!(saga.retire(), vec![make_oid(1)]);
+        assert!(saga.retire().is_empty());
     }
 }
