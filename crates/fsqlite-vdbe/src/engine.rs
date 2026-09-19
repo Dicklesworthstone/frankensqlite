@@ -609,6 +609,18 @@ fn unique_constraint_supports_index(collations: &[Option<String>]) -> bool {
         .all(|collation| unique_constraint_collation_is_indexable(collation.as_deref()))
 }
 
+fn nocase_key_bytes(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    let mut terminated = false;
+    bytes.iter().map(move |&byte| {
+        terminated |= byte == 0;
+        if terminated {
+            0
+        } else {
+            byte.to_ascii_lowercase()
+        }
+    })
+}
+
 fn append_unique_constraint_key_component(
     key: &mut Vec<u8>,
     value: &SqliteValue,
@@ -647,7 +659,9 @@ fn append_unique_constraint_key_component(
             if is_nocase {
                 #[allow(clippy::cast_possible_truncation)]
                 key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
-                key.extend(text_bytes.iter().map(u8::to_ascii_lowercase));
+                // Retain the full key length while ignoring the NUL suffix,
+                // matching NOCASE equality without losing component framing.
+                key.extend(nocase_key_bytes(text_bytes));
             } else if is_rtrim {
                 let trimmed = trim_rtrim_collation_text(text_bytes);
                 #[allow(clippy::cast_possible_truncation)]
@@ -6973,7 +6987,7 @@ fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> Disti
                 if is_nocase {
                     #[allow(clippy::cast_possible_truncation)]
                     key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
-                    key.extend(text_bytes.iter().map(u8::to_ascii_lowercase));
+                    key.extend(nocase_key_bytes(text_bytes));
                 } else if is_rtrim {
                     let trimmed = trim_rtrim_collation_text(text_bytes);
                     #[allow(clippy::cast_possible_truncation)]
@@ -18081,6 +18095,11 @@ fn compare_ascii_nocase_bytes(left: &[u8], right: &[u8]) -> Ordering {
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
+        // Match sqlite3_strnicmp: stop at a shared NUL, then compare the
+        // original lengths rather than examining bytes beyond that NUL.
+        if l == 0 {
+            break;
+        }
     }
     left.len().cmp(&right.len())
 }
@@ -20137,6 +20156,60 @@ mod tests {
     use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
     use rusqlite::params_from_iter;
     use rusqlite::types::Value as RusqliteValue;
+
+    #[test]
+    fn test_nocase_comparators_match_sqlite_boundaries() {
+        let sqlite = rusqlite::Connection::open_in_memory().expect("canonical SQLite");
+        let registry = fsqlite_func::collation::CollationRegistry::new();
+        let collation = registry.find("NOCASE").expect("built-in NOCASE");
+        let values = [
+            "", "A", "a", "Z", "z", "[", "\\", "]", "^", "_", "`", "{", "Ä", "ä",
+            "\0", "\0a", "\0z", "A\0x", "a\0y", "a\0longer", "A\u{1}",
+        ];
+        for left in values {
+            let left_value = SqliteValue::Text(left.into());
+            let mut table = MemTable::new(1);
+            table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+            table.insert(1, vec![left_value.clone()]);
+            for right in values {
+                let comparison: i64 = sqlite
+                    .query_row(
+                        "SELECT CASE WHEN ?1 = ?2 COLLATE NOCASE THEN 0 \
+                         WHEN ?1 < ?2 COLLATE NOCASE THEN -1 ELSE 1 END",
+                        [left, right],
+                        |row| row.get(0),
+                    )
+                    .expect("canonical NOCASE comparison");
+                let expected = comparison.cmp(&0);
+                assert_eq!(
+                    compare_ascii_nocase_bytes(left.as_bytes(), right.as_bytes()),
+                    expected,
+                    "VDBE {left:?}, {right:?}"
+                );
+                assert_eq!(
+                    collation.compare(left.as_bytes(), right.as_bytes()),
+                    expected,
+                    "registry {left:?}, {right:?}"
+                );
+                let right_value = SqliteValue::Text(right.into());
+                assert_eq!(
+                    distinct_key_collated(std::slice::from_ref(&left_value), Some("NOCASE"))
+                        == distinct_key_collated(std::slice::from_ref(&right_value), Some("NOCASE")),
+                    expected == Ordering::Equal,
+                    "DISTINCT {left:?}, {right:?}"
+                );
+                assert_eq!(
+                    table.find_unique_conflicts(&[right_value]),
+                    if expected == Ordering::Equal {
+                        vec![1]
+                    } else {
+                        vec![]
+                    },
+                    "UNIQUE {left:?}, {right:?}"
+                );
+            }
+        }
+    }
 
     struct RecordProfileThreadOverrideGuard {
         previous: Option<bool>,

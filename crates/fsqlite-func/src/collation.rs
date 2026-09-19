@@ -58,8 +58,10 @@ impl CollationFunction for BinaryCollation {
 
 /// NOCASE collation: ASCII case-insensitive comparison.
 ///
-/// Only folds ASCII letters (`a-z` → `A-Z`). Non-ASCII bytes are compared
-/// as-is. For full Unicode case folding, use the ICU extension (§14.6).
+/// Only folds ASCII letters (`A-Z` → `a-z`). Non-ASCII bytes are compared
+/// as-is. A shared NUL terminates byte comparison; equal prefixes are then
+/// ordered by their original byte lengths, including any NUL suffix.
+/// For full Unicode case folding, use the ICU extension (§14.6).
 pub struct NoCaseCollation;
 
 impl CollationFunction for NoCaseCollation {
@@ -68,9 +70,18 @@ impl CollationFunction for NoCaseCollation {
     }
 
     fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
-        let l = left.iter().map(u8::to_ascii_uppercase);
-        let r = right.iter().map(u8::to_ascii_uppercase);
-        l.cmp(r)
+        // SQLite uses sqlite3_strnicmp followed by a full-length tie-break.
+        // Uppercasing instead reverses ordering against '[' through '`'.
+        for (&l, &r) in left.iter().zip(right) {
+            let order = l.to_ascii_lowercase().cmp(&r.to_ascii_lowercase());
+            if order != Ordering::Equal {
+                return order;
+            }
+            if l == 0 {
+                break;
+            }
+        }
+        left.len().cmp(&right.len())
     }
 }
 
@@ -349,8 +360,8 @@ mod tests {
         let coll = NoCaseCollation;
         assert_eq!(coll.compare(b"ABC", b"abc"), Ordering::Equal);
         assert_eq!(coll.compare(b"Alice", b"alice"), Ordering::Equal);
-        // `[` (0x5B) < `a` (0x61) normally, but NOCASE: `[` (0x5B) > `A` (0x41)
-        assert_eq!(coll.compare(b"[", b"a"), Ordering::Greater);
+        // SQLite folds to lowercase, retaining punctuation before letters.
+        assert_eq!(coll.compare(b"[", b"a"), Ordering::Less);
     }
 
     #[test]
