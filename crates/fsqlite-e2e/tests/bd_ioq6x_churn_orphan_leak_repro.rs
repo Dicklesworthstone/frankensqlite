@@ -216,7 +216,18 @@ fn run_churn(db: &str, with_index: bool) -> i64 {
                     // ~1.5KB rows force multi-page splits -> EOF allocation.
                     let payload = "d".repeat(1500);
 
+                    // bd-ehf0h: a writer that fails must STILL reach both
+                    // barriers, every phase. They are sized n_threads + 1, so a
+                    // writer returning early leaves them permanently short and
+                    // every remaining participant blocks in Barrier::wait()
+                    // forever -- turning a real error into a silent hang.
+                    // Record the first failure, stop doing work, keep arriving.
+                    let mut failure: Option<String> = None;
                     for phase in 0..phases {
+                        let phase_result: Result<(), String> = async {
+                        if failure.is_some() {
+                            return Ok(());
+                        }
                         for i in 0..ops_per_phase {
                             let seq = phase * ops_per_phase + i;
                             let base = tid * 100_000_000;
@@ -293,12 +304,25 @@ fn run_churn(db: &str, with_index: bool) -> i64 {
                                 }
                             }
                         }
+                        Ok(())
+                        }
+                        .await;
+                        if let Err(error) = phase_result {
+                            failure.get_or_insert(error);
+                        }
                         // Phase done: this thread is idle (no active txn). Sync
                         // with the coordinator so the checkpoint runs quiesced.
+                        // Reached unconditionally -- see the bd-ehf0h note above.
                         done_b.wait();
                         resume_b.wait();
                     }
-                    conn.close().await.map_err(|e| format!("{e:?}"))?;
+                    // Close regardless, then report the first failure so the
+                    // suite FAILS with the real error instead of hanging.
+                    let close_result = conn.close().await.map_err(|e| format!("{e:?}"));
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
+                    close_result?;
                     Ok(())
                 }
                 .await;
