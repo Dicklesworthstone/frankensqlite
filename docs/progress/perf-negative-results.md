@@ -23152,3 +23152,37 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   retains `baseline.log`, `candidate.log`, their source hashes and `stock.json`.
   Later candidate outcomes belong in the same issue; none establish completion
   of the original populated-store migration by themselves.
+
+## 2026-09-19 — JSON-key EXISTS lowering cannot assume TEXT affinity parity
+
+- Workload: `hfdt-gbou9l`, unchanged correlated `NOT EXISTS` over `json_each`
+  keys and ordinary SQL outer columns. No financial or live-provider evidence.
+- Candidate: lower the pure key equality to a truth-tested IN subquery using
+  the existing lazy memo. Nested dispatches fell from 128 to 1 for 128 integer
+  outer rows, but the SQLite oracle rejected the broader TEXT-column case:
+  for array `[1,2]` and text value `'0'`, the lowered engine incorrectly found
+  a match. The suite exited 101; the candidate is not acceptable as tested.
+- Files: `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-core/tests/hfdt_gbou9l_json_exists.rs`.
+- Evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-json-exists-engine/`
+  contains `baseline-retry.log`, `candidate.log`, and their source hashes.
+- Retry condition: restrict admission to proven operand-affinity semantics or
+  repair the underlying comparison mismatch; retain both operand orders, TEXT
+  and NOCASE controls, NULLs, errors, effects and module overrides. Never relax
+  the oracle assertion, rewrite the HFDT trigger, or call the dispatch count
+  a completed migration. The revised candidate admits only integer affinity.
+
+- Follow-up `final-tests.log` still failed the same TEXT oracle after the
+  lowering admitted only integer-affinity outer columns. Restricting the new
+  optimization does not repair the fallback comparator's existing conflation
+  of declared BLOB affinity with no affinity. The next candidate uses the
+  already-defined `ExprAffinity` / `ComparisonAffinity` distinction there;
+  it must pass the unchanged oracle plus existing comparison-affinity tests.
+
+- The broad fallback candidate passed nine selected tests in
+  `affinity-retry-tests.log`, but review rejected applying it to all joined
+  columns: the existing context also represents affinity-less derived columns
+  as BLOB. The retained correction proves built-in JSON-key declarations and
+  preserves the prior path elsewhere. `scoped-affinity-tests.log` passed all
+  nine tests, including an added computed-column coercion control; this is
+  SQL-engine evidence, not populated-store migration acceptance.

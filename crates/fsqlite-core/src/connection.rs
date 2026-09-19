@@ -16399,6 +16399,7 @@ impl Connection {
         }
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
                 column_collations,
                 column_affinities,
                 // A bounded CHECK expression is evaluated against one table's
@@ -17056,6 +17057,7 @@ impl Connection {
             column_affinities.push(TypeAffinity::Integer);
         }
         let _guard = JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
             column_collations,
             column_affinities,
             // Index key expressions are evaluated against one table's row,
@@ -43704,6 +43706,7 @@ impl Connection {
             col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
                 column_collations: col_collations.clone(),
                 column_affinities: col_affinities.clone(),
                 using_column_projections: HashMap::new(),
@@ -43873,6 +43876,7 @@ impl Connection {
     {
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
                 column_collations: prepared.column_collations.clone(),
                 column_affinities: prepared.column_affinities.clone(),
                 using_column_projections: HashMap::new(),
@@ -74459,6 +74463,7 @@ impl Connection {
                         column_affinities.push(TypeAffinity::Integer);
                     }
                     Some(Arc::new(JoinEvalCollationContext {
+                        declared_json_keys: HashSet::new(),
                         column_collations,
                         column_affinities,
                         using_column_projections: HashMap::new(),
@@ -79850,6 +79855,7 @@ impl Connection {
         );
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
                 column_collations,
                 column_affinities,
                 using_column_projections,
@@ -82518,6 +82524,266 @@ impl Connection {
         ExistsProbeMemoGuard { conn: self }
     }
 
+    fn builtin_json_key_columns(
+        &self,
+        sources: &[&TableOrSubquery],
+        col_map: &[(String, String, bool)],
+    ) -> HashSet<usize> {
+        let modules = self.vtab_modules.borrow();
+        let defaults = shared_default_vtab_module_registry();
+        sources
+            .iter()
+            .filter_map(|source| {
+                let TableOrSubquery::TableFunction { name, alias, .. } = source else {
+                    return None;
+                };
+                let module = name.to_ascii_uppercase();
+                if !matches!(module.as_str(), "JSON_EACH" | "JSON_TREE")
+                    || !Arc::ptr_eq(modules.get(&module)?, defaults.get(&module)?)
+                {
+                    return None;
+                }
+                Some(alias.as_deref().unwrap_or(name))
+            })
+            .flat_map(|label| {
+                col_map
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, (table, column, hidden))| {
+                        (!hidden
+                            && table.eq_ignore_ascii_case(label)
+                            && column.eq_ignore_ascii_case("key"))
+                        .then_some(index)
+                    })
+            })
+            .collect()
+    }
+
+    fn json_key_outer_equality<'a>(
+        predicate: &'a Expr,
+        label: &str,
+        col_map: &[(String, String, bool)],
+    ) -> Option<(&'a Expr, &'a Expr)> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = predicate
+        else {
+            return None;
+        };
+        let context = current_join_eval_collation_context_snapshot()?;
+        [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ]
+        .into_iter()
+        .find(|(inner, outer)| {
+            let (Expr::Column(inner, _), Expr::Column(outer, _)) = (inner, outer) else {
+                return false;
+            };
+            inner.column.eq_ignore_ascii_case("key")
+                && inner
+                    .table
+                    .as_deref()
+                    .is_some_and(|table| table.eq_ignore_ascii_case(label))
+                && outer.table.as_deref().is_some_and(|table| {
+                    !table.eq_ignore_ascii_case(label)
+                        && find_col_in_map(col_map, Some(table), &outer.column, None)
+                            .ok()
+                            .and_then(|index| context.column_affinities.get(index))
+                            // Only integer ordinals have proven equality/IN parity here.
+                            // In particular, TEXT comparison affinity is not interchangeable.
+                            .is_some_and(|affinity| *affinity == TypeAffinity::Integer)
+                })
+        })
+    }
+
+    /// Lower a pure JSON-key semi/anti-join into the existing lazy IN memo.
+    /// Only the final WHERE tree changes; caller SQL and trigger DDL stay intact.
+    fn lower_json_key_exists_where(
+        &self,
+        expr: &Expr,
+        col_map: &[(String, String, bool)],
+    ) -> Option<Expr> {
+        if !expr_has_any_subquery(expr) {
+            return None;
+        }
+        let context = current_join_eval_collation_context_snapshot()?;
+        if !context.registry.uses_builtin_implementation("BINARY")
+            || context
+                .column_collations
+                .iter()
+                .flatten()
+                .any(|name| !name.eq_ignore_ascii_case("BINARY"))
+        {
+            return None;
+        }
+        fn pure_atom(expr: &Expr) -> bool {
+            match expr {
+                Expr::Literal(..) | Expr::Placeholder(..) | Expr::Column(..) => true,
+                Expr::BoundOuterValue { collation, .. } => match collation {
+                    BoundCollation::Unspecified | BoundCollation::Binary => true,
+                    BoundCollation::Named(name) => name.eq_ignore_ascii_case("BINARY"),
+                },
+                _ => false,
+            }
+        }
+        fn rewrite(
+            conn: &Connection,
+            expr: &Expr,
+            col_map: &[(String, String, bool)],
+            changed: &mut bool,
+            depth: usize,
+        ) -> Option<Expr> {
+            // Keep this optional optimization bounded for deep boolean trees.
+            if depth >= 32 {
+                return None;
+            }
+            match expr {
+                Expr::Exists { .. } => {
+                    let lowered = conn.json_key_exists_membership(expr, col_map)?;
+                    *changed = true;
+                    Some(lowered)
+                }
+                Expr::BinaryOp {
+                    left,
+                    op: op @ (BinaryOp::And | BinaryOp::Or),
+                    right,
+                    span,
+                } => Some(Expr::BinaryOp {
+                    left: Box::new(rewrite(conn, left, col_map, changed, depth + 1)?),
+                    op: *op,
+                    right: Box::new(rewrite(conn, right, col_map, changed, depth + 1)?),
+                    span: *span,
+                }),
+                Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr: child,
+                    span,
+                } => Some(Expr::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr: Box::new(rewrite(conn, child, col_map, changed, depth + 1)?),
+                    span: *span,
+                }),
+                Expr::BinaryOp { left, right, .. } if pure_atom(left) && pure_atom(right) => {
+                    Some(expr.clone())
+                }
+                _ if pure_atom(expr) => Some(expr.clone()),
+                // Functions, custom collations and other subqueries could have
+                // effects before the probe; do not reorder or memoize them.
+                _ => None,
+            }
+        }
+        let mut changed = false;
+        let result = rewrite(self, expr, col_map, &mut changed, 0)?;
+        changed.then_some(result)
+    }
+
+    fn json_key_exists_membership(
+        &self,
+        expr: &Expr,
+        col_map: &[(String, String, bool)],
+    ) -> Option<Expr> {
+        let Expr::Exists {
+            subquery,
+            not,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        if subquery.with.is_some()
+            || !subquery.body.compounds.is_empty()
+            || subquery.limit.is_some()
+            || !subquery.order_by.is_empty()
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause: Some(predicate),
+            group_by,
+            having,
+            windows,
+            distinct,
+            ..
+        } = &subquery.body.select
+        else {
+            return None;
+        };
+        if !from.joins.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || *distinct != fsqlite_ast::Distinctness::All
+            || !matches!(
+                columns.as_slice(),
+                [ResultColumn::Expr {
+                    expr: Expr::Literal(Literal::Integer(1), _),
+                    ..
+                }]
+            )
+        {
+            return None;
+        }
+        let TableOrSubquery::TableFunction {
+            name, alias, args, ..
+        } = &from.source
+        else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case("json_each")
+            || args.len() != 1
+            || !args.iter().all(|arg| {
+                matches!(
+                    arg,
+                    Expr::Literal(..) | Expr::Placeholder(..) | Expr::BoundOuterValue { .. }
+                )
+            })
+        {
+            return None;
+        }
+        let modules = self.vtab_modules.borrow();
+        if !Arc::ptr_eq(
+            modules.get("JSON_EACH")?,
+            shared_default_vtab_module_registry().get("JSON_EACH")?,
+        ) {
+            return None;
+        }
+        drop(modules);
+        let label = alias.as_deref().unwrap_or(name);
+        let pair = Self::json_key_outer_equality(predicate, label, col_map)?;
+        let mut rhs = subquery.as_ref().clone();
+        if let SelectCore::Select {
+            columns,
+            where_clause,
+            ..
+        } = &mut rhs.body.select
+        {
+            *columns = vec![ResultColumn::Expr {
+                expr: pair.0.clone(),
+                alias: None,
+            }];
+            *where_clause = None;
+        }
+        // JSON key's BLOB affinity combines with the integer outer affinity.
+        // The surrounding truth test maps NULL membership to EXISTS false.
+        Some(Expr::BinaryOp {
+            left: Box::new(Expr::In {
+                expr: Box::new(pair.1.clone()),
+                set: InSet::Subquery(Box::new(rhs)),
+                not: false,
+                span: *span,
+            }),
+            op: if *not { BinaryOp::IsNot } else { BinaryOp::Is },
+            right: Box::new(Expr::Literal(Literal::True, *span)),
+            span: *span,
+        })
+    }
+
     /// Prove local output columns of an unchanged built-in table function
     /// without teaching the global correlation walker guessed module schemas.
     fn in_memo_subquery_is_uncorrelated(&self, subquery: &SelectStatement) -> bool {
@@ -85015,6 +85281,7 @@ impl Connection {
         );
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
                 column_collations,
                 column_affinities,
                 using_column_projections,
@@ -91492,6 +91759,7 @@ impl Connection {
             self.build_join_using_column_projections(select, &col_collations, &col_affinities);
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: self.builtin_json_key_columns(&all_sources, &col_map),
                 column_collations: col_collations,
                 column_affinities: col_affinities,
                 using_column_projections,
@@ -91943,6 +92211,8 @@ impl Connection {
 
         // ── 5. Apply WHERE filter ──
         if let Some(where_expr) = effective_where_clause_for_eval {
+            let membership_where = self.lower_json_key_exists_where(where_expr, &col_map);
+            let where_expr = membership_where.as_ref().unwrap_or(where_expr);
             // The effective expression has already received any statement-level
             // rewrites. Bind that exact tree once so ordinary WHERE evaluation
             // does not repeat case-insensitive scans of `col_map` for every
@@ -144816,6 +145086,8 @@ impl JoinUsingProjection {
 
 #[derive(Clone)]
 struct JoinEvalCollationContext {
+    /// Built-in JSON keys have declared BLOB affinity, unlike computed columns.
+    declared_json_keys: HashSet<usize>,
     column_collations: Vec<Option<String>>,
     column_affinities: Vec<TypeAffinity>,
     /// Compact, non-overridable runtime projections for unqualified columns
@@ -147215,6 +147487,37 @@ fn cmp_values_with_affinity(
     cmp_sqlite_values(left.as_ref(), right.as_ref())
 }
 
+fn is_declared_json_key(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    context: &JoinEvalCollationContext,
+) -> bool {
+    match expr {
+        Expr::Column(column, _) => resolve_join_expr_column_index(column, col_map)
+            .is_ok_and(|index| context.declared_json_keys.contains(&index)),
+        Expr::Collate { expr, .. } => is_declared_json_key(expr, col_map, context),
+        _ => false,
+    }
+}
+
+/// Preserve declared BLOB affinity separately from an affinity-less expression.
+fn join_operand_expr_affinity(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    context: &JoinEvalCollationContext,
+) -> ExprAffinity {
+    match expr {
+        Expr::BoundOuterValue { affinity, .. } => {
+            affinity.map_or(ExprAffinity::None, ExprAffinity::Affinity)
+        }
+        Expr::Column(..) | Expr::Cast { .. } => {
+            ExprAffinity::Affinity(join_expr_affinity(expr, col_map, context))
+        }
+        Expr::Collate { expr, .. } => join_operand_expr_affinity(expr, col_map, context),
+        _ => ExprAffinity::None,
+    }
+}
+
 fn compare_join_expr_values(
     left_expr: &Expr,
     left_value: &SqliteValue,
@@ -147254,13 +147557,36 @@ fn compare_join_expr_values(
                 )
             },
             |context| {
-                let left_affinity = join_expr_affinity(left_expr, col_map, context);
-                let right_affinity = join_expr_affinity(right_expr, col_map, context);
-                cmp_values_with_comparison_affinity(
+                // Other sources can contain computed columns whose lack of
+                // affinity is currently represented as BLOB in this context.
+                // Limit this correction to keys whose declaration we proved.
+                if context.declared_json_keys.is_empty()
+                    || (!is_declared_json_key(left_expr, col_map, context)
+                        && !is_declared_json_key(right_expr, col_map, context))
+                {
+                    return cmp_values_with_comparison_affinity(
+                        left_value,
+                        right_value,
+                        join_expr_affinity(left_expr, col_map, context),
+                        join_expr_affinity(right_expr, col_map, context),
+                        collation.as_deref(),
+                        &context.registry,
+                    );
+                }
+                let affinity = match ComparisonAffinity::from_operands(
+                    join_operand_expr_affinity(left_expr, col_map, context),
+                    join_operand_expr_affinity(right_expr, col_map, context),
+                ) {
+                    ComparisonAffinity::None | ComparisonAffinity::Blob => None,
+                    ComparisonAffinity::Text => Some(TypeAffinity::Text),
+                    ComparisonAffinity::Numeric
+                    | ComparisonAffinity::Integer
+                    | ComparisonAffinity::Real => Some(TypeAffinity::Numeric),
+                };
+                cmp_values_with_affinity(
                     left_value,
                     right_value,
-                    left_affinity,
-                    right_affinity,
+                    affinity,
                     collation.as_deref(),
                     &context.registry,
                 )
@@ -247051,6 +247377,7 @@ mod pager_routing_tests {
     #[test]
     fn test_join_eval_collation_context_callback_allows_nested_guard() {
         let context = JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
             column_collations: vec![Some("NOCASE".to_owned())],
             column_affinities: vec![TypeAffinity::Text],
             using_column_projections: HashMap::new(),
@@ -247070,6 +247397,7 @@ mod pager_routing_tests {
     #[test]
     fn test_join_comparison_metadata_neutral_left_does_not_hide_right_nocase() {
         let context = JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
             column_collations: vec![Some("NOCASE".to_owned())],
             column_affinities: vec![TypeAffinity::Text],
             using_column_projections: HashMap::new(),
@@ -247112,6 +247440,7 @@ mod pager_routing_tests {
             },
         );
         let context = JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
             column_collations: vec![None, Some("NOCASE".to_owned())],
             column_affinities: vec![TypeAffinity::Text, TypeAffinity::Text],
             using_column_projections: projections,
