@@ -23132,3 +23132,23 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   Retry only with measured repair of the existing path and unchanged capture,
   triggers, validators and timeout. Do not claim migration completion from
   the independently useful SQL seek repair.
+
+## 2026-09-19 — Truth-test admission alone did not reuse JSON membership
+
+- Workload: `hfdt-gbou9l`, SQL-engine reproduction of repeated JSON membership
+  beneath `IS TRUE` / `IS NOT TRUE`. Four ordinary SQL outer rows, one fixed
+  uncorrelated array; no financial or live-provider proof.
+- Candidate: admitting truth-test children in `with_in_subquery_memo` alone.
+  The unchanged test still measured four JSON evaluations instead of one and
+  exited 101, just like the baseline. Stock SQLite evaluates the RHS once.
+- Cause: the conservative correlation walker treats bare table-function output
+  names as potentially external; the new wrapper branch never admitted the IN.
+  Merely broadening boolean traversal cannot fix that second blocker.
+- Retry condition: prove local output names against the unchanged registered
+  built-in factory, preserve fallback for overrides and unknown names, and keep
+  the correlated-input, NULL, changed-parameter and malformed-input controls.
+  Do not weaken the one-evaluation assertion or rewrite an HFDT migration.
+- Evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-json-membership-engine/`
+  retains `baseline.log`, `candidate.log`, their source hashes and `stock.json`.
+  Later candidate outcomes belong in the same issue; none establish completion
+  of the original populated-store migration by themselves.

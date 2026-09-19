@@ -82542,7 +82542,7 @@ impl Connection {
         };
         for column in columns {
             if let ResultColumn::Expr {
-                expr: Expr::Column(column),
+                expr: Expr::Column(column, _),
                 ..
             } = column
                 && column.table.is_none()
@@ -82550,7 +82550,7 @@ impl Connection {
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(&column.column))
             {
-                column.table = Some(alias.as_ref().unwrap_or(name).clone());
+                column.table = Some(alias.as_deref().unwrap_or(name).into());
             }
         }
         drop(modules);
