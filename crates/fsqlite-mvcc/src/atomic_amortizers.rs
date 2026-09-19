@@ -28,6 +28,11 @@
 //!   when two threads hold disjoint batches simultaneously — this is by
 //!   design (Cicada's observation: readers only need a snapshot-safe,
 //!   unique read-ts, not a globally ordered one).
+//! * Cached batches belong to an allocator instance, not its memory address.
+//!   Moving or replacing an allocator cannot transfer its cached values to
+//!   another instance.
+//! * Reservations never wrap the shared counter. An exhausted allocator
+//!   fails before changing its watermark or handing out duplicate values.
 //!
 //! # Non-goals / caveats
 //!
@@ -36,6 +41,8 @@
 //!   fine for both use cases: read timestamps and TIDs are opaque monotone
 //!   identifiers and gaps are safe.
 //! * `batch_size == 0` / `gap_size == 0` is clamped to `1`.
+//! * Ranges are half-open and must fit in `u64`; `u64::MAX` is an exclusive
+//!   endpoint, not an issued value. A reservation that cannot fit panics.
 //!
 //! # No unsafe
 //!
@@ -67,16 +74,35 @@ impl LocalBatch {
     }
 }
 
-// Each thread caches one LocalBatch per ReadTsBatcher *instance* it has seen.
-// In practice FrankenSQLite wires a single global ReadTsBatcher, so we use a
-// single thread-local slot keyed by the batcher's address. If a thread ever
-// interacts with a different batcher, we transparently re-reserve a batch
-// from it; this is correct (never hands out stale values) but slightly less
-// efficient for the pathological multi-batcher case.
+// Zero denotes an uninitialized identity. Keys are never recycled, even
+// after an allocator is dropped: another thread may still cache its batch.
+static NEXT_READ_TS_CACHE_KEY: AtomicU64 = AtomicU64::new(1);
+
+// Each thread caches one LocalBatch, keyed by a stable allocator identity.
+// Switching allocators discards the remaining local reservation. An address
+// cannot identify the owner: stack/heap storage may be reused, and moving an
+// allocator changes its address without changing ownership of its ranges.
 thread_local! {
-    static LOCAL_READ_TS: Cell<(usize, LocalBatch)> = const {
+    static LOCAL_READ_TS: Cell<(u64, LocalBatch)> = const {
         Cell::new((0, LocalBatch::EMPTY))
     };
+}
+
+/// Reserve a complete half-open range without ever wrapping the watermark.
+///
+/// Saturating only the local endpoint is not sufficient: `fetch_add` would
+/// still wrap the shared counter and allow later reservations to overlap.
+fn reserve_id_range(shared: &AtomicU64, size: u64) -> LocalBatch {
+    let start = shared
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |start| {
+            start.checked_add(size)
+        })
+        .expect("MVCC identifier range exhausted");
+    LocalBatch {
+        next: start,
+        // The successful atomic update already checked this addition.
+        end: start + size,
+    }
 }
 
 /// Cicada-style read-timestamp batcher.
@@ -88,6 +114,7 @@ thread_local! {
 pub struct ReadTsBatcher {
     shared: AtomicU64,
     batch_size: u64,
+    cache_key: AtomicU64,
 }
 
 impl ReadTsBatcher {
@@ -102,6 +129,7 @@ impl ReadTsBatcher {
         Self {
             shared: AtomicU64::new(start),
             batch_size: b,
+            cache_key: AtomicU64::new(0),
         }
     }
 
@@ -111,45 +139,69 @@ impl ReadTsBatcher {
         Self::new(1, 64)
     }
 
+    /// Return this instance's stable, nonzero TLS cache identity.
+    ///
+    /// Initialization is lazy to preserve const construction. Competing
+    /// callers may consume extra keys, but all use the identity installed
+    /// by the winning CAS. Relaxed ordering suffices: the key identifies an
+    /// owner, not a publication fence for any other data.
+    fn cache_key(&self) -> u64 {
+        let key = self.cache_key.load(Ordering::Relaxed);
+        if key != 0 {
+            return key;
+        }
+        let candidate = NEXT_READ_TS_CACHE_KEY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("read timestamp cache identity space exhausted");
+        match self.cache_key.compare_exchange(
+            0,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => candidate,
+            Err(installed) => installed,
+        }
+    }
+
     /// Hand out the next unique read timestamp.
     ///
     /// Uses a thread-local batch when available; otherwise CAS-reserves a
     /// fresh batch of `batch_size` timestamps from the shared counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a complete batch no longer fits in the identifier space,
+    /// or if the process has exhausted its allocator cache identities.
+    /// Neither failure wraps a counter or reissues an existing identifier.
     pub fn next_read_ts(&self) -> u64 {
-        let self_key = std::ptr::from_ref::<Self>(self) as usize;
+        let self_key = self.cache_key();
         LOCAL_READ_TS.with(|slot| {
             let (key, mut batch) = slot.get();
             if key != self_key || batch.is_exhausted() {
                 batch = self.reserve_batch();
             }
             // Safe because reserve_batch() always returns a non-empty batch
-            // (batch_size >= 1).
+            // (batch_size >= 1) or panics before changing the shared counter.
             debug_assert!(!batch.is_exhausted());
             let v = batch.next;
-            batch.next = batch.next.saturating_add(1);
+            batch.next += 1;
             slot.set((self_key, batch));
             v
         })
     }
 
-    /// Reserve a contiguous batch of `batch_size` timestamps via fetch_add.
-    ///
-    /// `fetch_add(n)` is equivalent to a CAS-loop that reserves a range
-    /// of length `n`, but compiles to a single LOCK XADD on x86_64 — one
-    /// atomic RMW total, not `batch_size` of them.
+    /// Reserve a complete batch with an overflow-checked atomic update.
     fn reserve_batch(&self) -> LocalBatch {
-        let start = self.shared.fetch_add(self.batch_size, Ordering::Relaxed);
-        LocalBatch {
-            next: start,
-            end: start.saturating_add(self.batch_size),
-        }
+        reserve_id_range(&self.shared, self.batch_size)
     }
 
     /// Observe the current shared watermark (for tests / telemetry).
     ///
-    /// Note: any outstanding per-thread batches are *above* this watermark
-    /// only in the sense that they have already been reserved from it;
-    /// the shared counter itself equals the next-batch-start.
+    /// The shared counter equals the next-batch-start. Values in outstanding
+    /// per-thread batches have already been reserved and are below it.
     #[must_use]
     pub fn watermark(&self) -> u64 {
         self.shared.load(Ordering::Relaxed)
@@ -227,8 +279,8 @@ impl TidGap {
 /// Hekaton-style TID gap allocator.
 ///
 /// Each call to [`TidGapAllocator::reserve_gap`] reserves `gap_size`
-/// contiguous TIDs via a single CAS (fetch_add), returning a [`TidGap`]
-/// the caller can draw from without further synchronization.
+/// contiguous TIDs via an overflow-checked atomic update, returning a
+/// [`TidGap`] the caller can draw from without further synchronization.
 #[derive(Debug)]
 pub struct TidGapAllocator {
     shared: AtomicU64,
@@ -258,14 +310,18 @@ impl TidGapAllocator {
     ///
     /// Two calls from any threads are guaranteed to return non-overlapping
     /// ranges.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a complete gap no longer fits in the identifier space.
+    /// The shared watermark is unchanged on failure.
     #[must_use]
     pub fn reserve_gap(&self) -> TidGap {
-        let start = self.shared.fetch_add(self.gap_size, Ordering::Relaxed);
-        let end = start.saturating_add(self.gap_size);
+        let batch = reserve_id_range(&self.shared, self.gap_size);
         TidGap {
-            start,
-            end,
-            next: Cell::new(start),
+            start: batch.next,
+            end: batch.end,
+            next: Cell::new(batch.next),
         }
     }
 
@@ -379,6 +435,91 @@ mod tests {
         assert!(b > a);
     }
 
+    #[test]
+    fn cicada_replacement_at_same_address_starts_its_own_sequence() {
+        let mut batcher = Box::new(ReadTsBatcher::new(1, 8));
+        assert_eq!(batcher.next_read_ts(), 1);
+        // Reuse exactly the same storage with an unexhausted TLS batch.
+        // The old address-keyed cache would return 2 through 8, then start
+        // the new allocator at 1 and issue duplicates within that instance.
+        *batcher = ReadTsBatcher::new(1, 8);
+        let values: Vec<_> = (0..24).map(|_| batcher.next_read_ts()).collect();
+        assert_eq!(values, (1..=24).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn cicada_replacement_cannot_return_below_its_start() {
+        let mut batcher = Box::new(ReadTsBatcher::new(1, 64));
+        assert_eq!(batcher.next_read_ts(), 1);
+        *batcher = ReadTsBatcher::new(10_000, 64);
+        assert_eq!(batcher.next_read_ts(), 10_000);
+        assert_eq!(batcher.watermark(), 10_064);
+    }
+
+    #[test]
+    fn cicada_cache_identity_moves_with_the_allocator() {
+        let mut first = ReadTsBatcher::new(1, 8);
+        let mut second = ReadTsBatcher::new(1000, 8);
+        assert_eq!(first.next_read_ts(), 1);
+        let first_key = first.cache_key();
+        std::mem::swap(&mut first, &mut second);
+        // The original allocator moved but still owns the cached batch.
+        assert_eq!(second.cache_key(), first_key);
+        assert_eq!(second.next_read_ts(), 2);
+        assert_eq!(second.watermark(), 9);
+        assert_ne!(first.cache_key(), first_key);
+        assert_eq!(first.next_read_ts(), 1000);
+    }
+
+    #[test]
+    fn cicada_concurrent_first_use_installs_one_cache_identity() {
+        let batcher = Arc::new(ReadTsBatcher::new(1, 8));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let batcher = Arc::clone(&batcher);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    (batcher.cache_key(), batcher.next_read_ts())
+                })
+            })
+            .collect();
+        let mut values = HashSet::new();
+        let mut identity = None;
+        for thread in threads {
+            let (key, value) = thread.join().unwrap();
+            assert_ne!(key, 0);
+            if let Some(installed) = identity {
+                assert_eq!(key, installed);
+            } else {
+                identity = Some(key);
+            }
+            assert!(values.insert(value));
+        }
+        assert_eq!(values.len(), 8);
+    }
+
+    #[test]
+    fn cicada_exhaustion_never_wraps_or_changes_the_watermark() {
+        let batcher = ReadTsBatcher::new(u64::MAX - 2, 2);
+        assert_eq!(batcher.next_read_ts(), u64::MAX - 2);
+        assert_eq!(batcher.next_read_ts(), u64::MAX - 1);
+        for _ in 0..2 {
+            assert!(std::panic::catch_unwind(|| batcher.next_read_ts()).is_err());
+            assert_eq!(batcher.watermark(), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn cicada_incomplete_final_batch_does_not_advance_the_counter() {
+        let batcher = ReadTsBatcher::new(u64::MAX - 3, 2);
+        assert_eq!(batcher.next_read_ts(), u64::MAX - 3);
+        assert_eq!(batcher.next_read_ts(), u64::MAX - 2);
+        assert!(std::panic::catch_unwind(|| batcher.next_read_ts()).is_err());
+        assert_eq!(batcher.watermark(), u64::MAX - 1);
+    }
+
     // ------- Hekaton -------
 
     /// 10 reserved gaps are pairwise non-overlapping.
@@ -480,5 +621,29 @@ mod tests {
         assert_eq!(g.capacity(), 1);
         assert_eq!(g.next_tid(), Some(5));
         assert_eq!(g.next_tid(), None);
+    }
+
+    #[test]
+    fn hekaton_exhaustion_never_wraps_or_changes_the_watermark() {
+        let alloc = TidGapAllocator::new(u64::MAX - 2, 2);
+        let gap = alloc.reserve_gap();
+        assert_eq!(gap.capacity(), 2);
+        assert_eq!(gap.next_tid(), Some(u64::MAX - 2));
+        assert_eq!(gap.next_tid(), Some(u64::MAX - 1));
+        assert_eq!(gap.next_tid(), None);
+        for _ in 0..2 {
+            assert!(std::panic::catch_unwind(|| alloc.reserve_gap()).is_err());
+            assert_eq!(alloc.watermark(), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn hekaton_incomplete_final_gap_does_not_advance_the_counter() {
+        let alloc = TidGapAllocator::new(u64::MAX - 3, 2);
+        let gap = alloc.reserve_gap();
+        assert_eq!(gap.start(), u64::MAX - 3);
+        assert_eq!(gap.end(), u64::MAX - 1);
+        assert!(std::panic::catch_unwind(|| alloc.reserve_gap()).is_err());
+        assert_eq!(alloc.watermark(), u64::MAX - 1);
     }
 }
