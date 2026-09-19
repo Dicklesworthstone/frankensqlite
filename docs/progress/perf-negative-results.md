@@ -23186,3 +23186,32 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   preserves the prior path elsewhere. `scoped-affinity-tests.log` passed all
   nine tests, including an added computed-column coercion control; this is
   SQL-engine evidence, not populated-store migration acceptance.
+
+## 2026-09-19 — JSON-key anti-join repair still exceeds populated migration budget
+
+- Workload: `hfdt-gbou9l`, unchanged full 6,187-fact retained provider capture,
+  original production triggers, four original test filters, and 1,800-second
+  runtime deadline. HFDT source `27d83c97d693f7d1a0d2646fab61c9fca200dc6a`
+  used an explicitly experimental engine archive; no released dependency changed.
+- Engine repair `39e48fc43` reduced the original integer JSON-key anti-join
+  regression from 128 nested dispatches to one. Nine selected SQL-engine tests
+  and strict Clippy passed. That measured SQL improvement is retained, but it
+  did not establish completed populated-store migration.
+- Full consumer exited 124 after 1,800.539 seconds. All 6,187 facts persisted;
+  no migration outcome or terminal schema 178 marker was emitted. Fresh
+  read-only stock SQLite found schema 116, quick/integrity checks `ok`, no FK
+  violations, and six counts `1/1/1/6187/6187/1`. Counts and integrity are not
+  proof of complete typed-value preservation after a successful upgrade.
+  The three original controls subsequently passed separately; aggregate
+  acceptance remains false.
+- Binary SHA256:
+  `ee81e9852993de658dc5399e4deaae3577ef0744ec51a42992734ac1ce3889b2`.
+  Evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-json-exists-shipping-consumer/`
+  contains source identities, execution/result, controls, and postmortem.
+  The attempted stack diagnostic refused before attaching because ptrace
+  policy was 1; no policy change or debugger pause occurred.
+- Retry condition: localize the remaining work after the seed marker with
+  bounded diagnostics, then repair the measured bottleneck. The test snapshots
+  the graph before calling migrations, so absence of the outcome marker alone
+  does not identify the hot stage. Keep capture, SQL, assertions and deadline
+  unchanged; no live-provider or release certification is claimed.
