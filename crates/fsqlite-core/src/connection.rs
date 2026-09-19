@@ -82505,6 +82505,60 @@ impl Connection {
         ExistsProbeMemoGuard { conn: self }
     }
 
+    /// Prove local output columns of an unchanged built-in table function
+    /// without teaching the global correlation walker guessed module schemas.
+    fn in_memo_subquery_is_uncorrelated(&self, subquery: &SelectStatement) -> bool {
+        if !rewrite_probe_is_correlated(self, subquery) {
+            return true;
+        }
+        let mut probe = subquery.clone();
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            ..
+        } = &mut probe.body.select
+        else {
+            return false;
+        };
+        if !from.joins.is_empty() || probe.with.is_some() || !probe.body.compounds.is_empty() {
+            return false;
+        }
+        let TableOrSubquery::TableFunction { name, alias, .. } = &from.source else {
+            return false;
+        };
+        let key = name.to_ascii_uppercase();
+        let modules = self.vtab_modules.borrow();
+        let Some(factory) = modules.get(&key) else {
+            return false;
+        };
+        let Some(builtin) = shared_default_vtab_module_registry().get(&key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(factory, builtin) {
+            return false;
+        }
+        let Some(names) = table_function_column_names(name) else {
+            return false;
+        };
+        for column in columns {
+            if let ResultColumn::Expr {
+                expr: Expr::Column(column),
+                ..
+            } = column
+                && column.table.is_none()
+                && names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.column))
+            {
+                column.table = Some(alias.as_ref().unwrap_or(name).clone());
+            }
+        }
+        drop(modules);
+        // Arguments, predicates, nested scopes, limits and all unknown names
+        // still go through the existing conservative correlation proof.
+        !rewrite_probe_is_correlated(self, &probe)
+    }
+
     fn with_in_subquery_memo<'a, T>(
         &'a self,
         expr: &'a Expr,
@@ -82548,7 +82602,7 @@ impl Connection {
                     set: InSet::Subquery(subquery),
                     ..
                 } if !matches!(left.as_ref(), Expr::RowValue(..))
-                    && !rewrite_probe_is_correlated(self, subquery) =>
+                    && self.in_memo_subquery_is_uncorrelated(subquery) =>
                 {
                     scope.insert(std::ptr::from_ref(expr) as usize, None);
                 }
