@@ -86,6 +86,17 @@ pub struct WalFecReplayResult<'a> {
     stop: Option<WalFecReplayStop>,
 }
 
+/// The last accepted prefix before a chain of repairs lost its original
+/// terminal checksum. A later ORIGINAL checksum must bind the whole chain
+/// before these tentative commits can enter the returned replay prefix.
+#[derive(Debug, Clone, Copy)]
+struct PendingReplayAnchor {
+    first_damaged_frame_no: u32,
+    committed_frames: u32,
+    db_size_pages: Option<u32>,
+    repaired_frame_count: usize,
+}
+
 impl<'a> WalFecReplayResult<'a> {
     /// Validated header of the input generation.
     #[must_use]
@@ -108,7 +119,8 @@ impl<'a> WalFecReplayResult<'a> {
         self.discarded_tail_bytes
     }
 
-    /// Includes repaired frame headers, even when no payload needed decoding.
+    /// Accepted repairs only, including headers with intact payloads. Tentative
+    /// repairs discarded for lack of an original checksum anchor are excluded.
     #[must_use]
     pub fn repaired_frame_nos(&self) -> &[u32] {
         &self.repaired_frame_nos
@@ -281,8 +293,10 @@ fn authoritative_database_size(bytes: &[u8]) -> Option<u32> {
 /// number, commit size, payload and preceding chain, so other end-frame header
 /// fields can be repaired too. Salts are independently bound to the validated
 /// WAL header by the FEC metadata; SQLite excludes them from frame checksums.
-/// A damaged terminal checksum is still refused rather than synthesized from
-/// sidecar metadata alone.
+/// If that checksum is damaged too, reconstruction remains tentative until a
+/// later original frame or repaired group's original end checksum validates
+/// the entire preceding chain. If no such anchor survives, all tentative
+/// commits are excluded, even when every payload was successfully decoded.
 /// These are accidental-corruption checks, not cryptographic authentication.
 ///
 /// Later frames are checked against their ORIGINAL checksum fields. Repairing
@@ -317,6 +331,7 @@ pub fn recover_wal_fec_image<'a>(
     let mut repaired_frame_nos = Vec::new();
     let mut decode_proofs = Vec::new();
     let mut stop = None;
+    let mut pending_anchor: Option<PendingReplayAnchor> = None;
 
     while frame_index < frame_count {
         let offset = frame_offset(frame_index, frame_size)?;
@@ -330,6 +345,10 @@ pub fn recover_wal_fec_image<'a>(
             && frame_header.salts == header.salts
             && frame_header.checksum == expected
         {
+            // This frame has not been reconstructed. Its original checksum
+            // validates every tentative preceding group, even if this frame
+            // belongs to a still-uncommitted successor transaction.
+            pending_anchor = None;
             running = expected;
             frame_index += 1;
             if frame_header.is_commit() {
@@ -422,21 +441,27 @@ pub fn recover_wal_fec_image<'a>(
         let original_checksum = WalFrameHeader::from_bytes(
             &wal_bytes[original_terminal..original_terminal + WAL_FRAME_HEADER_SIZE],
         )?.checksum;
-        let refusal = if rebuilt[..verified_len] != image[group_start..group_start + verified_len] {
-            Some(WalFecReplayStopReason::PrefixMismatch)
-        } else if rebuilt_checksum != original_checksum {
-            Some(WalFecReplayStopReason::TerminalAnchorMismatch)
-        } else {
-            None
-        };
         decode_proofs.push(recovered.decode_proof);
-        if let Some(reason) = refusal {
-            stop = Some(WalFecReplayStop { frame_no: damaged_frame_no, reason });
+        if rebuilt[..verified_len] != image[group_start..group_start + verified_len] {
+            stop = Some(WalFecReplayStop {
+                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::PrefixMismatch,
+            });
             break;
         }
+        if rebuilt_checksum == original_checksum {
+            pending_anchor = None;
+        } else if pending_anchor.is_none() {
+            pending_anchor = Some(PendingReplayAnchor {
+                first_damaged_frame_no: damaged_frame_no,
+                committed_frames,
+                db_size_pages,
+                repaired_frame_count: repaired_frame_nos.len(),
+            });
+        }
 
-        // Publish only into the owned plan, after BOTH anchors match. A failed
-        // attempt never modifies even an earlier validated frame in the plan.
+        // Tentative bytes stay in this private plan. Missing groups, decoder
+        // failures, admission refusals and end-of-input all discard them unless
+        // an independently stored later checksum closes the pending anchor.
         for (index, frame) in rebuilt.chunks_exact(frame_size).enumerate() {
             let offset = group_start + index * frame_size;
             if image[offset..offset + frame_size] != *frame {
@@ -452,6 +477,19 @@ pub fn recover_wal_fec_image<'a>(
         db_size_pages = Some(meta.db_size_pages);
     }
 
+    if let Some(pending) = pending_anchor {
+        committed_frames = pending.committed_frames;
+        db_size_pages = pending.db_size_pages;
+        repaired_frame_nos.truncate(pending.repaired_frame_count);
+        // Preserve a more specific failure (e.g. insufficient symbols). Decoder
+        // proofs are retained as evidence, not claims of accepted WAL repair.
+        if stop.is_none() {
+            stop = Some(WalFecReplayStop {
+                frame_no: pending.first_damaged_frame_no,
+                reason: WalFecReplayStopReason::TerminalAnchorMismatch,
+            });
+        }
+    }
     if stop.is_none() && !(wal_bytes.len() - WAL_HEADER_SIZE).is_multiple_of(frame_size) {
         stop = Some(WalFecReplayStop {
             frame_no: frame_count.checked_add(1)
@@ -715,6 +753,213 @@ mod tests {
                 assert_eq!(damaged, saved);
             }
         }
+    }
+
+    fn corrupt_checksum(wal: &mut [u8], frame_no: u32) {
+        let offset = frame_offset(frame_no - 1, FRAME_SIZE).unwrap();
+        wal[offset + 16] ^= 1;
+    }
+
+    #[test]
+    fn damaged_terminal_checksum_uses_a_later_original_frame() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let sidecar = append_group(&mut wal, 3, 8, 21);
+            append_group(&mut wal, 2, 8, 22); // No FEC is needed for this successor.
+            let expected = wal.clone();
+            corrupt_checksum(&mut wal, 3);
+            let damaged = wal.clone();
+            let result = recover_wal_fec_image(
+                &wal, &sidecar, WalFecReplayLimits::default(),
+            ).unwrap();
+            assert_eq!(result.committed_frames(), 5);
+            assert_eq!(result.repaired_frame_nos(), &[3]);
+            assert!(!result.decode_proofs()[0].decode_attempted);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+            assert_eq!(wal, damaged);
+        }
+    }
+
+    #[test]
+    fn consecutive_damaged_anchors_wait_for_an_original_later_checksum() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let mut sidecar = append_group(&mut wal, 3, 8, 23);
+            sidecar.extend(append_group(&mut wal, 4, 8, 24));
+            sidecar.extend(append_group(&mut wal, 2, 8, 25));
+            let expected = wal.clone();
+            let terminal = frame_offset(2, FRAME_SIZE).unwrap();
+            wal[terminal..terminal + WAL_FRAME_HEADER_SIZE].fill(0);
+            // Neither successor starts with a valid original frame, so all
+            // three groups must wait for the third group's original terminal.
+            corrupt_payload(&mut wal, 4);
+            corrupt_checksum(&mut wal, 7);
+            corrupt_payload(&mut wal, 8);
+            let result = recover_wal_fec_image(
+                &wal, &sidecar, WalFecReplayLimits::default(),
+            ).unwrap();
+            assert_eq!(result.committed_frames(), 9);
+            assert_eq!(result.repaired_frame_nos(), &[3, 4, 7, 8]);
+            assert_eq!(result.decode_proofs().len(), 3);
+            assert!(result.decode_proofs()[1].decode_attempted);
+            assert!(result.decode_proofs()[2].decode_attempted);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn unanchored_chain_never_enters_the_returned_prefix_or_database() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 8, 26);
+        let accepted = wal.clone();
+        let mut sidecar = append_group(&mut wal, 3, 8, 27);
+        sidecar.extend(append_group(&mut wal, 3, 8, 28));
+        corrupt_checksum(&mut wal, 5);
+        corrupt_payload(&mut wal, 6);
+        corrupt_checksum(&mut wal, 8);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.committed_frames(), 2);
+        assert_eq!(result.db_size_pages(), Some(100));
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert_eq!(result.discarded_tail_bytes(), 6 * FRAME_SIZE);
+        assert!(result.repaired_frame_nos().is_empty());
+        assert_eq!(result.decode_proofs().len(), 2);
+        assert!(result.database_image(&[0; PAGE_SIZE], 100 * PAGE_SIZE).is_err());
+        assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn unanchored_growth_does_not_change_the_reported_database_size() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 1))], 1);
+        let accepted = wal.clone();
+        let sidecar = append_group(&mut wal, 3, 8, 42); // Tentative size is 100.
+        corrupt_checksum(&mut wal, 4);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.committed_frames(), 1);
+        assert_eq!(result.db_size_pages(), Some(1));
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn an_accepted_earlier_repair_survives_later_anchor_failure() {
+        let mut wal = header(WAL_MAGIC_BE).to_bytes().unwrap().to_vec();
+        let mut sidecar = append_group(&mut wal, 2, 8, 29);
+        let accepted = wal.clone();
+        sidecar.extend(append_group(&mut wal, 3, 8, 30));
+        sidecar.extend(append_group(&mut wal, 3, 8, 31));
+        corrupt_payload(&mut wal, 1);
+        corrupt_checksum(&mut wal, 5);
+        corrupt_payload(&mut wal, 6);
+        corrupt_checksum(&mut wal, 8);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.committed_frames(), 2);
+        assert_eq!(result.repaired_frame_nos(), &[1]);
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert_eq!(result.decode_proofs().len(), 3);
+        assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn uncommitted_successor_anchors_without_becoming_a_commit() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 32);
+        let accepted = wal.clone();
+        append_database_frames(&mut wal, &[(9, vec![6; PAGE_SIZE])], 0);
+        corrupt_checksum(&mut wal, 3);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.committed_frames(), 3);
+        assert_eq!(result.repaired_frame_nos(), &[3]);
+        assert_eq!(result.discarded_tail_bytes(), FRAME_SIZE);
+        assert_eq!(result.complete_image().unwrap().as_ref(), accepted);
+    }
+
+    #[test]
+    fn missing_successor_group_discards_the_unanchored_predecessor() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 8, 33);
+        let accepted = wal.clone();
+        let sidecar = append_group(&mut wal, 3, 8, 34);
+        append_group(&mut wal, 2, 8, 35);
+        corrupt_checksum(&mut wal, 5);
+        corrupt_payload(&mut wal, 6);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::MissingGroup);
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert!(result.repaired_frame_nos().is_empty());
+        assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn later_anchors_cannot_validate_a_substituted_generation_or_commit_size() {
+        for change_generation in [false, true] {
+            let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+            let mut sidecar = append_group(&mut wal, 3, 8, 36);
+            sidecar.extend(append_group(&mut wal, 2, 8, 37));
+            if change_generation {
+                let mut replacement = header(WAL_MAGIC_LE);
+                replacement.checkpoint_seq += 1;
+                wal[..WAL_HEADER_SIZE].copy_from_slice(&replacement.to_bytes().unwrap());
+            } else {
+                let mut records = crate::wal_fec::scan_wal_fec_bytes(
+                    std::path::Path::new("snapshot-only"), &sidecar,
+                ).unwrap().groups;
+                records[0].meta.db_size_pages += 1;
+                records[0].meta.checksum = records[0].meta.compute_checksum();
+                sidecar = encode_wal_fec_group(&records[0]).unwrap();
+                sidecar.extend(encode_wal_fec_group(&records[1]).unwrap());
+            }
+            corrupt_payload(&mut wal, 1);
+            let result = recover_wal_fec_image(
+                &wal, &sidecar, WalFecReplayLimits::default(),
+            ).unwrap();
+            assert_eq!(result.committed_frames(), 0);
+            assert!(result.repaired_frame_nos().is_empty());
+            assert!(result.complete_image().is_err());
+        }
+    }
+
+    #[test]
+    fn successor_resource_refusal_discards_tentative_commits() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 8, 38);
+        let accepted = wal.clone();
+        let mut sidecar = append_group(&mut wal, 3, 8, 39);
+        sidecar.extend(append_group(&mut wal, 4, 8, 40));
+        corrupt_checksum(&mut wal, 5);
+        corrupt_payload(&mut wal, 6);
+        let limits = WalFecReplayLimits { max_source_pages: 3, ..WalFecReplayLimits::default() };
+        let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::ResourceLimit);
+        assert_eq!(result.decode_proofs().len(), 1);
+        assert!(result.repaired_frame_nos().is_empty());
+        assert_eq!(result.replayable_prefix(), accepted);
+    }
+
+    #[test]
+    fn a_partial_successor_is_not_an_original_checksum_anchor() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 41);
+        corrupt_checksum(&mut wal, 3);
+        wal.extend_from_slice(&[0; 17]);
+        let result = recover_wal_fec_image(
+            &wal, &sidecar, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.committed_frames(), 0);
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert!(result.repaired_frame_nos().is_empty());
+        assert!(result.complete_image().is_err());
     }
 
     #[test]

@@ -573,6 +573,80 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         }
 
         #[test]
+        fn native_export_recovers_an_erased_commit_header() {
+            run_test(async {
+                let (options, expected) = fixture(8, &[1]);
+                let wal_path = companion(&options.source, "-wal");
+                let mut damaged = host_fs::read(&wal_path).unwrap();
+                let terminal = WAL_HEADER_SIZE + 3 * FRAME_SIZE;
+                // Preserve only the original checksum words in the header.
+                damaged[terminal..terminal + 16].fill(0);
+                host_fs::write(&wal_path, &damaged).unwrap();
+                let main_before = host_fs::read(&options.source).unwrap();
+                let sidecar = companion(&options.source, "-wal-fec");
+                let sidecar_before = host_fs::read(&sidecar).unwrap();
+                let cx = request_context().unwrap();
+                let report = recover_to_new_database(&NativeVfs::new(), &cx, &options).await.unwrap();
+                assert_eq!(report.wal_frames, 4);
+                assert_eq!(report.repaired_frames, 2);
+                assert_eq!(host_fs::read(&options.destination).unwrap(), expected);
+                assert_eq!(report.digest, blake3::hash(&expected));
+                assert_eq!(host_fs::read(&wal_path).unwrap(), damaged);
+                assert_eq!(host_fs::read(&options.source).unwrap(), main_before);
+                assert_eq!(host_fs::read(&sidecar).unwrap(), sidecar_before);
+            });
+        }
+
+        #[test]
+        fn native_export_uses_a_later_commit_to_anchor_a_repaired_terminal() {
+            run_test(async {
+                let (options, _) = fixture(8, &[1]);
+                let wal_path = companion(&options.source, "-wal");
+                let mut damaged = host_fs::read(&wal_path).unwrap();
+                let terminal = WAL_HEADER_SIZE + 3 * FRAME_SIZE;
+                let previous = WalFrameHeader::from_bytes(&damaged[terminal..]).unwrap().checksum;
+                let header = WalHeader::from_bytes(&damaged).unwrap();
+                let expected = empty_database(99);
+                let mut successor = WalFrameHeader {
+                    page_number: 1, db_size: 1, salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }.to_bytes().to_vec();
+                successor.extend_from_slice(&expected);
+                let checksum = WalChecksumTransform::for_wal_frame(
+                    &successor, PAGE_SIZE, header.big_endian_checksum(),
+                ).unwrap().apply(previous);
+                successor[16..20].copy_from_slice(&checksum.s1.to_be_bytes());
+                successor[20..24].copy_from_slice(&checksum.s2.to_be_bytes());
+                damaged.extend_from_slice(&successor); // No FEC for this intact commit.
+                damaged[terminal..terminal + WAL_FRAME_HEADER_SIZE].fill(0);
+                host_fs::write(&wal_path, &damaged).unwrap();
+                let cx = request_context().unwrap();
+                let report = recover_to_new_database(&NativeVfs::new(), &cx, &options).await.unwrap();
+                assert_eq!(report.wal_frames, 5);
+                assert_eq!(report.repaired_frames, 2);
+                assert_eq!(host_fs::read(&options.destination).unwrap(), expected);
+                assert_eq!(report.digest, blake3::hash(&expected));
+                assert_eq!(host_fs::read(&wal_path).unwrap(), damaged);
+            });
+        }
+
+        #[test]
+        fn native_export_never_publishes_an_unanchored_reconstruction() {
+            run_test(async {
+                let (options, _) = fixture(8, &[1]);
+                let wal_path = companion(&options.source, "-wal");
+                let mut damaged = host_fs::read(&wal_path).unwrap();
+                damaged[WAL_HEADER_SIZE + 3 * FRAME_SIZE + 16] ^= 1;
+                host_fs::write(&wal_path, &damaged).unwrap();
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&wal_path).unwrap(), damaged);
+            });
+        }
+
+        #[test]
         fn failed_recovery_and_input_budget_do_not_create_output() {
             run_test(async {
                 let (mut options, _) = fixture(2, &[0, 1, 2]);

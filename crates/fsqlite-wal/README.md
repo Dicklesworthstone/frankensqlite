@@ -125,7 +125,14 @@ completion is not certified. A success reports page/frame counts and the output
 BLAKE3 digest from readback; it does not certify B-tree integrity of untouched source pages.
 Run `PRAGMA integrity_check` against the **output** before using it.
 
-Recovery refuses unresolved corruption, damaged terminal commit anchors, partial
+Recovery can restore terminal page numbers, commit sizes and salts when the
+original rolling checksum survives. When that checksum is damaged too, a later
+original WAL frame or a later repaired group's original terminal checksum can
+anchor the preceding reconstructed chain. Such repairs remain tentative until
+that independent checksum matches; a successful payload decode alone is not
+enough. A chain with no surviving anchor is never exported as a complete database.
+
+Recovery refuses unresolved corruption, unanchored commit chains, partial
 WAL tails, ambiguous FEC groups, mismatched headers, and unexplained missing
 pages. It does not silently substitute a shortened WAL prefix: the main file
 may already contain newer checkpointed pages. The materializer applies latest
