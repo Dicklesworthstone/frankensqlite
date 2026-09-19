@@ -4837,6 +4837,20 @@ impl MemDatabase {
     }
 
     fn clear_table(&mut self, root_page: i32) {
+        // Active-transaction refreshes can clear the schema-only mirror once
+        // per trigger query. An already-empty table has nothing to restore;
+        // cloning its constraint metadata and recording undo on every refresh
+        // only grows the transaction's undo log. Check the index state too so
+        // a stale unique-key entry is still cleared and remains undoable.
+        if self.tables.get(&root_page).is_none_or(|table| {
+            table.rows.is_empty()
+                && table
+                    .unique_constraints
+                    .iter()
+                    .all(|constraint| constraint.index.as_ref().is_none_or(BTreeMap::is_empty))
+        }) {
+            return;
+        }
         let prev = self.tables.get(&root_page).cloned();
         if let Some(table) = prev {
             self.push_undo(MemDbUndoOp::ClearTable { root_page, table });
@@ -29337,6 +29351,89 @@ mod tests {
         // Both paths read max rowid (11) from B-tree → return 12.
         assert_eq!(rows_serialized, vec![vec![SqliteValue::Integer(12)]]);
         assert_eq!(rows_concurrent, vec![vec![SqliteValue::Integer(12)]]);
+    }
+
+    #[test]
+    fn test_memdb_repeated_clear_preserves_undo_and_temp_rows() {
+        let mut db = MemDatabase::new();
+        let main = db.create_table(1);
+        let temp = db.create_table(1);
+        assert!(temp > main);
+        db.get_table_mut(main)
+            .expect("main table")
+            .add_unique_column_group(vec![0]);
+        db.upsert_row(main, 7, vec![SqliteValue::Integer(42)]);
+        db.upsert_row(temp, 9, vec![SqliteValue::Integer(84)]);
+        db.begin_undo();
+        let original = db.undo_version();
+
+        db.clear_table_rows_at_or_below(main);
+        let cleared = db.undo_version();
+        assert_ne!(cleared, original, "a populated clear must be undoable");
+        for _ in 0..64 {
+            db.clear_table_rows_at_or_below(main);
+        }
+        assert_eq!(db.undo_version(), cleared, "empty refreshes need no undo");
+        assert_eq!(
+            db.get_table(temp)
+                .expect("temp table")
+                .row_values_by_rowid(9),
+            Some([SqliteValue::Integer(84)].as_slice())
+        );
+
+        db.upsert_row(main, 11, vec![SqliteValue::Integer(63)]);
+        db.clear_table_rows_at_or_below(main);
+        db.rollback_to(cleared);
+        assert!(db.get_table(main).expect("main table").rows.is_empty());
+        db.rollback_to(original);
+        let table = db.get_table(main).expect("main table");
+        assert_eq!(
+            table.row_values_by_rowid(7),
+            Some([SqliteValue::Integer(42)].as_slice())
+        );
+        assert_eq!(table.next_rowid_hint(), 8);
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            vec![7]
+        );
+        assert!(
+            table
+                .find_unique_conflicts(&[SqliteValue::Integer(63)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_memdb_clear_removes_stale_unique_entries_without_rows() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table");
+        table.add_unique_column_group(vec![0]);
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+        // Deliberate inconsistent-state control: a row-only emptiness check
+        // would incorrectly leave this unique-key entry in place.
+        table.rows.clear();
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            vec![1]
+        );
+        db.begin_undo();
+        let original = db.undo_version();
+        db.clear_table(root);
+        assert_ne!(db.undo_version(), original);
+        assert!(
+            db.get_table(root)
+                .expect("table")
+                .find_unique_conflicts(&[SqliteValue::Integer(42)])
+                .is_empty()
+        );
+        db.rollback_to(original);
+        assert_eq!(
+            db.get_table(root)
+                .expect("table")
+                .find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            vec![1]
+        );
     }
 
     #[test]
