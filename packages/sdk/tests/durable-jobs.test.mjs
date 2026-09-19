@@ -15,6 +15,7 @@ class SqlDatabase {
   calls = 0;
   postCommitFailure = null;
   beforeStart = null;
+  beforeExecute = null;
   constructor(path = ':memory:') { this.sql = new DatabaseSync(path); }
   transaction(work) {
     this.calls++;
@@ -24,7 +25,10 @@ class SqlDatabase {
       let committed = false;
       try {
         const value = await work({
-          execute: async (sql, params = []) => Number(this.sql.prepare(sql).run(...params).changes),
+          execute: async (sql, params = []) => {
+            this.beforeExecute?.(sql, params);
+            return Number(this.sql.prepare(sql).run(...params).changes);
+          },
           query: async (sql, params = []) => ({ rows: this.sql.prepare(sql).all(...params) }),
         });
         this.sql.exec('COMMIT');
@@ -552,4 +556,110 @@ test('SQL constraint failure rolls back application effects and the new outbox j
   }));
   assert.deepEqual(db.sql.prepare('SELECT id FROM effects ORDER BY id').all().map(row => row.id), ['existing']);
   assert.equal(await queue.get('one'), null);
+});
+
+test('batch claims return an ordered immutable prefix in one host transaction', async t => {
+  const { db, queue } = await fixture(t);
+  for (let i = 0; i < 20; i++) await queue.enqueue(job(`job-${i}`, { priority: i }));
+  const calls = db.calls;
+  const batch = await queue.claimBatch('worker');
+  assert.equal(db.calls, calls + 1);
+  assert.equal(batch.length, 16);
+  assert.deepEqual(batch.map(lease => lease.id), Array.from({ length: 16 }, (_, i) => `job-${19 - i}`));
+  assert.equal(Object.isFrozen(batch), true);
+  assert.equal(batch.every(lease => Object.isFrozen(lease) && lease.attempt === 1), true);
+  assert.equal(new Set(batch.map(lease => lease.token)).size, 16);
+  assert.equal((await queue.claimBatch('other')).length, 4);
+  assert.deepEqual(await queue.claimBatch('empty'), []);
+});
+
+test('batch payload budget counts UTF-8 bytes and leaves unclaimed attempts untouched', async t => {
+  const { queue } = await fixture(t);
+  const payload = '\u{1f600}'.repeat(131072); // 512 KiB, not 256 KiB.
+  for (const id of ['a', 'b', 'c']) await queue.enqueue(job(id, { payload }));
+  const batch = await queue.claimBatch('worker', { limit: 3, maxPayloadBytes: 1024 * 1024 });
+  assert.deepEqual(batch.map(lease => lease.id), ['a', 'b']);
+  assert.equal(batch.reduce((bytes, lease) => bytes + Buffer.byteLength(lease.payload), 0), 1024 * 1024);
+  assert.equal((await queue.get('c')).attempts, 0);
+  assert.equal((await queue.get('c')).state, 'ready');
+  assert.equal((await queue.claimBatch('worker', { maxPayloadBytes: 1024 * 1024 }))[0].id, 'c');
+});
+
+test('batch byte pressure stops at the priority prefix instead of skipping large jobs', async t => {
+  const { queue } = await fixture(t);
+  await queue.enqueue(job('a', { payload: 'a'.repeat(786432), priority: 3 }));
+  await queue.enqueue(job('b', { payload: 'b'.repeat(524288), priority: 2 }));
+  await queue.enqueue(job('c', { payload: 'c'.repeat(104857), priority: 1 }));
+  const options = { maxPayloadBytes: 1024 * 1024 };
+  assert.deepEqual((await queue.claimBatch('worker', options)).map(lease => lease.id), ['a']);
+  assert.deepEqual((await queue.claimBatch('worker', options)).map(lease => lease.id), ['b', 'c']);
+});
+
+test('batch reclaim renews tokens and fences the old receipts as one transaction', async t => {
+  const { queue, time } = await fixture(t);
+  for (const id of ['a', 'b']) await queue.enqueue(job(id));
+  const old = await queue.claimBatch('worker', { leaseMs: 10 });
+  time(1010);
+  const fresh = await queue.claimBatch('worker', { leaseMs: 20 });
+  assert.deepEqual(fresh.map(lease => lease.attempt), [2, 2]);
+  assert.equal(fresh.every(lease => lease.expiresAt === 1030), true);
+  for (let i = 0; i < old.length; i++) {
+    assert.notEqual(old[i].token, fresh[i].token);
+    await assert.rejects(queue.complete(old[i]), lost);
+    await queue.complete(fresh[i]);
+  }
+});
+
+test('SQL failure midway through claiming rolls back the entire batch', async t => {
+  const { db, queue } = await fixture(t);
+  for (const id of ['a', 'b', 'c']) await queue.enqueue(job(id));
+  const failure = new Error('injected write failure');
+  let updates = 0;
+  db.beforeExecute = sql => {
+    if (sql.startsWith('UPDATE') && ++updates === 2) throw failure;
+  };
+  await assert.rejects(queue.claimBatch('worker'), error => error === failure);
+  db.beforeExecute = null;
+  for (const id of ['a', 'b', 'c']) {
+    const saved = await queue.get(id);
+    assert.equal(saved.state, 'ready');
+    assert.equal(saved.attempts, 0);
+    assert.equal(saved.owner, null);
+  }
+  assert.equal((await queue.claimBatch('worker')).length, 3);
+});
+
+test('batch commit ambiguity propagates without replaying claims or returning partial receipts', async t => {
+  const { db, queue } = await fixture(t);
+  for (const id of ['a', 'b', 'c']) await queue.enqueue(job(id));
+  const failure = new Error('batch checkpoint receipt lost');
+  failure.sqlCommitted = true;
+  db.postCommitFailure = failure;
+  const calls = db.calls;
+  await assert.rejects(queue.claimBatch('worker'), error => error === failure);
+  assert.equal(db.calls, calls + 1);
+  assert.equal((await queue.stats()).leased, 3);
+  assert.deepEqual(await queue.claimBatch('other'), []);
+});
+
+test('batch admission validates limits and captures options before waiting', async t => {
+  const { db, queue } = await fixture(t);
+  for (const id of ['a', 'b']) await queue.enqueue(job(id));
+  const calls = db.calls;
+  for (const options of [{ limit: 0 }, { limit: 129 }, { limit: 1.5 }, { leaseMs: 0 },
+    { maxPayloadBytes: 1024 * 1024 - 1 }, { maxPayloadBytes: 64 * 1024 * 1024 + 1 }]) {
+    await assert.rejects(queue.claimBatch('worker', options), RangeError);
+  }
+  assert.equal(db.calls, calls);
+  let release;
+  db.beforeStart = () => new Promise(resolve => { release = resolve; });
+  const options = { limit: 1, leaseMs: 10 };
+  const pending = queue.claimBatch('worker', options);
+  await Promise.resolve();
+  options.limit = 2; options.leaseMs = 100;
+  db.beforeStart = null;
+  release();
+  const batch = await pending;
+  assert.equal(batch.length, 1);
+  assert.equal(batch[0].expiresAt, 1010);
 });

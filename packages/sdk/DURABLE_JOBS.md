@@ -72,6 +72,22 @@ then availability, creation time and id. It increments attempts and creates a
 fresh token atomically. It may directly reclaim an expired non-final attempt.
 A null result means no currently eligible non-exhausted job, not an empty table.
 
+`claimBatch(owner, { limit?, leaseMs?, maxPayloadBytes? })` claims an ordered
+prefix in **one transaction** and, with checkpoint-on-commit, one checkpoint.
+It defaults to 16 jobs, 30-second leases and 4 MiB of returned UTF-8 payload.
+The hard limits are 128 receipts and 64 MiB; the payload budget must allow at
+least 1 MiB so that a single valid job can always fit. Only candidate ids are
+selected up front; payloads are loaded individually, with at most one lookahead
+job when the byte limit is reached. This bounds returned payload, not total
+database memory, UTF-16 string storage, or process RSS.
+
+A byte-limited batch stops at the first job that does not fit rather than
+skipping higher-priority work. Unclaimed candidates do not consume attempts.
+Every receipt has a distinct token. A failure midway through claiming rolls
+back the entire SQL transaction; a lost commit/checkpoint acknowledgement still
+propagates as an unknown outcome, never as partial success. Do not prefetch more
+jobs than the worker can process or renew before their shared deadline.
+
 `renew(lease, leaseMs = 30000)`, `complete(lease, result = null)` and
 `fail(lease, error, retryDelayMs = 0)` require an unexpired current lease. At the
 exact deadline, the lease is expired. Failure releases work to a delayed retry
@@ -151,8 +167,15 @@ live SQL diagnostics and committed-but-unacknowledged errors:
 
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
-  --test packages/sdk/tests/durable-jobs.test.mjs
+  --test packages/sdk/tests/durable-jobs.test.mjs packages/sdk/tests/durable-jobs-thread.test.mjs
 ```
+
+The thread suite uses four independent SQLite connections to the same file,
+checks disjoint batched claims and unique application effects, and forcibly
+terminates workers after a committed claim and during uncommitted completion.
+The latter verifies that an abandoned application transaction leaves no partial
+effects and the persisted lease can subsequently be reclaimed. These are
+SQLite-reference worker-termination tests, not machine power-loss tests.
 
 It requires a Node release with `node:sqlite` and the workspace TypeScript
 module. This reference suite is not FrankenSQLite engine conformance,

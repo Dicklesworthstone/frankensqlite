@@ -26,6 +26,15 @@ export interface DurableJobQueueOptions {
   clock?: () => number;
 }
 
+export interface DurableClaimOptions {
+  /** Maximum receipts, 1..128; defaults to 16. */
+  limit?: number;
+  /** Lease duration for every claimed job; defaults to 30 seconds. */
+  leaseMs?: number;
+  /** Returned payload UTF-8 bytes, 1..64 MiB; defaults to 4 MiB. */
+  maxPayloadBytes?: number;
+}
+
 export interface EnqueueJob {
   /** Stable idempotency key, scoped to this queue. Retain it across retries. */
   id: string;
@@ -186,24 +195,52 @@ export class DurableJobQueue {
    * Database contention propagates; there is no blind callback replay.
    */
   async claim(owner: string, leaseMs = 30_000): Promise<DurableJobLease | null> {
-    identifier(owner, "worker owner"); integer(leaseMs, "leaseMs", 1, MAX_LEASE_MS);
+    const leases = await this.claimBatch(owner, { limit: 1, leaseMs, maxPayloadBytes: MAX_TEXT_BYTES });
+    return leases[0] ?? null;
+  }
+
+  /**
+   * Claim a bounded prefix in one commit/checkpoint, without running handlers.
+   * Stops at the byte budget rather than skipping higher-priority work. A SQL
+   * or commit failure never returns a partially acknowledged batch of leases.
+   */
+  async claimBatch(owner: string, options?: DurableClaimOptions): Promise<readonly DurableJobLease[]> {
+    identifier(owner, "worker owner");
+    const { limit = 16, leaseMs = 30_000, maxPayloadBytes = 4 * MAX_TEXT_BYTES } = options ?? {};
+    integer(limit, "limit", 1, 128);
+    integer(leaseMs, "leaseMs", 1, MAX_LEASE_MS);
+    integer(maxPayloadBytes, "maxPayloadBytes", MAX_TEXT_BYTES, 64 * MAX_TEXT_BYTES);
     return this.#db.transaction(async tx => {
       const now = this.#now();
       const expires = addTime(now, leaseMs);
-      const rows = (await tx.query(`SELECT job_id FROM ${TABLE} WHERE queue_name = ?
+      // Select only bounded identifiers: LIMIT must not materialize 128 MiB of
+      // payload before the byte budget has a chance to stop admission.
+      const candidates = (await tx.query(`SELECT job_id FROM ${TABLE} WHERE queue_name = ?
         AND attempts < max_attempts AND ((state = 'ready' AND available_at <= ?)
           OR (state = 'leased' AND lease_expires_at <= ?))
-        ORDER BY priority DESC, available_at, created_at, job_id LIMIT 1`, [this.name, now, now])).rows;
-      if (rows.length === 0) return null;
-      const id = string(rows[0]!, "job_id");
-      const token = crypto.randomUUID();
-      const changed = await tx.execute(`UPDATE ${TABLE} SET state = 'leased', attempts = attempts + 1,
-        lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
-        WHERE queue_name = ? AND job_id = ? AND attempts < max_attempts
-          AND ((state = 'ready' AND available_at <= ?) OR (state = 'leased' AND lease_expires_at <= ?))`,
-        [owner, token, expires, now, this.name, id, now, now]);
-      if (changed !== 1) throw new DurableJobError("ERR_FSQLITE_JOB_CONFLICT", "Job changed during claim; no lease was granted");
-      return this.#receipt(tx, id);
+        ORDER BY priority DESC, available_at, created_at, job_id LIMIT ?`, [this.name, now, now, limit])).rows;
+      const leases: DurableJobLease[] = [];
+      let payloadBytes = 0;
+      for (const candidate of candidates) {
+        const id = string(candidate, "job_id");
+        const row = (await tx.query(`SELECT payload, attempts FROM ${TABLE} WHERE queue_name = ? AND job_id = ?`,
+          [this.name, id])).rows[0];
+        if (row === undefined) throw corrupt("Claim candidate disappeared");
+        const payload = string(row, "payload");
+        const bytes = text(payload, "stored payload");
+        if (payloadBytes + bytes > maxPayloadBytes) break;
+        const token = crypto.randomUUID();
+        const changed = await tx.execute(`UPDATE ${TABLE} SET state = 'leased', attempts = attempts + 1,
+          lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
+          WHERE queue_name = ? AND job_id = ? AND attempts < max_attempts
+            AND ((state = 'ready' AND available_at <= ?) OR (state = 'leased' AND lease_expires_at <= ?))`,
+          [owner, token, expires, now, this.name, id, now, now]);
+        if (changed !== 1) throw new DurableJobError("ERR_FSQLITE_JOB_CONFLICT", "Job changed during claim; no lease was granted");
+        leases.push(Object.freeze({ queue: this.name, id, payload, owner, token,
+          attempt: number(row, "attempts") + 1, expiresAt: expires }));
+        payloadBytes += bytes;
+      }
+      return Object.freeze(leases);
     });
   }
 
@@ -384,11 +421,15 @@ function identifier(value: string, label: string): void {
   }
 }
 
-function text(value: string, label: string): void {
+function text(value: string, label: string): number {
   if (typeof value !== "string") throw new TypeError(`${label} must be a string`);
-  if (value.length > MAX_TEXT_BYTES || new TextEncoder().encode(value).byteLength > MAX_TEXT_BYTES) {
+  // Check code-unit length first to avoid allocating for obviously oversized input.
+  if (value.length > MAX_TEXT_BYTES) throw new RangeError(`${label} exceeds ${MAX_TEXT_BYTES} UTF-8 bytes`);
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes > MAX_TEXT_BYTES) {
     throw new RangeError(`${label} exceeds ${MAX_TEXT_BYTES} UTF-8 bytes`);
   }
+  return bytes;
 }
 
 function integer(value: number, label: string, min = 0, max = Number.MAX_SAFE_INTEGER): void {
