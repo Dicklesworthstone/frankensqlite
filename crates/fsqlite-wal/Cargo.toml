@@ -43,6 +43,11 @@ serde_json = { workspace = true }
 [lints]
 workspace = true
 
+[[bin]]
+name = "fsqlite-recover"
+path = "src/bin/fsqlite-recover.rs"
+required-features = ["native"]
+
 [[bench]]
 name = "raptorq_matrix"
 harness = false

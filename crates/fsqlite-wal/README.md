@@ -92,6 +92,67 @@ let (s0, s1) = compute_wal_frame_checksum(
 );
 ```
 
+## Recover into a new database
+
+The native `fsqlite-recover` binary connects WAL-FEC decoding to a standalone
+recovered database, without opening an SQL connection on the damaged source:
+
+```bash
+cargo run --locked -p fsqlite-wal --bin fsqlite-recover -- damaged.db recovered.db
+```
+
+This is an explicit administrative recovery command, **not automatic recovery
+on `Connection::open`**. Preserve the source main/WAL/FEC set before using any
+SQL tool that might checkpoint it. An existing `damaged.db-wal` is required;
+repair symbols, when needed, come from `damaged.db-wal-fec`. Native capture uses
+the existing main/WAL recovery fences and a shared sidecar mutation guard.
+Active reader/writer contention fails without waiting. Source data is not
+rewritten, although VFS admission can create lock/SHM companions and therefore
+requires a writable source namespace. Use cooperative trusted directories;
+external pathname replacement or raw writes that bypass VFS locks are outside
+this contract. Source locks are released before decoding and exporting.
+
+The output must not exist or have old recovery companions. The command reserves
+it with exclusive creation, writes and synchronizes the body behind an invalid
+header, then writes and synchronizes the final header, verifies the output by
+streaming byte-for-byte readback, and synchronizes the parent where the VFS
+supports it. No overwrite or automatic deletion is performed.
+Do not open or manipulate the destination until the command reports success.
+On an error after destination creation, the candidate is retained and its
+completion is not certified. A success reports page/frame counts and the output
+BLAKE3 digest from readback; it does not certify B-tree integrity of untouched source pages.
+Run `PRAGMA integrity_check` against the **output** before using it.
+
+Recovery refuses unresolved corruption, damaged terminal commit anchors, partial
+WAL tails, ambiguous FEC groups, mismatched headers, and unexplained missing
+pages. It does not silently substitute a shortened WAL prefix: the main file
+may already contain newer checkpointed pages. The materializer applies latest
+committed page versions, honors shrink/regrowth boundaries, preserves page-one
+metadata and WAL mode, and does not copy the old WAL or SHM into the destination.
+This is not recovery of unrelated main-file B-tree corruption.
+
+Defaults bound main/output to 256 MiB, WAL to 64 MiB, FEC to 32 MiB, and each
+decode to 256 source pages. `--max-bytes N` changes the per-file/output bound;
+`--max-source-pages N` changes the decode source bound. These are admission
+limits, not a process-RSS guarantee. Use `--help` for the full contract.
+
+Library callers with already-coherent immutable snapshots can use
+`wal_fec::replay::recover_wal_fec_image` followed by
+`WalFecReplayResult::database_image`. These functions perform no filesystem I/O.
+
+The inline command tests cover real encoded FEC input, native lock contention,
+source preservation, output refusal, cancellation, and publication failures.
+Execute them explicitly through the approved build route:
+
+```bash
+cargo test --locked -p fsqlite-wal --bin fsqlite-recover
+cargo test --locked -p fsqlite-wal --lib wal_fec::replay
+```
+
+These Rust tests were added but were **not executed in the authoring environment**.
+The separately executed SQLite image-oracle model is not a Rust, native-lock,
+RaptorQ-decoder, or cross-platform runtime acceptance result.
+
 ## Dependencies
 
 - `fsqlite-types` -- Shared type definitions.
