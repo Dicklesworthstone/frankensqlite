@@ -36862,9 +36862,30 @@ impl Connection {
             // bd-irmuw: clear the retained-flush drop marker before dispatch; the
             // flush (if any) runs inside the first attempt below and re-arms it.
             self.retained_flush_dropped_pending_writes.set(false);
-            let autocommit_retry_entry =
-                matches!(statement, Statement::Pragma(_) | Statement::Select(_))
-                    && self.autocommit_conflict_retry_boundary();
+            // bd-udetu: BEGIN belongs in this set too. Both begin paths bind a
+            // pager publication BEFORE opening the pager transaction, and that
+            // bind sees the same transients a read does while a checkpoint holds
+            // exclusive access -- plain `Busy`, and the `BusySnapshot` straddle
+            // of a TRUNCATE that bd-odyb1 (GH #335) armed this loop for on the
+            // read side. BEGIN had no retry at all, so it was refused in ~0 ms
+            // with `busy_timeout=10000` armed: the admission budget in
+            // `begin_pager_txn_with_busy_timeout` never applied, because BEGIN
+            // never reached admission. Measured against a `wal_checkpoint
+            // (TRUNCATE)` loop, 577_277 of 577_277 refusals returned in under a
+            // second (min / p50 / p90 all 0 ms), which is what turns a caller
+            // that retries without backoff -- the ioq6x churn writers do -- into
+            // a livelock.
+            //
+            // Re-running a failed BEGIN is idempotent: every error exit in
+            // `execute_begin` rolls back the pager transaction it opened and
+            // returns before `in_transaction` is set, so a failed attempt leaves
+            // no state behind, and `autocommit_conflict_retry_boundary()` below
+            // still holds. This is exactly what the caller would do by hand,
+            // except it now happens inside `busy_timeout` as SQLite specifies.
+            let autocommit_retry_entry = matches!(
+                statement,
+                Statement::Pragma(_) | Statement::Select(_) | Statement::Begin(_)
+            ) && self.autocommit_conflict_retry_boundary();
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
                 .await;
