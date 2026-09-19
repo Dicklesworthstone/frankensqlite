@@ -190,6 +190,41 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
             execute_both(
                 &conn,
                 &oracle,
+                "CREATE TRIGGER full_key_guard BEFORE INSERT ON items
+                 WHEN EXISTS(SELECT 1 FROM items AS prior
+                     WHERE prior.owner=NEW.owner AND prior.ordinal=NEW.ordinal)
+                 BEGIN SELECT RAISE(ABORT,'duplicate key guard'); END;",
+            )
+            .await;
+            set_hot_path_profile_enabled(true);
+            let guard = ProfileGuard;
+            let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
+            compare(
+                &conn,
+                &oracle,
+                "INSERT INTO items VALUES ('group',512,'middle') RETURNING ordinal",
+                1,
+            )
+            .await;
+            let trigger_ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
+            drop(guard);
+            eprintln!("full_pk_trigger suffix={suffix:?} insert_ops={trigger_ops}");
+            assert!(
+                (1..512).contains(&trigger_ops),
+                "full-PK trigger scan: {trigger_ops}"
+            );
+            let duplicate = "INSERT INTO items VALUES ('group',511,'middle')";
+            let stock_error = oracle.execute_batch(duplicate).expect_err("stock trigger");
+            let engine_error = conn
+                .execute_batch(duplicate)
+                .await
+                .expect_err("engine trigger");
+            assert!(stock_error.to_string().contains("duplicate key guard"));
+            assert!(engine_error.to_string().contains("duplicate key guard"));
+            execute_both(&conn, &oracle, "DELETE FROM items WHERE ordinal=512").await;
+            execute_both(
+                &conn,
+                &oracle,
                 "CREATE UNIQUE INDEX by_reordered_pk ON items(ordinal,owner);
                  CREATE INDEX by_owner_nocase ON items(owner COLLATE NOCASE,category);
                  CREATE INDEX by_owner_expression ON items(owner,lower(category))

@@ -23050,3 +23050,36 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   If a future workload is shown to be genuinely bound by the `rowids_by_value`
   build (many distinct probe keys per commit epoch on a large table), measure it
   against that workload, not against a read that matches nothing.
+
+## 2026-09-19 — HFDT full-PK routing: fast lookup did not prove valid indexes
+
+- Workload: `hfdt-gbou9l`, complete primary-key existence probes with a
+  competing secondary index sharing only the first PK column. The engine
+  regression uses 512 ordinary SQL rows, not financial/provider evidence.
+- Rejected candidate: engine `da6d46d59066ba085145e61d19a077b5a925c722`,
+  codegen SHA256 `42d9f46535a5264cd3620c7dc3a3e463b4a8580786695708dccf17d0297816b5`,
+  connection SHA256 `531aae763b1f94ff9cb095ac61c32c253e9e59ff6f373cd1ea02f9096b4d93d5`.
+  Files: `crates/fsqlite-vdbe/src/codegen.rs`,
+  `crates/fsqlite-core/src/connection.rs`, and
+  `crates/fsqlite-core/tests/hfdt_gbou9l_index_exclusion.rs`.
+- The initial baseline returned no row for an existing full PK after index
+  backfill. The candidate repaired that lookup and used 29 VM instructions
+  for the WITHOUT ROWID hit plus miss, versus 4,616 for a forced-scan miss.
+  Nevertheless the test exited 101: stock SQLite's final integrity check
+  reported missing entries in the mixed-expression secondary index. Internal
+  query agreement had concealed a shared writer/reader layout mistake.
+- Cause: backfill appended PK fields already present in the index, while
+  ordinary DML/readers omitted them. Simply reusing the existing helper was
+  insufficient: it did not recognize plain terms in mixed expression indexes.
+  Stock `index_xinfo` also confirms different collations require separate
+  copies of an otherwise overlapping column.
+- Retry condition: preserve forced-index reads and stock reopen integrity,
+  repair all exercised layouts, and keep original HFDT migration acceptance
+  separate. The bounded validator independently rejected a stock-valid
+  overlapping-key image; its repair requires intact corruption controls and
+  a separate gate change. No full-capture migration speedup is established by
+  these instruction counts.
+- Evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-full-pk-routing/`
+  contains `baseline.log`, `candidate.log`, `candidate-source.json`, and
+  `candidate2-corrected-test.log`. The last distinguishes the repaired
+  runtime test from the still-failing bounded-validation baseline.
