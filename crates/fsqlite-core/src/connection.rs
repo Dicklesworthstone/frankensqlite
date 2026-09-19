@@ -36862,9 +36862,57 @@ impl Connection {
             // bd-irmuw: clear the retained-flush drop marker before dispatch; the
             // flush (if any) runs inside the first attempt below and re-arms it.
             self.retained_flush_dropped_pending_writes.set(false);
-            let autocommit_retry_entry =
-                matches!(statement, Statement::Pragma(_) | Statement::Select(_))
-                    && self.autocommit_conflict_retry_boundary();
+            // bd-udetu: BEGIN belongs in this set too. Both begin paths bind a
+            // pager publication BEFORE opening the pager transaction, and that
+            // bind sees the same transients a read does while a checkpoint holds
+            // exclusive access -- plain `Busy`, and the `BusySnapshot` straddle
+            // of a TRUNCATE that bd-odyb1 (GH #335) armed this loop for on the
+            // read side. BEGIN had no retry at all, so it was refused in ~0 ms
+            // with `busy_timeout=10000` armed: the admission budget in
+            // `begin_pager_txn_with_busy_timeout` never applied, because BEGIN
+            // never reached admission. Measured against a `wal_checkpoint
+            // (TRUNCATE)` loop, 577_277 of 577_277 refusals returned in under a
+            // second (min / p50 / p90 all 0 ms), which is what turns a caller
+            // that retries without backoff -- the ioq6x churn writers do -- into
+            // a livelock.
+            //
+            // Re-running a failed BEGIN is idempotent: every error exit in
+            // `execute_begin` rolls back the pager transaction it opened and
+            // returns before `in_transaction` is set, so a failed attempt leaves
+            // no state behind, and `autocommit_conflict_retry_boundary()` below
+            // still holds. This is exactly what the caller would do by hand,
+            // except it now happens inside `busy_timeout` as SQLite specifies.
+            // bd-orwh0: SAVEPOINT and ANALYZE belong here for the same reason
+            // BEGIN did. The transients this loop absorbs come from the pager
+            // publication bind, which runs before the pager admission that owns
+            // the `busy_timeout` budget, so the exposure is not per-shape --
+            // every autocommit statement passes through that bind. Measured
+            // against a `wal_checkpoint(TRUNCATE)` loop with `busy_timeout=4000`,
+            // SAVEPOINT was refused 45_492 times and ANALYZE 53_879 times, all
+            // at min / p50 = 0 ms, and ANALYZE never completed once. SAVEPOINT
+            // opens a transaction exactly as BEGIN does; ANALYZE rewrites
+            // sqlite_stat1 from scratch, so a re-run recomputes rather than
+            // accumulates.
+            //
+            // DDL is deliberately NOT here, and the allowlist stays an allowlist
+            // for that reason. Arming every shape except transaction completion
+            // made `CREATE INDEX` produce a malformed index -- "index <name>
+            // payload is not a valid SQLite record", 633 consecutive ANALYZE
+            // failures -- in 1 of 3 runs, where the unfixed engine was clean in
+            // 3 of 3 with MORE successful CREATE INDEXes. The retry re-enters at
+            // `execute_statement_once_after_background_status`, below the point
+            // in `execute_impl` that sets `pending_ddl_source`, so a re-run does
+            // not see the same DDL state the first attempt did. Until that is
+            // understood, a DDL statement that returns SQLITE_BUSY is the
+            // caller's to retry. bd-pa8e5.
+            let autocommit_retry_entry = matches!(
+                statement,
+                Statement::Pragma(_)
+                    | Statement::Select(_)
+                    | Statement::Begin(_)
+                    | Statement::Savepoint(_)
+                    | Statement::Analyze(_)
+            ) && self.autocommit_conflict_retry_boundary();
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
                 .await;

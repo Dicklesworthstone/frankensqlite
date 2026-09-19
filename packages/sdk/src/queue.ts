@@ -1,4 +1,5 @@
 import { FrankenDB, observeDatabaseFailure } from "./database";
+import { isSnapshotPersistenceMode } from "@frankensqlite/worker";
 import { FrankenSQLiteError } from "./errors";
 import { TableChangeJournal, captureTables } from "./change-journal";
 import { ChangeObserver, createChangeStream } from "./subscriptions";
@@ -25,7 +26,7 @@ export interface JobQueueOptions {
   /** Active or still-finishing subscriptions, 1..1024. Defaults to 64. */
   maxSubscriptions?: number;
   /**
-   * In indexeddb-snapshot mode, acknowledge transaction jobs only after their
+   * In either snapshot mode, acknowledge transaction jobs only after their
    * committed image is checkpointed. Defaults to false. Not a page-level VFS.
    */
   checkpointOnCommit?: boolean;
@@ -173,9 +174,9 @@ export class FrankenDBQueue {
       throw new RangeError("maxSubscriptions must be an integer in 1..1024");
     }
     const db = await FrankenDB.open(databaseOptions);
-    if (checkpointOnCommit === true && db.persistence !== "indexeddb-snapshot") {
+    if (checkpointOnCommit === true && !isSnapshotPersistenceMode(db.persistence)) {
       const cause = new FrankenSQLiteError({ code: "ERR_FSQLITE_CHECKPOINT_MODE",
-        message: "checkpointOnCommit requires indexeddb-snapshot persistence", transient: false });
+        message: "checkpointOnCommit requires indexeddb-snapshot or opfs-snapshot persistence", transient: false });
       try { await db.close(); }
       catch (cleanup: unknown) {
         throw new AggregateError([cause, cleanup], "Invalid checkpoint mode and database cleanup failed", { cause });
@@ -196,6 +197,8 @@ export class FrankenDBQueue {
   get path(): string { return this.#db.path; }
   get persistence() { return this.#db.persistence; }
   get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
+  /** Retain to require the exact failed checkpoint when opening a new worker. */
+  get pendingCheckpointRecovery() { return this.#db.pendingCheckpointRecovery; }
   get checkpointOnCommit(): boolean { return this.#checkpointOnCommit; }
   get checkpointRecoverySupported(): boolean { return this.#db.checkpointRecoverySupported; }
   /** Local watched-write sequence, not a native commit sequence or saved revision. */
@@ -378,7 +381,7 @@ export class FrankenDBQueue {
   }
 
   /**
-   * Publish the current committed image in indexeddb-snapshot mode. Includes
+   * Publish the current committed image in either snapshot mode. Includes
    * earlier successful jobs, excludes later jobs, and waits for publication.
    * Preceding job failures do not implicitly cancel this independent barrier.
    */

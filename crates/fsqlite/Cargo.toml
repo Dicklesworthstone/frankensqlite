@@ -23,6 +23,7 @@ fsqlite-ext-session = { workspace = true, optional = true }
 fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
 fsqlite-parser = { workspace = true }
+fsqlite-ast = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [features]
@@ -39,7 +40,7 @@ json = ["dep:fsqlite-ext-json", "fsqlite-core/ext-json"]
 fts5 = ["dep:fsqlite-ext-fts5", "fsqlite-core/ext-fts5"]
 fts3 = ["dep:fsqlite-ext-fts3"]
 rtree = ["dep:fsqlite-ext-rtree", "fsqlite-core/ext-rtree"]
-session = ["dep:fsqlite-ext-session"]
+session = ["dep:fsqlite-ext-session", "dep:fsqlite-ast"]
 icu = ["dep:fsqlite-ext-icu", "fsqlite-core/ext-icu"]
 misc = ["dep:fsqlite-ext-misc", "fsqlite-core/ext-misc"]
 # `async-api` implies the full `native` stack (fsqlite#379): the async surface

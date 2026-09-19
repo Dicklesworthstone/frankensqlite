@@ -13,6 +13,7 @@ export type { StreamFailurePhase } from "./stream";
 export { FrankenPreparedStatement } from "./statement";
 export { FrankenTransaction } from "./transaction";
 export type {
+  CheckpointRecoveryIdentity,
   ResultEncoding,
   ExecuteManyOptions,
   ExecuteManyResult,
@@ -39,3 +40,7 @@ export type { JobQueueOptions, JobQueueStats, QueuedJobOptions, QueuedTransactio
 export type { CommittedTableChange, TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
 export { watchQuery } from "./live-query";
 export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";
+export { DurableJobQueue, DurableJobError, DURABLE_JOBS_TABLE } from "./durable-jobs";
+export type { DurableJobDatabase, DurableJobTransaction, DurableJobQueueOptions, DurableClaimOptions, EnqueueJob, DurableJobState, DurableJob, DurableJobLease, DurableEnqueueResult, DurableEnqueueWorkResult, DurableJobStats } from "./durable-jobs";
+export { DurableJobWorker, DurableJobWorkerError } from "./durable-job-worker";
+export type { DurableWorkerQueue, DurableJobHandler, DurableJobContext, DurableJobCompletion, DurableJobWorkerOptions, DurableJobWorkerStopOptions, DurableJobWorkerStats, DurableJobWorkerPhase } from "./durable-job-worker";

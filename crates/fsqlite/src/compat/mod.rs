@@ -4,6 +4,8 @@
 //! `rusqlite` to `fsqlite` is mostly mechanical import swaps.
 
 mod batch;
+#[cfg(feature = "session")]
+pub mod changeset;
 mod connection;
 mod flags;
 mod optional;

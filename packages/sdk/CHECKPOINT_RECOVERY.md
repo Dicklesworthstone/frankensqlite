@@ -131,3 +131,58 @@ contents. This is not a browser storage, browser worker entrypoint, native Rust,
 or WASM certificate. Strict TypeScript checking of the affected dependency graph
 uses the repository configuration and actual core declarations; it is not a
 full-workspace build.
+
+## Reopening after worker or transport failure
+
+Both `opfs-snapshot` and `indexeddb-snapshot` support exact-image reopening.
+After a failed checkpoint settles, `db.pendingCheckpointRecovery` (also exposed
+by `FrankenDBQueue`) returns an immutable `CheckpointRecoveryIdentity`, or null
+when no recoverable candidate is known. It includes the storage backend, database
+name, publication UUID and last acknowledged parent. It remains readable after
+worker disposal and failed queue close. It is an identity, **not a success
+receipt**; retain it before retrying any operation that can replace the candidate.
+
+Pass this identity as `requireCheckpoint` when opening a new database or queue:
+
+```ts
+// Run after a failed checkpoint/queue job has settled, not while it is pending.
+const required = queue.pendingCheckpointRecovery;
+if (required === null) throw new Error("No checkpoint identity; reconcile manually");
+
+// Release the old owner. An unresolved checkpoint keeps close() rejecting.
+try { await queue.close(); } catch { /* The original failed outcome is retained. */ }
+const reopened = await FrankenDBQueue.open(
+  { dbName: required.path, persistence: required.persistence, requireCheckpoint: required },
+  { checkpointOnCommit: true },
+);
+// Reaching here means the exact checkpoint was restored. Do NOT rerun the
+// original committed callback. Continue with new work on reopened instead.
+```
+
+The precondition is captured and validated before allocating a worker or
+transferring import bytes. It must identify the requested snapshot backend and
+name and cannot be combined with an initialization image. The new worker loads,
+validates, hashes and imports authoritative bytes normally. The SDK exposes the
+handle only when the restored revision AND parent match the required identity.
+It never upgrades a stale in-memory image's revision to a newer stored token.
+The next checkpoint therefore extends the actual imported image, with the
+ordinary compare-and-swap protection against a later writer.
+
+Absent storage, an older checkpoint, incorrect parent lineage, or a superseding
+checkpoint rejects opening with `ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED`. A corrupt
+envelope or checksum rejects with the storage corruption error. In particular,
+an unsuccessful reopen does not prove the old publication never happened.
+Reconcile competing data; there is no automatic merge, historical revision
+lookup, or permission to repeat application effects.
+
+The recovery identity is JSON-serializable but is not persisted by the SDK.
+Whole-page/application death also loses it unless the application retained it
+elsewhere. No candidate is exposed while checkpoints remain outstanding, and
+older workers without publication identities still cannot supply one. This
+feature does not recover in-memory writes made after the saved checkpoint.
+
+The `packages/sdk/tests/opfs-persistence.test.mjs` suite covers both backends
+through the production SDK and host, real Node SQLite images, and deterministic
+storage models. Its fatal-delivery tests retire the original transport and
+reopen through a new host without replaying SQL or republishing a snapshot.
+These are not actual browser, WASM, machine-crash or power-loss tests.

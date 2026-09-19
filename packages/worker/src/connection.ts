@@ -25,6 +25,8 @@ import {
 } from "./vfs-init";
 import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
 import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName } from "./snapshot-store";
+import { OpfsSnapshotStore } from "./opfs-snapshot-store";
+import { isSnapshotPersistenceMode } from "./protocol";
 import type { SnapshotMetadata } from "./snapshot-store";
 import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
 import type { RequestLimits, RequestQueueStats } from "./admission";
@@ -109,7 +111,7 @@ export class WorkerConnectionHost {
   #nextBulkSavepoint = 1n;
   #terminalError: Error | null = null;
   readonly #bulkCancellations = new Map<number, BulkCancellation>();
-  #snapshotStore: IndexedDbSnapshotStore | null = null;
+  #snapshotStore: IndexedDbSnapshotStore | OpfsSnapshotStore | null = null;
   #snapshotRevision: string | null = null;
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
@@ -330,16 +332,18 @@ export class WorkerConnectionHost {
       maxBytes: Math.min(requestedStatements.maxBytes, this.#statementCeiling.maxBytes),
     });
 
-    let stagedStore: IndexedDbSnapshotStore | null = null;
+    let stagedStore: IndexedDbSnapshotStore | OpfsSnapshotStore | null = null;
     let stagedDb: CoreDatabaseHandle | null = null;
     let disposingPrevious = false;
     try {
       let image = config.snapshot;
       let saved: SnapshotMetadata | null = null;
-      if (ready.persistence === "indexeddb-snapshot") {
+      if (isSnapshotPersistenceMode(ready.persistence)) {
         validateSnapshotName(config.dbName ?? "");
         if (image !== undefined) validateSnapshotBytes(image);
-        stagedStore = await IndexedDbSnapshotStore.open(config.dbName!);
+        stagedStore = ready.persistence === "opfs-snapshot"
+          ? await OpfsSnapshotStore.open(config.dbName!)
+          : await IndexedDbSnapshotStore.open(config.dbName!);
         const loaded = await stagedStore.load();
         if (loaded !== null) {
           if (image !== undefined) {
@@ -364,7 +368,7 @@ export class WorkerConnectionHost {
         stagedDb = null;
         throw new Error("Database initialization must return a separately owned handle");
       }
-      const path = ready.persistence === "indexeddb-snapshot" ? ready.path : stagedDb.path || ready.path;
+      const path = isSnapshotPersistenceMode(ready.persistence) ? ready.path : stagedDb.path || ready.path;
       if (typeof path !== "string") throw new Error("Invalid initialized database path");
       if (this.#terminalError !== null) throw this.#terminalError;
 
@@ -388,7 +392,7 @@ export class WorkerConnectionHost {
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           preparedStatementLimits: stagedStatementBudget.limits,
-          ...(ready.persistence === "indexeddb-snapshot" ? { snapshot: saved, checkpointRecovery: 1 as const } : {}),
+          ...(isSnapshotPersistenceMode(ready.persistence) ? { snapshot: saved, checkpointRecovery: 1 as const } : {}),
         },
       };
     } catch (cause: unknown) {
@@ -612,7 +616,7 @@ export class WorkerConnectionHost {
     const store = this.#snapshotStore;
     if (store === null) {
       throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
-        "Explicit checkpoints require persistence: indexeddb-snapshot");
+        "Explicit checkpoints require persistence: indexeddb-snapshot or opfs-snapshot");
     }
     // The current WASM contract has no transaction-state accessor. Probe an
     // empty BEGIN/ROLLBACK boundary instead of guessing from SQL text (which
@@ -644,7 +648,7 @@ export class WorkerConnectionHost {
   async #recoverCheckpoint(requestId: number, publicationId: string, parentRevision: string | null): Promise<CheckpointResponse> {
     const store = this.#snapshotStore;
     if (store === null) throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
-      "Checkpoint recovery requires persistence: indexeddb-snapshot");
+      "Checkpoint recovery requires persistence: indexeddb-snapshot or opfs-snapshot");
     // Do not roll back the host's revision if another local checkpoint has
     // advanced it. It may be at the parent (lost store acknowledgement) or
     // at this publication (lost worker acknowledgement), and nowhere else.

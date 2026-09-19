@@ -15,6 +15,7 @@ export { DEFAULT_PREPARED_STATEMENT_LIMITS, PreparedStatementError, resolvePrepa
 export type { PreparedStatementLimits, PreparedStatementStats } from "./statement-budget";
 export { validateBulkSql } from "./bulk";
 export { IndexedDbSnapshotStore, MAX_SNAPSHOT_BYTES, SnapshotStoreError, validateSnapshotBytes } from "./snapshot-store";
+export { OpfsSnapshotStore } from "./opfs-snapshot-store";
 export { validateManagedSql } from "./transactions";
 export type { SnapshotMetadata, StoredSnapshot } from "./snapshot-store";
 export {
