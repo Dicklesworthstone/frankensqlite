@@ -13,6 +13,7 @@ export type { StreamFailurePhase } from "./stream";
 export { FrankenPreparedStatement } from "./statement";
 export { FrankenTransaction } from "./transaction";
 export type {
+  CheckpointRecoveryIdentity,
   ResultEncoding,
   ExecuteManyOptions,
   ExecuteManyResult,

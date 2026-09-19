@@ -71,9 +71,23 @@ export interface ExecuteStreamProgress extends ExecuteStreamResult {
   committed: false;
 }
 
+/** Identity of an unacknowledged publication, not proof that it was saved. */
+export interface CheckpointRecoveryIdentity {
+  readonly path: string;
+  readonly persistence: "indexeddb-snapshot" | "opfs-snapshot";
+  readonly publicationId: string;
+  readonly parentRevision: string | null;
+}
+
 export interface FrankenDbOpenOptions
   extends Omit<InitConfig, "snapshot"> {
   snapshot?: Uint8Array;
+  /**
+   * Reopen only if authoritative storage restores exactly this checkpoint.
+   * Missing/replaced publications reject; failure never authorizes SQL replay.
+   * Cannot be combined with an initialization snapshot.
+   */
+  requireCheckpoint?: CheckpointRecoveryIdentity;
   worker?: WorkerLike | (() => WorkerLike);
   /** Bound active + queued request count and accounted payload before IPC. */
   requestLimits?: Partial<RequestLimits>;

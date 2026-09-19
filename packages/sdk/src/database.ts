@@ -1,7 +1,7 @@
 import { FrankenPreparedStatement } from "./statement";
 import { captureTransactionOptions, combineTransactionSignals, FrankenTransaction, TransactionBudget } from "./transaction";
 import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SqlBindings, SnapshotMetadata } from "./types";
-import { normalizeOpenOptions, resolveWorker } from "./utils";
+import { captureRequiredCheckpoint, normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
 import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
@@ -9,7 +9,7 @@ import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./
 import { isSnapshotPersistenceMode, resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
 import type { PreparedStatementLimits } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
-import type { TransactionOptions } from "./types";
+import type { CheckpointRecoveryIdentity, TransactionOptions } from "./types";
 import { isTransactionConflict, resolveTransactionRetryOptions, runTransactionRetry } from "./transaction-retry";
 import type { RetryRecovery, TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
@@ -125,6 +125,7 @@ export class FrankenDB {
 
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
     const normalized = normalizeOpenOptions(options);
+    const requiredCheckpoint = captureRequiredCheckpoint(normalized);
     // Validate before allocating a worker or transferring a snapshot buffer.
     const limits = resolveRequestLimits(normalized.requestLimits);
     const resultEncoding = resolveResultEncoding(normalized.resultEncoding);
@@ -159,6 +160,16 @@ export class FrankenDB {
           snapshot = captureSnapshotReceipt(saved);
         }
       } catch (cause: unknown) { throw snapshotReceiptFailure(cause); }
+      // The worker has restored and hashed these bytes, not merely looked up
+      // a revision token. Never bind a fresh session at the parent to a later
+      // publication: that would let stale memory overwrite committed data.
+      if (requiredCheckpoint !== null && (snapshot === null ||
+          snapshot.revision !== requiredCheckpoint.publicationId ||
+          snapshot.parentRevision !== requiredCheckpoint.parentRevision)) {
+        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED", transient: false,
+          message: "The required checkpoint is not the restored authoritative image; it may have been replaced or never published",
+          suggestion: "Reconcile saved data before replaying SQL. This rejection does not prove that the publication never committed." });
+      }
       const policy = Object.getOwnPropertyDescriptor(ready, "preparedStatementLimits");
       if (policy !== undefined && !Object.hasOwn(policy, "value")) {
         throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", message: "Invalid worker prepared-statement policy" });
@@ -209,6 +220,18 @@ export class FrankenDB {
   /** Last loaded/published checkpoint, not the state of unsaved memory writes. */
   get snapshotRevision(): string | null {
     return this.#snapshotRevision;
+  }
+
+  /**
+   * Retain after a failed checkpoint, even after worker disposal. Pass it to
+   * open({ requireCheckpoint }) on a new worker; it is not a success receipt.
+   * No identity is exposed while publications are still outstanding.
+   */
+  get pendingCheckpointRecovery(): Readonly<CheckpointRecoveryIdentity> | null {
+    const pending = this.#checkpointCandidate;
+    if (pending === null || this.#checkpointInFlight !== 0 || !isSnapshotPersistenceMode(this.#persistence)) return null;
+    return Object.freeze({ path: this.#path, persistence: this.#persistence,
+      publicationId: pending.publicationId, parentRevision: pending.parentRevision });
   }
 
   /** Ordinary requests only; close/cancellation have a separate control lane. */

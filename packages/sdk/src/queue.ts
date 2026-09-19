@@ -197,6 +197,8 @@ export class FrankenDBQueue {
   get path(): string { return this.#db.path; }
   get persistence() { return this.#db.persistence; }
   get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
+  /** Retain to require the exact failed checkpoint when opening a new worker. */
+  get pendingCheckpointRecovery() { return this.#db.pendingCheckpointRecovery; }
   get checkpointOnCommit(): boolean { return this.#checkpointOnCommit; }
   get checkpointRecoverySupported(): boolean { return this.#db.checkpointRecoverySupported; }
   /** Local watched-write sequence, not a native commit sequence or saved revision. */
