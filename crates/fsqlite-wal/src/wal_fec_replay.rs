@@ -9,6 +9,7 @@
 //! a WAL index. A returned prefix is never permission to discard a live WAL.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
@@ -130,6 +131,110 @@ impl<'a> WalFecReplayResult<'a> {
         &self.image
     }
 
+    /// Materialize a standalone database from a coherent main-file snapshot
+    /// and the completely verified WAL. No source bytes are changed.
+    ///
+    /// This deliberately refuses a recovery fallback: a main file can already
+    /// contain checkpointed pages newer than that fallback's committed prefix.
+    /// Combining them would manufacture a mixed transaction snapshot.
+    /// Callers must capture main and WAL under the same recovery fence, or
+    /// supply an externally frozen pair from the same database generation.
+    ///
+    /// Later page versions win. Commit-time shrink boundaries retire both
+    /// earlier WAL versions and base-file pages, so subsequent growth cannot
+    /// resurrect stale bytes. Every page beyond the retained base must have a
+    /// surviving WAL image; unexplained holes are refused rather than zeroed.
+    /// The result preserves page-one metadata and reserved bytes, including
+    /// WAL journal mode. It needs no old WAL or SHM file to be read.
+    ///
+    /// `max_database_bytes` bounds both the base input and output allocation,
+    /// not total process memory. This checks image provenance and header
+    /// consistency, not B-tree integrity of untouched main-file pages.
+    pub fn database_image(&self, database: &[u8], max_database_bytes: usize) -> Result<Vec<u8>> {
+        if let Some(stop) = self.stop {
+            return Err(corrupt(format!(
+                "cannot materialize a database from incomplete WAL recovery at frame {}: {:?}",
+                stop.frame_no, stop.reason
+            )));
+        }
+        if database.len() > max_database_bytes {
+            return Err(corrupt("main database exceeds recovery input limit"));
+        }
+        let page_size = usize::try_from(self.header.page_size)
+            .map_err(|_| corrupt("database page size exceeds address space"))?;
+        if !database.len().is_multiple_of(page_size) {
+            return Err(corrupt("main database has a partial page"));
+        }
+        let physical_base_pages = u32::try_from(database.len() / page_size)
+            .map_err(|_| corrupt("main database page count exceeds SQLite's domain"))?;
+        let mut retained_base_pages = physical_base_pages;
+        if !database.is_empty() {
+            validate_database_header(database, self.header.page_size)?;
+            if let Some(declared) = authoritative_database_size(database) {
+                retained_base_pages = retained_base_pages.min(declared);
+            }
+        }
+
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let mut latest_pages = BTreeMap::<u32, &[u8]>::new();
+        for frame in self.image[WAL_HEADER_SIZE..].chunks_exact(frame_size) {
+            let frame_header = WalFrameHeader::from_bytes(frame)?;
+            latest_pages.insert(frame_header.page_number, &frame[WAL_FRAME_HEADER_SIZE..]);
+            if frame_header.is_commit() {
+                retained_base_pages = retained_base_pages.min(frame_header.db_size);
+                while latest_pages.last_key_value()
+                    .is_some_and(|(page, _)| *page > frame_header.db_size)
+                {
+                    latest_pages.pop_last();
+                }
+            }
+        }
+        let final_pages = match self.db_size_pages {
+            Some(pages) => pages,
+            None if !database.is_empty() => {
+                authoritative_database_size(database).unwrap_or(physical_base_pages)
+            }
+            None => return Err(corrupt("no committed database image is available")),
+        };
+        if PageNumber::new(final_pages).is_none() {
+            return Err(corrupt("invalid recovered database page count"));
+        }
+        let output_len = usize::try_from(final_pages).ok()
+            .and_then(|pages| pages.checked_mul(page_size))
+            .filter(|size| *size <= max_database_bytes)
+            .ok_or_else(|| corrupt("recovered database exceeds output limit"))?;
+        retained_base_pages = retained_base_pages.min(final_pages);
+        for page in retained_base_pages + 1..=final_pages {
+            if !latest_pages.contains_key(&page) {
+                return Err(corrupt(format!(
+                    "recovered database page {page} has no surviving source image"
+                )));
+            }
+        }
+
+        // Validate the final page-one version before allocating the output.
+        let page_one = latest_pages.get(&1).copied()
+            .or_else(|| database.get(..page_size))
+            .ok_or_else(|| corrupt("recovered database has no page one"))?;
+        validate_database_header(page_one, self.header.page_size)?;
+        if authoritative_database_size(page_one).is_some_and(|size| size != final_pages) {
+            return Err(corrupt("recovered page-one size disagrees with the final WAL commit"));
+        }
+
+        let mut output = Vec::new();
+        output.try_reserve_exact(output_len).map_err(|_| FrankenError::OutOfMemory)?;
+        output.resize(output_len, 0);
+        let base_len = usize::try_from(retained_base_pages)
+            .map_err(|_| corrupt("base page count exceeds address space"))? * page_size;
+        output[..base_len].copy_from_slice(&database[..base_len]);
+        for (page, payload) in latest_pages {
+            let offset = usize::try_from(page - 1)
+                .map_err(|_| corrupt("page number exceeds address space"))? * page_size;
+            output[offset..offset + page_size].copy_from_slice(payload);
+        }
+        Ok(output)
+    }
+
     /// Return the image only when every complete input frame was validated.
     /// A valid, non-committed suffix is omitted according to SQLite replay rules.
     pub fn complete_image(self) -> Result<Cow<'a, [u8]>> {
@@ -141,6 +246,29 @@ impl<'a> WalFecReplayResult<'a> {
         }
         Ok(self.image)
     }
+}
+
+fn validate_database_header(bytes: &[u8], expected_page_size: u32) -> Result<()> {
+    if bytes.len() < 100 || !bytes.starts_with(b"SQLite format 3\0") {
+        return Err(corrupt("invalid main database header during recovery"));
+    }
+    let encoded = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if encoded == 1 { 65_536 } else { u32::from(encoded) };
+    if page_size != expected_page_size {
+        return Err(corrupt("main database and WAL page sizes differ"));
+    }
+    if !matches!(bytes[18], 1 | 2) || !matches!(bytes[19], 1 | 2)
+        || bytes[21..24] != [64, 32, 32]
+        || page_size.saturating_sub(u32::from(bytes[20])) < 480
+    {
+        return Err(corrupt("unsupported main database header format during recovery"));
+    }
+    Ok(())
+}
+
+fn authoritative_database_size(bytes: &[u8]) -> Option<u32> {
+    let size = u32::from_be_bytes(bytes[28..32].try_into().expect("validated database header"));
+    (size != 0 && bytes[24..28] == bytes[92..96]).then_some(size)
 }
 
 /// Decode damaged groups and reconstruct their real WAL frame headers/checksums.
@@ -682,5 +810,191 @@ mod tests {
         assert_eq!(result.discarded_tail_bytes, 17);
         assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::PartialFrame);
         assert!(result.complete_image().is_err());
+    }
+
+    fn database_page_one(page_size: u32, pages: u32) -> Vec<u8> {
+        let mut page = vec![0; usize::try_from(page_size).unwrap()];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        let encoded = if page_size == 65_536 { 1 } else { u16::try_from(page_size).unwrap() };
+        page[16..18].copy_from_slice(&encoded.to_be_bytes());
+        page[18..20].copy_from_slice(&[2, 2]);
+        page[21..24].copy_from_slice(&[64, 32, 32]);
+        page[24..28].copy_from_slice(&7_u32.to_be_bytes());
+        page[28..32].copy_from_slice(&pages.to_be_bytes());
+        page[44..48].copy_from_slice(&4_u32.to_be_bytes());
+        page[56..60].copy_from_slice(&1_u32.to_be_bytes());
+        page[60..64].copy_from_slice(&123_u32.to_be_bytes());
+        page[68..72].copy_from_slice(&456_u32.to_be_bytes());
+        page[92..96].copy_from_slice(&7_u32.to_be_bytes());
+        page[100] = 13; // Empty sqlite_schema leaf, for header/provenance tests.
+        let cell_start = if page_size == 65_536 { 0 } else { encoded };
+        page[105..107].copy_from_slice(&cell_start.to_be_bytes());
+        page
+    }
+
+    fn append_database_frames(wal: &mut Vec<u8>, pages: &[(u32, Vec<u8>)], commit_size: u32) {
+        let header = WalHeader::from_bytes(wal).unwrap();
+        let page_size = usize::try_from(header.page_size).unwrap();
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let mut running = if wal.len() == WAL_HEADER_SIZE {
+            header.checksum
+        } else {
+            WalFrameHeader::from_bytes(&wal[wal.len() - frame_size..]).unwrap().checksum
+        };
+        for (index, (number, page)) in pages.iter().enumerate() {
+            assert_eq!(page.len(), page_size);
+            let start = wal.len();
+            wal.extend_from_slice(&WalFrameHeader {
+                page_number: *number,
+                db_size: if index + 1 == pages.len() { commit_size } else { 0 },
+                salts: header.salts,
+                checksum: SqliteWalChecksum::default(),
+            }.to_bytes());
+            wal.extend_from_slice(page);
+            running = WalChecksumTransform::for_wal_frame(
+                &wal[start..], page_size, header.big_endian_checksum(),
+            ).unwrap().apply(running);
+            wal[start + 16..start + 20].copy_from_slice(&running.s1.to_be_bytes());
+            wal[start + 20..start + 24].copy_from_slice(&running.s2.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn database_image_uses_latest_committed_pages_and_preserves_metadata() {
+        let mut database = database_page_one(PAGE_SIZE_U32, 2);
+        database.extend_from_slice(&[1; PAGE_SIZE]);
+        let original = database.clone();
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(2, vec![2; PAGE_SIZE])], 2);
+        append_database_frames(&mut wal, &[(2, vec![3; PAGE_SIZE])], 2);
+        // A valid but uncommitted suffix must not affect the exported database.
+        append_database_frames(&mut wal, &[(2, vec![4; PAGE_SIZE])], 0);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        let image = result.database_image(&database, 8 * PAGE_SIZE).unwrap();
+        assert_eq!(&image[..PAGE_SIZE], &database[..PAGE_SIZE]);
+        assert_eq!(&image[PAGE_SIZE..], &[3; PAGE_SIZE]);
+        assert_eq!(database, original);
+        assert_eq!(result.committed_frames(), 2);
+    }
+
+    #[test]
+    fn database_image_can_rebuild_an_empty_base_with_complete_wal_coverage() {
+        let page_one = database_page_one(PAGE_SIZE_U32, 2);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, page_one.clone()), (2, vec![7; PAGE_SIZE])], 2);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        let image = result.database_image(&[], 2 * PAGE_SIZE).unwrap();
+        assert_eq!(&image[..PAGE_SIZE], page_one);
+        assert_eq!(&image[PAGE_SIZE..], &[7; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn database_image_refuses_missing_growth_pages() {
+        let database = database_page_one(PAGE_SIZE_U32, 1);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[
+            (1, database_page_one(PAGE_SIZE_U32, 3)), (3, vec![9; PAGE_SIZE]),
+        ], 3);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, 3 * PAGE_SIZE).unwrap_err()
+            .to_string().contains("page 2 has no surviving source"));
+    }
+
+    #[test]
+    fn database_image_applies_commit_shrink() {
+        let mut database = database_page_one(PAGE_SIZE_U32, 3);
+        database.extend_from_slice(&[2; PAGE_SIZE]);
+        database.extend_from_slice(&[3; PAGE_SIZE]);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 2))], 2);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        let image = result.database_image(&database, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(image.len(), 2 * PAGE_SIZE);
+        assert_eq!(&image[PAGE_SIZE..], &[2; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn database_image_cannot_resurrect_pages_across_shrink_and_regrowth() {
+        let mut database = database_page_one(PAGE_SIZE_U32, 3);
+        database.extend_from_slice(&[2; 2 * PAGE_SIZE]);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(3, vec![9; PAGE_SIZE])], 3);
+        append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 1))], 1);
+        append_database_frames(&mut wal, &[
+            (1, database_page_one(PAGE_SIZE_U32, 3)), (2, vec![6; PAGE_SIZE]),
+        ], 3);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
+            .to_string().contains("page 3 has no surviving source"));
+        // A new post-shrink image supplies the missing provenance.
+        append_database_frames(&mut wal, &[(3, vec![8; PAGE_SIZE])], 3);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        let image = result.database_image(&database, 4 * PAGE_SIZE).unwrap();
+        assert_eq!(&image[PAGE_SIZE..2 * PAGE_SIZE], &[6; PAGE_SIZE]);
+        assert_eq!(&image[2 * PAGE_SIZE..], &[8; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn database_image_refuses_a_fallback_even_with_a_full_main_file() {
+        let database = database_page_one(PAGE_SIZE_U32, 1);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, database.clone())], 1);
+        corrupt_payload(&mut wal, 1);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
+            .to_string().contains("incomplete WAL recovery"));
+    }
+
+    #[test]
+    fn database_image_checks_input_output_and_header_boundaries() {
+        let database = database_page_one(PAGE_SIZE_U32, 1);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, database.clone())], 1);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, PAGE_SIZE - 1).is_err());
+        assert!(result.database_image(&database[..PAGE_SIZE - 1], 4 * PAGE_SIZE).is_err());
+        assert!(result.database_image(&database_page_one(1024, 1), 4 * PAGE_SIZE).is_err());
+        let mut malformed = database.clone();
+        malformed[21] = 63;
+        assert!(result.database_image(&malformed, 4 * PAGE_SIZE).is_err());
+        append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 3))], 2);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, PAGE_SIZE).unwrap_err()
+            .to_string().contains("output limit"));
+    }
+
+    #[test]
+    fn database_image_refuses_authoritative_page_one_size_disagreement() {
+        let mut database = database_page_one(PAGE_SIZE_U32, 2);
+        database.extend_from_slice(&[2; PAGE_SIZE]);
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 3))], 2);
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
+            .to_string().contains("page-one size disagrees"));
+    }
+
+    #[test]
+    fn database_image_respects_legacy_size_validity_and_64k_pages() {
+        for page_size in [PAGE_SIZE_U32, 65_536] {
+            let size = usize::try_from(page_size).unwrap();
+            let mut database = database_page_one(page_size, 99);
+            database[92..96].copy_from_slice(&6_u32.to_be_bytes()); // Size is stale.
+            let mut wal_header = header(WAL_MAGIC_BE);
+            wal_header.page_size = page_size;
+            let wal = wal_header.to_bytes().unwrap();
+            let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+            assert_eq!(result.database_image(&database, size).unwrap(), database);
+            assert!(result.database_image(&[], size).is_err());
+        }
+    }
+
+    #[test]
+    fn database_image_trims_stale_physical_tail_without_a_wal_commit() {
+        let mut database = database_page_one(PAGE_SIZE_U32, 1);
+        database.extend_from_slice(&[0xaa; PAGE_SIZE]);
+        let wal = header(WAL_MAGIC_LE).to_bytes().unwrap();
+        let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
+        assert_eq!(result.database_image(&database, 2 * PAGE_SIZE).unwrap(), &database[..PAGE_SIZE]);
     }
 }
