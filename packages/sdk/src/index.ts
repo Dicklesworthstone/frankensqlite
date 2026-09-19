@@ -50,3 +50,5 @@ export { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from ".
 export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, ChangesetConflict, ApplyChangesetOptions, ApplyChangesetResult } from "./changeset-apply";
 export { captureChangeset, ChangesetCaptureError } from "./changeset-capture";
 export type { CaptureChangesetOptions, CapturedChangeset } from "./changeset-capture";
+export { ChangesetOutbox, ChangesetOutboxError, CHANGESET_OUTBOX_TABLE } from "./changeset-outbox";
+export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions } from "./changeset-outbox";

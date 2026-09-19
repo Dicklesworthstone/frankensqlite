@@ -256,9 +256,18 @@ async function collect(tx: ChangesetExecutor, s: Settings, p: Plan, retained: { 
  */
 export async function captureChangeset<T>(target: ChangesetTarget,
   work: (tx: ChangesetExecutor) => T | Promise<T>, options: CaptureChangesetOptions): Promise<CapturedChangeset<T>> {
+  const capture = prepareChangesetCapture(work, options);
+  return target.transaction(capture.run, capture.transactionOptions);
+}
+
+/** @internal Shared admission/collection boundary for atomic outbox composition. */
+export function prepareChangesetCapture<T>(
+  work: (tx: ChangesetExecutor) => T | Promise<T>, options: CaptureChangesetOptions) {
   if (typeof work !== "function") fail("INPUT", "Capture requires a callback");
   const s = settings(options); s.checkpoint();
-  return target.transaction(async tx => {
+  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]), indirect: s.indirect,
+    run: async (tx: ChangesetExecutor): Promise<CapturedChangeset<T>> => {
     s.checkpoint();
     if (await scalar(tx, s, "PRAGMA recursive_triggers") !== 1) fail("SCHEMA", "Set PRAGMA recursive_triggers=ON before capture so REPLACE deletions cannot disappear");
     if ((await read(tx, s, "SELECT name FROM temp.sqlite_schema WHERE name GLOB ? LIMIT 1", [`${PREFIX}*`])).length) {
@@ -296,5 +305,6 @@ export async function captureChangeset<T>(target: ChangesetTarget,
     }
     await execute(tx, s, `DROP TABLE temp.${quote(BUDGET)}`);
     return { value, changeset, touchedRows, changes: tables.reduce((n, t) => n + t.changes.length, 0) };
-  }, s.transactionOptions);
+    },
+  };
 }

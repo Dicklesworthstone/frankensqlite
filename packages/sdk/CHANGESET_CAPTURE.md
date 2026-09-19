@@ -117,3 +117,126 @@ foreign-key actions, resource limits, cancellation, and indexed reads over a
 not equality with SQLite 3.49.1's native key-slot UPDATE representation or
 unconditional inversion. These are real SQLite-reference tests of the SQL
 helper, not certification of FrankenSQLite Rust/WASM or browser execution.
+
+## Durable outgoing delivery with `ChangesetOutbox`
+
+`ChangesetOutbox.record` closes the gap between source SQL commit and retaining
+its outgoing message. It captures the callback and stores the resulting binary
+payload, SHA-256, capture scope and stable delivery ID in the **same** owned SQL
+transaction. Source changes cannot commit without the outbox record, and a
+failed/rolled-back source transaction cannot leave a queued message.
+
+```ts
+import { ChangesetOutbox, applyChangeset } from '@frankensqlite/sdk';
+
+await source.execute('PRAGMA recursive_triggers=ON');
+const outbox = new ChangesetOutbox(source, {
+  maxEntries: 10_000,
+  maxPayloadBytes: 64 * 1024 * 1024,
+});
+const result = await outbox.record(async tx => {
+  await tx.execute('UPDATE notes SET body=? WHERE id=?', ['revised', 12n]);
+  return 'saved';
+}, { deliveryId: 'source-42:operation-108', tables: ['notes'] });
+
+// A transport can send this exact ID and payload after source durability.
+const message = await outbox.read(result.delivery.deliveryId);
+if (message !== null && message.changeset !== null) {
+  await applyChangeset(destination, message.changeset, {
+    deliveryId: message.delivery.deliveryId,
+    tables: ['notes'],
+  });
+  // In snapshot mode, checkpoint destination BEFORE acknowledging the source.
+  await outbox.acknowledge(message.delivery.deliveryId, message.delivery.sha256);
+}
+```
+
+For browser snapshot persistence, checkpoint the source after `record` and
+before treating its outgoing message as durably retained. Checkpoint the
+receiver's rows/inbox before sending a durable ACK, and checkpoint the source's
+acknowledgement state too. The helper does not perform those checkpoints or
+pretend that a memory transaction is persistent storage.
+
+### Recovery, ordering and ownership
+
+Supply a stable, globally source-qualified `deliveryId` (valid UTF-8, 1..512
+bytes, no NUL). A retained ID causes `record` to return `replayed: true` without
+running the callback again. Fresh results have `replayed: false` and the callback
+`value`; recovered results have no `value`, because arbitrary JavaScript return
+values are not stored. Reusing an ID with a different table set or indirect flag
+rejects. The helper cannot compare arbitrary callback bodies or business inputs:
+never reuse an ID for a different operation, even if its capture scope matches.
+
+An uncertain source commit acknowledgement is not permission to execute the SQL
+again with a new ID. Retry the same ID: committed records are recovered, while
+rolled-back work can run anew. Database effects and the outbox are atomic;
+external callback side effects are not. A losing concurrent transaction may
+have entered its callback before a storage conflict rolls it back. There is no
+automatic replay, network transport, remote authentication or consensus here.
+
+`pending({ limit, after })` returns frozen metadata in monotonic sequence order,
+not payloads. Its default page is 100 entries, with a maximum of 256. `after` is
+a nonnegative int64 `bigint`; AUTOINCREMENT prevents cursor reuse when old
+acknowledged entries are forgotten. Deliver dependent changesets in sequence,
+and do not advance a durable delivery cursor past unsuccessful entries. Multiple
+senders may read the same pending entry; this is at-least-once delivery, not a
+work-leasing protocol. Pair it with receiver-side `applyChangeset` receipts.
+
+`read(id)` validates lengths, storage classes, the capture scope, codec, counts
+and SHA-256 before returning one owned payload. An unknown ID returns null. An
+acknowledged ID returns metadata with `changeset: null`. `pending` validates
+metadata only; listing an entry is not a payload-integrity certificate.
+
+`acknowledge(id, sha256)` must only be called after the receiver durably confirms
+that exact ID and digest under the application's authentication/conflict policy.
+Wrong/unknown acknowledgements reject. The first acknowledgement returns true;
+repeating it returns false. Pending payload bytes are reclaimed, but the ID,
+digest, original counts and capture scope remain to prevent callback replay.
+An acknowledged receipt records delivery history, not the receiver's current
+contents or an immutable guarantee about future database edits.
+
+### Retention and schema contract
+
+The outbox lives in reserved `main.__fsqlite_changeset_outbox`. Its schema,
+primary-key sequence rule and BINARY delivery identity are validated; incompatible
+existing tables, extra indexes and triggers are rejected rather than overwritten.
+Metadata reads do not create the table. Source capture excludes SDK/system tables.
+Application SQL and adapters are trusted, and must not edit outbox internals.
+SHA-256 binds payload bytes to local metadata; it is not sender authentication or
+protection against an authorized SQL writer rewriting both bytes and metadata.
+
+`maxEntries` counts all retained IDs, including acknowledged ones (default 10,000,
+maximum 100,000). `maxPayloadBytes` counts pending payload bytes (default 64 MiB,
+maximum 1 GiB). Individual messages still obey capture/codec bounds. Capacity
+checks abort the whole source transaction; acknowledged bytes free payload
+capacity but do not free an ID slot. These are application accounting limits,
+not total SQLite file-size or RSS bounds. Metadata/count scans are bounded by
+the retained entry population; this is not an unbounded streaming log.
+
+Only `forgetAcknowledged(id, sha256)` explicitly removes an exact acknowledged
+identity. It refuses pending deliveries or a mismatched digest, and returns
+false for an already absent ID. **Forgetting removes duplicate-operation
+protection.** Retain IDs for the complete retry/redelivery horizon; never reuse
+them for new work. Restoring an older source or receiver backup likewise restores
+an older deduplication history. Nothing automatically expires or deletes IDs.
+
+### Additional executed tests
+
+The combined capture/outbox suite passed **90/90 tests**, with no skipped tests,
+on Node 22.16.0 / SQLite 3.49.1. Outbox coverage includes native receiver apply,
+duplicate work suppression, payload ownership/corruption, exact acknowledgement,
+retention limits, schema checks, outer rollback, deferred commit failure, and
+lost source/acknowledgement responses. Two file-backed connections are forced to
+overlap at an absent delivery ID; only one source transaction commits.
+
+Separate child processes reopen and deliver retained payloads. Additional child
+processes are SIGKILLed after the SQL/outbox writes but before COMMIT, and after
+COMMIT but before returning an acknowledgement. Reopen verifies the expected
+atomic decision in each case. This proves those process-death cuts on the tested
+SQLite platform, not power-loss resilience or FrankenSQLite Rust/WASM execution.
+
+```sh
+node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
+  --test packages/sdk/tests/changeset-capture.test.mjs \
+  packages/sdk/tests/changeset-outbox.test.mjs
+```
