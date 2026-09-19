@@ -276,11 +276,13 @@ fn authoritative_database_size(bytes: &[u8]) -> Option<u32> {
 /// The healthy path borrows the input and never parses the sidecar or constructs
 /// a decoder. A damaged group must start immediately after the last validated
 /// commit. Independently hashed payloads are decoded by the existing production
-/// RaptorQ implementation; the reconstructed end-frame header must exactly match
-/// the original end-frame header. This terminal anchor prevents stale metadata
-/// from blessing a different generation or inventing a commit boundary. It also
-/// deliberately refuses damage to that final header; such recovery requires a
-/// stronger durable anchor than the current sidecar provides.
+/// RaptorQ implementation; the reconstructed rolling checksum must match the
+/// ORIGINAL end-frame checksum. That checksum binds the reconstructed page
+/// number, commit size, payload and preceding chain, so other end-frame header
+/// fields can be repaired too. Salts are independently bound to the validated
+/// WAL header by the FEC metadata; SQLite excludes them from frame checksums.
+/// A damaged terminal checksum is still refused rather than synthesized from
+/// sidecar metadata alone.
 /// These are accidental-corruption checks, not cryptographic authentication.
 ///
 /// Later frames are checked against their ORIGINAL checksum fields. Repairing
@@ -416,13 +418,13 @@ pub fn recover_wal_fec_image<'a>(
         let group_start = frame_offset(committed_frames, frame_size)?;
         let group_end = frame_offset(meta.end_frame_no, frame_size)?;
         let verified_len = frame_offset(frame_index, frame_size)? - group_start;
-        let terminal_offset = rebuilt.len() - frame_size;
         let original_terminal = group_end - frame_size;
+        let original_checksum = WalFrameHeader::from_bytes(
+            &wal_bytes[original_terminal..original_terminal + WAL_FRAME_HEADER_SIZE],
+        )?.checksum;
         let refusal = if rebuilt[..verified_len] != image[group_start..group_start + verified_len] {
             Some(WalFecReplayStopReason::PrefixMismatch)
-        } else if rebuilt[terminal_offset..terminal_offset + WAL_FRAME_HEADER_SIZE]
-            != image[original_terminal..original_terminal + WAL_FRAME_HEADER_SIZE]
-        {
+        } else if rebuilt_checksum != original_checksum {
             Some(WalFecReplayStopReason::TerminalAnchorMismatch)
         } else {
             None
@@ -688,6 +690,69 @@ mod tests {
         assert_eq!(result.committed_frames, 0);
         assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
         assert!(result.repaired_frame_nos.is_empty());
+        assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn terminal_header_fields_are_restored_using_the_original_checksum() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut original = header(magic).to_bytes().unwrap().to_vec();
+            let sidecar = append_group(&mut original, 3, 8, 9);
+            let terminal = frame_offset(2, FRAME_SIZE).unwrap();
+            // Page number, commit size and both salts are repairable. The
+            // original checksum words, not corrupted header fields, anchor it.
+            for field_byte in 0..16 {
+                let mut damaged = original.clone();
+                damaged[terminal + field_byte] ^= 0x80;
+                let saved = damaged.clone();
+                let result = recover_wal_fec_image(
+                    &damaged, &sidecar, WalFecReplayLimits::default(),
+                ).unwrap();
+                assert_eq!(result.committed_frames(), 3);
+                assert_eq!(result.repaired_frame_nos(), &[3]);
+                assert!(!result.decode_proofs()[0].decode_attempted);
+                assert_eq!(result.complete_image().unwrap().as_ref(), original);
+                assert_eq!(damaged, saved);
+            }
+        }
+    }
+
+    #[test]
+    fn erased_commit_marker_and_corrupted_payload_recover_together() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let sidecar = append_group(&mut wal, 5, 8, 11);
+            let expected = wal.clone();
+            let terminal = frame_offset(4, FRAME_SIZE).unwrap();
+            wal[terminal + 4..terminal + 8].fill(0);
+            corrupt_payload(&mut wal, 2);
+            corrupt_payload(&mut wal, 5);
+            let result = recover_wal_fec_image(
+                &wal, &sidecar, WalFecReplayLimits::default(),
+            ).unwrap();
+            assert_eq!(result.repaired_frame_nos(), &[2, 5]);
+            assert_eq!(result.db_size_pages(), Some(100));
+            assert!(result.decode_proofs()[0].decode_attempted);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn sidecar_cannot_substitute_a_different_terminal_page_number() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 12);
+        let mut records = crate::wal_fec::scan_wal_fec_bytes(
+            std::path::Path::new("snapshot-only"), &sidecar,
+        ).unwrap().groups;
+        records[0].meta.page_numbers[2] += 1;
+        records[0].meta.checksum = records[0].meta.compute_checksum();
+        let substituted = encode_wal_fec_group(&records[0]).unwrap();
+        corrupt_payload(&mut wal, 1);
+        let result = recover_wal_fec_image(
+            &wal, &substituted, WalFecReplayLimits::default(),
+        ).unwrap();
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert!(result.repaired_frame_nos().is_empty());
         assert!(result.complete_image().is_err());
     }
 
