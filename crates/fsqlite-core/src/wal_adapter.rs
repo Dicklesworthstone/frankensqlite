@@ -3996,11 +3996,47 @@ where
             }
             result => result,
         };
+        let missing = matches!(&opened, Err(FrankenError::CannotOpen { .. }))
+            || matches!(&opened, Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound);
+        if missing {
+            // bd-7zs8a. Two things were wrong here.
+            //
+            // First, the arm this replaces matched `Io(NotFound)`, but the Unix
+            // VFS maps a missing path to `CannotOpen { path }` before returning,
+            // so on Unix it was dead code and a vanished companion escaped as a
+            // hard error.
+            //
+            // Second, and the reason matching it is not enough: reporting
+            // `RecoveryRequired` here is a dead end. `recover_native_read_state`
+            // answers that outcome with `BusyRecovery` -- index-only recovery is
+            // not allowed to create a physical WAL -- so the caller spins on a
+            // transient until busy_timeout and the companion is never restored.
+            // Instrumenting every BusyRecovery value site in this file showed
+            // exactly that: 106 hits on that one return for a single statement.
+            //
+            // A database with no `-wal` is not a damaged database; it is a clean
+            // one. The legacy (non-native) `ensure_current_wal_path` has always
+            // treated it that way -- `access(EXISTS)` then `create_missing` ->
+            // `replace_with_created_wal` -- and the native path added by
+            // 304280b37 turned the same state into an unrecoverable error. Treat
+            // it as the legacy path does when we are allowed to create, and only
+            // fall back to requesting recovery when we are not.
+            //
+            // A same-process stock SQLite library is the realistic way to reach
+            // this: POSIX fcntl locks are per process, so stock cannot see our
+            // shared dead-man-switch hold, believes it is the last connection,
+            // checkpoints, and unlinks the companions. Cross-process stock DOES
+            // see the hold and leaves them alone (measured on bd-1nq3j), so the
+            // data is in the main database and creating a fresh WAL loses
+            // nothing.
+            if self.create_missing && !self.inner.has_pending_publication() {
+                self.replace_with_created_wal(cx).await?;
+                return Ok(WalNativeReadOutcome::Ready);
+            }
+            return Ok(WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::WalGenerationMismatch));
+        }
         let (mut file, _) = match opened {
             Ok(opened) => opened,
-            Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::WalGenerationMismatch));
-            }
             Err(error) => return Err(error),
         };
         let size = match file.file_size(cx) {
@@ -4029,7 +4065,37 @@ where
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
         self.ensure_db_file_identity_captured(cx).await;
-        let (mut file, _) = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)?;
+        // bd-7zs8a: the companion may be gone. The legacy (non-native)
+        // `ensure_current_wal_path` has always tolerated that -- `access(EXISTS)`
+        // then `create_missing` -> `replace_with_created_wal`, else Ok -- and the
+        // native path added by 304280b37 skipped the check entirely, so a missing
+        // -wal became a hard `CannotOpen` and every later statement on the
+        // connection re-entered this validator and failed the same way. That is
+        // what made nine retained-autocommit tests red.
+        //
+        // Re-labelling it transient is not enough: nothing in the statement retry
+        // loop reaches the read-admission path that actually requests recovery,
+        // so a transient here just spins until busy_timeout. Recreate, exactly as
+        // the legacy path does.
+        //
+        // A same-process stock SQLite library is the realistic way to reach this:
+        // POSIX fcntl locks are per process, so stock cannot see our shared
+        // dead-man-switch hold and unlinks the companions on its own close.
+        // Cross-process stock DOES see it and leaves them alone (measured on
+        // bd-1nq3j), so this is tolerance for a configuration stock itself
+        // documents as unsupported, not cover for an interop defect.
+        if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
+            if self.inner.has_pending_publication() {
+                return Err(FrankenError::Busy);
+            }
+            if self.create_missing {
+                return self.replace_with_created_wal(cx).await;
+            }
+            return Ok(());
+        }
+        let (mut file, _) = self
+            .vfs
+            .open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)?;
         let validation = self.path_header_matches_current_handle(cx, &file).await;
         let cleanup_cx = cx.create_child();
         let _cleanup_mask = cleanup_cx.masked();
@@ -4056,6 +4122,14 @@ where
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding {
             binding.validate_path_identity()?;
+        }
+        // bd-7zs8a: same missing-companion tolerance as the statement-path
+        // validator above. VACUUM reaches retirement with the -wal already gone.
+        if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
+            if self.create_missing {
+                return self.replace_with_created_wal(cx).await;
+            }
+            return Ok(());
         }
         let (mut file, _) = self.vfs.open(
             cx,
