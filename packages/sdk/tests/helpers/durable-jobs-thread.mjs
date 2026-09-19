@@ -3,23 +3,31 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { DurableJobQueue } from '../../src/durable-jobs.ts';
+import { DurableJobWorker } from '../../src/durable-job-worker.ts';
 
 const sql = new DatabaseSync(workerData.path);
 sql.exec('PRAGMA busy_timeout = 5000');
+let tail = Promise.resolve();
 const database = {
-  async transaction(work) {
-    sql.exec('BEGIN IMMEDIATE');
-    try {
-      const result = await work({
-        execute: async (statement, params = []) => Number(sql.prepare(statement).run(...params).changes),
-        query: async (statement, params = []) => ({ rows: sql.prepare(statement).all(...params) }),
-      });
-      sql.exec('COMMIT');
-      return result;
-    } catch (error) {
-      sql.exec('ROLLBACK');
-      throw error;
-    }
+  transaction(work) {
+    // Serialize transactions on THIS connection, not across worker connections
+    // or application handlers. Heartbeats and completion share this owner.
+    const pending = tail.then(async () => {
+      sql.exec('BEGIN IMMEDIATE');
+      try {
+        const result = await work({
+          execute: async (statement, params = []) => Number(sql.prepare(statement).run(...params).changes),
+          query: async (statement, params = []) => ({ rows: sql.prepare(statement).all(...params) }),
+        });
+        sql.exec('COMMIT');
+        return result;
+      } catch (error) {
+        sql.exec('ROLLBACK');
+        throw error;
+      }
+    });
+    tail = pending.catch(() => {});
+    return pending;
   },
 };
 
@@ -27,6 +35,24 @@ async function run() {
   const jobs = await DurableJobQueue.open(database, 'work', { clock: () => 1000 });
   parentPort.postMessage({ type: 'ready' });
   if (workerData.barrier) Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
+  if (workerData.mode.startsWith('managed-')) {
+    const runner = DurableJobWorker.start(jobs, async lease => {
+      if (workerData.mode === 'managed-hold-claim') {
+        parentPort.postMessage({ type: 'held', lease });
+        await new Promise(resolve => parentPort.once('message', resolve));
+      }
+      return { result: 'done', apply: async tx => {
+        await tx.execute('INSERT INTO effects(job_id, owner) VALUES (?,?)', [lease.id, lease.owner]);
+        if (workerData.mode === 'managed-hold-effects') {
+          parentPort.postMessage({ type: 'held', lease });
+          await new Promise(resolve => parentPort.once('message', resolve));
+        }
+      } };
+    }, { owner: workerData.owner, concurrency: workerData.mode === 'managed-consume' ? 2 : 1,
+      stopWhenIdle: true, clock: () => 1000, leaseMs: 30_000 });
+    await runner.done;
+    return { type: 'result', stats: runner.stats };
+  }
   if (workerData.mode === 'consume') {
     const ids = [];
     for (;;) {

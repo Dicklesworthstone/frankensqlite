@@ -56,12 +56,12 @@ async function fixture(t) {
     gate() { const gate = deferred(); gates.push(gate); return gate; },
     start(handler, options = {}, overrides = {}) {
       const wrapped = {};
-      for (const key of ['claim', 'renew', 'complete', 'fail', 'reapExpired']) {
+      for (const key of ['claim', 'renew', 'complete', 'completeWith', 'fail', 'reapExpired']) {
         wrapped[key] = overrides[key] ?? queue[key].bind(queue);
       }
       const worker = DurableJobWorker.start(wrapped, handler, { owner: 'worker',
         leaseMs: 3000, heartbeatMs: 10, pollIntervalMs: 5, retryDelayMs: 0,
-        reapIntervalMs: 1000, ...options });
+        reapIntervalMs: 1000, clock: () => now, ...options });
       workers.push(worker);
       return worker;
     },
@@ -453,4 +453,327 @@ test('all 64 slots can stop idle without retaining timers or polling again', asy
   assert.equal(worker.stats.activeJobs, 0);
   assert.equal(worker.stats.pendingClaims, 0);
   assert.equal(f.sql.prepare(`SELECT COUNT(*) AS n FROM ${DURABLE_JOBS_TABLE}`).get().n, 0);
+});
+
+test('a delayed claim receipt cannot start a handler after its lease deadline', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const receipt = f.gate();
+  let saved = false;
+  const worker = f.start(() => assert.fail('expired handler started'), { leaseMs: 300 }, {
+    claim: async (...args) => {
+      const lease = await f.queue.claim(...args); saved = true;
+      await receipt.promise; return lease;
+    },
+  });
+  await until(() => saved);
+  const stopped = worker.stop();
+  f.time(1300); receipt.resolve();
+  await stopped;
+  assert.equal(worker.stats.started, 0);
+  assert.equal(worker.stats.lostLeases, 1);
+  assert.equal(worker.stats.completed, 0);
+});
+
+test('expiry aborts a handler even while its renewal is stuck, and stop joins that renewal', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const receipt = f.gate();
+  let renewing = false, signal;
+  const worker = f.start(async (_, context) => {
+    signal = context.signal;
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  }, { leaseMs: 300 }, { renew: async (...args) => {
+    renewing = true; await receipt.promise; return f.queue.renew(...args);
+  } });
+  await until(() => renewing);
+  f.time(1300);
+  await until(() => signal.aborted);
+  assert.equal(signal.reason.code, 'ERR_FSQLITE_JOB_LEASE_LOST');
+  const stopped = worker.stop();
+  let settled = false;
+  void stopped.then(() => { settled = true; });
+  await sleep(5);
+  assert.equal(settled, false);
+  receipt.resolve();
+  await stopped;
+  assert.equal(worker.stats.lostLeases, 1);
+  assert.equal(worker.stats.completed, 0);
+  assert.equal(worker.stats.failedJobs, 0);
+});
+
+test('a late successful renewal receipt cannot resurrect an expired handler', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const receipt = f.gate();
+  let renewed = false, signal;
+  const worker = f.start(async (_, context) => {
+    signal = context.signal;
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+    return 'stale';
+  }, { leaseMs: 300 }, { renew: async (...args) => {
+    f.time(1200);
+    const lease = await f.queue.renew(...args); renewed = true;
+    await receipt.promise; return lease;
+  } });
+  await until(() => renewed);
+  assert.equal((await f.queue.get('one')).leaseExpiresAt, 1500);
+  f.time(1300);
+  await until(() => signal.aborted);
+  const stopped = worker.stop(); receipt.resolve();
+  await stopped;
+  assert.equal(worker.stats.lostLeases, 1);
+  assert.equal(worker.stats.completed, 0);
+  assert.equal((await f.queue.get('one')).state, 'leased');
+});
+
+test('backward wall-clock jumps cannot extend the monotonic acknowledged lease budget', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const renewal = f.gate();
+  let renewing = false, signal;
+  const worker = f.start(async (_, context) => {
+    signal = context.signal;
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  }, { leaseMs: 90, heartbeatMs: 5 }, { renew: async (...args) => {
+    renewing = true; await renewal.promise; return f.queue.renew(...args);
+  } });
+  await until(() => renewing);
+  f.time(900);
+  await until(() => signal.aborted);
+  const stopped = worker.stop(); renewal.resolve();
+  await stopped;
+  assert.equal(worker.stats.lostLeases, 1);
+});
+
+test('cooperative checkpoints detect expiry without waiting for any timer callback', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  let caught;
+  const worker = f.start((_, context) => {
+    f.time(4000);
+    try { context.checkpoint(); } catch (error) { caught = error; }
+    void worker.stop();
+    return 'must-not-complete';
+  });
+  await worker.done;
+  assert.ok(caught instanceof DurableJobError);
+  assert.equal(caught.code, 'ERR_FSQLITE_JOB_LEASE_LOST');
+  assert.equal(worker.stats.lostLeases, 1);
+  assert.equal(worker.stats.completed, 0);
+});
+
+test('mismatched renewal acknowledgements stop rather than acquiring another identity', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const worker = f.start(async (_, { signal }) => {
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  }, {}, { renew: async (...args) => ({ ...await f.queue.renew(...args), token: 'wrong-token' }) });
+  await assert.rejects(worker.done, error => error.phase === 'lease' && error.cause instanceof TypeError);
+  assert.equal(worker.stats.completed, 0);
+});
+
+test('invalid clocks stop supervision without throwing from detached timer callbacks', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  const worker = f.start(async (_, { signal }) => {
+    f.time(NaN);
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  });
+  await assert.rejects(worker.done, error => error.phase === 'lease' && error.cause instanceof RangeError);
+  assert.equal(worker.stats.activeJobs, 0);
+});
+
+test('managed completion commits computed application effects and the job result atomically', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY, value TEXT)');
+  await enqueue(f.queue, 'one');
+  const worker = f.start(async (lease, context) => {
+    context.checkpoint();
+    const computed = lease.payload.toUpperCase();
+    return { result: 'indexed', apply: async (tx, applying) => {
+      applying.checkpoint();
+      await tx.execute('INSERT INTO effects VALUES (?, ?)', [lease.id, computed]);
+    } };
+  });
+  await until(() => worker.stats.completed === 1);
+  await worker.stop();
+  assert.equal(f.sql.prepare('SELECT value FROM effects').get().value, 'PAYLOAD:ONE');
+  assert.equal((await f.queue.get('one')).result, 'indexed');
+  assert.equal((await f.queue.get('one')).state, 'completed');
+});
+
+test('SQL application failure rolls back effects and stops without rerunning computation', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await enqueue(f.queue, 'one');
+  let computations = 0, applications = 0;
+  const worker = f.start(() => {
+    computations++;
+    return { apply: async tx => {
+      applications++;
+      await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+      await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+    } };
+  });
+  await assert.rejects(worker.done, error => error.phase === 'complete');
+  assert.equal(computations, 1); assert.equal(applications, 1);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+  assert.equal((await f.queue.get('one')).state, 'leased');
+  assert.equal(worker.stats.failedJobs, 0);
+});
+
+test('expiry during SQL application rolls back every write and job completion', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await enqueue(f.queue, 'one');
+  const worker = f.start(lease => ({ result: 'no', apply: async tx => {
+    await tx.execute('INSERT INTO effects VALUES (?)', [lease.id]);
+    f.time(4000);
+    void worker.stop();
+  } }));
+  await worker.done;
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+  assert.equal((await f.queue.get('one')).state, 'leased');
+  assert.equal(worker.stats.lostLeases, 1);
+});
+
+test('abort during SQL application drains rollback rather than acknowledging partial effects', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await enqueue(f.queue, 'one');
+  let applying = false;
+  const reason = new Error('stop during SQL application');
+  const worker = f.start(lease => ({ apply: async (tx, { signal }) => {
+    await tx.execute('INSERT INTO effects VALUES (?)', [lease.id]);
+    applying = true;
+    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  } }));
+  await until(() => applying);
+  await assert.rejects(worker.stop({ abort: true, reason }), error => error.phase === 'complete' && error.cause === reason);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+  assert.equal((await f.queue.get('one')).state, 'leased');
+  assert.equal(worker.stats.activeJobs, 0);
+});
+
+test('lost atomic completion receipt preserves committed effects without replay', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await enqueue(f.queue, 'one');
+  const cause = new Error('atomic checkpoint acknowledgement lost'); cause.sqlCommitted = true;
+  let computations = 0, applications = 0;
+  const worker = f.start(lease => {
+    computations++;
+    return { result: 'done', apply: async tx => {
+      applications++;
+      await tx.execute('INSERT INTO effects VALUES (?)', [lease.id]);
+    } };
+  }, {}, { completeWith: async (...args) => { await f.queue.completeWith(...args); throw cause; } });
+  await assert.rejects(worker.done, error => error.phase === 'complete' && error.cause === cause);
+  assert.equal(computations, 1); assert.equal(applications, 1);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 1);
+  assert.equal((await f.queue.get('one')).state, 'completed');
+  assert.equal(worker.stats.completed, 0);
+  assert.equal(worker.stats.failedJobs, 0);
+});
+
+test('completion callbacks and results are captured before queued transaction admission', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(value TEXT)');
+  await enqueue(f.queue, 'one');
+  const gate = f.gate();
+  let admitted = false;
+  const completion = { result: 'original', apply: async tx => tx.execute('INSERT INTO effects VALUES (?)', ['original']) };
+  const worker = f.start(() => completion, {}, { completeWith: async (...args) => {
+    admitted = true; await gate.promise; return f.queue.completeWith(...args);
+  } });
+  await until(() => admitted);
+  const stopped = worker.stop();
+  completion.result = 'changed';
+  completion.apply = () => assert.fail('mutated callback ran');
+  gate.resolve();
+  await stopped;
+  assert.equal((await f.queue.get('one')).result, 'original');
+  assert.equal(f.sql.prepare('SELECT value FROM effects').get().value, 'original');
+});
+
+for (const wrap of [error => error, error => new Error('wrapped', { cause: error }),
+  error => new AggregateError([new Error('other'), error], 'aggregate')]) {
+  test('explicit uncertain application commit errors are never recorded as retryable handler failures', async t => {
+    const f = await fixture(t);
+    await enqueue(f.queue, 'one');
+    const committed = new Error('committed checkpoint failed'); committed.sqlCommitted = true;
+    const cause = wrap(committed);
+    const worker = f.start(() => { throw cause; });
+    await assert.rejects(worker.done, error => error.phase === 'handler' && error.cause === cause);
+    assert.equal(worker.stats.started, 1);
+    assert.equal(worker.stats.failedJobs, 0);
+    assert.equal((await f.queue.get('one')).state, 'leased');
+  });
+}
+
+test('unreadable outcome getters fail closed without invoking application getters', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  let read = false;
+  const cause = new Error('unreadable');
+  Object.defineProperty(cause, 'sqlCommitted', { get() { read = true; return false; } });
+  const worker = f.start(() => { throw cause; });
+  await assert.rejects(worker.done, error => error.phase === 'handler' && error.cause === cause);
+  assert.equal(read, false);
+  assert.equal(worker.stats.failedJobs, 0);
+});
+
+test('finite draining joins every slot and atomic completion before done resolves', async t => {
+  const f = await fixture(t);
+  f.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  for (let i = 0; i < 17; i++) await enqueue(f.queue, String(i));
+  const worker = f.start(lease => ({ apply: tx => tx.execute('INSERT INTO effects VALUES (?)', [lease.id]) }),
+    { concurrency: 4, stopWhenIdle: true });
+  await worker.done;
+  assert.equal(worker.stats.completed, 17);
+  assert.equal(worker.stats.state, 'stopped');
+  assert.equal(worker.stats.pendingClaims, 0);
+  assert.equal(worker.stats.activeJobs, 0);
+  assert.equal(f.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 17);
+});
+
+test('finite draining of an empty queue finishes without leaving a reaper behind', async t => {
+  const f = await fixture(t);
+  const worker = f.start(() => assert.fail('handler ran'), { concurrency: 8, stopWhenIdle: true });
+  await worker.done;
+  const calls = f.calls();
+  await sleep(20);
+  assert.equal(f.calls(), calls);
+  assert.equal(worker.stats.started, 0);
+});
+
+test('finite draining preserves future schedules instead of waiting forever for them', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'future', { availableAt: 10000 });
+  const worker = f.start(() => assert.fail('future work ran'), { stopWhenIdle: true });
+  await worker.done;
+  assert.equal((await f.queue.get('future')).state, 'ready');
+  assert.equal((await f.queue.get('future')).attempts, 0);
+});
+
+test('finite draining can exhaust immediate retries without orphaning handlers', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one', { maxAttempts: 2 });
+  const worker = f.start(() => { throw new Error('failed'); }, { stopWhenIdle: true, retryDelayMs: 0 });
+  await worker.done;
+  assert.equal(worker.stats.failedJobs, 2);
+  assert.equal((await f.queue.get('one')).state, 'dead');
+});
+
+test('retained contexts cannot change worker state after their scope has finished', async t => {
+  const f = await fixture(t);
+  await enqueue(f.queue, 'one');
+  let retained;
+  const worker = f.start((_, context) => { retained = context; }, { stopWhenIdle: true });
+  await worker.done;
+  const before = worker.stats;
+  f.time(10000);
+  assert.throws(() => retained.checkpoint(), { code: 'ERR_FSQLITE_JOB_CONTEXT_CLOSED' });
+  assert.deepEqual(worker.stats, before);
 });

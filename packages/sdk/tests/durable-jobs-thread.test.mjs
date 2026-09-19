@@ -123,3 +123,50 @@ test('termination between application SQL and completion cannot leave partial ef
   assert.equal((await queue.get('one')).result, 'done');
   assert.deepEqual(sql.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check), ['ok']);
 });
+
+test('managed runners on four connections drain 128 jobs with atomic unique effects', { timeout: 30_000 }, async t => {
+  const { sql, queue, start } = await fixture(t);
+  for (let i = 0; i < 128; i++) await queue.enqueue({ id: `job-${i}`, payload: String(i) });
+  const barrier = new SharedArrayBuffer(4);
+  const running = Array.from({ length: 4 }, (_, i) => start('managed-consume', `worker-${i}`, barrier));
+  await Promise.all(running.map(worker => worker.ready));
+  Atomics.store(new Int32Array(barrier), 0, 1);
+  Atomics.notify(new Int32Array(barrier), 0);
+  const results = await Promise.all(running.map(worker => worker.result));
+  assert.equal(results.reduce((total, result) => total + result.stats.completed, 0), 128);
+  for (const { stats } of results) {
+    assert.equal(stats.activeJobs, 0);
+    assert.equal(stats.pendingClaims, 0);
+    assert.equal(stats.state, 'stopped');
+    assert.equal(stats.lostLeases, 0);
+  }
+  assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 128);
+  assert.equal(sql.prepare(`SELECT SUM(attempts) AS n FROM ${DURABLE_JOBS_TABLE}`).get().n, 128);
+  assert.equal((await queue.stats()).completed, 128);
+  assert.deepEqual(sql.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check), ['ok']);
+});
+
+for (const mode of ['managed-hold-claim', 'managed-hold-effects']) {
+  test(`forced termination during ${mode} preserves reclaimable work without partial effects`, { timeout: 30_000 }, async t => {
+    const { sql, queue, start, time } = await fixture(t);
+    await queue.enqueue({ id: 'one', payload: 'one' });
+    const running = start(mode, 'crashed');
+    const { lease } = await running.result;
+    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+    await running.worker.terminate();
+    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+    assert.equal((await queue.get('one')).state, 'leased');
+    assert.equal(await queue.claim('restart'), null);
+    time(31000);
+    const reclaimed = await queue.claim('restart');
+    assert.equal(reclaimed.attempt, 2);
+    assert.notEqual(reclaimed.token, lease.token);
+    await assert.rejects(queue.complete(lease), { code: 'ERR_FSQLITE_JOB_LEASE_LOST' });
+    await queue.completeWith(reclaimed, async tx => {
+      await tx.execute('INSERT INTO effects VALUES (?,?)', [reclaimed.id, reclaimed.owner]);
+    }, 'recovered');
+    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 1);
+    assert.equal((await queue.get('one')).result, 'recovered');
+    assert.deepEqual(sql.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check), ['ok']);
+  });
+}
