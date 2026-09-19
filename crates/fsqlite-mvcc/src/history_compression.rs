@@ -357,11 +357,12 @@ fn canonical_intent_ops_bytes(ops: &[IntentOp]) -> Vec<u8> {
 
 /// Compute the stable op digest for an intent operation.
 ///
-/// `op_digest := Trunc128(BLAKE3("fsqlite:intent:v1" || canonical_intent_bytes))`
+/// `op_digest := Trunc128(BLAKE3("fsqlite:intent:v2" || canonical_intent_bytes))`
+/// V2 binds the complete semantic-key identity, not only its supplied digest.
 #[must_use]
 pub fn compute_op_digest(op: &IntentOp) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fsqlite:intent:v1");
+    hasher.update(b"fsqlite:intent:v2");
     let canonical = canonical_intent_bytes(op);
     hasher.update(&canonical);
     let hash = hasher.finalize();
@@ -376,21 +377,21 @@ pub fn compute_op_digest(op: &IntentOp) -> [u8; 16] {
 #[must_use]
 pub fn compute_footprint_digest(footprints: &[&IntentFootprint]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fsqlite:footprint:v1");
+    hasher.update(b"fsqlite:footprint:v2");
     for fp in footprints {
         // Encode reads.
         #[allow(clippy::cast_possible_truncation)]
         let reads_len = fp.reads.len() as u32;
         hasher.update(&reads_len.to_le_bytes());
         for r in &fp.reads {
-            hasher.update(&r.key_digest);
+            hasher.update(&canonical_semantic_key_bytes(r));
         }
         // Encode writes.
         #[allow(clippy::cast_possible_truncation)]
         let writes_len = fp.writes.len() as u32;
         hasher.update(&writes_len.to_le_bytes());
         for w in &fp.writes {
-            hasher.update(&w.key_digest);
+            hasher.update(&canonical_semantic_key_bytes(w));
         }
         // Encode structural effects.
         hasher.update(&fp.structural.bits().to_le_bytes());
@@ -411,7 +412,9 @@ pub fn compute_footprint_digest(footprints: &[&IntentFootprint]) -> [u8; 16] {
 /// - `Writes(a) ∩ Reads(b) = ∅` and `Writes(b) ∩ Reads(a) = ∅`
 ///
 /// With column-level refinement for `UpdateExpression` pairs on the same key,
-/// and the join-max exception for AUTOINCREMENT.
+/// and the join-max exception for AUTOINCREMENT. Expression reads participate
+/// in the refinement; an explicit footprint read is never waived. Callers
+/// must still establish deterministic expressions and schema/rebase eligibility.
 #[must_use]
 pub fn are_intent_ops_independent(a: &IntentOp, b: &IntentOp) -> bool {
     // Rule 1: Schema epochs must match.
@@ -426,127 +429,139 @@ pub fn are_intent_ops_independent(a: &IntentOp, b: &IntentOp) -> bool {
         return false;
     }
 
-    // Rule 3 & 4: Check write/write and write/read disjointness.
-    // First check if this is an UpdateExpression pair on the same key
-    // (needs column-level refinement).
-    if let Some(independent) = check_update_expression_pair(&a.op, &b.op) {
-        return independent;
-    }
-
-    // General case: check semantic key sets.
-    let writes_a: BTreeSet<&[u8; 16]> = a.footprint.writes.iter().map(|w| &w.key_digest).collect();
-    let writes_b: BTreeSet<&[u8; 16]> = b.footprint.writes.iter().map(|w| &w.key_digest).collect();
-    let reads_a: BTreeSet<&[u8; 16]> = a.footprint.reads.iter().map(|r| &r.key_digest).collect();
-    let reads_b: BTreeSet<&[u8; 16]> = b.footprint.reads.iter().map(|r| &r.key_digest).collect();
-
-    // Writes(a) ∩ Writes(b) must be empty.
-    if !writes_a.is_disjoint(&writes_b) {
+    // An operation necessarily writes its own key even if the supplied
+    // footprint omits it. Empty footprints are not proof of distinct writes.
+    let target_a = intent_target_digest(&a.op);
+    let target_b = intent_target_digest(&b.op);
+    let refinement = check_update_expression_pair(&a.op, &b.op);
+    if refinement == Some(false) {
         return false;
     }
-    // Writes(a) ∩ Reads(b) must be empty.
-    if !writes_a.is_disjoint(&reads_b) {
-        return false;
-    }
-    // Writes(b) ∩ Reads(a) must be empty.
-    if !writes_b.is_disjoint(&reads_a) {
-        return false;
-    }
+    let writes_a: BTreeSet<[u8; 16]> = a
+        .footprint
+        .writes
+        .iter()
+        .map(|key| key.key_digest)
+        .chain(std::iter::once(target_a))
+        .collect();
+    let writes_b: BTreeSet<[u8; 16]> = b
+        .footprint
+        .writes
+        .iter()
+        .map(|key| key.key_digest)
+        .chain(std::iter::once(target_b))
+        .collect();
 
-    true
+    // Refine ONLY the shared target-row write/write conflict. Additional
+    // index/row writes and reads made before replay remain dependencies.
+    writes_a
+        .intersection(&writes_b)
+        .all(|key| refinement == Some(true) && *key == target_a && target_a == target_b)
+        && a.footprint
+            .reads
+            .iter()
+            .all(|key| !writes_b.contains(&key.key_digest))
+        && b.footprint
+            .reads
+            .iter()
+            .all(|key| !writes_a.contains(&key.key_digest))
 }
 
-/// Check `UpdateExpression` pair independence with column-level refinement.
-///
-/// Returns `Some(true/false)` if both ops are `UpdateExpression` on the same
-/// `(table, key)`, or if one is `UpdateExpression` and the other is a
-/// materialized `Update`/`Delete` on the same key (always not independent).
-/// Returns `None` if the pair does not match these patterns.
+fn intent_target_digest(op: &IntentOpKind) -> [u8; 16] {
+    match op {
+        IntentOpKind::Insert { table, key, .. }
+        | IntentOpKind::Delete { table, key }
+        | IntentOpKind::Update { table, key, .. }
+        | IntentOpKind::UpdateExpression { table, key, .. } => {
+            table_row_key_digest(BtreeRef::Table(*table), key.get())
+        }
+        IntentOpKind::IndexInsert { index, key, .. }
+        | IntentOpKind::IndexDelete { index, key, .. } => {
+            SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, BtreeRef::Index(*index), key)
+        }
+    }
+}
+
+/// Refine same-row expression updates only; all other conflicts use key sets.
 fn check_update_expression_pair(a: &IntentOpKind, b: &IntentOpKind) -> Option<bool> {
-    match (a, b) {
-        (
-            IntentOpKind::UpdateExpression {
-                table: ta,
-                key: ka,
-                column_updates: cols_a,
-            },
-            IntentOpKind::UpdateExpression {
-                table: tb,
-                key: kb,
-                column_updates: cols_b,
-            },
-        ) => {
-            if ta != tb || ka != kb {
-                return None; // Different keys — fall through to general case.
-            }
+    let (
+        IntentOpKind::UpdateExpression {
+            table: ta,
+            key: ka,
+            column_updates: cols_a,
+        },
+        IntentOpKind::UpdateExpression {
+            table: tb,
+            key: kb,
+            column_updates: cols_b,
+        },
+    ) = (a, b)
+    else {
+        return None;
+    };
+    if ta != tb || ka != kb {
+        return None;
+    }
 
-            // Same (table, key): check column-level disjointness.
-            let written_a: BTreeSet<ColumnIdx> = cols_a.iter().map(|(c, _)| *c).collect();
-            let written_b: BTreeSet<ColumnIdx> = cols_b.iter().map(|(c, _)| *c).collect();
+    let written_a: BTreeSet<ColumnIdx> = cols_a.iter().map(|(column, _)| *column).collect();
+    let written_b: BTreeSet<ColumnIdx> = cols_b.iter().map(|(column, _)| *column).collect();
+    // Do not let find() select one convenient assignment while hiding another.
+    if written_a.len() != cols_a.len() || written_b.len() != cols_b.len() {
+        return Some(false);
+    }
+    let overlap: BTreeSet<ColumnIdx> = written_a.intersection(&written_b).copied().collect();
+    if !cols_a.iter().chain(cols_b.iter()).all(|(column, expr)| {
+        !overlap.contains(column) || is_join_max_int_update(*column, expr)
+    }) {
+        return Some(false);
+    }
 
-            if written_a.is_disjoint(&written_b) {
-                // Disjoint columns → independent.
-                return Some(true);
-            }
+    // A shared MAX assignment may read its own column, but another assignment
+    // reading that same column still creates an order dependency. For example,
+    // SET a=MAX(a,10), b=a does not commute with SET a=MAX(a,20).
+    let mut remaining = 4096;
+    let independent = [(cols_a, &written_b), (cols_b, &written_a)]
+        .into_iter()
+        .all(|(updates, other_writes)| {
+            updates.iter().all(|(column, expr)| {
+                overlap.contains(column)
+                    || !expr_reads_columns(expr, other_writes, &mut remaining, 0)
+            })
+        });
+    Some(independent)
+}
 
-            // Overlapping columns: check join-max exception.
-            let overlap: BTreeSet<ColumnIdx> =
-                written_a.intersection(&written_b).copied().collect();
-
-            let all_join_max = overlap.iter().all(|col_idx| {
-                let a_expr = cols_a.iter().find(|(c, _)| c == col_idx).map(|(_, e)| e);
-                let b_expr = cols_b.iter().find(|(c, _)| c == col_idx).map(|(_, e)| e);
-                match (a_expr, b_expr) {
-                    (Some(ea), Some(eb)) => {
-                        is_join_max_int_update(*col_idx, ea) && is_join_max_int_update(*col_idx, eb)
-                    }
-                    _ => false,
-                }
-            });
-
-            Some(all_join_max)
+/// Conservative read analysis: inspect even currently unselected CASE arms.
+/// Exhausting the bounded traversal means "may read", never independence.
+fn expr_reads_columns(
+    expr: &RebaseExpr,
+    columns: &BTreeSet<ColumnIdx>,
+    remaining: &mut usize,
+    depth: usize,
+) -> bool {
+    if *remaining == 0 || depth >= 64 {
+        return true;
+    }
+    *remaining -= 1;
+    let mut reads = |expr: &RebaseExpr| expr_reads_columns(expr, columns, remaining, depth + 1);
+    match expr {
+        RebaseExpr::ColumnRef(column) => columns.contains(column),
+        RebaseExpr::Literal(_) => false,
+        RebaseExpr::UnaryOp { operand, .. }
+        | RebaseExpr::Cast { expr: operand, .. } => reads(operand),
+        RebaseExpr::BinaryOp { left, right, .. }
+        | RebaseExpr::NullIf { left, right }
+        | RebaseExpr::Concat { left, right } => reads(left) || reads(right),
+        RebaseExpr::FunctionCall { args, .. } | RebaseExpr::Coalesce(args) => args.iter().any(reads),
+        RebaseExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_ref().is_some_and(|expr| reads(expr))
+                || when_clauses.iter().any(|(when, then)| reads(when) || reads(then))
+                || else_clause.as_ref().is_some_and(|expr| reads(expr))
         }
-
-        // UpdateExpression + materialized Update/Delete on same key → NEVER independent.
-        (
-            IntentOpKind::UpdateExpression {
-                table: ta, key: ka, ..
-            },
-            IntentOpKind::Update {
-                table: tb, key: kb, ..
-            },
-        )
-        | (
-            IntentOpKind::Update {
-                table: tb, key: kb, ..
-            },
-            IntentOpKind::UpdateExpression {
-                table: ta, key: ka, ..
-            },
-        )
-        | (
-            IntentOpKind::UpdateExpression {
-                table: ta, key: ka, ..
-            },
-            IntentOpKind::Delete {
-                table: tb, key: kb, ..
-            },
-        )
-        | (
-            IntentOpKind::Delete {
-                table: tb, key: kb, ..
-            },
-            IntentOpKind::UpdateExpression {
-                table: ta, key: ka, ..
-            },
-        ) => {
-            if ta == tb && ka == kb {
-                Some(false)
-            } else {
-                None
-            }
-        }
-
-        _ => None,
     }
 }
 
@@ -613,10 +628,11 @@ fn extract_int_constant_pair(
 /// on integers.
 #[must_use]
 pub fn collapse_join_max_updates(col_idx: ColumnIdx, exprs: &[&RebaseExpr]) -> Option<RebaseExpr> {
+    // Collapsing a mixed list must not silently discard non-MAX operations.
     let constants: Vec<i64> = exprs
         .iter()
-        .filter_map(|e| extract_join_max_constant(col_idx, e))
-        .collect();
+        .map(|expr| extract_join_max_constant(col_idx, expr))
+        .collect::<Option<_>>()?;
 
     if constants.is_empty() {
         return None;
@@ -883,8 +899,9 @@ impl MergeCertificate {
     }
 }
 
-/// Current verifier version.
-pub const VERIFIER_VERSION: u32 = 1;
+/// V2 binds complete semantic keys and preserves exact context/page coverage.
+/// V1 certificates must be independently regenerated, not relabeled as V2.
+pub const VERIFIER_VERSION: u32 = 2;
 
 fn digest_bytes_equal(left: &[u8; 16], right: &[u8; 16]) -> bool {
     left.iter()
@@ -1179,15 +1196,38 @@ pub fn circuit_breaker_check(
     verification_error: CertificateVerificationError,
     certificate: &MergeCertificate,
 ) -> CircuitBreakerEvent {
-    // Compute a digest of the certificate for identification.
-    let mut cert_buf = Vec::with_capacity(128);
-    cert_buf.extend_from_slice(&certificate.base_commit_seq.to_le_bytes());
-    cert_buf.extend_from_slice(&certificate.schema_epoch.to_le_bytes());
-    cert_buf.extend_from_slice(&certificate.footprint_digest);
-    for digest in &certificate.normal_form {
-        cert_buf.extend_from_slice(digest);
+    // Bind the whole failed certificate so omitted/tampered page evidence and
+    // different verifier contracts cannot share an incident identity.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:merge-certificate:v2");
+    hasher.update(&certificate.verifier_version.to_le_bytes());
+    hasher.update(&[match certificate.merge_kind {
+        MergeKind::Rebase => 0,
+        MergeKind::StructuredPatch => 1,
+        MergeKind::RebaseAndPatch => 2,
+    }]);
+    hasher.update(&certificate.base_commit_seq.to_le_bytes());
+    hasher.update(&certificate.schema_epoch.to_le_bytes());
+    hash_certificate_length(&mut hasher, certificate.pages.len());
+    for page in &certificate.pages {
+        hasher.update(&page.get().to_le_bytes());
     }
-    let hash = blake3::hash(&cert_buf);
+    hash_certificate_length(&mut hasher, certificate.intent_op_digests.len());
+    for digest in &certificate.intent_op_digests {
+        hasher.update(digest);
+    }
+    hasher.update(&certificate.footprint_digest);
+    hash_certificate_length(&mut hasher, certificate.normal_form.len());
+    for digest in &certificate.normal_form {
+        hasher.update(digest);
+    }
+    hash_certificate_length(&mut hasher, certificate.post_state.page_hashes.len());
+    for (page, digest) in &certificate.post_state.page_hashes {
+        hasher.update(&page.get().to_le_bytes());
+        hasher.update(digest);
+    }
+    hasher.update(&certificate.post_state.btree_invariant_hash);
+    let hash = hasher.finalize();
     let mut cert_digest = [0u8; 16];
     cert_digest.copy_from_slice(&hash.as_bytes()[..16]);
 
@@ -1201,6 +1241,11 @@ pub fn circuit_breaker_check(
 // ---------------------------------------------------------------------------
 // Canonical intent encoding for op_digest computation
 // ---------------------------------------------------------------------------
+
+fn hash_certificate_length(hasher: &mut blake3::Hasher, length: usize) {
+    let length = u64::try_from(length).expect("certificate vector length fits u64");
+    hasher.update(&length.to_le_bytes());
+}
 
 /// Produce canonical bytes for an `IntentOp` (deterministic, for hashing).
 fn canonical_intent_bytes(op: &IntentOp) -> Vec<u8> {
@@ -1224,7 +1269,7 @@ fn canonical_footprint_bytes(buf: &mut Vec<u8>, fp: &IntentFootprint) {
     let reads_len = fp.reads.len() as u32;
     buf.extend_from_slice(&reads_len.to_le_bytes());
     for r in &fp.reads {
-        buf.extend_from_slice(&r.key_digest);
+        buf.extend_from_slice(&canonical_semantic_key_bytes(r));
     }
 
     // Writes.
@@ -1232,11 +1277,30 @@ fn canonical_footprint_bytes(buf: &mut Vec<u8>, fp: &IntentFootprint) {
     let writes_len = fp.writes.len() as u32;
     buf.extend_from_slice(&writes_len.to_le_bytes());
     for w in &fp.writes {
-        buf.extend_from_slice(&w.key_digest);
+        buf.extend_from_slice(&canonical_semantic_key_bytes(w));
     }
 
     // Structural effects.
     buf.extend_from_slice(&fp.structural.bits().to_le_bytes());
+}
+
+/// Key kind, B-tree namespace, B-tree id, and the supplied semantic digest.
+/// Changing routing metadata without recomputing a digest must still change
+/// the proof identity. Fixed widths keep the encoding unambiguous.
+fn canonical_semantic_key_bytes(key: &SemanticKeyRef) -> [u8; 22] {
+    let mut bytes = [0; 22];
+    bytes[0] = match key.kind {
+        SemanticKeyKind::TableRow => 0,
+        SemanticKeyKind::IndexEntry => 1,
+    };
+    let (tag, id) = match key.btree {
+        BtreeRef::Table(table) => (0, table.get()),
+        BtreeRef::Index(index) => (1, index.get()),
+    };
+    bytes[1] = tag;
+    bytes[2..6].copy_from_slice(&id.to_le_bytes());
+    bytes[6..].copy_from_slice(&key.key_digest);
+    bytes
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1470,6 +1534,252 @@ mod tests {
             btree,
             kind: SemanticKeyKind::TableRow,
             key_digest: table_row_key_digest(btree, rowid),
+        }
+    }
+
+    fn expression_update(updates: Vec<(ColumnIdx, RebaseExpr)>) -> IntentOp {
+        make_op(
+            1,
+            IntentOpKind::UpdateExpression {
+                table: TableId::new(1),
+                key: RowId::new(1),
+                column_updates: updates,
+            },
+        )
+    }
+
+    fn max_update(column: ColumnIdx, value: i64) -> RebaseExpr {
+        RebaseExpr::FunctionCall {
+            name: "MAX".to_owned(),
+            args: vec![
+                RebaseExpr::ColumnRef(column),
+                RebaseExpr::Literal(SqliteValue::Integer(value)),
+            ],
+        }
+    }
+
+    fn assert_dependent(left: &IntentOp, right: &IntentOp) {
+        assert!(!are_intent_ops_independent(left, right));
+        assert!(!are_intent_ops_independent(right, left));
+    }
+
+    #[test]
+    fn expression_reads_prevent_reordering_disjoint_writes() {
+        let left = expression_update(vec![(ColumnIdx::new(0), RebaseExpr::ColumnRef(ColumnIdx::new(1)))]);
+        let right = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(9)))]);
+        // From (a,b)=(1,2), a=b then b=9 yields (2,9); the reverse yields (9,9).
+        assert_dependent(&left, &right);
+        assert_eq!(
+            foata_normal_form(&[left.clone(), right.clone()]),
+            vec![compute_op_digest(&left), compute_op_digest(&right)]
+        );
+        assert_eq!(
+            foata_normal_form(&[right.clone(), left.clone()]),
+            vec![compute_op_digest(&right), compute_op_digest(&left)]
+        );
+    }
+
+    #[test]
+    fn dependency_walk_covers_every_expression_container() {
+        use fsqlite_types::{RebaseBinaryOp, RebaseUnaryOp};
+
+        let column = RebaseExpr::ColumnRef(ColumnIdx::new(1));
+        let literal = RebaseExpr::Literal(SqliteValue::Integer(0));
+        let expressions = vec![
+            column.clone(),
+            RebaseExpr::UnaryOp { op: RebaseUnaryOp::Not, operand: Box::new(column.clone()) },
+            RebaseExpr::BinaryOp {
+                op: RebaseBinaryOp::Add,
+                left: Box::new(literal.clone()),
+                right: Box::new(column.clone()),
+            },
+            RebaseExpr::FunctionCall { name: "ABS".to_owned(), args: vec![column.clone()] },
+            RebaseExpr::Cast { expr: Box::new(column.clone()), type_name: "TEXT".to_owned() },
+            RebaseExpr::Case {
+                operand: Some(Box::new(column.clone())),
+                when_clauses: vec![(literal.clone(), literal.clone())],
+                else_clause: None,
+            },
+            RebaseExpr::Case {
+                operand: None,
+                when_clauses: vec![(column.clone(), literal.clone())],
+                else_clause: None,
+            },
+            RebaseExpr::Case {
+                operand: None,
+                when_clauses: vec![(literal.clone(), column.clone())],
+                else_clause: None,
+            },
+            RebaseExpr::Case {
+                operand: None,
+                when_clauses: Vec::new(),
+                else_clause: Some(Box::new(column.clone())),
+            },
+            RebaseExpr::Coalesce(vec![literal.clone(), column.clone()]),
+            RebaseExpr::NullIf { left: Box::new(column.clone()), right: Box::new(literal.clone()) },
+            RebaseExpr::Concat { left: Box::new(literal.clone()), right: Box::new(column) },
+        ];
+        let writer = expression_update(vec![(ColumnIdx::new(1), literal)]);
+        for expr in expressions {
+            assert_dependent(&expression_update(vec![(ColumnIdx::new(0), expr)]), &writer);
+        }
+    }
+
+    #[test]
+    fn join_max_does_not_hide_reads_in_other_assignments() {
+        let a = ColumnIdx::new(0);
+        let b = ColumnIdx::new(1);
+        let left = expression_update(vec![(a, max_update(a, 10)), (b, RebaseExpr::ColumnRef(a))]);
+        let right = expression_update(vec![(a, max_update(a, 20))]);
+        assert_dependent(&left, &right);
+        // Without the cross-column read the shared MAX remains admissible.
+        let independent = expression_update(vec![
+            (a, max_update(a, 10)),
+            (b, RebaseExpr::Literal(SqliteValue::Integer(7))),
+        ]);
+        assert!(are_intent_ops_independent(&independent, &right));
+        assert!(are_intent_ops_independent(&right, &independent));
+    }
+
+    #[test]
+    fn duplicate_assignments_cannot_supply_a_false_join_max_witness() {
+        let column = ColumnIdx::new(0);
+        let duplicate = expression_update(vec![
+            (column, max_update(column, 10)),
+            (column, RebaseExpr::Literal(SqliteValue::Integer(0))),
+        ]);
+        let max = expression_update(vec![(column, max_update(column, 20))]);
+        assert_dependent(&duplicate, &max);
+        let other_column = expression_update(vec![
+            (ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(1))),
+        ]);
+        assert_dependent(&duplicate, &other_column);
+    }
+
+    #[test]
+    fn column_refinement_preserves_all_explicit_footprint_dependencies() {
+        let mut left = expression_update(vec![(ColumnIdx::new(0), RebaseExpr::Literal(SqliteValue::Integer(1)))]);
+        let mut right = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(2)))]);
+        left.footprint.writes.push(table_key(1, 1));
+        right.footprint.writes.push(table_key(1, 1));
+        assert!(are_intent_ops_independent(&left, &right));
+        let mut explicit_read = left.clone();
+        explicit_read.footprint.reads.push(table_key(1, 1));
+        assert_dependent(&explicit_read, &right);
+
+        let extra = SemanticKeyRef::new(BtreeRef::Index(IndexId::new(9)), SemanticKeyKind::IndexEntry, &[7]);
+        left.footprint.writes.push(extra.clone());
+        right.footprint.reads.push(extra.clone());
+        assert_dependent(&left, &right);
+        right.footprint.reads.clear();
+        right.footprint.writes.push(extra);
+        assert_dependent(&left, &right);
+        right.footprint.writes.pop();
+        right.footprint.writes.push(table_key(9, 3));
+        assert!(are_intent_ops_independent(&left, &right));
+    }
+
+    #[test]
+    fn intrinsic_table_writes_do_not_depend_on_footprint_completeness() {
+        let table = TableId::new(1);
+        let key = RowId::new(1);
+        let operations = [
+            IntentOpKind::Insert { table, key, record: vec![1] },
+            IntentOpKind::Delete { table, key },
+            IntentOpKind::Update { table, key, new_record: vec![2] },
+            IntentOpKind::UpdateExpression {
+                table, key,
+                column_updates: vec![(ColumnIdx::new(0), RebaseExpr::Literal(SqliteValue::Integer(1)))],
+            },
+        ];
+        for a in &operations {
+            for b in &operations {
+                assert_dependent(&make_op(1, a.clone()), &make_op(1, b.clone()));
+            }
+        }
+        let writer = make_op(1, operations[0].clone());
+        let mut reader = make_op(1, IntentOpKind::Delete { table, key: RowId::new(2) });
+        assert!(are_intent_ops_independent(&writer, &reader));
+        reader.footprint.reads.push(table_key(1, 1));
+        assert_dependent(&writer, &reader);
+    }
+
+    #[test]
+    fn intrinsic_index_writes_are_separate_from_table_key_space() {
+        let index = IndexId::new(1);
+        let left = make_op(1, IntentOpKind::IndexInsert { index, key: vec![1], rowid: RowId::new(1) });
+        let right = make_op(1, IntentOpKind::IndexDelete { index, key: vec![1], rowid: RowId::new(1) });
+        assert_dependent(&left, &right);
+        let table = make_op(1, IntentOpKind::Delete { table: TableId::new(1), key: RowId::new(1) });
+        assert!(are_intent_ops_independent(&left, &table));
+    }
+
+    #[test]
+    fn bounded_expression_analysis_fails_closed() {
+        let mut deep = RebaseExpr::Literal(SqliteValue::Integer(1));
+        for _ in 0..65 {
+            deep = RebaseExpr::Cast { expr: Box::new(deep), type_name: "INTEGER".to_owned() };
+        }
+        let writer = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(2)))]);
+        assert_dependent(&expression_update(vec![(ColumnIdx::new(0), deep)]), &writer);
+        let wide = RebaseExpr::Coalesce(vec![RebaseExpr::Literal(SqliteValue::Integer(1)); 4097]);
+        assert_dependent(&expression_update(vec![(ColumnIdx::new(0), wide)]), &writer);
+    }
+
+    #[test]
+    fn join_max_collapse_rejects_the_entire_mixed_input() {
+        let column = ColumnIdx::new(0);
+        let valid = max_update(column, 10);
+        let other_column = max_update(ColumnIdx::new(1), 20);
+        let non_max = RebaseExpr::Literal(SqliteValue::Integer(1));
+        for invalid in [&other_column, &non_max] {
+            assert_eq!(collapse_join_max_updates(column, &[&valid, invalid]), None);
+            assert_eq!(collapse_join_max_updates(column, &[invalid, &valid]), None);
+        }
+        assert_eq!(collapse_join_max_updates(column, &[]), None);
+        assert_eq!(collapse_join_max_updates(column, &[&valid, &valid]), Some(valid.clone()));
+    }
+
+    #[test]
+    fn independent_small_updates_commute_under_snapshot_assignment() {
+        // Independent test evaluator: every RHS sees the pre-statement row.
+        fn apply(op: &IntentOp, row: [i64; 2]) -> [i64; 2] {
+            let IntentOpKind::UpdateExpression { column_updates, .. } = &op.op else {
+                panic!("test only builds expression updates");
+            };
+            let mut result = row;
+            for (column, expr) in column_updates {
+                let value = match expr {
+                    RebaseExpr::ColumnRef(source) => row[usize::try_from(source.get()).unwrap()],
+                    RebaseExpr::Literal(SqliteValue::Integer(value)) => *value,
+                    _ => row[usize::try_from(column.get()).unwrap()].max(extract_join_max_constant(*column, expr).unwrap()),
+                };
+                result[usize::try_from(column.get()).unwrap()] = value;
+            }
+            result
+        }
+        let mut updates = Vec::new();
+        for column in [ColumnIdx::new(0), ColumnIdx::new(1)] {
+            for expr in [
+                RebaseExpr::ColumnRef(ColumnIdx::new(0)),
+                RebaseExpr::ColumnRef(ColumnIdx::new(1)),
+                RebaseExpr::Literal(SqliteValue::Integer(-1)),
+                RebaseExpr::Literal(SqliteValue::Integer(2)),
+                max_update(column, 1),
+                max_update(column, 3),
+            ] {
+                updates.push(expression_update(vec![(column, expr)]));
+            }
+        }
+        for a in &updates {
+            for b in &updates {
+                assert_eq!(are_intent_ops_independent(a, b), are_intent_ops_independent(b, a));
+                if are_intent_ops_independent(a, b) {
+                    for row in [[-2, 5], [0, 0], [9, -1]] {
+                        assert_eq!(apply(b, apply(a, row)), apply(a, apply(b, row)));
+                    }
+                }
+            }
         }
     }
 

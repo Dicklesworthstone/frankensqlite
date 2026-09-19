@@ -213,3 +213,108 @@ fn empty_evidence_is_only_a_consistent_no_op() {
     assert_eq!(verify_merge_certificate(&[], &pages(), [0; 16], &cert),
         Err(CertificateVerificationError::PageSetMismatch));
 }
+
+#[test]
+fn v1_certificates_require_regeneration_after_the_digest_upgrade() {
+    let mut cert = certificate();
+    assert_eq!(cert.verifier_version, 2);
+    assert!(verify(&cert).is_ok());
+    cert.verifier_version = 1;
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::UnsupportedVerifierVersion {
+            expected: VERIFIER_VERSION,
+            actual: 1,
+        })
+    );
+}
+
+#[test]
+fn proof_digests_bind_semantic_key_routing_metadata() {
+    use fsqlite_types::IndexId;
+
+    let btree = BtreeRef::Table(TableId::new(1));
+    let key = SemanticKeyRef {
+        btree,
+        kind: SemanticKeyKind::TableRow,
+        key_digest: table_row_key_digest(btree, 1),
+    };
+    let mut baseline = intent();
+    baseline.footprint.reads.push(key.clone());
+    baseline.footprint.writes.push(key);
+    let expected_op = compute_op_digest(&baseline);
+    let expected_footprint = compute_footprint_digest(&[&baseline.footprint]);
+    let cert = generate_merge_certificate(
+        context().merge_kind,
+        context().base_commit_seq,
+        context().schema_epoch,
+        &[baseline.clone()],
+        &pages(),
+        [0x42; 16],
+    )
+    .unwrap();
+    assert!(cert.verify_in_context(context(), &[baseline.clone()], &pages(), [0x42; 16]).is_ok());
+    for source in 0..2 {
+        for variant in 0..3 {
+            let mut changed = baseline.clone();
+            let key = if source == 0 {
+                &mut changed.footprint.reads[0]
+            } else {
+                &mut changed.footprint.writes[0]
+            };
+            let unchanged_digest = key.key_digest;
+            match variant {
+                0 => key.kind = SemanticKeyKind::IndexEntry,
+                1 => key.btree = BtreeRef::Index(IndexId::new(1)),
+                _ => key.btree = BtreeRef::Table(TableId::new(99)),
+            }
+            assert_eq!(key.key_digest, unchanged_digest);
+            assert_ne!(compute_op_digest(&changed), expected_op);
+            assert_ne!(compute_footprint_digest(&[&changed.footprint]), expected_footprint);
+            assert!(matches!(
+                cert.verify_in_context(context(), &[changed], &pages(), [0x42; 16]),
+                Err(CertificateVerificationError::OpDigestMismatch { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn complete_key_encoding_has_an_explicit_namespace_and_fixed_width() {
+    let key = SemanticKeyRef {
+        kind: SemanticKeyKind::IndexEntry,
+        btree: BtreeRef::Index(fsqlite_types::IndexId::new(9)),
+        key_digest: [0xAB; 16],
+    };
+    let encoded = canonical_semantic_key_bytes(&key);
+    assert_eq!(&encoded[..6], &[1, 1, 9, 0, 0, 0]);
+    assert_eq!(&encoded[6..], &[0xAB; 16]);
+}
+
+#[test]
+fn circuit_breaker_identity_binds_all_certificate_fields() {
+    let original = certificate();
+    let digest = |cert: &MergeCertificate| {
+        let event = circuit_breaker_check(CertificateVerificationError::InvalidNormalForm, cert);
+        assert!(event.disable_safe_merge);
+        event.certificate_digest
+    };
+    let expected = digest(&original);
+    for field in 0..11 {
+        let mut changed = original.clone();
+        match field {
+            0 => changed.verifier_version += 1,
+            1 => changed.merge_kind = MergeKind::StructuredPatch,
+            2 => changed.base_commit_seq += 1,
+            3 => changed.schema_epoch += 1,
+            4 => { let _ = changed.pages.pop(); }
+            5 => changed.intent_op_digests[0][0] ^= 1,
+            6 => changed.footprint_digest[0] ^= 1,
+            7 => changed.normal_form[0][0] ^= 1,
+            8 => changed.post_state.page_hashes[0].1[0] ^= 1,
+            9 => changed.post_state.btree_invariant_hash[0] ^= 1,
+            _ => changed.post_state.page_hashes[0].0 = PageNumber::ONE,
+        }
+        assert_ne!(digest(&changed), expected);
+    }
+}
