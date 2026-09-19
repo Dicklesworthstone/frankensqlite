@@ -5,15 +5,16 @@
 //! and index publication (or rollback) settle. Dropping its awaiter cannot
 //! release those locks while physical writes are still running.
 
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use asupersync::runtime::spawn_blocking;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
-use fsqlite_vfs::{ShmRegion, Vfs, VfsFile, host_fs};
+use fsqlite_vfs::{FileIdentity, ShmRegion, Vfs, VfsFile, host_fs};
 use crate::wal_fec::replay::recover_wal_fec_image_with_certificates;
 use crate::wal_index::{
     WAL_INDEX_VERSION, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation, WalIndexHdr,
@@ -25,9 +26,79 @@ use crate::wal_index::{
 use crate::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader};
 
 use super::{
-    CapturedSource, ExportReport, IO_CHUNK, NativeVfs, Options, Snapshot, SourceFile,
+    CapturedSource, ExportReport, IO_CHUNK, NativeFile, NativeVfs, Options, Snapshot, SourceFile,
     capture_held, checkpoint, companion, refuse_destination_artifacts, verify_image,
 };
+
+/// Keep the original main-file descriptor alive across the identity-bound open.
+/// Recovery locks are already restored, so the opener may acquire its own
+/// claims. This MUST be a managed VFS descriptor: closing an independent raw
+/// main descriptor would release the new connection's process-scoped locks.
+struct RepairHandoff {
+    source: PathBuf,
+    identity: FileIdentity,
+    main: SourceFile<NativeFile>,
+    report: ExportReport,
+}
+
+impl RepairHandoff {
+    // Connection futures and their results are intentionally allowed to be !Send.
+    #[allow(clippy::future_not_send)]
+    async fn open<T, F, Fut>(self, cx: &Cx, opener: F) -> (Result<T>, ExportReport)
+    where
+        F: FnOnce(PathBuf, FileIdentity) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Self { source, identity, main, report } = self;
+        // Cancellation after successful repair is an OPEN failure, not evidence
+        // that repair rolled back. Preserve the receipt in this case too.
+        let opened = match checkpoint(cx) {
+            Ok(()) => opener(source, identity).await,
+            Err(error) => Err(error),
+        };
+        // Also runs through SourceFile::drop when this future is abandoned or
+        // the opener unwinds. Native VFS cleanup retains retryable obligations.
+        drop(main);
+        (opened, report)
+    }
+}
+
+impl Options {
+    /// Repair this existing Unix WAL, then open the same physical database.
+    ///
+    /// `opener` is invoked at most once, only after complete recovery, the new
+    /// original-WAL backup, durable writes, index publication and restoration
+    /// of the recovery fence succeed. It receives the canonical source path
+    /// and its captured physical identity. It MUST use an existing-only,
+    /// expected-identity constructor, not an unchecked pathname open.
+    /// The managed identity descriptor stays alive until its future completes
+    /// or is dropped; no raw main-file descriptor is closed under the opener.
+    /// The callback and returned future need not be Send.
+    ///
+    /// Outer `Err` means repair or its handoff could not be certified; source
+    /// writes may already have occurred, so retain the backup. Outer `Ok`
+    /// always includes the successful repair receipt, even when the inner
+    /// open fails or cancellation is observed before the callback starts.
+    /// A failed open does not undo a successfully repaired WAL. Dropping this
+    /// future does not undo repair either, and may leave an unobserved receipt.
+    ///
+    /// This explicit administrative operation uses the caller's runtime. It
+    /// does not change ordinary Connection open or writer-concurrency defaults.
+    #[allow(clippy::future_not_send)]
+    pub async fn repair_and_open<T, F, Fut>(
+        &self,
+        cx: &Cx,
+        opener: F,
+    ) -> Result<(Result<T>, ExportReport)>
+    where
+        F: FnOnce(PathBuf, FileIdentity) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        super::preflight(cx, self)?;
+        let handoff = run_for_open(&NativeVfs::new(), cx, self).await?;
+        Ok(handoff.open(cx, opener).await)
+    }
+}
 
 /// All offsets are into the original physical WAL. The header, inode, file
 /// length, unchanged frames and uncommitted suffix are never replaced.
@@ -219,7 +290,7 @@ fn backup_original(vfs: &NativeVfs, cx: &Cx, path: &Path, original: &[u8]) -> Re
     result
 }
 
-fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> Result<ExportReport> {
+fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> Result<RepairHandoff> {
     checkpoint(cx)?;
     let vfs = NativeVfs::new();
     let mut plan = RepairPlan::build(&captured.snapshot, options)?;
@@ -274,15 +345,33 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
         eprintln!("WAL repair is NOT certified; original backup retained at {}", options.destination.display());
     }
     let digest = result?;
-    captured.finish()?;
-    Ok(ExportReport {
+    // Stop blocking native readers/writers before invoking an SQL constructor,
+    // but retain the same main descriptor as a live, non-reusable identity.
+    // A failed restoration retains its marker and NEVER authorizes the opener.
+    captured.wal.finish()?;
+    {
+        let _cleanup_mask = captured.main.cleanup_cx.masked();
+        captured.main.file.restore_external_maintenance_attempt(&captured.main.cleanup_cx)?;
+        captured.main.maintenance = false;
+    }
+    let report = ExportReport {
         destination: options.destination.clone(), pages: plan.pages,
         wal_frames: plan.index_header.mx_frame, repaired_frames: plan.changed.len(),
         certificate_anchors: plan.certificate_anchors, digest, repaired_in_place: true,
+    };
+    Ok(RepairHandoff {
+        source: options.source.clone(), identity: captured.main_identity,
+        main: captured.main, report,
     })
 }
 
 pub(super) async fn run(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<ExportReport> {
+    let mut handoff = run_for_open(vfs, cx, options).await?;
+    handoff.main.finish()?;
+    Ok(handoff.report)
+}
+
+async fn run_for_open(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<RepairHandoff> {
     let source = vfs.full_pathname(cx, &options.source)?;
     let destination = vfs.full_pathname(cx, &options.destination)?;
     // A backup must not become any companion of the source, even one that is
@@ -306,7 +395,306 @@ pub(super) async fn run(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    fn with_runtime<F: Future>(future: F) -> F::Output {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2).build().unwrap().block_on(future)
+    }
+
+    fn attached_context() -> Cx {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().unwrap());
+        cx
+    }
+
+    /// Three versions of an empty sqlite_schema page in one FEC-covered
+    /// transaction. Damage is in the first payload, not its terminal anchor.
+    fn handoff_fixture() -> (Options, Vec<u8>, Vec<u8>) {
+        use crate::checksum::{SqliteWalChecksum, WalChecksumTransform, WalHeader, WalSalts};
+        use crate::wal_fec::{
+            WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord, append_wal_fec_group,
+            build_source_page_hashes, generate_wal_fec_repair_symbols,
+        };
+        use fsqlite_types::{ObjectId, Oti};
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let options = Options::new(directory.join("source.db"), directory.join("original.wal"));
+        let mut page = vec![0_u8; 512];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&512_u16.to_be_bytes());
+        page[18..20].copy_from_slice(&[2, 2]);
+        page[21..24].copy_from_slice(&[64, 32, 32]);
+        page[24..28].copy_from_slice(&7_u32.to_be_bytes());
+        page[28..32].copy_from_slice(&1_u32.to_be_bytes());
+        page[44..48].copy_from_slice(&4_u32.to_be_bytes());
+        page[56..60].copy_from_slice(&1_u32.to_be_bytes());
+        page[92..96].copy_from_slice(&7_u32.to_be_bytes());
+        page[100] = 13;
+        page[105..107].copy_from_slice(&512_u16.to_be_bytes());
+        host_fs::write(&options.source, &page).unwrap();
+        let pages: Vec<_> = (1_u32..=3).map(|version| {
+            let mut current = page.clone();
+            current[60..64].copy_from_slice(&version.to_be_bytes());
+            current
+        }).collect();
+        let header = WalHeader {
+            magic: crate::WAL_MAGIC_LE, format_version: crate::WAL_FORMAT_VERSION,
+            page_size: 512, checkpoint_seq: 1,
+            salts: WalSalts { salt1: 123, salt2: 456 }, checksum: SqliteWalChecksum::default(),
+        };
+        let mut wal = header.to_bytes().unwrap().to_vec();
+        let mut running = WalHeader::from_bytes(&wal).unwrap().checksum;
+        for (index, page) in pages.iter().enumerate() {
+            let start = wal.len();
+            wal.extend_from_slice(&WalFrameHeader {
+                page_number: 1, db_size: u32::from(index == 2), salts: header.salts,
+                checksum: SqliteWalChecksum::default(),
+            }.to_bytes());
+            wal.extend_from_slice(page);
+            running = WalChecksumTransform::for_wal_frame(&wal[start..], 512, false)
+                .unwrap().apply(running);
+            wal[start + 16..start + 20].copy_from_slice(&running.s1.to_be_bytes());
+            wal[start + 20..start + 24].copy_from_slice(&running.s2.to_be_bytes());
+        }
+        let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
+            wal_salt1: 123, wal_salt2: 456, start_frame_no: 1, end_frame_no: 3,
+            db_size_pages: 1, page_size: 512, k_source: 3, r_repair: 8,
+            oti: Oti { f: 1536, al: 1, t: 512, z: 1, n: 1 },
+            object_id: ObjectId::derive_from_canonical_bytes(b"repair-open-handoff"),
+            page_numbers: vec![1; 3], source_page_xxh3_128: build_source_page_hashes(&pages),
+        }).unwrap();
+        let symbols = generate_wal_fec_repair_symbols(&meta, &pages).unwrap();
+        append_wal_fec_group(&companion(&options.source, "-wal-fec"),
+            &WalFecGroupRecord::new(meta, symbols).unwrap()).unwrap();
+        let repaired = wal.clone();
+        wal[WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 60] ^= 0xff;
+        host_fs::write(&companion(&options.source, "-wal"), &wal).unwrap();
+        (options, wal, repaired)
+    }
+
+    fn assert_recovery_available(source: &Path, cx: &Cx) {
+        let (file, _) = NativeVfs::new().open(cx, Some(source),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+        let mut owner = SourceFile::new(file, cx);
+        owner.acquire_recovery(cx).unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn handoff_opens_once_with_live_identity_after_repair_fences_are_restored() {
+        with_runtime(async {
+            let (options, original, repaired) = handoff_fixture();
+            let cx = attached_context();
+            let calls = Rc::new(Cell::new(0));
+            let calls_in_opener = Rc::clone(&calls);
+            let opener_cx = &cx;
+            let (opened, report) = options.repair_and_open(&cx, |path, identity| async move {
+                calls_in_opener.set(calls_in_opener.get() + 1);
+                let (file, _) = NativeVfs::new().open_with_expected_identity(
+                    opener_cx, &path, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB, identity,
+                )?;
+                let mut owner = SourceFile::new(file, opener_cx);
+                assert_eq!(owner.file.file_identity()?, Some(identity));
+                // This would conflict if the old recovery fence remained held.
+                owner.acquire_recovery(opener_cx)?;
+                owner.finish()?;
+                Ok(calls_in_opener) // Explicitly non-Send result and future.
+            }).await.unwrap();
+            assert!(Rc::ptr_eq(&opened.unwrap(), &calls));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(report.wal_frames, 3);
+            assert_eq!(report.repaired_frames, 1);
+            assert!(report.repaired_in_place);
+            assert_eq!(report.digest, blake3::hash(&repaired));
+            assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+        });
+    }
+
+    #[test]
+    fn handoff_preserves_repair_receipt_when_opener_fails() {
+        with_runtime(async {
+            let (options, original, repaired) = handoff_fixture();
+            let cx = attached_context();
+            let (opened, report) = options.repair_and_open(&cx, |_, _| async {
+                Err::<(), _>(FrankenError::NoSuchTable { name: "opener sentinel".to_owned() })
+            }).await.unwrap();
+            assert!(matches!(opened, Err(FrankenError::NoSuchTable { name }) if name == "opener sentinel"));
+            assert_eq!(report.digest, blake3::hash(&repaired));
+            assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+            assert_recovery_available(&options.source, &cx);
+        });
+    }
+
+    #[test]
+    fn handoff_does_not_unlock_the_openers_native_claims() {
+        const CHILD_PATH: &str = "FSQLITE_REPAIR_OPEN_LOCK_CHILD";
+        const TEST: &str = "native_recovery::repair::tests::handoff_does_not_unlock_the_openers_native_claims";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            with_runtime(async {
+                let cx = attached_context();
+                let (file, _) = NativeVfs::new().open(&cx, Some(Path::new(&path)),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+                let mut peer = SourceFile::new(file, &cx);
+                assert!(matches!(peer.acquire_recovery(&cx), Err(FrankenError::Busy)));
+                peer.finish().unwrap();
+            });
+            return;
+        }
+        with_runtime(async {
+            let (options, _, _) = handoff_fixture();
+            let cx = attached_context();
+            let opener_cx = &cx;
+            let (opened, _) = options.repair_and_open(&cx, |path, identity| async move {
+                let (file, _) = NativeVfs::new().open_with_expected_identity(
+                    opener_cx, &path, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB, identity,
+                )?;
+                let mut new_owner = SourceFile::new(file, opener_cx);
+                new_owner.acquire_recovery(opener_cx)?;
+                Ok(new_owner)
+            }).await.unwrap();
+            let mut owner = opened.unwrap();
+            // The old handoff descriptor has now been cleaned up. A raw
+            // close-any-fd bug would silently lose this owner's POSIX claims;
+            // a new process checks the actual kernel locks, not our ledger.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD_PATH, &options.source).spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "foreign process must observe the opener's locks");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("foreign lock witness did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            owner.finish().unwrap();
+            assert_recovery_available(&options.source, &cx);
+        });
+    }
+
+    #[test]
+    fn handoff_refusal_never_invokes_opener_or_overwrites_a_backup() {
+        with_runtime(async {
+            for existing_backup in [false, true] {
+                let (options, original, _) = handoff_fixture();
+                let cx = attached_context();
+                if existing_backup {
+                    host_fs::write(&options.destination, b"existing backup").unwrap();
+                } else {
+                    host_fs::write(&companion(&options.source, "-wal"), b"invalid WAL").unwrap();
+                }
+                let calls = Cell::new(0);
+                let result = options.repair_and_open(&cx, |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(()))
+                }).await;
+                assert!(result.is_err());
+                assert_eq!(calls.get(), 0);
+                if existing_backup {
+                    assert_eq!(host_fs::read(&options.destination).unwrap(), b"existing backup");
+                    assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+                } else {
+                    assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn handoff_contention_never_invokes_opener_and_can_be_retried() {
+        with_runtime(async {
+            let (options, original, _) = handoff_fixture();
+            let cx = attached_context();
+            let vfs = NativeVfs::new();
+            let (file, _) = vfs.open(&cx, Some(&options.source),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+            let mut owner = SourceFile::new(file, &cx);
+            owner.acquire_recovery(&cx).unwrap();
+            let calls = Cell::new(0);
+            let result = options.repair_and_open(&cx, |_, _| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(()))
+            }).await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0);
+            assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+            owner.finish().unwrap();
+            options.repair_and_open(&cx, |_, _| std::future::ready(Ok(())))
+                .await.unwrap().0.unwrap();
+        });
+    }
+
+    #[test]
+    fn handoff_cancellation_after_repair_retains_receipt_without_starting_open() {
+        with_runtime(async {
+            let (options, original, repaired) = handoff_fixture();
+            let cx = attached_context();
+            let handoff = run_for_open(&NativeVfs::new(), &cx, &options).await.unwrap();
+            cx.cancel();
+            let calls = Cell::new(0);
+            let (opened, report) = handoff.open(&cx, |_, _| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(()))
+            }).await;
+            assert!(matches!(opened, Err(FrankenError::Interrupt)));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(report.digest, blake3::hash(&repaired));
+            assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn handoff_drop_during_open_releases_managed_identity_guard() {
+        with_runtime(async {
+            let (options, original, repaired) = handoff_fixture();
+            let cx = attached_context();
+            let handoff = run_for_open(&NativeVfs::new(), &cx, &options).await.unwrap();
+            let calls = Cell::new(0);
+            let mut future = Box::pin(handoff.open(&cx, |_, _| {
+                calls.set(calls.get() + 1);
+                std::future::pending::<Result<()>>()
+            }));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            drop(future);
+            assert_eq!(calls.get(), 1);
+            assert_recovery_available(&options.source, &cx);
+            assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+        });
+    }
+
+    #[test]
+    fn handoff_unpolled_future_and_preflight_failure_have_no_effects() {
+        with_runtime(async {
+            let (options, original, _) = handoff_fixture();
+            let cx = attached_context();
+            let calls = Cell::new(0);
+            drop(options.repair_and_open(&cx, |_, _| {
+                calls.set(1);
+                std::future::ready(Ok(()))
+            }));
+            let detached = Cx::new();
+            assert!(options.repair_and_open(&detached, |_, _| {
+                calls.set(1);
+                std::future::ready(Ok(()))
+            }).await.is_err());
+            assert_eq!(calls.get(), 0);
+            assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
+            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+        });
+    }
 
     fn byte_plan(original: &[u8]) -> RepairPlan {
         let mut target = original.to_vec();
