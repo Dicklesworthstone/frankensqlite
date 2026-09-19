@@ -191383,8 +191383,7 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             let rowid = "CREATE TABLE entries (id INTEGER PRIMARY KEY, body TEXT)";
-            let without =
-                "CREATE TABLE entries (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID";
+            let without = "CREATE TABLE entries (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID";
             let cookie = *conn.schema_cookie.borrow();
             assert_eq!(conn.cached_without_rowid_table_sql(without), None);
             assert!(conn.table_sql_declares_without_rowid(without));
@@ -191428,7 +191427,7 @@ mod tests {
         assert!(!join_table_supports_hidden_rowid(
             "wr",
             &original_ddl_sql,
-            is_without_rowid_table_sql,
+            super::is_without_rowid_table_sql,
         ));
         assert_eq!(
             join_hidden_rowid_projection(
@@ -191436,7 +191435,7 @@ mod tests {
                 join_table_supports_hidden_rowid(
                     "wr",
                     &original_ddl_sql,
-                    is_without_rowid_table_sql,
+                    super::is_without_rowid_table_sql,
                 ),
             ),
             None
@@ -191459,7 +191458,7 @@ mod tests {
         assert!(!join_table_supports_hidden_rowid(
             "fts_messages",
             &original_ddl_sql,
-            is_without_rowid_table_sql,
+            super::is_without_rowid_table_sql,
         ));
         assert_eq!(
             join_hidden_rowid_projection(
@@ -191467,7 +191466,7 @@ mod tests {
                 join_table_supports_hidden_rowid(
                     "fts_messages",
                     &original_ddl_sql,
-                    is_without_rowid_table_sql,
+                    super::is_without_rowid_table_sql,
                 ),
             ),
             None
