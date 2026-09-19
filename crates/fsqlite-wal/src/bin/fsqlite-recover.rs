@@ -29,8 +29,10 @@ mod native {
     use fsqlite_error::{FrankenError, Result};
     use fsqlite_types::cx::Cx;
     use fsqlite_types::flags::VfsOpenFlags;
-    use fsqlite_vfs::{Vfs, VfsFile, host_fs};
-    use fsqlite_wal::wal_fec::replay::{WalFecReplayLimits, recover_wal_fec_image};
+    use fsqlite_vfs::{FileIdentity, Vfs, VfsFile, host_fs};
+    use fsqlite_wal::wal_fec::replay::{
+        WalFecReplayLimits, recover_wal_fec_image_with_certificates,
+    };
 
     #[cfg(unix)]
     type NativeVfs = fsqlite_vfs::unix::UnixVfs;
@@ -49,7 +51,7 @@ must not be concurrently manipulated. Do not open the destination until success.
 
 Options:
   --max-bytes N         Bound each input file and the output (default: main/output
-                       268435456, WAL 67108864, FEC 33554432 bytes).
+                       268435456, WAL 67108864, FEC/certificates 33554432 bytes).
   --max-source-pages N  Maximum source pages per FEC decode (default: 256).
   --                   End options; subsequent arguments are literal paths.
   --help               Show this help.
@@ -97,6 +99,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
                     options.max_database_bytes = limit;
                     options.replay.max_wal_bytes = limit;
                     options.replay.max_sidecar_bytes = limit;
+                    options.replay.max_certificate_bytes = limit;
                 } else {
                     options.replay.max_source_pages = limit;
                 }
@@ -137,6 +140,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
                 println!("Pages: {}; verified WAL frames: {}; repaired frames: {}",
                     report.pages, report.wal_frames, report.repaired_frames);
                 println!("Output BLAKE3: {}", report.digest);
+                println!("Certificate-validated intervals: {}", report.certificate_anchors);
                 println!("Source data preserved. Output B-tree integrity has not been checked.");
                 ExitCode::SUCCESS
             }
@@ -239,6 +243,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         database: Vec<u8>,
         wal: Vec<u8>,
         sidecar: Vec<u8>,
+        certificates: Vec<u8>,
     }
 
     async fn read_vfs_snapshot<F: VfsFile>(file: &F, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
@@ -327,6 +332,42 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         Ok(bytes)
     }
 
+    /// The retained main-file recovery fence already excludes certificate
+    /// append/checkpoint writers. Open through VFS, not a raw std descriptor:
+    /// an alias of main must not release process-scoped locks when closed.
+    async fn capture_certificates(
+        vfs: &NativeVfs,
+        cx: &Cx,
+        path: &Path,
+        limit: usize,
+        main_identity: FileIdentity,
+        wal_identity: FileIdentity,
+    ) -> Result<Vec<u8>> {
+        if !vfs.path_entry_exists(cx, path)? {
+            return Ok(Vec::new());
+        }
+        require_regular_file(path)?;
+        let (file, _) = vfs.open(cx, Some(path), VfsOpenFlags::READONLY)?;
+        let mut certificate = SourceFile::new(file, cx);
+        let identity = certificate.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
+        if identity == main_identity || identity == wal_identity {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let size = certificate.file.file_size(cx)?;
+        if usize::try_from(size).ok().is_none_or(|size| size > limit) {
+            // Optional proof cannot force an unbounded read or poison a WAL
+            // that can still recover using its original checksum anchors.
+            certificate.finish()?;
+            eprintln!("Optional commit certificates exceed the capture limit; not used");
+            return Ok(Vec::new());
+        }
+        let bytes = read_vfs_snapshot(&certificate.file, cx, limit).await?;
+        let (probe, _) = vfs.open_with_expected_identity(cx, path, VfsOpenFlags::READONLY, identity)?;
+        SourceFile::new(probe, cx).finish()?;
+        certificate.finish()?;
+        Ok(bytes)
+    }
+
     async fn capture(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Snapshot> {
         require_regular_file(&options.source)?;
         let (file, flags) = vfs.open(cx, Some(&options.source),
@@ -348,6 +389,10 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         let sidecar_cx = cx.create_child_for_spawn();
         let sidecar_limit = options.replay.max_sidecar_bytes;
         let sidecar = spawn_blocking(move || read_sidecar(&sidecar_path, &sidecar_cx, sidecar_limit)).await?;
+        let certificates = capture_certificates(
+            vfs, cx, &companion(&options.source, "-wal-cert"),
+            options.replay.max_certificate_bytes, main_identity, wal_identity,
+        ).await?;
         // Recheck both named descriptors before releasing the common fence.
         for (path, identity, flags) in [
             (&options.source, main_identity, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB),
@@ -358,7 +403,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         }
         wal.finish()?;
         main.finish()?;
-        Ok(Snapshot { database, wal: wal_bytes, sidecar })
+        Ok(Snapshot { database, wal: wal_bytes, sidecar, certificates })
     }
 
     fn refuse_destination_artifacts(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
@@ -420,6 +465,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         pages: usize,
         wal_frames: u32,
         repaired_frames: usize,
+        certificate_anchors: usize,
         digest: blake3::Hash,
     }
 
@@ -435,14 +481,21 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         let decode_cx = cx.create_child_for_spawn();
         let limits = options.replay;
         let max_database_bytes = options.max_database_bytes;
-        let (image, wal_frames, repaired_frames, pages) = spawn_blocking(move || {
+        let (image, wal_frames, repaired_frames, pages, certificate_anchors) = spawn_blocking(move || {
             checkpoint(&decode_cx)?;
-            let replay = recover_wal_fec_image(&snapshot.wal, &snapshot.sidecar, limits)?;
+            // capture() validated the main header before releasing the fence.
+            // Never infer this identity from certificate bytes or a repaired page.
+            let mut database_file_id = [0; 16];
+            database_file_id.copy_from_slice(&snapshot.database[76..92]);
+            let replay = recover_wal_fec_image_with_certificates(
+                &snapshot.wal, &snapshot.sidecar, &snapshot.certificates, database_file_id, limits,
+            )?;
             let image = replay.database_image(&snapshot.database, max_database_bytes)?;
             checkpoint(&decode_cx)?;
             let pages = image.len() / usize::try_from(replay.header().page_size)
                 .map_err(|_| FrankenError::TooBig)?;
-            Ok::<_, FrankenError>((image, replay.committed_frames(), replay.repaired_frame_nos().len(), pages))
+            Ok::<_, FrankenError>((image, replay.committed_frames(), replay.repaired_frame_nos().len(),
+                pages, replay.certificate_anchors().len()))
         }).await?;
         checkpoint(cx)?;
         // O_EXCL reserves only an absent final entry; existing/dangling links
@@ -465,7 +518,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         };
         drop(output);
         Ok(ExportReport {
-            destination: options.destination, pages, wal_frames, repaired_frames,
+            destination: options.destination, pages, wal_frames, repaired_frames, certificate_anchors,
             digest,
         })
     }
@@ -504,14 +557,25 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         }
 
         fn fixture(repairs: u32, corrupt_frames: &[usize]) -> (Options, Vec<u8>) {
+            fixture_with_identity(repairs, corrupt_frames, [0; 16])
+        }
+
+        fn fixture_with_identity(
+            repairs: u32, corrupt_frames: &[usize], identity: [u8; 16],
+        ) -> (Options, Vec<u8>) {
             // Preserve test artifacts rather than automatically deleting them.
             let directory = tempfile::tempdir().unwrap().keep();
             let options = parse_args(vec![
                 directory.join("source.db").into_os_string(),
                 directory.join("output.db").into_os_string(),
             ]).unwrap().unwrap();
-            host_fs::write(&options.source, empty_database(0)).unwrap();
-            let pages: Vec<_> = (1..=4).map(empty_database).collect();
+            let page_with_identity = |version| {
+                let mut page = empty_database(version);
+                page[76..92].copy_from_slice(&identity);
+                page
+            };
+            host_fs::write(&options.source, page_with_identity(0)).unwrap();
+            let pages: Vec<_> = (1..=4).map(page_with_identity).collect();
             let header = WalHeader {
                 magic: WAL_MAGIC_LE, format_version: WAL_FORMAT_VERSION, page_size: 512,
                 checkpoint_seq: 1, salts: WalSalts { salt1: 123, salt2: 456 },
@@ -760,6 +824,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             assert_eq!(options.destination, Path::new("-b"));
             assert_eq!(options.max_database_bytes, 2048);
             assert_eq!(options.replay.max_wal_bytes, 2048);
+            assert_eq!(options.replay.max_certificate_bytes, 2048);
         }
 
         #[test]
@@ -837,6 +902,164 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
                 symlink(&options.source, &options.destination).unwrap();
                 assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
                 assert_eq!(host_fs::read(&options.source).unwrap(), original);
+            });
+        }
+
+        const SOURCE_ID: [u8; 16] = [0x6d; 16];
+
+        fn write_fixture_certificate(options: &Options, identity: [u8; 16]) -> Vec<u8> {
+            use fsqlite_types::{CommitSeq, PageNumber};
+            use fsqlite_wal::{
+                PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, ParallelWalCommitCertificate,
+                ParallelWalDurableCertificateRecord, ParallelWalFramePayloadDigestBuilder,
+                ParallelWalOrderedResidue, WalGenerationIdentity,
+            };
+
+            let wal = host_fs::read(&companion(&options.source, "-wal")).unwrap();
+            let header = WalHeader::from_bytes(&wal).unwrap();
+            let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+            for frame in wal[WAL_HEADER_SIZE..].chunks_exact(FRAME_SIZE) {
+                let header = WalFrameHeader::from_bytes(frame).unwrap();
+                digest.update(PageNumber::new(header.page_number).unwrap(), header.db_size,
+                    &frame[WAL_FRAME_HEADER_SIZE..]);
+            }
+            let mut certificate = ParallelWalCommitCertificate {
+                format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
+                residue: ParallelWalOrderedResidue::CommitCertificateThenPublish,
+                certificate_epoch: 7, commit_seq_lo: CommitSeq::new(7),
+                commit_seq_hi: CommitSeq::new(7), durable_segment_epoch: 7,
+                lane_count: 1, lane_record_counts: vec![4], db_size_pages: 1,
+                page_set_size: 1, wal_frame_payload_digest: digest.finalize(),
+                certificate_crc32c: 0, fallback_active: false,
+            };
+            certificate.certificate_crc32c = certificate.computed_crc32c();
+            let record = ParallelWalDurableCertificateRecord::new(
+                WalGenerationIdentity::from_header(&header), 1, 4, identity, certificate,
+            ).unwrap();
+            let bytes = record.to_bytes();
+            host_fs::write(&companion(&options.source, "-wal-cert"), &bytes).unwrap();
+            bytes
+        }
+
+        fn erase_final_header(options: &Options) -> Vec<u8> {
+            let path = companion(&options.source, "-wal");
+            let mut bytes = host_fs::read(&path).unwrap();
+            let terminal = WAL_HEADER_SIZE + 3 * FRAME_SIZE;
+            bytes[terminal..terminal + WAL_FRAME_HEADER_SIZE].fill(0);
+            // Require real FEC decoding as well as certificate validation.
+            bytes[WAL_HEADER_SIZE + FRAME_SIZE + WAL_FRAME_HEADER_SIZE + 60] ^= 1;
+            host_fs::write(&path, &bytes).unwrap();
+            bytes
+        }
+
+        #[test]
+        fn certificate_backed_export_restores_final_transaction_and_preserves_all_sources() {
+            run_test(async {
+                let (options, expected) = fixture_with_identity(8, &[], SOURCE_ID);
+                write_fixture_certificate(&options, SOURCE_ID);
+                erase_final_header(&options);
+                let originals: Vec<_> = ["", "-wal", "-wal-fec", "-wal-cert"]
+                    .into_iter().map(|suffix| {
+                        let path = companion(&options.source, suffix);
+                        let bytes = host_fs::read(&path).unwrap();
+                        (path, bytes)
+                    }).collect();
+                let cx = request_context().unwrap();
+                let report = recover_to_new_database(&NativeVfs::new(), &cx, &options).await.unwrap();
+                assert_eq!(report.wal_frames, 4);
+                assert_eq!(report.repaired_frames, 2);
+                assert_eq!(report.certificate_anchors, 1);
+                assert_eq!(report.digest, blake3::hash(&expected));
+                assert_eq!(host_fs::read(&options.destination).unwrap(), expected);
+                for (path, bytes) in originals { assert_eq!(host_fs::read(&path).unwrap(), bytes); }
+            });
+        }
+
+        #[test]
+        fn foreign_certificate_refuses_export_without_reserving_output() {
+            run_test(async {
+                let (options, _) = fixture_with_identity(8, &[], SOURCE_ID);
+                let certificate = write_fixture_certificate(&options, [0x77; 16]);
+                let wal = erase_final_header(&options);
+                let main = host_fs::read(&options.source).unwrap();
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&options.source).unwrap(), main);
+                assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), wal);
+                assert_eq!(host_fs::read(&companion(&options.source, "-wal-cert")).unwrap(), certificate);
+            });
+        }
+
+        #[test]
+        fn missing_main_identity_is_not_borrowed_from_the_certificate_or_decoded_wal() {
+            run_test(async {
+                let (options, _) = fixture_with_identity(8, &[], SOURCE_ID);
+                write_fixture_certificate(&options, SOURCE_ID);
+                erase_final_header(&options);
+                let mut main = host_fs::read(&options.source).unwrap();
+                main[76..92].fill(0);
+                host_fs::write(&options.source, &main).unwrap();
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&options.source).unwrap(), main);
+            });
+        }
+
+        #[test]
+        fn optional_bad_or_oversized_certificates_do_not_block_checksum_backed_export() {
+            run_test(async {
+                for oversized in [false, true] {
+                    let (mut options, expected) = fixture_with_identity(8, &[1], SOURCE_ID);
+                    let certificate = companion(&options.source, "-wal-cert");
+                    host_fs::write(&certificate, b"unusable optional proof").unwrap();
+                    if oversized { options.replay.max_certificate_bytes = 1; }
+                    let cx = request_context().unwrap();
+                    let report = recover_to_new_database(&NativeVfs::new(), &cx, &options).await.unwrap();
+                    assert_eq!(report.certificate_anchors, 0);
+                    assert_eq!(host_fs::read(&options.destination).unwrap(), expected);
+                    assert_eq!(host_fs::read(&certificate).unwrap(), b"unusable optional proof");
+                }
+            });
+        }
+
+        #[test]
+        fn torn_certificate_stream_cannot_authorize_an_unanchored_export() {
+            run_test(async {
+                let (options, _) = fixture_with_identity(8, &[], SOURCE_ID);
+                let mut certificate = write_fixture_certificate(&options, SOURCE_ID);
+                certificate.push(0);
+                let path = companion(&options.source, "-wal-cert");
+                host_fs::write(&path, &certificate).unwrap();
+                let wal = erase_final_header(&options);
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&path).unwrap(), certificate);
+                assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), wal);
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn certificate_alias_of_source_data_is_refused() {
+            use std::os::unix::fs::symlink;
+            run_test(async {
+                for suffix in ["", "-wal"] {
+                    let (options, _) = fixture_with_identity(8, &[], SOURCE_ID);
+                    let source = companion(&options.source, suffix);
+                    let original = host_fs::read(&source).unwrap();
+                    symlink(&source, companion(&options.source, "-wal-cert")).unwrap();
+                    let cx = request_context().unwrap();
+                    let vfs = NativeVfs::new();
+                    assert!(recover_to_new_database(&vfs, &cx, &options).await.is_err());
+                    assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                    assert_eq!(host_fs::read(&source).unwrap(), original);
+                }
             });
         }
     }
