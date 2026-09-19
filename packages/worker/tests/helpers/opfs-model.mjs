@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 
 export function installOpfsModel() {
   const files = new Map(), directories = new Map(), tails = new Map();
+  const sessions = new Set();
   const hooks = {}, counts = { writes: 0, publications: 0, aborts: 0, removals: 0 };
   const notFound = () => new DOMException("Missing entry", "NotFoundError");
   function directory(path) {
@@ -64,6 +65,19 @@ export function installOpfsModel() {
   }
   const locks = {
     request(name, options, callback) {
+      if (options.ifAvailable === true) {
+        assert.ok(name.startsWith("frankensqlite:snapshot-session:v1:"));
+        assert.ok(options.mode === "shared" || options.mode === "exclusive");
+        assert.deepEqual(options, { mode: options.mode, ifAvailable: true });
+        return Promise.resolve().then(async () => {
+          if ([...sessions].some(lock => lock.name === name &&
+              (options.mode === "exclusive" || lock.mode === "exclusive"))) return callback(null);
+          const lock = { name, mode: options.mode };
+          sessions.add(lock);
+          try { return await callback(lock); }
+          finally { sessions.delete(lock); }
+        });
+      }
       assert.deepEqual(options, { mode: "exclusive" });
       const result = (tails.get(name) ?? Promise.resolve()).then(() => callback({ name, mode: "exclusive" }));
       const tail = result.then(() => {}, () => {});
@@ -75,7 +89,7 @@ export function installOpfsModel() {
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: {
     storage: { getDirectory: async () => directory("") }, locks,
   } });
-  return { files, hooks, counts, locks, restore() {
+  return { files, hooks, counts, locks, sessions, restore() {
     if (original) Object.defineProperty(globalThis, "navigator", original);
     else Reflect.deleteProperty(globalThis, "navigator");
   } };

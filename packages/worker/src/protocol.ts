@@ -1,6 +1,7 @@
 import type { SnapshotMetadata } from "./snapshot-store";
 import type { ResultEncoding } from "./result-codec";
 import type { PreparedStatementLimits } from "./statement-budget";
+import type { SnapshotOwnership } from "./snapshot-ownership";
 
 export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot" | "opfs-snapshot";
 
@@ -43,6 +44,8 @@ export interface QueryResult<Row extends Record<string, unknown> = Record<string
 export interface InitConfig {
   dbName?: string;
   persistence?: PersistenceMode;
+  /** Session lease acquired before snapshot load and held through cleanup. */
+  snapshotOwnership?: SnapshotOwnership;
   wasmUrl?: string;
   snapshot?: Uint8Array;
   /** Opt in to FQR1 transfer; unsupported result shapes still use structured clone. */
@@ -54,6 +57,8 @@ export interface InitConfig {
 export interface InitResult {
   path: string;
   persistence: PersistenceMode;
+  /** Present only when the host actually holds a Web Locks session lease. */
+  snapshotOwnership?: SnapshotOwnership;
   /** Version 1 supports client publication identities and read-only recovery. */
   checkpointRecovery?: 1;
   /** Last explicit checkpoint; absent for non-snapshot modes. */

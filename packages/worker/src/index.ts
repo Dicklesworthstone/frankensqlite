@@ -16,6 +16,8 @@ export type { PreparedStatementLimits, PreparedStatementStats } from "./statemen
 export { validateBulkSql } from "./bulk";
 export { IndexedDbSnapshotStore, MAX_SNAPSHOT_BYTES, SnapshotStoreError, validateSnapshotBytes } from "./snapshot-store";
 export { OpfsSnapshotStore } from "./opfs-snapshot-store";
+export { SnapshotOwnershipError, resolveSnapshotOwnership } from "./snapshot-ownership";
+export type { SnapshotOwnership } from "./snapshot-ownership";
 export { validateManagedSql } from "./transactions";
 export type { SnapshotMetadata, StoredSnapshot } from "./snapshot-store";
 export {
