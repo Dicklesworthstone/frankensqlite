@@ -13,6 +13,7 @@
 //!    `uuid_str` converts blob to string, `uuid_blob` converts string to blob.
 
 mod decimal_ext;
+mod series_scan;
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -60,11 +61,7 @@ impl VirtualTable for GenerateSeriesTable {
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
-        // generate_series accepts 1-3 equality constraints on hidden columns
-        // start (col=1), stop (col=2), step (col=3)
-        info.estimated_cost = 1.0;
-        info.estimated_rows = 1000;
-        Ok(())
+        series_scan::best_index(info)
     }
 
     fn open(&self) -> Result<Self::Cursor> {
@@ -74,6 +71,8 @@ impl VirtualTable for GenerateSeriesTable {
             stop: 0,
             step: 1,
             done: true,
+            scan_end: 0,
+            scan_step: 1,
         })
     }
 }
@@ -85,6 +84,10 @@ pub struct GenerateSeriesCursor {
     stop: i64,
     step: i64,
     done: bool,
+    // Scan bounds/order may differ from the original hidden column values.
+    scan_end: i64,
+    // Reversing i64::MIN needs the positive stride 2^63.
+    scan_step: i128,
 }
 
 impl GenerateSeriesCursor {
@@ -96,6 +99,8 @@ impl GenerateSeriesCursor {
         self.current = start;
         self.stop = stop;
         self.step = step;
+        self.scan_end = stop;
+        self.scan_step = i128::from(step);
         self.done = if step > 0 { start > stop } else { start < stop };
         debug!(start, stop, step, "generate_series: initialized cursor");
         Ok(())
@@ -105,46 +110,16 @@ impl GenerateSeriesCursor {
 impl VirtualTableCursor for GenerateSeriesCursor {
     fn filter(
         &mut self,
-        _cx: &Cx,
-        _idx_num: i32,
-        _idx_str: Option<&str>,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        let start = args
-            .first()
-            .map(SqliteValue::to_integer)
-            .ok_or_else(|| FrankenError::internal("generate_series: start argument is required"))?;
-        let end = args
-            .get(1)
-            .map_or(GENERATE_SERIES_DEFAULT_STOP, SqliteValue::to_integer);
-        let step = args.get(2).map_or(1, |value| {
-            normalize_generate_series_step(value.to_integer())
-        });
-        self.init(start, end, step)
+        series_scan::filter(self, cx, idx_num, idx_str, args)
     }
 
-    fn next(&mut self, _cx: &Cx) -> Result<()> {
-        if self.done {
-            return Ok(());
-        }
-        // Use checked_add to detect overflow and terminate gracefully.
-        // saturating_add would cause an infinite loop when current hits i64::MAX/MIN
-        // because `current > stop` would remain false while current stays saturated.
-        match self.current.checked_add(self.step) {
-            Some(next_val) => {
-                self.current = next_val;
-                self.done = if self.step > 0 {
-                    self.current > self.stop
-                } else {
-                    self.current < self.stop
-                };
-            }
-            None => {
-                // Overflow — we've exhausted the range, terminate iteration
-                self.done = true;
-            }
-        }
-        Ok(())
+    fn next(&mut self, cx: &Cx) -> Result<()> {
+        series_scan::next(self, cx)
     }
 
     fn eof(&self) -> bool {
