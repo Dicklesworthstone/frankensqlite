@@ -53,6 +53,13 @@ fn truth_tested_json_membership_materializes_once_and_preserves_nulls() {
         calls.store(0, Ordering::Relaxed);
         assert_eq!(conn.query("SELECT rowid FROM probes WHERE (value IN (SELECT value FROM json_each(count_json('[3]')))) IS TRUE").await.unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Even an override with compatible columns must not inherit the
+        // built-in identity proof. Use the real JSON-tree implementation.
+        conn.register_module("JSON_EACH", Box::new(fsqlite_func::vtab::module_factory_from::<fsqlite_ext_json::JsonTreeVtab>()));
+        calls.store(0, Ordering::Relaxed);
+        let rows = conn.query("SELECT rowid FROM probes WHERE (value IN (SELECT value FROM json_each(count_json('[0,1]')))) IS TRUE ORDER BY rowid").await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.values()[0].clone()).collect::<Vec<_>>(), vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]);
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "module overrides must retain conservative correlation handling");
         conn.close().await.unwrap();
     });
 }
