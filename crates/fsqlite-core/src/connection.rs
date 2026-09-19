@@ -225,7 +225,7 @@ use fsqlite_vdbe::codegen::{
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
-    emit_scan_filter, without_rowid_pk_indices,
+    emit_scan_filter, without_rowid_index_appended_pk, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -65289,7 +65289,7 @@ impl Connection {
         self.with_codegen_function_context(|| {
             Self::compile_index_backfill(
                 table,
-                table.root_page,
+                index,
                 index.root_page,
                 &idx_col_positions,
                 &key_exprs,
@@ -66320,7 +66320,7 @@ impl Connection {
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn compile_index_backfill(
         table: &TableSchema,
-        table_root: i32,
+        index: &IndexSchema,
         index_root: i32,
         idx_col_positions: &[usize],
         key_exprs: &[Expr],
@@ -66336,7 +66336,11 @@ impl Connection {
         };
         let without_rowid_pk = table
             .without_rowid
-            .then(|| without_rowid_pk_indices(table).map_err(codegen_error_to_franken))
+            .then(|| {
+                without_rowid_pk_indices(table)
+                    .map(|pk| without_rowid_index_appended_pk(table, index, &pk))
+                    .map_err(codegen_error_to_franken)
+            })
             .transpose()?;
         let n_row_locator_cols = without_rowid_pk.as_ref().map_or(1, Vec::len);
         let n_record_cols = n_idx_cols + n_row_locator_cols;
@@ -66353,7 +66357,7 @@ impl Connection {
         b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
         // OpenRead for the table (cursor 0).
-        b.emit_op(Opcode::OpenRead, 0, table_root, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, table.root_page, 0, P4::None, 0);
 
         // OpenWrite for the index (cursor 1).
         b.emit_op(Opcode::OpenWrite, 1, index_root, 0, P4::None, 0);
@@ -66372,8 +66376,8 @@ impl Connection {
             });
         }
 
-        // Rowid tables append the rowid. WITHOUT ROWID tables append every
-        // PRIMARY KEY column in declared PK order, matching ordinary DML.
+        // Match ordinary DML: WITHOUT ROWID indexes append only PRIMARY KEY
+        // columns absent from their key terms, in declared PK order.
         let key_regs = b.alloc_regs(n_record_cols as i32);
 
         if is_expression_index {

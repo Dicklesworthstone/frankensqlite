@@ -3904,6 +3904,9 @@ pub fn codegen_select(
     // probe — future scope). Same guards as L1; only reached when L1 declined
     // (multi-column PK, or a WHERE that is not a bare single equality). EQP
     // flips SCAN->SEARCH through the same program-verified `FullTableScan` arm.
+    // A competing secondary equality index must not displace a complete PK
+    // probe. Override that directive only for native literal comparisons on
+    // a proven ascending BINARY PK; explicit index hints remain authoritative.
     if table.without_rowid
         && !is_aggregate
         && from_index_hint.is_none()
@@ -3913,12 +3916,29 @@ pub fn codegen_select(
         && group_by.is_empty()
         && having.is_none()
         && !has_window_columns(columns)
-        && ctx.planner_select_directive.as_ref().is_none_or(|d| {
-            d.table_name.eq_ignore_ascii_case(&table.name)
-                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
-        })
         && let Some((pk_targets, residual_filter)) =
             wr_pk_point_seek_targets(table, where_clause.as_deref(), table_alias)
+        && ctx.planner_select_directive.as_ref().is_none_or(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && (matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+                    || (matches!(d.access_kind, PlannerSelectAccessKind::IndexEquality)
+                        && ctx.index_ordered_scan_reliable
+                        && ctx.collation_semantics == CollationSemantics::Builtin
+                        && ctx.wr_binary_ascending_roots.contains(&table.root_page)
+                        && table.primary_key_constraints[0]
+                            .iter()
+                            .zip(&pk_targets)
+                            .all(|(column, target)| {
+                                matches!(target, Expr::Literal(..))
+                                    && index_range_bound_is_seek_safe(
+                                        table,
+                                        table_alias,
+                                        schema,
+                                        column,
+                                        target,
+                                    )
+                            })))
+        })
     {
         return codegen_select_without_rowid_unique_seek(
             b,
@@ -24811,28 +24831,40 @@ pub fn codegen_delete(
 // leading declared columns in declared order; other shapes are rejected with a
 // clear "not yet supported" error rather than silently mis-ordering.
 
-/// Table-column index for each plain-column key term of `index` (leftmost
-/// first). Expression key terms — and any term whose name does not resolve to a
-/// declared column — map to `None`, which never dedups against a PK column.
+/// Table-column index for each key term that can replace a PK suffix field.
+/// Mixed expression indexes still contain plain-column terms. A different
+/// collation does not replace the PK field: SQLite retains both copies.
 fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> Vec<Option<usize>> {
     (0..index.key_term_count())
         .map(|p| {
-            index
+            let column = index
                 .columns
                 .get(p)
                 .and_then(|name| table.column_index(name))
+                .or_else(|| {
+                    let expr = parse_sql_expr(index.key_expressions.get(p)?).ok()?;
+                    table.column_index(explicit_index_simple_column_name(&expr)?)
+                })?;
+            let pk_collation = table.columns[column].collation.as_deref().unwrap_or("BINARY");
+            index
+                .key_term_collation(p)
+                .unwrap_or("BINARY")
+                .eq_ignore_ascii_case(pk_collation)
+                .then_some(column)
         })
         .collect()
 }
 
 /// SQLite WITHOUT ROWID rule (bd-5ava1 / GH #353): a secondary/auto index
 /// stores the index key terms followed only by the primary-key columns that are
-/// **not already** part of the index. Returns the subset of `pk_indices` (in
-/// PRIMARY KEY order) to append to this index's on-disk key. A PK column that
+/// **not already** part of the index under the same collation. Returns the
+/// subset of `pk_indices` (in PRIMARY KEY order) to append to the on-disk key.
+/// A PK column that
 /// coincides with an index key term is elided from the suffix, so an index like
 /// `UNIQUE(pk_leading, x)` on `PRIMARY KEY(pk_leading, ...)` stores each PK
-/// column exactly once — matching stock sqlite3's on-disk layout.
-fn without_rowid_index_appended_pk(
+/// column exactly once when the collations agree, matching stock's layout.
+#[must_use]
+pub fn without_rowid_index_appended_pk(
     table: &TableSchema,
     index: &IndexSchema,
     pk_indices: &[usize],

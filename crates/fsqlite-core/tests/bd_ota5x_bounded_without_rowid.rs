@@ -36,6 +36,78 @@ fn set_cell_count_zero(bytes: &mut [u8], page_size: usize, page_1based: usize) {
     bytes[hdr + 4] = 0;
 }
 
+/// hfdt-gbou9l: stock SQLite omits PK columns already present in an index.
+/// A valid independent image must pass, but losing its index entries must fail.
+#[test]
+fn bounded_integrity_checks_deduplicated_primary_key_locators() {
+    asupersync::test_utils::run_test(|| async {
+        for definition in [
+            "CREATE INDEX overlapping ON t(a,v)",
+            "CREATE UNIQUE INDEX overlapping ON t(b,a)",
+            "CREATE INDEX overlapping ON t(a COLLATE NOCASE,v)",
+            "CREATE INDEX overlapping ON t(a,lower(v)) WHERE b>0",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let image = dir.path().join("stock.db");
+            let stock = rusqlite::Connection::open(&image).expect("stock producer");
+            stock
+                .execute_batch(
+                    "CREATE TABLE t(a TEXT,b INTEGER,v TEXT,PRIMARY KEY(a,b)) WITHOUT ROWID;
+                     INSERT INTO t VALUES ('owner',1,'First'),('owner',2,'Second');",
+                )
+                .expect("stock rows");
+            stock.execute_batch(definition).expect("stock index");
+            let integrity: String = stock
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .expect("stock integrity");
+            assert_eq!(integrity, "ok");
+            let index_root: usize = stock
+                .query_row(
+                    "SELECT rootpage FROM sqlite_schema WHERE name='overlapping'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("index root");
+            stock.close().expect("close stock producer");
+            let original = std::fs::read(&image).expect("original image");
+            let owner = Connection::open(dir.path().join("owner.db").to_string_lossy())
+                .await
+                .expect("owner");
+            for corrupt in [false, true] {
+                let candidate = dir
+                    .path()
+                    .join(if corrupt { "broken.db" } else { "valid.db" });
+                let mut bytes = original.clone();
+                if corrupt {
+                    let page_size = header_page_size(&bytes);
+                    set_cell_count_zero(&mut bytes, page_size, index_root);
+                }
+                std::fs::write(&candidate, &bytes).expect("candidate image");
+                let receipt = owner
+                    .inspect_self_contained_image_receipt(&candidate)
+                    .await
+                    .expect("receipt");
+                let snapshot = owner
+                    .begin_bounded_structural_snapshot(&receipt, &candidate, 256)
+                    .await
+                    .expect("snapshot");
+                let result = snapshot
+                    .connection()
+                    .validate_database_integrity_bounded(dir.path())
+                    .await;
+                if corrupt {
+                    let error = result.expect_err("missing index entries must be rejected");
+                    assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+                    assert!(format!("{error:?}").contains("overlapping"));
+                } else {
+                    result.unwrap_or_else(|error| panic!("stock-valid {definition}: {error:?}"));
+                }
+            }
+            owner.close().await.expect("close owner");
+        }
+    });
+}
+
 #[test]
 fn bounded_integrity_accepts_simple_without_rowid_tables() {
     asupersync::test_utils::run_test(|| async {
