@@ -916,6 +916,58 @@ impl InodeTable {
         map.get(&key).cloned()
     }
 
+    /// Reuse an already retained lock domain without opening another ordinary
+    /// descriptor. Linux O_PATH closes do not run locks_remove_posix; the
+    /// descriptor pins the resolved inode across rename/replacement races.
+    #[cfg(target_os = "linux")]
+    fn reuse_retained_file(
+        &self,
+        path: &Path,
+        requested_rw: bool,
+    ) -> Option<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open};
+        use nix::sys::stat::Mode;
+
+        let witness = File::from(open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).ok()?);
+        if !witness.metadata().ok()?.is_file() {
+            return None;
+        }
+        let access = if requested_rw {
+            UnixAccessFlags::R_OK | UnixAccessFlags::W_OK
+        } else {
+            UnixAccessFlags::R_OK
+        };
+        nix::unistd::faccessat(
+            &witness,
+            "",
+            access,
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_EACCESS,
+        )
+        .ok()?;
+        let key = inode_key_from_file(&witness).ok()?;
+        let map = self.shards[self.shard_idx(key)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inode_info = Arc::clone(map.get(&key)?);
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only optimize an existing deferred-close domain. The initial open
+        // and first redundant open retain their normal registration semantics.
+        if info.deferred_close_files.is_empty() || inode_key_from_file(&info.file).ok()? != key {
+            return None;
+        }
+        let mode = OFlag::from_bits_truncate(fcntl(&*info.file, FcntlArg::F_GETFL).ok()?);
+        if requested_rw && mode & OFlag::O_ACCMODE != OFlag::O_RDWR {
+            return None;
+        }
+        info.n_ref = info.n_ref.checked_add(1)?;
+        let file = Arc::clone(&info.file);
+        drop(info);
+        drop(map);
+        Some((inode_info, file))
+    }
+
     /// Register an opened descriptor in the inode's one process-wide lock
     /// domain and return its canonical descriptor.
     ///
@@ -1450,9 +1502,23 @@ impl Vfs for UnixVfs {
                 .create_new(create_new)
                 .open(&resolved)
         };
-        let file =
-            open_with_optional_readonly_fallback(requested_rw, promote_readonly_to_rw, open_file)
-                .map_err(|e| {
+        #[cfg(target_os = "linux")]
+        let reused = if !create_new && !delete_on_close && flags.contains(VfsOpenFlags::MAIN_DB) {
+            global_inode_table().reuse_retained_file(&resolved, requested_rw)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let reused = None;
+        let (inode_info, file) = if let Some(reused) = reused {
+            reused
+        } else {
+            let file = open_with_optional_readonly_fallback(
+                requested_rw,
+                promote_readonly_to_rw,
+                open_file,
+            )
+            .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     FrankenError::CannotOpen {
                         path: resolved.clone(),
@@ -1462,23 +1528,24 @@ impl Vfs for UnixVfs {
                 }
             })?;
 
-        // Derive identity from the descriptor that was actually opened, then
-        // atomically register it with the process-wide canonical lock domain.
-        // Always opening first avoids the path-stat/open TOCTOU where a renamed
-        // file could otherwise make us return a descriptor for the wrong inode.
-        let inode_key = match inode_key_from_file(&file) {
-            Ok(key) => key,
-            Err(error) => {
-                // Once an fd is open, closing it without knowing its inode can
-                // erase unrelated process-wide fcntl locks on that inode. A
-                // failed descriptor-identity query is exceptional; leak this
-                // one fd fail-closed rather than risk silently unlocking a
-                // live database generation.
-                std::mem::forget(file);
-                return Err(error);
-            }
+            // Derive identity from the descriptor actually opened, never from
+            // a path stat that could race a rename to a different inode.
+            let inode_key = match inode_key_from_file(&file) {
+                Ok(key) => key,
+                Err(error) => {
+                    // Closing an ordinary fd with unknown identity could erase
+                    // a live inode's POSIX locks. Fail closed in this exceptional
+                    // case rather than silently unlocking a database generation.
+                    std::mem::forget(file);
+                    return Err(error);
+                }
+            };
+            global_inode_table().register_opened_file(inode_key, file)?
         };
-        let (inode_info, file) = global_inode_table().register_opened_file(inode_key, file)?;
+        let inode_key = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .key;
 
         let mut out_flags = flags;
         if is_create {
@@ -5570,6 +5637,122 @@ mod tests {
         );
         reopened.close(&cx).expect("close reopen");
         locked.close(&cx).expect("close locker");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_opens_bound_descriptors_without_releasing_foreign_lock_fence() {
+        const PROBE_PATH: &str = "FSQLITE_REPEATED_OPEN_LOCK_PROBE";
+        const TEST: &str =
+            "unix::tests::repeated_opens_bound_descriptors_without_releasing_foreign_lock_fence";
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let (mut probe, _) = vfs.open(&cx, Some(Path::new(&path)), flags).unwrap();
+            let acquired = match probe.lock(&cx, LockLevel::Exclusive) {
+                Ok(()) => true,
+                Err(FrankenError::Busy) => false,
+                Err(error) => panic!("unexpected foreign lock failure: {error}"),
+            };
+            println!("foreign-exclusive={acquired}");
+            probe.close(&cx).unwrap();
+            return;
+        }
+        let (_dir, path) = make_temp_path("bounded-repeated-opens.db");
+        let (mut owner, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        owner.lock(&cx, LockLevel::Shared).unwrap();
+        let foreign_exclusive = || {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(PROBE_PATH, &path)
+                .output()
+                .expect("execute independent kernel-lock probe");
+            assert!(output.status.success(), "foreign probe failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("foreign-exclusive="));
+            stdout.contains("foreign-exclusive=true")
+        };
+        let descriptor_count = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("inspect actual process descriptors")
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|target| target == &path)
+                .count()
+        };
+        assert!(
+            !foreign_exclusive(),
+            "initial shared lock must exclude writers"
+        );
+        let before = descriptor_count();
+        assert!(before > 0, "descriptor witness must identify the real file");
+        for _ in 0..64 {
+            let (mut reopened, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+            reopened.close(&cx).unwrap();
+        }
+        let after = descriptor_count();
+        assert!(
+            !foreign_exclusive(),
+            "repeated opens must preserve the lock"
+        );
+        owner.unlock(&cx, LockLevel::None).unwrap();
+        assert!(foreign_exclusive(), "final unlock must release the lock");
+        owner.close(&cx).unwrap();
+        assert!(
+            after <= before + 2,
+            "64 sequential opens must retain bounded descriptors: before={before}, after={after}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_descriptor_reuse_preserves_create_and_replacement_semantics() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("reuse-replacement.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut owner, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        owner.lock(&cx, LockLevel::Shared).unwrap();
+        let (mut sibling, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        sibling.close(&cx).unwrap();
+        let identity = owner.file_identity().unwrap().expect("real file identity");
+        let (mut reused, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        assert_eq!(reused.file_identity().unwrap(), Some(identity));
+        reused.close(&cx).unwrap();
+        assert!(
+            vfs.open(
+                &cx,
+                Some(&path),
+                flags | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE,
+            )
+            .is_err(),
+            "cached inode must not bypass exclusive-create refusal"
+        );
+        let original_permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let after_revocation = vfs.open(&cx, Some(&path), flags);
+        std::fs::set_permissions(&path, original_permissions).unwrap();
+        if nix::unistd::geteuid().is_root() {
+            // Root retains DAC override; ordinary root opens also succeed.
+            let (mut privileged, _) = after_revocation.unwrap();
+            privileged.close(&cx).unwrap();
+        } else {
+            assert!(
+                after_revocation.is_err(),
+                "cached descriptor must not bypass revoked read/write access"
+            );
+        }
+        let retired = path.with_extension("retired");
+        std::fs::rename(&path, &retired).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let (mut replacement, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        assert_ne!(replacement.file_identity().unwrap(), Some(identity));
+        replacement.close(&cx).unwrap();
+        owner.unlock(&cx, LockLevel::None).unwrap();
+        owner.close(&cx).unwrap();
     }
 
     #[test]

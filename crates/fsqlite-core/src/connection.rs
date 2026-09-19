@@ -20002,6 +20002,18 @@ impl Connection {
                     )
                     .await?;
                     let mut rewritten = insert.clone();
+                    if matches!(&rewritten.source, fsqlite_ast::InsertSource::Select(_))
+                        && (!rewritten.upsert.is_empty() || !rewritten.returning.is_empty())
+                        && let Some(params) = params
+                    {
+                        // The child replays materialized rows with a fresh bind
+                        // array. Resolve original-statement parameters first.
+                        bind_placeholders_in_insert_statement(
+                            &mut rewritten,
+                            &mut BindParamState::default(),
+                            params,
+                        )?;
+                    }
                     strip_attached_schema_from_insert_delegated_child_clauses(
                         &mut rewritten,
                         &target_schema,
@@ -40559,24 +40571,6 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        // bd-insert-select-returning-param-77yt5: the per-row replay
-        // (`build_insert_select_replay_sql`) stringifies RETURNING and runs it with
-        // only the inserted row's column values as params, so a RETURNING `?`
-        // (which refers to the ORIGINAL statement's bind params) would bind out of
-        // range. Resolve the RETURNING placeholders to literals here — params are
-        // available and the placeholders are already `Numbered` (once-entry
-        // canonicalize), so binding uses their global index — before the replay.
-        let resolved_insert;
-        let insert = match params {
-            Some(p) if !insert.returning.is_empty() => {
-                let mut cloned = insert.clone();
-                let mut bind_state = BindParamState::default();
-                bind_placeholders_in_result_columns(&mut cloned.returning, &mut bind_state, p)?;
-                resolved_insert = cloned;
-                &resolved_insert
-            }
-            _ => insert,
-        };
         Ok(self
             .execute_insert_select_fallback_outcome(insert, select_stmt, params)
             .await?
@@ -40589,6 +40583,25 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<InsertSelectReplayOutcome> {
+        // Per-row replay binds only materialized column values. UPSERT and
+        // RETURNING still refer to the original statement's parameter array,
+        // so resolve them before replay can alias an index or reject it. The
+        // shared binder preserves global numbering across the source and both
+        // trailing clauses, including named and explicitly numbered parameters.
+        let resolved_insert;
+        let insert = match params {
+            Some(params) if !insert.upsert.is_empty() || !insert.returning.is_empty() => {
+                let mut cloned = insert.clone();
+                bind_placeholders_in_insert_statement(
+                    &mut cloned,
+                    &mut BindParamState::default(),
+                    params,
+                )?;
+                resolved_insert = cloned;
+                &resolved_insert
+            }
+            _ => insert,
+        };
         let preserve_constraint_failure_rows =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         // bd-5bq6u: INSERT ... SELECT does not reach the `_with_db` statement
