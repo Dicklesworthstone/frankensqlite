@@ -116,6 +116,16 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
                 "CREATE INDEX by_owner_category ON items(owner, category);",
             )
             .await;
+            // Force the backfilled secondary index too: a direct PK route
+            // must not conceal malformed row locators in that index.
+            compare(
+                &conn,
+                &oracle,
+                "SELECT ordinal FROM items INDEXED BY by_owner_category
+                 WHERE owner='group' AND ordinal=511 LIMIT 1",
+                1,
+            )
+            .await;
             set_hot_path_profile_enabled(true);
             let guard = ProfileGuard;
             let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
@@ -150,6 +160,47 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
             );
             assert!((1..512).contains(&point_ops), "full-PK scan: {point_ops}");
             assert!(scan_ops > 512 && scan_ops > point_ops);
+            for (sql, expected) in [
+                (
+                    "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 AND category='middle' LIMIT 1",
+                    1,
+                ),
+                (
+                    "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 AND category='other' LIMIT 1",
+                    0,
+                ),
+                (
+                    "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 AND ordinal=510 LIMIT 1",
+                    0,
+                ),
+                (
+                    "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 LIMIT 0",
+                    0,
+                ),
+                (
+                    "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 LIMIT 1 OFFSET 1",
+                    0,
+                ),
+            ] {
+                compare(&conn, &oracle, sql, expected).await;
+            }
+            execute_both(
+                &conn,
+                &oracle,
+                "CREATE UNIQUE INDEX by_reordered_pk ON items(ordinal,owner);
+                 CREATE INDEX by_owner_nocase ON items(owner COLLATE NOCASE,category);
+                 CREATE INDEX by_owner_expression ON items(owner,lower(category))
+                    WHERE ordinal>=0;",
+            )
+            .await;
+            for sql in [
+                "SELECT ordinal FROM items INDEXED BY by_reordered_pk
+                 WHERE ordinal=511 AND owner='group'",
+                "SELECT ordinal FROM items INDEXED BY by_owner_expression
+                 WHERE owner='group' AND ordinal>=0 AND ordinal=511",
+            ] {
+                compare(&conn, &oracle, sql, 1).await;
+            }
 
             // Checking only the minimum would incorrectly suppress this row.
             execute_both(
@@ -297,6 +348,15 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
             assert!((1..512).contains(&trigger_costs[0]), "{trigger_costs:?}");
             assert!(trigger_costs[1] > 512 && trigger_costs[1] > trigger_costs[0]);
             conn.close().await.expect("close engine connection");
+            let reopened = rusqlite::Connection::open(&path).expect("stock reopen");
+            let integrity = reopened
+                .prepare("PRAGMA integrity_check")
+                .expect("prepare integrity")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("integrity query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("integrity rows");
+            assert_eq!(integrity, ["ok"], "stock reopen {suffix:?}");
         }
     });
 }
