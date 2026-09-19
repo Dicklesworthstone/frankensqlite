@@ -85,6 +85,58 @@ unbounded recovery sweep. `cancel(id)` cancels ready or leased work and fences
 its handler; terminal states are not overwritten. `get(id)` reads current
 state without exposing the token.
 
+`stats()` reads actual SQL state counts in a single transaction. It reports
+ready, leased, completed, dead and cancelled totals, plus currently available
+ready jobs and expired leases. An expired lease remains `leased` until reclaimed
+or reaped; these counts do not fabricate a state transition. This is an explicit
+queue scan, not an inexpensive scheduler counter or an engine-health check.
+
+## Atomic application handoffs
+
+Do not commit an application change and only then enqueue the corresponding
+work: a crash between those operations can lose the job. `enqueueWith` writes
+both in one transaction. A duplicate stable id skips the callback and returns
+`inserted: false, value: undefined`; a conflicting job definition rejects before
+the callback runs.
+
+```ts
+const submitted = await jobs.enqueueWith(
+  { id: 'document:123:v4', payload: JSON.stringify({ documentId: 123 }) },
+  async tx => {
+    await tx.execute('UPDATE documents SET body = ? WHERE id = ?', ['new text', 123]);
+    return 123;
+  },
+);
+// submitted.value is 123 for a new job, undefined for a duplicate.
+```
+
+Likewise, `completeWith` couples a current lease's completion with its database
+effects. It conditionally writes the ownership row before calling application
+code and checks the persisted lease again after the callback. A stale lease
+never runs the callback. Callback failure, SQL error or expiry detected by the
+second check rolls back **all** SQL in that transaction, including application
+effects. The returned promise resolves to the callback value only after the
+host commits.
+
+```ts
+const lease = await jobs.claim('worker-7');
+if (lease !== null) {
+  // Parse, compute and contact other systems OUTSIDE the transaction.
+  await jobs.completeWith(lease, async tx => {
+    await tx.execute('INSERT INTO indexed_documents(job_id) VALUES (?)', [lease.id]);
+    return lease.id;
+  }, 'indexed');
+}
+```
+
+Both callbacks must use only the supplied transaction, await all their SQL and
+not retain the transaction after return. Never call `jobs.*` or the owning
+`FrankenDBQueue` from inside a callback; that would queue a sibling behind the
+transaction waiting for it. Do not perform external side effects in these
+callbacks: transaction rollback cannot undo them. Normal commit contention and
+committed-but-unacknowledged publication errors propagate unchanged, without
+automatic callback replay. Reconcile an unknown outcome before retrying.
+
 The reserved SQL table is `__fsqlite_durable_jobs_v1`, exported as
 `DURABLE_JOBS_TABLE`; its two indexes support eligibility and expiry scans.
 The schema is installed transactionally. Application SQL must not change its
@@ -94,7 +146,8 @@ schema or bypass state transitions.
 
 The Node suite executes this production module against actual SQLite, including
 on-disk reopen, expiry boundaries, ABA fencing, retry exhaustion, bounded
-reaping, cancellation, input capture and committed-but-unacknowledged errors:
+reaping, cancellation, input capture, transactional outbox/completion rollback,
+live SQL diagnostics and committed-but-unacknowledged errors:
 
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \

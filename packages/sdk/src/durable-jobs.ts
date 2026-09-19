@@ -67,6 +67,37 @@ export interface DurableJobLease {
   readonly expiresAt: number;
 }
 
+export interface DurableEnqueueResult {
+  readonly inserted: boolean;
+  readonly job: DurableJob;
+}
+
+export interface DurableEnqueueWorkResult<T> extends DurableEnqueueResult {
+  /** Undefined on deduplication: application work never ran again. */
+  readonly value: T | undefined;
+}
+
+export interface DurableJobStats {
+  readonly ready: number;
+  readonly leased: number;
+  readonly completed: number;
+  readonly dead: number;
+  readonly cancelled: number;
+  /** Ready jobs whose schedule has arrived, with attempts remaining. */
+  readonly available: number;
+  /** Leased jobs whose deadline has passed, including exhausted attempts. */
+  readonly expired: number;
+  readonly total: number;
+}
+
+interface CapturedJob {
+  readonly id: string;
+  readonly payload: string;
+  readonly priority: number;
+  readonly availableAt: number | undefined;
+  readonly maxAttempts: number;
+}
+
 export class DurableJobError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
@@ -121,28 +152,23 @@ export class DurableJobQueue {
   }
 
   /** A duplicate id returns its original job; conflicting input is rejected. */
-  async enqueue(input: EnqueueJob): Promise<{ readonly inserted: boolean; readonly job: DurableJob }> {
-    // Capture all caller-owned properties before yielding to queue admission.
-    const { id, payload, priority = 0, availableAt, maxAttempts = 3 } = input;
-    identifier(id, "job id"); text(payload, "payload");
-    integer(priority, "priority", -2_147_483_648, 2_147_483_647);
-    integer(maxAttempts, "maxAttempts", 1, 1_000_000);
-    if (availableAt !== undefined) integer(availableAt, "availableAt");
+  async enqueue(input: EnqueueJob): Promise<DurableEnqueueResult> {
+    const captured = captureJob(input);
+    return this.#db.transaction(tx => this.#enqueueIn(tx, captured));
+  }
+
+  /**
+   * Transactional outbox: application SQL and the new job commit together.
+   * Duplicate ids never rerun work. Use only tx inside work, await all SQL,
+   * and do not perform external side effects or reenter this queue.
+   */
+  async enqueueWith<T>(input: EnqueueJob, work: (tx: DurableJobTransaction) => Promise<T>): Promise<DurableEnqueueWorkResult<T>> {
+    const captured = captureJob(input);
+    if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     return this.#db.transaction(async tx => {
-      const now = this.#now();
-      const scheduled = availableAt ?? now;
-      const inserted = await tx.execute(`INSERT INTO ${TABLE}
-        (queue_name,job_id,payload,state,priority,scheduled_at,available_at,attempts,max_attempts,created_at,updated_at)
-        VALUES (?,?,?,'ready',?,?,?,0,?,?,?) ON CONFLICT(queue_name,job_id) DO NOTHING`,
-        [this.name, id, payload, priority, scheduled, scheduled, maxAttempts, now, now]);
-      const row = await this.#row(tx, id);
-      if (row === null) throw corrupt("Enqueued job is missing");
-      const job = decodeJob(row);
-      if (job.payload !== payload || job.priority !== priority || job.maxAttempts !== maxAttempts ||
-          (availableAt !== undefined && number(row, "scheduled_at") !== availableAt)) {
-        throw new DurableJobError("ERR_FSQLITE_JOB_ID_CONFLICT", "Job id already identifies different input");
-      }
-      return Object.freeze({ inserted: inserted === 1, job });
+      const result = await this.#enqueueIn(tx, captured);
+      const value = result.inserted ? await work(tx) : undefined;
+      return Object.freeze({ ...result, value });
     });
   }
 
@@ -198,12 +224,77 @@ export class DurableJobQueue {
   async complete(lease: DurableJobLease, result: string | null = null): Promise<void> {
     const keys = this.#keys(lease);
     if (result !== null) text(result, "result");
-    await this.#db.transaction(async tx => {
+    await this.#db.transaction(tx => this.#completeIn(tx, keys, result));
+  }
+
+  /**
+   * Fence BEFORE application SQL, then check expiry again AFTER it. All SQL
+   * effects and completion commit together, or all roll back. Compute outside
+   * this callback; never do external I/O or call another queue method inside it.
+   * The host's committed-but-unacknowledged errors propagate without replay.
+   */
+  async completeWith<T>(lease: DurableJobLease, work: (tx: DurableJobTransaction) => Promise<T>, result: string | null = null): Promise<T> {
+    const keys = this.#keys(lease);
+    if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
+    if (result !== null) text(result, "result");
+    return this.#db.transaction(async tx => {
       const now = this.#now();
-      this.#changed(await tx.execute(`UPDATE ${TABLE} SET state = 'completed', result = ?, updated_at = ?,
-        lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE ${fence()}`,
-        [result, now, ...keys, now]));
+      // A conditional write, not an unlocked preflight read: competing claims
+      // must conflict with this transaction on the ownership row.
+      this.#changed(await tx.execute(`UPDATE ${TABLE} SET updated_at = ? WHERE ${fence()}`, [now, ...keys, now]));
+      const value = await work(tx);
+      await this.#completeIn(tx, keys, result);
+      return value;
     });
+  }
+
+  /** Live SQL counts in a single snapshot, not scheduler counters. */
+  async stats(): Promise<DurableJobStats> {
+    return this.#db.transaction(async tx => {
+      const now = this.#now();
+      const rows = (await tx.query(`SELECT state, COUNT(*) AS n,
+        SUM(CASE WHEN state = 'ready' AND available_at <= ? AND attempts < max_attempts THEN 1 ELSE 0 END) AS available,
+        SUM(CASE WHEN state = 'leased' AND lease_expires_at <= ? THEN 1 ELSE 0 END) AS expired
+        FROM ${TABLE} WHERE queue_name = ? GROUP BY state`, [now, now, this.name])).rows;
+      const counts = { ready: 0, leased: 0, completed: 0, dead: 0, cancelled: 0, available: 0, expired: 0, total: 0 };
+      for (const row of rows) {
+        const state = jobState(row);
+        const count = number(row, "n");
+        counts[state] = count;
+        counts.available += number(row, "available");
+        counts.expired += number(row, "expired");
+        counts.total += count;
+      }
+      for (const value of Object.values(counts)) {
+        if (!Number.isSafeInteger(value) || value < 0) throw corrupt("Invalid job count");
+      }
+      return Object.freeze(counts);
+    });
+  }
+
+  async #completeIn(tx: DurableJobTransaction, keys: readonly Parameter[], result: string | null): Promise<void> {
+    const now = this.#now();
+    this.#changed(await tx.execute(`UPDATE ${TABLE} SET state = 'completed', result = ?, updated_at = ?,
+      lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE ${fence()}`,
+      [result, now, ...keys, now]));
+  }
+
+  async #enqueueIn(tx: DurableJobTransaction, input: CapturedJob): Promise<DurableEnqueueResult> {
+    const { id, payload, priority, availableAt, maxAttempts } = input;
+    const now = this.#now();
+    const scheduled = availableAt ?? now;
+    const inserted = await tx.execute(`INSERT INTO ${TABLE}
+      (queue_name,job_id,payload,state,priority,scheduled_at,available_at,attempts,max_attempts,created_at,updated_at)
+      VALUES (?,?,?,'ready',?,?,?,0,?,?,?) ON CONFLICT(queue_name,job_id) DO NOTHING`,
+      [this.name, id, payload, priority, scheduled, scheduled, maxAttempts, now, now]);
+    const row = await this.#row(tx, id);
+    if (row === null) throw corrupt("Enqueued job is missing");
+    const job = decodeJob(row);
+    if (job.payload !== payload || job.priority !== priority || job.maxAttempts !== maxAttempts ||
+        (availableAt !== undefined && number(row, "scheduled_at") !== availableAt)) {
+      throw new DurableJobError("ERR_FSQLITE_JOB_ID_CONFLICT", "Job id already identifies different input");
+    }
+    return Object.freeze({ inserted: inserted === 1, job });
   }
 
   /** Release to a delayed retry, or dead-letter the final attempt. */
@@ -277,6 +368,16 @@ function fence(): string {
   return "queue_name = ? AND job_id = ? AND lease_owner = ? AND lease_token = ? AND attempts = ? AND state = 'leased' AND lease_expires_at > ?";
 }
 
+function captureJob(input: EnqueueJob): CapturedJob {
+  // Capture caller-owned getters once, before queue admission can yield.
+  const { id, payload, priority = 0, availableAt, maxAttempts = 3 } = input;
+  identifier(id, "job id"); text(payload, "payload");
+  integer(priority, "priority", -2_147_483_648, 2_147_483_647);
+  integer(maxAttempts, "maxAttempts", 1, 1_000_000);
+  if (availableAt !== undefined) integer(availableAt, "availableAt");
+  return { id, payload, priority, availableAt, maxAttempts };
+}
+
 function identifier(value: string, label: string): void {
   if (typeof value !== "string" || value.length === 0 || value.length > 256 || value.includes("\0")) {
     throw new TypeError(`${label} must be a nonempty string of at most 256 characters without NUL`);
@@ -312,11 +413,14 @@ function number(row: SqlRow, key: string): number {
   return value;
 }
 function nullableString(row: SqlRow, key: string): string | null { return row[key] === null ? null : string(row, key); }
-function decodeJob(row: SqlRow): DurableJob {
+function jobState(row: SqlRow): DurableJobState {
   const state = string(row, "state");
   if (!["ready", "leased", "completed", "dead", "cancelled"].includes(state)) throw corrupt("Invalid job state");
+  return state as DurableJobState;
+}
+function decodeJob(row: SqlRow): DurableJob {
   return Object.freeze({ id: string(row, "job_id"), queue: string(row, "queue_name"), payload: string(row, "payload"),
-    state: state as DurableJobState, priority: number(row, "priority"), availableAt: number(row, "available_at"),
+    state: jobState(row), priority: number(row, "priority"), availableAt: number(row, "available_at"),
     attempts: number(row, "attempts"), maxAttempts: number(row, "max_attempts"), owner: nullableString(row, "lease_owner"),
     leaseExpiresAt: row.lease_expires_at === null ? null : number(row, "lease_expires_at"),
     createdAt: number(row, "created_at"), updatedAt: number(row, "updated_at"),

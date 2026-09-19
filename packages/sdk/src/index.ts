@@ -40,4 +40,4 @@ export type { CommittedTableChange, TableChangeListener, TableChangeStream, Tabl
 export { watchQuery } from "./live-query";
 export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";
 export { DurableJobQueue, DurableJobError, DURABLE_JOBS_TABLE } from "./durable-jobs";
-export type { DurableJobDatabase, DurableJobTransaction, DurableJobQueueOptions, EnqueueJob, DurableJobState, DurableJob, DurableJobLease } from "./durable-jobs";
+export type { DurableJobDatabase, DurableJobTransaction, DurableJobQueueOptions, EnqueueJob, DurableJobState, DurableJob, DurableJobLease, DurableEnqueueResult, DurableEnqueueWorkResult, DurableJobStats } from "./durable-jobs";

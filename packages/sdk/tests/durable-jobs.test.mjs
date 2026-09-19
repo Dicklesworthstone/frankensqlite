@@ -344,3 +344,212 @@ test('jobs, results, and outstanding leases survive a real file close/reopen', a
   await queue.complete(recovered);
   assert.deepEqual(db.sql.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check), ['ok']);
 });
+
+test('enqueueWith commits application writes and the outbox entry together', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec('CREATE TABLE documents(id TEXT PRIMARY KEY, body TEXT NOT NULL)');
+  const result = await queue.enqueueWith(job('index:one'), async tx => {
+    await tx.execute('INSERT INTO documents VALUES (?,?)', ['one', 'original']);
+    const rows = (await tx.query('SELECT body FROM documents WHERE id=?', ['one'])).rows;
+    return rows[0].body;
+  });
+  assert.equal(result.inserted, true);
+  assert.equal(result.value, 'original');
+  assert.equal(result.job.state, 'ready');
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM documents').get().n, 1);
+  assert.equal((await queue.get('index:one')).state, 'ready');
+});
+
+test('enqueueWith rolls back every application write and the job on callback failure', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec('CREATE TABLE documents(id TEXT PRIMARY KEY, body TEXT NOT NULL)');
+  const failure = new Error('application write failed');
+  await assert.rejects(queue.enqueueWith(job('index:one'), async tx => {
+    await tx.execute('INSERT INTO documents VALUES (?,?)', ['one', 'original']);
+    throw failure;
+  }), error => error === failure);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM documents').get().n, 0);
+  assert.equal(await queue.get('index:one'), null);
+  assert.equal((await queue.enqueue(job('index:one'))).inserted, true);
+});
+
+test('enqueueWith deduplication never repeats application work, including terminal jobs', async t => {
+  const { queue } = await fixture(t);
+  let calls = 0;
+  const work = async () => ++calls;
+  assert.equal((await queue.enqueueWith(job('one'), work)).value, 1);
+  let duplicate = await queue.enqueueWith(job('one'), work);
+  assert.equal(duplicate.inserted, false);
+  assert.equal(duplicate.value, undefined);
+  await queue.complete(await queue.claim('worker'));
+  duplicate = await queue.enqueueWith(job('one'), work);
+  assert.equal(duplicate.job.state, 'completed');
+  assert.equal(duplicate.value, undefined);
+  await assert.rejects(queue.enqueueWith(job('one', { payload: 'new input' }), work),
+    { code: 'ERR_FSQLITE_JOB_ID_CONFLICT' });
+  assert.equal(calls, 1);
+});
+
+test('lost enqueueWith commit receipt does not justify replaying the application callback', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  let calls = 0;
+  const work = async tx => {
+    calls++;
+    await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+    return 'created';
+  };
+  const failure = new Error('checkpoint was committed but its receipt was lost');
+  failure.sqlCommitted = true;
+  db.postCommitFailure = failure;
+  await assert.rejects(queue.enqueueWith(job('one'), work), error => error === failure);
+  const duplicate = await queue.enqueueWith(job('one'), work);
+  assert.equal(duplicate.inserted, false);
+  assert.equal(duplicate.value, undefined);
+  assert.equal(calls, 1);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 1);
+});
+
+test('completeWith atomically commits application SQL, result and completion', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+  await queue.enqueue(job('one'));
+  const lease = await queue.claim('worker');
+  const value = await queue.completeWith(lease, async tx => {
+    await tx.execute('INSERT INTO effects VALUES (?,?)', ['one', 17]);
+    return (await tx.query('SELECT value FROM effects WHERE id=?', ['one'])).rows[0].value;
+  }, 'indexed');
+  assert.equal(value, 17);
+  const saved = await queue.get('one');
+  assert.equal(saved.state, 'completed');
+  assert.equal(saved.result, 'indexed');
+  assert.equal(saved.owner, null);
+  assert.equal(db.sql.prepare('SELECT value FROM effects').get().value, 17);
+});
+
+test('completeWith fences stale and expired receipts before running the callback', async t => {
+  const { queue, time } = await fixture(t);
+  await queue.enqueue(job('one'));
+  const first = await queue.claim('worker', 10);
+  let calls = 0;
+  const work = async () => ++calls;
+  time(1010);
+  await assert.rejects(queue.completeWith(first, work), lost);
+  const current = await queue.claim('worker', 10);
+  await assert.rejects(queue.completeWith(first, work), lost);
+  await queue.cancel('one');
+  await assert.rejects(queue.completeWith(current, work), lost);
+  assert.equal(calls, 0);
+});
+
+test('completeWith callback failure rolls back writes and leaves the current lease usable', async t => {
+  const { db, queue, time } = await fixture(t);
+  db.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await queue.enqueue(job('one'));
+  const lease = await queue.claim('worker', 100);
+  const before = await queue.get('one');
+  time(1010);
+  const failure = new Error('application failed');
+  await assert.rejects(queue.completeWith(lease, async tx => {
+    await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+    throw failure;
+  }), error => error === failure);
+  assert.deepEqual(await queue.get('one'), before);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+  await queue.completeWith(lease, async tx => tx.execute('INSERT INTO effects VALUES (?)', ['one']));
+  assert.equal((await queue.get('one')).state, 'completed');
+});
+
+test('completeWith rechecks lease expiry after application SQL and undoes all effects', async t => {
+  const { db, queue, time } = await fixture(t);
+  db.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await queue.enqueue(job('one'));
+  const lease = await queue.claim('worker', 10);
+  await assert.rejects(queue.completeWith(lease, async tx => {
+    await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+    time(1010);
+  }), lost);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 0);
+  assert.equal((await queue.get('one')).state, 'leased');
+  const reclaimed = await queue.claim('other');
+  assert.equal(reclaimed.attempt, 2);
+  await queue.completeWith(reclaimed, async tx => tx.execute('INSERT INTO effects VALUES (?)', ['one']));
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 1);
+});
+
+test('lost completeWith commit receipt propagates and an old lease cannot repeat SQL', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec('CREATE TABLE effects(id TEXT PRIMARY KEY)');
+  await queue.enqueue(job('one'));
+  const lease = await queue.claim('worker');
+  let calls = 0;
+  const work = async tx => {
+    calls++;
+    await tx.execute('INSERT INTO effects VALUES (?)', ['one']);
+  };
+  const failure = new Error('committed checkpoint acknowledgement lost');
+  failure.sqlCommitted = true;
+  db.postCommitFailure = failure;
+  await assert.rejects(queue.completeWith(lease, work), error => error === failure);
+  assert.equal((await queue.get('one')).state, 'completed');
+  await assert.rejects(queue.completeWith(lease, work), lost);
+  assert.equal(calls, 1);
+  assert.equal(db.sql.prepare('SELECT COUNT(*) AS n FROM effects').get().n, 1);
+});
+
+test('callback methods validate before transaction admission and capture lease identity', async t => {
+  const { db, queue } = await fixture(t);
+  await queue.enqueue(job('one'));
+  const lease = { ...await queue.claim('worker') };
+  const calls = db.calls;
+  await assert.rejects(queue.enqueueWith(job('two'), null), TypeError);
+  await assert.rejects(queue.completeWith(lease, null), TypeError);
+  await assert.rejects(queue.completeWith(lease, async () => {}, 'x'.repeat(1024 * 1024 + 1)), RangeError);
+  assert.equal(db.calls, calls);
+  let release;
+  db.beforeStart = () => new Promise(resolve => { release = resolve; });
+  const pending = queue.completeWith(lease, async () => 'done');
+  await Promise.resolve();
+  lease.token = 'caller-mutated'; lease.id = 'changed';
+  db.beforeStart = null;
+  release();
+  assert.equal(await pending, 'done');
+  assert.equal((await queue.get('one')).state, 'completed');
+});
+
+test('SQL diagnostics distinguish scheduled work, expired claims and terminal states', async t => {
+  const { db, queue, clock, time } = await fixture(t);
+  const zero = { ready: 0, leased: 0, completed: 0, dead: 0, cancelled: 0, available: 0, expired: 0, total: 0 };
+  assert.deepEqual(await queue.stats(), zero);
+  const other = await DurableJobQueue.open(db, 'other', { clock });
+  await other.enqueue(job('other'));
+  for (const id of ['completed', 'dead', 'expired', 'live']) {
+    await queue.enqueue(job(id, { maxAttempts: 1 }));
+    const lease = await queue.claim('worker', id === 'live' ? 100 : 10);
+    if (id === 'completed') await queue.complete(lease);
+    if (id === 'dead') await queue.fail(lease, 'terminal failure');
+  }
+  await queue.enqueue(job('cancelled'));
+  await queue.cancel('cancelled');
+  await queue.enqueue(job('scheduled', { availableAt: 2000 }));
+  await queue.enqueue(job('available'));
+  time(1010);
+  const counts = await queue.stats();
+  assert.deepEqual(counts, { ready: 2, leased: 2, completed: 1, dead: 1, cancelled: 1, available: 1, expired: 1, total: 7 });
+  assert.equal(Object.isFrozen(counts), true);
+  assert.equal(await queue.reapExpired(), 1);
+  assert.deepEqual(await queue.stats(), { ...counts, leased: 1, dead: 2, expired: 0 });
+  assert.deepEqual(await other.stats(), { ...zero, ready: 1, available: 1, total: 1 });
+});
+
+test('SQL constraint failure rolls back application effects and the new outbox job', async t => {
+  const { db, queue } = await fixture(t);
+  db.sql.exec("CREATE TABLE effects(id TEXT PRIMARY KEY); INSERT INTO effects VALUES ('existing')");
+  await assert.rejects(queue.enqueueWith(job('one'), async tx => {
+    await tx.execute('INSERT INTO effects VALUES (?)', ['new']);
+    await tx.execute('INSERT INTO effects VALUES (?)', ['existing']);
+  }));
+  assert.deepEqual(db.sql.prepare('SELECT id FROM effects ORDER BY id').all().map(row => row.id), ['existing']);
+  assert.equal(await queue.get('one'), null);
+});
