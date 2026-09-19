@@ -182,6 +182,45 @@ These Rust tests were added but were **not executed in the authoring environment
 The separately executed SQLite image-oracle model is not a Rust, native-lock,
 RaptorQ-decoder, or cross-platform runtime acceptance result.
 
+## Repair an existing WAL (Unix, explicit opt-in)
+
+```bash
+cargo run --locked -p fsqlite-wal --bin fsqlite-recover -- \
+  --repair-wal damaged.db original-damaged.wal
+```
+
+Export remains the default. With `--repair-wal`, the second path is a mandatory
+**new backup of the original WAL bytes**, not a recovered database. It must not
+exist or be a companion path of the source. The backup is exclusively created,
+synchronized, read back byte-for-byte and parent-directory-synchronized before
+any source WAL write. Preserve the original main/FEC/certificate set as well;
+the WAL backup by itself is not a complete database backup.
+
+Repair keeps the existing native recovery fences from input capture through
+decoding, physical writes, full WAL readback and shared-index publication.
+The blocking task owns the descriptors: dropping its awaiter cannot release
+source locks while synchronous writes are running. Cancellation is checked
+before source mutation and masked through settlement. Only differing committed
+frames are written. The WAL inode, generation header, length, intact frames and
+validated uncommitted suffix remain unchanged. Main, FEC and certificate data
+are not written. No WAL reset, checkpoint, file replacement or deletion occurs.
+
+Both shared-index headers are invalidated before repair writes. After WAL sync
+and exact readback, all required index regions are rebuilt, recovery marks are
+reset and the new index header is published last. A failed physical write or
+readback attempts to restore, synchronize and verify the original WAL. Failed
+restoration is explicitly reported as **indeterminate**; retain the backup and
+do not use the source. Index-publication failure leaves an invalid derived
+header for subsequent recovery, not an advertised partial index. Failed backup
+or recovery validation never authorizes source WAL mutation.
+
+This mode requires a cooperative trusted source namespace and refuses active
+reader/writer contention. It is administrative repair, **not automatic FEC
+repair during `Connection::open`**. Run `PRAGMA integrity_check` after successful
+repair; this command does not certify untouched main-file B-tree pages. The
+Rust/native execution tests for this mode have not run in the authoring
+environment; independent publication models do not establish runtime acceptance.
+
 ## Dependencies
 
 - `fsqlite-types` -- Shared type definitions.
