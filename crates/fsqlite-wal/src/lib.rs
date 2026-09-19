@@ -11,7 +11,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | Batch shape + serialization | `prepare_frame_bytes_with_transforms_into` | Frame-count mismatch, page-size mismatch, `frame_count * frame_size` overflow, salt/checksum helper failure while constructing transforms | `WalCorrupt`, `DatabaseFull`, or helper error | WAL file and in-memory WAL counters stay unchanged; caller-owned scratch may contain partial serialized bytes |
 //! | Append-window validation | `prepared_append_window_still_current` | File size changed, generation header changed, short header read, header parse failure | `Ok(false)` for stale window; `WalCorrupt` / parse error for malformed WAL | No append occurs; caller must rebuild from the new seed or treat the WAL as corrupt |
-//! | Checksum finalization | `finalize_prepared_frame_bytes` | Prepared buffer length mismatch, `frame_count * frame_size` overflow, salt/checksum write failure | `WalCorrupt`, `DatabaseFull`, or checksum helper error | No on-disk mutation; caller buffer may have partially rewritten checksum fields |
+//! | Checksum finalization | `finalize_prepared_frame_bytes` | Prepared buffer length mismatch, `frame_count * frame_size` overflow, salt/checksum write failure, finalized append failure, test-only after-append injected fault | `WalCorrupt`, `DatabaseFull`, or checksum helper error | No on-disk mutation; caller buffer may have partially rewritten checksum fields |
 //! | Durable byte append | `append_finalized_prepared_frame_bytes` | Frame-count overflow, prepared buffer length mismatch, VFS `write` failure, post-write state advance overflow guard | `DatabaseFull`, `WalCorrupt`, or VFS error | Pre-write validation faults leave WAL state unchanged; a write failure happens before `advance_state_after_write`, so in-memory counters do not advance even though the on-disk tail may need replay/validation |
 //! | One-shot prepared append | `append_prepared_frame_bytes` | Any finalization fault plus any finalized-append fault | Propagated error from the lower stage | Same guarantees as the composed lower layers: no publish on finalize failure; write-path faults may leave an untrusted tail that recovery must trim or validate |
 //! | Fused batched append | `append_frames` | Test/fault-injection busy hook, page-size mismatch in any frame, batch-size overflow, salt/checksum helper failure, finalized append failure, test-only after-append injected fault | `Busy`, `WalCorrupt`, `DatabaseFull`, helper error, or injected test fault | Assembly faults leave `frame_scratch` restored and counters unchanged; an after-append injected fault is special because bytes/state may already be advanced even though the function returns `Err` |
@@ -32,6 +32,8 @@ pub mod fault_hooks;
 pub mod group_commit;
 pub mod metrics;
 pub mod native_commit;
+#[cfg(all(feature = "native", not(target_arch = "wasm32"), any(unix, windows)))]
+pub mod native_recovery;
 pub mod parallel_wal;
 pub mod per_core_buffer;
 pub mod recovery_compaction;

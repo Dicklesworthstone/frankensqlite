@@ -14,15 +14,15 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_vfs::{ShmRegion, Vfs, VfsFile, host_fs};
-use fsqlite_wal::wal_fec::replay::recover_wal_fec_image_with_certificates;
-use fsqlite_wal::wal_index::{
+use crate::wal_fec::replay::recover_wal_fec_image_with_certificates;
+use crate::wal_index::{
     WAL_INDEX_VERSION, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation, WalIndexHdr,
     append_native_wal_index_entry, invalidate_shared_wal_index_header,
     publish_shared_wal_index_header, read_shared_wal_index_header,
     replace_shared_wal_index_region, reset_shared_wal_index_recovery_marks,
     validate_shared_wal_index_wal_binding,
 };
-use fsqlite_wal::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader};
+use crate::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader};
 
 use super::{
     CapturedSource, ExportReport, IO_CHUNK, NativeVfs, Options, Snapshot, SourceFile,
