@@ -59,8 +59,8 @@ impl CollationFunction for BinaryCollation {
 /// NOCASE collation: ASCII case-insensitive comparison.
 ///
 /// Only folds ASCII letters (`A-Z` → `a-z`). Non-ASCII bytes are compared
-/// as-is. A shared NUL terminates byte comparison; otherwise equal strings
-/// are ordered by their original byte lengths, including any NUL suffix.
+/// as-is. A shared NUL terminates byte comparison; equal prefixes are then
+/// ordered by their original byte lengths, including any NUL suffix.
 /// For full Unicode case folding, use the ICU extension (§14.6).
 pub struct NoCaseCollation;
 
@@ -70,9 +70,10 @@ impl CollationFunction for NoCaseCollation {
     }
 
     fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
-        // SQLite's NOCASE uses sqlite3_strnicmp followed by a length tie-break.
-        // Uppercasing preserves letter equality but reverses ordering against
-        // punctuation in the ASCII gap between 'Z' and 'a'.
+        // SQLite's NOCASE uses sqlite3_strnicmp followed by a full-length
+        // tie-break. Uppercasing preserves letter equality but reverses
+        // ordering against punctuation in the ASCII gap between 'Z' and 'a'
+        // (`[` through '`').
         for (&l, &r) in left.iter().zip(right) {
             let order = l.to_ascii_lowercase().cmp(&r.to_ascii_lowercase());
             if order != Ordering::Equal {
