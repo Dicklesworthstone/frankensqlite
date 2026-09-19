@@ -26,6 +26,9 @@ const BUSY_TIMEOUT_MS: u64 = 4_000;
 const MIN_LEGAL_REFUSAL_MS: u128 = (BUSY_TIMEOUT_MS / 2) as u128;
 const WRITER_RUN_SECS: u64 = 8;
 
+/// How many BEGINs succeeded, and `(elapsed_ms, message)` for each one refused.
+type BeginMeasurements = (u64, Vec<(u128, String)>);
+
 #[test]
 fn begin_under_checkpoint_contention_spends_busy_timeout_before_refusing() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -74,7 +77,7 @@ fn begin_under_checkpoint_contention_spends_busy_timeout_before_refusing() {
 
     // `run_test` requires the future to resolve to `()`, so the measurements
     // come back through shared state rather than as a return value.
-    let measured: Arc<Mutex<(u64, Vec<(u128, String)>)>> = Arc::new(Mutex::new((0, Vec::new())));
+    let measured: Arc<Mutex<BeginMeasurements>> = Arc::new(Mutex::new((0, Vec::new())));
 
     let writer = {
         let p = path.clone();
