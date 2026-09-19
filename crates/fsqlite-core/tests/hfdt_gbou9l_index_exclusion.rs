@@ -361,5 +361,31 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
                 .expect("integrity rows");
             assert_eq!(integrity, ["ok"], "stock reopen {suffix:?}");
         }
+
+        // The column's BINARY collation does not describe this table-level
+        // NOCASE PK. Keep its separate BINARY index key and NOCASE PK suffix.
+        let dir = tempfile::tempdir().expect("override tempdir");
+        let path = dir.path().join("pk-collation-override.db");
+        let stock = rusqlite::Connection::open(&path).expect("stock producer");
+        stock
+            .execute_batch(
+                "CREATE TABLE overridden(owner TEXT,ordinal INTEGER,category TEXT,
+                 PRIMARY KEY(owner COLLATE NOCASE,ordinal)) WITHOUT ROWID;
+                 INSERT INTO overridden VALUES ('group',0,'value'),('group',1,'value');",
+            )
+            .expect("stock schema and rows");
+        stock.close().expect("close stock");
+        let conn = Connection::open(path.to_string_lossy())
+            .await
+            .expect("open overridden PK");
+        conn.execute("CREATE INDEX separate_collations ON overridden(owner,category)")
+            .await
+            .expect("backfill overridden PK index");
+        conn.close().await.expect("close overridden PK");
+        let stock = rusqlite::Connection::open(&path).expect("stock reopen override");
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("override integrity");
+        assert_eq!(integrity, "ok");
     });
 }

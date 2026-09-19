@@ -65285,12 +65285,19 @@ impl Connection {
         let (idx_col_positions, key_exprs, where_expr) =
             self.bind_index_runtime_dependencies(table, index)?;
         let columns_label = index.key_label_qualified(&table.name);
+        // The compact schema does not retain table-level PK collation
+        // overrides. Only deduplicate when the original DDL proves the PK
+        // layout; retain the existing backfill path for other shapes.
+        let deduplicate_pk = self
+            .table_execution_metadata()
+            .wr_binary_ascending_roots
+            .contains(&table.root_page);
 
         self.with_codegen_function_context(|| {
             Self::compile_index_backfill(
                 table,
                 index,
-                index.root_page,
+                deduplicate_pk,
                 &idx_col_positions,
                 &key_exprs,
                 index.is_unique,
@@ -66321,7 +66328,7 @@ impl Connection {
     fn compile_index_backfill(
         table: &TableSchema,
         index: &IndexSchema,
-        index_root: i32,
+        deduplicate_pk: bool,
         idx_col_positions: &[usize],
         key_exprs: &[Expr],
         is_unique: bool,
@@ -66338,7 +66345,13 @@ impl Connection {
             .without_rowid
             .then(|| {
                 without_rowid_pk_indices(table)
-                    .map(|pk| without_rowid_index_appended_pk(table, index, &pk))
+                    .map(|pk| {
+                        if deduplicate_pk {
+                            without_rowid_index_appended_pk(table, index, &pk)
+                        } else {
+                            pk
+                        }
+                    })
                     .map_err(codegen_error_to_franken)
             })
             .transpose()?;
@@ -66360,7 +66373,7 @@ impl Connection {
         b.emit_op(Opcode::OpenRead, 0, table.root_page, 0, P4::None, 0);
 
         // OpenWrite for the index (cursor 1).
-        b.emit_op(Opcode::OpenWrite, 1, index_root, 0, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 1, index.root_page, 0, P4::None, 0);
 
         // Rewind: position at first row, jump to halt if empty.
         b.emit_jump_to_label(Opcode::Rewind, 0, 0, halt_label, P4::None, 0);
