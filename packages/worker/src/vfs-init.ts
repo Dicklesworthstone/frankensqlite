@@ -1,4 +1,5 @@
 import type { InitConfig, InitResult, PersistenceMode } from "./protocol";
+import { isSnapshotPersistenceMode } from "./protocol";
 
 export class UnsupportedPersistenceModeError extends Error {
   readonly code = "ERR_FSQLITE_UNSUPPORTED_PERSISTENCE";
@@ -33,7 +34,7 @@ export function createReadyResult(config: InitConfig): InitResult {
 export function assertSupportedPersistenceMode(
   persistence: PersistenceMode,
 ): void {
-  if (persistence !== "memory" && persistence !== "indexeddb-snapshot") {
+  if (persistence !== "memory" && !isSnapshotPersistenceMode(persistence)) {
     throw new UnsupportedPersistenceModeError(persistence);
   }
 }

@@ -2,7 +2,12 @@ import type { SnapshotMetadata } from "./snapshot-store";
 import type { ResultEncoding } from "./result-codec";
 import type { PreparedStatementLimits } from "./statement-budget";
 
-export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot";
+export type PersistenceMode = "memory" | "opfs" | "indexeddb" | "indexeddb-snapshot" | "opfs-snapshot";
+
+/** Whole-image checkpoints; neither mode is a page-level storage VFS. */
+export function isSnapshotPersistenceMode(value: unknown): value is "indexeddb-snapshot" | "opfs-snapshot" {
+  return value === "indexeddb-snapshot" || value === "opfs-snapshot";
+}
 
 export type SqlScalar =
   | null
