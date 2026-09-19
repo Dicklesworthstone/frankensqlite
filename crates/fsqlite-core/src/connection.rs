@@ -19705,7 +19705,9 @@ impl Connection {
     }
 
     fn attached_table_supports_last_insert_rowid(&self, table_name: &str) -> bool {
-        join_table_supports_hidden_rowid(table_name, &self.original_ddl_sql.borrow())
+        join_table_supports_hidden_rowid(table_name, &self.original_ddl_sql.borrow(), |sql| {
+            self.table_sql_declares_without_rowid(sql)
+        })
     }
 
     fn apply_attached_insert_tracking(&self, changes: usize, last_insert_rowid: Option<i64>) {
@@ -79639,7 +79641,28 @@ impl Connection {
         self.original_ddl_sql
             .borrow()
             .get(&table_name.to_ascii_lowercase())
-            .is_some_and(|sql| is_without_rowid_table_sql(sql))
+            .is_some_and(|sql| self.table_sql_declares_without_rowid(sql))
+    }
+
+    fn cached_without_rowid_table_sql(&self, sql: &str) -> Option<bool> {
+        let cache = self.schema_reload_parse_cache.borrow();
+        if cache.0 != *self.schema_cookie.borrow() {
+            return None;
+        }
+        match cache.1.get(sql) {
+            Some(Statement::CreateTable(create)) => Some(create.without_rowid),
+            _ => None,
+        }
+    }
+
+    fn table_sql_declares_without_rowid(&self, sql: &str) -> bool {
+        // Trigger queries already reload through the stored-schema parse cache.
+        // Read the flag without cloning that AST or parsing the DDL again. Keep
+        // the exact SQL key and generation check: a temporary binding can shadow
+        // the persistent table named by original_ddl_sql. Cold/non-table entries
+        // retain the compatibility parser's existing fallback behavior.
+        self.cached_without_rowid_table_sql(sql)
+            .unwrap_or_else(|| is_without_rowid_table_sql(sql))
     }
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
@@ -85710,12 +85733,15 @@ impl Connection {
                     Ok(join_table_supports_hidden_rowid(
                         &name.name,
                         &original_ddl_sql,
+                        |sql| attached.table_sql_declares_without_rowid(sql),
                     ))
                 })
                 .unwrap_or(false),
             _ => {
                 let original_ddl_sql = self.original_ddl_sql.borrow();
-                join_table_supports_hidden_rowid(&name.name, &original_ddl_sql)
+                join_table_supports_hidden_rowid(&name.name, &original_ddl_sql, |sql| {
+                    self.table_sql_declares_without_rowid(sql)
+                })
             }
         }
     }
@@ -144441,6 +144467,7 @@ fn collect_join_using_skip_indices(
 fn join_table_supports_hidden_rowid(
     table_name: &str,
     original_ddl_sql: &HashMap<String, String>,
+    without_rowid: impl FnOnce(&str) -> bool,
 ) -> bool {
     // Ordinary rowid tables expose a hidden rowid/_rowid_/oid column that the
     // join scanner appends to the projection (see build_join_scan_sql). Two
@@ -144450,7 +144477,7 @@ fn join_table_supports_hidden_rowid(
     // width and makes `row[..primary_width]` slice out of bounds during joins.
     original_ddl_sql
         .get(&table_name.to_ascii_lowercase())
-        .is_none_or(|sql| !is_without_rowid_table_sql(sql) && !is_virtual_table_sql(sql))
+        .is_none_or(|sql| !without_rowid(sql) && !is_virtual_table_sql(sql))
 }
 
 fn join_hidden_rowid_projection(columns: &[String], supports_hidden_rowid: bool) -> Option<String> {
@@ -191352,6 +191379,44 @@ mod tests {
     }
 
     #[test]
+    fn test_hidden_rowid_schema_cache_requires_exact_sql_and_generation() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let rowid = "CREATE TABLE entries (id INTEGER PRIMARY KEY, body TEXT)";
+            let without =
+                "CREATE TABLE entries (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID";
+            let cookie = *conn.schema_cookie.borrow();
+            assert_eq!(conn.cached_without_rowid_table_sql(without), None);
+            assert!(conn.table_sql_declares_without_rowid(without));
+            conn.parse_stored_schema_statement_cached(rowid, cookie)
+                .unwrap();
+            assert_eq!(conn.cached_without_rowid_table_sql(rowid), Some(false));
+            // Same table name is not the same definition. A name-keyed cache
+            // would incorrectly reuse the rowid flag here.
+            assert_eq!(conn.cached_without_rowid_table_sql(without), None);
+            assert!(conn.table_sql_declares_without_rowid(without));
+            conn.parse_stored_schema_statement_cached(without, cookie)
+                .unwrap();
+            for _ in 0..64 {
+                assert_eq!(conn.cached_without_rowid_table_sql(without), Some(true));
+                assert!(!conn.table_sql_declares_without_rowid(rowid));
+                assert!(conn.table_sql_declares_without_rowid(without));
+            }
+            *conn.schema_cookie.borrow_mut() = cookie.wrapping_add(1);
+            assert_eq!(conn.cached_without_rowid_table_sql(without), None);
+            assert!(conn.table_sql_declares_without_rowid(without));
+            assert!(!conn.table_sql_declares_without_rowid(rowid));
+
+            let virtual_sql = "CREATE VIRTUAL TABLE messages USING fts5(body)";
+            let cookie = *conn.schema_cookie.borrow();
+            conn.parse_stored_schema_statement_cached(virtual_sql, cookie)
+                .unwrap();
+            assert_eq!(conn.cached_without_rowid_table_sql(virtual_sql), None);
+            assert!(!conn.table_sql_declares_without_rowid(virtual_sql));
+        });
+    }
+
+    #[test]
     fn test_join_hidden_rowid_projection_skips_without_rowid_tables() {
         let columns = vec!["id".to_owned(), "payload".to_owned()];
         let mut original_ddl_sql = HashMap::new();
@@ -191360,11 +191425,19 @@ mod tests {
             "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID".to_owned(),
         );
 
-        assert!(!join_table_supports_hidden_rowid("wr", &original_ddl_sql));
+        assert!(!join_table_supports_hidden_rowid(
+            "wr",
+            &original_ddl_sql,
+            is_without_rowid_table_sql,
+        ));
         assert_eq!(
             join_hidden_rowid_projection(
                 &columns,
-                join_table_supports_hidden_rowid("wr", &original_ddl_sql),
+                join_table_supports_hidden_rowid(
+                    "wr",
+                    &original_ddl_sql,
+                    is_without_rowid_table_sql,
+                ),
             ),
             None
         );
@@ -191385,12 +191458,17 @@ mod tests {
 
         assert!(!join_table_supports_hidden_rowid(
             "fts_messages",
-            &original_ddl_sql
+            &original_ddl_sql,
+            is_without_rowid_table_sql,
         ));
         assert_eq!(
             join_hidden_rowid_projection(
                 &columns,
-                join_table_supports_hidden_rowid("fts_messages", &original_ddl_sql),
+                join_table_supports_hidden_rowid(
+                    "fts_messages",
+                    &original_ddl_sql,
+                    is_without_rowid_table_sql,
+                ),
             ),
             None
         );
