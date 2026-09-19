@@ -6,7 +6,7 @@ import { FrankenWorkerClient } from "./worker-client";
 import { FrankenSQLiteError } from "./errors";
 import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
-import { resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
+import { isSnapshotPersistenceMode, resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
 import type { PreparedStatementLimits } from "@frankensqlite/worker";
 import type { RequestQueueStats } from "./types";
 import type { TransactionOptions } from "./types";
@@ -153,7 +153,7 @@ export class FrankenDB {
       try {
         const saved = snapshotDataField(ready, "snapshot", false);
         if (saved !== undefined && saved !== null) {
-          if (ready.persistence !== "indexeddb-snapshot") {
+          if (!isSnapshotPersistenceMode(ready.persistence)) {
             throw new TypeError("Only snapshot persistence can return saved snapshot metadata");
           }
           snapshot = captureSnapshotReceipt(saved);
@@ -165,7 +165,7 @@ export class FrankenDB {
       }
       const effectiveStatements = captureStatementPolicy(policy?.value, statementLimits);
       const recovery = snapshotDataField(ready, "checkpointRecovery", false);
-      if (recovery !== undefined && (recovery !== 1 || ready.persistence !== "indexeddb-snapshot")) {
+      if (recovery !== undefined && (recovery !== 1 || !isSnapshotPersistenceMode(ready.persistence))) {
         throw snapshotReceiptFailure(new TypeError("Invalid checkpoint recovery capability"));
       }
       return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null, effectiveStatements, recovery === 1);

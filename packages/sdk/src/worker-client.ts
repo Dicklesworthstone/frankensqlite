@@ -16,7 +16,7 @@ import type {
   RequestLimits,
   RequestQueueStats,
 } from "@frankensqlite/worker";
-import { BindingError, RequestAdmissionError, RequestBudget, resolveBindings } from "@frankensqlite/worker";
+import { BindingError, RequestAdmissionError, RequestBudget, resolveBindings, isSnapshotPersistenceMode } from "@frankensqlite/worker";
 import type { ParameterLayout } from "@frankensqlite/worker";
 
 import { decodeFrankenError, FrankenSQLiteError } from "./errors";
@@ -243,13 +243,28 @@ export class FrankenWorkerClient {
   }
 
   async init(config: InitConfig) {
-    const requested = resolveResultEncoding(config.resultEncoding);
+    // Capture caller-owned getters before transport dispatch. A later mutation
+    // cannot change which database/persistence acknowledgement is acceptable.
+    const captured = { ...config };
+    const requested = resolveResultEncoding(captured.resultEncoding);
+    const persistence = captured.persistence ?? "memory";
+    const path = captured.dbName ?? ":memory:";
     const response = await this.#send({
       kind: "init",
       requestId: this.#nextId(),
-      config,
+      config: captured,
     });
     const ready = ensureKind(response, "ready").data;
+    // Snapshot names select durable storage. Memory imports instead report
+    // their core-assigned path, which need not equal a caller's display name.
+    if (ready.persistence !== persistence || (isSnapshotPersistenceMode(persistence) && ready.path !== path)) {
+      const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_PERSISTENCE_POLICY", transient: false,
+        userRecoverable: false,
+        message: "The worker did not acknowledge the requested database and persistence mode",
+        suggestion: "Use a matching SDK and worker. No database handle was opened; do not fall back to memory or another snapshot backend." });
+      this.#failTransport(error, true);
+      throw error;
+    }
     const accepted = resolveResultEncoding(ready.resultEncoding);
     if (accepted !== "structured-clone" && accepted !== requested) {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_RESULT_ENCODING", transient: false,
@@ -667,10 +682,26 @@ function captureResponse(source: Record<string, unknown>, kind: unknown, request
   switch (kind) {
     case "ready": {
       const data = responseObject(source.data);
-      if (typeof data.path !== "string" || !["memory", "opfs", "indexeddb", "indexeddb-snapshot"].includes(data.persistence as string)) {
+      // Capture own data properties rather than retaining a mutable transport
+      // envelope or invoking getters while accepting persistence authority.
+      const field = (key: string, required = false): unknown => {
+        const descriptor = Object.getOwnPropertyDescriptor(data, key);
+        if (descriptor === undefined && !required) return undefined;
+        if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+          throw new TypeError(`Invalid initialization field: ${key}`);
+        }
+        return descriptor.value;
+      };
+      const path = field("path", true), persistence = field("persistence", true);
+      if (typeof path !== "string" || !["memory", "opfs", "indexeddb", "indexeddb-snapshot", "opfs-snapshot"].includes(persistence as string)) {
         throw new TypeError("Invalid initialization result");
       }
-      return { kind, requestId, data: data as unknown as import("@frankensqlite/worker").InitResult };
+      const ready: Record<string, unknown> = { path, persistence };
+      for (const key of ["snapshot", "checkpointRecovery", "preparedStatementLimits", "resultEncoding"]) {
+        const value = field(key);
+        if (value !== undefined) ready[key] = value;
+      }
+      return { kind, requestId, data: Object.freeze(ready) as unknown as import("@frankensqlite/worker").InitResult };
     }
     case "execute-result": {
       const changes = source.changes;
