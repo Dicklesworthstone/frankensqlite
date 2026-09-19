@@ -47,11 +47,58 @@ also does not implement changegroup coalescing, rebasing, automatic capture,
 or authentication. Validate the source of received changes before applying
 anything to application tables; format validation is not authorization.
 
+## Transactional SQL application
+
+`applyChangeset` connects the wire codec to the existing `FrankenDB` SQL path.
+It also accepts a `FrankenTransaction`, using a recoverable child savepoint.
+
+```ts
+import { applyChangeset } from '@frankensqlite/sdk';
+
+const result = await applyChangeset(db, receivedBytes, {
+  tables: ['notes', 'tags'], // Required direct-target allowlist in main.
+  signal: abortController.signal,
+  timeoutMs: 10_000,
+});
+console.log(result.applied, result.omitted);
+```
+
+The complete wire input and allowlist are captured before asynchronous admission.
+All target schemas are validated inside one owned transaction before any row is
+written. Ordinary main tables with matching primary-key positions are supported,
+including composite WITHOUT ROWID keys. Extra trailing target columns use their
+defaults on INSERT and remain untouched by UPDATE. Missing/incompatible tables,
+views, virtual/shadow tables, and generated/hidden columns fail explicitly.
+
+DELETE checks every supplied non-key before-image; UPDATE checks only modified
+fields. Matching retains the target column's SQLite affinity and collation, and
+handles NULL separately from an omitted UPDATE field. Integral REALs are bound
+as REAL, and 64-bit integers are never converted through JavaScript numbers.
+SQL identifiers are quoted; values are bound, not interpolated.
+
+By default, a missing row, changed before-image or duplicate primary key aborts
+the complete application. An optional awaited `onConflict` callback receives
+`kind` (`data`, `not-found`, or `conflict`), table, zero-based global change index,
+column names and owned change images. It may return `omit` for that entry or
+`abort`. Thrown errors, invalid callback results, cancellation and SQL errors
+roll back the owned scope. SQL/constraint errors are never silently converted
+to omissions. INSERT/UPDATE use OR ABORT to override schema IGNORE/REPLACE rules;
+an ignored write cannot be counted as applied. Counts exclude trigger/FK effects.
+
+This is deliberately not the entire native `sqlite3changeset_apply` API. Local
+triggers and foreign-key actions retain ordinary SQL behavior, so the allowlist
+is not a security sandbox or a promise that triggers cannot modify other tables.
+Authenticate changesets and trust the target schema. The helper does not disable
+constraints, synthesize FK deferral, implement REPLACE/constraint omission or
+rebasing, automatically capture changes, or provide a replication transport.
+For snapshot persistence, SQL commit still requires an explicit checkpoint to
+publish durable browser storage; applying a changeset does not checkpoint.
+
 ## Verification
 
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
-  --test packages/sdk/tests/changeset-codec.test.mjs
+  --test packages/sdk/tests/changeset-codec.test.mjs packages/sdk/tests/changeset-apply.test.mjs
 ```
 
 Tests use Node's actual SQLite session extension to generate binary inputs,
@@ -60,3 +107,10 @@ include composite WITHOUT ROWID keys, mixed operations, all storage classes,
 integer extremes, UTF-8/NUL/BOM handling, malformed input and allocation limits,
 and 30 deterministic native mutation workloads. This is SQLite wire-format
 interoperability evidence, not FrankenSQLite engine/WASM/browser certification.
+
+Application tests additionally compare native session application with ordinary
+SQL for affinity/collation, mixed CRUD, inversion and 20 deterministic workloads.
+They exercise atomic multi-table rollback, nested savepoints, explicit omissions,
+constraint/trigger failures, schema preflight, quoted names, cancellation,
+deadlines and wide before-images. These run the shipped TypeScript helper over
+Node's SQLite SQL adapter; they do not claim a built FrankenSQLite WASM test.
