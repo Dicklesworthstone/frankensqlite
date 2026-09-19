@@ -4,6 +4,7 @@ import { BindingError, isNamedBindings } from "./bindings";
 import { validateTransactionId } from "./transactions";
 import { resolveResultEncoding } from "./result-codec";
 import { resolvePreparedStatementLimits } from "./statement-budget";
+import { resolveSnapshotOwnership } from "./snapshot-ownership";
 
 export interface RequestLimits {
   /** Active plus queued ordinary requests. Close/cancel use a separate lane. */
@@ -165,6 +166,8 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       const dbName = source.dbName, persistence = source.persistence, wasmUrl = source.wasmUrl, snapshot = source.snapshot;
       if (dbName !== undefined) config.dbName = text(dbName);
       if (persistence !== undefined) { text(persistence); config.persistence = persistence; }
+      const ownership = resolveSnapshotOwnership(source.snapshotOwnership);
+      if (ownership !== undefined) { text(ownership); config.snapshotOwnership = ownership; }
       if (wasmUrl !== undefined) config.wasmUrl = text(wasmUrl);
       if (snapshot !== undefined) config.snapshot = blob(snapshot);
       const resultEncoding = source.resultEncoding;

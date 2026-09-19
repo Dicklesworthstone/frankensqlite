@@ -23,6 +23,8 @@ import { decodeFrankenError, FrankenSQLiteError } from "./errors";
 import { decodeQueryResult, resolveResultEncoding, ResultCodecError } from "@frankensqlite/worker";
 import type { ResultEncoding } from "@frankensqlite/worker";
 import type { ExecuteManyOptions } from "./types";
+import { resolveSnapshotOwnership, SnapshotOwnershipError } from "@frankensqlite/worker";
+import type { SnapshotOwnership } from "@frankensqlite/worker";
 
 export interface WorkerMessageEvent {
   readonly data: WorkerMessage;
@@ -77,6 +79,7 @@ export class FrankenWorkerClient {
   #disposed = false;
   #closePromise: Promise<void> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
+  #snapshotOwnership: SnapshotOwnership | null = null;
 
   readonly #onMessage = (event: WorkerMessageEvent): void => {
     if (this.#disposed) return;
@@ -175,6 +178,8 @@ export class FrankenWorkerClient {
     return this.#resultEncoding;
   }
 
+  get snapshotOwnership(): SnapshotOwnership | null { return this.#snapshotOwnership; }
+
   /** Internal owner lifecycle, including faults observed before registration. */
   observeFailure(listener: (error: Error) => void): () => void {
     if (this.#failure !== null) {
@@ -248,6 +253,11 @@ export class FrankenWorkerClient {
     const captured = { ...config };
     const requested = resolveResultEncoding(captured.resultEncoding);
     const persistence = captured.persistence ?? "memory";
+    const ownership = resolveSnapshotOwnership(captured.snapshotOwnership);
+    if (ownership !== undefined && !isSnapshotPersistenceMode(persistence)) {
+      throw new SnapshotOwnershipError("ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
+        "snapshotOwnership requires snapshot persistence");
+    }
     const path = captured.dbName ?? ":memory:";
     const response = await this.#send({
       kind: "init",
@@ -265,6 +275,16 @@ export class FrankenWorkerClient {
       this.#failTransport(error, true);
       throw error;
     }
+    const held = ready.snapshotOwnership;
+    if ((held !== undefined && (held !== "shared" && held !== "exclusive" || !isSnapshotPersistenceMode(persistence))) ||
+        (ownership !== undefined && held !== ownership) || (ownership === undefined && held === "exclusive")) {
+      const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_UNAVAILABLE",
+        transient: false, userRecoverable: false,
+        message: "The worker did not acknowledge the requested snapshot session ownership",
+        suggestion: "Use a matching worker with Web Locks support; no SQL handle was exposed." });
+      this.#failTransport(error, true);
+      throw error;
+    }
     const accepted = resolveResultEncoding(ready.resultEncoding);
     if (accepted !== "structured-clone" && accepted !== requested) {
       throw new FrankenSQLiteError({ code: "ERR_FSQLITE_RESULT_ENCODING", transient: false,
@@ -272,6 +292,7 @@ export class FrankenWorkerClient {
     }
     // An older worker may omit the acknowledgement and keep structured clone.
     this.#resultEncoding = accepted;
+    this.#snapshotOwnership = held ?? null;
     return ready;
   }
 
@@ -697,7 +718,7 @@ function captureResponse(source: Record<string, unknown>, kind: unknown, request
         throw new TypeError("Invalid initialization result");
       }
       const ready: Record<string, unknown> = { path, persistence };
-      for (const key of ["snapshot", "checkpointRecovery", "preparedStatementLimits", "resultEncoding"]) {
+      for (const key of ["snapshot", "checkpointRecovery", "preparedStatementLimits", "resultEncoding", "snapshotOwnership"]) {
         const value = field(key);
         if (value !== undefined) ready[key] = value;
       }

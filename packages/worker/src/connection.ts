@@ -26,6 +26,7 @@ import {
 import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
 import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName } from "./snapshot-store";
 import { OpfsSnapshotStore } from "./opfs-snapshot-store";
+import { SnapshotOwnershipError, SnapshotSessionLease, resolveSnapshotOwnership } from "./snapshot-ownership";
 import { isSnapshotPersistenceMode } from "./protocol";
 import type { SnapshotMetadata } from "./snapshot-store";
 import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
@@ -112,6 +113,7 @@ export class WorkerConnectionHost {
   #terminalError: Error | null = null;
   readonly #bulkCancellations = new Map<number, BulkCancellation>();
   #snapshotStore: IndexedDbSnapshotStore | OpfsSnapshotStore | null = null;
+  #snapshotLease: SnapshotSessionLease | null = null;
   #snapshotRevision: string | null = null;
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
@@ -295,7 +297,7 @@ export class WorkerConnectionHost {
         case "checkpoint-recover":
           return await this.#recoverCheckpoint(request.requestId, request.publicationId, request.parentRevision);
         case "close":
-          return this.#close(request.requestId);
+          return await this.#close(request.requestId);
       }
     } catch (error: unknown) {
       // Set the failure fence before the FIFO advances, not after a client has
@@ -305,7 +307,7 @@ export class WorkerConnectionHost {
           error.connectionUnusable && this.#terminalError === null) {
         this.#terminalError = error;
         try {
-          this.#disposeDatabase();
+          await this.#disposeDatabase();
         } catch (cleanupError: unknown) {
           error.cleanupErrors.push(cleanupError);
         }
@@ -324,6 +326,11 @@ export class WorkerConnectionHost {
   ): Promise<ReadyResponse> {
     const ready = createReadyResult(config);
     assertSupportedPersistenceMode(ready.persistence);
+    const requestedOwnership = resolveSnapshotOwnership(config.snapshotOwnership);
+    if (requestedOwnership !== undefined && !isSnapshotPersistenceMode(ready.persistence)) {
+      throw new SnapshotOwnershipError("ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
+        "snapshotOwnership requires indexeddb-snapshot or opfs-snapshot persistence");
+    }
     const resultEncoding = resolveResultEncoding(config.resultEncoding);
     const requestedStatements = config.preparedStatementLimits === undefined
       ? this.#statementCeiling : resolvePreparedStatementLimits(config.preparedStatementLimits);
@@ -334,13 +341,25 @@ export class WorkerConnectionHost {
 
     let stagedStore: IndexedDbSnapshotStore | OpfsSnapshotStore | null = null;
     let stagedDb: CoreDatabaseHandle | null = null;
+    let stagedLease: SnapshotSessionLease | null = null;
+    let reusingLease = false;
     let disposingPrevious = false;
+    let previousRetired = false;
     try {
       let image = config.snapshot;
       let saved: SnapshotMetadata | null = null;
       if (isSnapshotPersistenceMode(ready.persistence)) {
         validateSnapshotName(config.dbName ?? "");
         if (image !== undefined) validateSnapshotBytes(image);
+        // Ownership must precede storage read/import, not just checkpoint CAS.
+        // Transfer an identical existing lease without releasing it between
+        // sessions. An upgrade/downgrade contends and leaves the old DB intact.
+        if (this.#snapshotLease?.matches(ready.persistence, config.dbName!, requestedOwnership)) {
+          stagedLease = this.#snapshotLease;
+          reusingLease = true;
+        } else {
+          stagedLease = await SnapshotSessionLease.acquire(ready.persistence, config.dbName!, requestedOwnership);
+        }
         stagedStore = ready.persistence === "opfs-snapshot"
           ? await OpfsSnapshotStore.open(config.dbName!)
           : await IndexedDbSnapshotStore.open(config.dbName!);
@@ -376,12 +395,15 @@ export class WorkerConnectionHost {
       // the old session fails, the candidate is NOT published and all later SQL
       // is fenced using the established fatal connection-cleanup contract.
       disposingPrevious = true;
-      this.#disposeDatabase();
+      await this.#disposeDatabase(stagedLease);
+      previousRetired = true;
       if (this.#terminalError !== null) throw this.#terminalError;
       this.#db = stagedDb;
       stagedDb = null;
       this.#snapshotStore = stagedStore;
       stagedStore = null; // Ownership transfers only after core initialization.
+      this.#snapshotLease = stagedLease;
+      stagedLease = null;
       this.#snapshotRevision = saved?.revision ?? null;
       this.#resultEncoding = resultEncoding;
       this.#statementBudget = stagedStatementBudget;
@@ -392,6 +414,7 @@ export class WorkerConnectionHost {
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           preparedStatementLimits: stagedStatementBudget.limits,
+          ...(this.#snapshotLease === null ? {} : { snapshotOwnership: this.#snapshotLease.mode }),
           ...(isSnapshotPersistenceMode(ready.persistence) ? { snapshot: saved, checkpointRecovery: 1 as const } : {}),
         },
       };
@@ -401,6 +424,13 @@ export class WorkerConnectionHost {
       // causes (including thrown undefined) without retrying any destructor.
       for (const cleanup of [() => stagedDb?.close(), () => stagedDb?.free(), () => stagedStore?.close()]) {
         try { cleanup(); } catch (error: unknown) { cleanupErrors.push(error); }
+      }
+      // Failed candidate construction must not release the old live session's
+      // reused lease. Unknown core cleanup must not grant a competing owner:
+      // leave that lease held until the worker realm is terminated instead.
+      if (cleanupErrors.length === 0 && (!reusingLease || (disposingPrevious && previousRetired))) {
+        try { await stagedLease?.close(); }
+        catch (error: unknown) { cleanupErrors.push(error); }
       }
       if (disposingPrevious || cleanupErrors.length !== 0) {
         const failure = new ManagedTransactionError(disposingPrevious
@@ -633,7 +663,7 @@ export class WorkerConnectionHost {
     } catch (cause: unknown) {
       const failure = new CheckpointRollbackError(cause);
       this.#terminalError = failure;
-      try { this.#disposeDatabase(); }
+      try { await this.#disposeDatabase(); }
       catch (cleanupError: unknown) { failure.cleanupErrors.push(cleanupError); }
       throw failure;
     }
@@ -661,15 +691,15 @@ export class WorkerConnectionHost {
     return { kind: "checkpoint-result", requestId, data: saved };
   }
 
-  #close(requestId: number): WorkerResponse {
-    this.#disposeDatabase();
+  async #close(requestId: number): Promise<WorkerResponse> {
+    await this.#disposeDatabase();
     return {
       kind: "close-result",
       requestId,
     };
   }
 
-  #disposeDatabase(): void {
+  async #disposeDatabase(retainLease: SnapshotSessionLease | null = null): Promise<void> {
     const statements = [...this.#statements.values()];
     const reservations = [...this.#statementReservations.values()];
     this.#statements.clear();
@@ -682,6 +712,8 @@ export class WorkerConnectionHost {
     const snapshotStore = this.#snapshotStore;
     this.#snapshotStore = null;
     this.#snapshotRevision = null;
+    const snapshotLease = this.#snapshotLease;
+    this.#snapshotLease = null;
 
     const errors: unknown[] = [];
     try { snapshotStore?.close(); }
@@ -704,6 +736,13 @@ export class WorkerConnectionHost {
       } catch (error: unknown) {
         errors.push(error);
       }
+    }
+    // Release only after all statements and the core have been retired. On a
+    // destructor failure, retain ownership until actual worker termination;
+    // a successful second close on cleared fields is not cleanup evidence.
+    if (errors.length === 0 && snapshotLease !== retainLease) {
+      try { await snapshotLease?.close(); }
+      catch (error: unknown) { errors.push(error); }
     }
     if (errors.length !== 0) {
       const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
