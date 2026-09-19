@@ -103,7 +103,9 @@ cargo run --locked -p fsqlite-wal --bin fsqlite-recover -- damaged.db recovered.
 
 This is an explicit administrative recovery command, **not automatic recovery
 on `Connection::open`**. Preserve the source main/WAL/FEC set before using any
-SQL tool that might checkpoint it. An existing `damaged.db-wal` is required;
+SQL tool that might checkpoint it. The source header must still declare WAL
+mode; rollback-mode sources are refused because a leftover WAL could be stale.
+An existing `damaged.db-wal` is required;
 repair symbols, when needed, come from `damaged.db-wal-fec`. Native capture uses
 the existing main/WAL recovery fences and a shared sidecar mutation guard.
 Active reader/writer contention fails without waiting. Source data is not

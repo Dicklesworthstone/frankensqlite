@@ -54,7 +54,7 @@ Options:
   --                   End options; subsequent arguments are literal paths.
   --help               Show this help.
 
-Requires an existing WAL and complete recovery. Missing repair data, ambiguous
+Requires a WAL-mode source, an existing WAL and complete recovery. Missing repair data, ambiguous
 commit anchors, partial WAL tails and unexplained page holes are errors, not
 permission to export a partial database. This does not repair unrelated main-file
 B-tree corruption. Run PRAGMA integrity_check on the OUTPUT before using it.
@@ -168,6 +168,22 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         // expose a device. Namespace stability still requires a trusted parent.
         if !host_fs::metadata(path)?.is_file() {
             return Err(FrankenError::CannotOpen { path: path.to_owned() });
+        }
+        Ok(())
+    }
+
+    fn require_wal_mode(database: &[u8]) -> Result<()> {
+        // A checksum-valid leftover WAL is not authority for a main database
+        // that has switched back to rollback journaling. Refuse that pairing
+        // instead of exporting stale commits over a newer main-file image.
+        if database.len() < DATABASE_HEADER_BYTES
+            || !database.starts_with(b"SQLite format 3\0")
+            || database[18] != 2
+            || database[19] != 2
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "source is not in WAL mode; refusing a potentially stale WAL companion".to_owned(),
+            });
         }
         Ok(())
     }
@@ -319,13 +335,14 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         if !flags.contains(VfsOpenFlags::READWRITE) { return Err(FrankenError::ReadOnly); }
         main.acquire_recovery(cx)?;
         let main_identity = main.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
+        let database = read_vfs_snapshot(&main.file, cx, options.max_database_bytes).await?;
+        require_wal_mode(&database)?;
         let wal_path = companion(&options.source, "-wal");
         require_regular_file(&wal_path)?;
         let (file, _) = vfs.open(cx, Some(&wal_path), VfsOpenFlags::READONLY | VfsOpenFlags::WAL)?;
         let mut wal = SourceFile::new(file, cx);
         let wal_identity = wal.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
         if main_identity == wal_identity { return Err(FrankenError::BusyRecovery); }
-        let database = read_vfs_snapshot(&main.file, cx, options.max_database_bytes).await?;
         let wal_bytes = read_vfs_snapshot(&wal.file, cx, options.replay.max_wal_bytes).await?;
         let sidecar_path = companion(&options.source, "-wal-fec");
         let sidecar_cx = cx.create_child_for_spawn();
@@ -669,6 +686,21 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             assert_eq!(options.destination, Path::new("-b"));
             assert_eq!(options.max_database_bytes, 2048);
             assert_eq!(options.replay.max_wal_bytes, 2048);
+        }
+
+        #[test]
+        fn source_mode_guard_rejects_stale_wal_pairings() {
+            let database = empty_database(19);
+            require_wal_mode(&database).unwrap();
+            for modes in [[1, 1], [1, 2], [2, 1], [0, 0], [3, 3]] {
+                let mut invalid = database.clone();
+                invalid[18..20].copy_from_slice(&modes);
+                assert!(require_wal_mode(&invalid).is_err());
+            }
+            assert!(require_wal_mode(&database[..19]).is_err());
+            let mut invalid = database;
+            invalid[0] = 0;
+            assert!(require_wal_mode(&invalid).is_err());
         }
 
         #[test]
