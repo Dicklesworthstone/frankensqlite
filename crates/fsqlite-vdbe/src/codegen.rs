@@ -3979,6 +3979,34 @@ pub fn codegen_select(
         );
     }
 
+    // A repeated EXISTS exclusion can otherwise scan a growing equality
+    // prefix even though every row has the excluded value. Ordered index
+    // extrema can prove that no row qualifies; when they cannot, leave the
+    // ordinary access-path selection and complete predicate unchanged.
+    if ctx.index_ordered_scan_reliable
+        && ctx.collation_semantics == CollationSemantics::Builtin
+        && !is_aggregate
+        && from_index_hint.is_none()
+        && time_travel.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.body.compounds.is_empty()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && matches!(columns.as_slice(), [ResultColumn::Expr {
+            expr: Expr::Literal(Literal::Integer(1), _), ..
+        }])
+        && stmt.limit.as_ref().is_some_and(|limit| {
+            limit.offset.is_none()
+                && matches!(limit.limit, Expr::Literal(Literal::Integer(1), _))
+        })
+        && let Some((index, excluded)) = literal_exists_exclusion_index(
+            table, table_alias, schema, where_clause.as_deref(),
+        )
+    {
+        emit_index_exclusion_preflight(b, cursor + 1, index, excluded, done_label);
+    }
+
     // HFDT's member-consistency probe has a partial PK and a residual. Walk
     // the table's PK range directly instead of resolving a secondary-index
     // entry back to the same table for every candidate row.
@@ -30360,6 +30388,79 @@ fn literal_exists_index_prefix<'a, 's>(
         }
         (targets.len() >= 2).then_some((index, targets))
     }).max_by_key(|(_, targets)| targets.len())
+}
+
+/// Only plain literal comparisons joined by AND qualify. In particular, an
+/// exclusion inside OR cannot prove the entire predicate false. Requiring
+/// native-class literals avoids adding affinity conversion or bind numbering
+/// ahead of the ordinary plan. Partial/expression indexes cannot prove facts
+/// about every table row, and custom/non-BINARY ordering cannot use this proof.
+fn literal_exists_exclusion_index<'a, 's>(
+    table: &'s TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    predicate: Option<&'a Expr>,
+) -> Option<(&'s IndexSchema, &'a Expr)> {
+    let mut terms = Vec::new();
+    collect_conjunctive_terms(predicate?, &mut terms);
+    let mut exclusion = None;
+    for term in terms {
+        let Expr::BinaryOp { left, op: op @ (BinaryOp::Eq | BinaryOp::Ne), right, .. } = term else {
+            return None;
+        };
+        let (column, bound) = if let Some(column) = column_name(left, table, table_alias) {
+            (column, right.as_ref())
+        } else {
+            (column_name(right, table, table_alias)?, left.as_ref())
+        };
+        if !matches!(bound, Expr::Literal(
+            Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_), _))
+            || !index_range_bound_is_seek_safe(table, table_alias, schema, &column, bound)
+        {
+            return None;
+        }
+        if *op == BinaryOp::Ne && exclusion.is_none() {
+            exclusion = table.indexes.iter().find(|index| {
+                index.supports_direct_column_lookup()
+                    && !index.key_term_descending(0)
+                    && index.key_term_collation(0)
+                        .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                    && index.columns.first()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column))
+            }).map(|index| (index, bound));
+        }
+    }
+    exclusion
+}
+
+/// Equal minimum and maximum leading keys prove all entries equal the bound.
+/// An empty complete index also proves absence. NULL or unequal extrema take
+/// the original plan, including all residual checks. Close the temporary
+/// cursor on both paths so subsequent emitters may reuse its number.
+fn emit_index_exclusion_preflight(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    index: &IndexSchema,
+    excluded: &Expr,
+    done: crate::Label,
+) {
+    let ordinary = b.emit_label();
+    let empty = b.emit_label();
+    let bound = b.alloc_reg();
+    let key = b.alloc_reg();
+    emit_expr(b, excluded, bound, None);
+    b.emit_op(Opcode::OpenRead, cursor, index.root_page, 0, P4::Index(index.name.clone()), 0);
+    for position in [Opcode::Rewind, Opcode::Last] {
+        b.emit_jump_to_label(position, cursor, 0, empty, P4::None, 0);
+        b.emit_op(Opcode::Column, cursor, 0, key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, key, 0, ordinary, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Ne, bound, key, ordinary, P4::None, 0);
+    }
+    b.resolve_label(empty);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+    b.resolve_label(ordinary);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
 }
 
 /// Admit only a proper leading PK prefix with native-class literal keys.
