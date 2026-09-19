@@ -95,8 +95,32 @@ pub mod host_fs {
     /// multiple hard links, because such a pathname is not an isolated
     /// authority namespace.
     pub fn open_existing_regular_file_no_follow(path: &Path) -> Result<File> {
+        open_existing_regular_file_with_access(path, false)
+    }
+
+    /// Open an existing, identity-checked WAL for synchronous guarded repair.
+    ///
+    /// Never creates, truncates, or replaces a file. The caller must retain the
+    /// native main-file recovery fence and a stable cooperative namespace for
+    /// the descriptor's entire lifetime. This is NOT a locking primitive.
+    /// Do not use this to open a locked main database: closing an independent
+    /// descriptor can release that process's POSIX main-file locks. Recovery
+    /// must first prove through VFS that WAL and main have different identities.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_wal_for_guarded_repair(
+        path: &Path,
+        expected_identity: super::FileIdentity,
+    ) -> Result<File> {
+        let file = open_existing_regular_file_with_access(path, true)?;
+        if super::FileIdentity::from_file(&file)? != Some(expected_identity) {
+            return Err(fsqlite_error::FrankenError::BusyRecovery);
+        }
+        Ok(file)
+    }
+
+    fn open_existing_regular_file_with_access(path: &Path, writable: bool) -> Result<File> {
         let mut options = OpenOptions::new();
-        options.read(true);
+        options.read(true).write(writable);
         #[cfg(unix)]
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
         #[cfg(windows)]
@@ -188,9 +212,60 @@ pub mod host_fs {
 
 #[cfg(all(test, feature = "native", unix))]
 mod host_fs_security_tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::symlink;
 
-    use super::host_fs::{open_existing_regular_file_no_follow, reserve_new_file};
+    use super::host_fs::{open_existing_regular_file_no_follow, open_wal_for_guarded_repair, reserve_new_file};
+    use super::FileIdentity;
+
+    #[test]
+    fn guarded_wal_open_is_existing_only_and_preserves_bytes_and_identity() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("source-wal");
+        let mut original = reserve_new_file(&path).unwrap();
+        original.write_all(b"original WAL bytes").unwrap();
+        let identity = FileIdentity::from_file(&original).unwrap().unwrap();
+        let mut writable = open_wal_for_guarded_repair(&path, identity).unwrap();
+        let mut bytes = Vec::new();
+        writable.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original WAL bytes");
+        writable.seek(SeekFrom::Start(0)).unwrap();
+        writable.write_all(b"repaired").unwrap();
+        assert_eq!(writable.metadata().unwrap().len(), 18);
+        assert_eq!(FileIdentity::from_file(&writable).unwrap(), Some(identity));
+        let missing = directory.join("missing-wal");
+        assert!(open_wal_for_guarded_repair(&missing, identity).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn guarded_wal_open_refuses_wrong_identity_without_truncation() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let first = directory.join("first-wal");
+        let second = directory.join("second-wal");
+        let original = reserve_new_file(&first).unwrap();
+        let identity = FileIdentity::from_file(&original).unwrap().unwrap();
+        let mut unrelated = reserve_new_file(&second).unwrap();
+        unrelated.write_all(b"other generation").unwrap();
+        assert!(matches!(open_wal_for_guarded_repair(&second, identity),
+            Err(fsqlite_error::FrankenError::BusyRecovery)));
+        assert_eq!(std::fs::read(&second).unwrap(), b"other generation");
+    }
+
+    #[test]
+    fn guarded_wal_open_refuses_symlinks_and_hard_links() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("source-wal");
+        let original = reserve_new_file(&path).unwrap();
+        let identity = FileIdentity::from_file(&original).unwrap().unwrap();
+        let link = directory.join("symlink-wal");
+        symlink(&path, &link).unwrap();
+        assert!(open_wal_for_guarded_repair(&link, identity).is_err());
+        let hard_link = directory.join("hardlink-wal");
+        std::fs::hard_link(&path, &hard_link).unwrap();
+        assert!(open_wal_for_guarded_repair(&path, identity).is_err());
+        assert!(open_wal_for_guarded_repair(&hard_link, identity).is_err());
+    }
 
     #[test]
     fn identity_guard_rejects_final_symlinks_and_hard_link_aliases() {

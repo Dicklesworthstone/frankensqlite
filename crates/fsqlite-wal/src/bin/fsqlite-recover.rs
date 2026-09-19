@@ -1,11 +1,13 @@
-//! Non-destructive WAL-FEC recovery into a new standalone database.
+//! WAL-FEC recovery: export by default, explicit backed-up WAL repair on Unix.
 //!
-//! This administrative command captures main/WAL under the native recovery
-//! fence, then releases source locks before decoding. It does not open an SQL
-//! Connection on damaged input and never publishes into the source namespace.
+//! Default export captures main/WAL under the native recovery fence, then
+//! releases source locks before decoding. Neither mode opens an SQL Connection
+//! on damaged input. Only explicit --repair-wal publishes into the source.
 //! Source directories must obey the VFS cooperative-namespace contract. Native
 //! admission may create lock/SHM companions; database, WAL and FEC data are not
-//! rewritten. A retained destination from a failed export is never auto-deleted.
+//! rewritten by export. Explicit --repair-wal retains the same recovery owner
+//! through backup, physical repair and shared-index publication. Neither mode
+//! deletes files or overwrites a destination/backup.
 
 #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
 fn main() -> std::process::ExitCode {
@@ -20,6 +22,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
 mod native {
+    #[cfg(unix)]
+    mod repair;
+
     use std::ffi::OsString;
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
@@ -38,18 +43,25 @@ mod native {
     type NativeVfs = fsqlite_vfs::unix::UnixVfs;
     #[cfg(windows)]
     type NativeVfs = fsqlite_vfs::windows::WindowsVfs;
+    type NativeFile = <NativeVfs as Vfs>::File;
 
     const IO_CHUNK: usize = 64 * 1024;
     const DATABASE_HEADER_BYTES: usize = 100;
     const HELP: &str = "Usage: fsqlite-recover [OPTIONS] SOURCE.db OUTPUT.db
+       fsqlite-recover --repair-wal [OPTIONS] SOURCE.db NEW_BACKUP.wal
 
-Recover a coherent main/WAL/FEC snapshot into a NEW database; never overwrite.
+By default, export a coherent main/WAL/FEC snapshot into a NEW database.
 Close active transactions first: source lock contention is a fail-fast error.
-The source must be writable for native recovery-lock/SHM admission. Its main,
-WAL and FEC data are preserved. The destination parent must already exist and
+The source must be writable for native recovery-lock/SHM admission. Export
+preserves source data; --repair-wal explicitly modifies its WAL and shared index.
+The destination/backup parent must already exist and
 must not be concurrently manipulated. Do not open the destination until success.
 
 Options:
+  --repair-wal         Unix only: repair the existing WAL and rebuild its index.
+                       The second path is a mandatory NEW backup of the original
+                       WAL, synced and verified BEFORE any source WAL mutation.
+                       No database/FEC/certificate writes, WAL reset or truncation.
   --max-bytes N         Bound each input file and the output (default: main/output
                        268435456, WAL 67108864, FEC/certificates 33554432 bytes).
   --max-source-pages N  Maximum source pages per FEC decode (default: 256).
@@ -68,6 +80,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         destination: PathBuf,
         max_database_bytes: usize,
         replay: WalFecReplayLimits,
+        repair_wal: bool,
     }
 
     fn positive_limit(value: &std::ffi::OsStr) -> std::result::Result<usize, String> {
@@ -85,6 +98,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             destination: PathBuf::new(),
             max_database_bytes: 256 * 1024 * 1024,
             replay: WalFecReplayLimits::default(),
+            repair_wal: false,
         };
         let mut paths = Vec::new();
         let mut literal_paths = false;
@@ -92,6 +106,8 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         while let Some(arg) = args.next() {
             if !literal_paths && arg == "--" {
                 literal_paths = true;
+            } else if !literal_paths && arg == "--repair-wal" {
+                options.repair_wal = true;
             } else if !literal_paths && (arg == "--max-bytes" || arg == "--max-source-pages") {
                 let value = args.next().ok_or_else(|| "missing limit value".to_owned())?;
                 let limit = positive_limit(&value)?;
@@ -132,16 +148,32 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         };
         let result = runtime.block_on(async {
             let cx = request_context()?;
+            if options.repair_wal {
+                #[cfg(unix)]
+                return repair::run(&NativeVfs::new(), &cx, &options).await;
+                #[cfg(not(unix))]
+                return Err(FrankenError::Unsupported);
+            }
             recover_to_new_database(&NativeVfs::new(), &cx, &options).await
         });
         match result {
             Ok(report) => {
-                println!("Recovered database: {}", report.destination.display());
+                if report.repaired_in_place {
+                    println!("Repaired WAL and rebuilt index: {}", options.source.display());
+                    println!("Original WAL backup: {}", report.destination.display());
+                } else {
+                    println!("Recovered database: {}", report.destination.display());
+                }
                 println!("Pages: {}; verified WAL frames: {}; repaired frames: {}",
                     report.pages, report.wal_frames, report.repaired_frames);
-                println!("Output BLAKE3: {}", report.digest);
+                println!("{} BLAKE3: {}",
+                    if report.repaired_in_place { "Repaired WAL" } else { "Output" }, report.digest);
                 println!("Certificate-validated intervals: {}", report.certificate_anchors);
-                println!("Source data preserved. Output B-tree integrity has not been checked.");
+                if report.repaired_in_place {
+                    println!("Main/FEC/certificates preserved. Run integrity_check before using the database.");
+                } else {
+                    println!("Source data preserved. Output B-tree integrity has not been checked.");
+                }
                 ExitCode::SUCCESS
             }
             Err(error) => { eprintln!("recovery failed: {error}"); ExitCode::FAILURE }
@@ -244,6 +276,26 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         wal: Vec<u8>,
         sidecar: Vec<u8>,
         certificates: Vec<u8>,
+    }
+
+    /// Transferable owner, not just bytes. Field order closes WAL before main.
+    /// Moving this into a blocking repair task keeps recovery fences alive even
+    /// if the caller drops the task's awaiter while synchronous writes settle.
+    struct CapturedSource {
+        snapshot: Snapshot,
+        wal: SourceFile<NativeFile>,
+        main: SourceFile<NativeFile>,
+        #[cfg(unix)]
+        main_identity: FileIdentity,
+        #[cfg(unix)]
+        wal_identity: FileIdentity,
+    }
+
+    impl CapturedSource {
+        fn finish(&mut self) -> Result<()> {
+            self.wal.finish()?;
+            self.main.finish()
+        }
     }
 
     async fn read_vfs_snapshot<F: VfsFile>(file: &F, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
@@ -369,6 +421,12 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
     }
 
     async fn capture(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Snapshot> {
+        let mut captured = capture_held(vfs, cx, options).await?;
+        captured.finish()?;
+        Ok(captured.snapshot)
+    }
+
+    async fn capture_held(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<CapturedSource> {
         require_regular_file(&options.source)?;
         let (file, flags) = vfs.open(cx, Some(&options.source),
             VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB)?;
@@ -381,7 +439,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         let wal_path = companion(&options.source, "-wal");
         require_regular_file(&wal_path)?;
         let (file, _) = vfs.open(cx, Some(&wal_path), VfsOpenFlags::READONLY | VfsOpenFlags::WAL)?;
-        let mut wal = SourceFile::new(file, cx);
+        let wal = SourceFile::new(file, cx);
         let wal_identity = wal.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
         if main_identity == wal_identity { return Err(FrankenError::BusyRecovery); }
         let wal_bytes = read_vfs_snapshot(&wal.file, cx, options.replay.max_wal_bytes).await?;
@@ -393,7 +451,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             vfs, cx, &companion(&options.source, "-wal-cert"),
             options.replay.max_certificate_bytes, main_identity, wal_identity,
         ).await?;
-        // Recheck both named descriptors before releasing the common fence.
+        // Recheck both named descriptors before returning ownership of the fence.
         for (path, identity, flags) in [
             (&options.source, main_identity, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB),
             (&wal_path, wal_identity, VfsOpenFlags::READONLY | VfsOpenFlags::WAL),
@@ -401,9 +459,14 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             let (file, _) = vfs.open_with_expected_identity(cx, path, flags, identity)?;
             SourceFile::new(file, cx).finish()?;
         }
-        wal.finish()?;
-        main.finish()?;
-        Ok(Snapshot { database, wal: wal_bytes, sidecar, certificates })
+        Ok(CapturedSource {
+            snapshot: Snapshot { database, wal: wal_bytes, sidecar, certificates },
+            wal, main,
+            #[cfg(unix)]
+            main_identity,
+            #[cfg(unix)]
+            wal_identity,
+        })
     }
 
     fn refuse_destination_artifacts(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
@@ -467,6 +530,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         repaired_frames: usize,
         certificate_anchors: usize,
         digest: blake3::Hash,
+        repaired_in_place: bool,
     }
 
     async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<ExportReport> {
@@ -519,7 +583,7 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         drop(output);
         Ok(ExportReport {
             destination: options.destination, pages, wal_frames, repaired_frames, certificate_anchors,
-            digest,
+            digest, repaired_in_place: false,
         })
     }
 
@@ -819,6 +883,9 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
             assert!(parse(&["--max-bytes", "0", "a", "b"]).is_err());
             assert!(parse(&["--max-source-pages"]).is_err());
             assert!(parse(&["--force", "a", "b"]).is_err());
+            assert!(!parse(&["a", "b"]).unwrap().unwrap().repair_wal);
+            assert!(parse(&["--repair-wal", "a", "b"]).unwrap().unwrap().repair_wal);
+            assert!(!parse(&["--", "--repair-wal", "b"]).unwrap().unwrap().repair_wal);
             let options = parse(&["--max-bytes", "2048", "--", "-a", "-b"]).unwrap().unwrap();
             assert_eq!(options.source, Path::new("-a"));
             assert_eq!(options.destination, Path::new("-b"));
@@ -906,6 +973,144 @@ A failed output is retained for diagnosis; it is never deleted or overwritten.";
         }
 
         const SOURCE_ID: [u8; 16] = [0x6d; 16];
+
+        #[cfg(unix)]
+        #[test]
+        fn native_in_place_repair_preserves_original_backup_and_publishes_index() {
+            use fsqlite_wal::wal_index::{
+                WAL_SHM_SEGMENT_BYTES, read_shared_wal_index_header,
+                validate_shared_wal_index_wal_binding,
+            };
+            run_test(async {
+                let (options, _) = fixture(8, &[1]);
+                let wal_path = companion(&options.source, "-wal");
+                let original = host_fs::read(&wal_path).unwrap();
+                let main_before = host_fs::read(&options.source).unwrap();
+                let sidecar_path = companion(&options.source, "-wal-fec");
+                let sidecar = host_fs::read(&sidecar_path).unwrap();
+                let expected = fsqlite_wal::wal_fec::replay::recover_wal_fec_image(
+                    &original, &sidecar, options.replay,
+                ).unwrap().complete_image().unwrap().into_owned();
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                // Retain an idle SHM attachment, but no reader mark. Otherwise
+                // a new opener is allowed to initialize a fresh derived index.
+                let (file, _) = vfs.open(&cx, Some(&options.source),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+                let mut observer = SourceFile::new(file, &cx);
+                let region = observer.file.shm_map(&cx, 0,
+                    u32::try_from(WAL_SHM_SEGMENT_BYTES).unwrap(), true).unwrap();
+                let (wal_observer, _) = vfs.open(&cx, Some(&wal_path),
+                    VfsOpenFlags::READONLY | VfsOpenFlags::WAL).unwrap();
+                let mut wal_observer = SourceFile::new(wal_observer, &cx);
+                let identity = wal_observer.file.file_identity().unwrap();
+                let report = repair::run(&vfs, &cx, &options).await.unwrap();
+                assert!(report.repaired_in_place);
+                assert_eq!(report.repaired_frames, 1);
+                assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+                assert_eq!(host_fs::read(&wal_path).unwrap(), expected);
+                assert_eq!(report.digest, blake3::hash(&expected));
+                assert_eq!(host_fs::read(&options.source).unwrap(), main_before);
+                assert_eq!(host_fs::read(&sidecar_path).unwrap(), sidecar);
+                assert_eq!(wal_observer.file.file_identity().unwrap(), identity);
+                let index = read_shared_wal_index_header(&region).unwrap().unwrap();
+                assert_eq!(index.mx_frame, 4);
+                assert_eq!(index.n_page, 1);
+                let header = WalHeader::from_bytes(&expected).unwrap();
+                let terminal = WalFrameHeader::from_bytes(&expected[expected.len() - FRAME_SIZE..]).unwrap();
+                validate_shared_wal_index_wal_binding(&index, &header, Some((4, terminal))).unwrap();
+                drop(region);
+                wal_observer.finish().unwrap();
+                observer.finish().unwrap();
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn native_in_place_refusals_never_change_wal_or_overwrite_backup() {
+            run_test(async {
+                let (mut options, _) = fixture(2, &[0, 1, 2]);
+                let wal_path = companion(&options.source, "-wal");
+                let original = host_fs::read(&wal_path).unwrap();
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&wal_path).unwrap(), original);
+                host_fs::write(&options.destination, b"existing backup").unwrap();
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert_eq!(host_fs::read(&options.destination).unwrap(), b"existing backup");
+                options.destination = companion(&options.source, "-wal-cert");
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                assert_eq!(host_fs::read(&wal_path).unwrap(), original);
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn native_in_place_repair_uses_certificate_without_rewriting_it() {
+            run_test(async {
+                let (options, _) = fixture_with_identity(8, &[], SOURCE_ID);
+                let certificate = write_fixture_certificate(&options, SOURCE_ID);
+                let wal_path = companion(&options.source, "-wal");
+                let expected = host_fs::read(&wal_path).unwrap();
+                let mut damaged = expected.clone();
+                let terminal = WAL_HEADER_SIZE + 3 * FRAME_SIZE;
+                damaged[terminal..terminal + WAL_FRAME_HEADER_SIZE].fill(0);
+                damaged[WAL_HEADER_SIZE + FRAME_SIZE + WAL_FRAME_HEADER_SIZE + 60] ^= 1;
+                host_fs::write(&wal_path, &damaged).unwrap();
+                let cx = request_context().unwrap();
+                let report = repair::run(&NativeVfs::new(), &cx, &options).await.unwrap();
+                assert_eq!(report.certificate_anchors, 1);
+                assert_eq!(host_fs::read(&wal_path).unwrap(), expected);
+                assert_eq!(host_fs::read(&options.destination).unwrap(), damaged);
+                assert_eq!(host_fs::read(&companion(&options.source, "-wal-cert")).unwrap(), certificate);
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn native_in_place_contention_and_precancellation_do_not_reserve_backup() {
+            run_test(async {
+                let (options, _) = fixture(8, &[1]);
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                let mut owner = capture_held(&vfs, &cx, &options).await.unwrap();
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                owner.finish().unwrap();
+                cx.cancel();
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&Cx::new(), &options.destination).unwrap());
+            });
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn transferred_capture_keeps_fences_until_the_worker_finishes() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+            run_test(async {
+                let (options, _) = fixture(8, &[1]);
+                let cx = request_context().unwrap();
+                let vfs = NativeVfs::new();
+                let mut captured = capture_held(&vfs, &cx, &options).await.unwrap();
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    captured.finish().unwrap();
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(repair::run(&vfs, &cx, &options).await.is_err());
+                assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
+                release_tx.send(()).unwrap();
+                worker.join().unwrap();
+                repair::run(&vfs, &cx, &options).await.unwrap();
+            });
+        }
 
         fn write_fixture_certificate(options: &Options, identity: [u8; 16]) -> Vec<u8> {
             use fsqlite_types::{CommitSeq, PageNumber};
