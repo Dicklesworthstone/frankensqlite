@@ -24,6 +24,11 @@ use crate::checksum::{
     SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalChecksumTransform,
     WalFrameHeader, WalHeader, validate_wal_header_checksum,
 };
+use crate::parallel_wal::{
+    PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE, ParallelWalDurableCertificateRecord,
+    ParallelWalFramePayloadDigestBuilder,
+};
+use crate::wal::WalGenerationIdentity;
 
 /// Admission limits, checked before image copies or decoder construction.
 /// These bound input sizes and source/repair counts, not total process RSS.
@@ -34,6 +39,8 @@ pub struct WalFecReplayLimits {
     pub max_sidecar_groups: usize,
     pub max_source_pages: usize,
     pub max_repair_symbols: usize,
+    pub max_certificate_bytes: usize,
+    pub max_certificate_records: usize,
 }
 
 impl Default for WalFecReplayLimits {
@@ -44,6 +51,8 @@ impl Default for WalFecReplayLimits {
             max_sidecar_groups: 4096,
             max_source_pages: 256,
             max_repair_symbols: 255,
+            max_certificate_bytes: 32 * 1024 * 1024,
+            max_certificate_records: 4096,
         }
     }
 }
@@ -69,6 +78,15 @@ pub struct WalFecReplayStop {
     pub reason: WalFecReplayStopReason,
 }
 
+/// Independently stored certificate that accepted otherwise unanchored repairs.
+/// This records byte validation, not a new durability or publication event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFecReplayCertificateAnchor {
+    pub start_frame_no: u32,
+    pub end_frame_no: u32,
+    pub certificate_epoch: u64,
+}
+
 /// A verified committed prefix plus explicit evidence about the omitted tail.
 ///
 /// Successful decoding is NOT durability. `complete_image` refuses an unresolved
@@ -83,6 +101,7 @@ pub struct WalFecReplayResult<'a> {
     discarded_tail_bytes: usize,
     repaired_frame_nos: Vec<u32>,
     decode_proofs: Vec<WalFecDecodeProof>,
+    certificate_anchors: Vec<WalFecReplayCertificateAnchor>,
     stop: Option<WalFecReplayStop>,
 }
 
@@ -131,6 +150,12 @@ impl<'a> WalFecReplayResult<'a> {
     #[must_use]
     pub fn decode_proofs(&self) -> &[WalFecDecodeProof] {
         &self.decode_proofs
+    }
+
+    /// Certificates whose full ordered payload digest accepted a repair chain.
+    #[must_use]
+    pub fn certificate_anchors(&self) -> &[WalFecReplayCertificateAnchor] {
+        &self.certificate_anchors
     }
 
     #[must_use]
@@ -307,6 +332,35 @@ pub fn recover_wal_fec_image<'a>(
     sidecar_bytes: &[u8],
     limits: WalFecReplayLimits,
 ) -> Result<WalFecReplayResult<'a>> {
+    recover_wal_fec_image_with_certificates(wal_bytes, sidecar_bytes, &[], [0; 16], limits)
+}
+
+/// Recover using optional durable certificates when original checksum anchors
+/// have been lost, including in the final committed transaction.
+///
+/// `database_file_id` MUST come from bytes 76..92 of the coherently captured
+/// main-file header, never from a decoded WAL page or the certificate itself.
+/// Zero/legacy identities cannot authorize this stronger recovery. The caller
+/// must capture all inputs from the same source under its recovery fences.
+///
+/// A certificate must bind the exact WAL generation and database identity,
+/// cover EVERY tentative group since the last accepted commit, and match the
+/// independently reconstructed ordered frame digest and final database size.
+/// It cannot authorize missing physical frames, supply missing FEC payloads,
+/// invent an uncommitted transaction, or overwrite a verified prefix.
+///
+/// Certificates are optional evidence: malformed, legacy, oversized or torn
+/// streams provide no authority, but do not impede original-checksum recovery.
+/// Conflicting eligible records provide no authority either. The healthy WAL
+/// path does not parse certificates. Checksums/digests protect against accidental
+/// corruption; these records are not signatures authenticating hostile inputs.
+pub fn recover_wal_fec_image_with_certificates<'a>(
+    wal_bytes: &'a [u8],
+    sidecar_bytes: &[u8],
+    certificate_bytes: &[u8],
+    database_file_id: [u8; 16],
+    limits: WalFecReplayLimits,
+) -> Result<WalFecReplayResult<'a>> {
     if wal_bytes.len() > limits.max_wal_bytes {
         return Err(corrupt("WAL image exceeds recovery input limit"));
     }
@@ -330,6 +384,8 @@ pub fn recover_wal_fec_image<'a>(
     let mut db_size_pages = None;
     let mut repaired_frame_nos = Vec::new();
     let mut decode_proofs = Vec::new();
+    let mut certificate_anchors = Vec::new();
+    let mut certificates = None;
     let mut stop = None;
     let mut pending_anchor: Option<PendingReplayAnchor> = None;
 
@@ -470,6 +526,19 @@ pub fn recover_wal_fec_image<'a>(
             }
         }
         image.to_mut()[group_start..group_end].copy_from_slice(&rebuilt);
+        if let Some(pending) = pending_anchor {
+            let records = certificates.get_or_insert_with(|| {
+                read_replay_certificates(
+                    certificate_bytes, database_file_id, &header, frame_count, limits,
+                )
+            });
+            if let Some(anchor) = match_replay_certificate(
+                records, &image, pending.committed_frames + 1, meta.end_frame_no, frame_size,
+            ) {
+                certificate_anchors.push(anchor);
+                pending_anchor = None;
+            }
+        }
         frame_index = meta.end_frame_no;
         committed_frames = frame_index;
         running = rebuilt_checksum;
@@ -505,7 +574,105 @@ pub fn recover_wal_fec_image<'a>(
     Ok(WalFecReplayResult {
         image, header, committed_frames, db_size_pages,
         discarded_tail_bytes: wal_bytes.len() - prefix_len,
-        repaired_frame_nos, decode_proofs, stop,
+        repaired_frame_nos, decode_proofs, certificate_anchors, stop,
+    })
+}
+
+/// Parse at most the admitted number of bounded records, once per replay.
+/// Any malformed envelope invalidates the optional stream; an unrelated bad
+/// certificate can never turn checksum-verified WAL bytes into a failure.
+fn read_replay_certificates(
+    bytes: &[u8],
+    database_file_id: [u8; 16],
+    header: &WalHeader,
+    physical_frames: u32,
+    limits: WalFecReplayLimits,
+) -> Vec<ParallelWalDurableCertificateRecord> {
+    if database_file_id == [0; 16] || bytes.len() > limits.max_certificate_bytes {
+        return Vec::new();
+    }
+    let parse = || -> Option<Vec<ParallelWalDurableCertificateRecord>> {
+        let mut records = Vec::new();
+        let mut remaining = bytes;
+        let mut seen = 0;
+        while !remaining.is_empty() {
+            if seen >= limits.max_certificate_records {
+                return None;
+            }
+            seen += 1;
+            let encoded_len = u32::from_le_bytes(remaining.get(10..14)?.try_into().ok()?);
+            let len = usize::try_from(encoded_len).ok()?;
+            if !(ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE
+                ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE).contains(&len)
+            {
+                return None;
+            }
+            let record = ParallelWalDurableCertificateRecord::from_bytes(remaining.get(..len)?)
+                .ok()?;
+            remaining = remaining.get(len..)?;
+            if record.db_file_id == database_file_id
+                && record.wal_generation == WalGenerationIdentity::from_header(header)
+                && record.wal_frame_end <= u64::from(physical_frames)
+            {
+                records.push(record);
+            }
+        }
+        Some(records)
+    };
+    parse().unwrap_or_default()
+}
+
+/// Unlike a rolling WAL checksum, a certificate digest binds ONLY its own
+/// interval. A later certificate starting after `first_unanchored` must never
+/// bless an earlier tentative transaction, even if its own digest matches.
+fn match_replay_certificate(
+    records: &[ParallelWalDurableCertificateRecord],
+    image: &[u8],
+    first_unanchored: u32,
+    end_frame_no: u32,
+    frame_size: usize,
+) -> Option<WalFecReplayCertificateAnchor> {
+    let mut candidates = records.iter().filter(|record| {
+        record.wal_frame_start <= u64::from(first_unanchored)
+            && record.wal_frame_end == u64::from(end_frame_no)
+    });
+    let record = candidates.next()?;
+    // An exact retry is harmless. Do not select an arbitrary authority among
+    // contradictory, independently checksummed records for the same endpoint.
+    if candidates.any(|other| other != record) {
+        return None;
+    }
+    let start_frame_no = u32::try_from(record.wal_frame_start).ok()?;
+    let start = frame_offset(start_frame_no.checked_sub(1)?, frame_size).ok()?;
+    let end = frame_offset(end_frame_no, frame_size).ok()?;
+    if start_frame_no > 1 {
+        let previous = image.get(start.checked_sub(frame_size)?..start)?;
+        if !WalFrameHeader::from_bytes(previous).ok()?.is_commit() {
+            return None;
+        }
+    }
+    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+    let mut terminal = None;
+    for frame in image.get(start..end)?.chunks_exact(frame_size) {
+        let header = WalFrameHeader::from_bytes(frame).ok()?;
+        let page = PageNumber::new(header.page_number)?;
+        digest.update(page, header.db_size, &frame[WAL_FRAME_HEADER_SIZE..]);
+        terminal = Some(header);
+    }
+    let terminal = terminal?;
+    let generation = WalGenerationIdentity::from_header(&WalHeader::from_bytes(image).ok()?);
+    if !terminal.is_commit()
+        || terminal.db_size != record.certificate.db_size_pages
+        || !record.authorizes_wal_boundary(
+            generation, u64::from(end_frame_no), u64::from(end_frame_no), digest.finalize(),
+        )
+    {
+        return None;
+    }
+    Some(WalFecReplayCertificateAnchor {
+        start_frame_no,
+        end_frame_no,
+        certificate_epoch: record.certificate.certificate_epoch,
     })
 }
 
@@ -1306,5 +1473,266 @@ mod tests {
         let wal = header(WAL_MAGIC_LE).to_bytes().unwrap();
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.database_image(&database, 2 * PAGE_SIZE).unwrap(), &database[..PAGE_SIZE]);
+    }
+
+    const CERTIFICATE_DATABASE_ID: [u8; 16] = [0x6d; 16];
+
+    fn certificate_for(
+        wal: &[u8], start_frame: u32, end_frame: u32,
+    ) -> ParallelWalDurableCertificateRecord {
+        use crate::parallel_wal::{
+            PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, ParallelWalCommitCertificate,
+            ParallelWalOrderedResidue,
+        };
+        use fsqlite_types::CommitSeq;
+
+        let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+        let mut commits = 0_u64;
+        let mut pages = std::collections::BTreeSet::new();
+        let mut db_size = 0;
+        for number in start_frame..=end_frame {
+            let offset = frame_offset(number - 1, FRAME_SIZE).unwrap();
+            let frame = &wal[offset..offset + FRAME_SIZE];
+            let header = WalFrameHeader::from_bytes(frame).unwrap();
+            pages.insert(header.page_number);
+            commits += u64::from(header.is_commit());
+            db_size = header.db_size;
+            digest.update(PageNumber::new(header.page_number).unwrap(), db_size,
+                &frame[WAL_FRAME_HEADER_SIZE..]);
+        }
+        let mut certificate = ParallelWalCommitCertificate {
+            format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
+            residue: ParallelWalOrderedResidue::CommitCertificateThenPublish,
+            certificate_epoch: 7,
+            commit_seq_lo: CommitSeq::new(1),
+            commit_seq_hi: CommitSeq::new(commits),
+            durable_segment_epoch: 7,
+            lane_count: 1,
+            lane_record_counts: vec![end_frame - start_frame + 1],
+            db_size_pages: db_size,
+            page_set_size: u32::try_from(pages.len()).unwrap(),
+            wal_frame_payload_digest: digest.finalize(),
+            certificate_crc32c: 0,
+            fallback_active: false,
+        };
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        ParallelWalDurableCertificateRecord::new(
+            WalGenerationIdentity::from_header(&WalHeader::from_bytes(wal).unwrap()),
+            u64::from(start_frame), u64::from(end_frame), CERTIFICATE_DATABASE_ID, certificate,
+        ).unwrap()
+    }
+
+    fn certificate_recovery<'a>(
+        wal: &'a [u8], sidecar: &[u8], certificates: &[u8],
+    ) -> WalFecReplayResult<'a> {
+        recover_wal_fec_image_with_certificates(
+            wal, sidecar, certificates, CERTIFICATE_DATABASE_ID, WalFecReplayLimits::default(),
+        ).unwrap()
+    }
+
+    #[test]
+    fn certificate_restores_final_commit_without_a_surviving_checksum() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let sidecar = append_group(&mut wal, 5, 8, 50);
+            let certificate = certificate_for(&wal, 1, 5).to_bytes();
+            let expected = wal.clone();
+            let terminal = frame_offset(4, FRAME_SIZE).unwrap();
+            wal[terminal..terminal + WAL_FRAME_HEADER_SIZE].fill(0);
+            corrupt_payload(&mut wal, 2);
+            corrupt_payload(&mut wal, 5);
+            let damaged = wal.clone();
+            let result = certificate_recovery(&wal, &sidecar, &certificate);
+            assert_eq!(result.committed_frames(), 5);
+            assert_eq!(result.repaired_frame_nos(), &[2, 5]);
+            assert_eq!(result.certificate_anchors(), &[WalFecReplayCertificateAnchor {
+                start_frame_no: 1, end_frame_no: 5, certificate_epoch: 7,
+            }]);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+            assert_eq!(wal, damaged);
+            assert!(recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default())
+                .unwrap().complete_image().is_err());
+        }
+    }
+
+    #[test]
+    fn certificate_must_cover_the_entire_unanchored_chain() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let mut sidecar = append_group(&mut wal, 3, 8, 51);
+        sidecar.extend(append_group(&mut wal, 4, 8, 52));
+        let full = certificate_for(&wal, 1, 7).to_bytes();
+        let narrow = certificate_for(&wal, 4, 7).to_bytes();
+        let expected = wal.clone();
+        corrupt_checksum(&mut wal, 3);
+        corrupt_payload(&mut wal, 4);
+        corrupt_checksum(&mut wal, 7);
+        let rejected = certificate_recovery(&wal, &sidecar, &narrow);
+        assert_eq!(rejected.committed_frames(), 0);
+        assert!(rejected.certificate_anchors().is_empty());
+        assert!(rejected.complete_image().is_err());
+        let recovered = certificate_recovery(&wal, &sidecar, &full);
+        assert_eq!(recovered.repaired_frame_nos(), &[3, 4, 7]);
+        assert_eq!(recovered.complete_image().unwrap().as_ref(), expected);
+    }
+
+    #[test]
+    fn certificate_interval_must_start_at_a_transaction_boundary() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 3, 8, 53);
+        let prefix = wal.clone();
+        let sidecar = append_group(&mut wal, 3, 8, 54);
+        let valid = certificate_for(&wal, 4, 6).to_bytes();
+        let mid_transaction = certificate_for(&wal, 2, 6).to_bytes();
+        let expected = wal.clone();
+        corrupt_checksum(&mut wal, 6);
+        let rejected = certificate_recovery(&wal, &sidecar, &mid_transaction);
+        assert_eq!(rejected.replayable_prefix(), prefix);
+        assert!(rejected.complete_image().is_err());
+        assert_eq!(certificate_recovery(&wal, &sidecar, &valid)
+            .complete_image().unwrap().as_ref(), expected);
+    }
+
+    #[test]
+    fn certificates_require_nonzero_matching_main_file_identity() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 55);
+        let record = certificate_for(&wal, 1, 3);
+        corrupt_checksum(&mut wal, 3);
+        for identity in [[0; 16], [0x7a; 16]] {
+            let result = recover_wal_fec_image_with_certificates(
+                &wal, &sidecar, &record.to_bytes(), identity, WalFecReplayLimits::default(),
+            ).unwrap();
+            assert!(result.certificate_anchors().is_empty());
+            assert!(result.complete_image().is_err());
+        }
+        let mut legacy = record;
+        legacy.db_file_id = [0; 16];
+        assert!(certificate_recovery(&wal, &sidecar, &legacy.to_bytes())
+            .complete_image().is_err());
+    }
+
+    #[test]
+    fn valid_envelope_cannot_substitute_generation_payload_or_database_size() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 56);
+        let original = certificate_for(&wal, 1, 3);
+        corrupt_checksum(&mut wal, 3);
+        for change in 0..6 {
+            let mut record = original.clone();
+            match change {
+                0 => record.wal_generation.checkpoint_seq += 1,
+                1 => record.wal_generation.salts.salt1 ^= 1,
+                2 => record.certificate.wal_frame_payload_digest[0] ^= 1,
+                3 => record.certificate.db_size_pages += 1,
+                4 => record.wal_frame_end += 1,
+                _ => record.db_file_id[0] ^= 1,
+            }
+            record.certificate.certificate_crc32c = record.certificate.computed_crc32c();
+            let encoded = record.to_bytes();
+            assert!(ParallelWalDurableCertificateRecord::from_bytes(&encoded).is_ok());
+            assert!(certificate_recovery(&wal, &sidecar, &encoded).complete_image().is_err());
+        }
+    }
+
+    #[test]
+    fn certificate_retries_are_deduplicated_but_conflicting_authorities_are_refused() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 57);
+        let mut record = certificate_for(&wal, 1, 3);
+        let encoded = record.to_bytes();
+        let expected = wal.clone();
+        corrupt_checksum(&mut wal, 3);
+        let mut duplicate = encoded.clone();
+        duplicate.extend_from_slice(&encoded);
+        assert_eq!(certificate_recovery(&wal, &sidecar, &duplicate)
+            .complete_image().unwrap().as_ref(), expected);
+        record.certificate.wal_frame_payload_digest[0] ^= 1;
+        record.certificate.certificate_crc32c = record.certificate.computed_crc32c();
+        for reversed in [false, true] {
+            let mut conflicting = if reversed { record.to_bytes() } else { encoded.clone() };
+            conflicting.extend(if reversed { encoded.clone() } else { record.to_bytes() });
+            assert!(certificate_recovery(&wal, &sidecar, &conflicting).complete_image().is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_or_over_budget_certificates_never_authorize_recovery() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 58);
+        let encoded = certificate_for(&wal, 1, 3).to_bytes();
+        corrupt_checksum(&mut wal, 3);
+        for len in [0, 1, 13, encoded.len() - 1] {
+            assert!(certificate_recovery(&wal, &sidecar, &encoded[..len])
+                .complete_image().is_err());
+        }
+        for index in 0..encoded.len() {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= 1;
+            assert!(certificate_recovery(&wal, &sidecar, &corrupted).complete_image().is_err());
+        }
+        for limits in [
+            WalFecReplayLimits { max_certificate_bytes: encoded.len() - 1, ..WalFecReplayLimits::default() },
+            WalFecReplayLimits { max_certificate_records: 0, ..WalFecReplayLimits::default() },
+        ] {
+            assert!(recover_wal_fec_image_with_certificates(
+                &wal, &sidecar, &encoded, CERTIFICATE_DATABASE_ID, limits,
+            ).unwrap().complete_image().is_err());
+        }
+        let mut torn_tail = encoded;
+        torn_tail.push(0);
+        assert!(certificate_recovery(&wal, &sidecar, &torn_tail).complete_image().is_err());
+    }
+
+    #[test]
+    fn invalid_certificates_do_not_poison_original_checksum_recovery() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 59);
+        append_group(&mut wal, 2, 8, 60);
+        let expected = wal.clone();
+        corrupt_checksum(&mut wal, 3);
+        let limits = WalFecReplayLimits { max_certificate_bytes: 0, ..WalFecReplayLimits::default() };
+        let result = recover_wal_fec_image_with_certificates(
+            &wal, &sidecar, b"invalid optional certificate", CERTIFICATE_DATABASE_ID, limits,
+        ).unwrap();
+        assert!(result.certificate_anchors().is_empty());
+        assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+    }
+
+    #[test]
+    fn certificate_never_supplies_missing_fec_or_missing_physical_frames() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 3, 8, 61);
+        let encoded = certificate_for(&wal, 1, 3).to_bytes();
+        corrupt_checksum(&mut wal, 3);
+        assert!(certificate_recovery(&wal, &[], &encoded).complete_image().is_err());
+        let truncated = &wal[..wal.len() - 1];
+        let result = certificate_recovery(truncated, &sidecar, &encoded);
+        assert!(result.certificate_anchors().is_empty());
+        assert!(result.complete_image().is_err());
+        // A certificate written before an append is not proof that the
+        // absent commit frame ever reached the WAL, even with old FEC nearby.
+        let missing_commit = &wal[..wal.len() - FRAME_SIZE];
+        let result = certificate_recovery(missing_commit, &sidecar, &encoded);
+        assert_eq!(result.committed_frames(), 0);
+        assert!(result.certificate_anchors().is_empty());
+        assert_eq!(result.replayable_prefix().len(), WAL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn accepted_certificate_survives_later_unanchored_failure_without_certifying_it() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let mut sidecar = append_group(&mut wal, 3, 8, 62);
+        let accepted = wal.clone();
+        let encoded = certificate_for(&wal, 1, 3).to_bytes();
+        sidecar.extend(append_group(&mut wal, 3, 8, 63));
+        corrupt_checksum(&mut wal, 3);
+        corrupt_payload(&mut wal, 4);
+        corrupt_checksum(&mut wal, 6);
+        let result = certificate_recovery(&wal, &sidecar, &encoded);
+        assert_eq!(result.committed_frames(), 3);
+        assert_eq!(result.repaired_frame_nos(), &[3]);
+        assert_eq!(result.certificate_anchors().len(), 1);
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert!(result.complete_image().is_err());
     }
 }

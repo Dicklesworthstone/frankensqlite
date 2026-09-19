@@ -132,6 +132,21 @@ anchor the preceding reconstructed chain. Such repairs remain tentative until
 that independent checksum matches; a successful payload decode alone is not
 enough. A chain with no surviving anchor is never exported as a complete database.
 
+When no original checksum survives, the command also captures an optional
+`damaged.db-wal-cert` under the same native recovery fence. A current-format
+durable certificate can validate the final recovered transaction only when its
+nonzero database identity matches the **captured main header**, its WAL generation
+matches, and its ordered BLAKE3 payload digest covers the **entire** tentative
+repair interval from a transaction boundary through the final commit. A later
+certificate cannot validate earlier frames outside its own interval. Exact
+duplicate records are harmless; contradictory eligible records are refused.
+Certificates cannot supply absent WAL frames or missing FEC data. Legacy/zero
+identities, malformed or torn certificate streams, and oversized proof streams
+provide no certificate authority; original-checksum recovery remains available.
+Certificate filesystem access/identity failures are errors, not permission to
+continue with a potentially incoherent capture. The success report includes the
+number of certificate-validated intervals. No certificate or source data is rewritten.
+
 Recovery refuses unresolved corruption, unanchored commit chains, partial
 WAL tails, ambiguous FEC groups, mismatched headers, and unexplained missing
 pages. It does not silently substitute a shortened WAL prefix: the main file
@@ -140,7 +155,8 @@ committed page versions, honors shrink/regrowth boundaries, preserves page-one
 metadata and WAL mode, and does not copy the old WAL or SHM into the destination.
 This is not recovery of unrelated main-file B-tree corruption.
 
-Defaults bound main/output to 256 MiB, WAL to 64 MiB, FEC to 32 MiB, and each
+Defaults bound main/output to 256 MiB, WAL to 64 MiB, FEC and certificates each
+to 32 MiB, the certificate stream to 4,096 records, and each
 decode to 256 source pages. `--max-bytes N` changes the per-file/output bound;
 `--max-source-pages N` changes the decode source bound. These are admission
 limits, not a process-RSS guarantee. Use `--help` for the full contract.
@@ -148,6 +164,10 @@ limits, not a process-RSS guarantee. Use `--help` for the full contract.
 Library callers with already-coherent immutable snapshots can use
 `wal_fec::replay::recover_wal_fec_image` followed by
 `WalFecReplayResult::database_image`. These functions perform no filesystem I/O.
+Callers with a coherently captured certificate stream can instead use
+`recover_wal_fec_image_with_certificates`; supply the identity from the main
+header, never from the certificate or the reconstructed WAL. Accepted authority
+intervals are available through `WalFecReplayResult::certificate_anchors`.
 
 The inline command tests cover real encoded FEC input, native lock contention,
 source preservation, output refusal, cancellation, and publication failures.
