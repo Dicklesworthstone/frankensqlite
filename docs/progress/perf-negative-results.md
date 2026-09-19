@@ -23105,3 +23105,30 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   Neither attempt counts as executed acceptance. No capture reduction,
   timeout increase, trigger rewrite or validator weakening is an acceptable
   retry condition.
+
+## 2026-09-19 — MAIN-qualified FK seeks did not complete HFDT migration
+
+- Workload: `hfdt-gbou9l`, the original 6,187-fact retained capture, unchanged
+  HFDT `27d83c97d693f7d1a0d2646fab61c9fca200dc6a`, four original filters and
+  1,800-second runtime limit, with the experimental engine overlay.
+- Engine repair `83d65ab7e9ec76f7f875bf826cef7916df124e34` admits explicit
+  `main` in the existing safe correlated equality seek rewrite. The bounded
+  rowid FK test fell from 302,496 to 8,234 VM instructions, preserving stock
+  violation output, NULL semantics and TEMP-shadow controls. All 11 focused
+  tests and strict changed-target Clippy passed. This does not establish a
+  full-consumer speedup.
+- Terminal consumer: exit 124 after 1,800.284 seconds. Persistence completed;
+  fresh stock readback still found schema 116, graph counts
+  `1/1/1/6187/6187/1`, clean quick/integrity checks and no FK violations.
+  The three remaining controls passed separately; aggregate acceptance failed.
+- Binary SHA256:
+  `22fdd045dbf7920dc4966e70f529dd2174ffa746ffc0f60d36d62b386d93aa8a`.
+  Evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-fk-main-consumer/`
+  retains source/archive identities, execution/result, controls, postmortem
+  and runtime-stack artifacts.
+- A single 1.266-second stack sample during persistence found the caller in
+  `mark_write_intent` and the worker in `json_each`/trigger subquery work.
+  That is a next bounded reproduction lead, not a distributional profile.
+  Retry only with measured repair of the existing path and unchanged capture,
+  triggers, validators and timeout. Do not claim migration completion from
+  the independently useful SQL seek repair.
