@@ -61,13 +61,14 @@ fn bounded_integrity_checks_deduplicated_primary_key_locators() {
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .expect("stock integrity");
             assert_eq!(integrity, "ok");
-            let index_root: usize = stock
+            let index_root: i64 = stock
                 .query_row(
                     "SELECT rootpage FROM sqlite_schema WHERE name='overlapping'",
                     [],
                     |row| row.get(0),
                 )
                 .expect("index root");
+            let index_root = usize::try_from(index_root).expect("positive index root");
             stock.close().expect("close stock producer");
             let original = std::fs::read(&image).expect("original image");
             let owner = Connection::open(dir.path().join("owner.db").to_string_lossy())
@@ -95,6 +96,7 @@ fn bounded_integrity_checks_deduplicated_primary_key_locators() {
                     .connection()
                     .validate_database_integrity_bounded(dir.path())
                     .await;
+                snapshot.finish().await.expect("image remains unchanged");
                 if corrupt {
                     let error = result.expect_err("missing index entries must be rejected");
                     assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));

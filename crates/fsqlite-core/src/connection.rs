@@ -16517,12 +16517,21 @@ impl Connection {
             )?
         };
         // Row-locator suffix. A rowid table appends its integer rowid; a
-        // WITHOUT ROWID table's secondary index is keyed by (index terms...,
-        // PRIMARY KEY columns...) instead — mirror emit_without_rowid_index_inserts
-        // (fsqlite-vdbe codegen). The PK columns are the leading declared columns
-        // (only shape fsqlite admits), read from the schema-ordered row image.
+        // WITHOUT ROWID indexes append only PK fields not already represented
+        // by an index term with the same collation. Match the proven backfill
+        // layout; leave unproven PK metadata on the existing validation path.
         if table.without_rowid {
-            for pk_position in without_rowid_pk_indices(table).map_err(codegen_error_to_franken)? {
+            let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+            let suffix = if self
+                .table_execution_metadata()
+                .wr_binary_ascending_roots
+                .contains(&table.root_page)
+            {
+                without_rowid_index_appended_pk(table, index, &pk)
+            } else {
+                pk
+            };
+            for pk_position in suffix {
                 let value = row_values.get(pk_position).cloned().ok_or_else(|| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -16812,9 +16821,16 @@ impl Connection {
         let collations = (0..index.key_term_count())
             .map(|position| index.key_term_collation(position).map(str::to_owned))
             .collect::<Vec<_>>();
-        let pk_count = without_rowid_pk_indices(table)
-            .map_err(codegen_error_to_franken)?
-            .len();
+        let pk = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+        let pk_count = if self
+            .table_execution_metadata()
+            .wr_binary_ascending_roots
+            .contains(&table.root_page)
+        {
+            without_rowid_index_appended_pk(table, index, &pk).len()
+        } else {
+            pk.len()
+        };
 
         // Phase 1: walk the WR table's index b-tree (no rowid) and collect the
         // expected secondary-index key for every row that satisfies the
