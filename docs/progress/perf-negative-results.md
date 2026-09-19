@@ -23083,3 +23083,25 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   contains `baseline.log`, `candidate.log`, `candidate-source.json`, and
   `candidate2-corrected-test.log`. The last distinguishes the repaired
   runtime test from the still-failing bounded-validation baseline.
+- Corrected consumer outcome: the unchanged four-filter HFDT run with the
+  original 6,187-fact capture and 1,800-second limit still timed out (exit 124,
+  1,800.651 seconds). Persistence completed this time. Fresh-process stock
+  SQLite readback found schema 116, graph counts `1/1/1/6187/6187/1`, clean
+  quick/integrity checks and no foreign-key violations. This preserves real
+  rows but does not complete migration to schema 178. The three remaining
+  controls passed separately; the aggregate remains failed.
+- Consumer evidence: `/data/projects/hfdt_nobleridge_scratch/20260919-pk-layout-consumer/`
+  records binary SHA256
+  `daa9e4dce40497f696a82490dbecc7ab01b1ec7600c86901a70280520810c144`,
+  source overlays, `execution.json`, `result.json`, `postmortem.json`, and
+  `migration-stack.txt`. A bounded stack sample after persistence places the
+  caller in `verify_foreign_keys_in_snapshot` (`PRAGMA foreign_key_check`) and
+  the worker in a b-tree walk. That is the next investigation lead, not a
+  distributional profile or permission to remove foreign-key validation.
+- Two invalid consumer attempts are retained: stale Cargo artifacts caused by
+  archive mtimes (aborted before runtime, corrected with byte-preserving mtime
+  refresh and explicit recompilation checks), and a preflight collision with
+  an empty build temporary directory (preserved before an unchanged retry).
+  Neither attempt counts as executed acceptance. No capture reduction,
+  timeout increase, trigger rewrite or validator weakening is an acceptable
+  retry condition.

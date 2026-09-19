@@ -24858,6 +24858,8 @@ fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> 
         .collect()
 }
 
+/// Return the PK columns a WITHOUT ROWID index must append to its key.
+///
 /// SQLite WITHOUT ROWID rule (bd-5ava1 / GH #353): a secondary/auto index
 /// stores the index key terms followed only by the primary-key columns that are
 /// **not already** part of the index under the same collation. Returns the
