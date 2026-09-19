@@ -48,3 +48,5 @@ export { ChangesetError, decodeChangeset, encodeChangeset, invertChangeset } fro
 export type { ChangesetValue, ChangesetField, ChangesetChange, ChangesetTable, ChangesetLimits } from "./changeset-codec";
 export { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
 export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, ChangesetConflict, ApplyChangesetOptions, ApplyChangesetResult } from "./changeset-apply";
+export { captureChangeset, ChangesetCaptureError } from "./changeset-capture";
+export type { CaptureChangesetOptions, CapturedChangeset } from "./changeset-capture";
