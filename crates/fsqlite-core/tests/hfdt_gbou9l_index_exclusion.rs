@@ -108,6 +108,49 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
                 "scan control did not execute: {scanned}"
             );
 
+            // A secondary index sharing only the first PK column must not
+            // turn a complete primary-key lookup into a growing-prefix scan.
+            execute_both(
+                &conn,
+                &oracle,
+                "CREATE INDEX by_owner_category ON items(owner, category);",
+            )
+            .await;
+            set_hot_path_profile_enabled(true);
+            let guard = ProfileGuard;
+            let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
+            compare(
+                &conn,
+                &oracle,
+                "SELECT 1 FROM items WHERE owner='group' AND ordinal=511 LIMIT 1",
+                1,
+            )
+            .await;
+            compare(
+                &conn,
+                &oracle,
+                "SELECT 1 FROM items WHERE owner='group' AND ordinal=512 LIMIT 1",
+                0,
+            )
+            .await;
+            let point_ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
+            let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
+            compare(
+                &conn,
+                &oracle,
+                "SELECT 1 FROM items NOT INDEXED
+                 WHERE owner='group' AND ordinal=512 LIMIT 1",
+                0,
+            )
+            .await;
+            let scan_ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
+            drop(guard);
+            eprintln!(
+                "full_pk_competing_index suffix={suffix:?} hit_and_miss_ops={point_ops} scan_ops={scan_ops}"
+            );
+            assert!((1..512).contains(&point_ops), "full-PK scan: {point_ops}");
+            assert!(scan_ops > 512 && scan_ops > point_ops);
+
             // Checking only the minimum would incorrectly suppress this row.
             execute_both(
                 &conn,
