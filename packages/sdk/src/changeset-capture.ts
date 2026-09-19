@@ -24,9 +24,23 @@ export interface CapturedChangeset<T> {
   readonly changes: number;
   readonly touchedRows: number;
 }
+export interface SnapshotChangesetOptions extends Omit<CaptureChangesetOptions, "maxRows" | "maxBytes" | "maxCells"> {
+  /** Total existing rows across all selected tables. Default 10,000. */
+  maxRows?: number;
+  /** Accounted collected row-image bytes, not heap/RSS. Default 8 MiB. */
+  maxBytes?: number;
+  /** Total collected row-image slots. Default 100,000. */
+  maxCells?: number;
+}
+export interface ChangesetSnapshot {
+  readonly changeset: Uint8Array;
+  /** Every existing row becomes one INSERT. Empty tables contribute no records. */
+  readonly changes: number;
+}
 export class ChangesetCaptureError extends Error {
   constructor(readonly code: "ERR_FSQLITE_CAPTURE_INPUT" | "ERR_FSQLITE_CAPTURE_SCHEMA" |
-    "ERR_FSQLITE_CAPTURE_RESULT" | "ERR_FSQLITE_CAPTURE_CANCELLED" | "ERR_FSQLITE_CAPTURE_TIMEOUT",
+    "ERR_FSQLITE_CAPTURE_RESULT" | "ERR_FSQLITE_CAPTURE_CANCELLED" | "ERR_FSQLITE_CAPTURE_TIMEOUT" |
+    "ERR_FSQLITE_CAPTURE_LIMIT",
     message: string, options?: ErrorOptions) {
     super(message, options); this.name = "ChangesetCaptureError";
   }
@@ -37,7 +51,7 @@ const BUDGET = `${PREFIX}budget`;
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 const literal = (name: string): string => `'${name.replaceAll("'", "''")}'`;
 const fold = (name: string): string => name.replace(/[A-Z]/g, c => c.toLowerCase());
-function fail(kind: "INPUT" | "SCHEMA" | "RESULT", message: string): never {
+function fail(kind: "INPUT" | "SCHEMA" | "RESULT" | "LIMIT", message: string): never {
   throw new ChangesetCaptureError(`ERR_FSQLITE_CAPTURE_${kind}`, message);
 }
 function name(value: unknown): string {
@@ -104,7 +118,7 @@ function settings(options: CaptureChangesetOptions) {
   return { tables, maxRows, maxBytes, maxCells, indirect, limits, transactionOptions, checkpoint };
 }
 type Settings = ReturnType<typeof settings>;
-interface Plan { table: string; columns: string[]; pk: number[]; keys: number[]; journal: string }
+interface Plan { table: string; columns: string[]; pk: number[]; keys: number[]; journal: string; rowidAlias: number | null }
 
 async function read(tx: ChangesetExecutor, s: Settings, sql: string, params: readonly ChangesetValue[] = []) {
   s.checkpoint(); const result = await tx.query(sql, params); s.checkpoint();
@@ -119,7 +133,7 @@ async function scalar(tx: ChangesetExecutor, s: Settings, sql: string): Promise<
   if (rows.length !== 1 || rows[0]!.length !== 1) fail("RESULT", "Invalid capture scalar result");
   return count(rows[0]![0]);
 }
-async function plan(tx: ChangesetExecutor, s: Settings, requested: string, i: number): Promise<Plan> {
+async function plan(tx: ChangesetExecutor, s: Settings, requested: string, i: number, mutations = true): Promise<Plan> {
   const listed = await read(tx, s, `PRAGMA main.table_list(${literal(requested)})`);
   const matches = listed.filter(row => row[0] === "main" && typeof row[1] === "string" && fold(row[1]) === fold(requested));
   if (matches.length !== 1 || matches[0]![2] !== "table") fail("SCHEMA", "Capture requires ordinary existing main tables");
@@ -138,12 +152,23 @@ async function plan(tx: ChangesetExecutor, s: Settings, requested: string, i: nu
   }
   // BEFORE/AFTER user triggers on this table can reorder observation around an
   // INSERT's generated key. Reject instead of relying on undocumented trigger order.
-  for (const ns of ["main", "temp"]) {
+  for (const ns of mutations ? ["main", "temp"] : []) {
     if ((await read(tx, s, `SELECT name FROM ${ns}.sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE LIMIT 1`, [table])).length) {
       fail("SCHEMA", "Capture tables with application triggers are not supported");
     }
   }
-  return { table, columns, pk, keys, journal: `${PREFIX}${i}` };
+  const keyType = info[keys[0]!]![2];
+  const rowidAlias = count(matches[0]![4]) === 0 && keys.length === 1 &&
+    typeof keyType === "string" && keyType.toUpperCase() === "INTEGER" ? keys[0]! : null;
+  return { table, columns, pk, keys, journal: `${PREFIX}${i}`, rowidAlias };
+}
+
+async function textDecoder(tx: ChangesetExecutor, s: Settings): Promise<TextDecoder> {
+  const encoding = await read(tx, s, "PRAGMA encoding");
+  const label = encoding[0]?.[0];
+  if (encoding.length !== 1 || encoding[0]!.length !== 1 ||
+      (label !== "UTF-8" && label !== "UTF-16le" && label !== "UTF-16be")) fail("RESULT", "Unsupported capture text encoding");
+  return new TextDecoder(label, { fatal: true, ignoreBOM: true });
 }
 
 function valueCost(expression: string): string {
@@ -275,11 +300,7 @@ export function prepareChangesetCapture<T>(
     }
     const plans: Plan[] = [];
     for (const table of s.tables) plans.push(await plan(tx, s, table, plans.length));
-    const encoding = await read(tx, s, "PRAGMA encoding");
-    const label = encoding[0]?.[0];
-    if (encoding.length !== 1 || encoding[0]!.length !== 1 ||
-        (label !== "UTF-8" && label !== "UTF-16le" && label !== "UTF-16be")) fail("RESULT", "Unsupported capture text encoding");
-    const text = new TextDecoder(label, { fatal: true, ignoreBOM: true });
+    const text = await textDecoder(tx, s);
     await execute(tx, s, `CREATE TEMP TABLE ${quote(BUDGET)} (n INTEGER NOT NULL, bytes INTEGER NOT NULL, cells INTEGER NOT NULL)`);
     await execute(tx, s, `INSERT INTO temp.${quote(BUDGET)} VALUES (0, 0, 0)`);
     for (const p of plans) await install(tx, s, p);
@@ -305,6 +326,114 @@ export function prepareChangesetCapture<T>(
     }
     await execute(tx, s, `DROP TABLE temp.${quote(BUDGET)}`);
     return { value, changeset, touchedRows, changes: tables.reduce((n, t) => n + t.changes.length, 0) };
+    },
+  };
+}
+
+interface SnapshotKey { column: number; expression: string; descending: boolean }
+async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promise<SnapshotKey[]> {
+  const indexes = (await read(tx, s, `PRAGMA main.index_list(${literal(p.table)})`)).filter(row => row[3] === "pk");
+  if (indexes.length === 0 && p.rowidAlias !== null) {
+    return [{ column: p.rowidAlias, expression: quote(p.columns[p.rowidAlias]!), descending: false }];
+  }
+  if (indexes.length !== 1 || count(indexes[0]![2]) !== 1 || count(indexes[0]![4]) !== 0) {
+    fail("SCHEMA", "Snapshot requires a complete primary-key index or INTEGER PRIMARY KEY alias");
+  }
+  const index = await read(tx, s, `PRAGMA main.index_xinfo(${literal(name(indexes[0]![1]))})`);
+  const keys: SnapshotKey[] = [];
+  for (const row of index) {
+    const key = count(row[5]);
+    if (key === 0) continue;
+    const column = count(row[1]), descending = count(row[3]);
+    if (key !== 1 || count(row[0]) !== keys.length || !p.keys.includes(column) ||
+        row[2] !== p.columns[column] || descending > 1 || keys.some(k => k.column === column)) {
+      fail("RESULT", "Invalid snapshot primary-key index metadata");
+    }
+    keys.push({ column, expression: `${quote(p.columns[column]!)} COLLATE ${quote(name(row[4]))}`, descending: descending === 1 });
+  }
+  if (keys.length !== p.keys.length) fail("RESULT", "Incomplete snapshot primary-key index");
+  return keys;
+}
+
+/**
+ * Consistent INSERT-only seed for existing application tables. This is logical
+ * row data, not a database image or schema migration. No source DML or TEMP
+ * objects are used; the caller's transaction must retain one snapshot.
+ */
+export async function snapshotChangeset(target: ChangesetTarget,
+  options: SnapshotChangesetOptions): Promise<ChangesetSnapshot> {
+  const snapshot = prepareChangesetSnapshot(options);
+  return target.transaction(snapshot.run, snapshot.transactionOptions);
+}
+
+/** @internal The outbox stores this seed in the SAME source transaction. */
+export function prepareChangesetSnapshot(options: SnapshotChangesetOptions) {
+  const s = settings(options); s.checkpoint();
+  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]), indirect: s.indirect,
+    run: async (tx: ChangesetExecutor): Promise<ChangesetSnapshot> => {
+      const plans: { plan: Plan; keys: SnapshotKey[] }[] = [];
+      const version = await scalar(tx, s, "PRAGMA main.schema_version");
+      // Preflight ALL tables before reading any row images. NULL keys cannot
+      // be represented by session changesets: reject instead of losing rows.
+      for (const table of s.tables) {
+        const p = await plan(tx, s, table, plans.length, false);
+        const nulls = await read(tx, s, `SELECT 1 FROM main.${quote(p.table)} WHERE ` +
+          p.keys.map(i => `${quote(p.columns[i]!)} IS NULL`).join(" OR ") + " LIMIT 1");
+        if (nulls.length) fail("SCHEMA", "Snapshot cannot represent rows with NULL primary-key components");
+        plans.push({ plan: p, keys: await snapshotKeys(tx, s, p) });
+      }
+      const text = await textDecoder(tx, s), tables: ChangesetTable[] = [];
+      let rows = 0, bytes = 0, cells = 0;
+      for (const { plan: p, keys } of plans) {
+        const columns = p.columns.map(quote), changes: ChangesetChange[] = [];
+        const cost = `${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")}`;
+        const order = keys.map(k => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
+        let last: ChangesetValue[] | null = null;
+        // Disjoint prefix ranges use the actual index's mixed ASC/DESC and
+        // collations. No OFFSET or full-table OR sort is required for paging.
+        pages: while (true) {
+          const after: ChangesetValue[] | null = last;
+          const stages = after === null ? [-1] : keys.map((_, i) => i).reverse();
+          for (const stage of stages) {
+            const predicates: string[] = [], params: ChangesetValue[] = [];
+            if (after !== null) {
+              for (let i = 0; i <= stage; i++) {
+                const k = keys[i]!, value = after[i]!;
+                predicates.push(`${k.expression} ${i < stage ? "=" : k.descending ? "<" : ">"} ` +
+                  (typeof value === "number" ? "+CAST(? AS REAL)" : "?"));
+                params.push(value);
+              }
+            }
+            const tail = ` FROM main.${quote(p.table)}` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
+              ` ORDER BY ${order} LIMIT 32`;
+            const sizes = await read(tx, s, `SELECT ${cost}${tail}`, params);
+            if (sizes.length > 32 || sizes.some(row => row.length !== 1)) fail("RESULT", "Invalid snapshot size page");
+            rows += sizes.length; cells += sizes.length * columns.length;
+            for (const row of sizes) bytes += count(row[0]);
+            if (rows > s.maxRows || bytes > s.maxBytes || cells > s.maxCells) {
+              fail("LIMIT", "Snapshot row images exceed the configured budget");
+            }
+            if (!sizes.length) continue;
+            const page = await read(tx, s, `SELECT ${projection(columns)}${tail}`, params);
+            if (page.length !== sizes.length) fail("RESULT", "Snapshot page changed between size and value reads");
+            for (const row of page) {
+              const image = decode(row, columns.length, text), next = keys.map(k => image[k.column]!);
+              if (next.some(v => v === null) || (last !== null && next.every((v, i) => equal(v, last![i]!)))) {
+                fail("RESULT", "Snapshot key did not advance or contained NULL");
+              }
+              last = next;
+              changes.push({ operation: "insert", indirect: s.indirect, new: image });
+            }
+            if (sizes.length === 32) continue pages;
+          }
+          break;
+        }
+        if (changes.length) tables.push({ name: p.table, primaryKey: p.pk, changes });
+      }
+      if (await scalar(tx, s, "PRAGMA main.schema_version") !== version) fail("SCHEMA", "Schema changed during snapshot collection");
+      s.checkpoint(); const changeset = encodeChangeset(tables, s.limits); s.checkpoint();
+      return Object.freeze({ changeset, changes: rows });
     },
   };
 }
