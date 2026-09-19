@@ -6,6 +6,9 @@
 //!
 //! Source symbols remain in `.wal` frames and are never duplicated in sidecar.
 
+#[path = "wal_fec_replay.rs"]
+pub mod replay;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
