@@ -13,6 +13,8 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-core = { workspace = true, default-features = false }
 fsqlite-vfs = { workspace = true, default-features = false }
+# Reuse the existing guarded repair implementation; no subprocess or private runtime.
+fsqlite-wal = { workspace = true, default-features = false, optional = true }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }
 fsqlite-ext-fts3 = { workspace = true, optional = true }
@@ -30,7 +32,7 @@ tracing = { workspace = true }
 # set adds `icu` + `misc` so a default facade build keeps the exact same
 # engine capabilities it had when core's `native` force-enabled everything.
 default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree", "icu", "misc"]
-native = ["dep:asupersync", "fsqlite-types/native", "fsqlite-core/native", "fsqlite-vfs/native"]
+native = ["dep:asupersync", "fsqlite-types/native", "fsqlite-core/native", "fsqlite-vfs/native", "dep:fsqlite-wal", "fsqlite-wal/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-core/wasm", "fsqlite-vfs/wasm"]
 linux-asupersync-uring = ["native", "fsqlite-core/linux-asupersync-uring", "fsqlite-vfs/linux-asupersync-uring"]
 json = ["dep:fsqlite-ext-json", "fsqlite-core/ext-json"]
