@@ -4,8 +4,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { snapshotChangeset, captureChangeset } from '../src/changeset-capture.ts';
-import { decodeChangeset, invertChangeset } from '../src/changeset-codec.ts';
+import { decodeChangeset, encodeChangeset, invertChangeset } from '../src/changeset-codec.ts';
+import { ChangesetOutbox, CHANGESET_OUTBOX_TABLE } from '../src/changeset-outbox.ts';
+import { applyChangeset } from '../src/changeset-apply.ts';
 
 // Real SQLite SQL/session oracle. Hooks inject interleavings or corrupt adapter
 // replies; none of the SQL or binary changeset semantics are mocked.
@@ -199,4 +202,211 @@ test('existing mutation capture still coalesces, rolls back and leaves no TEMP a
     await assert.rejects(captureChangeset(s,async tx=>{await tx.execute("UPDATE t SET v='bad'");throw Error('rollback');},{tables:['t']}),/rollback/);
     assert.equal(s.db.prepare('SELECT v FROM t').get().v,'last');assert.equal(s.db.prepare('SELECT count(*) AS n FROM temp.sqlite_schema').get().n,0);
   }finally{s.close();}
+});
+
+const appSchema = 'PRAGMA recursive_triggers=ON;CREATE TABLE t(id INTEGER PRIMARY KEY,v);';
+const outboxSchema = `CREATE TABLE ${CHANGESET_OUTBOX_TABLE} (seq INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id TEXT NOT NULL UNIQUE COLLATE BINARY, sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL, change_count INTEGER NOT NULL, scope TEXT NOT NULL, acknowledged INTEGER NOT NULL, payload BLOB NOT NULL)`;
+const bootstrapOptions = {tables:['t'],deliveryId:'source-42:bootstrap'};
+async function deliver(outbox, target, id) {
+  const message=await outbox.read(id);assert(message?.changeset instanceof Uint8Array);
+  const result=await applyChangeset(target,message.changeset,{tables:['t'],deliveryId:id});
+  await outbox.acknowledge(id,message.delivery.sha256);return result;
+}
+function noOutbox(s) {assert.equal(s.db.prepare('SELECT count(*) AS n FROM main.sqlite_schema WHERE name=?').get(CHANGESET_OUTBOX_TABLE).n,0);}
+
+test('bootstrap persists baseline first; real SDK apply then incremental delivery converges',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'old'),(2,'delete')"),r=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    const base=await outbox.bootstrap(bootstrapOptions);assert.equal(base.delivery.sequence,1n);assert.equal(base.delivery.changes,2);assert(!base.replayed);
+    const change=await outbox.record(async tx=>{await tx.execute("UPDATE t SET v='new' WHERE id=1");await tx.execute('DELETE FROM t WHERE id=2');await tx.execute("INSERT INTO t VALUES(3,'fresh')");return 42;},{tables:['t'],deliveryId:'source-42:update'});
+    assert.equal(change.value,42);assert.equal(change.delivery.sequence,2n);
+    assert.deepEqual((await outbox.pending()).map(v=>v.deliveryId),['source-42:bootstrap','source-42:update']);
+    assert.equal((await deliver(outbox,r,base.delivery.deliveryId)).applied,2);
+    assert.equal((await deliver(outbox,r,change.delivery.deliveryId)).applied,3);
+    assert.deepEqual(rows(s.db,'t'),rows(r.db,'t'));assert.deepEqual(await outbox.pending(),[]);
+    const replay=await outbox.bootstrap(bootstrapOptions);assert(replay.replayed);assert(replay.delivery.acknowledged);assert.equal((await outbox.read(replay.delivery.deliveryId)).changeset,null);
+  }finally{s.close();r.close();}
+});
+test('lost baseline receiver acknowledgement replays the inbox without duplicating rows',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'seed')"),r=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    await outbox.bootstrap(bootstrapOptions);const msg=await outbox.read(bootstrapOptions.deliveryId);
+    assert.equal((await applyChangeset(r,msg.changeset,{tables:['t'],deliveryId:msg.delivery.deliveryId})).replayed,false);
+    // Deliberately lose that result before source acknowledgement.
+    assert.equal((await outbox.pending()).length,1);
+    const replay=await deliver(outbox,r,msg.delivery.deliveryId);assert(replay.replayed);assert.equal(replay.applied,1);assert.deepEqual(rows(r.db,'t'),[[1n,'seed']]);
+  }finally{s.close();r.close();}
+});
+test('seed ID reuses original bytes after source changes; method/scope collisions never run callbacks',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'seed')"),outbox=new ChangesetOutbox(s);
+  try{
+    const base=await outbox.bootstrap(bootstrapOptions),before=(await outbox.read(base.delivery.deliveryId)).changeset;
+    await outbox.record(tx=>tx.execute("UPDATE t SET v='later'"),{tables:['t'],deliveryId:'source-42:next'});
+    s.log=[];const replay=await outbox.bootstrap(bootstrapOptions);assert(replay.replayed);assert(!s.log.some(images));assert.deepEqual((await outbox.read(base.delivery.deliveryId)).changeset,before);
+    let called=false;await assert.rejects(outbox.record(()=>{called=true;},{...bootstrapOptions}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});assert(!called);
+    await assert.rejects(outbox.bootstrap({...bootstrapOptions,indirect:true}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    await assert.rejects(outbox.bootstrap({...bootstrapOptions,tables:['other']}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    await assert.rejects(outbox.bootstrap({...bootstrapOptions,deliveryId:'source-42:next'}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+  }finally{s.close();}
+});
+test('a used, acknowledged or entirely forgotten outbox cannot append a new baseline',async()=>{
+  const s=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    const first=await outbox.record(tx=>tx.execute("INSERT INTO t VALUES(1,'v')"),{tables:['t'],deliveryId:'first'});
+    await assert.rejects(outbox.bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    await outbox.acknowledge('first',first.delivery.sha256);
+    await assert.rejects(outbox.bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    await outbox.forgetAcknowledged('first',first.delivery.sha256);assert.deepEqual(await outbox.pending(),[]);
+    await assert.rejects(outbox.bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    assert.equal(s.db.prepare(`SELECT count(*) AS n FROM ${CHANGESET_OUTBOX_TABLE}`).get().n,0);
+  }finally{s.close();}
+});
+test('forgetting the seed does not authorize silently generating a replacement seed',async()=>{
+  const s=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    const base=await outbox.bootstrap(bootstrapOptions);await outbox.acknowledge(base.delivery.deliveryId,base.delivery.sha256);await outbox.forgetAcknowledged(base.delivery.deliveryId,base.delivery.sha256);
+    await assert.rejects(outbox.bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+  }finally{s.close();}
+});
+test('empty bootstrap is a retained sequence boundary, followed by ordinary incremental inserts',async()=>{
+  const s=new Target(appSchema),r=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    const base=await outbox.bootstrap(bootstrapOptions);assert.equal(base.delivery.byteLength,0);assert.equal(base.delivery.changes,0);
+    assert.equal((await deliver(outbox,r,base.delivery.deliveryId)).applied,0);
+    await outbox.record(tx=>tx.execute('INSERT INTO t VALUES(1,2)'),{tables:['t'],deliveryId:'next'});
+    assert.equal((await deliver(outbox,r,'next')).applied,1);assert.deepEqual(rows(r.db,'t'),rows(s.db,'t'));
+  }finally{s.close();r.close();}
+});
+for(const options of [{maxRows:1},{maxCells:2},{maxBytes:10},{limits:{maxBytes:10}}]) test(`failed bootstrap leaves no seed or created inbox: ${JSON.stringify(options)}`,async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'a'),(2,'b')"),outbox=new ChangesetOutbox(s);
+  try{const before=rows(s.db,'t');await assert.rejects(outbox.bootstrap({...bootstrapOptions,...options}));noOutbox(s);assert.deepEqual(rows(s.db,'t'),before);assert.equal((await outbox.bootstrap(bootstrapOptions)).delivery.sequence,1n);}finally{s.close();}
+});
+test('outbox capacity and cancellation reject the whole seed before publication',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'a')");
+  try{
+    await assert.rejects(new ChangesetOutbox(s,{maxPayloadBytes:1}).bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_FULL'});noOutbox(s);
+    const controller=new AbortController();s.hook=sql=>{if(images(sql))controller.abort();};
+    await assert.rejects(new ChangesetOutbox(s).bootstrap({...bootstrapOptions,signal:controller.signal}),{code:'ERR_FSQLITE_CAPTURE_CANCELLED'});noOutbox(s);
+  }finally{s.close();}
+});
+test('bootstrap consumes retention capacity and nested rollback removes the entire provisional boundary',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'a')"),outbox=new ChangesetOutbox(s,{maxEntries:1});
+  try{
+    await assert.rejects(s.transaction(async()=>{const base=await outbox.bootstrap(bootstrapOptions);assert.equal(base.delivery.sequence,1n);throw Error('outer rollback');}),/outer rollback/);noOutbox(s);
+    const base=await outbox.bootstrap(bootstrapOptions);await outbox.acknowledge(base.delivery.deliveryId,base.delivery.sha256);
+    let called=false;await assert.rejects(outbox.record(()=>{called=true;},{tables:['t'],deliveryId:'next'}),{code:'ERR_FSQLITE_OUTBOX_FULL'});assert(!called);
+  }finally{s.close();}
+});
+test('lost source commit response recovers retained seed without a new scan',async()=>{
+  const s=new Target(appSchema+"INSERT INTO t VALUES(1,'seed')");let lose=true;
+  const target={transaction:async work=>{const result=await s.transaction(work);if(lose){lose=false;throw Error('lost source commit response');}return result;}};
+  const outbox=new ChangesetOutbox(target);
+  try{
+    await assert.rejects(outbox.bootstrap(bootstrapOptions),/lost source commit response/);
+    assert.equal((await new ChangesetOutbox(s).pending()).length,1);
+    s.log=[];const base=await outbox.bootstrap(bootstrapOptions);assert(base.replayed);assert(!s.log.some(images));assert.equal(base.delivery.sequence,1n);
+  }finally{s.close();}
+});
+test('two overlapping file-backed bootstraps cannot publish two baselines',async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-bootstrap-overlap-')),'db.sqlite');
+  const a=new Target('PRAGMA journal_mode=WAL;'+appSchema+'INSERT INTO t VALUES(1,2);'+outboxSchema,path),b=new Target('',path);
+  const abox=new ChangesetOutbox(a),bbox=new ChangesetOutbox(b);let release,arrived=0;const barrier=new Promise(r=>{release=r;});
+  for(const target of [a,b])target.hook=async sql=>{if(images(sql)){if(++arrived===2)release();await barrier;}};
+  try{
+    const results=await Promise.allSettled([abox.bootstrap(bootstrapOptions),bbox.bootstrap({...bootstrapOptions,deliveryId:'other-seed'})]);
+    assert.equal(arrived,2);assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(results.filter(r=>r.status==='rejected').length,1);
+    a.hook=b.hook=undefined;const pending=await abox.pending();assert.equal(pending.length,1);assert.equal(pending[0].sequence,1n);
+    const winner=pending[0].deliveryId;assert((await abox.bootstrap({...bootstrapOptions,deliveryId:winner})).replayed);
+    await assert.rejects(bbox.bootstrap({...bootstrapOptions,deliveryId:winner===bootstrapOptions.deliveryId?'other-seed':bootstrapOptions.deliveryId}),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+  }finally{a.close();b.close();}
+});
+test('an incremental writer winning during bootstrap prevents a stale baseline from committing',async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-bootstrap-writer-')),'db.sqlite');
+  const a=new Target('PRAGMA journal_mode=WAL;'+appSchema+'INSERT INTO t VALUES(1,2);'+outboxSchema,path),b=new Target('PRAGMA recursive_triggers=ON',path);
+  const abox=new ChangesetOutbox(a),bbox=new ChangesetOutbox(b);let wrote=false;
+  a.hook=async sql=>{if(images(sql)&&!wrote){wrote=true;await bbox.record(tx=>tx.execute('UPDATE t SET v=3'),{tables:['t'],deliveryId:'increment-won'});}};
+  try{
+    await assert.rejects(abox.bootstrap(bootstrapOptions),error=>error.code==='ERR_SQLITE_ERROR');assert(wrote);a.hook=undefined;
+    assert.deepEqual((await abox.pending()).map(d=>d.deliveryId),['increment-won']);assert.equal(await abox.read(bootstrapOptions.deliveryId),null);
+    await assert.rejects(abox.bootstrap(bootstrapOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+  }finally{a.close();b.close();}
+});
+test('bootstrap scope rejects malformed metadata and non-INSERT payloads even with matching hashes',async()=>{
+  const s=new Target(appSchema+'INSERT INTO t VALUES(1,2)'),outbox=new ChangesetOutbox(s);
+  try{
+    const base=await outbox.bootstrap(bootstrapOptions);
+    const change=encodeChangeset([{name:'t',primaryKey:[1,0],changes:[{operation:'update',indirect:false,old:[1n,2n],new:[undefined,3n]}]}]);
+    const digest=Buffer.from(await crypto.subtle.digest('SHA-256',change)).toString('hex');
+    s.db.prepare(`UPDATE ${CHANGESET_OUTBOX_TABLE} SET payload=?,byte_length=?,sha256=?`).run(change,change.length,digest);
+    await assert.rejects(outbox.read(base.delivery.deliveryId),{code:'ERR_FSQLITE_OUTBOX_CORRUPT'});
+    s.db.prepare(`UPDATE ${CHANGESET_OUTBOX_TABLE} SET scope=?`).run(JSON.stringify({tables:['t'],indirect:false,snapshot:false}));
+    await assert.rejects(outbox.pending(),{code:'ERR_FSQLITE_OUTBOX_CORRUPT'});
+  }finally{s.close();}
+});
+for(let seed=1;seed<=12;seed++)test(`deterministic snapshot-to-incremental convergence workload ${seed}`,async()=>{
+  const s=new Target(appSchema),r=new Target(appSchema),outbox=new ChangesetOutbox(s);let random=seed;
+  const next=()=>{random=(Math.imul(random,1664525)+1013904223)>>>0;return random;};
+  try{
+    for(let i=0;i<50;i++)s.db.prepare('INSERT INTO t VALUES(?,?)').run(i,String(next()));
+    await outbox.bootstrap(bootstrapOptions);
+    for(let batch=0;batch<3;batch++)await outbox.record(async tx=>{for(let j=0;j<20;j++){const k=next()%70;await tx.execute('INSERT INTO t VALUES(?,?) ON CONFLICT(id) DO UPDATE SET v=excluded.v',[BigInt(k),String(next())]);}},{tables:['t'],deliveryId:`change-${batch}`});
+    for(const d of await outbox.pending())await deliver(outbox,r,d.deliveryId);
+    assert.deepEqual(rows(r.db,'t'),rows(s.db,'t'));
+  }finally{s.close();r.close();}
+});
+
+async function killedBootstrap(path, cut) {
+  const code=`import {DatabaseSync} from 'node:sqlite';
+import {ChangesetOutbox} from ${JSON.stringify(new URL('../src/changeset-outbox.ts',import.meta.url).href)};
+${Target.toString()}
+const s=new Target('',process.argv[1]);const original=s.transaction.bind(s);
+const hold=()=>new Promise(()=>{});
+s.transaction=async work=>{
+  if(process.argv[2]==='before')return original(async tx=>{await work(tx);process.send('cut');await hold();});
+  const result=await original(work);process.send('cut');await hold();return result;
+};
+await new ChangesetOutbox(s).bootstrap(${JSON.stringify(bootstrapOptions)});`;
+  const child=spawn(process.execPath,['--experimental-loader',new URL('./helpers/source-loader.mjs',import.meta.url).pathname,'--input-type=module','-e',code,path,cut],{stdio:['ignore','ignore','pipe','ipc'],env:process.env});
+  let stderr='';child.stderr.on('data',chunk=>{stderr+=chunk;});
+  await new Promise((resolve,reject)=>{
+    let atCut=false;const timer=setTimeout(()=>{child.kill('SIGKILL');reject(Error('Child did not reach bootstrap cut: '+stderr));},15000);
+    child.on('message',message=>{if(message==='cut'){atCut=true;child.kill('SIGKILL');}});
+    child.on('error',error=>{clearTimeout(timer);reject(error);});
+    child.on('exit',(code,signal)=>{clearTimeout(timer);if(atCut&&signal==='SIGKILL')resolve();else reject(Error(`Child exited ${code}/${signal}: ${stderr}`));});
+  });
+}
+for(const cut of ['before','after'])test(`SIGKILL ${cut} source seed commit: reopen recovers one atomic bootstrap decision`,async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-bootstrap-crash-')),'db.sqlite');
+  const setup=new Target('PRAGMA journal_mode=WAL;'+appSchema+"INSERT INTO t VALUES(1,'retained')",path);setup.close();
+  await killedBootstrap(path,cut);
+  const source=new Target('',path),receiver=new Target(appSchema),outbox=new ChangesetOutbox(source);
+  try{
+    assert.deepEqual(rows(source.db,'t'),[[1n,'retained']]);
+    if(cut==='before')noOutbox(source);else assert.equal((await outbox.pending()).length,1);
+    const result=await outbox.bootstrap(bootstrapOptions);assert.equal(result.replayed,cut==='after');assert.equal(result.delivery.sequence,1n);
+    assert.equal((await deliver(outbox,receiver,result.delivery.deliveryId)).applied,1);assert.deepEqual(rows(receiver.db,'t'),rows(source.db,'t'));
+  }finally{source.close();receiver.close();}
+});
+
+test('nested source work, seed and later captured changes commit as one ordered unit',async()=>{
+  const s=new Target(appSchema),r=new Target(appSchema),outbox=new ChangesetOutbox(s);
+  try{
+    await s.transaction(async tx=>{
+      await tx.execute("INSERT INTO t VALUES(1,'before seed')");
+      await outbox.bootstrap(bootstrapOptions);
+      await outbox.record(t=>t.execute("UPDATE t SET v='after seed'"),{tables:['t'],deliveryId:'nested-after'});
+    });
+    for(const d of await outbox.pending())await deliver(outbox,r,d.deliveryId);
+    assert.deepEqual(rows(r.db,'t'),[[1n,'after seed']]);
+  }finally{s.close();r.close();}
+});
+test('receiver constraint failure rolls back the entire seed and keeps source deliveries pending',async()=>{
+  const s=new Target(appSchema+'INSERT INTO t VALUES(1,1),(2,100)'),r=new Target('CREATE TABLE t(id INTEGER PRIMARY KEY,v CHECK(v<10))'),outbox=new ChangesetOutbox(s);
+  try{
+    const seed=await outbox.bootstrap(bootstrapOptions);
+    await outbox.record(tx=>tx.execute('UPDATE t SET v=2 WHERE id=1'),{tables:['t'],deliveryId:'later'});
+    await assert.rejects(deliver(outbox,r,seed.delivery.deliveryId));
+    assert.deepEqual(rows(r.db,'t'),[]);assert.equal((await outbox.pending()).length,2);
+    assert.equal(r.db.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'").get().n,0);
+  }finally{s.close();r.close();}
 });

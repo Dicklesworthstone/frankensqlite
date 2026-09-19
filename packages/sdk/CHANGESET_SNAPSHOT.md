@@ -94,3 +94,110 @@ Strict TypeScript 5.8.3 checks pass against the actual capture, codec and apply
 source files. Full SDK/worker, Rust/WASM, browser persistence and power-loss
 certification were not run. These are reference-engine SQL tests, not claims
 that every FrankenSQLite runtime supports all exercised SQL shapes.
+
+## Atomic first-message bootstrap
+
+`ChangesetOutbox.bootstrap` retains the snapshot and delivery identity in the
+same source transaction that read all selected rows. It makes the seed the
+first outbox entry; subsequent `record` calls follow it in sequence. There is no
+window between a separate snapshot read and its eventual outbox insertion.
+
+```ts
+import { ChangesetOutbox, ChangesetDeliveryPump } from '@frankensqlite/sdk';
+
+const outbox = new ChangesetOutbox(source);
+const seed = await outbox.bootstrap({
+  deliveryId: 'source-42:initial-seed',
+  tables: ['parents', 'children'],
+  maxRows: 10_000,
+});
+// Only enable the incremental writer workflow after bootstrap succeeds.
+await source.execute('PRAGMA recursive_triggers=ON');
+await outbox.record(tx => tx.execute(
+  'UPDATE parents SET name=? WHERE id=?', ['revised', 12n],
+), { deliveryId: 'source-42:change-1', tables: ['parents', 'children'] });
+
+// Use the existing confirmed receiver / HTTP transport on the other end.
+const pump = new ChangesetDeliveryPump(outbox, {
+  receiverId: 'replica-42',
+  deliver,
+  confirmSource: () => source.checkpoint(), // For this snapshot-backed source.
+});
+await pump.run();
+```
+
+Create matching empty destination tables before delivery. DDL, indexes, triggers,
+extra destination rows, non-selected source tables and automatic schema migration
+are outside this seed. The bootstrap and incremental table set must cover every
+application table that needs replication. All changes after the seed's read
+boundary must go through `outbox.record`, including later writes inside an
+enclosing source transaction. A snapshot does not observe unrecorded changes.
+Source/receiver constraints retain their normal behavior; source mutations still
+have capture's existing trigger restrictions. Do not accept omissions when an
+exact baseline is required.
+
+### First-use and replay contract
+
+Bootstrap accepts only an unused outbox, not just one with no pending messages.
+Both retained rows and the AUTOINCREMENT history are checked in the transaction.
+An outbox that previously recorded or acknowledged work cannot append a baseline,
+even after every acknowledged entry has been explicitly forgotten. A fresh
+bootstrap must receive sequence 1. A competing incremental operation that wins
+first makes bootstrap reject; there is no automatic replay, global writer lock,
+or attempt to insert a snapshot behind that operation. Initialize bootstrap
+before enabling incremental producers. The target's transaction/conflict engine
+must correctly enforce the atomic read/write decision.
+
+The retained `deliveryId` distinguishes a snapshot from a callback operation.
+A retry of the same ID, table set and indirect policy returns `replayed: true`
+and its original delivery metadata. It verifies retained payload bytes, but
+never re-reads newer application rows or invokes a source callback. Changing the
+table set or using a callback operation's ID rejects. Table-list reordering on a
+retry returns the original payload order; it does not regenerate the seed.
+Capture budgets constrain new collection; replay uses the existing outbox's
+bounded retained-payload validation rather than resnapshotting.
+
+Once acknowledged, the payload is reclaimed by the normal outbox machinery;
+bootstrap retry still returns the acknowledged identity without regenerating
+bytes. Forgetting that identity ends its retry protection, but does not reset
+outbox history or authorize reseeding. The schema and reserved tables are
+trusted application state: do not drop/recreate them, reset sqlite_sequence,
+or change the fixed destination to circumvent these checks. Backups restore
+their own historical delivery state, not later acknowledgements.
+
+An empty source produces a valid empty changeset and still retains sequence 1.
+A failed schema check, image/codec/outbox limit, cancellation, transaction conflict
+or enclosing rollback leaves no committed seed. A lost source commit response
+is an unknown outcome: retry the same bootstrap ID. A retained seed recovers;
+rolled-back work may collect afresh. Once a seed is durable, newer captured
+changes remain ordered after it. Nested results are provisional until the outer
+transaction commits, and no returned metadata alone confirms durable storage.
+
+The seed passes unchanged through the existing apply/inbox/delivery protocol.
+Receiver replay prevents repeated INSERTs when an acknowledgement is lost.
+Source and receiver snapshot stores still require explicit checkpoints, and the
+pump's confirmation callbacks must target the correct databases. No transport,
+checkpoint, automatic retry, source authentication or native replication engine
+is created by bootstrap. Large datasets exceeding one bounded changeset still
+need a separately designed multi-message snapshot protocol; they are rejected,
+not silently truncated or divided across inconsistent transactions.
+
+### Combined executed verification
+
+The snapshot/bootstrap suite passes **69/69 tests**, with zero failures or skips,
+on Node 22.16.0 / SQLite 3.49.1. Strict TypeScript 5.8.3 checks include the actual
+capture, codec, application and outbox sources. Bootstrap tests use real source
+and receiver SQL, the SDK application/inbox path, and native SQLite session
+comparison. Twelve deterministic workloads seed existing rows, capture later
+upserts, deliver in order and compare final contents.
+
+Additional tests cover empty seeds, source/receiver lost acknowledgements,
+receiver constraint rollback, identity/method/scope collisions, acknowledged and
+forgotten history, budgets, cancellation, nested commit/rollback and corrupt
+snapshot payloads. Two file-backed connections overlap at seed collection; only
+one bootstrap commits. A competing incremental writer can win, but the stale
+bootstrap then fails instead of publishing behind it. Separate child processes
+are SIGKILLed before source commit and after commit before response. Reopened
+files recover the appropriate first-message decision and deliver without a new
+source snapshot for the committed case. Process death is not power-loss proof.
+No new HTTP, browser, full SDK/worker or Rust/WASM certification is claimed.

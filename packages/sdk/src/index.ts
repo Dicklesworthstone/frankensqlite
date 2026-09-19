@@ -51,7 +51,7 @@ export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, Changes
 export { captureChangeset, snapshotChangeset, ChangesetCaptureError } from "./changeset-capture";
 export type { CaptureChangesetOptions, CapturedChangeset, SnapshotChangesetOptions, ChangesetSnapshot } from "./changeset-capture";
 export { ChangesetOutbox, ChangesetOutboxError, CHANGESET_OUTBOX_TABLE } from "./changeset-outbox";
-export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions } from "./changeset-outbox";
+export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions, OutboxBootstrapOptions, OutboxBootstrapResult } from "./changeset-outbox";
 export { ChangesetReceiver, ChangesetDeliveryPump, ChangesetDeliveryError, CHANGESET_DELIVERY_PROTOCOL } from "./changeset-delivery";
 export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOptions, ChangesetDeliveryPhase, ChangesetReceiverOptions } from "./changeset-delivery";
 export type { ChangesetTransport, ChangesetPumpOptions, ChangesetPumpRunOptions, ChangesetPumpResult } from "./changeset-delivery";

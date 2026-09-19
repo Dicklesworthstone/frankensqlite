@@ -1,5 +1,5 @@
-import { prepareChangesetCapture } from "./changeset-capture";
-import type { CaptureChangesetOptions } from "./changeset-capture";
+import { prepareChangesetCapture, prepareChangesetSnapshot } from "./changeset-capture";
+import type { CaptureChangesetOptions, ChangesetSnapshot, SnapshotChangesetOptions } from "./changeset-capture";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { decodeChangeset } from "./changeset-codec";
 import type { ChangesetValue } from "./changeset-codec";
@@ -22,6 +22,14 @@ export interface OutboxDelivery {
 export interface OutboxRecordOptions extends CaptureChangesetOptions {
   /** Stable, globally source-qualified operation ID. Never reuse for other work. */
   deliveryId: string;
+}
+export interface OutboxBootstrapOptions extends SnapshotChangesetOptions {
+  /** Stable source-qualified seed identity, distinct from incremental operations. */
+  deliveryId: string;
+}
+export interface OutboxBootstrapResult {
+  readonly replayed: boolean;
+  readonly delivery: OutboxDelivery;
 }
 export type OutboxRecordResult<T> =
   | { readonly replayed: false; readonly value: T; readonly delivery: OutboxDelivery }
@@ -149,7 +157,8 @@ function metadata(row: readonly unknown[]): Stored {
   let scope: unknown;
   try { scope = JSON.parse(row[5]); } catch { return fail("CORRUPT", "Invalid outbox capture scope JSON"); }
   if (typeof scope !== "object" || scope === null) fail("CORRUPT", "Invalid capture scope shape");
-  const s = scope as { tables?: unknown; indirect?: unknown };
+  const s = scope as { tables?: unknown; indirect?: unknown; snapshot?: unknown };
+  if (s.snapshot !== undefined && s.snapshot !== true) fail("CORRUPT", "Invalid outbox snapshot scope");
   const tables = s.tables;
   if (!Array.isArray(tables) || !tables.length || tables.length > 64 || typeof s.indirect !== "boolean" ||
       tables.some(t => typeof t !== "string" || !t.length || t.length > 1024 || t.includes("\0") || t.startsWith("sqlite_") || t.startsWith("__fsqlite_")) ||
@@ -169,9 +178,31 @@ async function load(tx: ChangesetExecutor, record: Stored): Promise<Uint8Array |
   if (bytes.byteLength !== record.delivery.byteLength || await hash(bytes) !== record.delivery.sha256) fail("CORRUPT", "Outbox payload does not match its retained digest");
   const tables = decodeChangeset(bytes);
   if (tables.reduce((n, t) => n + t.changes.length, 0) !== record.delivery.changes) fail("CORRUPT", "Outbox change count disagrees with payload");
-  const scope = JSON.parse(record.scope) as { tables: string[]; indirect: boolean };
-  if (tables.some(t => !scope.tables.includes(fold(t.name)) || t.changes.some(c => c.indirect !== scope.indirect))) fail("CORRUPT", "Outbox payload disagrees with its capture scope");
+  const scope = JSON.parse(record.scope) as { tables: string[]; indirect: boolean; snapshot?: true };
+  if (tables.some(t => !scope.tables.includes(fold(t.name)) ||
+      t.changes.some(c => c.indirect !== scope.indirect || (scope.snapshot === true && c.operation !== "insert")))) {
+    fail("CORRUPT", "Outbox payload disagrees with its capture scope");
+  }
   return bytes;
+}
+
+/** Shared atomic publication for incremental captures and initial row snapshots. */
+async function store(tx: ChangesetExecutor, id: string, scope: string,
+  result: ChangesetSnapshot, checkpoint: () => void): Promise<OutboxDelivery> {
+  const sha256 = await hash(result.changeset); checkpoint();
+  // Some SQL adapters bind a zero-length typed array as NULL, not BLOB.
+  const payload = result.changeset.byteLength === 0 ? "X''" : "?";
+  const params: ChangesetValue[] = [id, sha256, BigInt(result.changeset.byteLength), BigInt(result.changes), scope];
+  if (result.changeset.byteLength) params.push(result.changeset);
+  const changed = await tx.execute(`INSERT OR ABORT INTO ${TABLE} (delivery_id,sha256,byte_length,change_count,scope,acknowledged,payload) VALUES (?,?,?,?,?,0,${payload})`, params);
+  checkpoint();
+  if (changed !== 1) fail("CORRUPT", "Outbox insertion did not affect exactly one row");
+  const saved = await find(tx, id); checkpoint();
+  if (saved === null || saved.delivery.sha256 !== sha256 || saved.delivery.acknowledged ||
+      saved.scope !== scope || saved.delivery.changes !== result.changes || saved.delivery.byteLength !== result.changeset.byteLength) {
+    fail("CORRUPT", "Outbox insertion was not confirmed");
+  }
+  return saved.delivery;
 }
 
 /** Persistent source-side delivery state; transport and remote ACK policy are caller-owned. */
@@ -205,17 +236,42 @@ export class ChangesetOutbox {
       if (entries >= this.#maxEntries || bytes > this.#maxPayloadBytes) fail("FULL", "Outbox retention limit reached; acknowledge or explicitly forget old deliveries");
       const result = await capture.run(tx); capture.checkpoint();
       if (result.changeset.byteLength > this.#maxPayloadBytes - bytes) fail("FULL", "Outbox pending payload budget exceeded");
-      const sha256 = await hash(result.changeset); capture.checkpoint();
-      // Some SQL adapters bind a zero-length typed array as NULL, not BLOB.
-      const payload = result.changeset.byteLength === 0 ? "X''" : "?";
-      const params: ChangesetValue[] = [id, sha256, BigInt(result.changeset.byteLength), BigInt(result.changes), scope];
-      if (result.changeset.byteLength) params.push(result.changeset);
-      const changed = await tx.execute(`INSERT OR ABORT INTO ${TABLE} (delivery_id,sha256,byte_length,change_count,scope,acknowledged,payload) VALUES (?,?,?,?,?,0,${payload})`, params);
-      if (changed !== 1) fail("CORRUPT", "Outbox insertion did not affect exactly one row");
-      const saved = await find(tx, id); capture.checkpoint();
-      if (saved === null || saved.delivery.sha256 !== sha256 || saved.delivery.acknowledged || saved.scope !== scope || saved.delivery.changes !== result.changes) fail("CORRUPT", "Outbox insertion was not confirmed");
-      return { replayed: false, value: result.value, delivery: saved.delivery };
+      const delivery = await store(tx, id, scope, result, capture.checkpoint);
+      return { replayed: false, value: result.value, delivery };
     }, capture.transactionOptions);
+  }
+
+  /**
+   * Persist a consistent existing-row seed as this outbox's FIRST operation.
+   * Later record() calls follow it in sequence. A retained seed ID is recovered,
+   * never regenerated from newer rows. No source DML or receiver schema edits.
+   */
+  async bootstrap(options: OutboxBootstrapOptions): Promise<OutboxBootstrapResult> {
+    const id = identity(options?.deliveryId), snapshot = prepareChangesetSnapshot(options);
+    const scope = JSON.stringify({ tables: snapshot.tables.map(fold).sort(), indirect: snapshot.indirect, snapshot: true });
+    if (globalThis.crypto?.subtle === undefined) fail("INPUT", "The outbox requires Web Crypto SHA-256");
+    return this.#target.transaction(async tx => {
+      snapshot.checkpoint(); await ensure(tx, true); snapshot.checkpoint();
+      const existing = await find(tx, id); snapshot.checkpoint();
+      if (existing !== null) {
+        if (existing.scope !== scope) fail("REUSE", "Delivery identity was already used for another operation or snapshot scope");
+        await load(tx, existing); snapshot.checkpoint();
+        return Object.freeze({ replayed: true, delivery: existing.delivery });
+      }
+      // An empty pending list is not a pristine history. Even explicitly
+      // forgotten acknowledgements leave sqlite_sequence advanced. Never
+      // append a fresh baseline after incremental data or silently reseed.
+      if ((await query(tx, `SELECT 1 FROM ${TABLE} LIMIT 1`)).length ||
+          (await query(tx, "SELECT 1 FROM main.sqlite_sequence WHERE name=? COLLATE BINARY LIMIT 1", [CHANGESET_OUTBOX_TABLE])).length) {
+        fail("STATE", "Bootstrap requires an unused outbox; recover the original seed ID instead of reseeding");
+      }
+      snapshot.checkpoint();
+      const result = await snapshot.run(tx); snapshot.checkpoint();
+      if (result.changeset.byteLength > this.#maxPayloadBytes) fail("FULL", "Outbox cannot retain the complete bootstrap payload");
+      const delivery = await store(tx, id, scope, result, snapshot.checkpoint);
+      if (delivery.sequence !== 1n) fail("STATE", "Bootstrap did not become the first outbox operation");
+      return Object.freeze({ replayed: false, delivery });
+    }, snapshot.transactionOptions);
   }
 
   /** Bounded metadata page. Sequence cursors are monotonic, not SQL OFFSETs. */
