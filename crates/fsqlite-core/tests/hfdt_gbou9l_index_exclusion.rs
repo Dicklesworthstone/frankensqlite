@@ -118,6 +118,9 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
             .await;
             // Force the backfilled secondary index too: a direct PK route
             // must not conceal malformed row locators in that index.
+            set_hot_path_profile_enabled(true);
+            let guard = ProfileGuard;
+            let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
             compare(
                 &conn,
                 &oracle,
@@ -126,8 +129,7 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
                 1,
             )
             .await;
-            set_hot_path_profile_enabled(true);
-            let guard = ProfileGuard;
+            let prefix_ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
             let before = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
             compare(
                 &conn,
@@ -156,10 +158,11 @@ fn index_extrema_exclusion_preserves_sqlite_results_and_bounds_empty_probe() {
             let scan_ops = hot_path_profile_snapshot().vdbe.opcodes_executed_total - before;
             drop(guard);
             eprintln!(
-                "full_pk_competing_index suffix={suffix:?} hit_and_miss_ops={point_ops} scan_ops={scan_ops}"
+                "full_pk_competing_index suffix={suffix:?} hit_and_miss_ops={point_ops} scan_ops={scan_ops} forced_prefix_ops={prefix_ops}"
             );
             assert!((1..512).contains(&point_ops), "full-PK scan: {point_ops}");
             assert!(scan_ops > 512 && scan_ops > point_ops);
+            assert!(prefix_ops > 512 && prefix_ops > point_ops);
             for (sql, expected) in [
                 (
                     "SELECT ordinal FROM items WHERE owner='group' AND ordinal=511 AND category='middle' LIMIT 1",

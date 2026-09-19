@@ -24845,7 +24845,10 @@ fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> 
                     let expr = parse_sql_expr(index.key_expressions.get(p)?).ok()?;
                     table.column_index(explicit_index_simple_column_name(&expr)?)
                 })?;
-            let pk_collation = table.columns[column].collation.as_deref().unwrap_or("BINARY");
+            let pk_collation = table.columns[column]
+                .collation
+                .as_deref()
+                .unwrap_or("BINARY");
             index
                 .key_term_collation(p)
                 .unwrap_or("BINARY")
@@ -24859,8 +24862,8 @@ fn without_rowid_index_key_columns(table: &TableSchema, index: &IndexSchema) -> 
 /// stores the index key terms followed only by the primary-key columns that are
 /// **not already** part of the index under the same collation. Returns the
 /// subset of `pk_indices` (in PRIMARY KEY order) to append to the on-disk key.
-/// A PK column that
-/// coincides with an index key term is elided from the suffix, so an index like
+/// A PK column that coincides with an index key term is elided from the suffix,
+/// so an index like
 /// `UNIQUE(pk_leading, x)` on `PRIMARY KEY(pk_leading, ...)` stores each PK
 /// column exactly once when the collations agree, matching stock's layout.
 #[must_use]
