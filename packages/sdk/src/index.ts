@@ -52,3 +52,5 @@ export { captureChangeset, ChangesetCaptureError } from "./changeset-capture";
 export type { CaptureChangesetOptions, CapturedChangeset } from "./changeset-capture";
 export { ChangesetOutbox, ChangesetOutboxError, CHANGESET_OUTBOX_TABLE } from "./changeset-outbox";
 export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions } from "./changeset-outbox";
+export { ChangesetReceiver, ChangesetDeliveryError, CHANGESET_DELIVERY_PROTOCOL } from "./changeset-delivery";
+export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOptions, ChangesetDeliveryPhase, ChangesetReceiverOptions } from "./changeset-delivery";
