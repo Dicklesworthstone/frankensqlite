@@ -6,6 +6,8 @@
 mod batch;
 #[cfg(feature = "session")]
 pub mod changeset;
+#[cfg(all(feature = "session", feature = "native", not(target_arch = "wasm32")))]
+pub mod changeset_stream;
 mod connection;
 mod flags;
 mod optional;
