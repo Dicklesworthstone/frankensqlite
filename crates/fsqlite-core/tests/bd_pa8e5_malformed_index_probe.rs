@@ -45,9 +45,27 @@ fn stock_view(db: &Path) -> String {
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_else(|error| format!("<no sqlite_master row: {error}>"));
-    let integrity = stock
-        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|error| format!("<integrity_check failed: {error}>"));
+    // Read EVERY integrity_check row, not just the first. stock reports one row
+    // per problem and "ok" alone when there are none, so taking row 0 turns a
+    // detailed corruption report into the single useless line
+    // "*** in database main ***". Knowing WHICH object and page stock objects to
+    // is the whole value of asking it.
+    let integrity = match stock.prepare("PRAGMA integrity_check") {
+        Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => {
+                let all: Vec<String> = rows.filter_map(Result::ok).collect();
+                if all.len() == 1 && all[0] == "ok" {
+                    "ok".to_owned()
+                } else {
+                    let shown: Vec<&str> =
+                        all.iter().take(8).map(String::as_str).collect();
+                    format!("{} rows: {}", all.len(), shown.join(" / "))
+                }
+            }
+            Err(error) => format!("<query failed: {error}>"),
+        },
+        Err(error) => format!("<prepare failed: {error}>"),
+    };
     format!("sqlite_master: {master} | integrity_check: {integrity}")
 }
 
