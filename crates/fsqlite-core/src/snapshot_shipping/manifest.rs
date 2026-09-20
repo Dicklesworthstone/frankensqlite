@@ -5,6 +5,9 @@
 //! This module validates transfer contents, not atomic source capture or
 //! publication of the received database.
 
+pub mod spool;
+pub use spool::{SnapshotCheckpoint, SnapshotSpool, SnapshotSpoolState};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -194,7 +197,8 @@ impl SnapshotSender {
 /// The limit covers saved symbol payloads and undrained decoded page payloads,
 /// not metadata, decoder scratch or total RSS. The existing codec admission
 /// limit separately bounds its conservative work estimate. Interleaving too
-/// many blocks can return TooBig; drain output and retry the rejected packet.
+/// many blocks can return TooBig; drain output and retry the rejected packet,
+/// or restart with a larger budget if no complete output can yet be drained.
 /// Completion is transfer completion, not durable database publication.
 pub struct ManifestSnapshotReceiver {
     manifest: SnapshotManifest,
