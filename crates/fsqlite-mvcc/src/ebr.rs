@@ -16,6 +16,9 @@ use crossbeam_epoch::{Collector, Guard, LocalHandle};
 use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
 use serde::Serialize;
 
+#[cfg(test)]
+mod pin_regression_tests;
+
 // ---------------------------------------------------------------------------
 // EBR metrics (bd-688.4)
 // ---------------------------------------------------------------------------
@@ -434,12 +437,19 @@ impl VersionGuardRegistry {
     /// Attach a snapshot `CommitSeq` to an already-pinned guard.
     ///
     /// Called by [`VersionGuard`] / [`VersionGuardTicket`] owners once their
-    /// transaction's `begin_seq` is known. Idempotent: later calls with the
-    /// same or newer seq are no-ops; monotonic behaviour is not enforced here
-    /// because a single guard corresponds to one transaction's lifetime.
+    /// transaction's `begin_seq` is known. Keep the oldest declared snapshot
+    /// for the guard's entire lifetime: repeating registration with the same
+    /// or a newer sequence must not release versions the reader still needs.
+    /// An older sequence tightens the retention bound; it cannot resurrect
+    /// versions already reclaimed before it was declared. To advance a
+    /// reader's snapshot, end the old guard and register a new one.
     pub fn set_pinned_commit_seq(&self, guard_id: u64, commit_seq: u64) {
         if let Some(state) = self.active.lock().get_mut(&guard_id) {
-            state.pinned_commit_seq = Some(commit_seq);
+            state.pinned_commit_seq = Some(
+                state
+                    .pinned_commit_seq
+                    .map_or(commit_seq, |pinned| pinned.min(commit_seq)),
+            );
         }
     }
 
