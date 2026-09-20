@@ -59,9 +59,11 @@ struct Shape {
 /// How many attempts succeeded, and `(elapsed_ms, message)` for each refusal.
 type ShapeOutcome = (u64, Vec<(u128, String)>);
 
-/// The shapes this fix newly covers: measured at 45_492 and 53_879 refusals
-/// respectively, all at min / p50 = 0 ms, before the allowlist was extended.
-/// DDL is absent on purpose — see bd-pa8e5 and the module docs.
+/// The shapes this fix covers. SAVEPOINT and ANALYZE came first (45_492 and
+/// 53_879 refusals respectively, all at min / p50 = 0 ms). DDL joined them once
+/// the "arming DDL corrupts an index" finding was retracted — see bd-pa8e5, and
+/// the module docs above. Measured with no stock connection anywhere, arming
+/// took CREATE INDEX from 94_411 busy refusals to zero with integrity_check ok.
 const REGRESSED_SHAPES: &[Shape] = &[
     Shape {
         label: "SAVEPOINT",
@@ -71,6 +73,16 @@ const REGRESSED_SHAPES: &[Shape] = &[
     Shape {
         label: "ANALYZE",
         sql: "ANALYZE",
+        cleanup: &[],
+    },
+    Shape {
+        label: "CREATE TABLE",
+        sql: "CREATE TABLE IF NOT EXISTS probe_ddl(a)",
+        cleanup: &[],
+    },
+    Shape {
+        label: "CREATE INDEX",
+        sql: "CREATE INDEX IF NOT EXISTS probe_ix2 ON t(id)",
         cleanup: &[],
     },
 ];
