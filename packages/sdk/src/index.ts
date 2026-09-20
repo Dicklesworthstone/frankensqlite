@@ -59,3 +59,4 @@ export { createChangesetHttpTransport, createChangesetHttpHandler, ChangesetHttp
 export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttpHandlerOptions, ChangesetHttpAuthorization } from "./changeset-http";
 export { streamSnapshotChangesets } from "./changeset-capture";
 export type { SnapshotChangesetStreamOptions, ChangesetSnapshotChunk, ChangesetSnapshotStreamResult } from "./changeset-capture";
+export type { OutboxBootstrapChunksOptions, OutboxBootstrapChunksResult } from "./changeset-outbox";

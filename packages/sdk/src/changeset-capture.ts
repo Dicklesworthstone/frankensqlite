@@ -352,7 +352,7 @@ interface SnapshotKey { column: number; expression: string; descending: boolean 
 async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promise<SnapshotKey[]> {
   const indexes = (await read(tx, s, `PRAGMA main.index_list(${literal(p.table)})`)).filter(row => row[3] === "pk");
   if (indexes.length === 0 && p.rowidAlias !== null) {
-    return [{ column: p.rowidAlias, expression: quote(p.columns[p.rowidAlias]!), descending: false }];
+    return [{ column: p.rowidAlias, expression: `s.${quote(p.columns[p.rowidAlias]!)}`, descending: false }];
   }
   if (indexes.length !== 1 || count(indexes[0]![2]) !== 1 || count(indexes[0]![4]) !== 0) {
     fail("SCHEMA", "Snapshot requires a complete primary-key index or INTEGER PRIMARY KEY alias");
@@ -367,7 +367,7 @@ async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promis
         row[2] !== p.columns[column] || descending > 1 || keys.some(k => k.column === column)) {
       fail("RESULT", "Invalid snapshot primary-key index metadata");
     }
-    keys.push({ column, expression: `${quote(p.columns[column]!)} COLLATE ${quote(name(row[4]))}`, descending: descending === 1 });
+    keys.push({ column, expression: `s.${quote(p.columns[column]!)} COLLATE ${quote(name(row[4]))}`, descending: descending === 1 });
   }
   if (keys.length !== p.keys.length) fail("RESULT", "Incomplete snapshot primary-key index");
   return keys;
@@ -421,7 +421,9 @@ async function walkSnapshot(tx: ChangesetExecutor, s: Settings, pageBytes: numbe
   const text = await textDecoder(tx, s);
   let rows = 0, bytes = 0, cells = 0;
   for (const { plan: p, keys } of plans) {
-    const columns = p.columns.map(quote);
+    // Qualify physical columns: ORDER BY t0/x0 must not resolve to projection
+    // aliases when an application uses those perfectly valid key names.
+    const columns = p.columns.map(c => `s.${quote(c)}`);
     const cost = `${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")}`;
     const order = keys.map(k => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
     let last: ChangesetValue[] | null = null;
@@ -438,7 +440,7 @@ async function walkSnapshot(tx: ChangesetExecutor, s: Settings, pageBytes: numbe
             params.push(value);
           }
         }
-        const tail = ` FROM main.${quote(p.table)}` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
+        const tail = ` FROM main.${quote(p.table)} AS s` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
           ` ORDER BY ${order}`;
         const sizes = await read(tx, s, `SELECT ${cost}${tail} LIMIT 32`, params);
         if (sizes.length > 32 || sizes.some(row => row.length !== 1)) fail("RESULT", "Invalid snapshot size page");

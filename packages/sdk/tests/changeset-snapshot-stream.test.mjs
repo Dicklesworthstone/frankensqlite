@@ -4,8 +4,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { streamSnapshotChangesets, snapshotChangeset, captureChangeset } from '../src/changeset-capture.ts';
 import { decodeChangeset, invertChangeset } from '../src/changeset-codec.ts';
+import { ChangesetOutbox, CHANGESET_OUTBOX_TABLE } from '../src/changeset-outbox.ts';
+import { applyChangeset } from '../src/changeset-apply.ts';
 
 // Actual SQL and native changeset application, not a simulated SQL interpreter.
 class Target {
@@ -206,4 +210,248 @@ test('streams a dataset larger than 64 MiB with bounded 1 MiB value pages',async
     const result=await streamSnapshotChangesets(a,c=>{const t=decodeChangeset(c.changeset)[0];assert.equal(t.changes.length,1);assert.equal(t.changes[0].new[1].byteLength,1000000);total+=c.changeset.byteLength;rows++;},{tables:['t'],chunkBytes:1048576});
     assert.equal(rows,70);assert.ok(total>64*1024*1024);assert.equal(result.byteLength,total);assert.ok(a.pages.every(n=>n===1));
   }finally{a.close();}
+});
+
+const seedOptions={deliveryId:'source:seed',tables:['t'],chunkRows:3};
+async function deliverPending(outbox, destination, loseFirst=false) {
+  let first=loseFirst,replays=0;
+  for(;;){
+    const page=await outbox.pending({limit:1});if(!page.length)break;
+    const message=await outbox.read(page[0].deliveryId);
+    const result=await applyChangeset(destination,message.changeset,{tables:['t'],deliveryId:message.delivery.deliveryId});
+    if(first){first=false;continue;} // Receiver committed, but no source ACK arrived.
+    replays+=Number(result.replayed);
+    await outbox.acknowledge(message.delivery.deliveryId,message.delivery.sha256);
+  }
+  return replays;
+}
+function noOutbox(t) {
+  const exists=t.db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get(CHANGESET_OUTBOX_TABLE);
+  if(exists)assert.equal(t.db.prepare(`SELECT count(*) n FROM ${CHANGESET_OUTBOX_TABLE}`).get().n,0);
+}
+function pristineOutbox(t) {
+  const template=new Target();
+  // Obtain the actual implementation's schema without publishing it to this file.
+  return new ChangesetOutbox(template).bootstrap({deliveryId:'template',tables:['t']}).then(()=>{
+    const ddl=template.db.prepare('SELECT sql FROM sqlite_schema WHERE name=?').get(CHANGESET_OUTBOX_TABLE).sql;
+    t.db.exec(ddl);template.close();
+  });
+}
+
+test('chunked outbox stores one atomic seed range, then incremental changes follow',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);
+    const seed=await outbox.bootstrapChunks(seedOptions);
+    assert.equal(seed.replayed,false);assert.equal(seed.chunks,4);assert.equal(seed.changes,10);
+    assert.equal(seed.firstSequence,1n);assert.equal(seed.lastSequence,4n);assert.equal(seed.complete,false);
+    const ids=(await outbox.pending()).map(x=>x.deliveryId);
+    assert.deepEqual(ids,['source:seed','source:seed/chunk/1','source:seed/chunk/2','source:seed/chunk/3']);
+    a.db.exec('PRAGMA recursive_triggers=ON');
+    const delta=await outbox.record(tx=>tx.execute("UPDATE t SET value='changed' WHERE id=0"),{deliveryId:'source:delta',tables:['t']});
+    assert.equal(delta.delivery.sequence,5n);
+    assert.equal(await deliverPending(outbox,b,true),1);assert.deepEqual(b.rows(),a.rows());
+    const replay=await outbox.bootstrapChunks({...seedOptions,chunkRows:1,maxRows:1});
+    assert.equal(replay.replayed,true);assert.equal(replay.chunks,4);assert.equal(replay.acknowledgedChunks,4);assert.equal(replay.complete,true);
+    assert.equal(replay.sha256,seed.sha256);
+  }finally{a.close();b.close();}
+});
+test('replay reads retained chunks, never resnapshots newer source rows',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);const seed=await outbox.bootstrapChunks(seedOptions);
+    a.db.exec("UPDATE t SET value='later'; INSERT INTO t VALUES(100,'later')");a.queries.length=0;
+    const again=await outbox.bootstrapChunks({...seedOptions,chunkBytes:1});
+    assert.equal(again.changes,10);assert.equal(again.byteLength,seed.byteLength);
+    assert.ok(a.queries.every(sql=>!sql.includes('FROM main."t"')));
+    await deliverPending(outbox,b);assert.equal(b.rows().length,10);assert.equal(b.rows()[0][1],'row-0');
+  }finally{a.close();b.close();}
+});
+test('empty chunked bootstrap still records a replayable first operation',async()=>{
+  const a=new Target(),b=new Target();try{
+    const outbox=new ChangesetOutbox(a);const seed=await outbox.bootstrapChunks(seedOptions);
+    assert.equal(seed.chunks,1);assert.equal(seed.changes,0);assert.equal(seed.byteLength,0);
+    await deliverPending(outbox,b);assert.equal((await outbox.bootstrapChunks(seedOptions)).complete,true);
+  }finally{a.close();b.close();}
+});
+test('partial receiver work remains explicitly incomplete and later chunks remain pending',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);await outbox.bootstrapChunks(seedOptions);
+    const first=await outbox.read(seedOptions.deliveryId);
+    await applyChangeset(b,first.changeset,{tables:['t'],deliveryId:first.delivery.deliveryId});
+    await outbox.acknowledge(first.delivery.deliveryId,first.delivery.sha256);
+    const status=await outbox.bootstrapChunks(seedOptions);
+    assert.equal(b.rows().length,3);assert.equal(status.acknowledgedChunks,1);assert.equal(status.complete,false);
+    assert.equal((await outbox.pending()).length,3);
+    await deliverPending(outbox,b);assert.deepEqual(b.rows(),a.rows());
+  }finally{a.close();b.close();}
+});
+for(const options of [{maxEntries:2},{maxPayloadBytes:100}]) test(`outbox capacity failure rolls back every stored chunk ${JSON.stringify(options)}`,async()=>{
+  const a=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a,options);
+    await assert.rejects(outbox.bootstrapChunks(seedOptions),{code:'ERR_FSQLITE_OUTBOX_FULL'});noOutbox(a);
+    assert.equal((await new ChangesetOutbox(a).bootstrapChunks(seedOptions)).replayed,false);
+  }finally{a.close();}
+});
+test('oversized later source row cannot leave a committed bootstrap prefix',async()=>{
+  const a=new Target();try{
+    populate(a,70);a.db.exec('UPDATE t SET value=zeroblob(5000) WHERE id=69');
+    const outbox=new ChangesetOutbox(a);
+    await assert.rejects(outbox.bootstrapChunks({...seedOptions,chunkBytes:1024}),{code:'ERR_FSQLITE_CAPTURE_LIMIT'});noOutbox(a);
+  }finally{a.close();}
+});
+test('cancellation after stored chunks drains and rolls back the complete source group',async()=>{
+  const a=new Target();try{
+    populate(a,10);const controller=new AbortController(),execute=a.execute.bind(a);let inserted=0;
+    a.execute=async(sql,params)=>{const n=await execute(sql,params);if(sql.startsWith(`INSERT OR ABORT INTO main."${CHANGESET_OUTBOX_TABLE}"`)&&++inserted===2)controller.abort('stop');return n;};
+    await assert.rejects(new ChangesetOutbox(a).bootstrapChunks({...seedOptions,signal:controller.signal}),{code:'ERR_FSQLITE_CAPTURE_CANCELLED'});
+    assert.equal(inserted,2);noOutbox(a);assert.equal(a.depth,0);
+  }finally{a.close();}
+});
+test('nested bootstrap remains provisional and enclosing rollback removes all chunks',async()=>{
+  const a=new Target();try{
+    populate(a,10);const expected=new Error('outer rollback');
+    await assert.rejects(a.transaction(async tx=>{const result=await new ChangesetOutbox(tx).bootstrapChunks(seedOptions);assert.equal(result.chunks,4);throw expected;}),e=>e===expected);
+    noOutbox(a);
+  }finally{a.close();}
+});
+test('deferred commit failure removes payloads and the completion manifest',async()=>{
+  const a=new Target('CREATE TABLE t(id INTEGER PRIMARY KEY,value);CREATE TABLE child(id REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);');
+  try{
+    populate(a,10);const transaction=a.transaction.bind(a);
+    a.transaction=work=>transaction(async tx=>{const result=await work(tx);await tx.execute('INSERT INTO child VALUES(999)');return result;});
+    await assert.rejects(new ChangesetOutbox(a).bootstrapChunks(seedOptions),/FOREIGN KEY/);noOutbox(a);
+  }finally{a.close();}
+});
+test('lost source commit response recovers the complete retained manifest and chunks',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const transaction=a.transaction.bind(a);let lose=true;
+    a.transaction=async work=>{const result=await transaction(work);if(lose){lose=false;throw new Error('lost commit response');}return result;};
+    const outbox=new ChangesetOutbox(a);await assert.rejects(outbox.bootstrapChunks(seedOptions),/lost commit response/);
+    a.db.exec("UPDATE t SET value='newer'");
+    assert.equal((await outbox.bootstrapChunks(seedOptions)).replayed,true);
+    await deliverPending(outbox,b);assert.equal(b.rows()[0][1],'row-0');
+  }finally{a.close();b.close();}
+});
+test('bootstrap ACKs must advance in order and partial group deletion is refused',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);const seed=await outbox.bootstrapChunks(seedOptions);
+    const second=await outbox.read('source:seed/chunk/1');
+    await assert.rejects(outbox.acknowledge(second.delivery.deliveryId,second.delivery.sha256),{code:'ERR_FSQLITE_OUTBOX_ACK'});
+    await assert.rejects(outbox.forgetBootstrapChunks(seed.deliveryId,seed.sha256),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    const first=await outbox.read(seed.deliveryId);await applyChangeset(b,first.changeset,{tables:['t'],deliveryId:seed.deliveryId});
+    await outbox.acknowledge(seed.deliveryId,seed.sha256);
+    await assert.rejects(outbox.forgetAcknowledged(seed.deliveryId,seed.sha256),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    await deliverPending(outbox,b);
+    await assert.rejects(outbox.forgetAcknowledged(second.delivery.deliveryId,second.delivery.sha256),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+  }finally{a.close();b.close();}
+});
+test('explicit whole-group cleanup preserves later deltas and cannot authorize reseeding',async()=>{
+  const a=new Target(),b=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);const seed=await outbox.bootstrapChunks(seedOptions);
+    await deliverPending(outbox,b);a.db.exec('PRAGMA recursive_triggers=ON');
+    const delta=await outbox.record(tx=>tx.execute("UPDATE t SET value='delta' WHERE id=0"),{deliveryId:'delta',tables:['t']});
+    await assert.rejects(outbox.forgetBootstrapChunks(seed.deliveryId,'0'.repeat(64)),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+    assert.equal(await outbox.forgetBootstrapChunks(seed.deliveryId,seed.sha256),true);
+    assert.equal(await outbox.forgetBootstrapChunks(seed.deliveryId,seed.sha256),false);
+    assert.deepEqual((await outbox.pending()).map(x=>x.deliveryId),['delta']);
+    await deliverPending(outbox,b);await outbox.forgetAcknowledged('delta',delta.delivery.sha256);
+    assert.deepEqual(await outbox.pending(),[]);
+    await assert.rejects(outbox.bootstrapChunks(seedOptions),{code:'ERR_FSQLITE_OUTBOX_STATE'});
+  }finally{a.close();b.close();}
+});
+for(const method of ['bootstrap','record','child','scope','indirect'])test(`rejects cross-method/identity reuse: ${method}`,async()=>{
+  const a=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);await outbox.bootstrapChunks(seedOptions);
+    if(method==='bootstrap')await assert.rejects(outbox.bootstrap(seedOptions),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    else if(method==='record')await assert.rejects(outbox.record(()=>assert.fail('no callback'),seedOptions),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    else if(method==='child')await assert.rejects(outbox.bootstrapChunks({...seedOptions,deliveryId:'source:seed/chunk/1'}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    else if(method==='scope')await assert.rejects(outbox.bootstrapChunks({...seedOptions,tables:['other']}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+    else await assert.rejects(outbox.bootstrapChunks({...seedOptions,indirect:true}),{code:'ERR_FSQLITE_OUTBOX_REUSE'});
+  }finally{a.close();}
+});
+for(const mutation of ['missing','total','truncated','identity','payload','ack-order'])test(`rejects damaged bootstrap ${mutation} rather than generating replacement data`,async()=>{
+  const a=new Target();try{
+    populate(a,10);const outbox=new ChangesetOutbox(a);await outbox.bootstrapChunks(seedOptions);
+    if(mutation==='missing')a.db.exec(`DELETE FROM ${CHANGESET_OUTBOX_TABLE} WHERE seq=2`);
+    else if(mutation==='payload')a.db.exec(`UPDATE ${CHANGESET_OUTBOX_TABLE} SET payload=zeroblob(byte_length) WHERE seq=2`);
+    else if(mutation==='ack-order')a.db.exec(`UPDATE ${CHANGESET_OUTBOX_TABLE} SET acknowledged=1,payload=X'' WHERE seq=2`);
+    else {
+      const seq=mutation==='identity'?2:1,row=a.db.prepare(`SELECT scope FROM ${CHANGESET_OUTBOX_TABLE} WHERE seq=?`).get(seq),scope=JSON.parse(row.scope);
+      if(mutation==='identity')scope.stream.id='wrong';
+      else if(mutation==='total')scope.stream.summary.changes++;
+      else scope.stream.summary.chunks--;
+      a.db.prepare(`UPDATE ${CHANGESET_OUTBOX_TABLE} SET scope=? WHERE seq=?`).run(JSON.stringify(scope),seq);
+    }
+    a.queries.length=0;await assert.rejects(outbox.bootstrapChunks(seedOptions),{code:'ERR_FSQLITE_OUTBOX_CORRUPT'});
+    assert.ok(a.queries.every(sql=>!sql.includes('FROM main."t"')));
+  }finally{a.close();}
+});
+test('two file-backed bootstraps overlap, and the stale reader cannot append a second seed',async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-chunk-race-')),'source.db');
+  const a=new Target('PRAGMA journal_mode=WAL;CREATE TABLE t(id INTEGER PRIMARY KEY,value);',path),b=new Target('',path);
+  try{
+    populate(a,10);await pristineOutbox(a);const query=a.query.bind(a);let raced=false,winner;
+    a.query=async(sql,params)=>{const result=await query(sql,params);if(!raced&&sql.startsWith('SELECT typeof(')){raced=true;winner=await new ChangesetOutbox(b).bootstrapChunks({...seedOptions,deliveryId:'winner'});}return result;};
+    await assert.rejects(new ChangesetOutbox(a).bootstrapChunks(seedOptions),/locked|busy/i);
+    assert.equal(raced,true);assert.equal(winner.chunks,4);
+    assert.deepEqual((await new ChangesetOutbox(b).pending()).map(x=>x.deliveryId),['winner','winner/chunk/1','winner/chunk/2','winner/chunk/3']);
+  }finally{a.close();b.close();}
+});
+test('an incremental writer can win before the first seed write; stale bootstrap aborts',async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-chunk-delta-')),'source.db');
+  const a=new Target('PRAGMA journal_mode=WAL;CREATE TABLE t(id INTEGER PRIMARY KEY,value);',path),b=new Target('',path);
+  try{
+    populate(a,10);await pristineOutbox(a);b.db.exec('PRAGMA recursive_triggers=ON');const query=a.query.bind(a);let raced=false;
+    a.query=async(sql,params)=>{const result=await query(sql,params);if(!raced&&sql.startsWith('SELECT typeof(')){raced=true;await new ChangesetOutbox(b).record(tx=>tx.execute("UPDATE t SET value='winner' WHERE id=0"),{deliveryId:'delta',tables:['t']});}return result;};
+    await assert.rejects(new ChangesetOutbox(a).bootstrapChunks(seedOptions),/locked|busy/i);
+    assert.deepEqual((await new ChangesetOutbox(b).pending()).map(x=>x.deliveryId),['delta']);
+  }finally{a.close();b.close();}
+});
+for(const cut of ['mid-chunks','before-commit','after-commit'])test(`SIGKILL ${cut} preserves the atomic source bootstrap decision`,async()=>{
+  const path=join(mkdtempSync(join(tmpdir(),'fsqlite-chunk-kill-')),'source.db');
+  const original=new Target('PRAGMA journal_mode=WAL;CREATE TABLE t(id INTEGER PRIMARY KEY,value);',path);
+  populate(original,10);original.close();
+  const code=`import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ChangesetOutbox} from ${JSON.stringify(new URL('../src/changeset-outbox.ts',import.meta.url).href)};
+    ${Target.toString()}
+    const a=new Target('',${JSON.stringify(path)});let inserts=0;
+    const execute=a.execute.bind(a);a.execute=async(sql,params)=>{const n=await execute(sql,params);if(${JSON.stringify(cut)}==='mid-chunks'&&sql.startsWith('INSERT OR ABORT INTO main."__fsqlite_changeset_outbox"')&&++inserts===2)process.kill(process.pid,'SIGKILL');return n;};
+    const transaction=a.transaction.bind(a);a.transaction=async work=>{const result=await transaction(async tx=>{const value=await work(tx);if(${JSON.stringify(cut)}==='before-commit')process.kill(process.pid,'SIGKILL');return value;});if(${JSON.stringify(cut)}==='after-commit')process.kill(process.pid,'SIGKILL');return result;};
+    await new ChangesetOutbox(a).bootstrapChunks({deliveryId:'source:seed',tables:['t'],chunkRows:3});throw Error('missed crash cut');`;
+  const child=spawn(process.execPath,['--experimental-loader='+new URL('./helpers/source-loader.mjs',import.meta.url).pathname,'--input-type=module','-e',code],{env:process.env,stdio:['ignore','ignore','pipe']});
+  let error='';child.stderr.on('data',d=>{if(error.length<8000)error+=d;});
+  const [status,signal]=await once(child,'close');assert.equal(status,null,error);assert.equal(signal,'SIGKILL',error);
+  const a=new Target('',path),b=new Target();try{
+    a.db.exec("UPDATE t SET value='newer'");const outbox=new ChangesetOutbox(a);
+    const result=await outbox.bootstrapChunks(seedOptions);assert.equal(result.replayed,cut==='after-commit');assert.equal(result.chunks,4);
+    await deliverPending(outbox,b);assert.equal(b.rows()[0][1],cut==='after-commit'?'row-0':'newer');
+  }finally{a.close();b.close();}
+});
+test('chunked outbox retains a larger-than-64-MiB seed without one giant payload',async()=>{
+  const a=new Target();try{
+    a.db.exec("WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<68) INSERT INTO t SELECT x,zeroblob(1000000) FROM n");
+    const outbox=new ChangesetOutbox(a,{maxPayloadBytes:80*1024*1024});
+    const result=await outbox.bootstrapChunks({...seedOptions,chunkBytes:1048576});
+    assert.equal(result.chunks,68);assert.equal(result.changes,68);assert.ok(result.byteLength>64*1024*1024);
+    const bounds=a.db.prepare(`SELECT max(byte_length) maximum,sum(byte_length) total FROM ${CHANGESET_OUTBOX_TABLE}`).get();
+    assert.ok(bounds.maximum<=1048576);assert.equal(bounds.total,result.byteLength);
+    assert.equal((await outbox.bootstrapChunks({...seedOptions,chunkBytes:1})).replayed,true);
+  }finally{a.close();}
+});
+
+test('ordinary pending delivery pagination uses numeric sequence order beyond nine',async()=>{
+  const a=new Target();try{
+    a.db.exec('PRAGMA recursive_triggers=ON');const outbox=new ChangesetOutbox(a);
+    for(let i=1;i<=45;i++)await outbox.record(tx=>tx.execute('INSERT INTO t VALUES(?,?)',[BigInt(i),'row']),{deliveryId:`delta-${i}`,tables:['t']});
+    assert.deepEqual((await outbox.pending({limit:100})).map(x=>x.sequence),Array.from({length:45},(_,i)=>BigInt(i+1)));
+    assert.deepEqual((await outbox.pending({limit:15,after:9n})).map(x=>x.sequence),Array.from({length:15},(_,i)=>BigInt(i+10)));
+    const p=await outbox.pending({limit:1});assert.equal(p[0].sequence,1n);
+  }finally{a.close();}
+});
+for(const column of ['t0','x0'])for(const layout of ['',' WITHOUT ROWID'])test(`snapshot key ${column} cannot resolve to typed projection aliases${layout}`,async()=>{
+  const ddl=`CREATE TABLE t(${column} TEXT PRIMARY KEY,value)${layout};`,a=new Target(ddl),b=new Target(ddl);
+  try{
+    const stmt=a.db.prepare('INSERT INTO t VALUES(?,?)');
+    for(let i=120;i>0;i--)stmt.run(String(i).padStart(4,'0'),i);
+    await transfer(a,b,{chunkRows:7});assert.deepEqual(b.rows(),a.rows());
+    const single=await snapshotChangeset(a,{tables:['t']});assert.equal(single.changes,120);
+  }finally{a.close();b.close();}
 });

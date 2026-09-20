@@ -178,9 +178,9 @@ Receiver replay prevents repeated INSERTs when an acknowledgement is lost.
 Source and receiver snapshot stores still require explicit checkpoints, and the
 pump's confirmation callbacks must target the correct databases. No transport,
 checkpoint, automatic retry, source authentication or native replication engine
-is created by bootstrap. Large datasets exceeding one bounded changeset still
-need a separately designed multi-message snapshot protocol; they are rejected,
-not silently truncated or divided across inconsistent transactions.
+is created by bootstrap. This single-message API rejects datasets exceeding one
+bounded changeset. Use `bootstrapChunks` below for atomic source-side retention
+of a multi-message seed; it does not provide atomic receiver-side visibility.
 
 ### Combined executed verification
 
@@ -201,3 +201,209 @@ are SIGKILLed before source commit and after commit before response. Reopened
 files recover the appropriate first-message decision and deliver without a new
 source snapshot for the committed case. Process death is not power-loss proof.
 No new HTTP, browser, full SDK/worker or Rust/WASM certification is claimed.
+
+## Streaming one consistent snapshot into bounded changesets
+
+`streamSnapshotChangesets(source, onChunk, options)` reads all selected tables
+in one owned source transaction, but materializes only bounded pages and one
+chunk rather than the complete seed. It awaits `onChunk` before continuing.
+Each chunk contains one table's INSERTs, has a contiguous zero-based `index`,
+and owns its bytes. An empty source emits one empty chunk. The resolved result
+contains total `chunks`, `changes` and emitted wire `byteLength`.
+
+```ts
+const summary = await streamSnapshotChangesets(source, async chunk => {
+  await staging.write(chunk.index, chunk.changeset);
+}, { tables: ['parents', 'children'], chunkRows: 1024, chunkBytes: 1024 * 1024 });
+// Only after success may the application finalize its own staged artifact.
+await staging.complete(summary);
+```
+
+The sink and source must be trusted. Do not mutate/reenter the source from the
+sink or publish chunks during collection as a completed baseline. Chunks remain
+provisional until this operation and any enclosing transaction commit. A later
+schema/limit/SQL error, sink failure or cancellation can invalidate already
+emitted chunks; external sink effects cannot be rolled back by this API. Use
+staging with an explicit completion decision, or transactional outbox storage.
+An open stream pins one snapshot for its entire lifetime. There is no resumable
+source cursor after failure: a new source transaction is a different snapshot.
+
+`chunkRows` defaults to 1,024 (maximum 100,000). `chunkBytes` defaults to 1 MiB
+(maximum 64 MiB), bounding both accounted images per chunk and encoded wire
+bytes. SQL size pages contain at most 32 scalar sizes, and the following value
+query is narrowed to a byte-fitting prefix. A single oversized row fails before
+its values are transferred. A page and a chunk may coexist; encoding/copying has
+additional bounded allocations. Sink-retained data, SQL execution memory and RSS
+are not bounded by these options. Conservative wire accounting can emit smaller
+chunks; `chunkRows`/`chunkBytes` are ceilings, not exact packing guarantees.
+
+Streaming total limits are independent: `maxRows` defaults to 1,000,000 (maximum
+10,000,000), `maxBytes` to 256 MiB (maximum 1 GiB of accounted row images),
+`maxCells` to 10,000,000 (maximum 100,000,000), and `maxChunks` to 10,000 (maximum
+100,000). Codec limits apply to each chunk; the single-image API's optional
+`limits` is not a streaming option. Existing `snapshotChangeset` and capture
+retain their old limits. Source schema/NULL-key checks, index ordering, typed
+values, table order, and cooperative cancellation follow the same shared reader.
+Cancellation and timeout wait for an already-started sink to settle; a sink that
+ignores cancellation can delay completion. No background work is started.
+
+The streaming suite passed 39/39 tests on Node 22.16.0 / SQLite 3.49.1, including
+native apply/invert, 100,001 rows, a 70,000,000-byte BLOB dataset, bounded value
+pages, concurrent source changes across tables/chunks, composite index order,
+UTF-16/int64 preservation, cancellation drain and terminal failures. Actual
+capture/codec/apply sources pass strict TypeScript 5.8.3 checks. These are
+reference-SQLite tests, not Rust/WASM, browser, full-SDK or power-loss certification.
+
+```sh
+node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
+  --test packages/sdk/tests/changeset-snapshot-stream.test.mjs
+```
+
+## Atomic multi-message bootstrap
+
+`ChangesetOutbox.bootstrapChunks` connects the streaming reader to persistent
+outgoing delivery. All chunks, their individual digests and the final manifest
+are retained in the SAME source transaction that reads all selected rows. There
+is no committed partial prefix, no network call inside the transaction, and no
+JavaScript array containing the complete seed. Subsequent `record` operations
+follow the entire baseline in sequence.
+
+```ts
+const outbox = new ChangesetOutbox(source, {
+  maxEntries: 10_000,
+  maxPayloadBytes: 256 * 1024 * 1024,
+});
+const options = {
+  deliveryId: 'source-42:baseline-1',
+  tables: ['parents', 'children'],
+  chunkRows: 1024,
+  chunkBytes: 1024 * 1024,
+  maxBytes: 256 * 1024 * 1024,
+};
+const seed = await outbox.bootstrapChunks(options);
+// Only now enable producers using outbox.record(). Confirm the source before
+// sending. The existing delivery pump performs that configured confirmation.
+await pump.run({ maxDeliveries: 100 });
+// Repeat bounded delivery runs as needed; never rerun source business callbacks.
+const progress = await outbox.bootstrapChunks(options);
+console.log(progress.acknowledgedChunks, progress.chunks, progress.complete);
+```
+
+Here `pump` must be configured for this exact outbox and a fixed, authenticated
+destination, using the existing source/receiver confirmation contract. The API
+does not manufacture a pump, schedule retries, or checkpoint either database.
+The receiver must already have matching empty schemas. Include every table that
+needs replication, and record all subsequent changes through the outbox. Table
+order remains caller-selected, including immediate foreign-key dependencies.
+
+### Atomic source publication, not atomic receiver installation
+
+**Each chunk is applied in a separate receiver transaction. Keep the destination
+staged or unavailable to application readers until the entire baseline has been
+acknowledged and its receiver storage confirmed.** During delivery the receiver
+may contain only part of the baseline. A later conflict does not undo earlier
+chunks, and source rollback cannot undo remote SQL. This API does not implement
+a staging-database swap, multi-message receiver transaction or atomic visibility
+barrier. Do not accept omissions when a complete baseline is required.
+
+The source snapshot and outbox append remain one transaction, so a concurrent
+source writer can cause a storage conflict and abort the whole bootstrap. An
+unused outbox is required. When an incremental writer wins first, bootstrap
+fails rather than appending a baseline behind it. Start producers only after
+bootstrap succeeds. Large source transactions can pin history and retain SQL
+write buffers even though JavaScript row-image memory is chunked; the limits
+are not a promise of small engine memory or short snapshot lifetimes.
+
+### Identities, manifest and replay
+
+The root `deliveryId` accepts 1..480 UTF-8 bytes without NUL. It identifies chunk
+zero; later chunks use `${deliveryId}/chunk/${index}` with contiguous zero-based
+indices. Do not use those derived delivery identities for other work. Chunk
+sequences occupy 1 through N in a new outbox. Even an empty source retains one
+empty chunk. Existing wire framing, receiver inbox receipts and HTTP transport
+remain unchanged: each retained message is a normal INSERT-only changeset.
+
+The root's existing scope field stores the manifest: total chunks, row changes
+and encoded byte length. Each member binds its root, index and table/indirect
+scope. Validation checks contiguous numeric sequences, matching identities,
+totals and a contiguous acknowledged prefix. The result's `sha256` is the
+digest of the FIRST chunk, not a cryptographic digest of the entire manifest.
+Reserved SQL metadata and the target adapter are trusted; payload hashes do
+not authenticate a source or protect against authorized metadata modification.
+
+Calling `bootstrapChunks` again with the same root and table/indirect scope
+returns `replayed: true`, the original totals and current acknowledgement
+progress. It reads metadata in pages of at most 32 and verifies each still-
+pending payload separately. It does not scan application rows or regenerate a
+seed from newer data. Different chunk packing or collection budgets do not
+rewrite retained work. A different operation type or capture scope rejects.
+Missing, mismatched or corrupted retained chunks fail rather than being
+silently replaced. Replay can therefore require reading all retained payloads;
+it is bounded-memory validation, not constant-time status lookup.
+
+`complete` means every chunk's SOURCE acknowledgement flag is set. It does not
+prove that a snapshot checkpoint succeeded or that receiver application readers
+are safe to admit. Use the existing confirmation/recovery rules on both ends.
+After an uncertain source commit response, retry the same root: a committed
+manifest recovers; a rolled-back bootstrap can collect a fresh snapshot. No
+uncommitted source-read cursor survives process death.
+
+### Capacity, acknowledgement and retention
+
+The streaming row/image/cell/chunk limits above apply to collection. In addition,
+all chunk identities count toward the outbox's `maxEntries`, and all pending
+wire payloads count toward its `maxPayloadBytes`. A limit or error in ANY chunk
+rolls back the complete source-side bootstrap. Configure the outbox's total
+payload allowance separately from per-chunk limits; its default remains 64 MiB
+and hard maximum 1 GiB. Choose `chunkBytes` within the receiver and transport's
+individual-message limits. Each payload still obeys the existing codec bounds.
+
+Acknowledging a chunk requires the exact delivery ID/digest and, for a later
+chunk, an acknowledged predecessor. The normal pump starts with the oldest
+pending message and stops on failure. Retrying after a lost receiver response
+uses that chunk's retained inbox receipt, not another copy of the source work.
+Do not manually acknowledge incremental messages ahead of an unfinished seed.
+
+Individual `forgetAcknowledged` calls reject chunked-bootstrap members, because
+deleting the root or a prefix would destroy complete-manifest recovery. After
+ALL chunks are acknowledged, explicitly call
+`forgetBootstrapChunks(seed.deliveryId, seed.sha256)` to remove the entire
+group in one transaction. It preserves later incremental entries and the
+AUTOINCREMENT history. Repeating cleanup after removal returns false; an
+incorrect digest or pending group rejects. Forgetting ends retry protection,
+but does not authorize reseeding used history. Never drop/recreate reserved
+tables or reset sequence metadata to bypass these rules. Restoring backups
+restores their older delivery and deduplication history.
+
+### Executed chunked-bootstrap verification
+
+The combined stream/bootstrap suite passes **74/74 tests**, with zero failures
+or skips, on Node 22.16.0 / SQLite 3.49.1. Strict TypeScript 5.8.3 checks pass
+against the actual outbox, capture, application and codec sources. Tests use
+real SQLite transactions and native session application/inversion, plus the
+SDK's actual inbox/application path.
+
+The suite includes 100,001 rows, a 70,000,000-byte streamed BLOB dataset, and
+68,000,000 bytes of BLOBs retained and replay-verified through a multi-page
+outbox manifest with 1 MiB chunk limits. It checks sizes and indexed plans of
+actual value pages, ordered seed-to-incremental convergence, lost source and
+receiver acknowledgements, deferred commit errors, enclosing rollback,
+capacity/cancellation failures, manifest corruption and group retention.
+
+Two file-backed bootstrap writers overlap; a separate case lets an incremental
+writer win while bootstrap holds its read snapshot. Child processes are actually
+SIGKILLed midway through chunk insertion, immediately before COMMIT, and after
+COMMIT before returning a response. Reopened files recover all-or-none source
+publication and reuse committed seed bytes instead of rescanning newer rows.
+These are process-death cuts, not simulated power-loss tests.
+
+The larger cases also exposed and now guard two SQL name-resolution defects:
+outbox pages order by the physical INTEGER sequence, not its projected TEXT
+alias (which sorted 10 before 2); snapshot key expressions are table-qualified
+so columns named `t0` or `x0` cannot resolve to typed-output aliases. The tests
+cover ordinary incremental outbox pagination and both snapshot entrypoints,
+not only the new chunked path.
+
+Full SDK/worker builds, FrankenSQLite Rust/WASM execution, real browser storage,
+atomic receiver visibility, native RaptorQ snapshots and physical power-loss
+behavior are not certified by these reference-SQLite tests.

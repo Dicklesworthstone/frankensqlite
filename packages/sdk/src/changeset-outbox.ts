@@ -1,5 +1,5 @@
-import { prepareChangesetCapture, prepareChangesetSnapshot } from "./changeset-capture";
-import type { CaptureChangesetOptions, ChangesetSnapshot, SnapshotChangesetOptions } from "./changeset-capture";
+import { prepareChangesetCapture, prepareChangesetSnapshot, prepareSnapshotChangesetStream } from "./changeset-capture";
+import type { CaptureChangesetOptions, ChangesetSnapshot, SnapshotChangesetOptions, SnapshotChangesetStreamOptions, ChangesetSnapshotStreamResult } from "./changeset-capture";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { decodeChangeset } from "./changeset-codec";
 import type { ChangesetValue } from "./changeset-codec";
@@ -30,6 +30,21 @@ export interface OutboxBootstrapOptions extends SnapshotChangesetOptions {
 export interface OutboxBootstrapResult {
   readonly replayed: boolean;
   readonly delivery: OutboxDelivery;
+}
+export interface OutboxBootstrapChunksOptions extends SnapshotChangesetStreamOptions {
+  /** Root operation identity, at most 480 UTF-8 bytes. Reserves its /chunk/ suffixes. */
+  deliveryId: string;
+}
+export interface OutboxBootstrapChunksResult extends ChangesetSnapshotStreamResult {
+  readonly replayed: boolean;
+  readonly deliveryId: string;
+  /** Digest of the first chunk, used with the exact root ID for explicit cleanup. */
+  readonly sha256: string;
+  readonly firstSequence: bigint;
+  readonly lastSequence: bigint;
+  readonly acknowledgedChunks: number;
+  /** All source acknowledgement flags are set; NOT a checkpoint or visibility proof. */
+  readonly complete: boolean;
 }
 export type OutboxRecordResult<T> =
   | { readonly replayed: false; readonly value: T; readonly delivery: OutboxDelivery }
@@ -144,7 +159,36 @@ async function ensure(tx: ChangesetExecutor, create: boolean): Promise<boolean> 
   }
   return true;
 }
-interface Stored { delivery: OutboxDelivery; scope: string }
+interface StreamInfo {
+  id: string;
+  index: number;
+  base: string;
+  summary: ChangesetSnapshotStreamResult | null;
+}
+interface Stored { delivery: OutboxDelivery; scope: string; stream: StreamInfo | null }
+function streamIdentity(value: unknown): string {
+  const id = identity(value);
+  if (new TextEncoder().encode(id).length > 480) fail("INPUT", "Chunked bootstrap identity exceeds 480 UTF-8 bytes");
+  return id;
+}
+function chunkId(id: string, index: number): string { return index === 0 ? id : `${id}/chunk/${index}`; }
+function streamInfo(value: unknown, base: string, sequence: bigint, id: string): StreamInfo {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail("CORRUPT", "Invalid bootstrap chunk metadata");
+  const v = value as { id?: unknown; index?: unknown; summary?: unknown };
+  let root: string;
+  try { root = streamIdentity(v.id); } catch { return fail("CORRUPT", "Invalid bootstrap root identity"); }
+  const index = integer(v.index);
+  if (index >= 100_000 || sequence !== BigInt(index + 1) || id !== chunkId(root, index)) fail("CORRUPT", "Bootstrap chunk identity/order mismatch");
+  let summary: ChangesetSnapshotStreamResult | null = null;
+  if (index === 0) {
+    if (typeof v.summary !== "object" || v.summary === null || Array.isArray(v.summary)) fail("CORRUPT", "Missing bootstrap completion manifest");
+    const s = v.summary as { chunks?: unknown; changes?: unknown; byteLength?: unknown };
+    const chunks = integer(s.chunks), changes = integer(s.changes), byteLength = integer(s.byteLength);
+    if (chunks < 1 || chunks > 100_000 || changes > 10_000_000 || byteLength > 1024 * 1024 * 1024) fail("CORRUPT", "Invalid bootstrap totals");
+    summary = Object.freeze({ chunks, changes, byteLength });
+  } else if (v.summary !== undefined) fail("CORRUPT", "Only the first chunk may contain a bootstrap manifest");
+  return { id: root, index, base, summary };
+}
 function metadata(row: readonly unknown[]): Stored {
   if (row.length !== 9 || typeof row[0] !== "string" || !/^[1-9][0-9]{0,18}$/.test(row[0])) fail("CORRUPT", "Invalid outbox sequence");
   const sequence = BigInt(row[0]);
@@ -157,13 +201,16 @@ function metadata(row: readonly unknown[]): Stored {
   let scope: unknown;
   try { scope = JSON.parse(row[5]); } catch { return fail("CORRUPT", "Invalid outbox capture scope JSON"); }
   if (typeof scope !== "object" || scope === null) fail("CORRUPT", "Invalid capture scope shape");
-  const s = scope as { tables?: unknown; indirect?: unknown; snapshot?: unknown };
+  const s = scope as { tables?: unknown; indirect?: unknown; snapshot?: unknown; stream?: unknown };
   if (s.snapshot !== undefined && s.snapshot !== true) fail("CORRUPT", "Invalid outbox snapshot scope");
   const tables = s.tables;
   if (!Array.isArray(tables) || !tables.length || tables.length > 64 || typeof s.indirect !== "boolean" ||
       tables.some(t => typeof t !== "string" || !t.length || t.length > 1024 || t.includes("\0") || t.startsWith("sqlite_") || t.startsWith("__fsqlite_")) ||
       tables.some((t, i) => fold(t) !== t || (i > 0 && tables[i - 1] >= t))) fail("CORRUPT", "Invalid capture scope tables");
-  return { scope: row[5], delivery: Object.freeze({ sequence, deliveryId, sha256, byteLength, changes, acknowledged: ack === 1 }) };
+  if (s.stream !== undefined && s.snapshot !== true) fail("CORRUPT", "Bootstrap chunks must be snapshot operations");
+  const stream = s.stream === undefined ? null : streamInfo(s.stream,
+    JSON.stringify({ tables, indirect: s.indirect, snapshot: true }), sequence, deliveryId);
+  return { scope: row[5], stream, delivery: Object.freeze({ sequence, deliveryId, sha256, byteLength, changes, acknowledged: ack === 1 }) };
 }
 async function find(tx: ChangesetExecutor, id: string): Promise<Stored | null> {
   const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE delivery_id=?`, [id]);
@@ -171,6 +218,7 @@ async function find(tx: ChangesetExecutor, id: string): Promise<Stored | null> {
   return rows.length ? metadata(rows[0]!) : null;
 }
 async function load(tx: ChangesetExecutor, record: Stored): Promise<Uint8Array | null> {
+  if (record.stream !== null) await validateStreamEntry(tx, record);
   if (record.delivery.acknowledged) return null;
   const rows = await query(tx, `SELECT payload FROM ${TABLE} WHERE delivery_id=? AND typeof(payload)='blob' AND length(payload)=?`, [record.delivery.deliveryId, BigInt(record.delivery.byteLength)]);
   if (rows.length !== 1 || rows[0]!.length !== 1 || !(rows[0]![0] instanceof Uint8Array)) fail("CORRUPT", "Invalid outbox payload");
@@ -184,6 +232,44 @@ async function load(tx: ChangesetExecutor, record: Stored): Promise<Uint8Array |
     fail("CORRUPT", "Outbox payload disagrees with its capture scope");
   }
   return bytes;
+}
+
+async function validateStreamEntry(tx: ChangesetExecutor, entry: Stored): Promise<Stored> {
+  const part = entry.stream;
+  if (part === null) fail("STATE", "Not a chunked bootstrap delivery");
+  const root = part.index === 0 ? entry : await find(tx, part.id);
+  if (root === null || root.stream?.summary === null || root.stream?.summary === undefined ||
+      root.stream.base !== part.base || part.index >= root.stream.summary.chunks) fail("CORRUPT", "Bootstrap chunk has no matching complete manifest");
+  return root;
+}
+
+/** One metadata page / one verified pending payload at a time, never a seed array. */
+async function inspectStream(tx: ChangesetExecutor, root: Stored, checkpoint: () => void,
+  verifyPayloads: boolean): Promise<Omit<OutboxBootstrapChunksResult, "replayed">> {
+  const stream = root.stream, summary = stream?.summary;
+  if (stream === null || summary === null || summary === undefined) fail("STATE", "Identity does not name a bootstrap manifest");
+  let seen = 0, changes = 0, byteLength = 0, acknowledgedChunks = 0, pending = false;
+  while (seen < summary.chunks) {
+    checkpoint();
+    const rows = await query(tx, `SELECT ${META} FROM ${TABLE} AS o WHERE o.seq>? AND o.seq<=? ORDER BY o.seq LIMIT 32`, [BigInt(seen), BigInt(summary.chunks)]);
+    if (!rows.length || rows.length > 32) fail("CORRUPT", "Bootstrap manifest has missing chunks or an oversized metadata page");
+    for (const row of rows) {
+      const entry = metadata(row), part = entry.stream;
+      if (part === null || part.id !== stream.id || part.index !== seen || part.base !== stream.base) fail("CORRUPT", "Bootstrap manifest contains foreign or out-of-order chunks");
+      if (entry.delivery.acknowledged) {
+        if (pending) fail("CORRUPT", "Bootstrap acknowledgements are not a contiguous prefix");
+        acknowledgedChunks++;
+      } else pending = true;
+      if (verifyPayloads) await load(tx, entry);
+      checkpoint(); seen++; changes += entry.delivery.changes; byteLength += entry.delivery.byteLength;
+    }
+  }
+  const next = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [BigInt(summary.chunks + 1)]);
+  if (next.length > 1 || (next.length === 1 && metadata(next[0]!).stream?.id === stream.id)) fail("CORRUPT", "Bootstrap manifest truncates its retained chunks");
+  if (changes !== summary.changes || byteLength !== summary.byteLength) fail("CORRUPT", "Bootstrap totals disagree with retained chunks");
+  checkpoint();
+  return Object.freeze({ ...summary, deliveryId: stream.id, sha256: root.delivery.sha256,
+    firstSequence: 1n, lastSequence: BigInt(summary.chunks), acknowledgedChunks, complete: acknowledgedChunks === summary.chunks });
 }
 
 /** Shared atomic publication for incremental captures and initial row snapshots. */
@@ -274,13 +360,76 @@ export class ChangesetOutbox {
     }, snapshot.transactionOptions);
   }
 
+  /**
+   * Atomically retain ALL seed chunks from one source snapshot before record().
+   * The receiver applies separate transactions: keep it unpublished until the
+   * whole baseline is acknowledged and storage-confirmed. No network inside SQL.
+   */
+  async bootstrapChunks(options: OutboxBootstrapChunksOptions): Promise<OutboxBootstrapChunksResult> {
+    const id = streamIdentity(options?.deliveryId), snapshot = prepareSnapshotChangesetStream(options);
+    const base = { tables: snapshot.tables.map(fold).sort(), indirect: snapshot.indirect, snapshot: true };
+    const baseScope = JSON.stringify(base);
+    if (globalThis.crypto?.subtle === undefined) fail("INPUT", "The outbox requires Web Crypto SHA-256");
+    return this.#target.transaction(async tx => {
+      snapshot.checkpoint(); await ensure(tx, true); snapshot.checkpoint();
+      const existing = await find(tx, id); snapshot.checkpoint();
+      if (existing !== null) {
+        if (existing.stream?.index !== 0 || existing.stream.base !== baseScope) fail("REUSE", "Identity belongs to another operation or bootstrap scope");
+        return Object.freeze({ ...await inspectStream(tx, existing, snapshot.checkpoint, true), replayed: true });
+      }
+      if ((await query(tx, `SELECT 1 FROM ${TABLE} LIMIT 1`)).length ||
+          (await query(tx, "SELECT 1 FROM main.sqlite_sequence WHERE name=? COLLATE BINARY LIMIT 1", [CHANGESET_OUTBOX_TABLE])).length) {
+        fail("STATE", "Chunked bootstrap requires an unused outbox; recover the original identity");
+      }
+      let retainedBytes = 0, firstScope = "";
+      const summary = await snapshot.run(tx, async chunk => {
+        snapshot.checkpoint();
+        if (chunk.index >= this.#maxEntries || chunk.changeset.byteLength > this.#maxPayloadBytes - retainedBytes) fail("FULL", "Outbox cannot retain the complete chunked bootstrap");
+        const stream = chunk.index === 0
+          ? { id, index: 0, summary: { chunks: 1, changes: chunk.changes, byteLength: chunk.changeset.byteLength } }
+          : { id, index: chunk.index };
+        const scope = JSON.stringify({ ...base, stream });
+        if (chunk.index === 0) firstScope = scope;
+        const saved = await store(tx, chunkId(id, chunk.index), scope, chunk, snapshot.checkpoint);
+        if (saved.sequence !== BigInt(chunk.index + 1)) fail("STATE", "Bootstrap chunks did not occupy the initial sequence range");
+        retainedBytes += chunk.changeset.byteLength;
+      });
+      snapshot.checkpoint();
+      const scope = JSON.stringify({ ...base, stream: { id, index: 0, summary } });
+      const changed = await tx.execute(`UPDATE OR ABORT ${TABLE} SET scope=? WHERE seq=1 AND delivery_id=? AND scope=? AND acknowledged=0`, [scope, id, firstScope]);
+      snapshot.checkpoint();
+      if (changed !== 1) fail("CORRUPT", "Bootstrap completion manifest was not stored");
+      const root = await find(tx, id);
+      if (root === null || root.scope !== scope) fail("CORRUPT", "Bootstrap completion manifest was not confirmed");
+      return Object.freeze({ ...await inspectStream(tx, root, snapshot.checkpoint, false), replayed: false });
+    }, snapshot.transactionOptions);
+  }
+
+  /** Explicitly forget the entire acknowledged bootstrap, never just its prefix. */
+  async forgetBootstrapChunks(deliveryId: string, sha256: string): Promise<boolean> {
+    const id = streamIdentity(deliveryId), expected = digest(sha256);
+    return this.#target.transaction(async tx => {
+      if (!await ensure(tx, false)) return false;
+      const root = await find(tx, id);
+      if (root === null) return false;
+      if (root.delivery.sha256 !== expected) fail("STATE", "Bootstrap cleanup digest does not match");
+      const status = await inspectStream(tx, root, () => {}, false);
+      if (!status.complete) fail("STATE", "All bootstrap chunks must be acknowledged before forgetting");
+      const changed = await tx.execute(`DELETE FROM ${TABLE} WHERE seq>=1 AND seq<=? AND acknowledged=1`, [status.lastSequence]);
+      if (changed !== status.chunks) fail("CORRUPT", "Bootstrap cleanup did not remove its complete acknowledged range");
+      return true;
+    });
+  }
+
   /** Bounded metadata page. Sequence cursors are monotonic, not SQL OFFSETs. */
   async pending(options: OutboxPageOptions = {}): Promise<readonly OutboxDelivery[]> {
     const limit = bound(options.limit, 100, 256), after = options.after ?? 0n;
     if (typeof after !== "bigint" || after < 0n || after > (1n << 63n) - 1n) fail("INPUT", "after must be a nonnegative int64 bigint sequence");
     return this.#target.transaction(async tx => {
       if (!await ensure(tx, false)) return [];
-      const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE acknowledged=0 AND seq>? ORDER BY seq LIMIT ?`, [after, BigInt(limit)]);
+      // META exposes CAST(seq AS TEXT) AS seq to preserve int64. Unqualified
+      // ORDER BY seq sorts that text alias (1,10,11,2), not the numeric key.
+      const rows = await query(tx, `SELECT ${META} FROM ${TABLE} AS o WHERE acknowledged=0 AND o.seq>? ORDER BY o.seq LIMIT ?`, [after, BigInt(limit)]);
       if (rows.length > limit) fail("CORRUPT", "Outbox page exceeded its bound");
       let previous = after;
       return Object.freeze(rows.map(row => {
@@ -309,6 +458,14 @@ export class ChangesetOutbox {
       const record = await find(tx, id);
       if (record === null || record.delivery.sha256 !== expected) fail("ACK", "Acknowledgement does not match a retained delivery");
       if (record.delivery.acknowledged) return false;
+      if (record.stream !== null) {
+        await validateStreamEntry(tx, record);
+        if (record.stream.index > 0) {
+          const previous = await find(tx, chunkId(record.stream.id, record.stream.index - 1));
+          if (previous === null || previous.stream?.id !== record.stream.id ||
+              previous.stream.base !== record.stream.base || !previous.delivery.acknowledged) fail("ACK", "Acknowledge bootstrap chunks in order, without skipping a predecessor");
+        }
+      }
       await load(tx, record);
       const changed = await tx.execute(`UPDATE OR ABORT ${TABLE} SET acknowledged=1,payload=X'' WHERE delivery_id=? AND sha256=? AND acknowledged=0`, [id, expected]);
       if (changed !== 1) fail("CORRUPT", "Outbox acknowledgement did not affect exactly one row");
@@ -324,6 +481,7 @@ export class ChangesetOutbox {
       const record = await find(tx, id);
       if (record === null) return false;
       if (!record.delivery.acknowledged || record.delivery.sha256 !== expected) fail("STATE", "Only the exact acknowledged delivery may be forgotten");
+      if (record.stream !== null) fail("STATE", "Use forgetBootstrapChunks after the entire bootstrap is acknowledged");
       const changed = await tx.execute(`DELETE FROM ${TABLE} WHERE delivery_id=? AND sha256=? AND acknowledged=1`, [id, expected]);
       if (changed !== 1) fail("CORRUPT", "Outbox forgetting did not affect exactly one row");
       return true;
