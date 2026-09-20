@@ -5,6 +5,8 @@
 //! This module validates transfer contents, not atomic source capture or
 //! publication of the received database.
 
+pub mod image;
+pub use image::{SnapshotImageReceipt, SnapshotImageState, SnapshotImageWriter};
 pub mod spool;
 pub use spool::{SnapshotCheckpoint, SnapshotSpool, SnapshotSpoolState};
 
