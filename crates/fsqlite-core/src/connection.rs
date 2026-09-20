@@ -322,7 +322,7 @@ const EPROCESS_PRIORITY_THRESHOLD: u8 = 1;
 // busy_timeout from monopolizing the CPU and starving the lock holder.
 const BEGIN_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
 const BEGIN_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
-const BEGIN_BUSY_HANDOFF_BASE_SLEEP_US: u64 = 1_000;
+const BEGIN_BUSY_HANDOFF_BASE_SLEEP_US: u64 = 50;
 const BEGIN_BUSY_HANDOFF_MAX_SLEEP_US: u64 = 50_000;
 // Connection admission can serialize while a peer verifies and publishes the
 // database namespace. Callers cannot raise PRAGMA busy_timeout until open has
@@ -397,7 +397,12 @@ fn thread_parse_cache_capacity() -> NonZeroUsize {
 
 const fn begin_busy_retry_sleep_micros(attempt: u32) -> u64 {
     let growth = attempt.saturating_sub(1);
-    let shift = if growth > 6 { 6 } else { growth };
+    // bd-9kvey: the growth cap moves with the base. At 50us a cap of 6 would top
+    // the curve out at 3.2ms and poll ~15x more often through a long wait, which
+    // is exactly what the bounded sleep exists to prevent. 50us << 10 is
+    // 51_200us, which BEGIN_BUSY_HANDOFF_MAX_SLEEP_US clamps to the same 50ms
+    // ceiling this schedule always had -- so only the early steps change.
+    let shift = if growth > 10 { 10 } else { growth };
     let micros = BEGIN_BUSY_HANDOFF_BASE_SLEEP_US << shift;
     if micros > BEGIN_BUSY_HANDOFF_MAX_SLEEP_US {
         BEGIN_BUSY_HANDOFF_MAX_SLEEP_US
@@ -219552,10 +219557,17 @@ fts5(title, body, content=docs, content_rowid=id)'
 
     #[test]
     fn test_begin_busy_retry_sleep_cadence_is_bounded() {
-        assert_eq!(begin_busy_retry_sleep_micros(1), 1_000);
-        assert_eq!(begin_busy_retry_sleep_micros(2), 2_000);
-        assert_eq!(begin_busy_retry_sleep_micros(3), 4_000);
-        assert_eq!(begin_busy_retry_sleep_micros(7), 50_000);
+        // bd-9kvey: finer early steps, same ceiling. The first attempts now
+        // land inside the sub-millisecond window a checkpoint actually holds,
+        // and the curve still doubles to the same 50 ms cap -- it just takes
+        // four more steps to get there, so a long wait polls at the same rate
+        // it always did.
+        assert_eq!(begin_busy_retry_sleep_micros(1), 50);
+        assert_eq!(begin_busy_retry_sleep_micros(2), 100);
+        assert_eq!(begin_busy_retry_sleep_micros(3), 200);
+        assert_eq!(begin_busy_retry_sleep_micros(7), 3_200);
+        // Attempt 11 is where the cap first bites: 50 << 10 is 51_200.
+        assert_eq!(begin_busy_retry_sleep_micros(11), 50_000);
         assert_eq!(begin_busy_retry_sleep_micros(32), 50_000);
     }
 
@@ -219590,8 +219602,12 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(summary.attempts, 8);
         assert_eq!(summary.total_spin_loops, 8_128);
         assert_eq!(summary.max_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(summary.total_sleep_micros, 163_000);
-        assert_eq!(summary.max_sleep_micros, 50_000);
+        // bd-9kvey: 50 + 100 + 200 + 400 + 800 + 1_600 + 3_200 + 6_400.
+        // Eight attempts no longer reach the 50 ms cap; attempt 11 does, and
+        // test_begin_busy_retry_schedule_summary_bounds_sleep_tail still pins
+        // that ceiling at 21 attempts.
+        assert_eq!(summary.total_sleep_micros, 12_750);
+        assert_eq!(summary.max_sleep_micros, 6_400);
         assert_eq!(summary.p50_spin_loops, 512);
         assert_eq!(summary.p95_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
         assert_eq!(summary.p99_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
