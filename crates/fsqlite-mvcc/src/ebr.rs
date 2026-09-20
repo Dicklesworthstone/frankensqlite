@@ -18,6 +18,8 @@ use serde::Serialize;
 
 #[cfg(test)]
 mod pin_regression_tests;
+#[cfg(test)]
+mod retire_regression_tests;
 
 // ---------------------------------------------------------------------------
 // EBR metrics (bd-688.4)
@@ -890,17 +892,32 @@ impl EbrRetireQueue {
     }
 
     /// Batch-retire multiple slot indices.
+    ///
+    /// Consume the caller's iterator before acquiring the queue lock. An
+    /// iterator can consult this queue or do other work; running it under the
+    /// lock can deadlock or stall unrelated retiring/reclaiming threads.
     pub fn retire_batch(&self, indices: impl IntoIterator<Item = VersionIdx>, current_epoch: u64) {
+        let mut indices: Vec<VersionIdx> = indices.into_iter().collect();
+        if indices.is_empty() {
+            return;
+        }
+        let count = u64::try_from(indices.len()).unwrap_or(u64::MAX);
         let mut pending = self.pending.lock();
-        let mut count = 0_u64;
-        for idx in indices {
-            append_to_epoch_batch(&mut pending, current_epoch, idx);
-            count += 1;
+        // Resolve the epoch once for the whole batch. A delayed producer can
+        // legitimately publish an older epoch after another thread has
+        // advanced it; do not rescan every queued epoch for every input slot.
+        match epoch_batch_position(&pending, current_epoch) {
+            Ok(position) => pending[position].indices.append(&mut indices),
+            Err(position) => pending.insert(
+                position,
+                RetiredBatch {
+                    retire_epoch: current_epoch,
+                    indices,
+                },
+            ),
         }
+        self.total_retired.fetch_add(count, Ordering::Relaxed);
         drop(pending);
-        if count > 0 {
-            self.total_retired.fetch_add(count, Ordering::Relaxed);
-        }
     }
 
     /// Drain at most [`MAX_EBR_RECLAIM_SLOTS_PER_CYCLE`] safe retirements.
@@ -1031,49 +1048,41 @@ impl EbrRetireQueue {
     }
 }
 
-/// Append a single `VersionIdx` to the batch for `epoch`.
+/// Locate an existing epoch batch, or its sorted insertion position.
 ///
-/// Epochs advance monotonically, so the common case is that `epoch`
-/// matches the last batch or is newer.  The fast path avoids the
-/// linear insertion path reserved for out-of-order epochs.
+/// Appends to the current/newest epoch keep the O(1) fast path. Publication
+/// can arrive out of order even when epoch allocation is monotonic: an older
+/// producer may have been descheduled before taking the queue lock. Search
+/// that case logarithmically, without making the deque contiguous or sorting
+/// the queue while holding the lock.
+#[inline]
+fn epoch_batch_position(
+    pending: &VecDeque<RetiredBatch>,
+    epoch: u64,
+) -> std::result::Result<usize, usize> {
+    match pending.back() {
+        Some(last) if last.retire_epoch == epoch => Ok(pending.len() - 1),
+        Some(last) if last.retire_epoch > epoch => {
+            pending.binary_search_by_key(&epoch, |batch| batch.retire_epoch)
+        }
+        _ => Err(pending.len()),
+    }
+}
+
+/// Append a single `VersionIdx` without allocating a temporary batch for an
+/// existing epoch. Keep this path separate from caller-iterator collection.
 #[inline]
 fn append_to_epoch_batch(pending: &mut VecDeque<RetiredBatch>, epoch: u64, idx: VersionIdx) {
-    if let Some(last) = pending.back_mut() {
-        if last.retire_epoch == epoch {
-            last.indices.push(idx);
-            return;
-        }
-        if last.retire_epoch < epoch {
-            pending.push_back(RetiredBatch {
+    match epoch_batch_position(pending, epoch) {
+        Ok(position) => pending[position].indices.push(idx),
+        Err(position) => pending.insert(
+            position,
+            RetiredBatch {
                 retire_epoch: epoch,
                 indices: vec![idx],
-            });
-            return;
-        }
-    } else {
-        pending.push_back(RetiredBatch {
-            retire_epoch: epoch,
-            indices: vec![idx],
-        });
-        return;
+            },
+        ),
     }
-    // Rare: out-of-order epoch (should not happen with monotonic epochs,
-    // but preserve correctness).
-    if let Some(existing) = pending.iter().position(|batch| batch.retire_epoch == epoch) {
-        pending[existing].indices.push(idx);
-        return;
-    }
-    let insert_at = pending
-        .iter()
-        .position(|batch| batch.retire_epoch > epoch)
-        .unwrap_or(pending.len());
-    pending.insert(
-        insert_at,
-        RetiredBatch {
-            retire_epoch: epoch,
-            indices: vec![idx],
-        },
-    );
 }
 
 #[inline]
