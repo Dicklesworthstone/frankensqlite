@@ -1652,6 +1652,7 @@ static FSQLITE_CONCURRENT_COMMIT_PLAN_FULL_VALIDATIONS: AtomicU64 = AtomicU64::n
 static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_CONNECTION_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_FULL_RELOADS: AtomicU64 = AtomicU64::new(0);
@@ -2008,6 +2009,8 @@ pub struct HotPathProfileSnapshot {
     pub background_status_checks: u64,
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
+    /// Full connection/schema snapshots, including statement rollback snapshots.
+    pub connection_snapshots: u64,
     pub prepared_lookup_time_ns: u64,
     pub prepared_schema_refresh_time_ns: u64,
     pub prepared_schema_refreshes: u64,
@@ -2517,6 +2520,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_CONNECTION_SNAPSHOTS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.store(0, AtomicOrdering::Relaxed);
@@ -2721,6 +2725,7 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
         statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
             .load(AtomicOrdering::Relaxed),
+        connection_snapshots: FSQLITE_CONNECTION_SNAPSHOTS.load(AtomicOrdering::Relaxed),
         prepared_lookup_time_ns: FSQLITE_PREPARED_LOOKUP_TIME_NS.load(AtomicOrdering::Relaxed),
         prepared_schema_refresh_time_ns: FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS
             .load(AtomicOrdering::Relaxed),
@@ -27674,8 +27679,8 @@ impl Connection {
                             dispatch.post_write_action,
                             dispatch.rollback_on_constraint_violation,
                             dispatch.preserve_prior_changes_on_constraint_violation,
-                            dispatch.skip_statement_savepoint_in_explicit_txn
-                                || force_skip_statement_savepoint_in_explicit_txn,
+                            dispatch.skip_statement_savepoint_in_explicit_txn,
+                            force_skip_statement_savepoint_in_explicit_txn,
                             entry_proof.publication,
                             p,
                             false,
@@ -31532,6 +31537,7 @@ impl Connection {
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         skip_statement_savepoint_in_explicit_txn: bool,
+        caller_owns_transaction_rollback: bool,
         prebound_publication: Option<BoundPagerPublication>,
         params: Option<&[SqliteValue]>,
         capture_time_travel_snapshot: bool,
@@ -31541,13 +31547,23 @@ impl Connection {
         // VALUES INSERT that skips the savepoint neither flushes prior pending
         // in-txn writes (its conflict check then misses a prior in-txn row ->
         // bd-q2bju PK dup) nor rolls back its partial rows on ABORT (bd-01qa9
-        // explicit-txn facet). Keep the skip only for the single-row direct lane.
+        // explicit-txn facet). Keep automatic elision in the single-row direct lane.
         let is_single_row_direct = stmt
             .precompiled_dml()
             .and_then(|dml| dml.direct_simple_insert.as_ref())
             .is_some();
-        let skip_statement_savepoint_in_explicit_txn =
-            skip_statement_savepoint_in_explicit_txn && is_single_row_direct;
+        // The explicit opt-in API has a different contract from automatic
+        // elision: its caller must roll back the enclosing transaction on any
+        // error. Preserve that policy for constrained and multi-row INSERTs.
+        // Flushing prior direct writes remains necessary for conflict checks,
+        // even though this caller does not need a statement rollback snapshot.
+        let caller_owns_transaction_rollback =
+            caller_owns_transaction_rollback && self.in_transaction.get();
+        if caller_owns_transaction_rollback && !is_single_row_direct {
+            self.flush_pending_direct_write_runs(execution_cx).await?;
+        }
+        let skip_statement_savepoint_in_explicit_txn = caller_owns_transaction_rollback
+            || (skip_statement_savepoint_in_explicit_txn && is_single_row_direct);
         self.clear_table_program_error_state();
         // Issue #110: an `INSERT OR REPLACE` / upsert can delete or mutate an
         // existing row (possibly a parent of a previously cached child FK).
@@ -70269,6 +70285,9 @@ impl Connection {
 
     /// Take a snapshot of the current database + schema state.
     fn snapshot(&self) -> DbSnapshot {
+        if hot_path_profile_enabled() {
+            FSQLITE_CONNECTION_SNAPSHOTS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let db_version = self.db.borrow_mut().undo_version();
         DbSnapshot {
             db_version,

@@ -4909,6 +4909,7 @@ mod tests {
             background_status_checks: 2,
             op_cx_background_gates: 1,
             statement_dispatch_background_gates: 1,
+            connection_snapshots: 0,
             prepared_lookup_time_ns: 1_100,
             prepared_schema_refresh_time_ns: 2_200,
             prepared_schema_refreshes: 1,
