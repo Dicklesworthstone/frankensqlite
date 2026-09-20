@@ -56,6 +56,7 @@ impl Options {
 }
 
 /// Export a completely verified main/WAL/FEC snapshot into a new file.
+///
 /// The caller supplies an attached native context and its blocking pool;
 /// this library never constructs an executor. Source data is not changed.
 /// Namespace admission may create lock/SHM companions. On failure a created
@@ -66,6 +67,7 @@ pub async fn export_database(cx: &Cx, options: &Options) -> Result<ExportReport>
 }
 
 /// Repair an existing Unix WAL and rebuild its derived shared index.
+///
 /// A synchronized, verified NEW backup is mandatory before source writes.
 /// Dropping the future does not release recovery fences while a blocking
 /// task settles writes. A returned error may follow durable repair or an

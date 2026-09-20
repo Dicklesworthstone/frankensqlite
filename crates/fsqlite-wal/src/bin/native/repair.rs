@@ -207,10 +207,10 @@ struct IndexPublication {
 
 impl Drop for IndexPublication {
     fn drop(&mut self) {
-        if !self.complete {
-            if let Err(error) = invalidate_shared_wal_index_header(&self.zero) {
-                eprintln!("failed to invalidate incomplete recovery index: {error}");
-            }
+        if !self.complete
+            && let Err(error) = invalidate_shared_wal_index_header(&self.zero)
+        {
+            eprintln!("failed to invalidate incomplete recovery index: {error}");
         }
     }
 }

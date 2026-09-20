@@ -499,7 +499,7 @@ fn write_fixture_certificate(options: &Options, identity: [u8; 16]) -> Vec<u8> {
     let wal = host_fs::read(&companion(&options.source, "-wal")).unwrap();
     let header = WalHeader::from_bytes(&wal).unwrap();
     let mut digest = ParallelWalFramePayloadDigestBuilder::new();
-    for frame in wal[WAL_HEADER_SIZE..].chunks_exact(FRAME_SIZE) {
+    for frame in wal[WAL_HEADER_SIZE..].as_chunks::<FRAME_SIZE>().0 {
         let header = WalFrameHeader::from_bytes(frame).unwrap();
         digest.update(PageNumber::new(header.page_number).unwrap(), header.db_size, &frame[WAL_FRAME_HEADER_SIZE..]);
     }
