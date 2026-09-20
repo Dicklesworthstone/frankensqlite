@@ -57,3 +57,5 @@ export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOpti
 export type { ChangesetTransport, ChangesetPumpOptions, ChangesetPumpRunOptions, ChangesetPumpResult } from "./changeset-delivery";
 export { createChangesetHttpTransport, createChangesetHttpHandler, ChangesetHttpError, CHANGESET_HTTP_CONTENT_TYPE, CHANGESET_HTTP_RECEIPT_TYPE } from "./changeset-http";
 export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttpHandlerOptions, ChangesetHttpAuthorization } from "./changeset-http";
+export { streamSnapshotChangesets } from "./changeset-capture";
+export type { SnapshotChangesetStreamOptions, ChangesetSnapshotChunk, ChangesetSnapshotStreamResult } from "./changeset-capture";

@@ -37,6 +37,24 @@ export interface ChangesetSnapshot {
   /** Every existing row becomes one INSERT. Empty tables contribute no records. */
   readonly changes: number;
 }
+export interface SnapshotChangesetStreamOptions extends Omit<SnapshotChangesetOptions, "limits"> {
+  /** Rows per chunk, 1..100,000. Default 1,024. Tables never share a chunk. */
+  chunkRows?: number;
+  /** Per-chunk wire AND accounted image limit, 1..64 MiB. Default 1 MiB. */
+  chunkBytes?: number;
+  /** Emitted chunks, including an empty seed. Default 10,000, maximum 100,000. */
+  maxChunks?: number;
+}
+export interface ChangesetSnapshotChunk extends ChangesetSnapshot {
+  /** Zero-based, contiguous position; no individual chunk proves completion. */
+  readonly index: number;
+}
+export interface ChangesetSnapshotStreamResult {
+  readonly chunks: number;
+  readonly changes: number;
+  /** Sum of emitted wire bytes, not SQL image accounting or process RSS. */
+  readonly byteLength: number;
+}
 export class ChangesetCaptureError extends Error {
   constructor(readonly code: "ERR_FSQLITE_CAPTURE_INPUT" | "ERR_FSQLITE_CAPTURE_SCHEMA" |
     "ERR_FSQLITE_CAPTURE_RESULT" | "ERR_FSQLITE_CAPTURE_CANCELLED" | "ERR_FSQLITE_CAPTURE_TIMEOUT" |
@@ -76,7 +94,7 @@ function bounded(value: unknown, fallback: number, ceiling: number): number {
   }
   return n;
 }
-function settings(options: CaptureChangesetOptions) {
+function settings(options: CaptureChangesetOptions, streaming = false) {
   const input = options?.tables;
   if (!Array.isArray(input) || !input.length || input.length > 64) fail("INPUT", "Capture 1..64 explicit tables");
   const tables: string[] = [], seen = new Set<string>(), n = input.length;
@@ -87,12 +105,12 @@ function settings(options: CaptureChangesetOptions) {
     }
     tables.push(table); seen.add(key);
   }
-  const maxRows = bounded(options.maxRows, 10_000, 100_000);
-  const maxBytes = bounded(options.maxBytes, 8 * 1024 * 1024, 64 * 1024 * 1024);
-  const maxCells = bounded(options.maxCells, 100_000, 1_000_000);
+  const maxRows = bounded(options.maxRows, streaming ? 1_000_000 : 10_000, streaming ? 10_000_000 : 100_000);
+  const maxBytes = bounded(options.maxBytes, (streaming ? 256 : 8) * 1024 * 1024, (streaming ? 1024 : 64) * 1024 * 1024);
+  const maxCells = bounded(options.maxCells, streaming ? 10_000_000 : 100_000, streaming ? 100_000_000 : 1_000_000);
   const indirect = options.indirect ?? false;
   if (typeof indirect !== "boolean") fail("INPUT", "indirect must be boolean");
-  const inputLimits = options.limits;
+  const inputLimits = streaming ? undefined : options.limits;
   const limits: ChangesetLimits = {};
   for (const key of ["maxBytes", "maxTables", "maxColumns", "maxChanges", "maxCells"] as const) {
     const value = inputLimits?.[key];
@@ -372,68 +390,136 @@ export function prepareChangesetSnapshot(options: SnapshotChangesetOptions) {
   return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
     tables: Object.freeze([...s.tables]), indirect: s.indirect,
     run: async (tx: ChangesetExecutor): Promise<ChangesetSnapshot> => {
-      const plans: { plan: Plan; keys: SnapshotKey[] }[] = [];
-      const version = await scalar(tx, s, "PRAGMA main.schema_version");
-      // Preflight ALL tables before reading any row images. NULL keys cannot
-      // be represented by session changesets: reject instead of losing rows.
-      for (const table of s.tables) {
-        const p = await plan(tx, s, table, plans.length, false);
-        const nulls = await read(tx, s, `SELECT 1 FROM main.${quote(p.table)} WHERE ` +
-          p.keys.map(i => `${quote(p.columns[i]!)} IS NULL`).join(" OR ") + " LIMIT 1");
-        if (nulls.length) fail("SCHEMA", "Snapshot cannot represent rows with NULL primary-key components");
-        plans.push({ plan: p, keys: await snapshotKeys(tx, s, p) });
-      }
-      const text = await textDecoder(tx, s), tables: ChangesetTable[] = [];
-      let rows = 0, bytes = 0, cells = 0;
-      for (const { plan: p, keys } of plans) {
-        const columns = p.columns.map(quote), changes: ChangesetChange[] = [];
-        const cost = `${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")}`;
-        const order = keys.map(k => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
-        let last: ChangesetValue[] | null = null;
-        // Disjoint prefix ranges use the actual index's mixed ASC/DESC and
-        // collations. No OFFSET or full-table OR sort is required for paging.
-        pages: while (true) {
-          const after: ChangesetValue[] | null = last;
-          const stages = after === null ? [-1] : keys.map((_, i) => i).reverse();
-          for (const stage of stages) {
-            const predicates: string[] = [], params: ChangesetValue[] = [];
-            if (after !== null) {
-              for (let i = 0; i <= stage; i++) {
-                const k = keys[i]!, value = after[i]!;
-                predicates.push(`${k.expression} ${i < stage ? "=" : k.descending ? "<" : ">"} ` +
-                  (typeof value === "number" ? "+CAST(? AS REAL)" : "?"));
-                params.push(value);
-              }
-            }
-            const tail = ` FROM main.${quote(p.table)}` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
-              ` ORDER BY ${order} LIMIT 32`;
-            const sizes = await read(tx, s, `SELECT ${cost}${tail}`, params);
-            if (sizes.length > 32 || sizes.some(row => row.length !== 1)) fail("RESULT", "Invalid snapshot size page");
-            rows += sizes.length; cells += sizes.length * columns.length;
-            for (const row of sizes) bytes += count(row[0]);
-            if (rows > s.maxRows || bytes > s.maxBytes || cells > s.maxCells) {
-              fail("LIMIT", "Snapshot row images exceed the configured budget");
-            }
-            if (!sizes.length) continue;
-            const page = await read(tx, s, `SELECT ${projection(columns)}${tail}`, params);
-            if (page.length !== sizes.length) fail("RESULT", "Snapshot page changed between size and value reads");
-            for (const row of page) {
-              const image = decode(row, columns.length, text), next = keys.map(k => image[k.column]!);
-              if (next.some(v => v === null) || (last !== null && next.every((v, i) => equal(v, last![i]!)))) {
-                fail("RESULT", "Snapshot key did not advance or contained NULL");
-              }
-              last = next;
-              changes.push({ operation: "insert", indirect: s.indirect, new: image });
-            }
-            if (sizes.length === 32) continue pages;
-          }
-          break;
+      const tables: ChangesetTable[] = [];
+      let current: ChangesetChange[] = [];
+      const rows = await walkSnapshot(tx, s, s.maxBytes, (p, image) => {
+        if (tables.at(-1)?.name !== p.table) {
+          current = [];
+          tables.push({ name: p.table, primaryKey: p.pk, changes: current });
         }
-        if (changes.length) tables.push({ name: p.table, primaryKey: p.pk, changes });
-      }
-      if (await scalar(tx, s, "PRAGMA main.schema_version") !== version) fail("SCHEMA", "Schema changed during snapshot collection");
+        current.push({ operation: "insert", indirect: s.indirect, new: image });
+      });
       s.checkpoint(); const changeset = encodeChangeset(tables, s.limits); s.checkpoint();
       return Object.freeze({ changeset, changes: rows });
+    },
+  };
+}
+
+/** Shared indexed reader. A page is byte-admitted before any images cross SQL. */
+async function walkSnapshot(tx: ChangesetExecutor, s: Settings, pageBytes: number,
+  visit: (p: Plan, image: ChangesetValue[], imageBytes: number) => void | Promise<void>,
+  finish: () => void | Promise<void> = () => {}): Promise<number> {
+  const plans: { plan: Plan; keys: SnapshotKey[] }[] = [];
+  const version = await scalar(tx, s, "PRAGMA main.schema_version");
+  for (const table of s.tables) {
+    const p = await plan(tx, s, table, plans.length, false);
+    const nulls = await read(tx, s, `SELECT 1 FROM main.${quote(p.table)} WHERE ` +
+      p.keys.map(i => `${quote(p.columns[i]!)} IS NULL`).join(" OR ") + " LIMIT 1");
+    if (nulls.length) fail("SCHEMA", "Snapshot cannot represent rows with NULL primary-key components");
+    plans.push({ plan: p, keys: await snapshotKeys(tx, s, p) });
+  }
+  const text = await textDecoder(tx, s);
+  let rows = 0, bytes = 0, cells = 0;
+  for (const { plan: p, keys } of plans) {
+    const columns = p.columns.map(quote);
+    const cost = `${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")}`;
+    const order = keys.map(k => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
+    let last: ChangesetValue[] | null = null;
+    pages: while (true) {
+      const after: ChangesetValue[] | null = last;
+      const stages = after === null ? [-1] : keys.map((_, i) => i).reverse();
+      for (const stage of stages) {
+        const predicates: string[] = [], params: ChangesetValue[] = [];
+        if (after !== null) {
+          for (let i = 0; i <= stage; i++) {
+            const k = keys[i]!, value = after[i]!;
+            predicates.push(`${k.expression} ${i < stage ? "=" : k.descending ? "<" : ">"} ` +
+              (typeof value === "number" ? "+CAST(? AS REAL)" : "?"));
+            params.push(value);
+          }
+        }
+        const tail = ` FROM main.${quote(p.table)}` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
+          ` ORDER BY ${order}`;
+        const sizes = await read(tx, s, `SELECT ${cost}${tail} LIMIT 32`, params);
+        if (sizes.length > 32 || sizes.some(row => row.length !== 1)) fail("RESULT", "Invalid snapshot size page");
+        if (!sizes.length) continue;
+        // Narrow the value query to a fitting PREFIX of the indexed size page.
+        // A 32-row page of individually large blobs must not defeat chunkBytes.
+        let admitted = 0, pageCost = 0;
+        for (const row of sizes) {
+          const size = count(row[0]);
+          if (size > pageBytes - pageCost) break;
+          pageCost += size; admitted++;
+        }
+        if (admitted === 0) fail("LIMIT", "A snapshot row cannot fit the image-page budget");
+        rows += admitted; bytes += pageCost; cells += admitted * columns.length;
+        if (rows > s.maxRows || bytes > s.maxBytes || cells > s.maxCells) fail("LIMIT", "Snapshot row images exceed the configured budget");
+        const page = await read(tx, s, `SELECT ${projection(columns)}${tail} LIMIT ${admitted}`, params);
+        if (page.length !== admitted) fail("RESULT", "Snapshot page changed between size and value reads");
+        for (let i = 0; i < page.length; i++) {
+          const image = decode(page[i]!, columns.length, text), next = keys.map(k => image[k.column]!);
+          if (next.some(v => v === null) || (last !== null && next.every((v, j) => equal(v, last![j]!)))) {
+            fail("RESULT", "Snapshot key did not advance or contained NULL");
+          }
+          last = next;
+          s.checkpoint(); await visit(p, image, count(sizes[i]![0])); s.checkpoint();
+        }
+        if (admitted < sizes.length || sizes.length === 32) continue pages;
+      }
+      break;
+    }
+  }
+  s.checkpoint(); await finish(); s.checkpoint();
+  if (await scalar(tx, s, "PRAGMA main.schema_version") !== version) fail("SCHEMA", "Schema changed during snapshot collection");
+  return rows;
+}
+
+/**
+ * Await one owned chunk at a time under ONE source snapshot. Chunks are
+ * provisional until the returned promise commits; sink effects are not rolled
+ * back by this helper. Do not publish them as a completed baseline on failure.
+ */
+export async function streamSnapshotChangesets(target: ChangesetTarget,
+  onChunk: (chunk: ChangesetSnapshotChunk) => void | Promise<void>,
+  options: SnapshotChangesetStreamOptions): Promise<ChangesetSnapshotStreamResult> {
+  const stream = prepareSnapshotChangesetStream(options);
+  if (typeof onChunk !== "function") fail("INPUT", "Snapshot streaming requires an awaited chunk sink");
+  return target.transaction(tx => stream.run(tx, onChunk), stream.transactionOptions);
+}
+
+/** @internal Chunked outbox publication uses this reader inside its own txn. */
+export function prepareSnapshotChangesetStream(options: SnapshotChangesetStreamOptions) {
+  const s = settings(options, true);
+  const chunkRows = bounded(options.chunkRows, 1024, 100_000);
+  const chunkBytes = bounded(options.chunkBytes, 1024 * 1024, 64 * 1024 * 1024);
+  const maxChunks = bounded(options.maxChunks, 10_000, 100_000);
+  s.checkpoint();
+  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]), indirect: s.indirect,
+    run: async (tx: ChangesetExecutor, onChunk: (chunk: ChangesetSnapshotChunk) => void | Promise<void>): Promise<ChangesetSnapshotStreamResult> => {
+      let p: Plan | null = null, changes: ChangesetChange[] = [];
+      let imageBytes = 0, wireBound = 0, chunks = 0, byteLength = 0;
+      const flush = async (): Promise<void> => {
+        if (!changes.length && chunks !== 0) return;
+        if (chunks >= maxChunks) fail("LIMIT", "Snapshot exceeds maxChunks");
+        const count = changes.length;
+        const changeset = encodeChangeset(p === null ? [] : [{ name: p.table, primaryKey: p.pk, changes }], { maxBytes: chunkBytes });
+        const length = changeset.byteLength;
+        changes = []; imageBytes = 0; wireBound = 0;
+        s.checkpoint(); await onChunk(Object.freeze({ index: chunks, changes: count, changeset })); s.checkpoint();
+        chunks++; byteLength += length;
+      };
+      const rows = await walkSnapshot(tx, s, chunkBytes, async (next, image, cost) => {
+        const change: ChangesetChange = { operation: "insert", indirect: s.indirect, new: image };
+        // Sum of independently encoded rows conservatively bounds one combined
+        // header. This avoids repeatedly encoding a growing chunk (quadratic).
+        const size = encodeChangeset([{ name: next.table, primaryKey: next.pk, changes: [change] }], { maxBytes: chunkBytes }).byteLength;
+        if (changes.length && (p !== next || changes.length >= chunkRows ||
+            (changes.length + 1) * next.columns.length > 1_000_000 ||
+            imageBytes + cost > chunkBytes || wireBound + size > chunkBytes)) await flush();
+        p = next; changes.push(change); imageBytes += cost; wireBound += size;
+      }, flush);
+      return Object.freeze({ chunks, changes: rows, byteLength });
     },
   };
 }
