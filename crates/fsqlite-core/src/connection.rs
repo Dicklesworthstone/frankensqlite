@@ -110572,6 +110572,13 @@ fn correlated_exists_matches_count_semijoin_shape(
             // equality where the "inner" side still references the outer
             // scan, is not the supported probe shape.
             if left_external != right_external {
+                let inner = if left_external { right } else { left };
+                if !correlated_exists_probe_is_rowid(inner, &from.source, schema) {
+                    // Native EXISTS only seeks rowids. A text/indexed key here
+                    // otherwise scans the parent for every outer row; the
+                    // fallback binds that key and uses the ordinary index seek.
+                    return false;
+                }
                 correlated_probe_terms += 1;
                 continue;
             }
@@ -110594,6 +110601,36 @@ fn correlated_exists_matches_count_semijoin_shape(
     // matching `extract_exists_rowid_probe` + the recognizer's single-residual
     // ceiling.
     correlated_probe_terms == 1 && residual_terms <= 1
+}
+
+fn correlated_exists_probe_is_rowid(
+    inner: &Expr,
+    source: &TableOrSubquery,
+    schema: &[TableSchema],
+) -> bool {
+    let Expr::Column(column, _) = inner else {
+        return false;
+    };
+    let TableOrSubquery::Table { name, alias, .. } = source else {
+        return false;
+    };
+    let Some(table) = schema
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+    else {
+        return false;
+    };
+    !table.without_rowid
+        && column_ref_matches_table_rowid(
+            column,
+            table,
+            alias.as_deref().unwrap_or(&name.name),
+            table
+                .columns
+                .iter()
+                .find(|column| column.is_ipk)
+                .map(|column| column.name.as_str()),
+        )
 }
 
 // bd-lryih P10: a subquery matches iff it is exactly what the eager prepare-time
@@ -116569,12 +116606,12 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
         } => {
             // `col = bound` — relax the right operand.
             if let Some(col) = eq_seek_column(left, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(right, col)
+                && let Some(literal) = bound_outer_relaxable_to_literal(right, col, true)
             {
                 **right = literal;
             // `bound = col` — relax the left operand.
             } else if let Some(col) = eq_seek_column(right, table, alias)
-                && let Some(literal) = bound_outer_relaxable_to_literal(left, col)
+                && let Some(literal) = bound_outer_relaxable_to_literal(left, col, false)
             {
                 **left = literal;
             }
@@ -116622,9 +116659,10 @@ fn eq_seek_column<'a>(
 /// `v` to `A` is not a no-op: e.g. `text_col = <bound TEXT-affinity value 1>`
 /// leaves the integer `1` uncoerced (no match against `'1'`), but `text_col = 1`
 /// coerces `1`→`'1'` (spurious match). So relaxation is admitted ONLY when:
-///   * the donor collation is a known name equal to `col`'s effective collation
-///     (default `BINARY`), so the winning collation is `col`'s in either operand
-///     order;
+///   * the donor collation is known, and either the bare column is on the
+///     left (its implicit collation wins), or the donor matches the column's
+///     effective collation (default `BINARY`). Explicit COLLATE wrappers never
+///     match the bare-column / BoundOuterValue shape and remain untouched;
 ///   * the donor affinity equals `col`'s affinity (so the bound comparison
 ///     applies no affinity — the same treatment the coerced-literal path lands
 ///     on once the next condition holds); AND
@@ -116633,7 +116671,11 @@ fn eq_seek_column<'a>(
 ///     compare the value as stored.
 /// When any condition fails the bound value is left in place and the interpreted
 /// per-row fallback still evaluates it with full SQLite comparison semantics.
-fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Expr> {
+fn bound_outer_relaxable_to_literal(
+    expr: &Expr,
+    col: &ColumnInfo,
+    column_on_left: bool,
+) -> Option<Expr> {
     let Expr::BoundOuterValue {
         value,
         collation,
@@ -116649,7 +116691,7 @@ fn bound_outer_relaxable_to_literal(expr: &Expr, col: &ColumnInfo) -> Option<Exp
     let col_collation = col.collation.as_deref().unwrap_or("BINARY");
     if !collation
         .as_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case(col_collation))
+        .is_some_and(|name| column_on_left || name.eq_ignore_ascii_case(col_collation))
     {
         return None;
     }

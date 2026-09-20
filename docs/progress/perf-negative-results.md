@@ -23252,3 +23252,26 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   checks, change the capture or SQL, or extend the acceptance deadline.
   Keep the independently measured engine repair; do not call it a completed
   HFDT migration or live-provider/release proof.
+
+## 2026-09-20 — Text-parent fallback alone leaves NOCASE foreign-key scans
+
+- Workload: `hfdt-gbou9l`, generic SQL regression with 256 text-key parents,
+  258 children, one orphan and one NULL; stock SQLite supplies the oracle.
+  This is SQL-engine evidence, not financial/provider or migration acceptance.
+- Candidate: route non-rowid correlated EXISTS through the existing bound-query
+  fallback so ordinary index seeks can replace a parent scan per child.
+  Files: `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-core/tests/hfdt_gbou9l_text_parent_probe.rs`.
+- Baseline used 301,465 VDBE opcodes. The candidate reduced the BINARY rowid
+  case to 7,199, but the NOCASE-parent/BINARY-child case still used 169,624
+  and failed the unchanged 51,200-opcode ceiling. The test exited 101;
+  remaining WITHOUT ROWID cases and the retained-image probe did not run.
+- Evidence: `/data/projects/hfdt_nobleridge_scratch/20260920-text-parent-probe/`
+  contains `baseline.log`, `candidate-tests.log`, and source hashes. Separate
+  existing seek tests (nine) and composite-FK regression (one) passed; those
+  passes do not override this rejection.
+- Retry condition: preserve SQLite collation precedence while allowing the
+  parent-on-left comparison to seek its own NOCASE index. Retain stock-oracle
+  controls for reversed operands, explicit COLLATE, NULL, orphan rejection,
+  TEMP shadowing and WITHOUT ROWID; do not relax the cost ceiling. Then test
+  the retained real image before another unchanged full migration attempt.
