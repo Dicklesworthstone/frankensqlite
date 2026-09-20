@@ -19,7 +19,10 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{cx::Cx, flags::SyncFlags};
 use fsqlite_vfs::traits::VfsFile;
 
-use super::{BLOCK_DOMAIN, SnapshotBlockManifest, SnapshotManifest, corrupt};
+use super::{
+    BLOCK_DOMAIN, SnapshotBlockManifest, SnapshotManifest, SnapshotSpool, SnapshotSpoolState,
+    corrupt,
+};
 use crate::replication_sender::{
     CHANGESET_DOMAIN, CHANGESET_MAGIC, CHANGESET_VERSION, ChangesetHeader,
 };
@@ -302,6 +305,65 @@ impl<F: VfsFile> SnapshotImageWriter<F> {
     }
 }
 
+// Unlike a write-only attempt, replay can suspend while the image itself has
+// no I/O in flight. Preserve a terminal failure there too: callers must not
+// finalize an image after abandoning verification of a required spool prefix.
+struct ImageRestoreAttempt<'a, F: VfsFile> {
+    image: &'a mut SnapshotImageWriter<F>,
+    armed: bool,
+}
+
+impl<F: VfsFile> Drop for ImageRestoreAttempt<'_, F> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.image.state = SnapshotImageState::Poisoned;
+            self.image.receipt = None;
+        }
+    }
+}
+
+impl<F: VfsFile> SnapshotSpool<F> {
+    /// Restore a newly opened journal into a fresh, manifest-matched image.
+    ///
+    /// Replay verifies the journal's required checkpoint before finalization;
+    /// a verified complete prefix with an unacknowledged torn tail is sufficient
+    /// for image recovery, but the source journal is never repaired or changed.
+    /// Each replayed block is written and dropped before reading the next record.
+    ///
+    /// This is one restore attempt, not an image-resume protocol. After failure
+    /// or cancellation, quiesce old I/O, reopen the spool from its beginning,
+    /// and use another empty destination. Neither source nor failed output is
+    /// deleted. Incremental live receive can instead call apply_block directly.
+    pub async fn replay_into_image<G: VfsFile>(
+        &mut self,
+        cx: &Cx,
+        image: &mut SnapshotImageWriter<G>,
+    ) -> Result<SnapshotImageReceipt> {
+        checkpoint(cx)?;
+        if self.state() != SnapshotSpoolState::Replaying || self.record_count() != 0
+            || self.receiver().blocks_decoded() != 0 || self.receiver().retained_payload_bytes() != 0
+            || image.state != SnapshotImageState::Writing || image.completed != 0
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if self.receiver().manifest_id() != image.manifest_id {
+            return Err(corrupt("snapshot spool and image belong to different manifests"));
+        }
+        let mut attempt = ImageRestoreAttempt { image, armed: true };
+        while self.replay_next(cx).await?.is_some() {
+            for block in self.take_decoded_blocks() {
+                attempt.image.apply_block(cx, &block).await?;
+            }
+        }
+        if !self.receiver().is_complete() {
+            return Err(corrupt("snapshot journal ended before every image block was recovered"));
+        }
+        let receipt = attempt.image.finish(cx).await?;
+        attempt.armed = false;
+        Ok(receipt)
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::path::Path;
@@ -503,5 +565,24 @@ mod tests {
         header[92..96].copy_from_slice(&7_u32.to_be_bytes());
         assert!(validate_header(&header, 512, 3).is_ok());
         assert!(validate_header(&header, 1024, 3).is_err());
+    }
+
+    #[test]
+    fn abandoned_restore_attempt_cannot_be_finalized() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        let (manifest, _, _) = fixture(512, 1, 1);
+        let mut writer = SnapshotImageWriter::create(&cx, file(&vfs, &cx, "abandoned"), manifest.clone(), manifest.id(), 512).unwrap();
+        let mut future = Box::pin(async {
+            let _attempt = ImageRestoreAttempt { image: &mut writer, armed: true };
+            std::future::pending::<()>().await;
+        });
+        let mut task = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut task), Poll::Pending));
+        drop(future);
+        assert_eq!(writer.state(), SnapshotImageState::Poisoned);
+        run(async { assert!(writer.finish(&cx).await.is_err()); });
     }
 }
