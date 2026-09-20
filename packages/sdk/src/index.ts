@@ -48,12 +48,15 @@ export { ChangesetError, decodeChangeset, encodeChangeset, invertChangeset } fro
 export type { ChangesetValue, ChangesetField, ChangesetChange, ChangesetTable, ChangesetLimits } from "./changeset-codec";
 export { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
 export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, ChangesetConflict, ApplyChangesetOptions, ApplyChangesetResult } from "./changeset-apply";
-export { captureChangeset, ChangesetCaptureError } from "./changeset-capture";
-export type { CaptureChangesetOptions, CapturedChangeset } from "./changeset-capture";
+export { captureChangeset, snapshotChangeset, ChangesetCaptureError } from "./changeset-capture";
+export type { CaptureChangesetOptions, CapturedChangeset, SnapshotChangesetOptions, ChangesetSnapshot } from "./changeset-capture";
 export { ChangesetOutbox, ChangesetOutboxError, CHANGESET_OUTBOX_TABLE } from "./changeset-outbox";
-export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions } from "./changeset-outbox";
+export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions, OutboxBootstrapOptions, OutboxBootstrapResult } from "./changeset-outbox";
 export { ChangesetReceiver, ChangesetDeliveryPump, ChangesetDeliveryError, CHANGESET_DELIVERY_PROTOCOL } from "./changeset-delivery";
 export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOptions, ChangesetDeliveryPhase, ChangesetReceiverOptions } from "./changeset-delivery";
 export type { ChangesetTransport, ChangesetPumpOptions, ChangesetPumpRunOptions, ChangesetPumpResult } from "./changeset-delivery";
 export { createChangesetHttpTransport, createChangesetHttpHandler, ChangesetHttpError, CHANGESET_HTTP_CONTENT_TYPE, CHANGESET_HTTP_RECEIPT_TYPE } from "./changeset-http";
 export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttpHandlerOptions, ChangesetHttpAuthorization } from "./changeset-http";
+export { streamSnapshotChangesets } from "./changeset-capture";
+export type { SnapshotChangesetStreamOptions, ChangesetSnapshotChunk, ChangesetSnapshotStreamResult } from "./changeset-capture";
+export type { OutboxBootstrapChunksOptions, OutboxBootstrapChunksResult } from "./changeset-outbox";
