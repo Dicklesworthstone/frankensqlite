@@ -36951,13 +36951,43 @@ impl Connection {
             // not see the same DDL state the first attempt did. Until that is
             // understood, a DDL statement that returns SQLITE_BUSY is the
             // caller's to retry. bd-pa8e5.
-            let autocommit_retry_entry = matches!(
+            // bd-orwh0: armed by EXCLUSION, not by an allowlist.
+            //
+            // The transients this loop absorbs come from the pager publication
+            // bind, which runs BEFORE the pager admission that owns the
+            // `busy_timeout` budget. Every autocommit statement passes through
+            // that bind, so the exposure was never per-shape -- the allowlist
+            // just meant only the shapes someone had reported were covered.
+            //
+            // DDL was the last holdout, kept out because arming it appeared to
+            // corrupt an index. That finding is retracted: every verdict behind
+            // it was a stock SQLite read taken while our own connections were
+            // still open in the same process, which is the configuration
+            // bd-1nq3j showed is unsupported (POSIX locks are per process, so
+            // stock cannot see our WAL-index dead-man-switch hold). Asking stock
+            // only after a clean close returns `ok` six times out of six.
+            //
+            // Re-measured against a `wal_checkpoint(TRUNCATE)` + INSERT
+            // antagonist with NO stock connection anywhere, our own
+            // PRAGMA integrity_check as the judge, three runs each:
+            //
+            //     unmodified          126_656 attempts, 32_245 ok, 94_411 busy
+            //     CREATE INDEX armed    7_963 attempts,  7_963 ok,      0 busy
+            //
+            // zero malformed reports either way, integrity_check ok every run.
+            //
+            // Only transaction COMPLETION stays out. Retrying a `COMMIT` is
+            // ambiguous -- the caller cannot tell whether the first attempt
+            // committed -- and `ROLLBACK` / `RELEASE` at an autocommit boundary
+            // have no transaction to act on, so a transient there is not really
+            // transient. Everything else is safe for the reasons already given
+            // above for reads: the boundary check guarantees no transaction is
+            // open, a failed autocommit statement leaves no partial state, and
+            // `statement_retry_is_idempotent` below still bars any statement
+            // that calls an application function.
+            let autocommit_retry_entry = !matches!(
                 statement,
-                Statement::Pragma(_)
-                    | Statement::Select(_)
-                    | Statement::Begin(_)
-                    | Statement::Savepoint(_)
-                    | Statement::Analyze(_)
+                Statement::Commit | Statement::Rollback(_) | Statement::Release(_)
             ) && self.autocommit_conflict_retry_boundary();
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
