@@ -180,21 +180,34 @@ impl Connection {
             .saturating_sub(checkpoint_metrics_before.checkpoint_duration_us_total);
         self.checkpoint_advisor_note_checkpoint(mode, &result, checkpoint_duration_us);
 
-        // GH#399: SQLite reports `busy = 1` when readers kept the checkpoint
-        // from finishing — frames beyond the oldest reader horizon stayed in
-        // the WAL, or a RESTART/TRUNCATE could not replace the generation
-        // because a peer process still pins it. Mirror that so callers can
-        // retry instead of assuming the WAL was truncated.
-        let reset_requested = matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate);
-        let blocked_by_readers = !result.completed
-            || (reset_requested && result.total_frames > 0 && !result.wal_was_reset);
-
-        Ok([
-            i64::from(blocked_by_readers),
-            i64::from(result.total_frames),
-            i64::from(result.frames_backfilled),
-        ])
+        Ok(checkpoint_result_row(mode, &result))
     }
+}
+
+/// Translate successful pager execution into SQLite's checkpoint status row.
+/// A PASSIVE checkpoint may stop at a reader's horizon without being busy;
+/// failure to acquire the checkpoint lock is handled separately above.
+fn checkpoint_result_row(
+    mode: CheckpointMode,
+    result: &fsqlite_pager::CheckpointResult,
+) -> [i64; 3] {
+    let reset_requested = matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate);
+    let reset_completed = result.wal_was_reset
+        && (mode != CheckpointMode::Truncate || result.effective_mode == CheckpointMode::Truncate);
+    let blocked_by_readers = mode != CheckpointMode::Passive
+        && (!result.completed || (reset_requested && result.total_frames > 0 && !reset_completed));
+
+    // The pager records pre-checkpoint work for its metrics. SQLite instead
+    // reports the *post-truncation* log and backfill counts. RESTART retains
+    // its counts, and a safety downgrade must not pretend it truncated a WAL.
+    if mode == CheckpointMode::Truncate && !blocked_by_readers && reset_completed {
+        return [0, 0, 0];
+    }
+    [
+        i64::from(blocked_by_readers),
+        i64::from(result.total_frames),
+        i64::from(result.frames_backfilled),
+    ]
 }
 
 fn integrity_check_error_limit(value: Option<&fsqlite_ast::PragmaValue>) -> usize {
@@ -541,6 +554,169 @@ mod tests {
                 main_frames_before,
                 "TEMP checkpoint must not mutate main's WAL"
             );
+        });
+    }
+
+    #[test]
+    fn checkpoint_status_distinguishes_passive_progress_from_busy() {
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            let result = fsqlite_pager::CheckpointResult {
+                total_frames: 4,
+                frames_backfilled: 3,
+                completed: false,
+                wal_was_reset: false,
+                requested_mode: mode,
+                effective_mode: mode,
+            };
+            let expected_busy = i64::from(mode != CheckpointMode::Passive);
+            assert_eq!(checkpoint_result_row(mode, &result), [expected_busy, 4, 3]);
+        }
+    }
+
+    #[test]
+    fn checkpoint_status_preserves_unfinished_reset_and_downgrade() {
+        for mode in [CheckpointMode::Restart, CheckpointMode::Truncate] {
+            let mut result = fsqlite_pager::CheckpointResult {
+                total_frames: 4,
+                frames_backfilled: 4,
+                completed: true,
+                wal_was_reset: false,
+                requested_mode: mode,
+                effective_mode: CheckpointMode::Passive,
+            };
+            assert_eq!(checkpoint_result_row(mode, &result), [1, 4, 4]);
+            // A completed RESTART still does not satisfy requested TRUNCATE.
+            result.wal_was_reset = true;
+            result.effective_mode = CheckpointMode::Restart;
+            let expected = if mode == CheckpointMode::Truncate {
+                [1, 4, 4]
+            } else {
+                [0, 4, 4]
+            };
+            assert_eq!(checkpoint_result_row(mode, &result), expected);
+        }
+    }
+
+    #[test]
+    fn checkpoint_status_zeros_only_successful_truncate_counts() {
+        for frames in [0, 4, u32::MAX] {
+            for mode in [
+                CheckpointMode::Passive,
+                CheckpointMode::Full,
+                CheckpointMode::Restart,
+                CheckpointMode::Truncate,
+            ] {
+                let result = fsqlite_pager::CheckpointResult {
+                    total_frames: frames,
+                    frames_backfilled: frames,
+                    completed: true,
+                    wal_was_reset: matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate),
+                    requested_mode: mode,
+                    effective_mode: mode,
+                };
+                let expected = if mode == CheckpointMode::Truncate {
+                    [0, 0, 0]
+                } else {
+                    [0, i64::from(frames), i64::from(frames)]
+                };
+                assert_eq!(checkpoint_result_row(mode, &result), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn stock_checkpoint_reader_pin_and_truncate_status() {
+        // Keep the stock fixture separate from native fixtures: two SQLite
+        // implementations must not share a file in the same process.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stock-checkpoint.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 PRAGMA busy_timeout=0; CREATE TABLE t(id INTEGER PRIMARY KEY); \
+                 INSERT INTO t VALUES(1);",
+            )
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let pinned: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pinned, 1);
+        writer.execute_batch("INSERT INTO t VALUES(2);").unwrap();
+        for (mode, expected_busy) in [
+            ("PASSIVE", 0),
+            ("FULL", 1),
+            ("RESTART", 1),
+            ("TRUNCATE", 1),
+        ] {
+            let status: [i64; 3] = writer
+                .query_row(&format!("PRAGMA main.wal_checkpoint({mode});"), [], |row| {
+                    Ok([row.get(0)?, row.get(1)?, row.get(2)?])
+                })
+                .unwrap();
+            assert_eq!(status[0], expected_busy, "{mode}: {status:?}");
+            assert!(status[2] >= 0 && status[2] < status[1], "{mode}: {status:?}");
+        }
+        reader.execute_batch("ROLLBACK;").unwrap();
+        let restarted: [i64; 3] = writer
+            .query_row("PRAGMA main.wal_checkpoint(RESTART);", [], |row| {
+                Ok([row.get(0)?, row.get(1)?, row.get(2)?])
+            })
+            .unwrap();
+        assert_eq!(restarted[0], 0);
+        assert!(restarted[1] > 0);
+        assert_eq!(restarted[1], restarted[2]);
+        for _ in 0..2 {
+            let truncated: [i64; 3] = writer
+                .query_row("PRAGMA main.wal_checkpoint(TRUNCATE);", [], |row| {
+                    Ok([row.get(0)?, row.get(1)?, row.get(2)?])
+                })
+                .unwrap();
+            assert_eq!(truncated, [0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn native_truncate_status_reports_empty_wal_for_direct_and_prepared_queries() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("native-checkpoint.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute("PRAGMA journal_mode=WAL;").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            for prepared in [false, true] {
+                conn.execute("BEGIN;").await.unwrap();
+                conn.execute("INSERT INTO t DEFAULT VALUES;").await.unwrap();
+                conn.execute("COMMIT;").await.unwrap();
+                let cx = conn.op_cx().unwrap();
+                assert!(conn.pager.wal_frame_count(&cx).await > 0);
+                let sql = "PRAGMA main.wal_checkpoint(TRUNCATE);";
+                let rows = if prepared {
+                    conn.prepare(sql).await.unwrap().query().await.unwrap()
+                } else {
+                    conn.query(sql).await.unwrap()
+                };
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].values(),
+                    &[
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                        SqliteValue::Integer(0),
+                    ]
+                );
+                assert_eq!(conn.pager.wal_frame_count(&cx).await, 0);
+            }
+            conn.close().await.unwrap();
         });
     }
 }
