@@ -60,3 +60,5 @@ export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttp
 export { streamSnapshotChangesets } from "./changeset-capture";
 export type { SnapshotChangesetStreamOptions, ChangesetSnapshotChunk, ChangesetSnapshotStreamResult } from "./changeset-capture";
 export type { OutboxBootstrapChunksOptions, OutboxBootstrapChunksResult } from "./changeset-outbox";
+export { ChangesetBootstrapReceiver, ChangesetBootstrapError, createBootstrapManifest, CHANGESET_BOOTSTRAP_PROTOCOL, CHANGESET_BOOTSTRAP_STATE_TABLE, CHANGESET_BOOTSTRAP_CHUNKS_TABLE } from "./changeset-bootstrap";
+export type { BootstrapManifestInput, BootstrapManifest, BootstrapOperationOptions, BootstrapProgress, BootstrapInstallReceipt, BootstrapReceiverOptions } from "./changeset-bootstrap";
