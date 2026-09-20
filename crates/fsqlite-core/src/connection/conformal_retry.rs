@@ -3,35 +3,32 @@
 //! Exponential backoff on SQLITE_BUSY has no provable tail-latency property:
 //! a writer may spin retrying for the full `busy_timeout` even when the
 //! accumulated blocking has already blown past any reasonable latency
-//! target. This module replaces the naive timeout with a distribution-free
-//! conformal prediction cap.
+//! target. This module adds an opt-in latency-prediction cap.
 //!
 //! # Method
 //!
 //! Per-connection, we maintain a ring buffer of recent successful commit
-//! latencies (size `K`, default 256). On each BUSY retry attempt we compute
-//! a one-sided conformal upper bound at miscoverage α on the latency of a
-//! *future* successful commit:
+//! latencies (size `K`, default 256). A one-sided conformal upper bound at
+//! miscoverage alpha uses order-statistic rank `ceil((1 - alpha)(K + 1))`.
+//! The bound is cached until calibration or configuration changes, so an
+//! unchanged BUSY retry episode does not repeatedly allocate and select.
 //!
-//! ```text
-//!   q̂ = sample quantile at rank ⌈(1 − α)(K + 1)⌉
-//! ```
+//! Under exchangeability of the calibration and next-commit latencies, this
+//! bound has marginal coverage at least `1 - alpha`. When the rank is `K + 1`,
+//! no finite sample bound has the requested coverage; the predictor abstains
+//! instead of substituting the sample maximum. Without a finite prediction,
+//! retries use the configured SLO as a hard wall. With a prediction, retries
+//! stop when elapsed time plus the predicted tail reaches that wall.
 //!
-//! This is the classical split-conformal quantile under exchangeability
-//! (Vovk, Gammerman, Shafer — *Algorithmic Learning in a Random World*).
-//! Given K i.i.d. samples, the resulting prediction interval
-//! `[0, q̂]` covers the next realization with probability at least `1 − α`
-//! (finite-sample, distribution-free). When we already have `elapsed`
-//! wall-time spent retrying, our predicted total completion latency is
-//! `elapsed + q̂`. If that exceeds the user-configured SLO budget, further
-//! retries are wasted — we surface `SQLITE_BUSY` *now* rather than after
-//! the budget is exhausted.
+//! This is an admission heuristic, not a bound on physical commit completion
+//! or on a workload with drifting/non-exchangeable latency. A future commit
+//! can exceed its prediction, and a stopped retry could have succeeded.
 //!
 //! # Safety
 //!
 //! Retry budgets control *blocking*, not isolation. A short-circuited BUSY
 //! is behaviorally identical to a BUSY returned after the legacy
-//! `busy_timeout` expires — the MVCC invariants (SSI, snapshot visibility,
+//! `busy_timeout` expires -- the MVCC invariants (SSI, snapshot visibility,
 //! WAL ordering) are entirely untouched.
 //!
 //! # Defaults
@@ -40,14 +37,12 @@
 //! `busy_timeout` path runs unchanged. Users opt in via
 //! `PRAGMA fsqlite.retry_slo_ms = <n>`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Minimum calibration window — below this many samples, conformal
-/// prediction is not well-defined (⌈(1−α)(K+1)⌉ would exceed K for
-/// typical α). We simply do not apply the cap until enough samples
-/// accumulate.
+/// Minimum calibration window. This is only a warm-up floor: the requested
+/// miscoverage may require more samples before a finite bound exists.
 pub const MIN_CALIBRATION_SAMPLES: usize = 8;
 
 /// Lower bound on the configurable ring-buffer size. Windows smaller
@@ -55,25 +50,31 @@ pub const MIN_CALIBRATION_SAMPLES: usize = 8;
 const MIN_CALIBRATION_WINDOW: usize = MIN_CALIBRATION_SAMPLES;
 
 /// Upper bound on the configurable ring-buffer size. 4096 commit
-/// timings is ~32 KiB; beyond this the per-retry quantile computation
-/// becomes nontrivial without meaningfully tightening the bound.
+/// timings is ~32 KiB; beyond this the quantile computation becomes
+/// nontrivial without meaningfully tightening the bound.
 const MAX_CALIBRATION_WINDOW: usize = 4096;
 
 /// Default calibration window. Chosen to cover roughly the last few
 /// minutes of commits on typical OLTP workloads while staying cheap to
-/// sort on the cold BUSY path.
+/// select on the cold BUSY path.
 pub const DEFAULT_CALIBRATION_WINDOW: usize = 256;
 
-/// Default miscoverage bound. Matches the conventional 95% prediction
-/// interval used throughout statistics; tight enough to be useful for
-/// SLOs, loose enough that ordinary commit jitter does not trip it.
+/// Default miscoverage bound for a 95% marginal prediction interval under
+/// exchangeability. At least 19 samples are needed for a finite bound.
 pub const DEFAULT_ALPHA: f64 = 0.05;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuantileCache {
+    Dirty,
+    Unavailable,
+    Bound(u64),
+}
 
 /// Per-connection retry budget configuration and calibration ring.
 ///
 /// All state lives on the owning `Connection` and is accessed single-
 /// threaded; no synchronization is needed. The ring stores nanoseconds
-/// as `u64` — `u64::MAX ns` is ~584 years, comfortably larger than any
+/// as `u64` -- `u64::MAX ns` is ~584 years, comfortably larger than any
 /// real commit latency.
 #[derive(Debug)]
 pub struct ConformalRetryBudget {
@@ -86,6 +87,8 @@ pub struct ConformalRetryBudget {
     calibration_window: usize,
     /// Ring buffer of recent successful commit latencies, in nanoseconds.
     latencies_ns: VecDeque<u64>,
+    /// Includes unavailable bounds, so warm-up retries also avoid recomputing.
+    quantile_cache: Cell<QuantileCache>,
 }
 
 impl Default for ConformalRetryBudget {
@@ -95,6 +98,7 @@ impl Default for ConformalRetryBudget {
             alpha: DEFAULT_ALPHA,
             calibration_window: DEFAULT_CALIBRATION_WINDOW,
             latencies_ns: VecDeque::with_capacity(DEFAULT_CALIBRATION_WINDOW),
+            quantile_cache: Cell::new(QuantileCache::Dirty),
         }
     }
 }
@@ -133,9 +137,6 @@ impl ConformalRetryBudget {
     /// Configure miscoverage. Clamped into the open interval `(0, 1)`;
     /// callers that want input validation should check before calling.
     pub fn set_alpha(&mut self, alpha: f64) {
-        // Guard against NaN/inf by the total-order check against two
-        // sentinel bounds; clippy `float_cmp` is satisfied because we
-        // use relational comparisons rather than equality.
         let clamped = if alpha.is_nan() {
             DEFAULT_ALPHA
         } else if alpha <= 0.0 {
@@ -146,6 +147,7 @@ impl ConformalRetryBudget {
             alpha
         };
         self.alpha = clamped;
+        self.quantile_cache.set(QuantileCache::Dirty);
     }
 
     /// Resize the calibration ring, preserving the most recent samples.
@@ -159,6 +161,7 @@ impl ConformalRetryBudget {
         if self.latencies_ns.capacity() > window.saturating_mul(2) {
             self.latencies_ns.shrink_to(window);
         }
+        self.quantile_cache.set(QuantileCache::Dirty);
     }
 
     /// Record a successful commit latency for future calibration.
@@ -168,76 +171,58 @@ impl ConformalRetryBudget {
             self.latencies_ns.pop_front();
         }
         self.latencies_ns.push_back(ns);
+        self.quantile_cache.set(QuantileCache::Dirty);
     }
 
     /// Compute the one-sided conformal upper bound on a future commit
     /// latency at miscoverage `alpha`.
     ///
-    /// Returns `None` when too few samples are available to form a
-    /// well-defined prediction interval; in that case the caller must
-    /// fall back to the legacy `busy_timeout` behavior (i.e. keep
-    /// retrying).
+    /// Returns `None` during warm-up or when the finite-sample rank exceeds
+    /// the calibration set. In that case `retry_allowed` uses the raw SLO
+    /// deadline without pretending to have a finite tail prediction.
     ///
-    /// # Math
-    ///
-    /// For exchangeable calibration scores `s_1, …, s_K` and a fresh
-    /// score `s_{K+1}`, the rank of `s_{K+1}` among `s_1, …, s_{K+1}` is
-    /// uniform on `{1, …, K+1}`. Selecting the `⌈(1 − α)(K + 1)⌉`-th
-    /// order statistic of the calibration set therefore gives a
-    /// distribution-free upper bound with coverage ≥ `1 − α`.
+    /// The finite bound is the `ceil((1 - alpha)(K + 1))`-th smallest
+    /// calibration score. Its marginal coverage requires exchangeability.
+    /// An unchanged calibration set and alpha reuse the cached result.
     pub fn quantile_bound(&self) -> Option<Duration> {
+        match self.quantile_cache.get() {
+            QuantileCache::Bound(ns) => return Some(Duration::from_nanos(ns)),
+            QuantileCache::Unavailable => return None,
+            QuantileCache::Dirty => {}
+        }
+        let bound = self.compute_quantile_bound_ns();
+        self.quantile_cache.set(match bound {
+            Some(ns) => QuantileCache::Bound(ns),
+            None => QuantileCache::Unavailable,
+        });
+        bound.map(Duration::from_nanos)
+    }
+
+    fn compute_quantile_bound_ns(&self) -> Option<u64> {
         let k = self.latencies_ns.len();
         if k < MIN_CALIBRATION_SAMPLES {
             return None;
         }
-
-        // ⌈(1 − α)(K + 1)⌉. We saturate at K because the conformal
-        // bound is vacuous (∞) when α(K + 1) < 1 — treat that as "no
-        // cap" rather than panicking.
-        let alpha = self.alpha.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
-        let target = (1.0 - alpha) * ((k as f64) + 1.0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rank_ceil = target.ceil() as usize;
-        if rank_ceil == 0 {
-            return None;
-        }
-        let idx = rank_ceil.saturating_sub(1).min(k - 1);
-
+        let rank = conformal_rank(k, self.alpha)?;
         let mut scratch: Vec<u64> = self.latencies_ns.iter().copied().collect();
-        // Partial selection is linear; we use the stable `select_nth`
-        // API to avoid a full sort on every BUSY retry.
-        let (_, pivot, _) = scratch.select_nth_unstable(idx);
-        Some(Duration::from_nanos(*pivot))
+        let (_, pivot, _) = scratch.select_nth_unstable(rank - 1);
+        Some(*pivot)
     }
 
-    /// Return the predicted deadline after which further BUSY retries
-    /// are expected to violate the SLO.
-    ///
-    /// Semantics:
-    ///   * `None` → no cap is active (SLO disabled, or too few
-    ///     calibration samples); the caller should keep retrying under
-    ///     the legacy `busy_timeout` schedule.
-    ///   * `Some(budget)` → retry only while `elapsed + q̂ < budget`
-    ///     (i.e. the predicted additional commit latency still fits in
-    ///     the SLO).
+    /// Return the configured retry-admission deadline, or `None` if disabled.
+    /// An uncalibrated predictor still honors this explicit hard wall.
     pub fn slo_budget(&self) -> Option<Duration> {
         self.slo_ms().map(Duration::from_millis)
     }
 
     /// Decide whether a BUSY retry is allowed given how long we have
-    /// already been blocked.
-    ///
-    /// Returns `true` when:
-    ///   * the SLO cap is disabled (legacy behavior), or
-    ///   * the predicted total latency `elapsed + q̂` still fits inside
-    ///     the SLO budget with slack.
+    /// already been blocked. The engine's ordinary `busy_timeout` remains
+    /// an independent limit; this budget does not extend it.
     pub fn retry_allowed(&self, elapsed: Duration) -> bool {
         let Some(budget) = self.slo_budget() else {
             return true;
         };
         let Some(predicted_tail) = self.quantile_bound() else {
-            // Not enough calibration data → fall back to the raw SLO
-            // budget as a hard wall.
             return elapsed < budget;
         };
         let projected = elapsed.saturating_add(predicted_tail);
@@ -245,9 +230,24 @@ impl ConformalRetryBudget {
     }
 }
 
-/// RefCell wrapper for the retry budget; kept out of hot paths by
-/// checking `slo_ms()` first on the non-borrow path so that the default
-/// (disabled) configuration never touches the RefCell.
+/// One-based finite-sample rank, or no finite bound. Compute
+/// `K + 1 - floor(alpha * (K + 1))` exactly for the configured binary float:
+/// a rounded floating-point product can cross an integer boundary and select
+/// a rank with less than the requested coverage. Clamping alpha here makes
+/// its IEEE-754 exponent normal and the right shift lie in 53..=104; smaller
+/// positive alphas cannot produce a finite bound within the bounded window.
+fn conformal_rank(k: usize, alpha: f64) -> Option<usize> {
+    let n = k.checked_add(1)?;
+    let bits = alpha.clamp(f64::EPSILON, 1.0 - f64::EPSILON).to_bits();
+    let exponent = (bits >> 52) & 0x7ff;
+    let significand = (1_u128 << 52) | u128::from(bits & ((1_u64 << 52) - 1));
+    let scaled = significand * u128::try_from(n).ok()?;
+    let excluded = usize::try_from(scaled >> (1075 - exponent)).ok()?;
+    let rank = n.checked_sub(excluded)?;
+    (rank > 0 && rank <= k).then_some(rank)
+}
+
+/// RefCell wrapper for the single-threaded connection's retry budget.
 pub type ConformalRetryBudgetCell = RefCell<ConformalRetryBudget>;
 
 #[cfg(test)]
@@ -259,11 +259,13 @@ mod tests {
         let b = ConformalRetryBudget::default();
         assert!(b.slo_ms().is_none());
         assert!(b.retry_allowed(Duration::from_secs(3600)));
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
     }
 
     #[test]
     fn quantile_requires_minimum_samples() {
         let mut b = ConformalRetryBudget::default();
+        b.set_alpha(0.2);
         for _ in 0..(MIN_CALIBRATION_SAMPLES - 1) {
             b.record_success(Duration::from_millis(1));
         }
@@ -273,16 +275,59 @@ mod tests {
     }
 
     #[test]
+    fn default_confidence_requires_nineteen_samples() {
+        let mut b = ConformalRetryBudget::default();
+        b.set_slo_ms(100);
+        for _ in 0..18 {
+            b.record_success(Duration::from_millis(50));
+            assert!(b.quantile_bound().is_none());
+            assert!(b.retry_allowed(Duration::from_millis(60)));
+            assert!(!b.retry_allowed(Duration::from_millis(100)));
+        }
+        b.record_success(Duration::from_millis(50));
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(50)));
+        assert!(!b.retry_allowed(Duration::from_millis(60)));
+    }
+
+    #[test]
     fn quantile_picks_correct_order_statistic() {
         let mut b = ConformalRetryBudget::default();
         b.set_alpha(0.2);
-        // Ten samples, 1..=10 ms.
         for ms in 1u64..=10 {
             b.record_success(Duration::from_millis(ms));
         }
-        // ⌈(1 − 0.2) × 11⌉ = ⌈8.8⌉ = 9 → index 8 → 9 ms.
         let q = b.quantile_bound().expect("quantile with K=10");
         assert_eq!(q, Duration::from_millis(9));
+    }
+
+    #[test]
+    fn finite_sample_rank_does_not_round_across_confidence_boundaries() {
+        let alpha = 0.25_f64;
+        let below = f64::from_bits(alpha.to_bits() - 1);
+        let above = f64::from_bits(alpha.to_bits() + 1);
+        assert_eq!(conformal_rank(15, below), Some(13));
+        assert_eq!(conformal_rank(15, alpha), Some(12));
+        assert_eq!(conformal_rank(15, above), Some(12));
+
+        let minimum = 0.0625_f64;
+        assert_eq!(conformal_rank(15, minimum), Some(15));
+        assert_eq!(conformal_rank(15, f64::from_bits(minimum.to_bits() - 1)), None);
+        assert_eq!(conformal_rank(MAX_CALIBRATION_WINDOW, f64::EPSILON), None);
+    }
+
+    #[test]
+    fn finite_sample_ranks_match_exact_binary_fraction_oracle() {
+        // Numerators / 1024 are exactly representable. Check the complete
+        // confidence grid across window sizes, including unbounded ranks.
+        for k in [8_usize, 15, 19, 32, 255, 256, 4096] {
+            for numerator in 1_u32..1024 {
+                let alpha = f64::from(numerator) / 1024.0;
+                let numerator = usize::try_from(numerator).unwrap();
+                let rank = (k + 1) - (numerator * (k + 1) / 1024);
+                let expected = (rank <= k).then_some(rank);
+                assert_eq!(conformal_rank(k, alpha), expected, "k={k} alpha={alpha}");
+            }
+        }
     }
 
     #[test]
@@ -291,13 +336,46 @@ mod tests {
         for ms in 1u64..=100 {
             b.record_success(Duration::from_millis(ms));
         }
+        assert!(b.quantile_bound().is_some());
         b.set_calibration_window(16);
         assert_eq!(b.sample_count(), 16);
-        // The retained samples should be the newest 16.
-        b.set_alpha(0.05);
-        // ⌈0.95 × 17⌉ = 17 → clamped to last index → 100 ms.
-        let q = b.quantile_bound().unwrap();
-        assert_eq!(q, Duration::from_millis(100));
+        assert!(b.quantile_bound().is_none(), "16 samples cannot support 95% coverage");
+        b.set_alpha(0.1);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn cached_quantile_is_invalidated_by_samples_alpha_and_window() {
+        let mut b = ConformalRetryBudget::default();
+        b.set_alpha(0.2);
+        b.set_calibration_window(8);
+        assert!(b.quantile_bound().is_none());
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Unavailable);
+        for ms in 1u64..=8 {
+            b.record_success(Duration::from_millis(ms));
+        }
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
+        for _ in 0..100 {
+            assert_eq!(b.quantile_bound(), Some(Duration::from_millis(8)));
+            assert_eq!(b.quantile_cache.get(), QuantileCache::Bound(8_000_000));
+        }
+        b.record_success(Duration::from_millis(100));
+        assert_eq!(b.sample_count(), 8);
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(100)));
+        b.set_alpha(0.5);
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(6)));
+        b.set_calibration_window(16);
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(6)));
+        for _ in 0..8 {
+            b.record_success(Duration::from_millis(200));
+        }
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(200)));
+        b.set_calibration_window(8);
+        assert_eq!(b.quantile_cache.get(), QuantileCache::Dirty);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_millis(200)));
     }
 
     #[test]
@@ -317,9 +395,7 @@ mod tests {
         for _ in 0..20 {
             b.record_success(Duration::from_millis(50));
         }
-        // Quantile ≈ 50 ms. Elapsed 60 ms + 50 ms tail = 110 > 100.
         assert!(!b.retry_allowed(Duration::from_millis(60)));
-        // Elapsed 10 ms + 50 ms tail = 60 < 100.
         assert!(b.retry_allowed(Duration::from_millis(10)));
     }
 
@@ -332,6 +408,25 @@ mod tests {
         assert!(b.alpha() < 1.0);
         b.set_alpha(f64::NAN);
         assert!(b.alpha() > 0.0 && b.alpha() < 1.0);
+    }
+
+    #[test]
+    fn extreme_latencies_and_confidence_remain_bounded() {
+        let mut b = ConformalRetryBudget::default();
+        b.set_slo_ms(u64::MAX);
+        for _ in 0..32 {
+            b.record_success(Duration::MAX);
+        }
+        assert_eq!(b.quantile_bound(), Some(Duration::from_nanos(u64::MAX)));
+        assert!(!b.retry_allowed(Duration::MAX));
+        b.set_alpha(f64::NEG_INFINITY);
+        assert!(b.quantile_bound().is_none());
+        b.set_alpha(f64::INFINITY);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_nanos(u64::MAX)));
+        b.set_alpha(f64::NAN);
+        assert_eq!(b.quantile_bound(), Some(Duration::from_nanos(u64::MAX)));
+        b.set_slo_ms(0);
+        assert!(b.retry_allowed(Duration::MAX));
     }
 
     #[test]
