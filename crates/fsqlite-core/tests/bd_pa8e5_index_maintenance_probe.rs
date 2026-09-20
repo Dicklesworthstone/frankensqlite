@@ -1,6 +1,14 @@
 //! bd-pa8e5 — is it CREATE INDEX that corrupts the index, or ordinary writes to
 //! an indexed table while a checkpoint runs?
 //!
+//! RETRACTION: neither, and nothing here is durable corruption. See
+//! `bd_pa8e5_clean_close_probe` — asking stock for a verdict only after every
+//! FrankenSQLite connection is closed returns `ok` six times out of six. The
+//! corruption these probes appeared to find was an artifact of reading with an
+//! in-process stock connection while ours were still open (bd-1nq3j). The cases
+//! below are still worth keeping: they are what ruled out ordinary index
+//! maintenance as a suspect.
+//!
 //! The previous probe hammered `CREATE INDEX IF NOT EXISTS` in a loop beside a
 //! checkpointer and left a database that stock SQLite's own integrity_check
 //! calls corrupt, in 3 of 4 runs, on unmodified main. But almost all of those

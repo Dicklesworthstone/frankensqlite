@@ -1,6 +1,22 @@
 //! bd-pa8e5 — when a retried CREATE INDEX leaves a malformed index, WHICH side
 //! diverged: the durable database, or this connection's local schema?
 //!
+//! RETRACTION, READ THIS FIRST. This probe originally reported durable
+//! corruption. It does not. Every verdict it takes is a stock SQLite read issued
+//! WHILE a FrankenSQLite connection is still open on the same file, in the same
+//! process — the configuration bd-1nq3j proved unsupported, because POSIX fcntl
+//! locks are per process and stock therefore cannot see our shared WAL-index
+//! dead-man-switch hold. `bd_pa8e5_clean_close_probe` runs the identical
+//! workload and asks stock only AFTER every connection is closed: six of six
+//! verdicts are `ok`. The database is not durably corrupt, and the reading
+//! stock gives here — "wrong # of entries in index probe_ix" — is a count
+//! mismatch of the sort a partially visible WAL produces, not damage.
+//!
+//! What survives is narrower: our OWN engine has reported "index payload is not
+//! a valid SQLite record" under heavy CREATE INDEX plus checkpoint contention,
+//! in a run that opened no stock connection at all. That is a spurious
+//! corruption report, not data loss, and it is what bd-pa8e5 now tracks.
+//!
 //! Arming DDL for the autocommit transient retry made `CREATE INDEX` produce
 //! "database disk image is malformed: index probe_ix payload is not a valid
 //! SQLite record" in 1 of 3 runs. Two explanations fit that symptom and they
