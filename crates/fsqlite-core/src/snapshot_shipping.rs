@@ -11,6 +11,9 @@
 //! - Natural multicast: initialize many replicas simultaneously
 //! - Progressive receive: partial queries after first block decoded
 
+pub mod manifest;
+pub use manifest::{ManifestSnapshotReceiver, SnapshotBlockManifest, SnapshotManifest};
+
 use std::collections::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
@@ -513,26 +516,14 @@ impl SnapshotReceiver {
         }
     }
 
-    /// Create from a resume state (after crash/reconnect).
+    /// Restart collection from metadata alone after a crash/reconnect.
+    ///
+    /// ResumeState contains neither symbol payloads nor decoded pages. Its
+    /// flags cannot establish completion or suppress retransmission. Durable
+    /// resume must restore the saved packet bytes through a transfer spool.
     #[must_use]
     pub fn from_resume(resume: ResumeState, page_size: u32) -> Self {
-        let num_blocks = resume.total_blocks as usize;
-        let block_decoders = (0..num_blocks).map(|_| BlockDecoder::new()).collect();
-        Self {
-            state: if resume.all_decoded() {
-                SnapshotReceiverState::Complete
-            } else {
-                SnapshotReceiverState::Waiting
-            },
-            changeset_to_block: HashMap::new(),
-            block_decoders,
-            num_blocks,
-            decoded_blocks: Vec::new(),
-            resume,
-            page_size,
-            buffered_symbol_bytes: 0,
-            auth_key: None,
-        }
+        Self::new(resume.total_blocks as usize, page_size)
     }
 
     /// Current state.
@@ -553,10 +544,10 @@ impl SnapshotReceiver {
         Ok(())
     }
 
-    /// Number of blocks decoded so far.
+    /// Number of blocks decoded so far, including output already drained.
     #[must_use]
     pub fn blocks_decoded(&self) -> usize {
-        self.decoded_blocks.len()
+        self.resume.decoded_count() as usize
     }
 
     /// Get the resume state for persistence.
