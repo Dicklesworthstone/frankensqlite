@@ -23215,3 +23215,40 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   the graph before calling migrations, so absence of the outcome marker alone
   does not identify the hot stage. Keep capture, SQL, assertions and deadline
   unchanged; no live-provider or release certification is claimed.
+
+
+## 2026-09-20 — Caller-owned batch rollback repair still exceeds migration budget
+
+- Workload: `hfdt-gbou9l`, unchanged full 6,187-fact retained provider capture,
+  original production triggers, four original filters, and 1,800-second runtime
+  deadline. Pinned HFDT `27d83c97d693f7d1a0d2646fab61c9fca200dc6a` used
+  a declared experimental engine archive; no released dependency changed.
+- Repair `c5a3f443d` preserves explicit caller-owned rollback in constrained
+  prepared INSERTs, separately from automatic single-row savepoint elision,
+  and flushes prior buffered writes for conflict visibility. The unchanged
+  SQL regression went from 128 full catalog snapshots for 128 rows to zero;
+  three selected tests and strict scoped Clippy passed, including constraints,
+  rollback, ordinary statement atomicity, and durable readback controls.
+- Full consumer still exited 124 after 1,800.555 seconds. All 6,187 facts
+  persisted, but no migration-success or terminal-schema marker appeared.
+  Fresh stock SQLite found the source at schema 116, quick/integrity checks
+  `ok`, no FK violations, and six counts `1/1/1/6187/6187/1`. The three original
+  controls passed separately; aggregate acceptance remains false.
+- The compact candidate also has all six counts and clean stock-SQLite
+  integrity/FK checks. A preserved `hfdt.sealed-phase-two.db` is at schema 117
+  with all six counts, quick-check `ok`, and no FK violations. The earlier
+  final-validation seal remains at 116. These artifacts localize progress to
+  phase-two sealing or later; they are not proof of complete typed-value
+  preservation, publication, terminal schema 178, or the exact hot stack.
+- Binary SHA256:
+  `751935f8d5f1e7e86a0459254d3ca836b6a4adcc97235736355d97a8be5fff3d`.
+  Evidence: `/data/projects/hfdt_nobleridge_scratch/20260920-batch-savepoints-consumer/`
+  includes source/build identities, `execution.json`, `result.json`, controls,
+  and source/candidate/sealed postmortems. Initial launcher failure was a
+  pre-test empty-tmp collision; it is retained separately as NOT-RUN.
+- Retry condition: profile the later phase-two validation/publication work,
+  preferably from the preserved real sealed image where the same operation
+  can be exercised, before another full run. Do not weaken integrity/digest
+  checks, change the capture or SQL, or extend the acceptance deadline.
+  Keep the independently measured engine repair; do not call it a completed
+  HFDT migration or live-provider/release proof.
