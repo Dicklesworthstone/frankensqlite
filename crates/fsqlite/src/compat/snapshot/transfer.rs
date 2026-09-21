@@ -13,9 +13,13 @@ pub use fsqlite_core::replication_sender::SenderConfig;
 use fsqlite_core::snapshot_shipping::SnapshotSender;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
+use fsqlite_vfs::VfsFile;
 
-use super::SnapshotManifest;
-use crate::Connection;
+use super::{
+    BootstrapOptions, BootstrapProgress, Destination, SnapshotCheckpoint, SnapshotImageState,
+    SnapshotManifest, SnapshotOpen, SnapshotPacketResult, SnapshotSpool, SnapshotSpoolState,
+};
+use crate::{Connection, ConnectionEnv};
 
 /// Admission policy for the captured image and its packet coding schedule.
 ///
@@ -208,11 +212,157 @@ impl CapturedSnapshot {
     pub fn restart(&mut self) { self.sender.restart(); }
 }
 
+/// A journal checkpoint and the independently verified SQL installation.
+///
+/// The checkpoint covers authenticated packet bytes, not SQL-open success.
+/// Inspect `installed.connection` separately; an open error does not undo
+/// either durable artifact. Journal namespace/directory durability remains
+/// the caller's responsibility, as with [`SnapshotSpool::checkpoint`].
+#[derive(Debug)]
+#[must_use = "inspect the journal checkpoint, image receipt and SQL-open result"]
+pub struct JournaledSnapshotOpen {
+    pub checkpoint: SnapshotCheckpoint,
+    pub installed: SnapshotOpen,
+}
+
+/// Receive an authenticated snapshot into both a packet journal and a SQL image.
+///
+/// Unlike the volatile bootstrap, every newly accepted packet is journaled
+/// before its decoded pages are written. Completed blocks are drained after
+/// each packet, so the image is not retained in memory. Call `checkpoint` to
+/// acknowledge a recoverable prefix, and retain that receipt in trusted state.
+/// Neither a received packet nor a decoded block is a durability receipt.
+///
+/// The borrowed spool is exclusively owned for this attempt. Its file must
+/// live OUTSIDE the private bootstrap directory and must not alias a database
+/// or any of its sidecars. The caller owns journal namespace exclusion,
+/// directory durability and quiescence of abandoned I/O before reopening.
+/// Its preconfigured payload/journal limits apply; the bootstrap options'
+/// file limit governs the output image, not the journal or decoder memory.
+/// Failed staging files are preserved, never deleted or reused in place.
+pub struct JournaledSnapshotBootstrap<'a, F: VfsFile> {
+    destination: Destination,
+    spool: &'a mut SnapshotSpool<F>,
+    write_in_flight: bool,
+}
+
+impl<F: VfsFile> fmt::Debug for JournaledSnapshotBootstrap<'_, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JournaledSnapshotBootstrap")
+            .field("progress", &self.progress())
+            .field("journal_records", &self.spool.record_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
+    /// Bind a newly created, empty spool to a fresh guarded image destination.
+    ///
+    /// The spool already carries a trusted manifest and packet authentication
+    /// key. A nonfresh spool is refused before creating any output artifacts;
+    /// previously decoded pages must never disappear through a second owner.
+    pub fn begin(
+        cx: &Cx,
+        options: &BootstrapOptions,
+        spool: &'a mut SnapshotSpool<F>,
+        expected_id: [u8; 32],
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        Self::require_fresh(spool, SnapshotSpoolState::Ready)?;
+        let destination = Destination::create(
+            cx, options, spool.receiver().manifest().clone(), expected_id,
+        )?;
+        Ok(Self { destination, spool, write_in_flight: false })
+    }
+
+    fn require_fresh(spool: &SnapshotSpool<F>, state: SnapshotSpoolState) -> Result<()> {
+        if spool.state() != state || spool.record_count() != 0
+            || spool.receiver().blocks_decoded() != 0
+            || spool.receiver().retained_payload_bytes() != 0
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> BootstrapProgress {
+        BootstrapProgress {
+            blocks_decoded: self.spool.receiver().blocks_decoded(),
+            blocks_written: self.destination.image.blocks_applied(),
+            blocks_total: self.spool.receiver().manifest().blocks().len(),
+            retained_payload_bytes: self.spool.receiver().retained_payload_bytes(),
+            poisoned: self.write_in_flight
+                || self.spool.state() == SnapshotSpoolState::Poisoned
+                || self.destination.image.state() == SnapshotImageState::Poisoned,
+        }
+    }
+
+    /// Private staging pathname; never open it before successful finalization.
+    #[must_use]
+    pub fn database_path(&self) -> &std::path::Path { &self.destination.path }
+
+    async fn drain_blocks(&mut self, cx: &Cx) -> Result<()> {
+        // Arm BEFORE taking output: cancellation at apply_block's entry must
+        // not discard a decoded block while leaving finalization admissible.
+        self.write_in_flight = true;
+        for block in self.spool.take_decoded_blocks() {
+            self.destination.image.apply_block(cx, &block).await?;
+        }
+        self.write_in_flight = false;
+        Ok(())
+    }
+
+    /// Append an admitted packet before applying any newly decoded pages.
+    ///
+    /// Rejected/duplicate packets do not grow the journal. Preflight admission
+    /// errors leave the owner retryable; failed or abandoned journal/image
+    /// writes poison it. Restart from the journal rather than retrying an
+    /// in-doubt image write. No durability acknowledgement is implicit here.
+    pub async fn receive_packet(
+        &mut self, cx: &Cx, packet: &ReplicationPacket,
+    ) -> Result<SnapshotPacketResult> {
+        if self.progress().poisoned { return Err(FrankenError::BusyRecovery); }
+        let result = self.spool.append(cx, packet).await?;
+        self.drain_blocks(cx).await?;
+        Ok(result)
+    }
+
+    /// Sync the saved packet prefix, without claiming the image is installed.
+    pub fn checkpoint(&mut self, cx: &Cx) -> Result<SnapshotCheckpoint> {
+        if self.progress().poisoned { return Err(FrankenError::BusyRecovery); }
+        self.spool.checkpoint(cx)
+    }
+
+    pub async fn finish_and_open(self, cx: &Cx) -> Result<JournaledSnapshotOpen> {
+        self.finish_and_open_with_env(cx, ConnectionEnv::default()).await
+    }
+
+    /// Sync the complete journal before image verification/publication/SQL open.
+    ///
+    /// Uses the existing guarded install path and preserves its separate
+    /// image/open result. A failed or abandoned finalizer can leave durable
+    /// bytes without a returned receipt; it never deletes either artifact.
+    pub async fn finish_and_open_with_env(
+        self, cx: &Cx, env: ConnectionEnv,
+    ) -> Result<JournaledSnapshotOpen> {
+        let progress = self.progress();
+        if progress.poisoned { return Err(FrankenError::BusyRecovery); }
+        if !progress.ready_to_finish() { return Err(FrankenError::Busy); }
+        let saved = self.spool.checkpoint(cx)?;
+        let installed = self.destination.finish_and_open(cx, env).await?;
+        Ok(JournaledSnapshotOpen { checkpoint: saved, installed })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::{BootstrapOptions, SnapshotBootstrap};
     use crate::SqliteValue;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::unix::{UnixFile, UnixVfs};
+    use fsqlite_vfs::{Vfs, host_fs};
 
     const KEY: [u8; 32] = [0x6B; 32];
 
@@ -366,5 +516,157 @@ mod tests {
         assert!(matches!(CapturedSnapshot::from_image(
             &cx, bytes, KEY, CaptureOptions::default(),
         ), Err(FrankenError::Interrupt)));
+    }
+
+    async fn create_journal(
+        cx: &Cx,
+        path: &std::path::Path,
+        manifest: &SnapshotManifest,
+        limit: u64,
+    ) -> SnapshotSpool<UnixFile> {
+        let vfs = UnixVfs::new();
+        let (file, _) = vfs.open(cx, Some(path),
+            VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+        ).unwrap();
+        let receiver = super::super::ManifestSnapshotReceiver::new(
+            manifest.clone(), manifest.id(), KEY, 1 << 20,
+        ).unwrap();
+        let spool = SnapshotSpool::create(cx, file, receiver, limit).await.unwrap();
+        vfs.sync_parent_directory(cx, path).unwrap();
+        spool
+    }
+
+    async fn reopen_journal(
+        cx: &Cx,
+        path: &std::path::Path,
+        manifest: &SnapshotManifest,
+        saved: SnapshotCheckpoint,
+        writable: bool,
+    ) -> SnapshotSpool<UnixFile> {
+        let flags = if writable { VfsOpenFlags::READWRITE } else { VfsOpenFlags::READONLY };
+        let (file, _) = UnixVfs::new().open(cx, Some(path), flags).unwrap();
+        let receiver = super::super::ManifestSnapshotReceiver::new(
+            manifest.clone(), manifest.id(), KEY, 1 << 20,
+        ).unwrap();
+        SnapshotSpool::open(cx, file, receiver, 1 << 20, Some(saved)).await.unwrap()
+    }
+
+    fn captured_image(cx: &Cx) -> CapturedSnapshot {
+        CapturedSnapshot::from_image(cx, image(512), KEY, CaptureOptions {
+            coding: SenderConfig { symbol_size: 256, max_isi_multiplier: 1 },
+            ..CaptureOptions::default()
+        }).unwrap()
+    }
+
+    #[test]
+    fn journaled_live_bootstrap_checkpoints_and_recovers_sql_image() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let mut source = captured_image(&cx);
+            let manifest = source.manifest().clone();
+            let path = root.join("transfer.spool");
+            let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
+            let options = BootstrapOptions::new(root.join("replica"));
+            let mut bootstrap = JournaledSnapshotBootstrap::begin(
+                &cx, &options, &mut spool, manifest.id(),
+            ).unwrap();
+            assert_eq!(bootstrap.checkpoint(&cx).unwrap().record_count, 0);
+            let first = source.next_packet(&cx).unwrap().unwrap();
+            assert!(first.k_source > 1);
+            bootstrap.receive_packet(&cx, &first).await.unwrap();
+            let partial = bootstrap.checkpoint(&cx).unwrap();
+            assert_eq!(partial.record_count, 1);
+            assert!(!bootstrap.progress().ready_to_finish());
+            while let Some(packet) = source.next_packet(&cx).unwrap() {
+                bootstrap.receive_packet(&cx, &packet).await.unwrap();
+            }
+            assert!(bootstrap.progress().ready_to_finish());
+            assert_eq!(bootstrap.progress().retained_payload_bytes, 0);
+            let result = bootstrap.finish_and_open(&cx).await.unwrap();
+            assert!(result.checkpoint.record_count > partial.record_count);
+            assert_eq!(result.installed.image.byte_len, source.image_bytes());
+            let conn = result.installed.connection.unwrap();
+            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into())));
+            conn.execute("BEGIN; INSERT INTO t VALUES(2,'replica-only'); COMMIT;").await.unwrap();
+            conn.close().await.unwrap();
+            spool.into_file().close(&cx).unwrap();
+
+            // A reopened owner can use the acknowledged packet journal alone.
+            // Recovery must not pick up writes made later on the first replica.
+            let original = host_fs::read(&path).unwrap();
+            let mut reopened = reopen_journal(&cx, &path, &manifest, result.checkpoint, false).await;
+            let restored = super::super::restore_spool_and_open(
+                &cx, &BootstrapOptions::new(root.join("restored")), &mut reopened, manifest.id(),
+            ).await.unwrap();
+            let conn = restored.connection.unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(1)));
+            assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                Some(&SqliteValue::Text("ok".into())));
+            conn.close().await.unwrap();
+            reopened.into_file().close(&cx).unwrap();
+            assert_eq!(host_fs::read(&path).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn journaled_admission_is_retryable_and_never_acknowledges_rejected_packets() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let mut source = captured_image(&cx);
+            let manifest = source.manifest().clone();
+            let first = source.next_packet(&cx).unwrap().unwrap();
+            let second = source.next_packet(&cx).unwrap().unwrap();
+            let wire = first.to_bytes().unwrap();
+            // Header + exactly one record (sequence/length, packet, chain hash).
+            let limit = 40 + 12 + u64::try_from(wire.len()).unwrap() + 32;
+            let mut spool = create_journal(&cx, &root.join("bounded.spool"), &manifest, limit).await;
+            let options = BootstrapOptions::new(root.join("bounded-image"));
+            let mut bootstrap = JournaledSnapshotBootstrap::begin(
+                &cx, &options, &mut spool, manifest.id(),
+            ).unwrap();
+            let mut bad = ReplicationPacket::from_bytes(&wire).unwrap();
+            bad.symbol_data[0] ^= 1;
+            assert_eq!(bootstrap.receive_packet(&cx, &bad).await.unwrap(), SnapshotPacketResult::Rejected);
+            assert_eq!(bootstrap.checkpoint(&cx).unwrap().record_count, 0);
+            assert_eq!(bootstrap.receive_packet(&cx, &first).await.unwrap(), SnapshotPacketResult::Accepted);
+            let saved = bootstrap.checkpoint(&cx).unwrap();
+            assert_eq!(bootstrap.receive_packet(&cx, &first).await.unwrap(), SnapshotPacketResult::Duplicate);
+            assert!(matches!(bootstrap.receive_packet(&cx, &second).await, Err(FrankenError::TooBig)));
+            assert!(!bootstrap.progress().poisoned);
+            assert_eq!(bootstrap.checkpoint(&cx).unwrap(), saved);
+            assert!(matches!(bootstrap.finish_and_open(&cx).await, Err(FrankenError::Busy)));
+            assert_eq!(spool.state(), SnapshotSpoolState::Ready);
+            assert_eq!(spool.record_count(), 1);
+            spool.into_file().close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn journaled_begin_refuses_wrong_identity_and_used_spools_before_output_creation() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let mut source = captured_image(&cx);
+            let manifest = source.manifest().clone();
+            let mut spool = create_journal(&cx, &root.join("used.spool"), &manifest, 1 << 20).await;
+            let options = BootstrapOptions::new(root.join("refused-image"));
+            let mut wrong_id = manifest.id();
+            wrong_id[0] ^= 1;
+            assert!(JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, wrong_id).is_err());
+            assert!(host_fs::metadata(&options.directory).is_err());
+            let first = source.next_packet(&cx).unwrap().unwrap();
+            spool.append(&cx, &first).await.unwrap();
+            assert!(matches!(
+                JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, manifest.id()),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(host_fs::metadata(&options.directory).is_err());
+            assert_eq!(spool.record_count(), 1);
+            spool.into_file().close(&cx).unwrap();
+        });
     }
 }
