@@ -29,6 +29,20 @@ pub const SQLITE_FULL: u32 = 13;
 /// SQLite error code: schema changed.
 pub const SQLITE_SCHEMA: u32 = 17;
 
+/// One past the positive RowId domain, encoded using the same sentinel as an
+/// exact-through-MAX reservation. This is not an available negative rowid.
+const EXHAUSTED_NEXT_ROWID: i64 = i64::MIN;
+
+/// Compare allocator tips in allocation order, where exhaustion follows MAX.
+/// Signed `max` would revive an exhausted allocator during a floor refresh.
+fn max_rowid_tip(left: i64, right: i64) -> i64 {
+    if left < 1 || right < 1 {
+        EXHAUSTED_NEXT_ROWID
+    } else {
+        left.max(right)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key + per-table state
 // ---------------------------------------------------------------------------
@@ -43,7 +57,7 @@ pub struct AllocatorKey {
 /// Per-table allocator state owned by the coordinator.
 #[derive(Debug, Clone)]
 struct TableAllocatorState {
-    /// Next rowid to hand out (always ≥ 1).
+    /// Next positive rowid, or EXHAUSTED_NEXT_ROWID after the final value.
     next_rowid: i64,
     /// Normal vs AUTOINCREMENT.
     mode: RowIdMode,
@@ -64,13 +78,15 @@ impl TableAllocatorState {
     /// Initialise from the durable tip (§5.10.1.1 "Coordinator Initialization").
     fn new(max_committed_rowid: Option<RowId>, sqlite_sequence_seq: i64, mode: RowIdMode) -> Self {
         let max_committed = max_committed_rowid.map_or(0, RowId::get);
-        let next = match mode {
-            RowIdMode::Normal => max_committed.saturating_add(1).max(1),
-            RowIdMode::AutoIncrement => {
-                let base = max_committed.max(sqlite_sequence_seq);
-                base.saturating_add(1).max(1)
-            }
+        let base = match mode {
+            RowIdMode::Normal => max_committed,
+            RowIdMode::AutoIncrement => max_committed.max(sqlite_sequence_seq),
         };
+        // Saturating at MAX would hand out an already committed identifier.
+        // Preserve exhaustion even when the first observation is after reopen.
+        let next = base
+            .checked_add(1)
+            .map_or(EXHAUSTED_NEXT_ROWID, |next| next.max(1));
 
         info!(
             max_committed_rowid = max_committed,
@@ -81,7 +97,7 @@ impl TableAllocatorState {
         );
 
         let high_water = if mode == RowIdMode::AutoIncrement {
-            sqlite_sequence_seq
+            base.max(0)
         } else {
             0
         };
@@ -343,9 +359,15 @@ impl ConcurrentRowIdAllocator {
                 .copied()
                 .unwrap_or(0);
             let my_count_since = current_count - sp_count;
+            // Use the reservation path's exact-through-MAX encoding, but only
+            // after proving the count fits the remaining positive domain.
+            // Plain signed addition panics at the final rowid; unchecked
+            // wrapping alone could turn an invalid count into ownership proof.
             if my_count_since > 0
+                && sp_next > 0
+                && my_count_since <= i64::MAX - sp_next + 1
                 && let Some(state) = tables.get_mut(&key)
-                && state.next_rowid == sp_next + my_count_since
+                && state.next_rowid == sp_next.wrapping_add(my_count_since)
             {
                 state.next_rowid = sp_next;
                 if state.mode == RowIdMode::AutoIncrement {
@@ -422,7 +444,7 @@ impl ConcurrentRowIdAllocator {
         let mut tables = self.tables.lock();
         match tables.get_mut(&key) {
             Some(state) => {
-                state.next_rowid = state.next_rowid.max(derived.next_rowid);
+                state.next_rowid = max_rowid_tip(state.next_rowid, derived.next_rowid);
                 state.mode = mode;
                 if mode == RowIdMode::AutoIncrement {
                     state.autoincrement_high_water = state
@@ -696,6 +718,176 @@ mod tests {
             schema_epoch: epoch(e),
             table_id: table(t),
         }
+    }
+
+    #[test]
+    fn durable_maximum_starts_exhausted_including_after_restart() {
+        for (mode, committed, sequence) in [
+            (RowIdMode::Normal, Some(RowId::MAX), 0),
+            (RowIdMode::AutoIncrement, Some(RowId::MAX), 0),
+            (RowIdMode::AutoIncrement, None, i64::MAX),
+            (RowIdMode::AutoIncrement, Some(RowId::new(7)), i64::MAX),
+        ] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.init_table(k, committed, sequence, mode);
+            assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
+            assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+            assert_eq!(alloc.reserve_range(k, 64), Err(RowIdAllocError::Exhausted));
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
+            }
+        }
+    }
+
+    #[test]
+    fn floor_refresh_cannot_revive_an_exhausted_allocator() {
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            for explicit in [false, true] {
+                let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+                let k = key(1, 1);
+                alloc.init_table(k, Some(RowId::new(i64::MAX - 1)), 0, mode);
+                if explicit {
+                    alloc.bump_explicit(k, RowId::MAX).unwrap();
+                } else {
+                    assert_eq!(alloc.allocate_one(k).unwrap(), RowId::MAX);
+                }
+                // A stale connection can report any earlier durable tip.
+                // Even a floor derived from MAX must remain terminal.
+                for (committed, sequence) in [
+                    (None, 0),
+                    (Some(RowId::new(10)), 5),
+                    (Some(RowId::new(i64::MAX - 1)), i64::MAX - 1),
+                    (Some(RowId::MAX), i64::MAX),
+                ] {
+                    alloc.ensure_table_floor(k, committed, sequence, mode);
+                    assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
+                    assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+                    if mode == RowIdMode::AutoIncrement {
+                        assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observing_a_durable_maximum_fences_existing_and_ipc_reservations() {
+        for (mode, committed, sequence) in [
+            (RowIdMode::Normal, Some(RowId::MAX), 0),
+            (RowIdMode::AutoIncrement, None, i64::MAX),
+        ] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.init_table(k, None, 0, mode);
+            assert_eq!(alloc.allocate_one(k).unwrap().get(), 1);
+            alloc.ensure_table_floor(k, committed, sequence, mode);
+            alloc.ensure_table_floor(k, None, 0, mode);
+            let payload = RowidReservePayload {
+                txn: crate::coordinator_ipc::WireTxnToken {
+                    txn_id: 1,
+                    txn_epoch: 1,
+                },
+                schema_epoch: 1,
+                table_id: 1,
+                count: 1,
+            };
+            assert_eq!(
+                alloc.handle_rowid_reserve(&payload),
+                RowidReserveResponse::Err { code: SQLITE_FULL }
+            );
+            assert_eq!(alloc.session_reservation_len(), 0);
+        }
+    }
+
+    #[test]
+    fn durable_high_water_includes_existing_rows_and_normal_mode_ignores_sequence() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        alloc.init_table(k, Some(RowId::new(100)), 10, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.autoincrement_high_water(&k), Some(100));
+        alloc.ensure_table_floor(k, Some(RowId::new(200)), 20, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.autoincrement_high_water(&k), Some(200));
+        assert_eq!(alloc.allocate_one(k).unwrap().get(), 201);
+        alloc.ensure_table_floor(k, Some(RowId::new(50)), 5, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.allocate_one(k).unwrap().get(), 202);
+
+        let normal = key(1, 2);
+        alloc.init_table(normal, None, i64::MAX, RowIdMode::Normal);
+        assert_eq!(alloc.allocate_one(normal).unwrap().get(), 1);
+        assert_eq!(alloc.autoincrement_high_water(&normal), Some(0));
+        let negative = key(1, 3);
+        alloc.init_table(negative, Some(RowId::new(-10)), -5, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.autoincrement_high_water(&negative), Some(0));
+        assert_eq!(alloc.allocate_one(negative).unwrap().get(), 1);
+    }
+
+    #[test]
+    fn savepoint_reclaims_the_final_owned_rowid_without_overflow() {
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            for fresh in [false, true] {
+                let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+                let k = key(1, 1);
+                if !fresh {
+                    alloc.init_table(k, Some(RowId::new(i64::MAX - 1)), 0, mode);
+                }
+                let mark = alloc.mark_savepoint(10);
+                if fresh {
+                    alloc.init_table(k, Some(RowId::new(i64::MAX - 1)), 0, mode);
+                }
+                assert_eq!(alloc.allocate_one_for_session(k, 10).unwrap(), RowId::MAX);
+                assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+                alloc.rewind_to_mark(&mark);
+                assert_eq!(alloc.next_rowid(&k), Some(i64::MAX));
+                assert_eq!(alloc.session_reservation_len(), 0);
+                if mode == RowIdMode::AutoIncrement {
+                    assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX - 1));
+                }
+                // Repeating the rollback does not invent another reservation.
+                alloc.rewind_to_mark(&mark);
+                assert_eq!(alloc.allocate_one_for_session(k, 10).unwrap(), RowId::MAX);
+                assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+            }
+        }
+    }
+
+    #[test]
+    fn savepoint_never_reclaims_a_peers_final_rowid() {
+        for mode in [RowIdMode::Normal, RowIdMode::AutoIncrement] {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let k = key(1, 1);
+            alloc.init_table(k, Some(RowId::new(i64::MAX - 2)), 0, mode);
+            let mark = alloc.mark_savepoint(10);
+            assert_eq!(alloc.allocate_one_for_session(k, 10).unwrap().get(), i64::MAX - 1);
+            assert_eq!(alloc.allocate_one_for_session(k, 20).unwrap(), RowId::MAX);
+            alloc.rewind_to_mark(&mark);
+            assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
+            assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+            assert_eq!(alloc.session_reservation_len(), 1, "peer attribution survives");
+            if mode == RowIdMode::AutoIncrement {
+                assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_oversized_range_preserves_the_last_valid_reservation() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        alloc.init_table(k, Some(RowId::new(i64::MAX - 3)), 0, RowIdMode::AutoIncrement);
+        let mark = alloc.mark_savepoint(10);
+        assert_eq!(alloc.reserve_range_for_session(k, 4, 10), Err(RowIdAllocError::Exhausted));
+        assert_eq!(alloc.session_reservation_len(), 0);
+        let range = alloc.reserve_range_for_session(k, 3, 10).unwrap();
+        assert_eq!(range.end_rowid_inclusive(), Some(RowId::MAX));
+        let mut cache = LocalRowIdCache::new(range, k);
+        for expected in [i64::MAX - 2, i64::MAX - 1, i64::MAX] {
+            assert_eq!(cache.allocate(), Some(RowId::new(expected)));
+        }
+        assert_eq!(cache.allocate(), None);
+        assert_eq!(cache.remaining(), 0);
+        alloc.rewind_to_mark(&mark);
+        assert_eq!(alloc.reserve_range_for_session(k, 3, 10).unwrap(), range);
     }
 
     // ── bd-gh-147: CAS savepoint rewind safety ──
@@ -980,6 +1172,7 @@ mod tests {
         // Txn B: allocate range of 20 → rowids 11..30.
         let range_b = alloc.reserve_range(k, 20).unwrap();
         assert_eq!(range_b.start_rowid.get(), 11);
+        assert_eq!(range_b.count, 20);
 
         // The high-water reflects the max of both (30).
         let hw = alloc.autoincrement_high_water(&k).unwrap();
