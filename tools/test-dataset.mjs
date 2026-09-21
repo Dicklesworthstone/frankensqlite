@@ -35,7 +35,10 @@ function parseUnifiedHunks(patch) {
     i++;
     for (; i < lines.length; i++) {
       const l = lines[i];
-      if (l.startsWith("@@")) { i--; break; }
+      if (l.startsWith("@@")) {
+        i--;
+        break;
+      }
       if (l.startsWith("diff --git")) break;
       if (l.startsWith("index ") || l.startsWith("---") || l.startsWith("+++")) continue;
       hunkLines.push(l);
@@ -45,14 +48,16 @@ function parseUnifiedHunks(patch) {
   return hunks;
 }
 
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 
 function applyPatchLines(prevLines, patch) {
   const hunks = parseUnifiedHunks(patch);
   const out = prevLines.slice();
   let offset = 0;
   for (const h of hunks) {
-    let at = (h.oldStart - 1) + offset;
+    let at = h.oldStart - 1 + offset;
     at = clamp(at, 0, out.length);
     let cursor = at;
     const next = [];
@@ -60,9 +65,14 @@ function applyPatchLines(prevLines, patch) {
       if (!hl) continue;
       const p = hl[0];
       const content = hl.slice(1);
-      if (p === " ") { next.push(content); cursor += 1; }
-      else if (p === "-") { cursor += 1; }
-      else if (p === "+") { next.push(content); }
+      if (p === " ") {
+        next.push(content);
+        cursor += 1;
+      } else if (p === "-") {
+        cursor += 1;
+      } else if (p === "+") {
+        next.push(content);
+      }
     }
     out.splice(at, cursor - at, ...next);
     offset += next.length - (cursor - at);
@@ -108,7 +118,8 @@ function assert(condition, msg, ctx) {
   } else {
     failed++;
     console.error(`  FAIL: ${msg}`);
-    if (ctx !== undefined) console.error(`    Context:`, typeof ctx === "string" ? ctx : JSON.stringify(ctx));
+    if (ctx !== undefined)
+      console.error(`    Context:`, typeof ctx === "string" ? ctx : JSON.stringify(ctx));
   }
 }
 
@@ -196,7 +207,8 @@ console.log("--- 1. Patch Apply ---");
 // 1i. Patch with diff header lines (should be skipped)
 {
   const prev = ["hello", "world"];
-  const patch = "diff --git a/file.md b/file.md\nindex abc1234..def5678 100644\n--- a/file.md\n+++ b/file.md\n@@ -1,2 +1,2 @@\n-hello\n+Hello\n world\n";
+  const patch =
+    "diff --git a/file.md b/file.md\nindex abc1234..def5678 100644\n--- a/file.md\n+++ b/file.md\n@@ -1,2 +1,2 @@\n-hello\n+Hello\n world\n";
   const result = applyPatchLines(prev, patch);
   assertEq(result, ["Hello", "world"], "1i: patch with full git diff headers");
 }
@@ -237,7 +249,11 @@ console.log("--- 2. countDiffLines ---");
 
 {
   const patch = "--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new\n";
-  assertEq(countDiffLines(patch), { add: 1, del: 1, impact: 2 }, "2e: --- and +++ lines not counted");
+  assertEq(
+    countDiffLines(patch),
+    { add: 1, del: 1, impact: 2 },
+    "2e: --- and +++ lines not counted",
+  );
 }
 
 // ============================================================
@@ -311,7 +327,11 @@ console.log("--- 5. parseUnifiedHunks ---");
   assertEq(hunks[0].oldCount, 3, "5a: oldCount");
   assertEq(hunks[0].newStart, 1, "5a: newStart");
   assertEq(hunks[0].newCount, 4, "5a: newCount");
-  assert(hunks[0].lines.length >= 4, "5a: at least 4 hunk lines (trailing empty ok)", hunks[0].lines.length);
+  assert(
+    hunks[0].lines.length >= 4,
+    "5a: at least 4 hunk lines (trailing empty ok)",
+    hunks[0].lines.length,
+  );
 }
 
 {

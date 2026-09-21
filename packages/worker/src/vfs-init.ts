@@ -14,9 +14,7 @@ export class UnsupportedPersistenceModeError extends Error {
   }
 }
 
-export function resolvePersistenceMode(
-  persistence: PersistenceMode | undefined,
-): PersistenceMode {
+export function resolvePersistenceMode(persistence: PersistenceMode | undefined): PersistenceMode {
   return persistence ?? "memory";
 }
 
@@ -31,9 +29,7 @@ export function createReadyResult(config: InitConfig): InitResult {
   };
 }
 
-export function assertSupportedPersistenceMode(
-  persistence: PersistenceMode,
-): void {
+export function assertSupportedPersistenceMode(persistence: PersistenceMode): void {
   if (persistence !== "memory" && !isSnapshotPersistenceMode(persistence)) {
     throw new UnsupportedPersistenceModeError(persistence);
   }

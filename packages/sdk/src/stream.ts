@@ -3,7 +3,14 @@ import { FrankenSQLiteError } from "./errors";
 import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource, SqlScalar } from "./types";
 import type { FrankenWorkerClient } from "./worker-client";
 
-export type StreamFailurePhase = "input" | "source" | "prepare" | "execute" | "progress" | "cleanup" | "cancelled";
+export type StreamFailurePhase =
+  | "input"
+  | "source"
+  | "prepare"
+  | "execute"
+  | "progress"
+  | "cleanup"
+  | "cancelled";
 
 /** The original SQL/producer error remains available as cause. */
 export class FrankenStreamError extends Error {
@@ -15,8 +22,10 @@ export class FrankenStreamError extends Error {
     cause: unknown,
     readonly cleanupErrors: readonly unknown[] = [],
   ) {
-    super(`FrankenSQLite stream ${phase} failed${rowIndex === undefined ? "" : ` at input row ${rowIndex}`}`,
-      { cause });
+    super(
+      `FrankenSQLite stream ${phase} failed${rowIndex === undefined ? "" : ` at input row ${rowIndex}`}`,
+      { cause },
+    );
     this.name = "FrankenStreamError";
     this.code = phase === "cancelled" ? "ERR_FSQLITE_STREAM_CANCELLED" : "ERR_FSQLITE_STREAM";
   }
@@ -30,7 +39,8 @@ export interface RowStreamConfig {
 }
 
 export function checkStreamCancellation(config: RowStreamConfig, rowIndex?: number): void {
-  if (config.signal?.aborted) throw new FrankenStreamError("cancelled", rowIndex, config.signal.reason);
+  if (config.signal?.aborted)
+    throw new FrankenStreamError("cancelled", rowIndex, config.signal.reason);
 }
 
 /** Validate before BEGIN or touching a producer; capture options exactly once. */
@@ -44,14 +54,24 @@ export function streamOptions(sql: string, options: ExecuteStreamOptions = {}): 
     if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_EXECUTE_MANY_ROWS) {
       throw new RangeError(`batchSize must be an integer in 1..${MAX_EXECUTE_MANY_ROWS}`);
     }
-    if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes < 1 || maxBatchBytes > 64 * 1024 * 1024) {
+    if (
+      !Number.isSafeInteger(maxBatchBytes) ||
+      maxBatchBytes < 1 ||
+      maxBatchBytes > 64 * 1024 * 1024
+    ) {
       throw new RangeError("maxBatchBytes must be an integer in 1..67108864");
     }
-    if (signal !== undefined && (signal === null || typeof signal.aborted !== "boolean" ||
-      typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")) {
+    if (
+      signal !== undefined &&
+      (signal === null ||
+        typeof signal.aborted !== "boolean" ||
+        typeof signal.addEventListener !== "function" ||
+        typeof signal.removeEventListener !== "function")
+    ) {
       throw new TypeError("signal must be an AbortSignal");
     }
-    if (onProgress !== undefined && typeof onProgress !== "function") throw new TypeError("onProgress must be a function");
+    if (onProgress !== undefined && typeof onProgress !== "function")
+      throw new TypeError("onProgress must be a function");
     const config = { batchSize, maxBatchBytes, signal, onProgress };
     checkStreamCancellation(config, 0);
     return config;
@@ -63,9 +83,14 @@ export function streamOptions(sql: string, options: ExecuteStreamOptions = {}): 
 
 interface RowIterator {
   next(): IteratorResult<readonly SqlScalar[]> | PromiseLike<IteratorResult<readonly SqlScalar[]>>;
-  return?(): IteratorResult<readonly SqlScalar[]> | PromiseLike<IteratorResult<readonly SqlScalar[]>>;
+  return?():
+    | IteratorResult<readonly SqlScalar[]>
+    | PromiseLike<IteratorResult<readonly SqlScalar[]>>;
 }
-type StreamClient = Pick<FrankenWorkerClient, "prepare" | "executePreparedMany" | "finalizePrepared">;
+type StreamClient = Pick<
+  FrankenWorkerClient,
+  "prepare" | "executePreparedMany" | "finalizePrepared"
+>;
 
 function rowIterator(source: SqlRowSource): RowIterator {
   const asyncFactory = (source as AsyncIterable<readonly SqlScalar[]>)[Symbol.asyncIterator];
@@ -81,8 +106,12 @@ function rowIterator(source: SqlRowSource): RowIterator {
   return iterator;
 }
 
-function copyRow(row: readonly SqlScalar[], maxBytes: number): { params: SqlScalar[]; bytes: number } {
-  if (!Array.isArray(row)) throw new TypeError("Each input row must be a positional parameter array");
+function copyRow(
+  row: readonly SqlScalar[],
+  maxBytes: number,
+): { params: SqlScalar[]; bytes: number } {
+  if (!Array.isArray(row))
+    throw new TypeError("Each input row must be a positional parameter array");
   // Account before cloning large blobs. The allowances deliberately make empty
   // arrays, NULLs and other zero-payload values consume the budget as well.
   let bytes = 16;
@@ -94,11 +123,12 @@ function copyRow(row: readonly SqlScalar[], maxBytes: number): { params: SqlScal
     bytes += 16;
     if (value instanceof Uint8Array) bytes += value.byteLength;
     else if (typeof value === "string") bytes += value.length * 2;
-    else if (typeof value === "bigint" && (value < -(1n << 63n) || value >= (1n << 63n))) {
+    else if (typeof value === "bigint" && (value < -(1n << 63n) || value >= 1n << 63n)) {
       throw new RangeError("Integer parameters must fit SQLite's signed 64-bit range");
-    }
-    else if (value !== null && !["number", "bigint", "boolean"].includes(typeof value)) {
-      throw new TypeError("Parameters must be SQL scalars (null, string, number, bigint, boolean or Uint8Array)");
+    } else if (value !== null && !["number", "bigint", "boolean"].includes(typeof value)) {
+      throw new TypeError(
+        "Parameters must be SQL scalars (null, string, number, bigint, boolean or Uint8Array)",
+      );
     }
     if (bytes > maxBytes) throw new RangeError("One input row exceeds maxBatchBytes");
     // Producers often reuse a scratch row/blob on every yield. Detach both
@@ -137,11 +167,19 @@ export async function executeRowStream(
     bytes = 0;
     let result;
     try {
-      result = await client.executePreparedMany(statementId!, batch,
-        config.signal === undefined ? undefined : { signal: config.signal });
+      result = await client.executePreparedMany(
+        statementId!,
+        batch,
+        config.signal === undefined ? undefined : { signal: config.signal },
+      );
     } catch (error: unknown) {
-      if (error instanceof FrankenSQLiteError && error.batchIndex !== undefined &&
-        Number.isSafeInteger(error.batchIndex) && error.batchIndex >= 0 && error.batchIndex < batch.length) {
+      if (
+        error instanceof FrankenSQLiteError &&
+        error.batchIndex !== undefined &&
+        Number.isSafeInteger(error.batchIndex) &&
+        error.batchIndex >= 0 &&
+        error.batchIndex < batch.length
+      ) {
         rowIndex = totals.executions + error.batchIndex;
       }
       if (error instanceof FrankenSQLiteError && error.code === "ERR_FSQLITE_BULK_CANCELLED") {
@@ -149,9 +187,14 @@ export async function executeRowStream(
       }
       throw error;
     }
-    if (result.executions !== batch.length || !Number.isSafeInteger(result.changes) || result.changes < 0 ||
+    if (
+      result.executions !== batch.length ||
+      !Number.isSafeInteger(result.changes) ||
+      result.changes < 0 ||
       !Number.isSafeInteger(totals.executions + result.executions) ||
-      !Number.isSafeInteger(totals.changes + result.changes) || !Number.isSafeInteger(totals.batches + 1)) {
+      !Number.isSafeInteger(totals.changes + result.changes) ||
+      !Number.isSafeInteger(totals.batches + 1)
+    ) {
       throw new RangeError("Stream result counts are invalid or exceed the safe integer range");
     }
     totals.executions += result.executions;
@@ -173,7 +216,8 @@ export async function executeRowStream(
     const metadata = await client.prepare(sql);
     statementId = metadata.statementId;
     checkStreamCancellation(config, 0);
-    if (metadata.columnCount !== 0) throw new TypeError("Stream execution does not accept result rows");
+    if (metadata.columnCount !== 0)
+      throw new TypeError("Stream execution does not accept result rows");
     phase = "source";
     rowIndex = 0;
     iterator = rowIterator(source);
@@ -182,7 +226,8 @@ export async function executeRowStream(
       rowIndex = consumed;
       checkStreamCancellation(config, consumed);
       const next = await iterator.next();
-      if (next === null || typeof next !== "object") throw new TypeError("Iterator next() must return an object");
+      if (next === null || typeof next !== "object")
+        throw new TypeError("Iterator next() must return an object");
       if (next.done) {
         exhausted = true;
         checkStreamCancellation(config, consumed);
@@ -195,13 +240,15 @@ export async function executeRowStream(
       rows.push(row.params);
       bytes += row.bytes;
       consumed += 1;
-      if (!Number.isSafeInteger(consumed)) throw new RangeError("Stream input count exceeds the safe integer range");
+      if (!Number.isSafeInteger(consumed))
+        throw new RangeError("Stream input count exceeds the safe integer range");
       // No concurrent next() and no prefetch while a worker batch is outstanding.
       if (rows.length === config.batchSize || bytes === config.maxBatchBytes) await flush();
     }
     await flush();
   } catch (error: unknown) {
-    failure = error instanceof FrankenStreamError ? error : new FrankenStreamError(phase, rowIndex, error);
+    failure =
+      error instanceof FrankenStreamError ? error : new FrankenStreamError(phase, rowIndex, error);
   }
 
   const cleanupErrors: unknown[] = [];
@@ -211,15 +258,19 @@ export async function executeRowStream(
       if (finish !== undefined && finish !== null) {
         if (typeof finish !== "function") throw new TypeError("Iterator return must be a function");
         const returned = await finish.call(iterator);
-        if (returned === null || typeof returned !== "object") throw new TypeError("Iterator return() must return an object");
+        if (returned === null || typeof returned !== "object")
+          throw new TypeError("Iterator return() must return an object");
       }
     } catch (error: unknown) {
       cleanupErrors.push(error);
     }
   }
   if (statementId !== undefined) {
-    try { await client.finalizePrepared(statementId); }
-    catch (error: unknown) { cleanupErrors.push(error); }
+    try {
+      await client.finalizePrepared(statementId);
+    } catch (error: unknown) {
+      cleanupErrors.push(error);
+    }
   }
   if (failure !== undefined) {
     throw new FrankenStreamError(failure.phase, failure.rowIndex, failure.cause, cleanupErrors);

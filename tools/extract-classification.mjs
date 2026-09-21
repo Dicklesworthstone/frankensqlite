@@ -9,7 +9,7 @@
  *     --out site/spec-evolution/data/spec_evolution_classification_v1.json
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import vm from "node:vm";
 
@@ -20,8 +20,14 @@ const flags = {
 };
 
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--html" && args[i + 1]) { flags.html = args[++i]; continue; }
-  if (args[i] === "--out" && args[i + 1]) { flags.out = args[++i]; continue; }
+  if (args[i] === "--html" && args[i + 1]) {
+    flags.html = args[++i];
+    continue;
+  }
+  if (args[i] === "--out" && args[i + 1]) {
+    flags.out = args[++i];
+    continue;
+  }
   if (args[i] === "--help" || args[i] === "-h") {
     console.log(`Usage: node tools/extract-classification.mjs [--html PATH] [--out PATH]
 
@@ -52,12 +58,24 @@ function findArrayLiteral(src, marker, nextMarker) {
   for (let i = open; i < endLimit; i++) {
     const ch = src[i];
     if (inStr) {
-      if (escape) { escape = false; continue; }
-      if (ch === "\\") { escape = true; continue; }
-      if (ch === inStr) { inStr = null; continue; }
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === inStr) {
+        inStr = null;
+        continue;
+      }
       continue;
     }
-    if (ch === "'" || ch === '"' || ch === "`") { inStr = ch; continue; }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      inStr = ch;
+      continue;
+    }
     if (ch === "[") depth++;
     if (ch === "]") {
       depth--;
@@ -67,7 +85,7 @@ function findArrayLiteral(src, marker, nextMarker) {
 
   throw new Error(
     `Unterminated array literal after marker: ${marker}` +
-    (nextMarker ? ` (nextMarker=${nextMarker})` : "")
+      (nextMarker ? ` (nextMarker=${nextMarker})` : ""),
   );
 }
 
@@ -102,4 +120,6 @@ const out = {
 
 mkdirSync(dirname(flags.out), { recursive: true });
 writeFileSync(flags.out, JSON.stringify(out, null, 2) + "\n", "utf-8");
-console.log(`[extract] Wrote ${flags.out} (early=${early.length}, middle=${middle.length}, late=${late.length})`);
+console.log(
+  `[extract] Wrote ${flags.out} (early=${early.length}, middle=${middle.length}, late=${late.length})`,
+);

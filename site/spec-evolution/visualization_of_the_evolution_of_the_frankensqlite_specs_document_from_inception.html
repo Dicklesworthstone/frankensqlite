@@ -957,7 +957,7 @@
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 
 <script type="module">
-    import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
+    import { animate, spring, stagger } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
 
     const CANONICAL_ORIGIN = "https://frankensqlite.com";
     const DB_FILENAME = "data/spec_evolution_v1.sqlite3";
@@ -979,10 +979,10 @@
     let DB = null;
     let COMMITS = [];
     let FILTERED = []; 
-    let GROUPS = new Map();
-    let DOC_CACHE = new Map();
-    let PATCH_CACHE = new Map();
-    let METRICS = [];
+    const GROUPS = new Map();
+    const DOC_CACHE = new Map();
+    const PATCH_CACHE = new Map();
+    const METRICS = [];
     let BASE_DOC = "";
     
     const STATE = { 
@@ -1536,7 +1536,7 @@
 
     // --- Interactions ---
 
-    window.selectCommit = async function(idx, animateScroll = true, isAuto = false) {
+    window.selectCommit = async (idx, animateScroll = true, isAuto = false) => {
         if (!isAuto && STATE.playing) togglePlay();
 
         const targetIdx = Math.max(0, Math.min(COMMITS.length - 1, idx));
@@ -2148,7 +2148,7 @@
 
     function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
 
-    let charts = {};
+    const charts = {};
     function renderCharts(nonce) {
         if (nonce !== STATE.renderNonce) return;
         const t = { 

@@ -1,10 +1,18 @@
 // Compile-only public entrypoint contracts, including intentional misuse.
-import { scanTable, FrankenDBQueue } from "../src/index";
+
 import type { TableScan, TableScanOptions, TableScanStats } from "../src/index";
+import { type FrankenDBQueue, scanTable } from "../src/index";
+
 declare const queue: FrankenDBQueue;
 declare const signal: AbortSignal;
-const options: TableScanOptions = { columns: ["id", "value"], batchSize: 128, reverse: true,
-  idleTimeoutMs: 5000, waitTimeoutMs: 1000, signal };
+const options: TableScanOptions = {
+  columns: ["id", "value"],
+  batchSize: 128,
+  reverse: true,
+  idleTimeoutMs: 5000,
+  waitTimeoutMs: 1000,
+  signal,
+};
 const scan: TableScan<{ id: bigint; value: string }> = scanTable(queue, "items", options);
 const done: Promise<void> = scan.done;
 const stats: Readonly<TableScanStats> = scan.stats;

@@ -1,7 +1,6 @@
-import { describe, expect, it } from "vitest";
-
-import { FrankenDB } from "../src/database";
 import type { WorkerResponse } from "@frankensqlite/worker";
+import { describe, expect, it } from "vitest";
+import { FrankenDB } from "../src/database";
 import type { WorkerLike, WorkerMessageEvent } from "../src/worker-client";
 
 class PreparedWorker implements WorkerLike {

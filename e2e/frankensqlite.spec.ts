@@ -1,4 +1,4 @@
-import { test, expect, type Page, type ConsoleMessage } from "@playwright/test";
+import { type ConsoleMessage, expect, type Page, test } from "@playwright/test";
 
 // ---------------------------------------------------------------------------
 // Console monitor – captures runtime errors, network failures, React warnings
@@ -42,9 +42,7 @@ class ConsoleMonitor {
   }
 
   getRuntimeErrors() {
-    return this.errors.filter(
-      (e) => e.category === "runtime" || e.category === "pageerror"
-    );
+    return this.errors.filter((e) => e.category === "runtime" || e.category === "pageerror");
   }
 }
 
@@ -69,10 +67,9 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
     await expect(page).toHaveTitle(/FrankenSQLite/i);
 
     // KPI widgets should populate (not stay as "-")
-    await page.waitForFunction(
-      () => document.getElementById("kpiCommits")?.textContent !== "-",
-      { timeout: 10_000 }
-    );
+    await page.waitForFunction(() => document.getElementById("kpiCommits")?.textContent !== "-", {
+      timeout: 10_000,
+    });
     const commits = await page.textContent("#kpiCommits");
     expect(Number(commits)).toBeGreaterThan(50);
   });
@@ -88,10 +85,7 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
     expect(href).toContain("COMPREHENSIVE_SPEC");
 
     // Navigate and verify it loads
-    const [response] = await Promise.all([
-      page.waitForNavigation(),
-      specLink.click(),
-    ]);
+    const [response] = await Promise.all([page.waitForNavigation(), specLink.click()]);
     expect(response?.status()).toBe(200);
   });
 
@@ -133,10 +127,9 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
     await expect(page.locator("#btnGalaxy")).toBeVisible();
 
     // Commit list loads
-    await page.waitForFunction(
-      () => (document.querySelectorAll("#commitList > *").length > 5),
-      { timeout: 15_000 }
-    );
+    await page.waitForFunction(() => document.querySelectorAll("#commitList > *").length > 5, {
+      timeout: 15_000,
+    });
     const commitCount = await page.locator("#commitList > *").count();
     expect(commitCount).toBeGreaterThan(10);
 
@@ -197,10 +190,9 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
   // ── Dock slider interaction ───────────────────────────────────────────
   test("dock slider scrolls through commits", async ({ page }) => {
     await page.goto("/");
-    await page.waitForFunction(
-      () => document.getElementById("kpiCommits")?.textContent !== "-",
-      { timeout: 10_000 }
-    );
+    await page.waitForFunction(() => document.getElementById("kpiCommits")?.textContent !== "-", {
+      timeout: 10_000,
+    });
 
     const slider = page.locator("#dockSlider");
     await expect(slider).toBeVisible();
@@ -236,7 +228,7 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
 
     // Also check if the commit slider moved to index 5
     const sliderVal = await page.evaluate(
-      () => (document.getElementById("dockSlider") as HTMLInputElement)?.value
+      () => (document.getElementById("dockSlider") as HTMLInputElement)?.value,
     );
 
     // At minimum the page should have loaded without error
@@ -256,9 +248,7 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
   });
 
   // ── Performance: no excessive DOM size ────────────────────────────────
-  test("DOM size audit (report element count breakdown)", async ({
-    page,
-  }) => {
+  test("DOM size audit (report element count breakdown)", async ({ page }) => {
     await page.goto("/");
     await page.waitForLoadState("networkidle");
 
@@ -307,10 +297,7 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
 
     const errors = monitor.getErrors();
     const critical = errors.filter(
-      (e) =>
-        e.category === "runtime" ||
-        e.category === "hydration" ||
-        e.category === "security"
+      (e) => e.category === "runtime" || e.category === "hydration" || e.category === "security",
     );
     if (critical.length > 0) {
       console.log("Critical errors:", JSON.stringify(critical, null, 2));
@@ -321,10 +308,9 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
   // ── Filter interaction doesn't crash ──────────────────────────────────
   test("filter panel opens and bucket toggles work", async ({ page }) => {
     await page.goto("/");
-    await page.waitForFunction(
-      () => document.getElementById("kpiCommits")?.textContent !== "-",
-      { timeout: 10_000 }
-    );
+    await page.waitForFunction(() => document.getElementById("kpiCommits")?.textContent !== "-", {
+      timeout: 10_000,
+    });
 
     // Click Filters button
     const filtersBtn = page.locator('button:has-text("Filters")');
@@ -371,16 +357,13 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
    */
   async function goToSpecWithChanges(page: Page): Promise<boolean> {
     await page.goto("/?v=spec&c=5");
-    await page.waitForFunction(
-      () => document.getElementById("kpiCommits")?.textContent !== "-",
-      { timeout: 10_000 }
-    );
+    await page.waitForFunction(() => document.getElementById("kpiCommits")?.textContent !== "-", {
+      timeout: 10_000,
+    });
     await page.waitForSelector("#docRendered", { state: "attached", timeout: 5_000 });
     await page.waitForTimeout(1000);
     // Check if the feature is deployed
-    const hasFeature = await page.evaluate(
-      () => !!document.getElementById("btnIHToggle")
-    );
+    const hasFeature = await page.evaluate(() => !!document.getElementById("btnIHToggle"));
     return hasFeature;
   }
 
@@ -425,7 +408,10 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
     });
     console.log(`[IH Diag] internals:`, JSON.stringify(diag, null, 2));
 
-    test.skip(highlightCount === 0, "No highlights produced for this commit — sentinel rendering may not be fully deployed");
+    test.skip(
+      highlightCount === 0,
+      "No highlights produced for this commit — sentinel rendering may not be fully deployed",
+    );
 
     expect(highlightCount).toBeGreaterThan(0);
 
@@ -446,7 +432,10 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
 
     // Enable
     const onCount = await enableHighlightsAndWait(page);
-    test.skip(onCount === 0, "Sentinel rendering not producing highlights — feature partially deployed");
+    test.skip(
+      onCount === 0,
+      "Sentinel rendering not producing highlights — feature partially deployed",
+    );
 
     // Disable
     await page.locator("#btnIHToggle").click();
@@ -456,9 +445,7 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
     expect(offCount).toBe(0);
 
     // Nav bar should be hidden
-    const navDisplay = await page.evaluate(
-      () => document.getElementById("ihNav")?.style.display
-    );
+    const navDisplay = await page.evaluate(() => document.getElementById("ihNav")?.style.display);
     expect(navDisplay).not.toBe("inline-flex");
 
     expect(monitor.getRuntimeErrors()).toHaveLength(0);
@@ -474,7 +461,7 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
 
     // Get initial scroll position
     const scrollBefore = await page.evaluate(
-      () => document.getElementById("docRendered")?.scrollTop ?? 0
+      () => document.getElementById("docRendered")?.scrollTop ?? 0,
     );
 
     // Click "Next change"
@@ -482,7 +469,7 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
     await page.waitForTimeout(500);
 
     const scrollAfterNext = await page.evaluate(
-      () => document.getElementById("docRendered")?.scrollTop ?? 0
+      () => document.getElementById("docRendered")?.scrollTop ?? 0,
     );
     console.log(`[IH Diag] scroll: before=${scrollBefore}, after_next=${scrollAfterNext}`);
 
@@ -498,7 +485,7 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
     await page.waitForTimeout(500);
 
     const scrollAfterPrev = await page.evaluate(
-      () => document.getElementById("docRendered")?.scrollTop ?? 0
+      () => document.getElementById("docRendered")?.scrollTop ?? 0,
     );
     const labelAfterPrev = await page.textContent("#ihNavLabel");
     console.log(`[IH Diag] scroll: after_prev=${scrollAfterPrev}, label="${labelAfterPrev}"`);
@@ -579,7 +566,10 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
     test.skip(!deployed, "Inline highlights feature not yet deployed");
 
     const countBefore = await enableHighlightsAndWait(page);
-    test.skip(countBefore === 0, "Sentinel rendering not producing highlights — feature partially deployed");
+    test.skip(
+      countBefore === 0,
+      "Sentinel rendering not producing highlights — feature partially deployed",
+    );
 
     // Switch to diff tab
     const diffTab = page.locator('button:has-text("Diff"), [data-tab="diff"]').first();
@@ -605,17 +595,18 @@ test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
   // ── URL state preserves highlights toggle ─────────────────────────────
   test("ih=1 URL param enables highlights on load", async ({ page }) => {
     await page.goto("/?v=spec&c=5&ih=1");
-    await page.waitForFunction(
-      () => document.getElementById("kpiCommits")?.textContent !== "-",
-      { timeout: 10_000 }
-    );
+    await page.waitForFunction(() => document.getElementById("kpiCommits")?.textContent !== "-", {
+      timeout: 10_000,
+    });
     const deployed = await page.evaluate(() => !!document.getElementById("btnIHToggle"));
     test.skip(!deployed, "Inline highlights feature not yet deployed");
 
     // Wait for highlights to appear (ih=1 triggers them on load)
     try {
       await page.waitForSelector("#docRendered .ih-changed", { timeout: 5_000 });
-    } catch { /* may not appear if commit has no changes */ }
+    } catch {
+      /* may not appear if commit has no changes */
+    }
 
     const btnClass = await page.getAttribute("#btnIHToggle", "class");
     const isActive = btnClass?.includes("bg-slate-900") ?? false;

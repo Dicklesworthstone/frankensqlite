@@ -1,8 +1,11 @@
-import { DurableJobError } from "./durable-jobs";
 import type { DurableJobLease, DurableJobQueue, DurableJobTransaction } from "./durable-jobs";
+import { DurableJobError } from "./durable-jobs";
 
 /** The queue, not the runner, owns transactions, persistence and fencing. */
-export type DurableWorkerQueue = Pick<DurableJobQueue, "claim" | "renew" | "complete" | "completeWith" | "fail" | "reapExpired">;
+export type DurableWorkerQueue = Pick<
+  DurableJobQueue,
+  "claim" | "renew" | "complete" | "completeWith" | "fail" | "reapExpired"
+>;
 
 export interface DurableJobContext {
   /** Observe cancellation and await all child work before returning. */
@@ -19,8 +22,15 @@ export interface DurableJobCompletion {
 }
 
 /** External effects must be idempotent: delivery remains at least once. */
-export type DurableJobHandler = (lease: DurableJobLease, context: DurableJobContext) =>
-  string | null | void | DurableJobCompletion | Promise<string | null | void | DurableJobCompletion>;
+export type DurableJobHandler = (
+  lease: DurableJobLease,
+  context: DurableJobContext,
+) =>
+  | string
+  | null
+  | void
+  | DurableJobCompletion
+  | Promise<string | null | void | DurableJobCompletion>;
 
 export interface DurableJobWorkerOptions {
   owner: string;
@@ -69,13 +79,26 @@ export interface DurableJobWorkerStats {
   readonly reapedLeases: number;
 }
 
-export type DurableJobWorkerPhase = "claim" | "renew" | "complete" | "fail" | "reap" | "lease" | "handler" | "run";
+export type DurableJobWorkerPhase =
+  | "claim"
+  | "renew"
+  | "complete"
+  | "fail"
+  | "reap"
+  | "lease"
+  | "handler"
+  | "run";
 
 /** Storage failure or an uncertain outcome. Never authorizes automatic replay. */
 export class DurableJobWorkerError extends Error {
   readonly code = "ERR_FSQLITE_JOB_WORKER_STOPPED";
-  constructor(readonly phase: DurableJobWorkerPhase, cause: unknown) {
-    super(`Durable job worker stopped during ${phase}; reconcile storage before restarting`, { cause });
+  constructor(
+    readonly phase: DurableJobWorkerPhase,
+    cause: unknown,
+  ) {
+    super(`Durable job worker stopped during ${phase}; reconcile storage before restarting`, {
+      cause,
+    });
     this.name = "DurableJobWorkerError";
   }
 }
@@ -118,7 +141,12 @@ export class DurableJobWorker {
   #reapedLeases = 0;
   readonly done: Promise<void>;
 
-  private constructor(queue: DurableWorkerQueue, handler: DurableJobHandler, policy: Policy, signal: AbortSignal | undefined) {
+  private constructor(
+    queue: DurableWorkerQueue,
+    handler: DurableJobHandler,
+    policy: Policy,
+    signal: AbortSignal | undefined,
+  ) {
     this.#queue = queue;
     this.#handler = handler;
     this.#policy = policy;
@@ -133,22 +161,40 @@ export class DurableJobWorker {
     if (signal?.aborted) this.#onAbort();
   }
 
-  static start(queue: DurableWorkerQueue, handler: DurableJobHandler, options: DurableJobWorkerOptions): DurableJobWorker {
+  static start(
+    queue: DurableWorkerQueue,
+    handler: DurableJobHandler,
+    options: DurableJobWorkerOptions,
+  ): DurableJobWorker {
     const { signal, ...policy } = capturePolicy(options);
     if (typeof handler !== "function") throw new TypeError("A job handler is required");
-    if (queue === null || typeof queue !== "object" ||
-        ["claim", "renew", "complete", "completeWith", "fail", "reapExpired"].some(key => typeof Reflect.get(queue, key) !== "function")) {
+    if (
+      queue === null ||
+      typeof queue !== "object" ||
+      ["claim", "renew", "complete", "completeWith", "fail", "reapExpired"].some(
+        (key) => typeof Reflect.get(queue, key) !== "function",
+      )
+    ) {
       throw new TypeError("A durable job queue is required");
     }
     return new DurableJobWorker(queue, handler, policy, signal);
   }
 
   get stats(): DurableJobWorkerStats {
-    return Object.freeze({ state: this.#state, concurrency: this.#policy.concurrency,
-      activeJobs: this.#active.size, pendingClaims: this.#pendingClaims,
-      claimed: this.#claimed, started: this.#started, completed: this.#completed,
-      failedJobs: this.#failedJobs, cancelledJobs: this.#cancelledJobs,
-      lostLeases: this.#lostLeases, renewals: this.#renewals, reapedLeases: this.#reapedLeases });
+    return Object.freeze({
+      state: this.#state,
+      concurrency: this.#policy.concurrency,
+      activeJobs: this.#active.size,
+      pendingClaims: this.#pendingClaims,
+      claimed: this.#claimed,
+      started: this.#started,
+      completed: this.#completed,
+      failedJobs: this.#failedJobs,
+      cancelledJobs: this.#cancelledJobs,
+      lostLeases: this.#lostLeases,
+      renewals: this.#renewals,
+      reapedLeases: this.#reapedLeases,
+    });
   }
 
   /** Calling from a handler is allowed; awaiting it there would await yourself. */
@@ -184,17 +230,22 @@ export class DurableJobWorker {
   async #run(): Promise<void> {
     try {
       if (this.#state === "running") {
-        try { this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit); }
-        catch (cause: unknown) { this.#halt("reap", cause); }
+        try {
+          this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit);
+        } catch (cause: unknown) {
+          this.#halt("reap", cause);
+        }
       }
       if (this.#state === "running") {
         let consumers = this.#policy.concurrency;
-        const tasks = Array.from({ length: consumers }, () => this.#consume().finally(() => {
-          if (--consumers === 0) this.#requestStop(false, undefined);
-        }));
+        const tasks = Array.from({ length: consumers }, () =>
+          this.#consume().finally(() => {
+            if (--consumers === 0) this.#requestStop(false, undefined);
+          }),
+        );
         tasks.push(this.#reaper());
         // Catch inside each task so one failure cannot abandon its siblings.
-        await Promise.all(tasks.map(task => task.catch(cause => this.#halt("run", cause))));
+        await Promise.all(tasks.map((task) => task.catch((cause) => this.#halt("run", cause))));
       }
     } finally {
       this.#signal?.removeEventListener("abort", this.#onAbort);
@@ -208,8 +259,12 @@ export class DurableJobWorker {
     while (this.#state === "running") {
       await this.#wait(this.#policy.reapIntervalMs);
       if (this.#state !== "running") return;
-      try { this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit); }
-      catch (cause: unknown) { this.#halt("reap", cause); return; }
+      try {
+        this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit);
+      } catch (cause: unknown) {
+        this.#halt("reap", cause);
+        return;
+      }
     }
   }
 
@@ -218,9 +273,14 @@ export class DurableJobWorker {
       let lease: DurableJobLease | null;
       this.#pendingClaims++;
       const claimStarted = performance.now();
-      try { lease = await this.#queue.claim(this.#policy.owner, this.#policy.leaseMs); }
-      catch (cause: unknown) { this.#halt("claim", cause); return; }
-      finally { this.#pendingClaims--; }
+      try {
+        lease = await this.#queue.claim(this.#policy.owner, this.#policy.leaseMs);
+      } catch (cause: unknown) {
+        this.#halt("claim", cause);
+        return;
+      } finally {
+        this.#pendingClaims--;
+      }
       if (lease === null && this.#policy.stopWhenIdle) return;
       if (lease !== null) {
         this.#claimed++;
@@ -236,7 +296,7 @@ export class DurableJobWorker {
 
   #wait(ms: number): Promise<void> {
     if (this.#state !== "running") return Promise.resolve();
-    return new Promise(resolve => {
+    return new Promise((resolve) => {
       const finish = (): void => {
         clearTimeout(timer);
         this.#waiters.delete(finish);
@@ -263,16 +323,25 @@ export class DurableJobWorker {
 
   #remaining(job: ActiveJob): number {
     const now = this.#policy.clock();
-    if (!Number.isSafeInteger(now) || now < 0) throw new RangeError("clock must return nonnegative safe-integer milliseconds");
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new RangeError("clock must return nonnegative safe-integer milliseconds");
     return Math.min(job.lease.expiresAt - now, job.monotonicDeadline - performance.now());
   }
 
   #checkLease(job: ActiveJob): boolean {
     if (job.closed || job.lost || this.#failure !== null) return false;
     try {
-      if (this.#remaining(job) <= 0) this.#lose(job, new DurableJobError("ERR_FSQLITE_JOB_LEASE_LOST",
-        "The acknowledged lease deadline expired; a pending renewal is not ownership authority"));
-    } catch (cause: unknown) { this.#halt("lease", cause); }
+      if (this.#remaining(job) <= 0)
+        this.#lose(
+          job,
+          new DurableJobError(
+            "ERR_FSQLITE_JOB_LEASE_LOST",
+            "The acknowledged lease deadline expired; a pending renewal is not ownership authority",
+          ),
+        );
+    } catch (cause: unknown) {
+      this.#halt("lease", cause);
+    }
     return !job.lost && this.#failure === null;
   }
 
@@ -280,15 +349,25 @@ export class DurableJobWorker {
     this.#disarmLease(job);
     if (!this.#checkLease(job)) return;
     try {
-      job.expiryTimer = setTimeout(() => this.#armLease(job),
-        Math.max(1, Math.ceil(Math.min(this.#remaining(job), this.#policy.heartbeatMs))));
-    } catch (cause: unknown) { this.#halt("lease", cause); }
+      job.expiryTimer = setTimeout(
+        () => this.#armLease(job),
+        Math.max(1, Math.ceil(Math.min(this.#remaining(job), this.#policy.heartbeatMs))),
+      );
+    } catch (cause: unknown) {
+      this.#halt("lease", cause);
+    }
   }
 
   #adoptLease(job: ActiveJob, lease: DurableJobLease, operationStarted: number): void {
-    if (!Number.isSafeInteger(lease.expiresAt) || lease.expiresAt < 0 ||
-        lease.queue !== job.lease.queue || lease.id !== job.lease.id || lease.token !== job.lease.token ||
-        lease.owner !== job.lease.owner || lease.attempt !== job.lease.attempt) {
+    if (
+      !Number.isSafeInteger(lease.expiresAt) ||
+      lease.expiresAt < 0 ||
+      lease.queue !== job.lease.queue ||
+      lease.id !== job.lease.id ||
+      lease.token !== job.lease.token ||
+      lease.owner !== job.lease.owner ||
+      lease.attempt !== job.lease.attempt
+    ) {
       this.#halt("lease", new TypeError("Invalid or mismatched lease acknowledgement"));
       return;
     }
@@ -320,16 +399,30 @@ export class DurableJobWorker {
   }
 
   async #handle(lease: DurableJobLease, claimStarted: number): Promise<void> {
-    const job: ActiveJob = { cancel: new AbortController(), stopHeartbeat: new AbortController(),
-      lease, monotonicDeadline: 0, expiryTimer: undefined, lost: false, closed: false };
+    const job: ActiveJob = {
+      cancel: new AbortController(),
+      stopHeartbeat: new AbortController(),
+      lease,
+      monotonicDeadline: 0,
+      expiryTimer: undefined,
+      lost: false,
+      closed: false,
+    };
     this.#active.add(job);
     if (this.#state === "aborting") job.cancel.abort(this.#abortReason);
     this.#adoptLease(job, lease, claimStarted);
-    const context: DurableJobContext = Object.freeze({ signal: job.cancel.signal, checkpoint: () => {
-      if (job.closed) throw new DurableJobError("ERR_FSQLITE_JOB_CONTEXT_CLOSED", "The job handler scope has finished");
-      this.#checkLease(job);
-      job.cancel.signal.throwIfAborted();
-    } });
+    const context: DurableJobContext = Object.freeze({
+      signal: job.cancel.signal,
+      checkpoint: () => {
+        if (job.closed)
+          throw new DurableJobError(
+            "ERR_FSQLITE_JOB_CONTEXT_CLOSED",
+            "The job handler scope has finished",
+          );
+        this.#checkLease(job);
+        job.cancel.signal.throwIfAborted();
+      },
+    });
     const heartbeat = this.#heartbeat(job, lease);
     let result: string | null = null;
     let apply: DurableJobCompletion["apply"] | undefined;
@@ -343,19 +436,27 @@ export class DurableJobWorker {
           if (typeof value === "object" && value !== null) {
             const capturedApply = value.apply;
             const capturedResult = value.result;
-            if (typeof capturedApply !== "function") throw new TypeError("Job completion requires an apply callback");
+            if (typeof capturedApply !== "function")
+              throw new TypeError("Job completion requires an apply callback");
             apply = capturedApply;
             value = capturedResult;
           }
-          if (value !== undefined && value !== null && typeof value !== "string") throw new TypeError("Invalid job result");
-          if (typeof value === "string" && (value.length > 1024 * 1024 || new TextEncoder().encode(value).byteLength > 1024 * 1024)) {
+          if (value !== undefined && value !== null && typeof value !== "string")
+            throw new TypeError("Invalid job result");
+          if (
+            typeof value === "string" &&
+            (value.length > 1024 * 1024 || new TextEncoder().encode(value).byteLength > 1024 * 1024)
+          ) {
             throw new RangeError("Job result exceeds 1 MiB of UTF-8");
           }
           result = value ?? null;
         }
       } catch (cause: unknown) {
         if (uncertainOutcome(cause)) this.#halt("handler", cause);
-        else { failed = true; failure = cause; }
+        else {
+          failed = true;
+          failure = cause;
+        }
       }
       // A heartbeat already in flight must finish before final mutation. Never
       // race complete/fail with renewal on a transaction-owning connection.
@@ -367,21 +468,31 @@ export class DurableJobWorker {
       const phase = failed || cancelled ? "fail" : "complete";
       try {
         if (phase === "fail") {
-          await this.#queue.fail(lease, describeFailure(cancelled ? job.cancel.signal.reason : failure), this.#policy.retryDelayMs);
+          await this.#queue.fail(
+            lease,
+            describeFailure(cancelled ? job.cancel.signal.reason : failure),
+            this.#policy.retryDelayMs,
+          );
           if (cancelled) this.#cancelledJobs++;
           else this.#failedJobs++;
         } else {
           if (apply === undefined) await this.#queue.complete(lease, result);
           else {
             const application = apply;
-            await this.#queue.completeWith(lease, async tx => {
-              this.#armLease(job);
-              try {
-                context.checkpoint();
-                await application(tx, context);
-                context.checkpoint();
-              } finally { this.#disarmLease(job); }
-            }, result);
+            await this.#queue.completeWith(
+              lease,
+              async (tx) => {
+                this.#armLease(job);
+                try {
+                  context.checkpoint();
+                  await application(tx, context);
+                  context.checkpoint();
+                } finally {
+                  this.#disarmLease(job);
+                }
+              },
+              result,
+            );
           }
           this.#completed++;
         }
@@ -403,31 +514,65 @@ function leaseLost(cause: unknown): boolean {
   return cause instanceof DurableJobError && cause.code === "ERR_FSQLITE_JOB_LEASE_LOST";
 }
 
-function capturePolicy(options: DurableJobWorkerOptions): Policy & { signal: AbortSignal | undefined } {
-  const { owner, concurrency = 1, leaseMs = 30_000, heartbeatMs = Math.floor(leaseMs / 3),
-    pollIntervalMs = 1000, retryDelayMs = 1000, reapIntervalMs = 30_000, reapLimit = 100,
-    clock = Date.now, stopWhenIdle = false, signal } = options;
+function capturePolicy(
+  options: DurableJobWorkerOptions,
+): Policy & { signal: AbortSignal | undefined } {
+  const {
+    owner,
+    concurrency = 1,
+    leaseMs = 30_000,
+    heartbeatMs = Math.floor(leaseMs / 3),
+    pollIntervalMs = 1000,
+    retryDelayMs = 1000,
+    reapIntervalMs = 30_000,
+    reapLimit = 100,
+    clock = Date.now,
+    stopWhenIdle = false,
+    signal,
+  } = options;
   if (typeof stopWhenIdle !== "boolean") throw new TypeError("stopWhenIdle must be a boolean");
   if (typeof clock !== "function") throw new TypeError("clock must be a function");
-  if (typeof owner !== "string" || owner.length === 0 || owner.length > 256 || owner.includes("\0")) {
+  if (
+    typeof owner !== "string" ||
+    owner.length === 0 ||
+    owner.length > 256 ||
+    owner.includes("\0")
+  ) {
     throw new TypeError("owner must be a nonempty string of at most 256 characters without NUL");
   }
   for (const [key, value, min, max] of [
-    ["concurrency", concurrency, 1, 64], ["leaseMs", leaseMs, 3, 86_400_000],
+    ["concurrency", concurrency, 1, 64],
+    ["leaseMs", leaseMs, 3, 86_400_000],
     ["heartbeatMs", heartbeatMs, 1, Math.floor(leaseMs / 3)],
-    ["pollIntervalMs", pollIntervalMs, 1, 2_147_483_647], ["retryDelayMs", retryDelayMs, 0, 2_147_483_647],
-    ["reapIntervalMs", reapIntervalMs, 1, 2_147_483_647], ["reapLimit", reapLimit, 1, 1000],
+    ["pollIntervalMs", pollIntervalMs, 1, 2_147_483_647],
+    ["retryDelayMs", retryDelayMs, 0, 2_147_483_647],
+    ["reapIntervalMs", reapIntervalMs, 1, 2_147_483_647],
+    ["reapLimit", reapLimit, 1, 1000],
   ] as const) {
-    if (!Number.isSafeInteger(value) || value < min || value > max) throw new RangeError(`${key} must be an integer in ${min}..${max}`);
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      throw new RangeError(`${key} must be an integer in ${min}..${max}`);
   }
-  if (signal !== undefined) Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
-  return { owner, concurrency, leaseMs, heartbeatMs, pollIntervalMs, retryDelayMs, reapIntervalMs, reapLimit, clock, stopWhenIdle, signal };
+  if (signal !== undefined)
+    Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
+  return {
+    owner,
+    concurrency,
+    leaseMs,
+    heartbeatMs,
+    pollIntervalMs,
+    retryDelayMs,
+    reapIntervalMs,
+    reapLimit,
+    clock,
+    stopWhenIdle,
+    signal,
+  };
 }
 
 /** One timer and one removable listener; abort is a wake-up, not a rejection. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     const finish = (): void => {
       clearTimeout(timer);
       signal.removeEventListener("abort", finish);
@@ -440,8 +585,11 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 function describeFailure(cause: unknown): string {
-  try { return (cause instanceof Error ? cause.message : String(cause)).slice(0, 16_384); }
-  catch { return "Job handler failed with an unreadable error"; }
+  try {
+    return (cause instanceof Error ? cause.message : String(cause)).slice(0, 16_384);
+  } catch {
+    return "Job handler failed with an unreadable error";
+  }
 }
 
 /** Do not turn an explicit unknown commit in application code into a retry. */
@@ -457,13 +605,18 @@ function uncertainOutcome(cause: unknown): boolean {
       seen.add(value);
       const field = (key: string): unknown => {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor !== undefined && !Object.hasOwn(descriptor, "value")) throw new TypeError("Unreadable error outcome");
+        if (descriptor !== undefined && !Object.hasOwn(descriptor, "value"))
+          throw new TypeError("Unreadable error outcome");
         return descriptor?.value;
       };
       if (field("sqlCommitted") === true) return true;
       const code = field("code");
-      if (code === "ERR_FSQLITE_COMMITTED_CHECKPOINT_FAILED" || code === "ERR_FSQLITE_SNAPSHOT_RECEIPT" ||
-          code === "ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED") return true;
+      if (
+        code === "ERR_FSQLITE_COMMITTED_CHECKPOINT_FAILED" ||
+        code === "ERR_FSQLITE_SNAPSHOT_RECEIPT" ||
+        code === "ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED"
+      )
+        return true;
       pending.push(field("cause"));
       if (value instanceof AggregateError) {
         const errors = field("errors");
@@ -476,5 +629,7 @@ function uncertainOutcome(cause: unknown): boolean {
       }
     }
     return false;
-  } catch { return true; }
+  } catch {
+    return true;
+  }
 }

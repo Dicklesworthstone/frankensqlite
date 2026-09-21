@@ -1,7 +1,7 @@
-import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "./connection";
-import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
-import type { ExecuteManyResult, SqlScalar } from "./protocol";
 import { namedParameterEnd, parameterLayout, resolveBindings } from "./bindings";
+import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "./connection";
+import type { ExecuteManyResult, SqlScalar } from "./protocol";
+import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
 
 export class BulkExecutionError extends Error {
   readonly batchIndex: number | undefined;
@@ -14,9 +14,12 @@ export class BulkExecutionError extends Error {
     cleanupErrors: unknown[] = [],
     connectionUnusable = false,
   ) {
-    super(batchIndex === undefined
-      ? "FrankenSQLite bulk execution failed"
-      : `FrankenSQLite bulk execution failed at parameter set ${batchIndex}`, { cause });
+    super(
+      batchIndex === undefined
+        ? "FrankenSQLite bulk execution failed"
+        : `FrankenSQLite bulk execution failed at parameter set ${batchIndex}`,
+      { cause },
+    );
     this.name = "BulkExecutionError";
     this.batchIndex = batchIndex;
     this.cleanupErrors = cleanupErrors;
@@ -45,7 +48,8 @@ export class BulkCancellation {
     this.checkOwner?.();
     if (this.#requested) {
       throw Object.assign(new Error("FrankenSQLite bulk execution was cancelled"), {
-        code: "ERR_FSQLITE_BULK_CANCELLED", transient: false,
+        code: "ERR_FSQLITE_BULK_CANCELLED",
+        transient: false,
       });
     }
   }
@@ -62,7 +66,9 @@ export class BulkCancellation {
   async yield(): Promise<void> {
     // A chain of already-resolved core promises would otherwise starve worker
     // message events. This is a task yield, not just another microtask.
-    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
     this.check();
   }
 }
@@ -79,7 +85,7 @@ export function validateBulkSql(sql: string): void {
   }
   let firstWord: string | undefined;
   let ended = false;
-  for (let i = 0; i < sql.length;) {
+  for (let i = 0; i < sql.length; ) {
     const char = sql[i]!;
     if (/[\t\n\v\f\r \uFEFF]/.test(char)) {
       i += 1;
@@ -94,7 +100,10 @@ export function validateBulkSql(sql: string): void {
       if (ended) throw invalid("Bulk execution requires exactly one DML statement");
       if (firstWord === undefined) {
         const word = /^[A-Za-z]+/.exec(sql.slice(i))?.[0];
-        if (word === undefined || !["INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"].includes(word.toUpperCase())) {
+        if (
+          word === undefined ||
+          !["INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"].includes(word.toUpperCase())
+        ) {
           throw invalid("Bulk execution accepts INSERT, UPDATE, DELETE, REPLACE or WITH DML only");
         }
         firstWord = word;
@@ -213,7 +222,11 @@ export async function executeMany(
       // Explicitly bind EVERY row, even []. Never reuse the previous row's binds.
       const changes = await statement.executeWithParams([...params]);
       cancellation?.check();
-      if (!Number.isSafeInteger(changes) || changes < 0 || !Number.isSafeInteger(result.changes + changes)) {
+      if (
+        !Number.isSafeInteger(changes) ||
+        changes < 0 ||
+        !Number.isSafeInteger(result.changes + changes)
+      ) {
         throw invalid("Bulk affected-row count is outside the safe integer range");
       }
       result.changesPerExecution.push(changes);

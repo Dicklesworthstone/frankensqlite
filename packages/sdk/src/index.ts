@@ -1,20 +1,169 @@
+export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
+export type {
+  ApplyChangesetOptions,
+  ApplyChangesetResult,
+  ChangesetConflict,
+  ChangesetConflictKind,
+  ChangesetExecutor,
+  ChangesetTarget,
+} from "./changeset-apply";
+export { applyChangeset, CHANGESET_RECEIPTS_TABLE, ChangesetApplyError } from "./changeset-apply";
+export type {
+  BootstrapInstallReceipt,
+  BootstrapManifest,
+  BootstrapManifestInput,
+  BootstrapOperationOptions,
+  BootstrapProgress,
+  BootstrapReceiverOptions,
+} from "./changeset-bootstrap";
+export {
+  CHANGESET_BOOTSTRAP_CHUNKS_TABLE,
+  CHANGESET_BOOTSTRAP_PROTOCOL,
+  CHANGESET_BOOTSTRAP_STATE_TABLE,
+  ChangesetBootstrapError,
+  ChangesetBootstrapReceiver,
+  createBootstrapManifest,
+} from "./changeset-bootstrap";
+export type {
+  CaptureChangesetOptions,
+  CapturedChangeset,
+  ChangesetSnapshot,
+  ChangesetSnapshotChunk,
+  ChangesetSnapshotStreamResult,
+  SnapshotChangesetOptions,
+  SnapshotChangesetStreamOptions,
+} from "./changeset-capture";
+export {
+  ChangesetCaptureError,
+  captureChangeset,
+  snapshotChangeset,
+  streamSnapshotChangesets,
+} from "./changeset-capture";
+export type {
+  ChangesetChange,
+  ChangesetField,
+  ChangesetLimits,
+  ChangesetTable,
+  ChangesetValue,
+} from "./changeset-codec";
+export {
+  ChangesetError,
+  decodeChangeset,
+  encodeChangeset,
+  invertChangeset,
+} from "./changeset-codec";
+export type {
+  ChangesetDeliveryOptions,
+  ChangesetDeliveryPhase,
+  ChangesetDeliveryReceipt,
+  ChangesetEnvelope,
+  ChangesetPumpOptions,
+  ChangesetPumpResult,
+  ChangesetPumpRunOptions,
+  ChangesetReceiverOptions,
+  ChangesetTransport,
+} from "./changeset-delivery";
+export {
+  CHANGESET_DELIVERY_PROTOCOL,
+  ChangesetDeliveryError,
+  ChangesetDeliveryPump,
+  ChangesetReceiver,
+} from "./changeset-delivery";
+export type {
+  ChangesetHttpAuthorization,
+  ChangesetHttpHandler,
+  ChangesetHttpHandlerOptions,
+  ChangesetHttpTransportOptions,
+} from "./changeset-http";
+export {
+  CHANGESET_HTTP_CONTENT_TYPE,
+  CHANGESET_HTTP_RECEIPT_TYPE,
+  ChangesetHttpError,
+  createChangesetHttpHandler,
+  createChangesetHttpTransport,
+} from "./changeset-http";
+export type {
+  ChangesetOutboxOptions,
+  OutboxBootstrapChunksOptions,
+  OutboxBootstrapChunksResult,
+  OutboxBootstrapOptions,
+  OutboxBootstrapResult,
+  OutboxDelivery,
+  OutboxPageOptions,
+  OutboxReadResult,
+  OutboxRecordOptions,
+  OutboxRecordResult,
+} from "./changeset-outbox";
+export { CHANGESET_OUTBOX_TABLE, ChangesetOutbox, ChangesetOutboxError } from "./changeset-outbox";
 export { FrankenDB } from "./database";
-export { FrankenMigrationPlan, FrankenMigrationError, MIGRATION_HISTORY_TABLE } from "./migrations";
-export type { SchemaMigration, MigrationIdentity, MigrationStatus, MigrationResult } from "./migrations";
-export { FrankenTransactionRetryError } from "./transaction-retry";
-export type { TransactionRetryOptions, TransactionRetryAttempt } from "./transaction-retry";
-export { scanTable } from "./table-scan";
-export type { TableScan, TableScanOptions, TableScanStats } from "./table-scan";
-export { FrankenSnapshotPool, FrankenPoolError } from "./snapshot-pool";
-export type { SnapshotPoolOptions, SnapshotQueryOptions, SnapshotPoolStats, SnapshotPoolIdentity, SnapshotQueryResult, SnapshotRefreshResult } from "./snapshot-pool";
+export type {
+  DurableJobCompletion,
+  DurableJobContext,
+  DurableJobHandler,
+  DurableJobWorkerOptions,
+  DurableJobWorkerPhase,
+  DurableJobWorkerStats,
+  DurableJobWorkerStopOptions,
+  DurableWorkerQueue,
+} from "./durable-job-worker";
+export { DurableJobWorker, DurableJobWorkerError } from "./durable-job-worker";
+export type {
+  DurableClaimOptions,
+  DurableEnqueueResult,
+  DurableEnqueueWorkResult,
+  DurableJob,
+  DurableJobDatabase,
+  DurableJobLease,
+  DurableJobQueueOptions,
+  DurableJobState,
+  DurableJobStats,
+  DurableJobTransaction,
+  EnqueueJob,
+} from "./durable-jobs";
+export { DURABLE_JOBS_TABLE, DurableJobError, DurableJobQueue } from "./durable-jobs";
 export { FrankenSQLiteError } from "./errors";
-export { FrankenStreamError } from "./stream";
-export type { StreamFailurePhase } from "./stream";
+export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";
+export { watchQuery } from "./live-query";
+export type {
+  MigrationIdentity,
+  MigrationResult,
+  MigrationStatus,
+  SchemaMigration,
+} from "./migrations";
+export { FrankenMigrationError, FrankenMigrationPlan, MIGRATION_HISTORY_TABLE } from "./migrations";
+export type {
+  JobQueueOptions,
+  JobQueueStats,
+  QueuedJobOptions,
+  QueuedTransactionOptions,
+  QueuedTransactionRetryOptions,
+} from "./queue";
+export { FrankenCheckpointCommitError, FrankenDBQueue } from "./queue";
+export type {
+  SnapshotPoolIdentity,
+  SnapshotPoolOptions,
+  SnapshotPoolStats,
+  SnapshotQueryOptions,
+  SnapshotQueryResult,
+  SnapshotRefreshResult,
+} from "./snapshot-pool";
+export { FrankenPoolError, FrankenSnapshotPool } from "./snapshot-pool";
 export { FrankenPreparedStatement } from "./statement";
+export type { StreamFailurePhase } from "./stream";
+export { FrankenStreamError } from "./stream";
+export type {
+  CommittedTableChange,
+  TableChangeListener,
+  TableChangeStream,
+  TableSubscription,
+} from "./subscriptions";
+export type { TableScan, TableScanOptions, TableScanStats } from "./table-scan";
+export { scanTable } from "./table-scan";
 export { FrankenTransaction } from "./transaction";
+export type { TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
+export { FrankenTransactionRetryError } from "./transaction-retry";
 export type {
   CheckpointRecoveryIdentity,
-  ResultEncoding,
   ExecuteManyOptions,
   ExecuteManyResult,
   ExecuteStreamOptions,
@@ -26,39 +175,12 @@ export type {
   QueryResult,
   RequestLimits,
   RequestQueueStats,
+  ResultEncoding,
   SerializedFrankenError,
-  SqlScalar,
+  SnapshotMetadata,
   SqlBindings,
   SqlRowSource,
-  SnapshotMetadata,
+  SqlScalar,
   TransactionOptions,
 } from "./types";
-export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type { WorkerLike } from "./worker-client";
-export { FrankenDBQueue, FrankenCheckpointCommitError } from "./queue";
-export type { JobQueueOptions, JobQueueStats, QueuedJobOptions, QueuedTransactionOptions, QueuedTransactionRetryOptions } from "./queue";
-export type { CommittedTableChange, TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
-export { watchQuery } from "./live-query";
-export type { LiveQuery, LiveQueryOptions, LiveQueryResult } from "./live-query";
-export { DurableJobQueue, DurableJobError, DURABLE_JOBS_TABLE } from "./durable-jobs";
-export type { DurableJobDatabase, DurableJobTransaction, DurableJobQueueOptions, DurableClaimOptions, EnqueueJob, DurableJobState, DurableJob, DurableJobLease, DurableEnqueueResult, DurableEnqueueWorkResult, DurableJobStats } from "./durable-jobs";
-export { DurableJobWorker, DurableJobWorkerError } from "./durable-job-worker";
-export type { DurableWorkerQueue, DurableJobHandler, DurableJobContext, DurableJobCompletion, DurableJobWorkerOptions, DurableJobWorkerStopOptions, DurableJobWorkerStats, DurableJobWorkerPhase } from "./durable-job-worker";
-export { ChangesetError, decodeChangeset, encodeChangeset, invertChangeset } from "./changeset-codec";
-export type { ChangesetValue, ChangesetField, ChangesetChange, ChangesetTable, ChangesetLimits } from "./changeset-codec";
-export { applyChangeset, ChangesetApplyError, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
-export type { ChangesetExecutor, ChangesetTarget, ChangesetConflictKind, ChangesetConflict, ApplyChangesetOptions, ApplyChangesetResult } from "./changeset-apply";
-export { captureChangeset, snapshotChangeset, ChangesetCaptureError } from "./changeset-capture";
-export type { CaptureChangesetOptions, CapturedChangeset, SnapshotChangesetOptions, ChangesetSnapshot } from "./changeset-capture";
-export { ChangesetOutbox, ChangesetOutboxError, CHANGESET_OUTBOX_TABLE } from "./changeset-outbox";
-export type { ChangesetOutboxOptions, OutboxDelivery, OutboxRecordOptions, OutboxRecordResult, OutboxReadResult, OutboxPageOptions, OutboxBootstrapOptions, OutboxBootstrapResult } from "./changeset-outbox";
-export { ChangesetReceiver, ChangesetDeliveryPump, ChangesetDeliveryError, CHANGESET_DELIVERY_PROTOCOL } from "./changeset-delivery";
-export type { ChangesetEnvelope, ChangesetDeliveryReceipt, ChangesetDeliveryOptions, ChangesetDeliveryPhase, ChangesetReceiverOptions } from "./changeset-delivery";
-export type { ChangesetTransport, ChangesetPumpOptions, ChangesetPumpRunOptions, ChangesetPumpResult } from "./changeset-delivery";
-export { createChangesetHttpTransport, createChangesetHttpHandler, ChangesetHttpError, CHANGESET_HTTP_CONTENT_TYPE, CHANGESET_HTTP_RECEIPT_TYPE } from "./changeset-http";
-export type { ChangesetHttpTransportOptions, ChangesetHttpHandler, ChangesetHttpHandlerOptions, ChangesetHttpAuthorization } from "./changeset-http";
-export { streamSnapshotChangesets } from "./changeset-capture";
-export type { SnapshotChangesetStreamOptions, ChangesetSnapshotChunk, ChangesetSnapshotStreamResult } from "./changeset-capture";
-export type { OutboxBootstrapChunksOptions, OutboxBootstrapChunksResult } from "./changeset-outbox";
-export { ChangesetBootstrapReceiver, ChangesetBootstrapError, createBootstrapManifest, CHANGESET_BOOTSTRAP_PROTOCOL, CHANGESET_BOOTSTRAP_STATE_TABLE, CHANGESET_BOOTSTRAP_CHUNKS_TABLE } from "./changeset-bootstrap";
-export type { BootstrapManifestInput, BootstrapManifest, BootstrapOperationOptions, BootstrapProgress, BootstrapInstallReceipt, BootstrapReceiverOptions } from "./changeset-bootstrap";

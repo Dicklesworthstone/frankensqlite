@@ -1,4 +1,10 @@
-import type { BinaryQueryResponse, QueryResponse, QueryResult, SqlScalar, WorkerResponse } from "./protocol";
+import type {
+  BinaryQueryResponse,
+  QueryResponse,
+  QueryResult,
+  SqlScalar,
+  WorkerResponse,
+} from "./protocol";
 
 /** Binary transport is opt-in until measured on the application's browser. */
 export type ResultEncoding = "structured-clone" | "binary" | "auto";
@@ -23,17 +29,21 @@ export class ResultCodecError extends Error {
 export function resolveResultEncoding(value: unknown = "structured-clone"): ResultEncoding {
   if (value === "structured-clone" || value === "binary" || value === "auto") return value;
   throw Object.assign(new TypeError("resultEncoding must be structured-clone, binary or auto"), {
-    code: "ERR_FSQLITE_RESULT_ENCODING", transient: false,
+    code: "ERR_FSQLITE_RESULT_ENCODING",
+    transient: false,
   });
 }
 
 /** Encode only after execution, with no retry or change to the SQL outcome. */
 export function encodeQueryResponse(
-  requestId: number, data: QueryResult, encoding: ResultEncoding,
+  requestId: number,
+  data: QueryResult,
+  encoding: ResultEncoding,
 ): QueryResponse | BinaryQueryResponse {
   if (encoding !== "structured-clone") {
     const buffer = tryEncodeQueryResult(data, encoding === "auto" ? BINARY_RESULT_THRESHOLD : 0);
-    if (buffer !== null) return { kind: "query-binary-result", requestId, encoding: "fqr1", data: buffer };
+    if (buffer !== null)
+      return { kind: "query-binary-result", requestId, encoding: "fqr1", data: buffer };
   }
   return { kind: "query-result", requestId, data };
 }
@@ -50,13 +60,23 @@ function invalid(): never {
 }
 
 function checkShape(rows: number, columns: number, types: number): void {
-  if (![rows, columns, types].every(n => Number.isSafeInteger(n) && n >= 0) ||
-      columns > MAX_COLUMNS || types > MAX_COLUMNS || rows * (columns + 1) > MAX_SLOTS) invalid();
+  if (
+    ![rows, columns, types].every((n) => Number.isSafeInteger(n) && n >= 0) ||
+    columns > MAX_COLUMNS ||
+    types > MAX_COLUMNS ||
+    rows * (columns + 1) > MAX_SLOTS
+  )
+    invalid();
 }
 
 function sameValue(left: unknown, right: SqlScalar): boolean {
   if (Object.is(left, right)) return true;
-  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array) || left.length !== right.length) return false;
+  if (
+    !(left instanceof Uint8Array) ||
+    !(right instanceof Uint8Array) ||
+    left.length !== right.length
+  )
+    return false;
   for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
   return true;
 }
@@ -71,13 +91,28 @@ export function tryEncodeQueryResult(result: QueryResult, minimumBytes = 0): Arr
   try {
     if (!Number.isSafeInteger(minimumBytes) || minimumBytes < 0) return null;
     const { columns, columnCount, columnTypes, rows, rowArrays, changes } = result;
-    if (!Array.isArray(columns) || !Array.isArray(columnTypes) || !Array.isArray(rows) ||
-        !Array.isArray(rowArrays) || columnCount !== columns.length || rows.length !== rowArrays.length ||
-        !Number.isSafeInteger(changes) || changes < 0) return null;
+    if (
+      !Array.isArray(columns) ||
+      !Array.isArray(columnTypes) ||
+      !Array.isArray(rows) ||
+      !Array.isArray(rowArrays) ||
+      columnCount !== columns.length ||
+      rows.length !== rowArrays.length ||
+      !Number.isSafeInteger(changes) ||
+      changes < 0
+    )
+      return null;
     checkShape(rows.length, columnCount, columnTypes.length);
     // Do not drop an extension's additional top-level metadata.
-    const allowed = new Set(["columns", "columnCount", "columnTypes", "rows", "rowArrays", "changes"]);
-    if (Object.keys(result).some(key => !allowed.has(key))) return null;
+    const allowed = new Set([
+      "columns",
+      "columnCount",
+      "columnTypes",
+      "rows",
+      "rowArrays",
+      "changes",
+    ]);
+    if (Object.keys(result).some((key) => !allowed.has(key))) return null;
     let size = HEADER_BYTES;
     const charge = (bytes: number): void => {
       size += bytes;
@@ -94,11 +129,18 @@ export function tryEncodeQueryResult(result: QueryResult, minimumBytes = 0): Arr
     }
     for (const type of columnTypes) measureText(type);
     for (let index = 0; index < rowArrays.length; index++) {
-      const values = rowArrays[index]!, row = rows[index];
-      if (!Array.isArray(values) || values.length !== columnCount || typeof row !== "object" || row === null ||
-          Object.keys(row).length !== projection.size) return null;
+      const values = rowArrays[index]!,
+        row = rows[index];
+      if (
+        !Array.isArray(values) ||
+        values.length !== columnCount ||
+        typeof row !== "object" ||
+        row === null ||
+        Object.keys(row).length !== projection.size
+      )
+        return null;
       for (const [name, column] of projection) {
-        if (!Object.prototype.hasOwnProperty.call(row, name) || !sameValue(row[name], values[column]!)) return null;
+        if (!Object.hasOwn(row, name) || !sameValue(row[name], values[column]!)) return null;
       }
       for (const value of values) {
         charge(1); // type tag
@@ -113,7 +155,9 @@ export function tryEncodeQueryResult(result: QueryResult, minimumBytes = 0): Arr
       }
     }
     if (size < minimumBytes) return null;
-    const buffer = new ArrayBuffer(size), view = new DataView(buffer), bytes = new Uint8Array(buffer);
+    const buffer = new ArrayBuffer(size),
+      view = new DataView(buffer),
+      bytes = new Uint8Array(buffer);
     view.setUint32(0, MAGIC, true);
     view.setUint16(4, 1, true); // version; bytes 6..7 reserved, zero.
     view.setUint32(8, size, true);
@@ -123,26 +167,37 @@ export function tryEncodeQueryResult(result: QueryResult, minimumBytes = 0): Arr
     view.setFloat64(24, changes, true);
     let offset = HEADER_BYTES;
     const writeText = (text: string): void => {
-      view.setUint32(offset, text.length, true); offset += 4;
-      for (let i = 0; i < text.length; i++, offset += 2) view.setUint16(offset, text.charCodeAt(i), true);
+      view.setUint32(offset, text.length, true);
+      offset += 4;
+      for (let i = 0; i < text.length; i++, offset += 2)
+        view.setUint16(offset, text.charCodeAt(i), true);
     };
     for (const name of columns) writeText(name);
     for (const type of columnTypes) writeText(type);
-    for (const values of rowArrays) for (const value of values) {
-      if (value === null) bytes[offset++] = 0;
-      else if (value === false) bytes[offset++] = 1;
-      else if (value === true) bytes[offset++] = 2;
-      else if (typeof value === "number") {
-        bytes[offset++] = 3; view.setFloat64(offset, value, true); offset += 8;
-      } else if (typeof value === "bigint") {
-        bytes[offset++] = 4; view.setBigInt64(offset, value, true); offset += 8;
-      } else if (typeof value === "string") {
-        bytes[offset++] = 5; writeText(value);
-      } else {
-        bytes[offset++] = 6; view.setUint32(offset, value.byteLength, true); offset += 4;
-        bytes.set(value, offset); offset += value.byteLength;
+    for (const values of rowArrays)
+      for (const value of values) {
+        if (value === null) bytes[offset++] = 0;
+        else if (value === false) bytes[offset++] = 1;
+        else if (value === true) bytes[offset++] = 2;
+        else if (typeof value === "number") {
+          bytes[offset++] = 3;
+          view.setFloat64(offset, value, true);
+          offset += 8;
+        } else if (typeof value === "bigint") {
+          bytes[offset++] = 4;
+          view.setBigInt64(offset, value, true);
+          offset += 8;
+        } else if (typeof value === "string") {
+          bytes[offset++] = 5;
+          writeText(value);
+        } else {
+          bytes[offset++] = 6;
+          view.setUint32(offset, value.byteLength, true);
+          offset += 4;
+          bytes.set(value, offset);
+          offset += value.byteLength;
+        }
       }
-    }
     if (offset !== size) return null;
     return buffer;
   } catch {
@@ -155,13 +210,24 @@ export function tryEncodeQueryResult(result: QueryResult, minimumBytes = 0): Arr
 /** Strict, bounded frame decoder. Text is UTF-16LE, including lone surrogates. */
 export function decodeQueryResult(buffer: ArrayBuffer): QueryResult {
   try {
-    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < HEADER_BYTES ||
-        buffer.byteLength > MAX_BINARY_RESULT_BYTES) invalid();
+    if (
+      !(buffer instanceof ArrayBuffer) ||
+      buffer.byteLength < HEADER_BYTES ||
+      buffer.byteLength > MAX_BINARY_RESULT_BYTES
+    )
+      invalid();
     const view = new DataView(buffer);
-    if (view.getUint32(0, true) !== MAGIC || view.getUint16(4, true) !== 1 ||
-        view.getUint16(6, true) !== 0 || view.getUint32(8, true) !== buffer.byteLength) invalid();
-    const rowCount = view.getUint32(12, true), columnCount = view.getUint32(16, true);
-    const typeCount = view.getUint32(20, true), changes = view.getFloat64(24, true);
+    if (
+      view.getUint32(0, true) !== MAGIC ||
+      view.getUint16(4, true) !== 1 ||
+      view.getUint16(6, true) !== 0 ||
+      view.getUint32(8, true) !== buffer.byteLength
+    )
+      invalid();
+    const rowCount = view.getUint32(12, true),
+      columnCount = view.getUint32(16, true);
+    const typeCount = view.getUint32(20, true),
+      changes = view.getFloat64(24, true);
     checkShape(rowCount, columnCount, typeCount);
     if (!Number.isSafeInteger(changes) || changes < 0) invalid();
     let offset = HEADER_BYTES;
@@ -171,50 +237,85 @@ export function decodeQueryResult(buffer: ArrayBuffer): QueryResult {
     // Check minimum encoded cost before allocating metadata or row containers.
     need((columnCount + typeCount) * 4 + rowCount * columnCount);
     const readLength = (): number => {
-      need(4); const n = view.getUint32(offset, true); offset += 4; return n;
+      need(4);
+      const n = view.getUint32(offset, true);
+      offset += 4;
+      return n;
     };
     const readText = (): string => {
-      const length = readLength(); need(length * 2);
+      const length = readLength();
+      need(length * 2);
       let text = "";
       // Avoid spread-argument limits and Unicode replacement by TextDecoder.
-      for (let i = 0; i < length;) {
-        const count = Math.min(length - i, 4096), codes = new Array<number>(count);
+      for (let i = 0; i < length; ) {
+        const count = Math.min(length - i, 4096),
+          codes = new Array<number>(count);
         for (let j = 0; j < count; j++, offset += 2) codes[j] = view.getUint16(offset, true);
-        text += String.fromCharCode(...codes); i += count;
+        text += String.fromCharCode(...codes);
+        i += count;
       }
       return text;
     };
-    const columns: string[] = [], columnTypes: string[] = [];
+    const columns: string[] = [],
+      columnTypes: string[] = [];
     for (let i = 0; i < columnCount; i++) columns.push(readText());
     for (let i = 0; i < typeCount; i++) columnTypes.push(readText());
-    const rows: Record<string, unknown>[] = [], rowArrays: SqlScalar[][] = [];
+    const rows: Record<string, unknown>[] = [],
+      rowArrays: SqlScalar[][] = [];
     for (let i = 0; i < rowCount; i++) {
-      const row: Record<string, unknown> = {}, values: SqlScalar[] = [];
+      const row: Record<string, unknown> = {},
+        values: SqlScalar[] = [];
       for (let j = 0; j < columnCount; j++) {
         need(1);
         const tag = view.getUint8(offset++);
         let value: SqlScalar;
         switch (tag) {
-          case 0: value = null; break;
-          case 1: value = false; break;
-          case 2: value = true; break;
-          case 3: need(8); value = view.getFloat64(offset, true); offset += 8; break;
-          case 4: need(8); value = view.getBigInt64(offset, true); offset += 8; break;
-          case 5: value = readText(); break;
+          case 0:
+            value = null;
+            break;
+          case 1:
+            value = false;
+            break;
+          case 2:
+            value = true;
+            break;
+          case 3:
+            need(8);
+            value = view.getFloat64(offset, true);
+            offset += 8;
+            break;
+          case 4:
+            need(8);
+            value = view.getBigInt64(offset, true);
+            offset += 8;
+            break;
+          case 5:
+            value = readText();
+            break;
           case 6: {
-            const length = readLength(); need(length);
+            const length = readLength();
+            need(length);
             // A retained tiny blob must not retain the entire result frame.
-            value = new Uint8Array(buffer.slice(offset, offset + length)); offset += length; break;
+            value = new Uint8Array(buffer.slice(offset, offset + length));
+            offset += length;
+            break;
           }
-          default: invalid();
+          default:
+            invalid();
         }
         values.push(value);
         const name = columns[j]!;
-        if (name === "__proto__") Object.defineProperty(row, name,
-          { value, writable: true, enumerable: true, configurable: true });
+        if (name === "__proto__")
+          Object.defineProperty(row, name, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
         else row[name] = value;
       }
-      rows.push(row); rowArrays.push(values);
+      rows.push(row);
+      rowArrays.push(values);
     }
     if (offset !== buffer.byteLength) invalid();
     return { columns, columnCount, columnTypes, rows, rowArrays, changes };

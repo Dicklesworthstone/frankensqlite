@@ -22,8 +22,10 @@ export interface TransactionRetryAttempt {
 
 export class FrankenTransactionRetryError extends Error {
   constructor(
-    readonly code: "ERR_FSQLITE_TRANSACTION_RETRY_INPUT" |
-      "ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED" | "ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT",
+    readonly code:
+      | "ERR_FSQLITE_TRANSACTION_RETRY_INPUT"
+      | "ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED"
+      | "ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT",
     message: string,
     readonly attempts: number,
     options?: ErrorOptions,
@@ -50,7 +52,9 @@ export interface ResolvedTransactionRetryOptions {
   readonly signal: AbortSignal | undefined;
 }
 
-export function resolveTransactionRetryOptions(options?: TransactionRetryOptions): ResolvedTransactionRetryOptions {
+export function resolveTransactionRetryOptions(
+  options?: TransactionRetryOptions,
+): ResolvedTransactionRetryOptions {
   // Capture caller getters once, before the database claims its retry lease.
   const maxAttempts = options?.maxAttempts ?? 4;
   const timeoutMs = options?.timeoutMs ?? 5000;
@@ -64,13 +68,19 @@ export function resolveTransactionRetryOptions(options?: TransactionRetryOptions
     ["maxDelayMs", maxDelayMs, 0, 2_147_483_647],
   ] as const) {
     if (!Number.isSafeInteger(value) || value < min || value > max) {
-      throw new FrankenTransactionRetryError("ERR_FSQLITE_TRANSACTION_RETRY_INPUT",
-        `${name} must be an integer in ${min}..${max}`, 0);
+      throw new FrankenTransactionRetryError(
+        "ERR_FSQLITE_TRANSACTION_RETRY_INPUT",
+        `${name} must be an integer in ${min}..${max}`,
+        0,
+      );
     }
   }
   if (initialDelayMs > maxDelayMs) {
-    throw new FrankenTransactionRetryError("ERR_FSQLITE_TRANSACTION_RETRY_INPUT",
-      "initialDelayMs must not exceed maxDelayMs", 0);
+    throw new FrankenTransactionRetryError(
+      "ERR_FSQLITE_TRANSACTION_RETRY_INPUT",
+      "initialDelayMs must not exceed maxDelayMs",
+      0,
+    );
   }
   if (signal !== undefined) {
     Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
@@ -87,39 +97,56 @@ export function isTransactionConflict(error: unknown): boolean {
   const ancestors = new Set<object>();
   let remaining = 64;
   const visit = (value: unknown, depth: number): boolean => {
-    if (--remaining < 0 || depth > 8 || !(value instanceof Error) || ancestors.has(value)) return false;
+    if (--remaining < 0 || depth > 8 || !(value instanceof Error) || ancestors.has(value))
+      return false;
     ancestors.add(value);
     try {
       if (value instanceof AggregateError) {
         const children = value.errors;
-        if (!Array.isArray(children) || children.length === 0 || children.length > remaining) return false;
+        if (!Array.isArray(children) || children.length === 0 || children.length > remaining)
+          return false;
         for (let i = 0; i < children.length; i++) {
           if (!Object.hasOwn(children, i) || !visit(children[i], depth + 1)) return false;
         }
         return true;
       }
-      if (!(value instanceof FrankenSQLiteError) || value.cleanupErrors.length !== 0 || value.userRecoverable === false) return false;
+      if (
+        !(value instanceof FrankenSQLiteError) ||
+        value.cleanupErrors.length !== 0 ||
+        value.userRecoverable === false
+      )
+        return false;
       // Later operations in an already-failed scope can report this wrapper.
       // It cannot continue in-place, but the enclosing transaction can restart
       // after confirmed rollback if every underlying failure is a conflict.
       if (value.code === "ERR_FSQLITE_TRANSACTION_ABORTED") return visit(value.cause, depth + 1);
       if (value.transient === false) return false;
       const codes: Record<string, number> = {
-        SQLITE_BUSY: 5, SQLITE_BUSY_RECOVERY: 261,
-        SQLITE_BUSY_SNAPSHOT: 517, SQLITE_BUSY_TIMEOUT: 773,
+        SQLITE_BUSY: 5,
+        SQLITE_BUSY_RECOVERY: 261,
+        SQLITE_BUSY_SNAPSHOT: 517,
+        SQLITE_BUSY_TIMEOUT: 773,
       };
       const code = Object.hasOwn(codes, value.code) ? codes[value.code] : undefined;
       if (code === undefined) return false;
       if (value.sqliteCode !== undefined && value.sqliteCode !== 5) return false;
-      if (value.extendedCode !== undefined &&
-          (code === 5 ? ![5, 261, 517, 773].includes(value.extendedCode) : value.extendedCode !== code)) return false;
+      if (
+        value.extendedCode !== undefined &&
+        (code === 5
+          ? ![5, 261, 517, 773].includes(value.extendedCode)
+          : value.extendedCode !== code)
+      )
+        return false;
       return value.cause === undefined || visit(value.cause, depth + 1);
     } finally {
       ancestors.delete(value);
     }
   };
-  try { return visit(error, 0); }
-  catch { return false; } // Caller-created Error getters are not retry authority.
+  try {
+    return visit(error, 0);
+  } catch {
+    return false;
+  } // Caller-created Error getters are not retry authority.
 }
 
 /** A cancelled child and its parent may independently report the same abort. */
@@ -127,39 +154,57 @@ function isCancellationFailure(error: unknown, reason: unknown): boolean {
   const ancestors = new Set<object>();
   let remaining = 64;
   const visit = (value: unknown, depth: number): boolean => {
-    if (--remaining < 0 || depth > 8 || !(value instanceof Error) || ancestors.has(value)) return false;
+    if (--remaining < 0 || depth > 8 || !(value instanceof Error) || ancestors.has(value))
+      return false;
     ancestors.add(value);
     try {
       if (value instanceof AggregateError) {
         const children = value.errors;
-        if (!Array.isArray(children) || children.length === 0 || children.length > remaining) return false;
+        if (!Array.isArray(children) || children.length === 0 || children.length > remaining)
+          return false;
         for (let i = 0; i < children.length; i++) {
           if (!Object.hasOwn(children, i) || !visit(children[i], depth + 1)) return false;
         }
         return true;
       }
-      if (!(value instanceof FrankenSQLiteError) || value.cleanupErrors.length !== 0 || value.userRecoverable === false) return false;
+      if (
+        !(value instanceof FrankenSQLiteError) ||
+        value.cleanupErrors.length !== 0 ||
+        value.userRecoverable === false
+      )
+        return false;
       if (value.code === "ERR_FSQLITE_TRANSACTION_ABORTED") return visit(value.cause, depth + 1);
       // Local cancellation retains the exact caller reason. Worker cancellation
       // has no clone of that reason. An unrelated cause is not ours to discard.
-      return value.code === "ERR_FSQLITE_TRANSACTION_CANCELLED" &&
-        (value.cause === undefined || value.cause === reason);
+      return (
+        value.code === "ERR_FSQLITE_TRANSACTION_CANCELLED" &&
+        (value.cause === undefined || value.cause === reason)
+      );
     } finally {
       ancestors.delete(value);
     }
   };
-  try { return visit(error, 0); }
-  catch { return false; }
+  try {
+    return visit(error, 0);
+  } catch {
+    return false;
+  }
 }
 
 /** Internal scheduler. Never returns while an attempt/rollback is outstanding. */
 export async function runTransactionRetry<T>(
-  attempt: (signal: AbortSignal, info: TransactionRetryAttempt, recovery: RetryRecovery) => Promise<T>,
+  attempt: (
+    signal: AbortSignal,
+    info: TransactionRetryAttempt,
+    recovery: RetryRecovery,
+  ) => Promise<T>,
   options: ResolvedTransactionRetryOptions,
 ): Promise<T> {
   const timeout = new AbortController();
   const timeoutReason = new Error("FrankenSQLite transaction retry deadline expired");
-  const signal = AbortSignal.any(options.signal === undefined ? [timeout.signal] : [options.signal, timeout.signal]);
+  const signal = AbortSignal.any(
+    options.signal === undefined ? [timeout.signal] : [options.signal, timeout.signal],
+  );
   const deadline = performance.now() + options.timeoutMs;
   let attempts = 0;
   let lastError: unknown;
@@ -171,13 +216,21 @@ export async function runTransactionRetry<T>(
     checkpoint();
     if (!signal.aborted) return;
     if (signal.reason === timeoutReason) {
-      throw new FrankenTransactionRetryError("ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT",
-        "Transaction retry deadline expired; the active attempt has been joined", attempts,
-        lastError === undefined ? undefined : { cause: lastError }, lastError);
+      throw new FrankenTransactionRetryError(
+        "ERR_FSQLITE_TRANSACTION_RETRY_TIMEOUT",
+        "Transaction retry deadline expired; the active attempt has been joined",
+        attempts,
+        lastError === undefined ? undefined : { cause: lastError },
+        lastError,
+      );
     }
-    throw new FrankenTransactionRetryError("ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED",
-      "Transaction retry was cancelled; the active attempt has been joined", attempts,
-      { cause: signal.reason }, lastError);
+    throw new FrankenTransactionRetryError(
+      "ERR_FSQLITE_TRANSACTION_RETRY_CANCELLED",
+      "Transaction retry was cancelled; the active attempt has been joined",
+      attempts,
+      { cause: signal.reason },
+      lastError,
+    );
   };
   try {
     while (true) {
@@ -187,7 +240,11 @@ export async function runTransactionRetry<T>(
       try {
         // Do not recheck the signal after success: an acknowledged COMMIT wins
         // over an abort/deadline that arrived after its dispatch.
-        return await attempt(signal, Object.freeze({ attempt: attempts, maxAttempts: options.maxAttempts }), recovery);
+        return await attempt(
+          signal,
+          Object.freeze({ attempt: attempts, maxAttempts: options.maxAttempts }),
+          recovery,
+        );
       } catch (error: unknown) {
         // Failed cleanup/uncertain outcomes remain authoritative even if abort
         // fired. Never hide them under a convenient cancellation/timeout error.
@@ -202,7 +259,10 @@ export async function runTransactionRetry<T>(
         if (attempts >= options.maxAttempts) throw error;
       }
       const cap = Math.min(options.maxDelayMs, options.initialDelayMs * 2 ** (attempts - 1));
-      const delay = Math.min(Math.floor(Math.random() * cap), Math.max(0, deadline - performance.now()));
+      const delay = Math.min(
+        Math.floor(Math.random() * cap),
+        Math.max(0, deadline - performance.now()),
+      );
       // Even zero-delay retries yield a TASK, so cancellation and other worker
       // messages cannot be starved by resolved-Promise retry loops.
       await new Promise<void>((resolve) => {

@@ -1,14 +1,14 @@
-import { FrankenDB, observeDatabaseFailure } from "./database";
 import { isSnapshotPersistenceMode } from "@frankensqlite/worker";
+import { captureTables, TableChangeJournal } from "./change-journal";
+import { FrankenDB, observeDatabaseFailure } from "./database";
 import { FrankenSQLiteError } from "./errors";
-import { TableChangeJournal, captureTables } from "./change-journal";
-import { ChangeObserver, createChangeStream } from "./subscriptions";
 import type { TableChangeListener, TableChangeStream, TableSubscription } from "./subscriptions";
-import { captureTransactionOptions } from "./transaction";
+import { ChangeObserver, createChangeStream } from "./subscriptions";
 import type { FrankenTransaction } from "./transaction";
-import type { FrankenDbOpenOptions, SnapshotMetadata, TransactionOptions } from "./types";
-import { resolveTransactionRetryOptions } from "./transaction-retry";
+import { captureTransactionOptions } from "./transaction";
 import type { TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
+import { resolveTransactionRetryOptions } from "./transaction-retry";
+import type { FrankenDbOpenOptions, SnapshotMetadata, TransactionOptions } from "./types";
 
 type CloseListener = (failure: Error | null) => void;
 const queueClosers = new WeakMap<FrankenDBQueue, (listener: CloseListener) => () => void>();
@@ -44,7 +44,10 @@ export class FrankenCheckpointCommitError<T = unknown> extends Error {
     readonly previousRevision: string | null,
     cause: unknown,
   ) {
-    super("SQL committed, but its checkpoint was not acknowledged. Confirm with recoverCheckpoint(), or retry checkpoint() for a known publication failure; never replay the callback. Export before closing if recovery is impossible.", { cause });
+    super(
+      "SQL committed, but its checkpoint was not acknowledged. Confirm with recoverCheckpoint(), or retry checkpoint() for a known publication failure; never replay the callback. Export before closing if recovery is impossible.",
+      { cause },
+    );
     this.name = "FrankenCheckpointCommitError";
   }
 }
@@ -100,8 +103,11 @@ interface Job {
 }
 
 function cancelled(signal: AbortSignal): FrankenSQLiteError {
-  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_CANCELLED",
-    message: "Queued job cancelled before starting; no SQL was executed", transient: false });
+  const error = new FrankenSQLiteError({
+    code: "ERR_FSQLITE_JOB_CANCELLED",
+    message: "Queued job cancelled before starting; no SQL was executed",
+    transient: false,
+  });
   // The local reason need not be serializable across the worker boundary.
   error.cause = signal.reason;
   return error;
@@ -139,17 +145,27 @@ export class FrankenDBQueue {
   #timedOut = 0;
   #rejected = 0;
 
-  private constructor(db: FrankenDB, maxPendingJobs: number, maxSubscriptions: number, checkpointOnCommit: boolean) {
+  private constructor(
+    db: FrankenDB,
+    maxPendingJobs: number,
+    maxSubscriptions: number,
+    checkpointOnCommit: boolean,
+  ) {
     this.#db = db;
     this.#maxPendingJobs = maxPendingJobs;
     this.#maxSubscriptions = maxSubscriptions;
     this.#checkpointOnCommit = checkpointOnCommit;
-    queueClosers.set(this, listener => {
-      if (this.#state !== "open") { listener(this.#terminalFailure); return () => {}; }
+    queueClosers.set(this, (listener) => {
+      if (this.#state !== "open") {
+        listener(this.#terminalFailure);
+        return () => {};
+      }
       this.#closeListeners.add(listener);
-      return () => { this.#closeListeners.delete(listener); };
+      return () => {
+        this.#closeListeners.delete(listener);
+      };
     });
-    this.#stopObservingFailure = observeDatabaseFailure(db, error => {
+    this.#stopObservingFailure = observeDatabaseFailure(db, (error) => {
       this.#terminalFailure ??= error;
       for (const observer of this.#subscriptions) observer.fail(error);
       void this.close().catch(() => {});
@@ -175,49 +191,85 @@ export class FrankenDBQueue {
     }
     const db = await FrankenDB.open(databaseOptions);
     if (checkpointOnCommit === true && !isSnapshotPersistenceMode(db.persistence)) {
-      const cause = new FrankenSQLiteError({ code: "ERR_FSQLITE_CHECKPOINT_MODE",
-        message: "checkpointOnCommit requires indexeddb-snapshot or opfs-snapshot persistence", transient: false });
-      try { await db.close(); }
-      catch (cleanup: unknown) {
-        throw new AggregateError([cause, cleanup], "Invalid checkpoint mode and database cleanup failed", { cause });
+      const cause = new FrankenSQLiteError({
+        code: "ERR_FSQLITE_CHECKPOINT_MODE",
+        message: "checkpointOnCommit requires indexeddb-snapshot or opfs-snapshot persistence",
+        transient: false,
+      });
+      try {
+        await db.close();
+      } catch (cleanup: unknown) {
+        throw new AggregateError(
+          [cause, cleanup],
+          "Invalid checkpoint mode and database cleanup failed",
+          { cause },
+        );
       }
       throw cause;
     }
-    const queue = new FrankenDBQueue(db, maxPendingJobs, maxSubscriptions, checkpointOnCommit === true);
+    const queue = new FrankenDBQueue(
+      db,
+      maxPendingJobs,
+      maxSubscriptions,
+      checkpointOnCommit === true,
+    );
     if (queue.#terminalFailure !== null) {
       const cause = queue.#terminalFailure;
-      try { await queue.close(); } catch (cleanup: unknown) {
-        if (cleanup !== cause) throw new AggregateError([cause, cleanup], "Queue opening and cleanup failed", { cause });
+      try {
+        await queue.close();
+      } catch (cleanup: unknown) {
+        if (cleanup !== cause)
+          throw new AggregateError([cause, cleanup], "Queue opening and cleanup failed", { cause });
       }
       throw cause;
     }
     return queue;
   }
 
-  get path(): string { return this.#db.path; }
-  get persistence() { return this.#db.persistence; }
-  get snapshotRevision(): string | null { return this.#db.snapshotRevision; }
+  get path(): string {
+    return this.#db.path;
+  }
+  get persistence() {
+    return this.#db.persistence;
+  }
+  get snapshotRevision(): string | null {
+    return this.#db.snapshotRevision;
+  }
   /** Retain to require the exact failed checkpoint when opening a new worker. */
-  get pendingCheckpointRecovery() { return this.#db.pendingCheckpointRecovery; }
-  get checkpointOnCommit(): boolean { return this.#checkpointOnCommit; }
-  get checkpointRecoverySupported(): boolean { return this.#db.checkpointRecoverySupported; }
+  get pendingCheckpointRecovery() {
+    return this.#db.pendingCheckpointRecovery;
+  }
+  get checkpointOnCommit(): boolean {
+    return this.#checkpointOnCommit;
+  }
+  get checkpointRecoverySupported(): boolean {
+    return this.#db.checkpointRecoverySupported;
+  }
   /** Local watched-write sequence, not a native commit sequence or saved revision. */
-  get changeSequence(): bigint { return this.#changeSequence; }
+  get changeSequence(): bigint {
+    return this.#changeSequence;
+  }
 
   /** Frozen scheduler accounting, not a database-health or memory measurement. */
   get stats(): JobQueueStats {
     const activeJobs = this.#active === null ? 0 : 1;
     return Object.freeze({
-      state: this.#state, maxPendingJobs: this.#maxPendingJobs,
+      state: this.#state,
+      maxPendingJobs: this.#maxPendingJobs,
       pendingJobs: activeJobs + this.#waiting.size,
-      waitingJobs: this.#waiting.size, activeJobs,
-      acceptedJobs: this.#accepted, completedJobs: this.#completed,
-      failedJobs: this.#failed, cancelledJobs: this.#cancelled,
-      timedOutJobs: this.#timedOut, rejectedJobs: this.#rejected,
-      subscriptions: this.#subscriptions.size, reservedSubscriptions: this.#observers.size,
+      waitingJobs: this.#waiting.size,
+      activeJobs,
+      acceptedJobs: this.#accepted,
+      completedJobs: this.#completed,
+      failedJobs: this.#failed,
+      cancelledJobs: this.#cancelled,
+      timedOutJobs: this.#timedOut,
+      rejectedJobs: this.#rejected,
+      subscriptions: this.#subscriptions.size,
+      reservedSubscriptions: this.#observers.size,
       maxSubscriptions: this.#maxSubscriptions,
-      pendingNotifications: [...this.#observers].filter(observer => observer.pending).length,
-      activeListeners: [...this.#observers].filter(observer => observer.running).length,
+      pendingNotifications: [...this.#observers].filter((observer) => observer.pending).length,
+      activeListeners: [...this.#observers].filter((observer) => observer.running).length,
       checkpointRecoveryRequired: this.#checkpointFailure !== null,
     });
   }
@@ -245,16 +297,21 @@ export class FrankenDBQueue {
       this.#rejected++;
       return Promise.reject(error);
     }
-    return this.#enqueue(async signal => {
-      const transactionOptions: TransactionOptions = {};
-      if (signal !== undefined) transactionOptions.signal = signal;
-      if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
-      if (this.#journal === null) {
-        return this.#finishTransaction(await this.#db.transaction(work, transactionOptions), []);
-      }
-      const result = await this.#journal.run(this.#db, work, transactionOptions);
-      return this.#finishTransaction(result.value, result.tables);
-    }, admission, work, true);
+    return this.#enqueue(
+      async (signal) => {
+        const transactionOptions: TransactionOptions = {};
+        if (signal !== undefined) transactionOptions.signal = signal;
+        if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
+        if (this.#journal === null) {
+          return this.#finishTransaction(await this.#db.transaction(work, transactionOptions), []);
+        }
+        const result = await this.#journal.run(this.#db, work, transactionOptions);
+        return this.#finishTransaction(result.value, result.tables);
+      },
+      admission,
+      work,
+      true,
+    );
   }
 
   /**
@@ -282,15 +339,23 @@ export class FrankenDBQueue {
       this.#rejected++;
       return Promise.reject(error);
     }
-    return this.#enqueue(async signal => {
-      const retryOptions: TransactionRetryOptions = { ...policy };
-      if (signal !== undefined) retryOptions.signal = signal;
-      if (this.#journal === null) {
-        return this.#finishTransaction(await this.#db.transactionWithRetry(work, retryOptions), []);
-      }
-      const result = await this.#journal.runWithRetry(this.#db, work, retryOptions);
-      return this.#finishTransaction(result.value, result.tables);
-    }, admission, work, true);
+    return this.#enqueue(
+      async (signal) => {
+        const retryOptions: TransactionRetryOptions = { ...policy };
+        if (signal !== undefined) retryOptions.signal = signal;
+        if (this.#journal === null) {
+          return this.#finishTransaction(
+            await this.#db.transactionWithRetry(work, retryOptions),
+            [],
+          );
+        }
+        const result = await this.#journal.runWithRetry(this.#db, work, retryOptions);
+        return this.#finishTransaction(result.value, result.tables);
+      },
+      admission,
+      work,
+      true,
+    );
   }
 
   async #finishTransaction<T>(value: T, tables: readonly string[]): Promise<T> {
@@ -314,10 +379,13 @@ export class FrankenDBQueue {
 
   #assertCheckpointReady(): void {
     if (this.#checkpointFailure === null) return;
-    const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED",
+    const error = new FrankenSQLiteError({
+      code: "ERR_FSQLITE_CHECKPOINT_RECOVERY_REQUIRED",
       message: "A prior SQL commit needs checkpoint recovery; this job executed no SQL",
       transient: false,
-      suggestion: "Await checkpoint(), or export the committed image and reopen/merge. Do not replay the committed callback." });
+      suggestion:
+        "Await checkpoint(), or export the committed image and reopen/merge. Do not replay the committed callback.",
+    });
     error.cause = this.#checkpointFailure;
     throw error;
   }
@@ -326,14 +394,20 @@ export class FrankenDBQueue {
     if (tables.length === 0) return;
     const sequence = ++this.#changeSequence;
     for (const observer of this.#subscriptions) {
-      try { observer.publish(tables, sequence); }
-      catch (cause: unknown) { observer.fail(cause); }
+      try {
+        observer.publish(tables, sequence);
+      } catch (cause: unknown) {
+        observer.fail(cause);
+      }
     }
   }
 
   /** Register at a FIFO boundary; only later successful local commits notify. */
-  subscribe(tables: readonly string[], listener: TableChangeListener,
-    options?: QueuedJobOptions): Promise<TableSubscription> {
+  subscribe(
+    tables: readonly string[],
+    listener: TableChangeListener,
+    options?: QueuedJobOptions,
+  ): Promise<TableSubscription> {
     let requested: readonly string[];
     try {
       this.#assertAdmission();
@@ -343,32 +417,51 @@ export class FrankenDBQueue {
       this.#rejected++;
       return Promise.reject(cause);
     }
-    return this.#enqueue(async signal => {
-      if (this.#observers.size >= this.#maxSubscriptions) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SUBSCRIPTION_LIMIT", transient: true,
-          message: "Subscription capacity is reserved; unsubscribe and await done before retrying" });
-      }
-      const journal = this.#journal ??= new TableChangeJournal();
-      const all = new Map(this.#watchedTables().map(name => [foldTable(name), name]));
-      for (const name of requested) all.set(foldTable(name), name);
-      const canonical = await journal.configure(this.#db, [...all.values()],
-        signal === undefined ? undefined : { signal });
-      if (this.#terminalFailure !== null) throw this.#terminalFailure;
-      const keys = new Set(requested.map(foldTable));
-      const observer = new ChangeObserver(canonical.filter(name => keys.has(foldTable(name))), listener,
-        () => { this.#subscriptions.delete(observer); },
-        () => { this.#observers.delete(observer); });
-      this.#subscriptions.add(observer);
-      this.#observers.add(observer);
-      observer.activate(signal);
-      if (this.#state !== "open") observer.stop();
-      return observer.handle;
-    }, options, listener, true);
+    return this.#enqueue(
+      async (signal) => {
+        if (this.#observers.size >= this.#maxSubscriptions) {
+          throw new FrankenSQLiteError({
+            code: "ERR_FSQLITE_SUBSCRIPTION_LIMIT",
+            transient: true,
+            message:
+              "Subscription capacity is reserved; unsubscribe and await done before retrying",
+          });
+        }
+        const journal = (this.#journal ??= new TableChangeJournal());
+        const all = new Map(this.#watchedTables().map((name) => [foldTable(name), name]));
+        for (const name of requested) all.set(foldTable(name), name);
+        const canonical = await journal.configure(
+          this.#db,
+          [...all.values()],
+          signal === undefined ? undefined : { signal },
+        );
+        if (this.#terminalFailure !== null) throw this.#terminalFailure;
+        const keys = new Set(requested.map(foldTable));
+        const observer = new ChangeObserver(
+          canonical.filter((name) => keys.has(foldTable(name))),
+          listener,
+          () => {
+            this.#subscriptions.delete(observer);
+          },
+          () => {
+            this.#observers.delete(observer);
+          },
+        );
+        this.#subscriptions.add(observer);
+        this.#observers.add(observer);
+        observer.activate(signal);
+        if (this.#state !== "open") observer.stop();
+        return observer.handle;
+      },
+      options,
+      listener,
+      true,
+    );
   }
 
   /** One buffered invalidation range and one outstanding next(), never row results. */
   changes(tables: readonly string[], options?: QueuedJobOptions): Promise<TableChangeStream> {
-    return createChangeStream(listener => this.subscribe(tables, listener, options));
+    return createChangeStream((listener) => this.subscribe(tables, listener, options));
   }
 
   /**
@@ -421,7 +514,11 @@ export class FrankenDBQueue {
     const listeners = [...this.#closeListeners];
     this.#closeListeners.clear();
     for (const listener of listeners) {
-      try { listener(this.#terminalFailure); } catch { /* Internal cleanup cannot suppress close. */ }
+      try {
+        listener(this.#terminalFailure);
+      } catch {
+        /* Internal cleanup cannot suppress close. */
+      }
     }
     for (const observer of this.#subscriptions) observer.stop();
     this.#schedule();
@@ -431,13 +528,18 @@ export class FrankenDBQueue {
   #assertAdmission(): void {
     if (this.#terminalFailure !== null) throw this.#terminalFailure;
     if (this.#state !== "open") {
-      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_CLOSED",
-        message: "This job queue no longer accepts work" });
+      throw new FrankenSQLiteError({
+        code: "ERR_FSQLITE_JOB_QUEUE_CLOSED",
+        message: "This job queue no longer accepts work",
+      });
     }
     if (this.#waiting.size + (this.#active === null ? 0 : 1) >= this.#maxPendingJobs) {
-      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_JOB_QUEUE_FULL", transient: true,
+      throw new FrankenSQLiteError({
+        code: "ERR_FSQLITE_JOB_QUEUE_FULL",
+        transient: true,
         message: "Job queue is full; no SQL was executed",
-        suggestion: "Await an accepted job before retrying the complete operation" });
+        suggestion: "Await an accepted job before retrying the complete operation",
+      });
     }
   }
 
@@ -456,12 +558,16 @@ export class FrankenDBQueue {
       if (typeof callback !== "function") throw new TypeError("A transaction callback is required");
       const requestedSignal = options?.signal;
       waitTimeoutMs = options?.waitTimeoutMs;
-      if (waitTimeoutMs !== undefined && (!Number.isInteger(waitTimeoutMs)
-        || waitTimeoutMs < 1 || waitTimeoutMs > 2_147_483_647)) {
+      if (
+        waitTimeoutMs !== undefined &&
+        (!Number.isInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 2_147_483_647)
+      ) {
         throw new RangeError("waitTimeoutMs must be an integer in 1..2147483647");
       }
       if (requestedSignal !== undefined) {
-        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(requestedSignal);
+        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(
+          requestedSignal,
+        );
         // A dependent native signal is private. A caller's abort listener cannot
         // stopImmediatePropagation() and hide cancellation from this queue.
         signal = AbortSignal.any([requestedSignal]);
@@ -478,26 +584,37 @@ export class FrankenDBQueue {
     const deadline = waitTimeoutMs === undefined ? undefined : performance.now() + waitTimeoutMs;
     return new Promise<T>((resolve, reject) => {
       const job: Job = {
-        state: "waiting", signal, deadline, reject, stopWaiting: () => {},
+        state: "waiting",
+        signal,
+        deadline,
+        reject,
+        stopWaiting: () => {},
         start: () => {
           let result: Promise<T>;
           try {
             // Jobs accepted before a publication failure are fenced too. Do
             // not execute even journal-maintenance SQL before this check.
             if (requiresPublished) this.#assertCheckpointReady();
-            result = (maintenance === "reconcile" && this.#checkpointFailure === null ? this.#reconcileSubscriptions() : Promise.resolve())
-              .then(() => operation(signal));
+            result = (
+              maintenance === "reconcile" && this.#checkpointFailure === null
+                ? this.#reconcileSubscriptions()
+                : Promise.resolve()
+            ).then(() => operation(signal));
+          } catch (error: unknown) {
+            result = Promise.reject(error);
           }
-          catch (error: unknown) { result = Promise.reject(error); }
           // Release capacity only after the real operation (including cleanup)
           // settles. Never race running SQL or a callback against a timer/abort.
-          void result.then(value => {
-            this.#finish(job, true);
-            resolve(value);
-          }, (error: unknown) => {
-            this.#finish(job, false);
-            reject(error);
-          });
+          void result.then(
+            (value) => {
+              this.#finish(job, true);
+              resolve(value);
+            },
+            (error: unknown) => {
+              this.#finish(job, false);
+              reject(error);
+            },
+          );
         },
       };
       const onAbort = () => this.#discard(job, "cancelled", cancelled(signal!));
@@ -517,11 +634,16 @@ export class FrankenDBQueue {
   }
 
   #expire(job: Job): void {
-    this.#discard(job, "timeout", new FrankenSQLiteError({
-      code: "ERR_FSQLITE_JOB_WAIT_TIMEOUT", transient: true,
-      message: "Queued job exceeded its start deadline; no SQL was executed",
-      suggestion: "Retry the complete job after queue pressure subsides",
-    }));
+    this.#discard(
+      job,
+      "timeout",
+      new FrankenSQLiteError({
+        code: "ERR_FSQLITE_JOB_WAIT_TIMEOUT",
+        transient: true,
+        message: "Queued job exceeded its start deadline; no SQL was executed",
+        suggestion: "Retry the complete job after queue pressure subsides",
+      }),
+    );
   }
 
   #discard(job: Job, reason: "cancelled" | "timeout", error: unknown): void {
@@ -544,7 +666,7 @@ export class FrankenDBQueue {
   }
 
   #watchedTables(): readonly string[] {
-    return [...new Set([...this.#subscriptions].flatMap(observer => observer.handle.tables))];
+    return [...new Set([...this.#subscriptions].flatMap((observer) => observer.handle.tables))];
   }
 
   async #reconcileSubscriptions(): Promise<void> {
@@ -587,28 +709,37 @@ export class FrankenDBQueue {
     }
     if (this.#state === "closing" && !this.#closeStarted) {
       this.#closeStarted = true;
-      void this.#db.close().then(() => {
-        this.#stopObservingFailure?.();
-        this.#stopObservingFailure = null;
-        this.#state = "closed";
-        if (this.#checkpointFailure === null) this.#resolveClose!();
-        else this.#rejectClose!(this.#checkpointFailure);
-        this.#resolveClose = null;
-        this.#rejectClose = null;
-      }, (error: unknown) => {
-        this.#stopObservingFailure?.();
-        this.#stopObservingFailure = null;
-        this.#state = "closed";
-        this.#rejectClose!(this.#checkpointFailure === null ? error : new AggregateError(
-          [this.#checkpointFailure, error], "Unacknowledged checkpoint and database close both failed",
-          { cause: this.#checkpointFailure }));
-        this.#resolveClose = null;
-        this.#rejectClose = null;
-      });
+      void this.#db.close().then(
+        () => {
+          this.#stopObservingFailure?.();
+          this.#stopObservingFailure = null;
+          this.#state = "closed";
+          if (this.#checkpointFailure === null) this.#resolveClose!();
+          else this.#rejectClose!(this.#checkpointFailure);
+          this.#resolveClose = null;
+          this.#rejectClose = null;
+        },
+        (error: unknown) => {
+          this.#stopObservingFailure?.();
+          this.#stopObservingFailure = null;
+          this.#state = "closed";
+          this.#rejectClose!(
+            this.#checkpointFailure === null
+              ? error
+              : new AggregateError(
+                  [this.#checkpointFailure, error],
+                  "Unacknowledged checkpoint and database close both failed",
+                  { cause: this.#checkpointFailure },
+                ),
+          );
+          this.#resolveClose = null;
+          this.#rejectClose = null;
+        },
+      );
     }
   }
 }
 
 function foldTable(name: string): string {
-  return name.replace(/[A-Z]/g, char => char.toLowerCase());
+  return name.replace(/[A-Z]/g, (char) => char.toLowerCase());
 }

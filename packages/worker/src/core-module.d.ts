@@ -1,11 +1,5 @@
 declare module "@frankensqlite/core" {
-  export type CoreSqlScalar =
-    | null
-    | string
-    | number
-    | bigint
-    | boolean
-    | Uint8Array;
+  export type CoreSqlScalar = null | string | number | bigint | boolean | Uint8Array;
 
   export interface CoreQueryResult<Row extends Record<string, unknown> = Record<string, unknown>> {
     columns: string[];
@@ -36,15 +30,9 @@ declare module "@frankensqlite/core" {
     [Symbol.dispose](): void;
     static create(name?: string | null): Promise<FrankenDB>;
     static open(name?: string | null): Promise<FrankenDB>;
-    static openWithOptions(
-      name?: string | null,
-      options?: unknown | null,
-    ): Promise<FrankenDB>;
+    static openWithOptions(name?: string | null, options?: unknown | null): Promise<FrankenDB>;
     static import(data: Uint8Array): Promise<FrankenDB>;
-    static importWithOptions(
-      data: Uint8Array,
-      options?: unknown | null,
-    ): Promise<FrankenDB>;
+    static importWithOptions(data: Uint8Array, options?: unknown | null): Promise<FrankenDB>;
     readonly path: string;
     close(): void;
     execute(sql: string): Promise<number>;
@@ -62,12 +50,7 @@ declare module "@frankensqlite/core" {
   export function init(): void;
   export function parseSql(input: string): unknown;
 
-  export type InitInput =
-    | RequestInfo
-    | URL
-    | Response
-    | BufferSource
-    | WebAssembly.Module;
+  export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
   export default function init(
     moduleOrPath?:

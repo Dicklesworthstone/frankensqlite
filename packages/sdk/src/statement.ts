@@ -1,9 +1,15 @@
-import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar, SqlBindings } from "./types";
-import { parameterLayout } from "@frankensqlite/worker";
 import type { ParameterLayout } from "@frankensqlite/worker";
-import { FrankenWorkerClient } from "./worker-client";
+import { parameterLayout } from "@frankensqlite/worker";
 import { FrankenSQLiteError } from "./errors";
 import { combineTransactionSignals } from "./transaction";
+import type {
+  ExecuteManyOptions,
+  ExecuteManyResult,
+  QueryResult,
+  SqlBindings,
+  SqlScalar,
+} from "./types";
+import type { FrankenWorkerClient } from "./worker-client";
 
 type StatementOperation = <T>(operation: () => Promise<T>) => Promise<T>;
 
@@ -46,10 +52,14 @@ export class FrankenPreparedStatement<
     this.columnNames = [...columnNames];
   }
 
-  get parameterCount(): number { return this.#layout.count; }
+  get parameterCount(): number {
+    return this.#layout.count;
+  }
 
   /** Null denotes an anonymous slot or unused ?NNN hole; includes SQL prefixes. */
-  get parameterNames(): readonly (string | null)[] { return this.#layout.names; }
+  get parameterNames(): readonly (string | null)[] {
+    return this.#layout.names;
+  }
 
   /** Replace the entire binding with a validated, privately copied snapshot. */
   bind(params: SqlBindings): Promise<this> {
@@ -57,35 +67,57 @@ export class FrankenPreparedStatement<
       const captured = this.#client.captureBindings(this.#statementId, params, this.#layout, true);
       // Capturing getters can re-enter close, finalize or another scope. Check
       // again before replacing a valid binding or admitting any SQL.
-      return this.#operate(() => { this.#bindings = captured; return Promise.resolve(this); });
+      return this.#operate(() => {
+        this.#bindings = captured;
+        return Promise.resolve(this);
+      });
     });
   }
 
   clearBindings(): Promise<void> {
-    return this.#operate(() => { this.#bindings = null; return Promise.resolve(); });
+    return this.#operate(() => {
+      this.#bindings = null;
+      return Promise.resolve();
+    });
   }
 
   /** Complete bindings required; returns the affected-row count, not a row id. */
   run(params?: SqlBindings): Promise<number> {
-    return this.#strict(params, values => this.#client.executePrepared(this.#statementId, values, this.#transactionId));
+    return this.#strict(params, (values) =>
+      this.#client.executePrepared(this.#statementId, values, this.#transactionId),
+    );
   }
 
   /** Executes once to completion; returns the first row or undefined. Not a cursor. */
   get(params?: SqlBindings): Promise<Row | undefined> {
-    return this.#strict(params, async values =>
-      (await this.#client.queryPrepared<Row>(this.#statementId, values, this.#transactionId)).rows[0]);
+    return this.#strict(
+      params,
+      async (values) =>
+        (await this.#client.queryPrepared<Row>(this.#statementId, values, this.#transactionId))
+          .rows[0],
+    );
   }
 
   /** Executes once to completion and returns the typed object rows. */
   all(params?: SqlBindings): Promise<Row[]> {
-    return this.#strict(params, async values =>
-      (await this.#client.queryPrepared<Row>(this.#statementId, values, this.#transactionId)).rows);
+    return this.#strict(
+      params,
+      async (values) =>
+        (await this.#client.queryPrepared<Row>(this.#statementId, values, this.#transactionId))
+          .rows,
+    );
   }
 
-  #strict<T>(params: SqlBindings | undefined, operation: (values: readonly SqlScalar[]) => Promise<T>): Promise<T> {
+  #strict<T>(
+    params: SqlBindings | undefined,
+    operation: (values: readonly SqlScalar[]) => Promise<T>,
+  ): Promise<T> {
     return this.#operate(() => {
-      const values = this.#client.captureBindings(this.#statementId,
-        params === undefined ? this.#bindings ?? [] : params, this.#layout);
+      const values = this.#client.captureBindings(
+        this.#statementId,
+        params === undefined ? (this.#bindings ?? []) : params,
+        this.#layout,
+      );
       return this.#operate(() => operation(values));
     });
   }
@@ -94,15 +126,23 @@ export class FrankenPreparedStatement<
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => { this.#client.assertOpen(); return operation(); });
+    return this.#run(() => {
+      this.#client.assertOpen();
+      return operation();
+    });
   }
 
   execute(params?: SqlBindings): Promise<number> {
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.executePrepared(this.#statementId,
-      params === undefined ? this.#bindings ?? [] : params, this.#transactionId));
+    return this.#run(() =>
+      this.#client.executePrepared(
+        this.#statementId,
+        params === undefined ? (this.#bindings ?? []) : params,
+        this.#transactionId,
+      ),
+    );
   }
 
   executeMany(
@@ -114,8 +154,12 @@ export class FrankenPreparedStatement<
     }
     return this.#run(() => {
       const signal = combineTransactionSignals(this.#signal, options?.signal);
-      return this.#client.executePreparedMany(this.#statementId, parameterSets,
-        signal === undefined ? {} : { signal }, this.#transactionId);
+      return this.#client.executePreparedMany(
+        this.#statementId,
+        parameterSets,
+        signal === undefined ? {} : { signal },
+        this.#transactionId,
+      );
     });
   }
 
@@ -123,8 +167,13 @@ export class FrankenPreparedStatement<
     if (this.#finalizePromise !== null) {
       return Promise.reject(new Error("FrankenSQLite prepared statement is finalized"));
     }
-    return this.#run(() => this.#client.queryPrepared<Row>(this.#statementId,
-      params === undefined ? this.#bindings ?? [] : params, this.#transactionId));
+    return this.#run(() =>
+      this.#client.queryPrepared<Row>(
+        this.#statementId,
+        params === undefined ? (this.#bindings ?? []) : params,
+        this.#transactionId,
+      ),
+    );
   }
 
   finalize(): Promise<void> {
@@ -135,22 +184,30 @@ export class FrankenPreparedStatement<
       // Keep scope ownership until the worker actually accepts finalization.
       // Admission refusals run no SQL and must leave the handle retryable (or
       // available to the owning transaction's drain/cleanup after overload).
-      this.#finalizePromise = this.#client.finalizePrepared(this.#statementId, this.#transactionId).then(
-        () => { this.#bindings = null; this.#onFinalize?.(false); },
-        (error: unknown) => {
-          if (error instanceof FrankenSQLiteError &&
-            (error.code === "ERR_FSQLITE_QUEUE_FULL" || error.code === "ERR_FSQLITE_REQUEST_TOO_LARGE" ||
-             error.code === "ERR_FSQLITE_REQUEST_INPUT")) {
-            this.#finalizePromise = null;
-          } else {
-            // A free() error can occur after the worker removed the handle;
-            // that outcome is not a license to finalize the same handle twice.
+      this.#finalizePromise = this.#client
+        .finalizePrepared(this.#statementId, this.#transactionId)
+        .then(
+          () => {
             this.#bindings = null;
-            this.#onFinalize?.(true);
-          }
-          throw error;
-        },
-      );
+            this.#onFinalize?.(false);
+          },
+          (error: unknown) => {
+            if (
+              error instanceof FrankenSQLiteError &&
+              (error.code === "ERR_FSQLITE_QUEUE_FULL" ||
+                error.code === "ERR_FSQLITE_REQUEST_TOO_LARGE" ||
+                error.code === "ERR_FSQLITE_REQUEST_INPUT")
+            ) {
+              this.#finalizePromise = null;
+            } else {
+              // A free() error can occur after the worker removed the handle;
+              // that outcome is not a license to finalize the same handle twice.
+              this.#bindings = null;
+              this.#onFinalize?.(true);
+            }
+            throw error;
+          },
+        );
       return this.#finalizePromise;
     });
   }

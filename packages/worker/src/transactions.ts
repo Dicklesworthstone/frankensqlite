@@ -1,6 +1,6 @@
+import { namedParameterEnd } from "./bindings";
 import type { CoreDatabaseHandle } from "./connection";
 import type { TransactionRequest } from "./protocol";
-import { namedParameterEnd } from "./bindings";
 
 export class ManagedTransactionError extends Error {
   readonly cleanupErrors: unknown[] = [];
@@ -19,8 +19,10 @@ export class ManagedTransactionError extends Error {
 
 export function validateTransactionId(id: string): void {
   if (typeof id !== "string" || !/^[1-9][0-9]{0,31}$/.test(id)) {
-    throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_INPUT",
-      "Transaction ids must be positive decimal integers of at most 32 digits");
+    throw new ManagedTransactionError(
+      "ERR_FSQLITE_TRANSACTION_INPUT",
+      "Transaction ids must be positive decimal integers of at most 32 digits",
+    );
   }
 }
 
@@ -34,7 +36,9 @@ export function validateManagedSql(sql: string, script = false): void {
   // Exhaust the scanner before executing ANY part of a managed script. A
   // transaction boundary or malformed token in its tail must not be hidden
   // behind an earlier statement with externally observable function effects.
-  for (const _end of managedStatementEnds(sql, script)) { /* validation only */ }
+  for (const _end of managedStatementEnds(sql, script)) {
+    /* validation only */
+  }
 }
 
 /** Statement end offsets, sharing exactly the managed preflight's lexer. */
@@ -42,15 +46,19 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
   const reject = (message: string): never => {
     throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_SQL", message);
   };
-  if (typeof sql !== "string" || sql.includes("\0")) reject("Managed SQL must be a string without NUL bytes");
+  if (typeof sql !== "string" || sql.includes("\0"))
+    reject("Managed SQL must be a string without NUL bytes");
   let start = true;
   let count = 0;
   let createPrefix = 0;
   let trigger = false;
   let triggerTail = 0; // 1: body semicolon, 2: END following that semicolon.
-  for (let i = 0; i < sql.length;) {
+  for (let i = 0; i < sql.length; ) {
     const char = sql[i]!;
-    if (/[\t\n\v\f\r \uFEFF]/.test(char)) { i++; continue; }
+    if (/[\t\n\v\f\r \uFEFF]/.test(char)) {
+      i++;
+      continue;
+    }
     if (sql.startsWith("--", i)) {
       const end = sql.indexOf("\n", i + 2);
       i = end < 0 ? sql.length : end + 1;
@@ -63,7 +71,10 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
     }
     if (char === ";") {
       i++;
-      if (trigger && triggerTail !== 2) { triggerTail = 1; continue; }
+      if (trigger && triggerTail !== 2) {
+        triggerTail = 1;
+        continue;
+      }
       if (!start) yield i;
       trigger = false;
       triggerTail = 0;
@@ -81,7 +92,10 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
       let closed = false;
       for (i++; i < sql.length; i++) {
         if (sql[i] !== end) continue;
-        if (char !== "[" && sql[i + 1] === end) { i++; continue; }
+        if (char !== "[" && sql[i + 1] === end) {
+          i++;
+          continue;
+        }
         i++;
         closed = true;
         break;
@@ -98,12 +112,15 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
       if (["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"].includes(word)) {
         reject("Transaction boundaries belong to the SDK; use transaction() for nesting");
       }
-      if (++count > 1 && !script) reject("This managed operation requires one SQL statement; use executeBatch for scripts");
+      if (++count > 1 && !script)
+        reject("This managed operation requires one SQL statement; use executeBatch for scripts");
       start = false;
       createPrefix = word === "CREATE" ? 1 : 0;
     } else if (createPrefix !== 0) {
-      if (word === "TRIGGER") { trigger = true; createPrefix = 0; }
-      else if (createPrefix === 1 && (word === "TEMP" || word === "TEMPORARY")) createPrefix = 2;
+      if (word === "TRIGGER") {
+        trigger = true;
+        createPrefix = 0;
+      } else if (createPrefix === 1 && (word === "TEMP" || word === "TEMPORARY")) createPrefix = 2;
       else createPrefix = 0;
     }
     if (trigger) triggerTail = triggerTail === 1 && word === "END" ? 2 : 0;
@@ -128,10 +145,16 @@ export async function executeManagedBatch(
   let remaining = 0;
   for (const _end of managedStatementEnds(sql, true)) remaining++;
   checkpoint();
-  const yieldTask = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0); });
+  const yieldTask = (): Promise<void> =>
+    new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
   // Give already-arriving cancellation controls a task turn before a script
   // starts. Keep ordinary single-statement calls on their existing fast path.
-  if (remaining > 1) { await yieldTask(); checkpoint(); }
+  if (remaining > 1) {
+    await yieldTask();
+    checkpoint();
+  }
   let start = 0;
   let sinceYield = 0;
   let lastYield = performance.now();
@@ -165,14 +188,18 @@ export class ManagedTransactions {
   readonly #stack: Frame[] = [];
   #lastId = 0n;
 
-  clear(): void { this.#stack.length = 0; }
+  clear(): void {
+    this.#stack.length = 0;
+  }
 
   cancel(id: string): boolean {
     validateTransactionId(id);
-    const index = this.#stack.findIndex(frame => frame.id === id);
+    const index = this.#stack.findIndex((frame) => frame.id === id);
     if (index < 0 || this.#stack[index]!.committing) return false;
-    const cause = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CANCELLED",
-      "This managed transaction was cancelled; cleanup and rollback must finish");
+    const cause = new ManagedTransactionError(
+      "ERR_FSQLITE_TRANSACTION_CANCELLED",
+      "This managed transaction was cancelled; cleanup and rollback must finish",
+    );
     // Cancelling a child must not poison its parent or successful siblings.
     // A parent can still be cancelled while a child's RELEASE is in flight:
     // that release is provisional, and the parent will roll back afterward.
@@ -185,17 +212,30 @@ export class ManagedTransactions {
   assertOwner(id: string | undefined, cleanup = false): void {
     const frame = this.#stack.at(-1);
     if (frame === undefined) {
-      if (id !== undefined) throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CLOSED", "This worker transaction is no longer active");
+      if (id !== undefined)
+        throw new ManagedTransactionError(
+          "ERR_FSQLITE_TRANSACTION_CLOSED",
+          "This worker transaction is no longer active",
+        );
       return;
     }
-    if (frame.id !== id) throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Another transaction scope owns this worker connection");
+    if (frame.id !== id)
+      throw new ManagedTransactionError(
+        "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
+        "Another transaction scope owns this worker connection",
+      );
     if (!cleanup && frame.failure !== null) {
-      if (frame.failure.cause instanceof ManagedTransactionError &&
-          frame.failure.cause.code === "ERR_FSQLITE_TRANSACTION_CANCELLED") {
+      if (
+        frame.failure.cause instanceof ManagedTransactionError &&
+        frame.failure.cause.code === "ERR_FSQLITE_TRANSACTION_CANCELLED"
+      ) {
         throw frame.failure.cause;
       }
-      throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_ABORTED",
-        "This scope failed; only cleanup and rollback may run", { cause: frame.failure.cause });
+      throw new ManagedTransactionError(
+        "ERR_FSQLITE_TRANSACTION_ABORTED",
+        "This scope failed; only cleanup and rollback may run",
+        { cause: frame.failure.cause },
+      );
     }
   }
 
@@ -215,7 +255,10 @@ export class ManagedTransactions {
       this.assertOwner(request.parentId);
       // Never reuse a finished/failed id, including across reinitialization.
       if (BigInt(id) <= this.#lastId || this.#stack.length >= 64) {
-        throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_INPUT", "Transaction id must advance and nesting must not exceed 64 scopes");
+        throw new ManagedTransactionError(
+          "ERR_FSQLITE_TRANSACTION_INPUT",
+          "Transaction id must advance and nesting must not exceed 64 scopes",
+        );
       }
       this.#lastId = BigInt(id);
       const savepoint = request.parentId === undefined ? null : `fsqlite_owned_${id}`;
@@ -229,7 +272,12 @@ export class ManagedTransactions {
       // An out-of-band cancel may have fenced the parent while SAVEPOINT was
       // awaited. Still acknowledge the successful begin so its caller knows
       // it owns rollback, but never let the new child execute unfenced work.
-      this.#stack.push({ id, savepoint, failure: this.#stack.at(-1)?.failure ?? null, committing: false });
+      this.#stack.push({
+        id,
+        savepoint,
+        failure: this.#stack.at(-1)?.failure ?? null,
+        committing: false,
+      });
       return;
     }
     this.assertOwner(id, request.action === "rollback");
@@ -237,31 +285,53 @@ export class ManagedTransactions {
     try {
       finalize(id);
     } catch (cause: unknown) {
-      const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
-        "Transaction handle cleanup failed; reopen the connection", { cause }, true);
-      try { await this.#rollback(db, frame); }
-      catch (cleanupError: unknown) { failure.cleanupErrors.push(cleanupError); }
+      const failure = new ManagedTransactionError(
+        "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+        "Transaction handle cleanup failed; reopen the connection",
+        { cause },
+        true,
+      );
+      try {
+        await this.#rollback(db, frame);
+      } catch (cleanupError: unknown) {
+        failure.cleanupErrors.push(cleanupError);
+      }
       throw failure;
     }
     if (request.action === "rollback") {
-      try { await this.#rollback(db, frame); }
-      catch (cause: unknown) {
-        throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
-          "Managed rollback failed; no further SQL may execute on this connection", { cause }, true);
+      try {
+        await this.#rollback(db, frame);
+      } catch (cause: unknown) {
+        throw new ManagedTransactionError(
+          "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+          "Managed rollback failed; no further SQL may execute on this connection",
+          { cause },
+          true,
+        );
       }
     } else {
       // free() may re-enter control delivery. Check again after cleanup and
       // seal immediately before dispatch, not while commit is merely queued.
       this.assertOwner(id);
       frame.committing = true;
-      try { await db.executeBatch(frame.savepoint === null ? "COMMIT" : `RELEASE SAVEPOINT ${frame.savepoint}`); }
-      catch (cause: unknown) { frame.committing = false; this.fail(id, cause); throw cause; }
+      try {
+        await db.executeBatch(
+          frame.savepoint === null ? "COMMIT" : `RELEASE SAVEPOINT ${frame.savepoint}`,
+        );
+      } catch (cause: unknown) {
+        frame.committing = false;
+        this.fail(id, cause);
+        throw cause;
+      }
     }
     this.#stack.pop();
   }
 
   async #rollback(db: CoreDatabaseHandle, frame: Frame): Promise<void> {
-    if (frame.savepoint === null) { await db.executeBatch("ROLLBACK"); return; }
+    if (frame.savepoint === null) {
+      await db.executeBatch("ROLLBACK");
+      return;
+    }
     await db.executeBatch(`ROLLBACK TO SAVEPOINT ${frame.savepoint}`);
     // Never release after failed rollback-to: RELEASE might commit partial work.
     await db.executeBatch(`RELEASE SAVEPOINT ${frame.savepoint}`);

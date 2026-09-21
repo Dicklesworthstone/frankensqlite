@@ -1,18 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { WorkerConnectionHost } from "../src/connection";
-import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "../src/connection";
 import { validateBulkSql } from "../src/bulk";
-import { MAX_EXECUTE_MANY_ROWS } from "../src/protocol";
+import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "../src/connection";
+import { WorkerConnectionHost } from "../src/connection";
 import type { ExecuteManyRequest, QueryResult, SqlScalar, WorkerResponse } from "../src/protocol";
+import { MAX_EXECUTE_MANY_ROWS } from "../src/protocol";
 
 const SQL = "INSERT INTO items(v) VALUES (?)";
 const emptyResult: QueryResult = {
-  columns: [], columnCount: 0, columnTypes: [], rows: [], rowArrays: [], changes: 0,
+  columns: [],
+  columnCount: 0,
+  columnTypes: [],
+  rows: [],
+  rowArrays: [],
+  changes: 0,
 };
 
 function deferred() {
   let resolve!: () => void;
-  const promise = new Promise<void>((done) => { resolve = done; });
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }
 
@@ -39,7 +46,10 @@ async function fixture(faults: Faults = {}) {
   let rowGate: ReturnType<typeof deferred> | undefined;
   let blockedRow = 0;
   const started = deferred();
-  const boundaries = new Map<string, { gate: ReturnType<typeof deferred>; started: ReturnType<typeof deferred> }>();
+  const boundaries = new Map<
+    string,
+    { gate: ReturnType<typeof deferred>; started: ReturnType<typeof deferred> }
+  >();
   async function waitBoundary(name: string): Promise<void> {
     const boundary = boundaries.get(name);
     boundary?.started.resolve();
@@ -54,7 +64,9 @@ async function fixture(faults: Faults = {}) {
       frees += 1;
       if (faults.free) throw new Error("free failed");
     },
-    async execute() { throw new Error("unbound execution reused prior bindings"); },
+    async execute() {
+      throw new Error("unbound execution reused prior bindings");
+    },
     async executeWithParams(params) {
       events.push("row");
       const index = bindings.length;
@@ -69,21 +81,37 @@ async function fixture(faults: Faults = {}) {
           snapshots.length = 0;
         }
         throw Object.assign(new Error("constraint failed"), {
-          code: "SQLITE_CONSTRAINT", sqliteCode: 19, extendedCode: 2067,
+          code: "SQLITE_CONSTRAINT",
+          sqliteCode: 19,
+          extendedCode: 2067,
         });
       }
       if (params[0] !== "skip") rows.push([...params]);
       return faults.count ?? (params[0] === "skip" ? 0 : params[0] === "two" ? 2 : 1);
     },
-    async query() { return emptyResult; },
-    async queryWithParams() { return emptyResult; },
+    async query() {
+      return emptyResult;
+    },
+    async queryWithParams() {
+      return emptyResult;
+    },
   };
   const db: CoreDatabaseHandle = {
     path: ":memory:",
-    close() { events.push("close"); if (faults.close) throw new Error("close failed"); },
-    free() { events.push("database.free"); },
-    async execute() { events.push("execute"); return 1; },
-    async executeWithParams() { return 1; },
+    close() {
+      events.push("close");
+      if (faults.close) throw new Error("close failed");
+    },
+    free() {
+      events.push("database.free");
+    },
+    async execute() {
+      events.push("execute");
+      return 1;
+    },
+    async executeWithParams() {
+      return 1;
+    },
     async executeBatch(sql) {
       events.push(sql);
       const name = sql.split(" ").at(-1)!;
@@ -105,23 +133,51 @@ async function fixture(faults: Faults = {}) {
         snapshots.pop();
       }
     },
-    async query() { events.push("query"); return emptyResult; },
-    async queryWithParams() { return emptyResult; },
-    async prepare() { events.push("prepare"); prepares += 1; await waitBoundary("prepare"); return statement; },
-    async export() { return Uint8Array.of(1); },
+    async query() {
+      events.push("query");
+      return emptyResult;
+    },
+    async queryWithParams() {
+      return emptyResult;
+    },
+    async prepare() {
+      events.push("prepare");
+      prepares += 1;
+      await waitBoundary("prepare");
+      return statement;
+    },
+    async export() {
+      return Uint8Array.of(1);
+    },
   };
   const host = new WorkerConnectionHost({
-    async load() { return { FrankenDB: {
-      async create() { return db; }, async import() { return db; },
-    } }; },
+    async load() {
+      return {
+        FrankenDB: {
+          async create() {
+            return db;
+          },
+          async import() {
+            return db;
+          },
+        },
+      };
+    },
   });
   await host.handle({ kind: "init", requestId: 1, config: {} });
   return {
-    host, db, events, bindings,
+    host,
+    db,
+    events,
+    bindings,
     rows: () => rows,
     frees: () => frees,
     prepares: () => prepares,
-    block(index = 0) { blockedRow = index; rowGate = deferred(); return { ...rowGate, started: started.promise }; },
+    block(index = 0) {
+      blockedRow = index;
+      rowGate = deferred();
+      return { ...rowGate, started: started.promise };
+    },
     blockBoundary(name: string) {
       const gate = deferred();
       const started = deferred();
@@ -144,20 +200,30 @@ describe("atomic bulk execution", () => {
   it("prepares once, binds each row and returns exact per-execution counts", async () => {
     const f = await fixture();
     expect(await f.run([[1], ["skip"], ["two"]])).toEqual({
-      kind: "execute-many-result", requestId: 2,
+      kind: "execute-many-result",
+      requestId: 2,
       data: { executions: 3, changes: 3, changesPerExecution: [1, 0, 2] },
     });
     expect(f.prepares()).toBe(1);
     expect(f.frees()).toBe(1);
     expect(f.events).toEqual([
-      "prepare", "SAVEPOINT fsqlite_bulk_1", "row", "row", "row", "free", "RELEASE SAVEPOINT fsqlite_bulk_1",
+      "prepare",
+      "SAVEPOINT fsqlite_bulk_1",
+      "row",
+      "row",
+      "row",
+      "free",
+      "RELEASE SAVEPOINT fsqlite_bulk_1",
     ]);
   });
 
   it("does not prepare or start a transaction for an empty input", async () => {
     const f = await fixture();
-    expect(await f.run([])).toEqual({ kind: "execute-many-result", requestId: 2,
-      data: { executions: 0, changes: 0, changesPerExecution: [] } });
+    expect(await f.run([])).toEqual({
+      kind: "execute-many-result",
+      requestId: 2,
+      data: { executions: 0, changes: 0, changesPerExecution: [] },
+    });
     expect(f.events).toEqual([]);
   });
 
@@ -173,9 +239,12 @@ describe("atomic bulk execution", () => {
       expect(f.rows()).toEqual([["before"]]);
       expect(f.frees()).toBe(1);
       expect(f.events.slice(-2)).toEqual([
-        "ROLLBACK TO SAVEPOINT fsqlite_bulk_1", "RELEASE SAVEPOINT fsqlite_bulk_1",
+        "ROLLBACK TO SAVEPOINT fsqlite_bulk_1",
+        "RELEASE SAVEPOINT fsqlite_bulk_1",
       ]);
-      expect((await f.host.handle({ kind: "query", requestId: 3, sql: "SELECT 1" })).kind).toBe("query-result");
+      expect((await f.host.handle({ kind: "query", requestId: 3, sql: "SELECT 1" })).kind).toBe(
+        "query-result",
+      );
     });
   }
 
@@ -198,11 +267,23 @@ describe("atomic bulk execution", () => {
     const f = await fixture();
     const prepared = await f.host.handle({ kind: "prepare", requestId: 2, sql: SQL });
     if (prepared.kind !== "prepare-result") throw new Error("prepare failed");
-    expect((await f.host.handle({ kind: "statement-execute-many", requestId: 3,
-      statementId: prepared.data.statementId, parameterSets: [[1], [2]] })).kind).toBe("execute-many-result");
+    expect(
+      (
+        await f.host.handle({
+          kind: "statement-execute-many",
+          requestId: 3,
+          statementId: prepared.data.statementId,
+          parameterSets: [[1], [2]],
+        })
+      ).kind,
+    ).toBe("execute-many-result");
     expect(f.prepares()).toBe(1);
     expect(f.frees()).toBe(0);
-    await f.host.handle({ kind: "statement-finalize", requestId: 4, statementId: prepared.data.statementId });
+    await f.host.handle({
+      kind: "statement-finalize",
+      requestId: 4,
+      statementId: prepared.data.statementId,
+    });
     expect(f.frees()).toBe(1);
   });
 
@@ -224,11 +305,17 @@ describe("atomic bulk execution", () => {
     expect(failure.batchIndex).toBeUndefined();
     expect(f.rows()).toEqual([["before"]]);
     expect(f.events.slice(-3)).toEqual([
-      "RELEASE SAVEPOINT fsqlite_bulk_1", "ROLLBACK TO SAVEPOINT fsqlite_bulk_1", "RELEASE SAVEPOINT fsqlite_bulk_1",
+      "RELEASE SAVEPOINT fsqlite_bulk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_bulk_1",
+      "RELEASE SAVEPOINT fsqlite_bulk_1",
     ]);
   });
 
-  for (const faults of [{ row: 1, rollback: true }, { row: 1, release: 1 }, { row: 1, wholeTransactionRollback: true }]) {
+  for (const faults of [
+    { row: 1, rollback: true },
+    { row: 1, release: 1 },
+    { row: 1, wholeTransactionRollback: true },
+  ]) {
     it(`poisons the host after failed recovery: ${JSON.stringify(faults)}`, async () => {
       const f = await fixture(faults);
       const failure = error(await f.run());
@@ -237,11 +324,18 @@ describe("atomic bulk execution", () => {
       expect(failure.cleanupErrors?.length).toBe(1);
       expect(failure.cause?.code).toBe("SQLITE_CONSTRAINT");
       const eventsBefore = [...f.events];
-      error(await f.host.handle({ kind: "execute", requestId: 3, sql: "INSERT INTO items VALUES (99)" }));
+      error(
+        await f.host.handle({
+          kind: "execute",
+          requestId: 3,
+          sql: "INSERT INTO items VALUES (99)",
+        }),
+      );
       expect(f.events).toEqual(eventsBefore);
       expect(f.events.slice(-2)).toEqual(["close", "database.free"]);
       expect((await f.host.handle({ kind: "close", requestId: 4 })).kind).toBe("close-result");
-      if (faults.rollback) expect(f.events.includes("RELEASE SAVEPOINT fsqlite_bulk_1")).toBe(false);
+      if (faults.rollback)
+        expect(f.events.includes("RELEASE SAVEPOINT fsqlite_bulk_1")).toBe(false);
     });
   }
 
@@ -256,7 +350,11 @@ describe("atomic bulk execution", () => {
     const f = await fixture({ row: 0, free: true, rollback: true, close: true });
     const failure = error(await f.run());
     expect(failure.cause?.message).toBe("constraint failed");
-    expect(failure.cleanupErrors?.map((item) => item.message)).toEqual(["free failed", "rollback failed", "close failed"]);
+    expect(failure.cleanupErrors?.map((item) => item.message)).toEqual([
+      "free failed",
+      "rollback failed",
+      "close failed",
+    ]);
     expect(f.events.at(-1)).toBe("database.free");
   });
 
@@ -272,16 +370,28 @@ describe("atomic bulk execution", () => {
     gate.resolve();
     const responses = await Promise.all([bulk, query, close]);
     expect(before).toEqual(["prepare", "SAVEPOINT fsqlite_bulk_1", "row"]);
-    expect(responses.map((response) => response.kind)).toEqual(["execute-many-result", "query-result", "close-result"]);
-    expect(f.events.slice(-4)).toEqual(["RELEASE SAVEPOINT fsqlite_bulk_1", "query", "close", "database.free"]);
+    expect(responses.map((response) => response.kind)).toEqual([
+      "execute-many-result",
+      "query-result",
+      "close-result",
+    ]);
+    expect(f.events.slice(-4)).toEqual([
+      "RELEASE SAVEPOINT fsqlite_bulk_1",
+      "query",
+      "close",
+      "database.free",
+    ]);
   });
 
   it("rejects oversized or malformed input before preparing or writing", async () => {
     const f = await fixture();
-    expect(error(await f.run(Array.from({ length: MAX_EXECUTE_MANY_ROWS + 1 }, () => [1]))).code)
-      .toBe("ERR_FSQLITE_BULK_INPUT");
+    expect(
+      error(await f.run(Array.from({ length: MAX_EXECUTE_MANY_ROWS + 1 }, () => [1]))).code,
+    ).toBe("ERR_FSQLITE_BULK_INPUT");
     const malformed = { kind: "execute-many", requestId: 3, sql: SQL, parameterSets: [[1], null] };
-    expect(error(await f.host.handle(malformed as unknown as ExecuteManyRequest)).batchIndex).toBe(1);
+    expect(error(await f.host.handle(malformed as unknown as ExecuteManyRequest)).batchIndex).toBe(
+      1,
+    );
     expect(f.events).toEqual([]);
   });
 
@@ -296,10 +406,21 @@ describe("atomic bulk execution", () => {
 
 describe("bulk SQL boundary", () => {
   for (const sql of [
-    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT s", "RELEASE s", "PRAGMA journal_mode=OFF",
-    "CREATE TABLE t(v)", "SELECT 1", "-- empty", "/* empty */", "",
-    "INSERT INTO t VALUES(1); COMMIT", "INSERT INTO t VALUES(1); -- tail\n DELETE FROM t",
-    "INSERT INTO t VALUES('unterminated)", "INSERT INTO t VALUES(1) /* unterminated",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVEPOINT s",
+    "RELEASE s",
+    "PRAGMA journal_mode=OFF",
+    "CREATE TABLE t(v)",
+    "SELECT 1",
+    "-- empty",
+    "/* empty */",
+    "",
+    "INSERT INTO t VALUES(1); COMMIT",
+    "INSERT INTO t VALUES(1); -- tail\n DELETE FROM t",
+    "INSERT INTO t VALUES('unterminated)",
+    "INSERT INTO t VALUES(1) /* unterminated",
     "INSERT INTO t VALUES(1)\0; COMMIT",
   ]) {
     it(`rejects unsafe batch boundary ${JSON.stringify(sql)}`, async () => {
@@ -327,18 +448,31 @@ function cancel(host: WorkerConnectionHost, targetRequestId = 2, requestId = 90)
 }
 
 function cancellable(host: WorkerConnectionHost, requestId = 2) {
-  return host.handle({ kind: "execute-many", requestId, sql: SQL,
-    parameterSets: [[1], [2], [3]], cancellable: true });
+  return host.handle({
+    kind: "execute-many",
+    requestId,
+    sql: SQL,
+    parameterSets: [[1], [2], [3]],
+    cancellable: true,
+  });
 }
 
 describe("bulk cancellation and commit boundary", () => {
   it("cancels a queued batch before any prepare or savepoint", async () => {
     const f = await fixture();
     const pending = cancellable(f.host);
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: true,
+    });
     expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
     expect(f.events).toEqual([]);
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: false,
+    });
   });
 
   for (const blockedRow of [0, 2]) {
@@ -347,16 +481,25 @@ describe("bulk cancellation and commit boundary", () => {
       const gate = f.block(blockedRow);
       const pending = cancellable(f.host);
       let settled = false;
-      void pending.then(() => { settled = true; });
+      void pending.then(() => {
+        settled = true;
+      });
       await gate.started;
-      expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+      expect(await cancel(f.host)).toEqual({
+        kind: "cancel-bulk-result",
+        requestId: 90,
+        accepted: true,
+      });
       expect(settled).toBe(false);
       expect(f.frees()).toBe(0);
       gate.resolve();
       expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
       expect(f.rows()).toEqual([["before"]]);
       expect(f.frees()).toBe(1);
-      expect(f.events.slice(-2)).toEqual(["ROLLBACK TO SAVEPOINT fsqlite_bulk_1", "RELEASE SAVEPOINT fsqlite_bulk_1"]);
+      expect(f.events.slice(-2)).toEqual([
+        "ROLLBACK TO SAVEPOINT fsqlite_bulk_1",
+        "RELEASE SAVEPOINT fsqlite_bulk_1",
+      ]);
       expect((await f.run([[4]])).kind).toBe("execute-many-result");
       expect(f.rows()).toEqual([["before"], [4]]);
     });
@@ -368,7 +511,9 @@ describe("bulk cancellation and commit boundary", () => {
     const rollback = f.blockBoundary("rollback");
     const pending = cancellable(f.host);
     let settled = false;
-    void pending.then(() => { settled = true; });
+    void pending.then(() => {
+      settled = true;
+    });
     await row.started;
     await cancel(f.host);
     row.resolve();
@@ -409,7 +554,11 @@ describe("bulk cancellation and commit boundary", () => {
     const gate = f.blockBoundary("release");
     const pending = cancellable(f.host);
     await gate.started;
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: false,
+    });
     gate.resolve();
     expect((await pending).kind).toBe("execute-many-result");
     expect(f.rows()).toEqual([["before"], [1], [2], [3]]);
@@ -448,7 +597,12 @@ describe("bulk cancellation and commit boundary", () => {
     const first = f.run([[11]]);
     await gate.started;
     const second = cancellable(f.host, 3);
-    const third = f.host.handle({ kind: "execute-many", requestId: 4, sql: SQL, parameterSets: [[44]] });
+    const third = f.host.handle({
+      kind: "execute-many",
+      requestId: 4,
+      sql: SQL,
+      parameterSets: [[44]],
+    });
     await cancel(f.host, 3);
     gate.resolve();
     expect((await first).kind).toBe("execute-many-result");
@@ -462,18 +616,34 @@ describe("bulk cancellation and commit boundary", () => {
     const gate = f.block();
     const pending = f.run();
     await gate.started;
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
-    expect(await cancel(f.host, 123)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: false,
+    });
+    expect(await cancel(f.host, 123)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: false,
+    });
     gate.resolve();
     expect((await pending).kind).toBe("execute-many-result");
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: false });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: false,
+    });
   });
 
   it("rejects duplicate active cancellation ids without replacing the first token", async () => {
     const f = await fixture();
     const pending = cancellable(f.host);
     expect(error(await cancellable(f.host)).message).toBe("Duplicate active bulk request id");
-    expect(await cancel(f.host)).toEqual({ kind: "cancel-bulk-result", requestId: 90, accepted: true });
+    expect(await cancel(f.host)).toEqual({
+      kind: "cancel-bulk-result",
+      requestId: 90,
+      accepted: true,
+    });
     expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
   });
 
@@ -482,15 +652,28 @@ describe("bulk cancellation and commit boundary", () => {
     const prepared = await f.host.handle({ kind: "prepare", requestId: 7, sql: SQL });
     if (prepared.kind !== "prepare-result") throw new Error("prepare failed");
     const gate = f.block();
-    const pending = f.host.handle({ kind: "statement-execute-many", requestId: 2,
-      statementId: prepared.data.statementId, parameterSets: [[1]], cancellable: true });
+    const pending = f.host.handle({
+      kind: "statement-execute-many",
+      requestId: 2,
+      statementId: prepared.data.statementId,
+      parameterSets: [[1]],
+      cancellable: true,
+    });
     await gate.started;
     await cancel(f.host);
     gate.resolve();
     expect(error(await pending).code).toBe("ERR_FSQLITE_BULK_CANCELLED");
     expect(f.frees()).toBe(0);
-    expect((await f.host.handle({ kind: "statement-execute-many", requestId: 3,
-      statementId: prepared.data.statementId, parameterSets: [[4]] })).kind).toBe("execute-many-result");
+    expect(
+      (
+        await f.host.handle({
+          kind: "statement-execute-many",
+          requestId: 3,
+          statementId: prepared.data.statementId,
+          parameterSets: [[4]],
+        })
+      ).kind,
+    ).toBe("execute-many-result");
     expect(f.rows()).toEqual([["before"], [4]]);
   });
 });

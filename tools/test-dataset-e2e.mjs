@@ -17,18 +17,27 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, unlinkSync, readFileSync, mkdtempSync } from "node:fs";
-import { gunzipSync } from "node:zlib";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 
 // --- CLI ---
 const args = process.argv.slice(2);
 const flags = { dataset: null, verbose: false, help: false };
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--dataset" && args[i + 1]) { flags.dataset = args[++i]; continue; }
-  if (args[i] === "--verbose") { flags.verbose = true; continue; }
-  if (args[i] === "--help" || args[i] === "-h") { flags.help = true; continue; }
+  if (args[i] === "--dataset" && args[i + 1]) {
+    flags.dataset = args[++i];
+    continue;
+  }
+  if (args[i] === "--verbose") {
+    flags.verbose = true;
+    continue;
+  }
+  if (args[i] === "--help" || args[i] === "-h") {
+    flags.help = true;
+    continue;
+  }
   console.error(`Unknown argument: ${args[i]}`);
   process.exit(1);
 }
@@ -46,8 +55,14 @@ Options:
 // --- Helpers ---
 const report = { passed: 0, failed: 0, timings: [] };
 
-function pass(msg) { report.passed++; console.log(`  PASS: ${msg}`); }
-function fail(msg) { report.failed++; console.error(`  FAIL: ${msg}`); }
+function pass(msg) {
+  report.passed++;
+  console.log(`  PASS: ${msg}`);
+}
+function fail(msg) {
+  report.failed++;
+  console.error(`  FAIL: ${msg}`);
+}
 
 function timed(label, fn) {
   const t0 = performance.now();
@@ -90,10 +105,17 @@ try {
   // Check git is available
   const gitVersion = run("git --version", { allowFail: true });
   if (gitVersion) pass(`Git available: ${gitVersion}`);
-  else { fail("Git not available"); process.exit(1); }
+  else {
+    fail("Git not available");
+    process.exit(1);
+  }
 
   // Check tools exist
-  for (const tool of ["tools/generate-dataset.mjs", "tools/validate-dataset.mjs", "tools/test-dataset.mjs"]) {
+  for (const tool of [
+    "tools/generate-dataset.mjs",
+    "tools/validate-dataset.mjs",
+    "tools/test-dataset.mjs",
+  ]) {
     if (existsSync(tool)) pass(`Tool exists: ${tool}`);
     else fail(`Tool not found: ${tool}`);
   }
@@ -120,7 +142,9 @@ try {
     console.log("\n--- Step 3a: Generate dataset (dry-run) ---");
     const dryRunOutput = timed("generate_dry_run", () => {
       try {
-        const output = run(`node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}" --dry-run`);
+        const output = run(
+          `node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}" --dry-run`,
+        );
         if (flags.verbose) console.log(output);
         return output;
       } catch (e) {
@@ -147,7 +171,9 @@ try {
     console.log("\n--- Step 3b: Generate dataset (real) ---");
     const genOutput = timed("generate_real", () => {
       try {
-        const output = run(`node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}"`);
+        const output = run(
+          `node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}"`,
+        );
         if (flags.verbose) console.log(output);
         return output;
       } catch (e) {
@@ -173,7 +199,8 @@ try {
       }
 
       // Verify determinism output
-      if (genOutput.includes("Determinism verified")) pass("Generator reports deterministic output");
+      if (genOutput.includes("Determinism verified"))
+        pass("Generator reports deterministic output");
       else fail("Generator did not confirm determinism");
     } else {
       fail("Generate failed or did not write output file");
@@ -181,7 +208,10 @@ try {
   } else {
     console.log("\n--- Step 3: Using provided dataset ---");
     if (existsSync(datasetPath)) pass(`Dataset exists: ${datasetPath}`);
-    else { fail(`Dataset not found: ${datasetPath}`); process.exit(1); }
+    else {
+      fail(`Dataset not found: ${datasetPath}`);
+      process.exit(1);
+    }
   }
 
   // Step 4: Validate dataset
@@ -189,7 +219,9 @@ try {
   const validateOutput = timed("validate", () => {
     try {
       const verboseFlag = flags.verbose ? " --verbose" : "";
-      const output = run(`node tools/validate-dataset.mjs --input "${datasetPath}" --spec-path "${specPath}"${verboseFlag}`);
+      const output = run(
+        `node tools/validate-dataset.mjs --input "${datasetPath}" --spec-path "${specPath}"${verboseFlag}`,
+      );
       if (flags.verbose) console.log(output);
       return output;
     } catch (e) {
@@ -215,7 +247,10 @@ try {
       const raw = gunzipSync(readFileSync(datasetPath));
       const data = JSON.parse(raw.toString("utf-8"));
       const lastHash = data.commits?.[data.commits.length - 1]?.hash;
-      if (!lastHash) { fail("No commits in dataset"); return; }
+      if (!lastHash) {
+        fail("No commits in dataset");
+        return;
+      }
 
       const commitCount = data.commits.length;
       const patchCount = data.patches.length;
@@ -224,15 +259,19 @@ try {
       console.log(`  [info] Base doc: ${(data.base_doc || "").length} chars`);
 
       // Patch size statistics
-      const patchSizes = data.patches.map(p => (p || "").length);
+      const patchSizes = data.patches.map((p) => (p || "").length);
       const totalPatchBytes = patchSizes.reduce((s, n) => s + n, 0);
       const avgPatch = patchSizes.length ? (totalPatchBytes / patchSizes.length).toFixed(0) : 0;
       const maxPatch = Math.max(...patchSizes);
       const minPatch = Math.min(...patchSizes);
-      console.log(`  [info] Patch sizes: total=${(totalPatchBytes / 1024).toFixed(1)}KB, avg=${avgPatch}B, min=${minPatch}B, max=${maxPatch}B`);
+      console.log(
+        `  [info] Patch sizes: total=${(totalPatchBytes / 1024).toFixed(1)}KB, avg=${avgPatch}B, min=${minPatch}B, max=${maxPatch}B`,
+      );
 
       // Check that last commit is reachable
-      const specAtLast = run(`git show ${lastHash}:"${data.spec_path || specPath}"`, { allowFail: true });
+      const specAtLast = run(`git show ${lastHash}:"${data.spec_path || specPath}"`, {
+        allowFail: true,
+      });
       if (specAtLast === null) {
         fail(`Cannot retrieve spec at ${lastHash.slice(0, 8)} (shallow clone?)`);
         return;
@@ -241,16 +280,23 @@ try {
 
       // Verify HEAD is at or after last dataset commit
       const headHash = git("rev-parse HEAD");
-      const isAncestor = run(`git merge-base --is-ancestor ${lastHash} ${headHash}`, { allowFail: true });
+      const isAncestor = run(`git merge-base --is-ancestor ${lastHash} ${headHash}`, {
+        allowFail: true,
+      });
       if (isAncestor !== null) {
         pass("Last dataset commit is ancestor of HEAD");
       } else {
         // Not necessarily a failure -- could be different branch
-        console.log(`  [warn] Last dataset commit ${lastHash.slice(0, 8)} may not be ancestor of HEAD ${headHash.slice(0, 8)}`);
+        console.log(
+          `  [warn] Last dataset commit ${lastHash.slice(0, 8)} may not be ancestor of HEAD ${headHash.slice(0, 8)}`,
+        );
       }
 
       // Count how many new commits exist beyond dataset
-      const newCommits = run(`git rev-list --count ${lastHash}..HEAD -- "${data.spec_path || specPath}"`, { allowFail: true });
+      const newCommits = run(
+        `git rev-list --count ${lastHash}..HEAD -- "${data.spec_path || specPath}"`,
+        { allowFail: true },
+      );
       if (newCommits !== null) {
         const n = parseInt(newCommits, 10);
         if (n === 0) pass("Dataset is up to date (no new commits beyond last)");
@@ -268,7 +314,9 @@ try {
     console.log("\n--- Step 6: Append mode (no-op) ---");
     const appendOutput = timed("append_noop", () => {
       try {
-        const output = run(`node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}" --append --dry-run`);
+        const output = run(
+          `node tools/generate-dataset.mjs --spec-path "${specPath}" --output "${datasetPath}" --append --dry-run`,
+        );
         if (flags.verbose) console.log(output);
         return output;
       } catch (e) {
@@ -283,15 +331,20 @@ try {
       fail("Append dry-run failed");
     }
   }
-
 } finally {
   // Cleanup temporary files
   if (tempDir && existsSync(datasetPath)) {
-    try { unlinkSync(datasetPath); } catch { /* ignore */ }
+    try {
+      unlinkSync(datasetPath);
+    } catch {
+      /* ignore */
+    }
     try {
       const { rmdirSync } = await import("node:fs");
       rmdirSync(tempDir);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 }
 

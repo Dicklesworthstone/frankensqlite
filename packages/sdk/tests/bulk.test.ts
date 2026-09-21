@@ -1,14 +1,22 @@
-import { describe, expect, it } from "vitest";
 import type { SerializedFrankenError, WorkerRequest, WorkerResponse } from "@frankensqlite/worker";
-import { FrankenDB, FrankenSQLiteError, MAX_EXECUTE_MANY_ROWS } from "../src/index";
+import { describe, expect, it } from "vitest";
 import type { FrankenPreparedStatement, FrankenTransaction, SqlScalar } from "../src/index";
+import { FrankenDB, FrankenSQLiteError, MAX_EXECUTE_MANY_ROWS } from "../src/index";
 import { ControlledWorker, deferred, drain, observe, rejected } from "./helpers/controlled-worker";
 
 const SQL = "INSERT INTO t(v) VALUES(?)";
 const failure: SerializedFrankenError = {
-  code: "SQLITE_CONSTRAINT", message: "bulk constraint failed", sqliteCode: 19,
-  extendedCode: 2067, batchIndex: 2,
-  cause: { code: "SQLITE_CONSTRAINT", message: "duplicate value", sqliteCode: 19, extendedCode: 2067 },
+  code: "SQLITE_CONSTRAINT",
+  message: "bulk constraint failed",
+  sqliteCode: 19,
+  extendedCode: 2067,
+  batchIndex: 2,
+  cause: {
+    code: "SQLITE_CONSTRAINT",
+    message: "duplicate value",
+    sqliteCode: 19,
+    extendedCode: 2067,
+  },
   cleanupErrors: [{ code: "SQLITE_IOERR", message: "cleanup failed", sqliteCode: 10 }],
 };
 
@@ -20,21 +28,43 @@ async function fixture() {
   function response(request: WorkerRequest): WorkerResponse {
     const requestId = request.requestId;
     switch (request.kind) {
-      case "init": return { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } };
-      case "execute-batch": return { kind: "execute-batch-result", requestId };
-      case "transaction": return { kind: "transaction-result", requestId };
+      case "init":
+        return { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } };
+      case "execute-batch":
+        return { kind: "execute-batch-result", requestId };
+      case "transaction":
+        return { kind: "transaction-result", requestId };
       case "execute-many":
       case "statement-execute-many": {
         if (fail) return { kind: "error", requestId, error: failure };
         const count = request.parameterSets.length;
-        return { kind: "execute-many-result", requestId,
-          data: { executions: count, changes: count, changesPerExecution: Array<number>(count).fill(1) } };
+        return {
+          kind: "execute-many-result",
+          requestId,
+          data: {
+            executions: count,
+            changes: count,
+            changesPerExecution: Array<number>(count).fill(1),
+          },
+        };
       }
-      case "prepare": return { kind: "prepare-result", requestId,
-        data: { statementId: `stmt-${requestId}`, sql: request.sql, columnCount: 0, columnNames: [] } };
-      case "statement-finalize": return { kind: "statement-finalize-result", requestId };
-      case "close": return { kind: "close-result", requestId };
-      default: return { kind: "execute-result", requestId, changes: 1 };
+      case "prepare":
+        return {
+          kind: "prepare-result",
+          requestId,
+          data: {
+            statementId: `stmt-${requestId}`,
+            sql: request.sql,
+            columnCount: 0,
+            columnNames: [],
+          },
+        };
+      case "statement-finalize":
+        return { kind: "statement-finalize-result", requestId };
+      case "close":
+        return { kind: "close-result", requestId };
+      default:
+        return { kind: "execute-result", requestId, changes: 1 };
     }
   }
   worker.onPost = (request) => {
@@ -46,12 +76,28 @@ async function fixture() {
     }
   };
   const db = await FrankenDB.open({ worker });
-  return { db, worker,
-    fail() { fail = true; },
-    hold() { hold = true; },
-    flush() { hold = false; for (const request of held.splice(0)) worker.reply(response(request)); },
-    requests() { return worker.requests.map((request) => request.kind === "transaction"
-      ? request.action.toUpperCase() : "sql" in request ? request.sql : request.kind); },
+  return {
+    db,
+    worker,
+    fail() {
+      fail = true;
+    },
+    hold() {
+      hold = true;
+    },
+    flush() {
+      hold = false;
+      for (const request of held.splice(0)) worker.reply(response(request));
+    },
+    requests() {
+      return worker.requests.map((request) =>
+        request.kind === "transaction"
+          ? request.action.toUpperCase()
+          : "sql" in request
+            ? request.sql
+            : request.kind,
+      );
+    },
   };
 }
 
@@ -68,7 +114,11 @@ describe("SDK atomic bulk execution", () => {
 
   it("supports empty batches without bypassing lifecycle admission", async () => {
     const f = await fixture();
-    expect(await f.db.executeMany(SQL, [])).toEqual({ executions: 0, changes: 0, changesPerExecution: [] });
+    expect(await f.db.executeMany(SQL, [])).toEqual({
+      executions: 0,
+      changes: 0,
+      changesPerExecution: [],
+    });
     await f.db.close();
     await expect(f.db.executeMany(SQL, [])).rejects.toThrow("disposed");
   });
@@ -100,7 +150,11 @@ describe("SDK atomic bulk execution", () => {
     await statement.finalize();
     await expect(statement.executeMany([])).rejects.toThrow("finalized");
     expect(f.worker.requests.map((request) => request.kind)).toEqual([
-      "init", "prepare", "statement-execute-many", "statement-execute", "statement-finalize",
+      "init",
+      "prepare",
+      "statement-execute-many",
+      "statement-execute",
+      "statement-finalize",
     ]);
   });
 
@@ -116,7 +170,12 @@ describe("SDK atomic bulk execution", () => {
     await expect(escaped.executeMany(SQL, [[2]])).rejects.toThrow("finished");
     await expect(statement.executeMany([[2]])).rejects.toThrow("finished");
     expect(f.worker.requests.map((request) => request.kind)).toEqual([
-      "init", "transaction", "prepare", "statement-execute-many", "statement-finalize", "transaction",
+      "init",
+      "transaction",
+      "prepare",
+      "statement-execute-many",
+      "statement-finalize",
+      "transaction",
     ]);
   });
 
@@ -147,7 +206,8 @@ describe("SDK atomic bulk execution", () => {
   });
 
   it("preserves the row index, SQLite codes and structured cause/cleanup errors", async () => {
-    const f = await fixture(); f.fail();
+    const f = await fixture();
+    f.fail();
     const observed = observe(f.db.executeMany(SQL, [[1], [2], [1]]));
     await observed.settled;
     const error = rejected(observed);
@@ -159,40 +219,57 @@ describe("SDK atomic bulk execution", () => {
     expect(error.cause instanceof FrankenSQLiteError).toBe(true);
     if (!(error.cause instanceof FrankenSQLiteError)) throw new Error("missing cause");
     expect(error.cause.message).toBe("duplicate value");
-    expect(error.cleanupErrors.map((item) => [item.code, item.message])).toEqual([["SQLITE_IOERR", "cleanup failed"]]);
+    expect(error.cleanupErrors.map((item) => [item.code, item.message])).toEqual([
+      ["SQLITE_IOERR", "cleanup failed"],
+    ]);
   });
 
   it("drains an already-admitted batch before committing its callback", async () => {
-    const f = await fixture(); f.hold();
+    const f = await fixture();
+    f.hold();
     const entered = deferred<void>();
-    const transaction = observe(f.db.transaction((tx) => {
-      void tx.executeMany(SQL, [[1], [2]]);
-      entered.resolve();
-    }));
-    await entered.promise; await drain();
+    const transaction = observe(
+      f.db.transaction((tx) => {
+        void tx.executeMany(SQL, [[1], [2]]);
+        entered.resolve();
+      }),
+    );
+    await entered.promise;
+    await drain();
     expect(transaction.outcome.status).toBe("pending");
     expect(f.requests()).toEqual(["init", "BEGIN", SQL]);
-    f.flush(); await transaction.settled;
+    f.flush();
+    await transaction.settled;
     expect(transaction.outcome.status).toBe("fulfilled");
     expect(f.requests().at(-1)).toBe("COMMIT");
   });
 
   it("rolls back when an unawaited batch fails instead of committing earlier work", async () => {
-    const f = await fixture(); f.hold(); f.fail();
+    const f = await fixture();
+    f.hold();
+    f.fail();
     const entered = deferred<void>();
-    const transaction = observe(f.db.transaction((tx) => {
-      void tx.executeMany(SQL, [[1], [2], [1]]);
-      entered.resolve();
-    }));
-    await entered.promise; f.flush(); await transaction.settled;
+    const transaction = observe(
+      f.db.transaction((tx) => {
+        void tx.executeMany(SQL, [[1], [2], [1]]);
+        entered.resolve();
+      }),
+    );
+    await entered.promise;
+    f.flush();
+    await transaction.settled;
     expect(rejected(transaction) instanceof FrankenSQLiteError).toBe(true);
     expect(f.requests().at(-1)).toBe("ROLLBACK");
   });
 
   it("rejects oversized and malformed batches before sending them", async () => {
     const f = await fixture();
-    await expect(f.db.executeMany(SQL, Array.from({ length: MAX_EXECUTE_MANY_ROWS + 1 }, () => [1])))
-      .rejects.toThrow("at most");
+    await expect(
+      f.db.executeMany(
+        SQL,
+        Array.from({ length: MAX_EXECUTE_MANY_ROWS + 1 }, () => [1]),
+      ),
+    ).rejects.toThrow("at most");
     const observed = observe(f.db.executeMany(SQL, [[1], null] as unknown as SqlScalar[][]));
     await observed.settled;
     const error = rejected(observed);
@@ -215,10 +292,17 @@ async function cancellationFixture() {
   const worker = new ControlledWorker();
   worker.onPost = (request) => {
     if (request.kind === "init") {
-      queueMicrotask(() => worker.reply({ kind: "ready", requestId: request.requestId,
-        data: { path: ":memory:", persistence: "memory" } }));
+      queueMicrotask(() =>
+        worker.reply({
+          kind: "ready",
+          requestId: request.requestId,
+          data: { path: ":memory:", persistence: "memory" },
+        }),
+      );
     } else if (request.kind === "cancel-bulk") {
-      queueMicrotask(() => worker.reply({ kind: "cancel-bulk-result", requestId: request.requestId, accepted: true }));
+      queueMicrotask(() =>
+        worker.reply({ kind: "cancel-bulk-result", requestId: request.requestId, accepted: true }),
+      );
     }
   };
   const db = await FrankenDB.open({ worker });
@@ -227,12 +311,28 @@ async function cancellationFixture() {
     if (request === undefined) throw new Error("batch was not posted");
     return request.requestId;
   };
-  return { db, worker, batchId,
-    complete() { worker.reply({ kind: "execute-many-result", requestId: batchId(),
-      data: { executions: 1, changes: 1, changesPerExecution: [1] } }); },
-    cancelled() { worker.reply({ kind: "error", requestId: batchId(), error: {
-      code: "ERR_FSQLITE_BULK_CANCELLED", message: "bulk execution was cancelled", transient: false,
-    } }); },
+  return {
+    db,
+    worker,
+    batchId,
+    complete() {
+      worker.reply({
+        kind: "execute-many-result",
+        requestId: batchId(),
+        data: { executions: 1, changes: 1, changesPerExecution: [1] },
+      });
+    },
+    cancelled() {
+      worker.reply({
+        kind: "error",
+        requestId: batchId(),
+        error: {
+          code: "ERR_FSQLITE_BULK_CANCELLED",
+          message: "bulk execution was cancelled",
+          transient: false,
+        },
+      });
+    },
   };
 }
 
@@ -259,7 +359,9 @@ describe("SDK cooperative bulk cancellation", () => {
     const f = await cancellationFixture();
     const tracked = trackedSignal();
     tracked.controller.abort();
-    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow("cancelled");
+    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow(
+      "cancelled",
+    );
     expect(f.worker.requests.map((item) => item.kind)).toEqual(["init"]);
     expect(tracked.counts()).toEqual([0, 0]);
   });
@@ -271,7 +373,11 @@ describe("SDK cooperative bulk cancellation", () => {
     tracked.controller.abort();
     await drain();
     expect(batch.outcome.status).toBe("pending");
-    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "cancel-bulk"]);
+    expect(f.worker.requests.map((item) => item.kind)).toEqual([
+      "init",
+      "execute-many",
+      "cancel-bulk",
+    ]);
     const request = f.worker.requests.at(-1);
     if (request?.kind !== "cancel-bulk") throw new Error("missing cancel request");
     expect(request.targetRequestId).toBe(f.batchId());
@@ -287,7 +393,12 @@ describe("SDK cooperative bulk cancellation", () => {
     const f = await cancellationFixture();
     const controller = new AbortController();
     f.worker.onPost = (request) => {
-      if (request.kind === "cancel-bulk") f.worker.reply({ kind: "cancel-bulk-result", requestId: request.requestId, accepted: false });
+      if (request.kind === "cancel-bulk")
+        f.worker.reply({
+          kind: "cancel-bulk-result",
+          requestId: request.requestId,
+          accepted: false,
+        });
     };
     const batch = f.db.executeMany(SQL, [[1]], { signal: controller.signal });
     controller.abort();
@@ -299,7 +410,8 @@ describe("SDK cooperative bulk cancellation", () => {
     const f = await cancellationFixture();
     const tracked = trackedSignal();
     const batch = f.db.executeMany(SQL, [[1]], { signal: tracked.signal });
-    f.complete(); await batch;
+    f.complete();
+    await batch;
     expect(tracked.counts()).toEqual([1, 1]);
     tracked.controller.abort();
     expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many"]);
@@ -308,8 +420,12 @@ describe("SDK cooperative bulk cancellation", () => {
   it("removes listeners after a synchronous transport failure", async () => {
     const f = await cancellationFixture();
     const tracked = trackedSignal();
-    f.worker.onPost = () => { throw new Error("clone failed"); };
-    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow("clone failed");
+    f.worker.onPost = () => {
+      throw new Error("clone failed");
+    };
+    await expect(f.db.executeMany(SQL, [[1]], { signal: tracked.signal })).rejects.toThrow(
+      "clone failed",
+    );
     expect(tracked.counts()).toEqual([1, 1]);
     tracked.controller.abort();
     expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many"]);
@@ -324,8 +440,13 @@ describe("SDK cooperative bulk cancellation", () => {
       prior(request);
     };
     const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
-    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "cancel-bulk"]);
-    f.cancelled(); await batch.settled;
+    expect(f.worker.requests.map((item) => item.kind)).toEqual([
+      "init",
+      "execute-many",
+      "cancel-bulk",
+    ]);
+    f.cancelled();
+    await batch.settled;
     expect(rejected(batch) instanceof FrankenSQLiteError).toBe(true);
   });
 
@@ -336,9 +457,11 @@ describe("SDK cooperative bulk cancellation", () => {
       if (request.kind === "cancel-bulk") throw new Error("cancel transport unavailable");
     };
     const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
-    controller.abort(); await drain();
+    controller.abort();
+    await drain();
     expect(batch.outcome.status).toBe("pending");
-    f.complete(); await batch.settled;
+    f.complete();
+    await batch.settled;
     expect(batch.outcome.status).toBe("fulfilled");
   });
 
@@ -348,10 +471,16 @@ describe("SDK cooperative bulk cancellation", () => {
     const batch = observe(f.db.executeMany(SQL, [[1]], { signal: controller.signal }));
     const close = f.db.close();
     controller.abort();
-    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "execute-many", "close", "cancel-bulk"]);
+    expect(f.worker.requests.map((item) => item.kind)).toEqual([
+      "init",
+      "execute-many",
+      "close",
+      "cancel-bulk",
+    ]);
     await drain();
     expect(batch.outcome.status).toBe("pending");
-    f.cancelled(); await batch.settled;
+    f.cancelled();
+    await batch.settled;
     const closeRequest = f.worker.requests.find((item) => item.kind === "close")!;
     f.worker.reply({ kind: "close-result", requestId: closeRequest.requestId });
     await close;
@@ -380,16 +509,25 @@ describe("SDK cooperative bulk cancellation", () => {
       const prepared = await tx.prepare(SQL);
       await prepared.executeMany([[3]], { signal: controller.signal });
     });
-    const batches = f.worker.requests.filter((item) => item.kind === "execute-many" || item.kind === "statement-execute-many");
+    const batches = f.worker.requests.filter(
+      (item) => item.kind === "execute-many" || item.kind === "statement-execute-many",
+    );
     expect(batches.map((item) => item.cancellable)).toEqual([true, true, true]);
   });
 
   it("does not bypass transaction ownership even with a pre-aborted signal", async () => {
     const f = await fixture();
-    const controller = new AbortController(); controller.abort();
+    const controller = new AbortController();
+    controller.abort();
     await f.db.transaction(async () => {
-      await expect(f.db.executeMany(SQL, [[1]], { signal: controller.signal })).rejects.toThrow("owns this connection");
+      await expect(f.db.executeMany(SQL, [[1]], { signal: controller.signal })).rejects.toThrow(
+        "owns this connection",
+      );
     });
-    expect(f.worker.requests.map((item) => item.kind)).toEqual(["init", "transaction", "transaction"]);
+    expect(f.worker.requests.map((item) => item.kind)).toEqual([
+      "init",
+      "transaction",
+      "transaction",
+    ]);
   });
 });

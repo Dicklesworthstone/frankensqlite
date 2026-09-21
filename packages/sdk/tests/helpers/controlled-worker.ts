@@ -1,9 +1,5 @@
 import type { WorkerMessage, WorkerRequest } from "@frankensqlite/worker";
-import type {
-  WorkerErrorEventLike,
-  WorkerLike,
-  WorkerMessageEvent,
-} from "../../src/worker-client";
+import type { WorkerErrorEventLike, WorkerLike, WorkerMessageEvent } from "../../src/worker-client";
 
 // Deliberately controllable transport: tests decide when responses, crashes and
 // synchronous postMessage failures occur. This is not a browser/WASM fixture.
@@ -74,7 +70,10 @@ export class ControlledWorker implements WorkerLike {
 export function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
   return { promise, resolve, reject };
 }
 
@@ -86,10 +85,19 @@ export type Outcome<T> =
 export function observe<T>(promise: Promise<T>) {
   let outcome: Outcome<T> = { status: "pending" };
   const settled = promise.then(
-    (value) => { outcome = { status: "fulfilled", value }; },
-    (reason: unknown) => { outcome = { status: "rejected", reason }; },
+    (value) => {
+      outcome = { status: "fulfilled", value };
+    },
+    (reason: unknown) => {
+      outcome = { status: "rejected", reason };
+    },
   );
-  return { get outcome() { return outcome; }, settled };
+  return {
+    get outcome() {
+      return outcome;
+    },
+    settled,
+  };
 }
 
 // Bounded microtask turns detect abandoned promises without a hanging test or

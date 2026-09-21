@@ -1,18 +1,33 @@
-import type { ExecuteManyOptions, ExecuteManyResult, QueryResult, SqlScalar, SqlBindings, TransactionOptions } from "./types";
-import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
 import type { FrankenDB } from "./database";
-import type { FrankenPreparedStatement } from "./statement";
 import { FrankenSQLiteError } from "./errors";
+import type { FrankenPreparedStatement } from "./statement";
+import type {
+  ExecuteManyOptions,
+  ExecuteManyResult,
+  ExecuteStreamOptions,
+  ExecuteStreamResult,
+  QueryResult,
+  SqlBindings,
+  SqlRowSource,
+  SqlScalar,
+  TransactionOptions,
+} from "./types";
 
 type TransactionCapableDb = Pick<
   FrankenDB,
   "execute" | "executeBatch" | "executeMany" | "executeStream" | "query" | "prepare"
 >;
 
-type NestedTransaction = <T>(work: (tx: FrankenTransaction) => T | Promise<T>, options?: TransactionOptions) => Promise<T>;
+type NestedTransaction = <T>(
+  work: (tx: FrankenTransaction) => T | Promise<T>,
+  options?: TransactionOptions,
+) => Promise<T>;
 
 /** Native dependent signals avoid a secondary set of retained JS listeners. */
-export function combineTransactionSignals(scope: AbortSignal | undefined, operation: AbortSignal | undefined): AbortSignal | undefined {
+export function combineTransactionSignals(
+  scope: AbortSignal | undefined,
+  operation: AbortSignal | undefined,
+): AbortSignal | undefined {
   if (scope === undefined) return operation;
   if (operation === undefined || operation === scope) return scope;
   return AbortSignal.any([scope, operation]);
@@ -22,9 +37,15 @@ export function combineTransactionSignals(scope: AbortSignal | undefined, operat
 export function captureTransactionOptions(options?: TransactionOptions): TransactionOptions {
   const signal = options?.signal;
   const timeoutMs = options?.timeoutMs;
-  if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647)) {
-    throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_INPUT", transient: false,
-      message: "timeoutMs must be an integer in 1..2147483647" });
+  if (
+    timeoutMs !== undefined &&
+    (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647)
+  ) {
+    throw new FrankenSQLiteError({
+      code: "ERR_FSQLITE_TRANSACTION_INPUT",
+      transient: false,
+      message: "timeoutMs must be an integer in 1..2147483647",
+    });
   }
   if (signal !== undefined) {
     Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
@@ -46,8 +67,11 @@ export class TransactionBudget {
   #timer: ReturnType<typeof setTimeout> | undefined;
   #finished = false;
 
-  constructor(parent: TransactionBudget | undefined, options: TransactionOptions,
-    outerCheckpoint?: () => void) {
+  constructor(
+    parent: TransactionBudget | undefined,
+    options: TransactionOptions,
+    outerCheckpoint?: () => void,
+  ) {
     this.#parent = parent;
     this.#outerCheckpoint = outerCheckpoint;
     const signals: AbortSignal[] = [];
@@ -70,7 +94,11 @@ export class TransactionBudget {
     // or retry deadline, even if it supplies a longer timeout of its own.
     this.#parent?.checkpoint();
     this.#outerCheckpoint?.();
-    if (this.#deadline !== undefined && performance.now() >= this.#deadline && !this.#timeout!.signal.aborted) {
+    if (
+      this.#deadline !== undefined &&
+      performance.now() >= this.#deadline &&
+      !this.#timeout!.signal.aborted
+    ) {
       clearTimeout(this.#timer);
       this.#timer = undefined;
       this.#timeout!.abort(this.#reason);
@@ -79,8 +107,10 @@ export class TransactionBudget {
 
   get timedOut(): boolean {
     if (!this.signal.aborted) return false;
-    return (this.#reason !== undefined && this.signal.reason === this.#reason) ||
-      (this.#parent?.timedOut === true && this.signal.reason === this.#parent.signal.reason);
+    return (
+      (this.#reason !== undefined && this.signal.reason === this.#reason) ||
+      (this.#parent?.timedOut === true && this.signal.reason === this.#parent.signal.reason)
+    );
   }
 
   finish(): void {
@@ -91,12 +121,15 @@ export class TransactionBudget {
 
   #arm(): void {
     if (this.#finished || this.signal.aborted || this.#deadline === undefined) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      this.checkpoint();
-      // An early timer is not authority to expire the monotonic deadline.
-      this.#arm();
-    }, Math.max(1, Math.ceil(this.#deadline - performance.now())));
+    this.#timer = setTimeout(
+      () => {
+        this.#timer = undefined;
+        this.checkpoint();
+        // An early timer is not authority to expire the monotonic deadline.
+        this.#arm();
+      },
+      Math.max(1, Math.ceil(this.#deadline - performance.now())),
+    );
   }
 }
 
@@ -105,7 +138,11 @@ export class FrankenTransaction {
   readonly #nested: NestedTransaction | undefined;
   readonly signal: AbortSignal;
 
-  constructor(db: TransactionCapableDb, nested?: NestedTransaction, signal = new AbortController().signal) {
+  constructor(
+    db: TransactionCapableDb,
+    nested?: NestedTransaction,
+    signal = new AbortController().signal,
+  ) {
     this.#db = db;
     this.#nested = nested;
     this.signal = signal;
@@ -151,9 +188,14 @@ export class FrankenTransaction {
   }
 
   /** Run an isolated child scope using a SAVEPOINT on this transaction. */
-  transaction<T>(work: (tx: FrankenTransaction) => T | Promise<T>, options?: TransactionOptions): Promise<T> {
+  transaction<T>(
+    work: (tx: FrankenTransaction) => T | Promise<T>,
+    options?: TransactionOptions,
+  ): Promise<T> {
     if (this.#nested === undefined) {
-      return Promise.reject(new Error("Nested transactions require a managed transaction callback"));
+      return Promise.reject(
+        new Error("Nested transactions require a managed transaction callback"),
+      );
     }
     return this.#nested(work, options);
   }

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { WorkerConnectionHost } from "../src/connection";
 import type { CoreDatabaseHandle, CorePreparedStatementHandle } from "../src/connection";
+import { WorkerConnectionHost } from "../src/connection";
 import type { QueryResult } from "../src/protocol";
 
 function deferred<T>() {
@@ -19,8 +18,12 @@ function fixture() {
   const gates = new Map<string, ReturnType<typeof deferred<void>>>();
   const starts = new Map<string, ReturnType<typeof deferred<void>>>();
   const result: QueryResult = {
-    columns: ["value"], columnCount: 1, columnTypes: ["integer"],
-    rows: [{ value: 1 }], rowArrays: [[1]], changes: 0,
+    columns: ["value"],
+    columnCount: 1,
+    columnTypes: ["integer"],
+    rows: [{ value: 1 }],
+    rowArrays: [[1]],
+    changes: 0,
   };
   async function step(name: string): Promise<void> {
     events.push(`${name}:start`);
@@ -29,36 +32,84 @@ function fixture() {
     events.push(`${name}:end`);
   }
   const statement: CorePreparedStatementHandle = {
-    sql: "SELECT 1", columnCount: 1,
+    sql: "SELECT 1",
+    columnCount: 1,
     columnNames: () => ["value"],
-    free: () => { events.push("statement:free"); },
-    execute: async () => { await step("statement-execute"); return 1; },
-    executeWithParams: async () => { await step("statement-execute"); return 1; },
-    query: async () => { await step("statement-query"); return result; },
-    queryWithParams: async () => { await step("statement-query"); return result; },
+    free: () => {
+      events.push("statement:free");
+    },
+    execute: async () => {
+      await step("statement-execute");
+      return 1;
+    },
+    executeWithParams: async () => {
+      await step("statement-execute");
+      return 1;
+    },
+    query: async () => {
+      await step("statement-query");
+      return result;
+    },
+    queryWithParams: async () => {
+      await step("statement-query");
+      return result;
+    },
   };
   const db: CoreDatabaseHandle = {
     path: ":memory:",
-    close: () => { events.push("database:close"); },
-    free: () => { events.push("database:free"); },
-    execute: async () => { await step("execute"); return 1; },
-    executeWithParams: async () => { await step("execute"); return 1; },
-    executeBatch: async () => { await step("batch"); },
-    query: async () => { await step("query"); return result; },
-    queryWithParams: async () => { await step("query"); return result; },
-    prepare: async () => { await step("prepare"); return statement; },
-    export: async () => { await step("export"); return Uint8Array.of(1); },
+    close: () => {
+      events.push("database:close");
+    },
+    free: () => {
+      events.push("database:free");
+    },
+    execute: async () => {
+      await step("execute");
+      return 1;
+    },
+    executeWithParams: async () => {
+      await step("execute");
+      return 1;
+    },
+    executeBatch: async () => {
+      await step("batch");
+    },
+    query: async () => {
+      await step("query");
+      return result;
+    },
+    queryWithParams: async () => {
+      await step("query");
+      return result;
+    },
+    prepare: async () => {
+      await step("prepare");
+      return statement;
+    },
+    export: async () => {
+      await step("export");
+      return Uint8Array.of(1);
+    },
   };
   const host = new WorkerConnectionHost({
     async load() {
-      return { FrankenDB: {
-        async create() { await step("create"); return db; },
-        async import() { await step("import"); return db; },
-      } };
+      return {
+        FrankenDB: {
+          async create() {
+            await step("create");
+            return db;
+          },
+          async import() {
+            await step("import");
+            return db;
+          },
+        },
+      };
     },
   });
   return {
-    host, events,
+    host,
+    events,
     block(name: string) {
       const gate = deferred<void>();
       const started = deferred<void>();
@@ -67,8 +118,7 @@ function fixture() {
       return { ...gate, started: started.promise };
     },
     async init() {
-      expect((await host.handle({ kind: "init", requestId: 1, config: {} })).kind)
-        .toBe("ready");
+      expect((await host.handle({ kind: "init", requestId: 1, config: {} })).kind).toBe("ready");
       events.length = 0;
     },
   };
@@ -99,8 +149,9 @@ describe("worker request ownership", () => {
     await Promise.all([query, close]);
     expect(beforeRelease).toEqual(["query:start"]);
     expect(f.events).toEqual(["query:start", "query:end", "database:close", "database:free"]);
-    expect((await f.host.handle({ kind: "query", requestId: 4, sql: "SELECT 1" })).kind)
-      .toBe("error");
+    expect((await f.host.handle({ kind: "query", requestId: 4, sql: "SELECT 1" })).kind).toBe(
+      "error",
+    );
   });
 
   it("keeps a prepared statement alive until its pending query settles", async () => {
@@ -111,11 +162,15 @@ describe("worker request ownership", () => {
     f.events.length = 0;
     const gate = f.block("statement-query");
     const query = f.host.handle({
-      kind: "statement-query", requestId: 3, statementId: prepared.data.statementId,
+      kind: "statement-query",
+      requestId: 3,
+      statementId: prepared.data.statementId,
     });
     await gate.started;
     const finalize = f.host.handle({
-      kind: "statement-finalize", requestId: 4, statementId: prepared.data.statementId,
+      kind: "statement-finalize",
+      requestId: 4,
+      statementId: prepared.data.statementId,
     });
     const beforeRelease = [...f.events];
     gate.resolve();
@@ -137,10 +192,16 @@ describe("worker request ownership", () => {
     const responses = await Promise.all([execute, query, close]);
     expect(beforeRelease).toEqual(["execute:start"]);
     expect(responses.map((r) => [r.requestId, r.kind])).toEqual([
-      [2, "error"], [3, "query-result"], [4, "close-result"],
+      [2, "error"],
+      [3, "query-result"],
+      [4, "close-result"],
     ]);
     expect(f.events).toEqual([
-      "execute:start", "query:start", "query:end", "database:close", "database:free",
+      "execute:start",
+      "query:start",
+      "query:end",
+      "database:close",
+      "database:free",
     ]);
   });
 
@@ -153,7 +214,11 @@ describe("worker request ownership", () => {
     await gate.started;
     const query = f.host.handle({ kind: "query", requestId: 3, sql: "SELECT 1" });
     const failure = new Error("error getter failed");
-    gate.reject({ get code() { throw failure; } });
+    gate.reject({
+      get code() {
+        throw failure;
+      },
+    });
     expect(await rejection).toBe(failure);
     expect((await query).kind).toBe("query-result");
     expect(f.events).toEqual(["execute:start", "query:start", "query:end"]);
@@ -169,7 +234,12 @@ describe("worker request ownership", () => {
     gate.resolve();
     await Promise.all([query, init]);
     expect(f.events).toEqual([
-      "query:start", "query:end", "database:close", "database:free", "create:start", "create:end",
+      "query:start",
+      "query:end",
+      "database:close",
+      "database:free",
+      "create:start",
+      "create:end",
     ]);
   });
 

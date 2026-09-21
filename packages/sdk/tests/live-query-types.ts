@@ -1,16 +1,26 @@
 // Compile-only public entrypoint contract; never execute intentional misuse.
-import { watchQuery, FrankenDBQueue, FrankenSnapshotPool } from "../src/index";
+
 import type { LiveQuery, LiveQueryResult } from "../src/index";
+import { type FrankenDBQueue, FrankenSnapshotPool, watchQuery } from "../src/index";
+
 async function contract(queue: FrankenDBQueue): Promise<void> {
-  const query: LiveQuery<{ id: number; value: string }> = await watchQuery(queue,
+  const query: LiveQuery<{ id: number; value: string }> = await watchQuery(
+    queue,
     "SELECT id,value FROM items WHERE id >= :id",
-    { tables: ["items"], params: { id: 1 }, maxInputBytes: 1024,
-      signal: new AbortController().signal, waitTimeoutMs: 500 });
+    {
+      tables: ["items"],
+      params: { id: 1 },
+      maxInputBytes: 1024,
+      signal: new AbortController().signal,
+      waitTimeoutMs: 500,
+    },
+  );
   for await (const result of query) {
     const typed: LiveQueryResult<{ id: number; value: string }> = result;
     const value: string | undefined = typed.rows[0]?.value;
     const sequence: bigint = result.throughSequence;
-    void value; void sequence;
+    void value;
+    void sequence;
     // @ts-expect-error Local sequences are bigint, not lossy numbers.
     const numberSequence: number = result.throughSequence;
     // @ts-expect-error Sequence metadata is read-only.

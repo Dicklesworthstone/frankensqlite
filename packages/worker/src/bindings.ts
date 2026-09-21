@@ -7,7 +7,10 @@ export class BindingError extends Error {
   readonly transient = false;
   readonly userRecoverable = true;
   constructor(
-    readonly code: "ERR_FSQLITE_BINDING_INPUT" | "ERR_FSQLITE_BINDING_ARITY" | "ERR_FSQLITE_BINDING_NAME",
+    readonly code:
+      | "ERR_FSQLITE_BINDING_INPUT"
+      | "ERR_FSQLITE_BINDING_ARITY"
+      | "ERR_FSQLITE_BINDING_NAME",
     message: string,
   ) {
     super(message);
@@ -30,16 +33,25 @@ function inputError(message: string): never {
 }
 
 function identifier(code: number): boolean {
-  return code >= 128 || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) ||
-    (code >= 48 && code <= 57) || code === 95 || code === 36;
+  return (
+    code >= 128 ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    (code >= 48 && code <= 57) ||
+    code === 95 ||
+    code === 36
+  );
 }
 
 /** End of a :/@/$ token, including its opaque Tcl-style suffix. */
 export function namedParameterEnd(sql: string, start: number): number {
-  let i = start + 1, characters = 0;
+  let i = start + 1,
+    characters = 0;
   while (i < sql.length) {
-    if (identifier(sql.charCodeAt(i))) { i++; characters++; }
-    else if (sql.startsWith("::", i)) i += 2;
+    if (identifier(sql.charCodeAt(i))) {
+      i++;
+      characters++;
+    } else if (sql.startsWith("::", i)) i += 2;
     else break;
   }
   if (characters === 0) inputError("Named SQL parameters require a name");
@@ -58,14 +70,18 @@ export function namedParameterEnd(sql: string, start: number): number {
  * Layouts are for ONE statement. Script execution retains its existing API.
  */
 export function parameterLayout(sql: string): ParameterLayout {
-  if (typeof sql !== "string" || sql.includes("\0")) inputError("SQL must be a string without NUL bytes");
+  if (typeof sql !== "string" || sql.includes("\0"))
+    inputError("SQL must be a string without NUL bytes");
   const names: (string | null)[] = [];
   const aliases: Record<string, number> = Object.create(null);
   const slots = new Set<number>();
   let count = 0;
-  for (let i = 0; i < sql.length;) {
+  for (let i = 0; i < sql.length; ) {
     const c = sql[i]!;
-    if (c === "\uFEFF") { i++; continue; }
+    if (c === "\uFEFF") {
+      i++;
+      continue;
+    }
     if (sql.startsWith("--", i)) {
       const end = sql.indexOf("\n", i + 2);
       i = end < 0 ? sql.length : end + 1;
@@ -81,8 +97,13 @@ export function parameterLayout(sql: string): ParameterLayout {
       let closed = false;
       for (i++; i < sql.length; i++) {
         if (sql[i] !== end) continue;
-        if (c !== "[" && sql[i + 1] === end) { i++; continue; }
-        i++; closed = true; break;
+        if (c !== "[" && sql[i + 1] === end) {
+          i++;
+          continue;
+        }
+        i++;
+        closed = true;
+        break;
       }
       if (!closed) inputError("Unterminated quoted value or identifier in SQL");
       continue;
@@ -124,18 +145,30 @@ export function parameterLayout(sql: string): ParameterLayout {
   const bare: Record<string, number | null> = Object.create(null);
   for (const name of Object.keys(aliases)) {
     if (name[0] === "?") continue;
-    const key = name.slice(1), slot = aliases[name]!;
+    const key = name.slice(1),
+      slot = aliases[name]!;
     if (!Object.hasOwn(bare, key)) bare[key] = slot;
     else if (bare[key] !== slot) bare[key] = null;
   }
-  return Object.freeze({ count, names: Object.freeze(names), slots: Object.freeze([...slots]),
-    aliases: Object.freeze(aliases), bare: Object.freeze(bare) });
+  return Object.freeze({
+    count,
+    names: Object.freeze(names),
+    slots: Object.freeze([...slots]),
+    aliases: Object.freeze(aliases),
+    bare: Object.freeze(bare),
+  });
 }
 
 export function validateBindingScalar(value: unknown): asserts value is SqlScalar {
-  if (value === null || typeof value === "string" || typeof value === "boolean" ||
-      typeof value === "number" || value instanceof Uint8Array) return;
-  if (typeof value === "bigint" && value >= -(1n << 63n) && value < (1n << 63n)) return;
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    typeof value === "number" ||
+    value instanceof Uint8Array
+  )
+    return;
+  if (typeof value === "bigint" && value >= -(1n << 63n) && value < 1n << 63n) return;
   inputError("Bindings must be SQL scalars; integers must fit signed 64-bit values");
 }
 
@@ -149,16 +182,21 @@ export function isNamedBindings(value: unknown): value is Readonly<Record<string
 export function resolveBindings(layout: ParameterLayout, values: SqlBindings): SqlScalar[] {
   if (Array.isArray(values)) {
     if (values.length !== layout.count) {
-      throw new BindingError("ERR_FSQLITE_BINDING_ARITY", `Expected ${layout.count} positional bindings, received ${values.length}`);
+      throw new BindingError(
+        "ERR_FSQLITE_BINDING_ARITY",
+        `Expected ${layout.count} positional bindings, received ${values.length}`,
+      );
     }
     const result: SqlScalar[] = [];
     for (let i = 0; i < values.length; i++) {
       const value: unknown = values[i];
-      validateBindingScalar(value); result.push(value);
+      validateBindingScalar(value);
+      result.push(value);
     }
     return result;
   }
-  if (!isNamedBindings(values)) inputError("Bindings must be a positional array or a plain named-parameter object");
+  if (!isNamedBindings(values))
+    inputError("Bindings must be a positional array or a plain named-parameter object");
   const result: SqlScalar[] = new Array<SqlScalar>(layout.count).fill(null);
   const assigned = new Set<number>();
   for (const key of Object.keys(values)) {
@@ -166,18 +204,31 @@ export function resolveBindings(layout: ParameterLayout, values: SqlBindings): S
     if (slot === undefined && !/^[?:@$]/.test(key)) {
       const candidate = layout.bare[key];
       if (candidate === null) {
-        throw new BindingError("ERR_FSQLITE_BINDING_NAME", `Ambiguous binding ${JSON.stringify(key)}; include its SQL prefix`);
+        throw new BindingError(
+          "ERR_FSQLITE_BINDING_NAME",
+          `Ambiguous binding ${JSON.stringify(key)}; include its SQL prefix`,
+        );
       }
       slot = candidate;
     }
-    if (slot === undefined) throw new BindingError("ERR_FSQLITE_BINDING_NAME", `Unknown binding ${JSON.stringify(key)}`);
-    if (assigned.has(slot)) throw new BindingError("ERR_FSQLITE_BINDING_NAME", `Multiple bindings target parameter slot ${slot}`);
+    if (slot === undefined)
+      throw new BindingError("ERR_FSQLITE_BINDING_NAME", `Unknown binding ${JSON.stringify(key)}`);
+    if (assigned.has(slot))
+      throw new BindingError(
+        "ERR_FSQLITE_BINDING_NAME",
+        `Multiple bindings target parameter slot ${slot}`,
+      );
     const value: unknown = values[key];
     validateBindingScalar(value);
-    result[slot - 1] = value; assigned.add(slot);
+    result[slot - 1] = value;
+    assigned.add(slot);
   }
   for (const slot of layout.slots) {
-    if (!assigned.has(slot)) throw new BindingError("ERR_FSQLITE_BINDING_ARITY", `Missing binding for ${layout.names[slot - 1] ?? `anonymous parameter ${slot}`}`);
+    if (!assigned.has(slot))
+      throw new BindingError(
+        "ERR_FSQLITE_BINDING_ARITY",
+        `Missing binding for ${layout.names[slot - 1] ?? `anonymous parameter ${slot}`}`,
+      );
   }
   return result;
 }

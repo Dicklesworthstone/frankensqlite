@@ -3,9 +3,12 @@
 import assert from "node:assert/strict";
 
 export function installOpfsModel() {
-  const files = new Map(), directories = new Map(), tails = new Map();
+  const files = new Map(),
+    directories = new Map(),
+    tails = new Map();
   const sessions = new Set();
-  const hooks = {}, counts = { writes: 0, publications: 0, aborts: 0, removals: 0 };
+  const hooks = {},
+    counts = { writes: 0, publications: 0, aborts: 0, removals: 0 };
   const notFound = () => new DOMException("Missing entry", "NotFoundError");
   function directory(path) {
     if (directories.has(path)) return directories.get(path);
@@ -44,13 +47,20 @@ export function installOpfsModel() {
                 await hooks.beforeClose?.(key);
                 const all = new Uint8Array(chunks.reduce((n, chunk) => n + chunk.length, 0));
                 let offset = 0;
-                for (const chunk of chunks) { all.set(chunk, offset); offset += chunk.length; }
+                for (const chunk of chunks) {
+                  all.set(chunk, offset);
+                  offset += chunk.length;
+                }
                 files.set(key, all);
                 counts.publications++;
                 closed = true;
                 await hooks.afterClose?.(key);
               },
-              async abort() { counts.aborts++; closed = true; await hooks.abort?.(key); },
+              async abort() {
+                counts.aborts++;
+                closed = true;
+                await hooks.abort?.(key);
+              },
             };
           },
         };
@@ -70,42 +80,71 @@ export function installOpfsModel() {
         assert.ok(options.mode === "shared" || options.mode === "exclusive");
         assert.deepEqual(options, { mode: options.mode, ifAvailable: true });
         return Promise.resolve().then(async () => {
-          if ([...sessions].some(lock => lock.name === name &&
-              (options.mode === "exclusive" || lock.mode === "exclusive"))) return callback(null);
+          if (
+            [...sessions].some(
+              (lock) =>
+                lock.name === name && (options.mode === "exclusive" || lock.mode === "exclusive"),
+            )
+          )
+            return callback(null);
           const lock = { name, mode: options.mode };
           sessions.add(lock);
-          try { return await callback(lock); }
-          finally { sessions.delete(lock); }
+          try {
+            return await callback(lock);
+          } finally {
+            sessions.delete(lock);
+          }
         });
       }
       assert.deepEqual(options, { mode: "exclusive" });
-      const result = (tails.get(name) ?? Promise.resolve()).then(() => callback({ name, mode: "exclusive" }));
-      const tail = result.then(() => {}, () => {});
+      const result = (tails.get(name) ?? Promise.resolve()).then(() =>
+        callback({ name, mode: "exclusive" }),
+      );
+      const tail = result.then(
+        () => {},
+        () => {},
+      );
       tails.set(name, tail);
-      return result.finally(() => { if (tails.get(name) === tail) tails.delete(name); });
+      return result.finally(() => {
+        if (tails.get(name) === tail) tails.delete(name);
+      });
     },
   };
   const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-  Object.defineProperty(globalThis, "navigator", { configurable: true, value: {
-    storage: { getDirectory: async () => directory("") }, locks,
-  } });
-  return { files, hooks, counts, locks, sessions, restore() {
-    if (original) Object.defineProperty(globalThis, "navigator", original);
-    else Reflect.deleteProperty(globalThis, "navigator");
-  } };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      storage: { getDirectory: async () => directory("") },
+      locks,
+    },
+  });
+  return {
+    files,
+    hooks,
+    counts,
+    locks,
+    sessions,
+    restore() {
+      if (original) Object.defineProperty(globalThis, "navigator", original);
+      else Reflect.deleteProperty(globalThis, "navigator");
+    },
+  };
 }
 
 export function databaseImage(marker = 0, pageSize = 512) {
   const bytes = new Uint8Array(pageSize);
   bytes.set(new TextEncoder().encode("SQLite format 3\0"));
   const encoded = pageSize === 65536 ? 1 : pageSize;
-  bytes[16] = encoded >> 8; bytes[17] = encoded & 255;
+  bytes[16] = encoded >> 8;
+  bytes[17] = encoded & 255;
   bytes[100] = marker;
   return bytes;
 }
 
 export function deferred() {
   let resolve;
-  const promise = new Promise(r => { resolve = r; });
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
   return { promise, resolve };
 }

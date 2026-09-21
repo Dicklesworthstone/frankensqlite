@@ -1,7 +1,10 @@
-import {
-  MAX_SNAPSHOT_BYTES, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName,
-} from "./snapshot-store";
 import type { SnapshotMetadata, StoredSnapshot } from "./snapshot-store";
+import {
+  MAX_SNAPSHOT_BYTES,
+  SnapshotStoreError,
+  validateSnapshotBytes,
+  validateSnapshotName,
+} from "./snapshot-store";
 
 const MAGIC = new TextEncoder().encode("FSQLOP01");
 const PREFIX_BYTES = MAGIC.length + 4;
@@ -34,8 +37,12 @@ export class OpfsSnapshotStore {
   readonly #name: string;
   #closed = false;
 
-  private constructor(directory: FileSystemDirectoryHandle, locks: LockManager,
-    lockName: string, name: string) {
+  private constructor(
+    directory: FileSystemDirectoryHandle,
+    locks: LockManager,
+    lockName: string,
+    name: string,
+  ) {
     this.#directory = directory;
     this.#locks = locks;
     this.#lockName = lockName;
@@ -44,11 +51,17 @@ export class OpfsSnapshotStore {
 
   static async open(name: string): Promise<OpfsSnapshotStore> {
     validateSnapshotName(name);
-    if (typeof navigator === "undefined" || typeof navigator.storage?.getDirectory !== "function" ||
-        typeof navigator.locks?.request !== "function" || !globalThis.crypto?.subtle ||
-        typeof crypto.randomUUID !== "function") {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_UNAVAILABLE",
-        "OPFS, Web Locks and secure-context Web Crypto are required for OPFS checkpoints");
+    if (
+      typeof navigator === "undefined" ||
+      typeof navigator.storage?.getDirectory !== "function" ||
+      typeof navigator.locks?.request !== "function" ||
+      !globalThis.crypto?.subtle ||
+      typeof crypto.randomUUID !== "function"
+    ) {
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_UNAVAILABLE",
+        "OPFS, Web Locks and secure-context Web Crypto are required for OPFS checkpoints",
+      );
     }
     // JSON preserves lone UTF-16 surrogates too. Encoding name directly would
     // map distinct invalid surrogate sequences to the same replacement byte.
@@ -56,8 +69,12 @@ export class OpfsSnapshotStore {
     const root = await navigator.storage.getDirectory();
     const snapshots = await root.getDirectoryHandle(ROOT, { create: true });
     const directory = await snapshots.getDirectoryHandle(key, { create: true });
-    return new OpfsSnapshotStore(directory, navigator.locks,
-      `frankensqlite:opfs-snapshot:v1:${key}`, name);
+    return new OpfsSnapshotStore(
+      directory,
+      navigator.locks,
+      `frankensqlite:opfs-snapshot:v1:${key}`,
+      name,
+    );
   }
 
   async load(): Promise<StoredSnapshot | null> {
@@ -65,8 +82,11 @@ export class OpfsSnapshotStore {
   }
 
   /** null is create-only; a rejected stale writer retains its local SQL data. */
-  async save(bytes: Uint8Array, expectedRevision: string | null,
-    publicationId?: string): Promise<SnapshotMetadata> {
+  async save(
+    bytes: Uint8Array,
+    expectedRevision: string | null,
+    publicationId?: string,
+  ): Promise<SnapshotMetadata> {
     this.#assertOpen();
     validateIdentity(expectedRevision, publicationId);
     validateSnapshotBytes(bytes);
@@ -75,8 +95,11 @@ export class OpfsSnapshotStore {
     const owned = new Uint8Array(bytes);
     validateSnapshotBytes(owned);
     const envelope: Envelope = {
-      format: 1, name: this.#name, revision: publicationId ?? crypto.randomUUID(),
-      parentRevision: expectedRevision, byteLength: owned.byteLength,
+      format: 1,
+      name: this.#name,
+      revision: publicationId ?? crypto.randomUUID(),
+      parentRevision: expectedRevision,
+      byteLength: owned.byteLength,
       sha256: await checksum(owned),
     };
     const header = new TextEncoder().encode(JSON.stringify(envelope));
@@ -91,15 +114,19 @@ export class OpfsSnapshotStore {
       const previous = await this.#read();
       const actual = previous?.revision ?? null;
       if (actual !== expectedRevision) {
-        throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_CONFLICT",
-          `Snapshot changed: expected ${expectedRevision ?? "no snapshot"}, found ${actual ?? "no snapshot"}. Reopen and merge; do not blindly retry.`);
+        throw new SnapshotStoreError(
+          "ERR_FSQLITE_SNAPSHOT_CONFLICT",
+          `Snapshot changed: expected ${expectedRevision ?? "no snapshot"}, found ${actual ?? "no snapshot"}. Reopen and merge; do not blindly retry.`,
+        );
       }
       const file = await this.#directory.getFileHandle(HEAD, { create: true });
       let stream: FileSystemWritableFileStream | undefined;
       try {
         if (typeof file.createWritable !== "function") {
-          throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_UNAVAILABLE",
-            "This browser does not support writable OPFS snapshot streams");
+          throw new SnapshotStoreError(
+            "ERR_FSQLITE_SNAPSHOT_UNAVAILABLE",
+            "This browser does not support writable OPFS snapshot streams",
+          );
         }
         stream = await file.createWritable({ keepExistingData: false });
         await stream.write(prefix);
@@ -111,8 +138,11 @@ export class OpfsSnapshotStore {
         // its acknowledgement was lost. Confirmation is read-only instead.
         const cleanupErrors: unknown[] = [];
         if (stream !== undefined) {
-          try { await stream.abort(); }
-          catch (error: unknown) { cleanupErrors.push(error); }
+          try {
+            await stream.abort();
+          } catch (error: unknown) {
+            cleanupErrors.push(error);
+          }
         }
         // getFileHandle(create) may have created an empty file before failure.
         // Remove ONLY that new, still-empty entry under the publication lock.
@@ -120,12 +150,21 @@ export class OpfsSnapshotStore {
         if (previous === null) {
           try {
             if ((await file.getFile()).size === 0) await this.#directory.removeEntry(HEAD);
-          } catch (error: unknown) { cleanupErrors.push(error); }
+          } catch (error: unknown) {
+            cleanupErrors.push(error);
+          }
         }
         if (cleanupErrors.length !== 0) {
-          throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_IO",
+          throw new SnapshotStoreError(
+            "ERR_FSQLITE_SNAPSHOT_IO",
             "OPFS checkpoint failed and staging cleanup was incomplete; confirm the publication before retrying",
-            { cause: new AggregateError([cause, ...cleanupErrors], "OPFS checkpoint publication failed") });
+            {
+              cause: new AggregateError(
+                [cause, ...cleanupErrors],
+                "OPFS checkpoint publication failed",
+              ),
+            },
+          );
         }
         throw cause;
       }
@@ -133,21 +172,31 @@ export class OpfsSnapshotStore {
     });
   }
 
-  async confirmPublication(revision: string, parentRevision: string | null): Promise<SnapshotMetadata> {
+  async confirmPublication(
+    revision: string,
+    parentRevision: string | null,
+  ): Promise<SnapshotMetadata> {
     if (!validRevision(revision)) {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Invalid checkpoint recovery identity");
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_INPUT",
+        "Invalid checkpoint recovery identity",
+      );
     }
     validateIdentity(parentRevision, revision);
     const saved = await this.load();
     if (saved === null || saved.revision !== revision || saved.parentRevision !== parentRevision) {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED",
-        "The stored checkpoint does not confirm this publication. Export and reconcile; never replay committed SQL.");
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED",
+        "The stored checkpoint does not confirm this publication. Export and reconcile; never replay committed SQL.",
+      );
     }
     return Object.freeze(metadata(saved));
   }
 
   /** Already-running operations finish; queued operations cannot start later. */
-  close(): void { this.#closed = true; }
+  close(): void {
+    this.#closed = true;
+  }
 
   async #locked<T>(operation: () => Promise<T>): Promise<T> {
     this.#assertOpen();
@@ -159,13 +208,17 @@ export class OpfsSnapshotStore {
 
   async #read(): Promise<StoredSnapshot | null> {
     let handle: FileSystemFileHandle;
-    try { handle = await this.#directory.getFileHandle(HEAD); }
-    catch (error: unknown) {
+    try {
+      handle = await this.#directory.getFileHandle(HEAD);
+    } catch (error: unknown) {
       if (error instanceof DOMException && error.name === "NotFoundError") return null;
       throw error;
     }
     const file = await handle.getFile();
-    if (file.size < PREFIX_BYTES || file.size > PREFIX_BYTES + MAX_HEADER_BYTES + MAX_SNAPSHOT_BYTES) {
+    if (
+      file.size < PREFIX_BYTES ||
+      file.size > PREFIX_BYTES + MAX_HEADER_BYTES + MAX_SNAPSHOT_BYTES
+    ) {
       throw corrupt("OPFS snapshot is truncated or exceeds the size limit");
     }
     const prefix = new Uint8Array(await file.slice(0, PREFIX_BYTES).arrayBuffer());
@@ -173,58 +226,85 @@ export class OpfsSnapshotStore {
       throw corrupt("Unsupported OPFS snapshot format");
     }
     const headerLength = new DataView(prefix.buffer).getUint32(MAGIC.length);
-    if (headerLength === 0 || headerLength > MAX_HEADER_BYTES || PREFIX_BYTES + headerLength > file.size) {
+    if (
+      headerLength === 0 ||
+      headerLength > MAX_HEADER_BYTES ||
+      PREFIX_BYTES + headerLength > file.size
+    ) {
       throw corrupt("Invalid OPFS snapshot header length");
     }
     let value: unknown;
     try {
       const header = await file.slice(PREFIX_BYTES, PREFIX_BYTES + headerLength).arrayBuffer();
       value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(header));
-    } catch (cause: unknown) { throw corrupt("Invalid OPFS snapshot metadata", cause); }
+    } catch (cause: unknown) {
+      throw corrupt("Invalid OPFS snapshot metadata", cause);
+    }
     const envelope = validateEnvelope(value, this.#name, file.size - PREFIX_BYTES - headerLength);
     const bytes = new Uint8Array(await file.slice(PREFIX_BYTES + headerLength).arrayBuffer());
     if (bytes.byteLength !== envelope.byteLength) throw corrupt("Truncated OPFS snapshot bytes");
     validateSnapshotBytes(bytes);
-    if (await checksum(bytes) !== envelope.sha256) throw corrupt("OPFS snapshot SHA-256 does not match its bytes");
+    if ((await checksum(bytes)) !== envelope.sha256)
+      throw corrupt("OPFS snapshot SHA-256 does not match its bytes");
     return { ...metadata(envelope), bytes };
   }
 
   #assertOpen(): void {
-    if (this.#closed) throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_CLOSED", "Snapshot storage is closed");
+    if (this.#closed)
+      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_CLOSED", "Snapshot storage is closed");
   }
 }
 
 function validRevision(value: unknown): value is string {
-  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
 }
 
 function validateIdentity(parent: string | null, revision?: string): void {
-  if ((parent !== null && !validRevision(parent)) ||
-      (revision !== undefined && (!validRevision(revision) || revision === parent))) {
-    throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Invalid checkpoint publication identity");
+  if (
+    (parent !== null && !validRevision(parent)) ||
+    (revision !== undefined && (!validRevision(revision) || revision === parent))
+  ) {
+    throw new SnapshotStoreError(
+      "ERR_FSQLITE_SNAPSHOT_INPUT",
+      "Invalid checkpoint publication identity",
+    );
   }
 }
 
 function validateEnvelope(value: unknown, name: string, byteLength: number): Envelope {
   if (typeof value !== "object" || value === null) throw corrupt("Invalid OPFS snapshot envelope");
   const e = value as Partial<Envelope>;
-  if (e.format !== 1 || e.name !== name || !validRevision(e.revision) ||
-      (e.parentRevision !== null && !validRevision(e.parentRevision)) || e.parentRevision === e.revision ||
-      typeof e.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(e.sha256) ||
-      e.byteLength !== byteLength || byteLength > MAX_SNAPSHOT_BYTES) {
+  if (
+    e.format !== 1 ||
+    e.name !== name ||
+    !validRevision(e.revision) ||
+    (e.parentRevision !== null && !validRevision(e.parentRevision)) ||
+    e.parentRevision === e.revision ||
+    typeof e.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(e.sha256) ||
+    e.byteLength !== byteLength ||
+    byteLength > MAX_SNAPSHOT_BYTES
+  ) {
     throw corrupt("Unsupported or malformed OPFS snapshot envelope");
   }
   return e as Envelope;
 }
 
 function metadata(value: SnapshotMetadata): SnapshotMetadata {
-  return { revision: value.revision, parentRevision: value.parentRevision,
-    byteLength: value.byteLength, sha256: value.sha256 };
+  return {
+    revision: value.revision,
+    parentRevision: value.parentRevision,
+    byteLength: value.byteLength,
+    sha256: value.sha256,
+  };
 }
 
 async function checksum(bytes: Uint8Array): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  return [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function corrupt(message: string, cause?: unknown): SnapshotStoreError {

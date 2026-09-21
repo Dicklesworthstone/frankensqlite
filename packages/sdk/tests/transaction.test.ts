@@ -1,7 +1,6 @@
-import { describe, expect, it } from "vitest";
-
-import { FrankenDB } from "../src/database";
 import type { WorkerResponse } from "@frankensqlite/worker";
+import { describe, expect, it } from "vitest";
+import { FrankenDB } from "../src/database";
 import type { WorkerLike, WorkerMessageEvent } from "../src/worker-client";
 
 class TransactionWorker implements WorkerLike {
@@ -27,8 +26,10 @@ class TransactionWorker implements WorkerLike {
   }
 
   postMessage(message: any): void {
-    this.requests.push({ kind: message.kind,
-      sql: message.kind === "transaction" ? message.action.toUpperCase() : message.sql });
+    this.requests.push({
+      kind: message.kind,
+      sql: message.kind === "transaction" ? message.action.toUpperCase() : message.sql,
+    });
     const response: WorkerResponse =
       message.kind === "init"
         ? {

@@ -34,9 +34,9 @@
 
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 const SCHEMA_VERSION = 1;
 
@@ -50,11 +50,26 @@ const flags = {
   help: false,
 };
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--spec-path" && args[i + 1]) { flags.specPath = args[++i]; continue; }
-  if (args[i] === "--output" && args[i + 1]) { flags.output = args[++i]; continue; }
-  if (args[i] === "--append") { flags.append = true; continue; }
-  if (args[i] === "--dry-run") { flags.dryRun = true; continue; }
-  if (args[i] === "--help" || args[i] === "-h") { flags.help = true; continue; }
+  if (args[i] === "--spec-path" && args[i + 1]) {
+    flags.specPath = args[++i];
+    continue;
+  }
+  if (args[i] === "--output" && args[i + 1]) {
+    flags.output = args[++i];
+    continue;
+  }
+  if (args[i] === "--append") {
+    flags.append = true;
+    continue;
+  }
+  if (args[i] === "--dry-run") {
+    flags.dryRun = true;
+    continue;
+  }
+  if (args[i] === "--help" || args[i] === "-h") {
+    flags.help = true;
+    continue;
+  }
   console.error(`Unknown argument: ${args[i]}`);
   process.exit(1);
 }
@@ -92,7 +107,11 @@ function getPatch(hash, specPath) {
     return git(`diff ${hash}~1 ${hash} -- "${specPath}"`);
   } catch {
     // First commit: diff against empty tree.
-    try { return git(`diff 4b825dc642cb6eb9a060e54bf899d8 ${hash} -- "${specPath}"`); } catch { return ""; }
+    try {
+      return git(`diff 4b825dc642cb6eb9a060e54bf899d8 ${hash} -- "${specPath}"`);
+    } catch {
+      return "";
+    }
   }
 }
 
@@ -109,7 +128,11 @@ function countDiffLines(patch) {
 
 /** Get file content at a specific commit. */
 function fileAt(hash, specPath) {
-  try { return git(`show ${hash}:"${specPath}"`); } catch { return ""; }
+  try {
+    return git(`show ${hash}:"${specPath}"`);
+  } catch {
+    return "";
+  }
 }
 
 /** Compute dataset hash matching the viz's computeDatasetHash(). */
@@ -147,8 +170,12 @@ if (flags.append && existsSync(flags.output)) {
   const raw = gunzipSync(readFileSync(flags.output));
   existing = JSON.parse(raw.toString("utf-8"));
   if (existing.schema_version !== SCHEMA_VERSION) {
-    console.error(`[dataset] Schema version mismatch: existing=${existing.schema_version}, expected=${SCHEMA_VERSION}`);
-    console.error("[dataset] Cannot append across schema versions. Regenerate fully or upgrade first.");
+    console.error(
+      `[dataset] Schema version mismatch: existing=${existing.schema_version}, expected=${SCHEMA_VERSION}`,
+    );
+    console.error(
+      "[dataset] Cannot append across schema versions. Regenerate fully or upgrade first.",
+    );
     process.exit(1);
   }
   console.log(`[dataset] Loaded existing dataset: ${existing.commits.length} commits`);
@@ -172,14 +199,18 @@ if (existing) {
   const lastExistingHash = existing.commits[existing.commits.length - 1]?.hash;
   const lastIdx = allCommits.findIndex((c) => c.hash === lastExistingHash);
   if (lastIdx < 0) {
-    console.error(`[dataset] Last existing commit ${lastExistingHash} not found in git log. Cannot append.`);
+    console.error(
+      `[dataset] Last existing commit ${lastExistingHash} not found in git log. Cannot append.`,
+    );
     process.exit(1);
   }
   startIdx = lastIdx + 1;
   commits = [...existing.commits];
   patches = [...existing.patches];
   baseDoc = existing.base_doc;
-  console.log(`[dataset] Appending from index ${startIdx} (${allCommits.length - startIdx} new commits)`);
+  console.log(
+    `[dataset] Appending from index ${startIdx} (${allCommits.length - startIdx} new commits)`,
+  );
 } else {
   baseDoc = fileAt(allCommits[0].hash, flags.specPath);
 }
@@ -189,7 +220,14 @@ for (let i = startIdx; i < allCommits.length; i++) {
   const c = allCommits[i];
   const patch = getPatch(c.hash, flags.specPath);
   const stats = countDiffLines(patch);
-  commits.push({ hash: c.hash, short: c.short, dateIso: c.dateIso, author: c.author, subject: c.subject, ...stats });
+  commits.push({
+    hash: c.hash,
+    short: c.short,
+    dateIso: c.dateIso,
+    author: c.author,
+    subject: c.subject,
+    ...stats,
+  });
   patches.push(patch);
   if ((i + 1) % 10 === 0 || i === allCommits.length - 1) {
     process.stdout.write(`\r[dataset] Processed ${i + 1}/${allCommits.length} commits`);
@@ -210,7 +248,9 @@ const dataset = {
 
 const hash = computeDatasetHash(dataset);
 console.log(`[dataset] Dataset hash: ${hash}`);
-console.log(`[dataset] Commits: ${commits.length}, Patches: ${patches.length}, Base doc: ${baseDoc.length} chars`);
+console.log(
+  `[dataset] Commits: ${commits.length}, Patches: ${patches.length}, Base doc: ${baseDoc.length} chars`,
+);
 
 if (flags.dryRun) {
   console.log("[dataset] Dry run — not writing output.");
@@ -221,7 +261,9 @@ const json = deterministicJson(dataset);
 const gz = deterministicGzip(Buffer.from(json, "utf-8"));
 mkdirSync(dirname(flags.output), { recursive: true });
 writeFileSync(flags.output, gz);
-console.log(`[dataset] Written ${flags.output} (${(gz.length / 1024).toFixed(1)} KB gzipped, ${(json.length / 1024).toFixed(1)} KB raw)`);
+console.log(
+  `[dataset] Written ${flags.output} (${(gz.length / 1024).toFixed(1)} KB gzipped, ${(json.length / 1024).toFixed(1)} KB raw)`,
+);
 
 // Verify determinism: re-serialize and compare.
 const json2 = deterministicJson(dataset);

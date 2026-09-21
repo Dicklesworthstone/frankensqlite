@@ -1,20 +1,33 @@
 // Compile-only API contract, never execute these deliberate misuse examples.
-import { FrankenDBQueue } from "../src/index";
-import type { CommittedTableChange, TableChangeStream, TableSubscription } from "../src/index";
+
+import type {
+  CommittedTableChange,
+  FrankenDBQueue,
+  TableChangeStream,
+  TableSubscription,
+} from "../src/index";
+
 async function contract(queue: FrankenDBQueue): Promise<void> {
-  const sub: TableSubscription = await queue.subscribe(["items"], async (change: CommittedTableChange) => {
-    const sequence: bigint = change.lastSequence;
-    const commits: bigint = change.commits;
-    const tables: readonly string[] = change.tables;
-    await queue.transaction(tx => tx.query("SELECT * FROM items"));
-    void sequence; void commits; void tables;
-    // @ts-expect-error Change tables are immutable.
-    change.tables.push("other");
-    // @ts-expect-error Sequences are BigInt, not lossy numbers.
-    const numberSequence: number = change.firstSequence;
-    void numberSequence;
-  }, { signal: new AbortController().signal, waitTimeoutMs: 1000 });
-  sub.unsubscribe(); await sub.done;
+  const sub: TableSubscription = await queue.subscribe(
+    ["items"],
+    async (change: CommittedTableChange) => {
+      const sequence: bigint = change.lastSequence;
+      const commits: bigint = change.commits;
+      const tables: readonly string[] = change.tables;
+      await queue.transaction((tx) => tx.query("SELECT * FROM items"));
+      void sequence;
+      void commits;
+      void tables;
+      // @ts-expect-error Change tables are immutable.
+      change.tables.push("other");
+      // @ts-expect-error Sequences are BigInt, not lossy numbers.
+      const numberSequence: number = change.firstSequence;
+      void numberSequence;
+    },
+    { signal: new AbortController().signal, waitTimeoutMs: 1000 },
+  );
+  sub.unsubscribe();
+  await sub.done;
   const changes: TableChangeStream = await queue.changes(["items"]);
   for await (const change of changes) {
     const sequence: bigint = change.lastSequence;

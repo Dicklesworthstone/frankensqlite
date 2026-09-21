@@ -22,7 +22,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
 // --- CLI arg parsing ---
@@ -36,12 +36,30 @@ const flags = {
   help: false,
 };
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--input" && args[i + 1]) { flags.input = args[++i]; continue; }
-  if (args[i] === "--spec-path" && args[i + 1]) { flags.specPath = args[++i]; continue; }
-  if (args[i] === "--skip-git") { flags.skipGit = true; continue; }
-  if (args[i] === "--skip-snapshot") { flags.skipSnapshot = true; continue; }
-  if (args[i] === "--verbose") { flags.verbose = true; continue; }
-  if (args[i] === "--help" || args[i] === "-h") { flags.help = true; continue; }
+  if (args[i] === "--input" && args[i + 1]) {
+    flags.input = args[++i];
+    continue;
+  }
+  if (args[i] === "--spec-path" && args[i + 1]) {
+    flags.specPath = args[++i];
+    continue;
+  }
+  if (args[i] === "--skip-git") {
+    flags.skipGit = true;
+    continue;
+  }
+  if (args[i] === "--skip-snapshot") {
+    flags.skipSnapshot = true;
+    continue;
+  }
+  if (args[i] === "--verbose") {
+    flags.verbose = true;
+    continue;
+  }
+  if (args[i] === "--help" || args[i] === "-h") {
+    flags.help = true;
+    continue;
+  }
   console.error(`Unknown argument: ${args[i]}`);
   process.exit(1);
 }
@@ -61,9 +79,19 @@ Options:
 
 // --- Report accumulator ---
 const report = { passed: 0, failed: 0, skipped: 0, errors: [] };
-function pass(msg) { report.passed++; if (flags.verbose) console.log(`  PASS: ${msg}`); }
-function fail(msg) { report.failed++; report.errors.push(msg); console.error(`  FAIL: ${msg}`); }
-function skip(msg) { report.skipped++; if (flags.verbose) console.log(`  SKIP: ${msg}`); }
+function pass(msg) {
+  report.passed++;
+  if (flags.verbose) console.log(`  PASS: ${msg}`);
+}
+function fail(msg) {
+  report.failed++;
+  report.errors.push(msg);
+  console.error(`  FAIL: ${msg}`);
+}
+function skip(msg) {
+  report.skipped++;
+  if (flags.verbose) console.log(`  SKIP: ${msg}`);
+}
 
 // --- Git helper ---
 function git(cmd) {
@@ -87,7 +115,10 @@ function parseUnifiedHunks(patch) {
     i++;
     for (; i < lines.length; i++) {
       const l = lines[i];
-      if (l.startsWith("@@")) { i--; break; }
+      if (l.startsWith("@@")) {
+        i--;
+        break;
+      }
       if (l.startsWith("diff --git")) break;
       if (l.startsWith("index ") || l.startsWith("---") || l.startsWith("+++")) continue;
       hunkLines.push(l);
@@ -97,14 +128,16 @@ function parseUnifiedHunks(patch) {
   return hunks;
 }
 
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 
 function applyPatchLines(prevLines, patch) {
   const hunks = parseUnifiedHunks(patch);
   const out = prevLines.slice();
   let offset = 0;
   for (const h of hunks) {
-    let at = (h.oldStart - 1) + offset;
+    let at = h.oldStart - 1 + offset;
     at = clamp(at, 0, out.length);
     let cursor = at;
     const next = [];
@@ -112,9 +145,14 @@ function applyPatchLines(prevLines, patch) {
       if (!hl) continue;
       const p = hl[0];
       const content = hl.slice(1);
-      if (p === " ") { next.push(content); cursor += 1; }
-      else if (p === "-") { cursor += 1; }
-      else if (p === "+") { next.push(content); }
+      if (p === " ") {
+        next.push(content);
+        cursor += 1;
+      } else if (p === "-") {
+        cursor += 1;
+      } else if (p === "+") {
+        next.push(content);
+      }
     }
     out.splice(at, cursor - at, ...next);
     offset += next.length - (cursor - at);
@@ -135,7 +173,11 @@ function countDiffLines(patch) {
 
 /** Get file content at a specific commit. */
 function fileAt(hash, specPath) {
-  try { return git(`show ${hash}:"${specPath}"`); } catch { return null; }
+  try {
+    return git(`show ${hash}:"${specPath}"`);
+  } catch {
+    return null;
+  }
 }
 
 // --- Main ---
@@ -161,7 +203,15 @@ if (data.schema_version === 1) {
 }
 
 // --- Check 2: Required fields ---
-for (const field of ["base_commit", "base_doc", "commits", "patches", "generated_from", "spec_path", "schema_version"]) {
+for (const field of [
+  "base_commit",
+  "base_doc",
+  "commits",
+  "patches",
+  "generated_from",
+  "spec_path",
+  "schema_version",
+]) {
   if (data[field] !== null && data[field] !== undefined) pass(`required field '${field}' present`);
   else fail(`required field '${field}' missing`);
 }
@@ -191,7 +241,8 @@ if (data.commits?.length > 0) {
 console.log("[validate] Applying patches sequentially (patches[1..N-1] on base_doc)...");
 let currentLines = String(data.base_doc || "").split("\n");
 let patchErrors = 0;
-if (flags.verbose) console.log(`  [0] ${data.commits[0]?.short || "?"}: base_doc = ${currentLines.length} lines`);
+if (flags.verbose)
+  console.log(`  [0] ${data.commits[0]?.short || "?"}: base_doc = ${currentLines.length} lines`);
 for (let i = 1; i < patchCount; i++) {
   const patch = data.patches[i];
   try {
@@ -199,7 +250,9 @@ for (let i = 1; i < patchCount; i++) {
     currentLines = applyPatchLines(currentLines, patch);
     const stats = countDiffLines(patch);
     if (flags.verbose) {
-      console.log(`  [${i}] ${data.commits[i]?.short || "?"}: ${before} → ${currentLines.length} lines (patch: +${stats.add}/-${stats.del})`);
+      console.log(
+        `  [${i}] ${data.commits[i]?.short || "?"}: ${before} → ${currentLines.length} lines (patch: +${stats.add}/-${stats.del})`,
+      );
     }
   } catch (err) {
     patchErrors++;
@@ -238,9 +291,14 @@ if (!flags.skipSnapshot && data.commits?.length > 0) {
         const gitLines = gitContent.split("\n");
         let firstDiff = -1;
         for (let i = 0; i < Math.max(reconLines.length, gitLines.length); i++) {
-          if (reconLines[i] !== gitLines[i]) { firstDiff = i + 1; break; }
+          if (reconLines[i] !== gitLines[i]) {
+            firstDiff = i + 1;
+            break;
+          }
         }
-        fail(`final snapshot mismatch: reconstructed=${reconLines.length} lines, git=${gitLines.length} lines, first diff at line ${firstDiff}`);
+        fail(
+          `final snapshot mismatch: reconstructed=${reconLines.length} lines, git=${gitLines.length} lines, first diff at line ${firstDiff}`,
+        );
       }
     }
   }
@@ -288,7 +346,9 @@ if (!flags.skipGit && data.commits?.length > 0) {
       if (flags.verbose) pass(`commit[${i}] add/del/impact matches patch`);
     } else {
       metaErrors++;
-      fail(`commit[${i}] stats: got +${c.add}/-${c.del}/${c.impact}, patch says +${stats.add}/-${stats.del}/${stats.impact}`);
+      fail(
+        `commit[${i}] stats: got +${c.add}/-${c.del}/${c.impact}, patch says +${stats.add}/-${stats.del}/${stats.impact}`,
+      );
     }
 
     if ((i + 1) % 20 === 0) {

@@ -1,26 +1,61 @@
+import type { PreparedStatementLimits } from "@frankensqlite/worker";
+import {
+  isSnapshotPersistenceMode,
+  resolvePreparedStatementLimits,
+  resolveRequestLimits,
+  resolveResultEncoding,
+  resolveSnapshotOwnership,
+  SnapshotOwnershipError,
+} from "@frankensqlite/worker";
+import { FrankenSQLiteError } from "./errors";
 import { FrankenPreparedStatement } from "./statement";
-import { captureTransactionOptions, combineTransactionSignals, FrankenTransaction, TransactionBudget } from "./transaction";
-import type { ExecuteManyOptions, ExecuteManyResult, FrankenDbOpenOptions, PersistenceMode, QueryResult, SqlScalar, SqlBindings, SnapshotMetadata } from "./types";
+import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
+import {
+  captureTransactionOptions,
+  combineTransactionSignals,
+  FrankenTransaction,
+  TransactionBudget,
+} from "./transaction";
+import type {
+  RetryRecovery,
+  TransactionRetryAttempt,
+  TransactionRetryOptions,
+} from "./transaction-retry";
+import {
+  isTransactionConflict,
+  resolveTransactionRetryOptions,
+  runTransactionRetry,
+} from "./transaction-retry";
+import type {
+  CheckpointRecoveryIdentity,
+  ExecuteManyOptions,
+  ExecuteManyResult,
+  ExecuteStreamOptions,
+  ExecuteStreamResult,
+  FrankenDbOpenOptions,
+  PersistenceMode,
+  QueryResult,
+  RequestQueueStats,
+  SnapshotMetadata,
+  SqlBindings,
+  SqlRowSource,
+  SqlScalar,
+  TransactionOptions,
+} from "./types";
 import { captureRequiredCheckpoint, normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
-import { FrankenSQLiteError } from "./errors";
-import { checkStreamCancellation, executeRowStream, streamOptions } from "./stream";
-import type { ExecuteStreamOptions, ExecuteStreamResult, SqlRowSource } from "./types";
-import { isSnapshotPersistenceMode, resolveRequestLimits, resolveResultEncoding, resolvePreparedStatementLimits } from "@frankensqlite/worker";
-import type { PreparedStatementLimits } from "@frankensqlite/worker";
-import { resolveSnapshotOwnership, SnapshotOwnershipError } from "@frankensqlite/worker";
-import type { RequestQueueStats } from "./types";
-import type { CheckpointRecoveryIdentity, TransactionOptions } from "./types";
-import { isTransactionConflict, resolveTransactionRetryOptions, runTransactionRetry } from "./transaction-retry";
-import type { RetryRecovery, TransactionRetryAttempt, TransactionRetryOptions } from "./transaction-retry";
 
 const databaseClients = new WeakMap<FrankenDB, FrankenWorkerClient>();
 
 function snapshotReceiptFailure(cause: unknown): FrankenSQLiteError {
-  const error = new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECEIPT",
+  const error = new FrankenSQLiteError({
+    code: "ERR_FSQLITE_SNAPSHOT_RECEIPT",
     message: "Snapshot acknowledgement is invalid or its revision lineage is unknown",
-    transient: false, userRecoverable: false,
-    suggestion: "Publication may have completed. Export the live image, reopen the authoritative snapshot and reconcile; do not replay committed SQL or blindly publish again." });
+    transient: false,
+    userRecoverable: false,
+    suggestion:
+      "Publication may have completed. Export the live image, reopen the authoritative snapshot and reconcile; do not replay committed SQL or blindly publish again.",
+  });
   error.cause = cause;
   return error;
 }
@@ -44,41 +79,78 @@ function captureSnapshotReceipt(value: unknown): SnapshotMetadata {
   const parentRevision = snapshotDataField(value, "parentRevision");
   const byteLength = snapshotDataField(value, "byteLength");
   const sha256 = snapshotDataField(value, "sha256");
-  const validRevision = (token: unknown): token is string => typeof token === "string" &&
+  const validRevision = (token: unknown): token is string =>
+    typeof token === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token);
-  if (!validRevision(revision) || (parentRevision !== null && !validRevision(parentRevision)) ||
-      revision === parentRevision || typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256) ||
-      typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) ||
-      byteLength < 512 || byteLength > 64 * 1024 * 1024 || byteLength % 512 !== 0) {
+  if (
+    !validRevision(revision) ||
+    (parentRevision !== null && !validRevision(parentRevision)) ||
+    revision === parentRevision ||
+    typeof sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(sha256) ||
+    typeof byteLength !== "number" ||
+    !Number.isSafeInteger(byteLength) ||
+    byteLength < 512 ||
+    byteLength > 64 * 1024 * 1024 ||
+    byteLength % 512 !== 0
+  ) {
     throw new TypeError("Malformed snapshot acknowledgement metadata");
   }
   return Object.freeze({ revision, parentRevision, byteLength, sha256 });
 }
 
 /** A requested policy must be acknowledged, not silently ignored by an old worker. */
-function captureStatementPolicy(value: unknown, requested: Readonly<PreparedStatementLimits> | undefined):
-  Readonly<PreparedStatementLimits> | null {
+function captureStatementPolicy(
+  value: unknown,
+  requested: Readonly<PreparedStatementLimits> | undefined,
+): Readonly<PreparedStatementLimits> | null {
   if (value === undefined && requested === undefined) return null;
   const reject = (): never => {
-    throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", transient: false,
-      message: "The worker did not acknowledge a valid prepared-statement policy within the requested limits",
-      suggestion: "Use a worker that supports preparedStatementLimits; no SQL has been submitted by this database handle." });
+    throw new FrankenSQLiteError({
+      code: "ERR_FSQLITE_STATEMENT_POLICY",
+      transient: false,
+      message:
+        "The worker did not acknowledge a valid prepared-statement policy within the requested limits",
+      suggestion:
+        "Use a worker that supports preparedStatementLimits; no SQL has been submitted by this database handle.",
+    });
   };
   if (typeof value !== "object" || value === null || Array.isArray(value)) return reject();
   const count = Object.getOwnPropertyDescriptor(value, "maxStatements");
   const bytes = Object.getOwnPropertyDescriptor(value, "maxBytes");
-  if (count === undefined || bytes === undefined || !Object.hasOwn(count, "value") || !Object.hasOwn(bytes, "value")) return reject();
+  if (
+    count === undefined ||
+    bytes === undefined ||
+    !Object.hasOwn(count, "value") ||
+    !Object.hasOwn(bytes, "value")
+  )
+    return reject();
   let effective: Readonly<PreparedStatementLimits>;
-  try { effective = resolvePreparedStatementLimits({ maxStatements: count.value, maxBytes: bytes.value }); }
-  catch { return reject(); }
+  try {
+    effective = resolvePreparedStatementLimits({
+      maxStatements: count.value,
+      maxBytes: bytes.value,
+    });
+  } catch {
+    return reject();
+  }
   // Missing values must not become locally supplied defaults in an acknowledgement.
-  if (count.value !== effective.maxStatements || bytes.value !== effective.maxBytes ||
-      (requested !== undefined && (effective.maxStatements > requested.maxStatements || effective.maxBytes > requested.maxBytes))) return reject();
+  if (
+    count.value !== effective.maxStatements ||
+    bytes.value !== effective.maxBytes ||
+    (requested !== undefined &&
+      (effective.maxStatements > requested.maxStatements ||
+        effective.maxBytes > requested.maxBytes))
+  )
+    return reject();
   return effective;
 }
 
 /** Internal lifecycle subscription for owners of a private connection. */
-export function observeDatabaseFailure(db: FrankenDB, listener: (error: Error) => void): () => void {
+export function observeDatabaseFailure(
+  db: FrankenDB,
+  listener: (error: Error) => void,
+): () => void {
   const client = databaseClients.get(db);
   if (client === undefined) throw new TypeError("A FrankenDB connection is required");
   return client.observeFailure(listener);
@@ -113,8 +185,14 @@ export class FrankenDB {
   #nextTransactionId = 1n;
   #retryOwner: object | null = null;
 
-  private constructor(client: FrankenWorkerClient, path: string, persistence: PersistenceMode, snapshotRevision: string | null,
-    preparedStatementLimits: Readonly<PreparedStatementLimits> | null, checkpointRecoverySupported: boolean) {
+  private constructor(
+    client: FrankenWorkerClient,
+    path: string,
+    persistence: PersistenceMode,
+    snapshotRevision: string | null,
+    preparedStatementLimits: Readonly<PreparedStatementLimits> | null,
+    checkpointRecoverySupported: boolean,
+  ) {
     this.#client = client;
     databaseClients.set(this, client);
     this.#path = path;
@@ -129,15 +207,19 @@ export class FrankenDB {
     const requiredCheckpoint = captureRequiredCheckpoint(normalized);
     const ownership = resolveSnapshotOwnership(normalized.snapshotOwnership);
     if (ownership !== undefined && !isSnapshotPersistenceMode(normalized.persistence)) {
-      throw new SnapshotOwnershipError("ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
-        "snapshotOwnership requires snapshot persistence");
+      throw new SnapshotOwnershipError(
+        "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
+        "snapshotOwnership requires snapshot persistence",
+      );
     }
     // Validate before allocating a worker or transferring a snapshot buffer.
     const limits = resolveRequestLimits(normalized.requestLimits);
     const resultEncoding = resolveResultEncoding(normalized.resultEncoding);
     const requestedStatementLimits = normalized.preparedStatementLimits;
-    const statementLimits = requestedStatementLimits === undefined
-      ? undefined : resolvePreparedStatementLimits(requestedStatementLimits);
+    const statementLimits =
+      requestedStatementLimits === undefined
+        ? undefined
+        : resolvePreparedStatementLimits(requestedStatementLimits);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
     if (ownership !== undefined) config.snapshotOwnership = ownership;
@@ -166,33 +248,59 @@ export class FrankenDB {
           }
           snapshot = captureSnapshotReceipt(saved);
         }
-      } catch (cause: unknown) { throw snapshotReceiptFailure(cause); }
+      } catch (cause: unknown) {
+        throw snapshotReceiptFailure(cause);
+      }
       // The worker has restored and hashed these bytes, not merely looked up
       // a revision token. Never bind a fresh session at the parent to a later
       // publication: that would let stale memory overwrite committed data.
-      if (requiredCheckpoint !== null && (snapshot === null ||
+      if (
+        requiredCheckpoint !== null &&
+        (snapshot === null ||
           snapshot.revision !== requiredCheckpoint.publicationId ||
-          snapshot.parentRevision !== requiredCheckpoint.parentRevision)) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED", transient: false,
-          message: "The required checkpoint is not the restored authoritative image; it may have been replaced or never published",
-          suggestion: "Reconcile saved data before replaying SQL. This rejection does not prove that the publication never committed." });
+          snapshot.parentRevision !== requiredCheckpoint.parentRevision)
+      ) {
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED",
+          transient: false,
+          message:
+            "The required checkpoint is not the restored authoritative image; it may have been replaced or never published",
+          suggestion:
+            "Reconcile saved data before replaying SQL. This rejection does not prove that the publication never committed.",
+        });
       }
       const policy = Object.getOwnPropertyDescriptor(ready, "preparedStatementLimits");
       if (policy !== undefined && !Object.hasOwn(policy, "value")) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_STATEMENT_POLICY", message: "Invalid worker prepared-statement policy" });
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_STATEMENT_POLICY",
+          message: "Invalid worker prepared-statement policy",
+        });
       }
       const effectiveStatements = captureStatementPolicy(policy?.value, statementLimits);
       const recovery = snapshotDataField(ready, "checkpointRecovery", false);
-      if (recovery !== undefined && (recovery !== 1 || !isSnapshotPersistenceMode(ready.persistence))) {
+      if (
+        recovery !== undefined &&
+        (recovery !== 1 || !isSnapshotPersistenceMode(ready.persistence))
+      ) {
         throw snapshotReceiptFailure(new TypeError("Invalid checkpoint recovery capability"));
       }
-      return new FrankenDB(client, ready.path, ready.persistence, snapshot?.revision ?? null, effectiveStatements, recovery === 1);
+      return new FrankenDB(
+        client,
+        ready.path,
+        ready.persistence,
+        snapshot?.revision ?? null,
+        effectiveStatements,
+        recovery === 1,
+      );
     } catch (error: unknown) {
       try {
         client.dispose();
       } catch (cleanupError: unknown) {
-        throw new AggregateError([error, cleanupError],
-          "FrankenSQLite initialization and worker cleanup both failed", { cause: error });
+        throw new AggregateError(
+          [error, cleanupError],
+          "FrankenSQLite initialization and worker cleanup both failed",
+          { cause: error },
+        );
       }
       throw error;
     }
@@ -217,10 +325,14 @@ export class FrankenDB {
   }
 
   /** Negotiated session policy, not proof that a closed/crashed worker is live. */
-  get snapshotOwnership() { return this.#client.snapshotOwnership; }
+  get snapshotOwnership() {
+    return this.#client.snapshotOwnership;
+  }
 
   /** Acknowledged worker limits; null means an older worker supplied no policy. */
-  get preparedStatementLimits(): Readonly<PreparedStatementLimits> | null { return this.#preparedStatementLimits; }
+  get preparedStatementLimits(): Readonly<PreparedStatementLimits> | null {
+    return this.#preparedStatementLimits;
+  }
 
   /** Effective worker policy; individual noncanonical results may still fall back. */
   get resultEncoding() {
@@ -239,9 +351,18 @@ export class FrankenDB {
    */
   get pendingCheckpointRecovery(): Readonly<CheckpointRecoveryIdentity> | null {
     const pending = this.#checkpointCandidate;
-    if (pending === null || this.#checkpointInFlight !== 0 || !isSnapshotPersistenceMode(this.#persistence)) return null;
-    return Object.freeze({ path: this.#path, persistence: this.#persistence,
-      publicationId: pending.publicationId, parentRevision: pending.parentRevision });
+    if (
+      pending === null ||
+      this.#checkpointInFlight !== 0 ||
+      !isSnapshotPersistenceMode(this.#persistence)
+    )
+      return null;
+    return Object.freeze({
+      path: this.#path,
+      persistence: this.#persistence,
+      publicationId: pending.publicationId,
+      parentRevision: pending.parentRevision,
+    });
   }
 
   /** Ordinary requests only; close/cancellation have a separate control lane. */
@@ -290,11 +411,17 @@ export class FrankenDB {
       // by per-operation callback bookkeeping.
       const consume = (_tx: FrankenTransaction, scope: TransactionScope) => {
         const signal = combineTransactionSignals(scope.signal, config.signal)!;
-        return executeRowStream({
-          prepare: (statementSql) => this.#client.prepare(statementSql, scope.id),
-          executePreparedMany: (id, values, settings) => this.#client.executePreparedMany(id, values, settings, scope.id),
-          finalizePrepared: (id) => this.#client.finalizePrepared(id, scope.id),
-        }, sql, rows, { ...config, signal });
+        return executeRowStream(
+          {
+            prepare: (statementSql) => this.#client.prepare(statementSql, scope.id),
+            executePreparedMany: (id, values, settings) =>
+              this.#client.executePreparedMany(id, values, settings, scope.id),
+            finalizePrepared: (id) => this.#client.finalizePrepared(id, scope.id),
+          },
+          sql,
+          rows,
+          { ...config, signal },
+        );
       };
       const beforeCommit = () => checkStreamCancellation(config);
       return parent === null
@@ -349,8 +476,11 @@ export class FrankenDB {
     return this.#run(null, async () => {
       if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
       if (this.#checkpointRecoveryPromise !== null) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
-          message: "Await checkpoint recovery before publishing another image", transient: false });
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
+          message: "Await checkpoint recovery before publishing another image",
+          transient: false,
+        });
       }
       const publicationId = this.#checkpointRecoverySupported ? crypto.randomUUID() : undefined;
       const remember = (): void => {
@@ -363,8 +493,9 @@ export class FrankenDB {
       this.#checkpointInFlight++;
       try {
         let response: unknown;
-        try { response = await this.#client.checkpoint(publicationId); }
-        catch (cause: unknown) {
+        try {
+          response = await this.#client.checkpoint(publicationId);
+        } catch (cause: unknown) {
           remember();
           if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
             this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
@@ -377,9 +508,13 @@ export class FrankenDB {
         if (this.#snapshotReceiptFailure !== null) throw this.#snapshotReceiptFailure;
         try {
           const saved = captureSnapshotReceipt(response);
-          if (saved.parentRevision !== this.#snapshotRevision ||
-              (publicationId !== undefined && saved.revision !== publicationId)) {
-            throw new TypeError("Snapshot acknowledgement does not match its publication and acknowledged parent");
+          if (
+            saved.parentRevision !== this.#snapshotRevision ||
+            (publicationId !== undefined && saved.revision !== publicationId)
+          ) {
+            throw new TypeError(
+              "Snapshot acknowledgement does not match its publication and acknowledged parent",
+            );
           }
           this.#snapshotRevision = saved.revision;
           this.#checkpointCandidate = null;
@@ -396,7 +531,9 @@ export class FrankenDB {
   }
 
   /** Whether this worker can confirm publication by identity without writing. */
-  get checkpointRecoverySupported(): boolean { return this.#checkpointRecoverySupported; }
+  get checkpointRecoverySupported(): boolean {
+    return this.#checkpointRecoverySupported;
+  }
 
   /**
    * Reconcile one failed checkpoint acknowledgement against stored bytes.
@@ -406,46 +543,72 @@ export class FrankenDB {
   recoverCheckpoint(): Promise<SnapshotMetadata> {
     return this.#run(null, () => {
       if (!this.#checkpointRecoverySupported) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_UNAVAILABLE",
-          message: "This worker cannot confirm checkpoint publications; reopen and reconcile", transient: false });
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_UNAVAILABLE",
+          message: "This worker cannot confirm checkpoint publications; reopen and reconcile",
+          transient: false,
+        });
       }
       if (this.#checkpointRecoveryPromise !== null) return this.#checkpointRecoveryPromise;
       if (this.#checkpointInFlight !== 0) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
-          message: "Await outstanding checkpoint results before recovery", transient: false });
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_PENDING",
+          message: "Await outstanding checkpoint results before recovery",
+          transient: false,
+        });
       }
       const candidate = this.#checkpointCandidate;
       if (candidate === null) {
-        throw new FrankenSQLiteError({ code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_EMPTY",
-          message: "There is no failed checkpoint publication to confirm", transient: false });
+        throw new FrankenSQLiteError({
+          code: "ERR_FSQLITE_SNAPSHOT_RECOVERY_EMPTY",
+          message: "There is no failed checkpoint publication to confirm",
+          transient: false,
+        });
       }
       // Publish the shared promise BEFORE dispatch, including for reentrant
       // custom transports. Recovery attempts retain just one bounded identity.
-      this.#checkpointRecoveryPromise = Promise.resolve().then(async () => {
-        let response: unknown;
-        try { response = await this.#client.recoverCheckpoint(candidate.publicationId, candidate.parentRevision); }
-        catch (cause: unknown) {
-          if (cause instanceof FrankenSQLiteError && cause.code === "ERR_FSQLITE_WORKER_RESPONSE") {
+      this.#checkpointRecoveryPromise = Promise.resolve()
+        .then(async () => {
+          let response: unknown;
+          try {
+            response = await this.#client.recoverCheckpoint(
+              candidate.publicationId,
+              candidate.parentRevision,
+            );
+          } catch (cause: unknown) {
+            if (
+              cause instanceof FrankenSQLiteError &&
+              cause.code === "ERR_FSQLITE_WORKER_RESPONSE"
+            ) {
+              this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
+              throw this.#snapshotReceiptFailure;
+            }
+            throw cause;
+          }
+          try {
+            const saved = captureSnapshotReceipt(response);
+            if (
+              this.#checkpointCandidate !== candidate ||
+              this.#snapshotRevision !== candidate.parentRevision ||
+              saved.revision !== candidate.publicationId ||
+              saved.parentRevision !== candidate.parentRevision
+            ) {
+              throw new TypeError(
+                "Recovery receipt does not confirm the pending publication and its parent",
+              );
+            }
+            this.#snapshotRevision = saved.revision;
+            this.#checkpointCandidate = null;
+            this.#snapshotReceiptFailure = null;
+            return saved;
+          } catch (cause: unknown) {
             this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
             throw this.#snapshotReceiptFailure;
           }
-          throw cause;
-        }
-        try {
-          const saved = captureSnapshotReceipt(response);
-          if (this.#checkpointCandidate !== candidate || this.#snapshotRevision !== candidate.parentRevision ||
-              saved.revision !== candidate.publicationId || saved.parentRevision !== candidate.parentRevision) {
-            throw new TypeError("Recovery receipt does not confirm the pending publication and its parent");
-          }
-          this.#snapshotRevision = saved.revision;
-          this.#checkpointCandidate = null;
-          this.#snapshotReceiptFailure = null;
-          return saved;
-        } catch (cause: unknown) {
-          this.#snapshotReceiptFailure ??= snapshotReceiptFailure(cause);
-          throw this.#snapshotReceiptFailure;
-        }
-      }).finally(() => { this.#checkpointRecoveryPromise = null; });
+        })
+        .finally(() => {
+          this.#checkpointRecoveryPromise = null;
+        });
       return this.#checkpointRecoveryPromise;
     });
   }
@@ -455,7 +618,7 @@ export class FrankenDB {
     options?: TransactionOptions,
   ): Promise<T> {
     // Never expose the internal scope/capability as a second callback argument.
-    return this.#transaction(null, tx => work(tx), undefined, options);
+    return this.#transaction(null, (tx) => work(tx), undefined, options);
   }
 
   /**
@@ -476,8 +639,17 @@ export class FrankenDB {
     const owner = {};
     this.#retryOwner = owner;
     try {
-      return await runTransactionRetry((signal, attempt, recovery) =>
-        this.#transaction(null, tx => work(tx, attempt), undefined, { signal }, { owner, recovery }), config);
+      return await runTransactionRetry(
+        (signal, attempt, recovery) =>
+          this.#transaction(
+            null,
+            (tx) => work(tx, attempt),
+            undefined,
+            { signal },
+            { owner, recovery },
+          ),
+        config,
+      );
     } finally {
       this.#retryOwner = null;
     }
@@ -499,8 +671,13 @@ export class FrankenDB {
     const signal = budget.signal;
     const scope: TransactionScope = {
       id: String(this.#nextTransactionId++),
-      signal, budget, cancellationError: null,
-      accepting: true, pending: new Set(), statements: new Set(), errors: [],
+      signal,
+      budget,
+      cancellationError: null,
+      accepting: true,
+      pending: new Set(),
+      statements: new Set(),
+      errors: [],
       children: new Set(),
       cleanupFailed: false,
     };
@@ -541,16 +718,22 @@ export class FrankenDB {
         try {
           await this.#client.transaction("rollback", scope.id);
         } catch (rollbackError: unknown) {
-          const failure = new AggregateError([error, rollbackError],
-            "FrankenSQLite transaction and rollback both failed", { cause: error });
+          const failure = new AggregateError(
+            [error, rollbackError],
+            "FrankenSQLite transaction and rollback both failed",
+            { cause: error },
+          );
           this.#transactionFailure = failure;
           // The connection's transactional state is now unknown. Never allow
           // the next caller to accidentally commit the failed callback's work.
           try {
             this.#client.dispose(failure);
           } catch (cleanupError: unknown) {
-            const cleanupFailure = new AggregateError([error, rollbackError, cleanupError],
-              "FrankenSQLite transaction, rollback and cleanup failed", { cause: error });
+            const cleanupFailure = new AggregateError(
+              [error, rollbackError, cleanupError],
+              "FrankenSQLite transaction, rollback and cleanup failed",
+              { cause: error },
+            );
             this.#transactionFailure = cleanupFailure;
             throw cleanupFailure;
           }
@@ -561,8 +744,12 @@ export class FrankenDB {
       // flag. A failed BEGIN is eligible only for a known core conflict; every
       // started transaction must first acknowledge its full rollback. Unknown
       // cleanup/transport outcomes never reach the retry scheduler as safe.
-      if (retry !== undefined && this.#transactionFailure === null && !scope.cleanupFailed &&
-          (began || !beginDispatched || isTransactionConflict(error))) {
+      if (
+        retry !== undefined &&
+        this.#transactionFailure === null &&
+        !scope.cleanupFailed &&
+        (began || !beginDispatched || isTransactionConflict(error))
+      ) {
         retry.recovery.recovered = true;
         retry.recovery.retryAllowed = isTransactionConflict(error);
       }
@@ -594,8 +781,12 @@ export class FrankenDB {
     // A rolled-back child is recoverable by its parent. Unlike a direct SQL
     // failure, a caught child failure must not automatically poison the parent.
     void promise.then(
-      () => { parent.children.delete(promise); },
-      () => { parent.children.delete(promise); },
+      () => {
+        parent.children.delete(promise);
+      },
+      () => {
+        parent.children.delete(promise);
+      },
     );
     return promise;
   }
@@ -606,13 +797,20 @@ export class FrankenDB {
 
   #assertOwner(scope: TransactionScope | null, retryOwner?: object): void {
     if (scope !== null && !scope.accepting) {
-      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_CLOSED",
-        message: "This FrankenSQLite transaction callback has finished" });
+      throw new FrankenSQLiteError({
+        code: "ERR_FSQLITE_TRANSACTION_CLOSED",
+        message: "This FrankenSQLite transaction callback has finished",
+      });
     }
-    if (this.#transactionScope !== scope ||
-        (scope === null && this.#retryOwner !== null && this.#retryOwner !== retryOwner)) {
-      throw new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
-        message: "A transaction owns this connection; use its transaction handle or wait until it finishes" });
+    if (
+      this.#transactionScope !== scope ||
+      (scope === null && this.#retryOwner !== null && this.#retryOwner !== retryOwner)
+    ) {
+      throw new FrankenSQLiteError({
+        code: "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
+        message:
+          "A transaction owns this connection; use its transaction handle or wait until it finishes",
+      });
     }
     if (scope !== null) this.#checkCancellation(scope);
     // The client may already retain the host's rollback error. Preserve the
@@ -626,9 +824,14 @@ export class FrankenDB {
     if (!scope.signal.aborted) return;
     if (scope.cancellationError === null) {
       scope.cancellationError = new FrankenSQLiteError({
-        code: scope.budget.timedOut ? "ERR_FSQLITE_TRANSACTION_TIMEOUT" : "ERR_FSQLITE_TRANSACTION_CANCELLED",
-        message: scope.budget.timedOut ? "This managed transaction exceeded its deadline" : "This managed transaction was cancelled",
-        transient: false });
+        code: scope.budget.timedOut
+          ? "ERR_FSQLITE_TRANSACTION_TIMEOUT"
+          : "ERR_FSQLITE_TRANSACTION_CANCELLED",
+        message: scope.budget.timedOut
+          ? "This managed transaction exceeded its deadline"
+          : "This managed transaction was cancelled",
+        transient: false,
+      });
       // Keep the caller's exact reason locally; it need not be structured-cloneable.
       scope.cancellationError.cause = scope.signal.reason;
     }
@@ -650,7 +853,9 @@ export class FrankenDB {
     if (scope !== null) {
       scope.pending.add(promise);
       void promise.then(
-        () => { scope.pending.delete(promise); },
+        () => {
+          scope.pending.delete(promise);
+        },
         (error: unknown) => {
           scope.pending.delete(promise);
           if (!scope.errors.includes(error)) scope.errors.push(error);
@@ -664,17 +869,30 @@ export class FrankenDB {
     scope: TransactionScope,
     work: (tx: FrankenTransaction, scope: TransactionScope) => T | Promise<T>,
   ): Promise<T> {
-    const tx = new FrankenTransaction({
-      execute: (sql, params) => this.#run(scope, () => this.#client.execute(sql, params, scope.id)),
-      executeBatch: (sql) => this.#run(scope, () => this.#client.executeBatch(sql, scope.id)),
-      executeMany: (sql, parameterSets, options) => this.#run(scope, () => this.#client.executeMany(sql, parameterSets,
-        { signal: combineTransactionSignals(scope.signal, options?.signal)! }, scope.id)),
-      executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
-      query: <Row extends Record<string, unknown>>(sql: string, params: SqlBindings = []) =>
-        this.#run(scope, () => this.#client.query<Row>(sql, params, scope.id)),
-      prepare: <Row extends Record<string, unknown>>(sql: string) =>
-        this.#run(scope, () => this.#prepare<Row>(sql, scope)),
-    }, (nestedWork, options) => this.#nestedTransaction(scope, tx => nestedWork(tx), undefined, options), scope.signal);
+    const tx = new FrankenTransaction(
+      {
+        execute: (sql, params) =>
+          this.#run(scope, () => this.#client.execute(sql, params, scope.id)),
+        executeBatch: (sql) => this.#run(scope, () => this.#client.executeBatch(sql, scope.id)),
+        executeMany: (sql, parameterSets, options) =>
+          this.#run(scope, () =>
+            this.#client.executeMany(
+              sql,
+              parameterSets,
+              { signal: combineTransactionSignals(scope.signal, options?.signal)! },
+              scope.id,
+            ),
+          ),
+        executeStream: (sql, rows, options) => this.#streamTransaction(scope, sql, rows, options),
+        query: <Row extends Record<string, unknown>>(sql: string, params: SqlBindings = []) =>
+          this.#run(scope, () => this.#client.query<Row>(sql, params, scope.id)),
+        prepare: <Row extends Record<string, unknown>>(sql: string) =>
+          this.#run(scope, () => this.#prepare<Row>(sql, scope)),
+      },
+      (nestedWork, options) =>
+        this.#nestedTransaction(scope, (tx) => nestedWork(tx), undefined, options),
+      scope.signal,
+    );
     let result!: T;
     let callbackErrors: unknown[] = [];
     try {
@@ -687,8 +905,12 @@ export class FrankenDB {
     }
     const children = [...scope.children];
     if (children.length > 0) {
-      scope.errors.push(new FrankenSQLiteError({ code: "ERR_FSQLITE_TRANSACTION_UNAWAITED",
-        message: "Await nested transactions before returning from the parent callback" }));
+      scope.errors.push(
+        new FrankenSQLiteError({
+          code: "ERR_FSQLITE_TRANSACTION_UNAWAITED",
+          message: "Await nested transactions before returning from the parent callback",
+        }),
+      );
     }
     await Promise.allSettled([...scope.pending]);
     for (const child of await Promise.allSettled(children)) {
@@ -703,13 +925,18 @@ export class FrankenDB {
       }
     }
     scope.statements.clear();
-    try { this.#checkCancellation(scope); }
-    catch (error: unknown) { scope.errors.push(error); }
+    try {
+      this.#checkCancellation(scope);
+    } catch (error: unknown) {
+      scope.errors.push(error);
+    }
     if (this.#transactionFailure !== null) scope.errors.push(this.#transactionFailure);
     const errors = [...new Set([...callbackErrors, ...scope.errors])];
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
-      throw new AggregateError(errors, "FrankenSQLite transaction operations failed", { cause: errors[0] });
+      throw new AggregateError(errors, "FrankenSQLite transaction operations failed", {
+        cause: errors[0],
+      });
     }
     return result;
   }

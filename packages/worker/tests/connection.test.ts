@@ -1,12 +1,11 @@
 import { describe, expect, it } from "vitest";
-
-import { WorkerConnectionHost } from "../src/connection";
 import type {
   CoreDatabaseConstructor,
   CoreDatabaseHandle,
   CoreModuleLoader,
   CorePreparedStatementHandle,
 } from "../src/connection";
+import { WorkerConnectionHost } from "../src/connection";
 import type { QueryResult } from "../src/protocol";
 
 class FakeStatement implements CorePreparedStatementHandle {
@@ -359,9 +358,7 @@ describe("WorkerConnectionHost", () => {
     });
     expect(statementQueried.kind).toBe("query-result");
     if (statementQueried.kind === "query-result") {
-      expect(statementQueried.data.rows).toEqual([
-        { id: 1, name: "alpha" },
-      ]);
+      expect(statementQueried.data.rows).toEqual([{ id: 1, name: "alpha" }]);
     }
   });
 

@@ -1,10 +1,10 @@
-import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
-import type { InitConfig, SqlBindings, SqlScalar, WorkerRequest } from "./protocol";
 import { BindingError, isNamedBindings } from "./bindings";
-import { validateTransactionId } from "./transactions";
+import type { InitConfig, SqlBindings, SqlScalar, WorkerRequest } from "./protocol";
+import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
 import { resolveResultEncoding } from "./result-codec";
-import { resolvePreparedStatementLimits } from "./statement-budget";
 import { resolveSnapshotOwnership } from "./snapshot-ownership";
+import { resolvePreparedStatementLimits } from "./statement-budget";
+import { validateTransactionId } from "./transactions";
 
 export interface RequestLimits {
   /** Active plus queued ordinary requests. Close/cancel use a separate lane. */
@@ -24,13 +24,24 @@ export const DEFAULT_REQUEST_LIMITS: Readonly<RequestLimits> = Object.freeze({
   maxPendingBytes: 128 * 1024 * 1024,
 });
 
-export function resolveRequestLimits(options: Partial<RequestLimits> = {}): Readonly<RequestLimits> {
-  const maxPendingRequests = options.maxPendingRequests ?? DEFAULT_REQUEST_LIMITS.maxPendingRequests;
+export function resolveRequestLimits(
+  options: Partial<RequestLimits> = {},
+): Readonly<RequestLimits> {
+  const maxPendingRequests =
+    options.maxPendingRequests ?? DEFAULT_REQUEST_LIMITS.maxPendingRequests;
   const maxPendingBytes = options.maxPendingBytes ?? DEFAULT_REQUEST_LIMITS.maxPendingBytes;
-  if (!Number.isSafeInteger(maxPendingRequests) || maxPendingRequests < 1 || maxPendingRequests > 4096) {
+  if (
+    !Number.isSafeInteger(maxPendingRequests) ||
+    maxPendingRequests < 1 ||
+    maxPendingRequests > 4096
+  ) {
     throw new RangeError("maxPendingRequests must be an integer in 1..4096");
   }
-  if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes < 256 || maxPendingBytes > 1024 ** 3) {
+  if (
+    !Number.isSafeInteger(maxPendingBytes) ||
+    maxPendingBytes < 256 ||
+    maxPendingBytes > 1024 ** 3
+  ) {
     throw new RangeError("maxPendingBytes must be an integer in 256..1073741824");
   }
   return Object.freeze({ maxPendingRequests, maxPendingBytes });
@@ -42,8 +53,15 @@ export class RequestAdmissionError extends Error {
   readonly suggestion: string;
   readonly batchIndex?: number;
 
-  constructor(readonly code: "ERR_FSQLITE_QUEUE_FULL" | "ERR_FSQLITE_REQUEST_TOO_LARGE" |
-    "ERR_FSQLITE_REQUEST_INPUT" | "ERR_FSQLITE_BULK_INPUT", message: string, batchIndex?: number) {
+  constructor(
+    readonly code:
+      | "ERR_FSQLITE_QUEUE_FULL"
+      | "ERR_FSQLITE_REQUEST_TOO_LARGE"
+      | "ERR_FSQLITE_REQUEST_INPUT"
+      | "ERR_FSQLITE_BULK_INPUT",
+    message: string,
+    batchIndex?: number,
+  ) {
     super(message);
     this.name = "RequestAdmissionError";
     if (batchIndex !== undefined) this.batchIndex = batchIndex;
@@ -69,12 +87,18 @@ export function validateRequestId(id: number): void {
  * Blob aliases are counted once per request, but their ENTIRE backing buffers
  * are counted (structured clone does not copy only a subarray's visible bytes).
  */
-function captureRequest(input: WorkerRequest, maximum: number): { request: WorkerRequest; bytes: number } {
+function captureRequest(
+  input: WorkerRequest,
+  maximum: number,
+): { request: WorkerRequest; bytes: number } {
   let bytes = 128;
   const buffers = new Set<ArrayBufferLike>();
   function charge(amount: number): void {
     if (!Number.isSafeInteger(amount) || amount < 0 || amount > maximum - bytes) {
-      throw new RequestAdmissionError("ERR_FSQLITE_REQUEST_TOO_LARGE", "Request exceeds maxPendingBytes");
+      throw new RequestAdmissionError(
+        "ERR_FSQLITE_REQUEST_TOO_LARGE",
+        "Request exceeds maxPendingBytes",
+      );
     }
     bytes += amount;
   }
@@ -96,7 +120,12 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
   }
   function params(values: readonly SqlScalar[], batchIndex?: number): SqlScalar[] {
     if (!Array.isArray(values)) {
-      if (batchIndex !== undefined) throw new RequestAdmissionError("ERR_FSQLITE_BULK_INPUT", "Each parameter set must be an array", batchIndex);
+      if (batchIndex !== undefined)
+        throw new RequestAdmissionError(
+          "ERR_FSQLITE_BULK_INPUT",
+          "Each parameter set must be an array",
+          batchIndex,
+        );
       invalid("Parameters must be a positional array");
     }
     const length = values.length;
@@ -104,19 +133,26 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     const captured: SqlScalar[] = [];
     for (let i = 0; i < length; i += 1) {
       const value = values[i];
-      if (typeof value === "string") { charge(value.length * 2); captured.push(value); }
-      else if (value instanceof Uint8Array) captured.push(blob(value));
-      else if (typeof value === "bigint") {
-        if (value < -(1n << 63n) || value >= (1n << 63n)) invalid("Integer parameters must fit signed 64-bit SQLite values");
+      if (typeof value === "string") {
+        charge(value.length * 2);
         captured.push(value);
-      } else if (value === null || typeof value === "boolean" || typeof value === "number") captured.push(value);
+      } else if (value instanceof Uint8Array) captured.push(blob(value));
+      else if (typeof value === "bigint") {
+        if (value < -(1n << 63n) || value >= 1n << 63n)
+          invalid("Integer parameters must fit signed 64-bit SQLite values");
+        captured.push(value);
+      } else if (value === null || typeof value === "boolean" || typeof value === "number")
+        captured.push(value);
       else invalid("Parameters must be SQL scalars");
     }
     return captured;
   }
   function sets(values: readonly (readonly SqlScalar[])[]): SqlScalar[][] {
     if (!Array.isArray(values) || values.length > MAX_EXECUTE_MANY_ROWS) {
-      throw new RequestAdmissionError("ERR_FSQLITE_BULK_INPUT", `Bulk execution accepts at most ${MAX_EXECUTE_MANY_ROWS} parameter sets`);
+      throw new RequestAdmissionError(
+        "ERR_FSQLITE_BULK_INPUT",
+        `Bulk execution accepts at most ${MAX_EXECUTE_MANY_ROWS} parameter sets`,
+      );
     }
     const length = values.length;
     charge(16 + length * 16);
@@ -127,7 +163,10 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
   function bindings(values: SqlBindings): SqlBindings {
     if (Array.isArray(values)) return params(values);
     if (!isNamedBindings(values)) {
-      throw new BindingError("ERR_FSQLITE_BINDING_INPUT", "Bindings must be an array or a plain named object");
+      throw new BindingError(
+        "ERR_FSQLITE_BINDING_INPUT",
+        "Bindings must be an array or a plain named object",
+      );
     }
     charge(16);
     const captured: Record<string, SqlScalar> = Object.create(null);
@@ -145,13 +184,18 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
   validateRequestId(requestId);
   const kind = input.kind;
   const transactionId = input.transactionId;
-  if (transactionId !== undefined) { validateTransactionId(transactionId); text(transactionId); }
+  if (transactionId !== undefined) {
+    validateTransactionId(transactionId);
+    text(transactionId);
+  }
   let request: WorkerRequest;
   switch (kind) {
     case "transaction": {
       if (transactionId === undefined) invalid("Managed boundaries require a transaction id");
-      const action = input.action, parentId = input.parentId;
-      if (action !== "begin" && action !== "commit" && action !== "rollback") invalid("Invalid transaction action");
+      const action = input.action,
+        parentId = input.parentId;
+      if (action !== "begin" && action !== "commit" && action !== "rollback")
+        invalid("Invalid transaction action");
       request = { kind, requestId, transactionId, action };
       if (parentId !== undefined) {
         if (action !== "begin") invalid("Only begin accepts a parent transaction id");
@@ -163,11 +207,20 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
     case "init": {
       const source = input.config;
       const config: InitConfig = {};
-      const dbName = source.dbName, persistence = source.persistence, wasmUrl = source.wasmUrl, snapshot = source.snapshot;
+      const dbName = source.dbName,
+        persistence = source.persistence,
+        wasmUrl = source.wasmUrl,
+        snapshot = source.snapshot;
       if (dbName !== undefined) config.dbName = text(dbName);
-      if (persistence !== undefined) { text(persistence); config.persistence = persistence; }
+      if (persistence !== undefined) {
+        text(persistence);
+        config.persistence = persistence;
+      }
       const ownership = resolveSnapshotOwnership(source.snapshotOwnership);
-      if (ownership !== undefined) { text(ownership); config.snapshotOwnership = ownership; }
+      if (ownership !== undefined) {
+        text(ownership);
+        config.snapshotOwnership = ownership;
+      }
       if (wasmUrl !== undefined) config.wasmUrl = text(wasmUrl);
       if (snapshot !== undefined) config.snapshot = blob(snapshot);
       const resultEncoding = source.resultEncoding;
@@ -183,26 +236,35 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       request = { kind, requestId, config };
       break;
     }
-    case "execute": case "query": {
-      const sql = text(input.sql), values = input.params;
+    case "execute":
+    case "query": {
+      const sql = text(input.sql),
+        values = input.params;
       request = { kind, requestId, sql, params: bindings(values ?? []) };
       break;
     }
-    case "execute-batch": case "prepare":
+    case "execute-batch":
+    case "prepare":
       request = { kind, requestId, sql: text(input.sql) };
       break;
-    case "statement-query": case "statement-execute": {
-      const statementId = text(input.statementId), values = input.params;
+    case "statement-query":
+    case "statement-execute": {
+      const statementId = text(input.statementId),
+        values = input.params;
       request = { kind, requestId, statementId, params: bindings(values ?? []) };
       break;
     }
-    case "execute-many": case "statement-execute-many": {
+    case "execute-many":
+    case "statement-execute-many": {
       const identity = kind === "execute-many" ? text(input.sql) : text(input.statementId);
       const parameterSets = sets(input.parameterSets);
       const cancellable = input.cancellable;
-      if (cancellable !== undefined && typeof cancellable !== "boolean") invalid("cancellable must be a boolean");
-      request = kind === "execute-many" ? { kind, requestId, sql: identity, parameterSets } :
-        { kind, requestId, statementId: identity, parameterSets };
+      if (cancellable !== undefined && typeof cancellable !== "boolean")
+        invalid("cancellable must be a boolean");
+      request =
+        kind === "execute-many"
+          ? { kind, requestId, sql: identity, parameterSets }
+          : { kind, requestId, statementId: identity, parameterSets };
       if (cancellable !== undefined) request.cancellable = cancellable;
       break;
     }
@@ -216,10 +278,16 @@ function captureRequest(input: WorkerRequest, maximum: number): { request: Worke
       break;
     }
     case "checkpoint-recover": {
-      const publicationId = revision(input.publicationId), parentRevision = input.parentRevision;
-      request = { kind, requestId, publicationId,
-        parentRevision: parentRevision === null ? null : revision(parentRevision) };
-      if (publicationId === parentRevision) invalid("Recovery revision must differ from its parent");
+      const publicationId = revision(input.publicationId),
+        parentRevision = input.parentRevision;
+      request = {
+        kind,
+        requestId,
+        publicationId,
+        parentRevision: parentRevision === null ? null : revision(parentRevision),
+      };
+      if (publicationId === parentRevision)
+        invalid("Recovery revision must differ from its parent");
       break;
     }
     case "export":
@@ -252,15 +320,25 @@ export class RequestBudget {
   }
 
   get stats(): RequestQueueStats {
-    return Object.freeze({ ...this.#limits, pendingRequests: this.#ids.size,
-      pendingBytes: this.#bytes, rejectedRequests: this.#rejected });
+    return Object.freeze({
+      ...this.#limits,
+      pendingRequests: this.#ids.size,
+      pendingBytes: this.#bytes,
+      rejectedRequests: this.#rejected,
+    });
   }
 
   admit(input: WorkerRequest): { request: WorkerRequest; release: () => void } {
     try {
       const checkCapacity = (bytes: number): void => {
-        if (this.#ids.size >= this.#limits.maxPendingRequests || bytes > this.#limits.maxPendingBytes - this.#bytes) {
-          throw new RequestAdmissionError("ERR_FSQLITE_QUEUE_FULL", "FrankenSQLite request queue is full");
+        if (
+          this.#ids.size >= this.#limits.maxPendingRequests ||
+          bytes > this.#limits.maxPendingBytes - this.#bytes
+        ) {
+          throw new RequestAdmissionError(
+            "ERR_FSQLITE_QUEUE_FULL",
+            "FrankenSQLite request queue is full",
+          );
         }
       };
       checkCapacity(0);
@@ -273,12 +351,15 @@ export class RequestBudget {
       this.#ids.add(id);
       this.#bytes += bytes;
       let released = false;
-      return { request, release: () => {
-        if (released) return;
-        released = true;
-        this.#ids.delete(id);
-        this.#bytes -= bytes;
-      } };
+      return {
+        request,
+        release: () => {
+          if (released) return;
+          released = true;
+          this.#ids.delete(id);
+          this.#bytes -= bytes;
+        },
+      };
     } catch (error: unknown) {
       this.#rejected = Math.min(this.#rejected + 1, Number.MAX_SAFE_INTEGER);
       throw error;

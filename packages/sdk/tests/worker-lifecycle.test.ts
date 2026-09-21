@@ -34,9 +34,15 @@ describe("worker client terminal lifecycle", () => {
     const { worker, client } = fixture();
     client.dispose();
     const operations = [
-      client.init({}), client.execute("SELECT 1"), client.executeBatch("SELECT 1"),
-      client.query("SELECT 1"), client.prepare("SELECT 1"), client.export(),
-      client.executePrepared("1"), client.queryPrepared("1"), client.finalizePrepared("1"),
+      client.init({}),
+      client.execute("SELECT 1"),
+      client.executeBatch("SELECT 1"),
+      client.query("SELECT 1"),
+      client.prepare("SELECT 1"),
+      client.export(),
+      client.executePrepared("1"),
+      client.queryPrepared("1"),
+      client.finalizePrepared("1"),
       client.close(),
     ].map((operation) => observe<unknown>(operation));
     await drain();
@@ -101,7 +107,9 @@ describe("worker client terminal lifecycle", () => {
   it("does not poison the connection after a synchronous postMessage error", async () => {
     const { worker, client } = fixture();
     const cloneError = new Error("DataCloneError");
-    worker.onPost = () => { throw cloneError; };
+    worker.onPost = () => {
+      throw cloneError;
+    };
     const failed = observe(client.execute("SELECT 1"));
     await drain();
     expect(rejected(failed)).toBe(cloneError);
@@ -116,9 +124,15 @@ describe("worker client terminal lifecycle", () => {
   it("releases worker resources when database initialization fails", async () => {
     const worker = new ControlledWorker();
     const opening = observe(FrankenDB.open({ worker }));
-    worker.reply({ kind: "error", requestId: 1, error: {
-      code: "SQLITE_NOTADB", sqliteCode: 26, message: "invalid snapshot",
-    } });
+    worker.reply({
+      kind: "error",
+      requestId: 1,
+      error: {
+        code: "SQLITE_NOTADB",
+        sqliteCode: 26,
+        message: "invalid snapshot",
+      },
+    });
     await drain();
     const error = rejected(opening);
     expect(error instanceof FrankenSQLiteError).toBe(true);
@@ -131,9 +145,14 @@ describe("worker client terminal lifecycle", () => {
   it("disposes after a close error and preserves the worker's error", async () => {
     const { worker, client } = fixture();
     const closing = observe(client.close());
-    worker.reply({ kind: "error", requestId: 1, error: {
-      code: "SQLITE_IOERR", message: "close failed",
-    } });
+    worker.reply({
+      kind: "error",
+      requestId: 1,
+      error: {
+        code: "SQLITE_IOERR",
+        message: "close failed",
+      },
+    });
     await drain();
     expect((rejected(closing) as FrankenSQLiteError).code).toBe("SQLITE_IOERR");
     expect(worker.terminateCount).toBe(1);
@@ -143,11 +162,18 @@ describe("worker client terminal lifecycle", () => {
   it("preserves both initialization and cleanup failures", async () => {
     const worker = new ControlledWorker();
     const cleanupError = new Error("terminate failed");
-    worker.onTerminate = () => { throw cleanupError; };
+    worker.onTerminate = () => {
+      throw cleanupError;
+    };
     const opening = observe(FrankenDB.open({ worker }));
-    worker.reply({ kind: "error", requestId: 1, error: {
-      code: "SQLITE_NOTADB", message: "invalid snapshot",
-    } });
+    worker.reply({
+      kind: "error",
+      requestId: 1,
+      error: {
+        code: "SQLITE_NOTADB",
+        message: "invalid snapshot",
+      },
+    });
     await drain();
     const error = rejected(opening);
     expect(error instanceof AggregateError).toBe(true);
@@ -160,11 +186,18 @@ describe("worker client terminal lifecycle", () => {
   it("preserves both close and cleanup failures", async () => {
     const { worker, client } = fixture();
     const cleanupError = new Error("terminate failed");
-    worker.onTerminate = () => { throw cleanupError; };
+    worker.onTerminate = () => {
+      throw cleanupError;
+    };
     const closing = observe(client.close());
-    worker.reply({ kind: "error", requestId: 1, error: {
-      code: "SQLITE_IOERR", message: "close failed",
-    } });
+    worker.reply({
+      kind: "error",
+      requestId: 1,
+      error: {
+        code: "SQLITE_IOERR",
+        message: "close failed",
+      },
+    });
     await drain();
     const error = rejected(closing);
     expect(error instanceof AggregateError).toBe(true);

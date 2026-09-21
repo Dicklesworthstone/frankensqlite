@@ -1,3 +1,9 @@
+import type { RequestLimits, RequestQueueStats } from "./admission";
+import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
+import type { ParameterLayout } from "./bindings";
+import { parameterLayout, resolveBindings } from "./bindings";
+import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
+import { OpfsSnapshotStore } from "./opfs-snapshot-store";
 import type {
   BinaryQueryResponse,
   CheckpointResponse,
@@ -10,12 +16,43 @@ import type {
   QueryResponse,
   ReadyResponse,
   SerializedFrankenError,
-  StatementFinalizeResponse,
-  SqlScalar,
   SqlBindings,
+  SqlScalar,
+  StatementFinalizeResponse,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
+import { isSnapshotPersistenceMode } from "./protocol";
+import type { ResultEncoding } from "./result-codec";
+import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
+import {
+  resolveSnapshotOwnership,
+  SnapshotOwnershipError,
+  SnapshotSessionLease,
+} from "./snapshot-ownership";
+import type { SnapshotMetadata } from "./snapshot-store";
+import {
+  IndexedDbSnapshotStore,
+  SnapshotStoreError,
+  validateSnapshotBytes,
+  validateSnapshotName,
+} from "./snapshot-store";
+import type {
+  PreparedStatementLimits,
+  PreparedStatementStats,
+  StatementReservation,
+} from "./statement-budget";
+import {
+  PreparedStatementBudget,
+  PreparedStatementError,
+  resolvePreparedStatementLimits,
+} from "./statement-budget";
+import {
+  executeManagedBatch,
+  ManagedTransactionError,
+  ManagedTransactions,
+  validateManagedSql,
+} from "./transactions";
 import {
   assertSupportedPersistenceMode,
   createReadyResult,
@@ -23,27 +60,15 @@ import {
   resolvePersistenceMode,
   UnsupportedPersistenceModeError,
 } from "./vfs-init";
-import { BulkCancellation, BulkExecutionError, executeMany } from "./bulk";
-import { IndexedDbSnapshotStore, SnapshotStoreError, validateSnapshotBytes, validateSnapshotName } from "./snapshot-store";
-import { OpfsSnapshotStore } from "./opfs-snapshot-store";
-import { SnapshotOwnershipError, SnapshotSessionLease, resolveSnapshotOwnership } from "./snapshot-ownership";
-import { isSnapshotPersistenceMode } from "./protocol";
-import type { SnapshotMetadata } from "./snapshot-store";
-import { RequestAdmissionError, RequestBudget, validateRequestId } from "./admission";
-import type { RequestLimits, RequestQueueStats } from "./admission";
-import { ManagedTransactionError, ManagedTransactions, executeManagedBatch, validateManagedSql } from "./transactions";
-import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
-import type { ResultEncoding } from "./result-codec";
-import { parameterLayout, resolveBindings } from "./bindings";
-import type { ParameterLayout } from "./bindings";
-import { PreparedStatementBudget, PreparedStatementError, resolvePreparedStatementLimits } from "./statement-budget";
-import type { PreparedStatementLimits, PreparedStatementStats, StatementReservation } from "./statement-budget";
 
 class CheckpointRollbackError extends SnapshotStoreError {
   readonly cleanupErrors: unknown[] = [];
   constructor(cause: unknown) {
-    super("ERR_FSQLITE_SNAPSHOT_CONNECTION_UNUSABLE",
-      "The checkpoint transaction probe could not roll back; reopen the connection", { cause });
+    super(
+      "ERR_FSQLITE_SNAPSHOT_CONNECTION_UNUSABLE",
+      "The checkpoint transaction probe could not roll back; reopen the connection",
+      { cause },
+    );
   }
 }
 
@@ -66,10 +91,7 @@ export interface CoreDatabaseHandle {
   executeBatch(sql: string): Promise<void>;
   executeWithParams(sql: string, params: unknown[]): Promise<number>;
   query(sql: string): Promise<QueryResponse["data"]>;
-  queryWithParams(
-    sql: string,
-    params: unknown[],
-  ): Promise<QueryResponse["data"]>;
+  queryWithParams(sql: string, params: unknown[]): Promise<QueryResponse["data"]>;
   prepare(sql: string): Promise<CorePreparedStatementHandle>;
   export(): Promise<Uint8Array>;
 }
@@ -119,8 +141,11 @@ export class WorkerConnectionHost {
   #closePromise: Promise<WorkerResponse> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
 
-  constructor(loader: CoreModuleLoader = defaultCoreModuleLoader, limits: Partial<RequestLimits> = {},
-    statementLimits: Partial<PreparedStatementLimits> = {}) {
+  constructor(
+    loader: CoreModuleLoader = defaultCoreModuleLoader,
+    limits: Partial<RequestLimits> = {},
+    statementLimits: Partial<PreparedStatementLimits> = {},
+  ) {
     this.#loader = loader;
     this.#budget = new RequestBudget(limits);
     this.#statementBudget = new PreparedStatementBudget(statementLimits);
@@ -132,7 +157,9 @@ export class WorkerConnectionHost {
   }
 
   /** Includes an in-flight prepare; capacity is held until actual cleanup. */
-  get preparedStatements(): PreparedStatementStats { return this.#statementBudget.stats; }
+  get preparedStatements(): PreparedStatementStats {
+    return this.#statementBudget.stats;
+  }
 
   /** Fence queued SQL immediately; close only after active work has settled. */
   failTransport(error: Error): Promise<WorkerResponse> {
@@ -148,43 +175,64 @@ export class WorkerConnectionHost {
       validateRequestId(request.requestId);
       return this.#admit(request);
     } catch (error: unknown) {
-      return Promise.resolve({ kind: "error", requestId: request.requestId,
-        error: serializeFrankenError(error) });
+      return Promise.resolve({
+        kind: "error",
+        requestId: request.requestId,
+        error: serializeFrankenError(error),
+      });
     }
   }
 
   #admit(request: WorkerRequest): Promise<WorkerResponse> {
     if (request.kind === "cancel-transaction") {
       // No SQL, queue reservation or tombstone is created by this control.
-      return Promise.resolve({ kind: "cancel-transaction-result", requestId: request.requestId,
-        accepted: this.#transactions.cancel(request.targetTransactionId) });
+      return Promise.resolve({
+        kind: "cancel-transaction-result",
+        requestId: request.requestId,
+        accepted: this.#transactions.cancel(request.targetTransactionId),
+      });
     }
     if (request.kind === "cancel-bulk") {
       validateRequestId(request.targetRequestId);
       // Do not put cancellation behind the work it needs to cancel. This only
       // updates a token; SQL and handle destruction still run in FIFO order.
-      return Promise.resolve({ kind: "cancel-bulk-result", requestId: request.requestId,
-        accepted: this.#bulkCancellations.get(request.targetRequestId)?.request() ?? false });
+      return Promise.resolve({
+        kind: "cancel-bulk-result",
+        requestId: request.requestId,
+        accepted: this.#bulkCancellations.get(request.targetRequestId)?.request() ?? false,
+      });
     }
     if (request.kind === "close") {
       const requestId = request.requestId;
       if (this.#closePromise !== null) {
-        return this.#closePromise.then(response => ({ ...response, requestId }));
+        return this.#closePromise.then((response) => ({ ...response, requestId }));
       }
       // Reserve one close fence independently of ordinary queue capacity. Later
       // SQL cannot enter; earlier SQL must settle before any handle is freed.
       const response = this.#requestTail.then(() => this.#handle({ kind: "close", requestId }));
       this.#closePromise = response;
-      this.#requestTail = response.then(() => undefined, () => undefined);
+      this.#requestTail = response.then(
+        () => undefined,
+        () => undefined,
+      );
       return response;
     }
     if (this.#closePromise !== null) {
-      return Promise.resolve({ kind: "error", requestId: request.requestId,
-        error: { code: "ERR_FSQLITE_CONNECTION_CLOSED", message: "FrankenSQLite worker connection is closing or closed" } });
+      return Promise.resolve({
+        kind: "error",
+        requestId: request.requestId,
+        error: {
+          code: "ERR_FSQLITE_CONNECTION_CLOSED",
+          message: "FrankenSQLite worker connection is closing or closed",
+        },
+      });
     }
     if (this.#bulkCancellations.has(request.requestId)) {
-      return Promise.resolve({ kind: "error", requestId: request.requestId,
-        error: { code: "ERR_FSQLITE_BULK_INPUT", message: "Duplicate active bulk request id" } });
+      return Promise.resolve({
+        kind: "error",
+        requestId: request.requestId,
+        error: { code: "ERR_FSQLITE_BULK_INPUT", message: "Duplicate active bulk request id" },
+      });
     }
     const admitted = this.#budget.admit(request);
     request = admitted.request;
@@ -193,32 +241,49 @@ export class WorkerConnectionHost {
     // re-enter close; never append captured SQL after an already-admitted fence.
     if (this.#closePromise !== null) {
       release();
-      return Promise.resolve({ kind: "error", requestId: request.requestId,
-        error: { code: "ERR_FSQLITE_CONNECTION_CLOSED", message: "FrankenSQLite worker connection is closing or closed" } });
+      return Promise.resolve({
+        kind: "error",
+        requestId: request.requestId,
+        error: {
+          code: "ERR_FSQLITE_CONNECTION_CLOSED",
+          message: "FrankenSQLite worker connection is closing or closed",
+        },
+      });
     }
     let cancellation: BulkCancellation | undefined;
     if (request.kind === "execute-many" || request.kind === "statement-execute-many") {
       const transactionId = request.transactionId;
       if (request.cancellable || transactionId !== undefined) {
-        cancellation = new BulkCancellation(transactionId === undefined
-          ? undefined : () => this.#transactions.assertOwner(transactionId));
+        cancellation = new BulkCancellation(
+          transactionId === undefined
+            ? undefined
+            : () => this.#transactions.assertOwner(transactionId),
+        );
         if (request.cancellable) this.#bulkCancellations.set(request.requestId, cancellation);
       }
     }
     // Worker message callbacks are not awaited by the browser. Keep ownership
     // of this connection (and its WASM handles) until each request settles,
     // including init, finalize, export and close. Other hosts remain independent.
-    const ordinary = request as Exclude<WorkerRequest, { kind: "cancel-bulk" | "cancel-transaction" }>;
-    const response = this.#requestTail.then(() => this.#handle(ordinary, cancellation)).finally(() => {
-      release();
-      if (cancellation !== undefined) {
-        cancellation.finish();
-        this.#bulkCancellations.delete(request.requestId);
-      }
-    });
+    const ordinary = request as Exclude<
+      WorkerRequest,
+      { kind: "cancel-bulk" | "cancel-transaction" }
+    >;
+    const response = this.#requestTail
+      .then(() => this.#handle(ordinary, cancellation))
+      .finally(() => {
+        release();
+        if (cancellation !== undefined) {
+          cancellation.finish();
+          this.#bulkCancellations.delete(request.requestId);
+        }
+      });
     // A failed request must not poison the queue, even if serializing its error
     // throws. Return the original promise so the caller still sees that failure.
-    this.#requestTail = response.then(() => undefined, () => undefined);
+    this.#requestTail = response.then(
+      () => undefined,
+      () => undefined,
+    );
     return response;
   }
 
@@ -231,13 +296,30 @@ export class WorkerConnectionHost {
         throw this.#terminalError;
       }
       if (request.kind !== "transaction" && request.kind !== "close") {
-        this.#transactions.assertOwner(request.transactionId, request.kind === "statement-finalize");
-        if ("statementId" in request && this.#statementOwners.get(request.statementId) !== request.transactionId) {
-          throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Prepared statement belongs to another scope");
+        this.#transactions.assertOwner(
+          request.transactionId,
+          request.kind === "statement-finalize",
+        );
+        if (
+          "statementId" in request &&
+          this.#statementOwners.get(request.statementId) !== request.transactionId
+        ) {
+          throw new ManagedTransactionError(
+            "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
+            "Prepared statement belongs to another scope",
+          );
         }
         if (request.transactionId !== undefined) {
-          if (request.kind === "init" || request.kind === "export" || request.kind === "checkpoint" || request.kind === "checkpoint-recover") {
-            throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_OWNERSHIP", "Finish the transaction before replacing or exporting its database");
+          if (
+            request.kind === "init" ||
+            request.kind === "export" ||
+            request.kind === "checkpoint" ||
+            request.kind === "checkpoint-recover"
+          ) {
+            throw new ManagedTransactionError(
+              "ERR_FSQLITE_TRANSACTION_OWNERSHIP",
+              "Finish the transaction before replacing or exporting its database",
+            );
           }
           // Managed batches perform the same complete preflight in their
           // cancellable runner, before any script statement is dispatched.
@@ -249,31 +331,36 @@ export class WorkerConnectionHost {
       }
       switch (request.kind) {
         case "transaction":
-          await this.#transactions.boundary(this.#requireDatabase(), request,
-            id => this.#finalizeTransactionStatements(id));
+          await this.#transactions.boundary(this.#requireDatabase(), request, (id) =>
+            this.#finalizeTransactionStatements(id),
+          );
           return { kind: "transaction-result", requestId: request.requestId };
         case "init":
           return await this.#initialize(request.requestId, request.config);
         case "execute":
-          return await this.#execute(
-            request.requestId,
-            request.sql,
-            request.params ?? [],
-          );
+          return await this.#execute(request.requestId, request.sql, request.params ?? []);
         case "execute-batch":
           return await this.#executeBatch(request.requestId, request.sql, request.transactionId);
         case "execute-many":
-          return await this.#executeMany(request.requestId, request.sql, request.parameterSets, undefined, cancellation);
-        case "statement-execute-many": {
-          const statement = this.#requireStatement(request.statementId);
-          return await this.#executeMany(request.requestId, statement.sql, request.parameterSets, statement, cancellation);
-        }
-        case "query":
-          return await this.#query(
+          return await this.#executeMany(
             request.requestId,
             request.sql,
-            request.params ?? [],
+            request.parameterSets,
+            undefined,
+            cancellation,
           );
+        case "statement-execute-many": {
+          const statement = this.#requireStatement(request.statementId);
+          return await this.#executeMany(
+            request.requestId,
+            statement.sql,
+            request.parameterSets,
+            statement,
+            cancellation,
+          );
+        }
+        case "query":
+          return await this.#query(request.requestId, request.sql, request.params ?? []);
         case "prepare":
           return await this.#prepare(request.requestId, request.sql, request.transactionId);
         case "statement-execute":
@@ -295,7 +382,11 @@ export class WorkerConnectionHost {
         case "checkpoint":
           return await this.#checkpoint(request.requestId, request.publicationId);
         case "checkpoint-recover":
-          return await this.#recoverCheckpoint(request.requestId, request.publicationId, request.parentRevision);
+          return await this.#recoverCheckpoint(
+            request.requestId,
+            request.publicationId,
+            request.parentRevision,
+          );
         case "close":
           return await this.#close(request.requestId);
       }
@@ -303,8 +394,11 @@ export class WorkerConnectionHost {
       // Set the failure fence before the FIFO advances, not after a client has
       // observed the rejection. Queued writes must not escape after OR ROLLBACK.
       if (request.kind !== "transaction") this.#transactions.fail(request.transactionId, error);
-      if ((error instanceof BulkExecutionError || error instanceof ManagedTransactionError) &&
-          error.connectionUnusable && this.#terminalError === null) {
+      if (
+        (error instanceof BulkExecutionError || error instanceof ManagedTransactionError) &&
+        error.connectionUnusable &&
+        this.#terminalError === null
+      ) {
         this.#terminalError = error;
         try {
           await this.#disposeDatabase();
@@ -320,22 +414,26 @@ export class WorkerConnectionHost {
     }
   }
 
-  async #initialize(
-    requestId: number,
-    config: InitConfig,
-  ): Promise<ReadyResponse> {
+  async #initialize(requestId: number, config: InitConfig): Promise<ReadyResponse> {
     const ready = createReadyResult(config);
     assertSupportedPersistenceMode(ready.persistence);
     const requestedOwnership = resolveSnapshotOwnership(config.snapshotOwnership);
     if (requestedOwnership !== undefined && !isSnapshotPersistenceMode(ready.persistence)) {
-      throw new SnapshotOwnershipError("ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
-        "snapshotOwnership requires indexeddb-snapshot or opfs-snapshot persistence");
+      throw new SnapshotOwnershipError(
+        "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT",
+        "snapshotOwnership requires indexeddb-snapshot or opfs-snapshot persistence",
+      );
     }
     const resultEncoding = resolveResultEncoding(config.resultEncoding);
-    const requestedStatements = config.preparedStatementLimits === undefined
-      ? this.#statementCeiling : resolvePreparedStatementLimits(config.preparedStatementLimits);
+    const requestedStatements =
+      config.preparedStatementLimits === undefined
+        ? this.#statementCeiling
+        : resolvePreparedStatementLimits(config.preparedStatementLimits);
     const stagedStatementBudget = new PreparedStatementBudget({
-      maxStatements: Math.min(requestedStatements.maxStatements, this.#statementCeiling.maxStatements),
+      maxStatements: Math.min(
+        requestedStatements.maxStatements,
+        this.#statementCeiling.maxStatements,
+      ),
       maxBytes: Math.min(requestedStatements.maxBytes, this.#statementCeiling.maxBytes),
     });
 
@@ -358,36 +456,50 @@ export class WorkerConnectionHost {
           stagedLease = this.#snapshotLease;
           reusingLease = true;
         } else {
-          stagedLease = await SnapshotSessionLease.acquire(ready.persistence, config.dbName!, requestedOwnership);
+          stagedLease = await SnapshotSessionLease.acquire(
+            ready.persistence,
+            config.dbName!,
+            requestedOwnership,
+          );
         }
-        stagedStore = ready.persistence === "opfs-snapshot"
-          ? await OpfsSnapshotStore.open(config.dbName!)
-          : await IndexedDbSnapshotStore.open(config.dbName!);
+        stagedStore =
+          ready.persistence === "opfs-snapshot"
+            ? await OpfsSnapshotStore.open(config.dbName!)
+            : await IndexedDbSnapshotStore.open(config.dbName!);
         const loaded = await stagedStore.load();
         if (loaded !== null) {
           if (image !== undefined) {
-            throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_EXISTS",
-              "An existing checkpoint cannot be replaced by an initialization snapshot");
+            throw new SnapshotStoreError(
+              "ERR_FSQLITE_SNAPSHOT_EXISTS",
+              "An existing checkpoint cannot be replaced by an initialization snapshot",
+            );
           }
           image = loaded.bytes;
-          saved = { revision: loaded.revision, parentRevision: loaded.parentRevision,
-            byteLength: loaded.byteLength, sha256: loaded.sha256 };
+          saved = {
+            revision: loaded.revision,
+            parentRevision: loaded.parentRevision,
+            byteLength: loaded.byteLength,
+            sha256: loaded.sha256,
+          };
         }
       }
       // Import/open and capture candidate metadata BEFORE touching the current
       // session. A rejected import must not erase unsaved data, prepared handles,
       // a manual transaction, or the previous snapshot publication lineage.
       const core = await this.#loader.load(config.wasmUrl);
-      stagedDb = image !== undefined
-        ? await core.FrankenDB.import(image)
-        : await core.FrankenDB.create(resolveDatabasePath(config));
+      stagedDb =
+        image !== undefined
+          ? await core.FrankenDB.import(image)
+          : await core.FrankenDB.create(resolveDatabasePath(config));
       if (stagedDb === this.#db) {
         // A loader may not transfer the live handle back as a new allocation.
         // In particular, never close that alias while cleaning up a candidate.
         stagedDb = null;
         throw new Error("Database initialization must return a separately owned handle");
       }
-      const path = isSnapshotPersistenceMode(ready.persistence) ? ready.path : stagedDb.path || ready.path;
+      const path = isSnapshotPersistenceMode(ready.persistence)
+        ? ready.path
+        : stagedDb.path || ready.path;
       if (typeof path !== "string") throw new Error("Invalid initialized database path");
       if (this.#terminalError !== null) throw this.#terminalError;
 
@@ -408,37 +520,55 @@ export class WorkerConnectionHost {
       this.#resultEncoding = resultEncoding;
       this.#statementBudget = stagedStatementBudget;
       return {
-        kind: "ready", requestId,
+        kind: "ready",
+        requestId,
         data: {
           path,
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           preparedStatementLimits: stagedStatementBudget.limits,
           ...(this.#snapshotLease === null ? {} : { snapshotOwnership: this.#snapshotLease.mode }),
-          ...(isSnapshotPersistenceMode(ready.persistence) ? { snapshot: saved, checkpointRecovery: 1 as const } : {}),
+          ...(isSnapshotPersistenceMode(ready.persistence)
+            ? { snapshot: saved, checkpointRecovery: 1 as const }
+            : {}),
         },
       };
     } catch (cause: unknown) {
       const cleanupErrors: unknown[] = [];
       // Close and free independently, even after a throwing close. Retain all
       // causes (including thrown undefined) without retrying any destructor.
-      for (const cleanup of [() => stagedDb?.close(), () => stagedDb?.free(), () => stagedStore?.close()]) {
-        try { cleanup(); } catch (error: unknown) { cleanupErrors.push(error); }
+      for (const cleanup of [
+        () => stagedDb?.close(),
+        () => stagedDb?.free(),
+        () => stagedStore?.close(),
+      ]) {
+        try {
+          cleanup();
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
       }
       // Failed candidate construction must not release the old live session's
       // reused lease. Unknown core cleanup must not grant a competing owner:
       // leave that lease held until the worker realm is terminated instead.
       if (cleanupErrors.length === 0 && (!reusingLease || (disposingPrevious && previousRetired))) {
-        try { await stagedLease?.close(); }
-        catch (error: unknown) { cleanupErrors.push(error); }
+        try {
+          await stagedLease?.close();
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
       }
       if (disposingPrevious || cleanupErrors.length !== 0) {
-        const failure = new ManagedTransactionError(disposingPrevious
-          ? "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE" : "ERR_FSQLITE_WORKER_INITIALIZATION",
+        const failure = new ManagedTransactionError(
+          disposingPrevious
+            ? "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE"
+            : "ERR_FSQLITE_WORKER_INITIALIZATION",
           disposingPrevious
             ? "Database replacement cleanup failed; reopen the connection"
             : "Database initialization and candidate cleanup failed; the previous session was retained",
-          { cause }, disposingPrevious);
+          { cause },
+          disposingPrevious,
+        );
         failure.cleanupErrors.push(...cleanupErrors);
         throw failure;
       }
@@ -446,17 +576,11 @@ export class WorkerConnectionHost {
     }
   }
 
-  async #execute(
-    requestId: number,
-    sql: string,
-    bindings: SqlBindings,
-  ): Promise<ExecuteResponse> {
+  async #execute(requestId: number, sql: string, bindings: SqlBindings): Promise<ExecuteResponse> {
     const db = this.#requireDatabase();
     const params = this.#parameters(sql, bindings);
     const changes =
-      params.length === 0
-        ? await db.execute(sql)
-        : await db.executeWithParams(sql, [...params]);
+      params.length === 0 ? await db.execute(sql) : await db.executeWithParams(sql, [...params]);
     return {
       kind: "execute-result",
       requestId,
@@ -493,9 +617,7 @@ export class WorkerConnectionHost {
     const db = this.#requireDatabase();
     const params = this.#parameters(sql, bindings);
     const data =
-      params.length === 0
-        ? await db.query(sql)
-        : await db.queryWithParams(sql, [...params]);
+      params.length === 0 ? await db.query(sql) : await db.queryWithParams(sql, [...params]);
     return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 
@@ -509,8 +631,14 @@ export class WorkerConnectionHost {
     return {
       kind: "execute-many-result",
       requestId,
-      data: await executeMany(this.#requireDatabase(), sql, parameterSets,
-        `fsqlite_bulk_${this.#nextBulkSavepoint++}`, prepared, cancellation),
+      data: await executeMany(
+        this.#requireDatabase(),
+        sql,
+        parameterSets,
+        `fsqlite_bulk_${this.#nextBulkSavepoint++}`,
+        prepared,
+        cancellation,
+      ),
     };
   }
 
@@ -527,13 +655,25 @@ export class WorkerConnectionHost {
       // Never finalize that alias while recovering from a failed preparation.
       if ([...this.#statements.values()].includes(candidate)) {
         candidate = null;
-        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Preparation returned an already owned statement");
+        throw new PreparedStatementError(
+          "ERR_FSQLITE_STATEMENT_METADATA",
+          "Preparation returned an already owned statement",
+        );
       }
       if (this.#terminalError !== null) throw this.#terminalError;
       this.#transactions.assertOwner(transactionId);
-      const preparedSql = candidate.sql, columnCount = candidate.columnCount;
-      if (typeof preparedSql !== "string" || !Number.isSafeInteger(columnCount) || columnCount < 0 || columnCount > 32768) {
-        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared statement metadata");
+      const preparedSql = candidate.sql,
+        columnCount = candidate.columnCount;
+      if (
+        typeof preparedSql !== "string" ||
+        !Number.isSafeInteger(columnCount) ||
+        columnCount < 0 ||
+        columnCount > 32768
+      ) {
+        throw new PreparedStatementError(
+          "ERR_FSQLITE_STATEMENT_METADATA",
+          "Invalid prepared statement metadata",
+        );
       }
       reservation.grow(preparedSql.length * 2);
       // The SDK constructs a lexical binding layout from the returned SQL.
@@ -542,12 +682,19 @@ export class WorkerConnectionHost {
       if (preparedSql !== sql) parameterLayout(preparedSql);
       const names = candidate.columnNames();
       if (!Array.isArray(names) || names.length !== columnCount) {
-        throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared column names");
+        throw new PreparedStatementError(
+          "ERR_FSQLITE_STATEMENT_METADATA",
+          "Invalid prepared column names",
+        );
       }
       const columnNames: string[] = [];
       for (let i = 0; i < columnCount; i++) {
         const name = names[i];
-        if (typeof name !== "string") throw new PreparedStatementError("ERR_FSQLITE_STATEMENT_METADATA", "Invalid prepared column name");
+        if (typeof name !== "string")
+          throw new PreparedStatementError(
+            "ERR_FSQLITE_STATEMENT_METADATA",
+            "Invalid prepared column name",
+          );
         reservation.grow(16 + name.length * 2);
         columnNames.push(name);
       }
@@ -556,10 +703,18 @@ export class WorkerConnectionHost {
       if (this.#terminalError !== null) throw this.#terminalError;
       this.#transactions.assertOwner(transactionId);
       const statementId = String(this.#nextStatementId++);
-      const response: PrepareResponse = { kind: "prepare-result", requestId, data: {
-        statementId, sql: preparedSql, columnCount, columnNames,
-        parameterCount: layout.count, parameterNames: layout.names,
-      } };
+      const response: PrepareResponse = {
+        kind: "prepare-result",
+        requestId,
+        data: {
+          statementId,
+          sql: preparedSql,
+          columnCount,
+          columnNames,
+          parameterCount: layout.count,
+          parameterNames: layout.names,
+        },
+      };
       this.#statements.set(statementId, candidate);
       this.#parameterLayouts.set(statementId, layout);
       this.#statementReservations.set(statementId, reservation);
@@ -567,10 +722,15 @@ export class WorkerConnectionHost {
       published = true;
       return response;
     } catch (cause: unknown) {
-      try { candidate?.free(); }
-      catch (cleanup: unknown) {
-        const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
-          "Failed to clean up an unpublished prepared statement; reopen the connection", { cause }, true);
+      try {
+        candidate?.free();
+      } catch (cleanup: unknown) {
+        const failure = new ManagedTransactionError(
+          "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+          "Failed to clean up an unpublished prepared statement; reopen the connection",
+          { cause },
+          true,
+        );
         failure.cleanupErrors.push(cleanup);
         throw failure;
       }
@@ -588,9 +748,7 @@ export class WorkerConnectionHost {
     const stmt = this.#requireStatement(statementId);
     const params = this.#parameters(stmt.sql, bindings, this.#parameterLayouts.get(statementId));
     const changes =
-      params.length === 0
-        ? await stmt.execute()
-        : await stmt.executeWithParams([...params]);
+      params.length === 0 ? await stmt.execute() : await stmt.executeWithParams([...params]);
     return {
       kind: "execute-result",
       requestId,
@@ -605,28 +763,29 @@ export class WorkerConnectionHost {
   ): Promise<QueryResponse | BinaryQueryResponse> {
     const stmt = this.#requireStatement(statementId);
     const params = this.#parameters(stmt.sql, bindings, this.#parameterLayouts.get(statementId));
-    const data =
-      params.length === 0
-        ? await stmt.query()
-        : await stmt.queryWithParams([...params]);
+    const data = params.length === 0 ? await stmt.query() : await stmt.queryWithParams([...params]);
     return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 
-  #statementFinalize(
-    requestId: number,
-    statementId: string,
-  ): StatementFinalizeResponse {
+  #statementFinalize(requestId: number, statementId: string): StatementFinalizeResponse {
     const stmt = this.#requireStatement(statementId);
     this.#statements.delete(statementId);
     this.#parameterLayouts.delete(statementId);
     this.#statementOwners.delete(statementId);
     const reservation = this.#statementReservations.get(statementId)!;
     this.#statementReservations.delete(statementId);
-    try { stmt.free(); }
-    catch (cause: unknown) {
-      throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
-        "Prepared statement cleanup failed; reopen the connection", { cause }, true);
-    } finally { reservation.release(); }
+    try {
+      stmt.free();
+    } catch (cause: unknown) {
+      throw new ManagedTransactionError(
+        "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+        "Prepared statement cleanup failed; reopen the connection",
+        { cause },
+        true,
+      );
+    } finally {
+      reservation.release();
+    }
     return {
       kind: "statement-finalize-result",
       requestId,
@@ -645,8 +804,10 @@ export class WorkerConnectionHost {
     const db = this.#requireDatabase();
     const store = this.#snapshotStore;
     if (store === null) {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
-        "Explicit checkpoints require persistence: indexeddb-snapshot or opfs-snapshot");
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_MODE",
+        "Explicit checkpoints require persistence: indexeddb-snapshot or opfs-snapshot",
+      );
     }
     // The current WASM contract has no transaction-state accessor. Probe an
     // empty BEGIN/ROLLBACK boundary instead of guessing from SQL text (which
@@ -655,16 +816,22 @@ export class WorkerConnectionHost {
     try {
       await db.executeBatch("BEGIN");
     } catch (cause: unknown) {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_TRANSACTION",
-        "Could not establish an idle checkpoint boundary; finish any active transaction first", { cause });
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_TRANSACTION",
+        "Could not establish an idle checkpoint boundary; finish any active transaction first",
+        { cause },
+      );
     }
     try {
       await db.executeBatch("ROLLBACK");
     } catch (cause: unknown) {
       const failure = new CheckpointRollbackError(cause);
       this.#terminalError = failure;
-      try { await this.#disposeDatabase(); }
-      catch (cleanupError: unknown) { failure.cleanupErrors.push(cleanupError); }
+      try {
+        await this.#disposeDatabase();
+      } catch (cleanupError: unknown) {
+        failure.cleanupErrors.push(cleanupError);
+      }
       throw failure;
     }
     // Remain in the same host FIFO slot through export, hash, CAS and commit.
@@ -675,15 +842,25 @@ export class WorkerConnectionHost {
     return { kind: "checkpoint-result", requestId, data: saved };
   }
 
-  async #recoverCheckpoint(requestId: number, publicationId: string, parentRevision: string | null): Promise<CheckpointResponse> {
+  async #recoverCheckpoint(
+    requestId: number,
+    publicationId: string,
+    parentRevision: string | null,
+  ): Promise<CheckpointResponse> {
     const store = this.#snapshotStore;
-    if (store === null) throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_MODE",
-      "Checkpoint recovery requires persistence: indexeddb-snapshot or opfs-snapshot");
+    if (store === null)
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_MODE",
+        "Checkpoint recovery requires persistence: indexeddb-snapshot or opfs-snapshot",
+      );
     // Do not roll back the host's revision if another local checkpoint has
     // advanced it. It may be at the parent (lost store acknowledgement) or
     // at this publication (lost worker acknowledgement), and nowhere else.
     if (this.#snapshotRevision !== publicationId && this.#snapshotRevision !== parentRevision) {
-      throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED", "The live session has advanced beyond this publication");
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_NOT_CONFIRMED",
+        "The live session has advanced beyond this publication",
+      );
     }
     const saved = await store.confirmPublication(publicationId, parentRevision);
     if (this.#terminalError !== null) throw this.#terminalError;
@@ -716,14 +893,19 @@ export class WorkerConnectionHost {
     this.#snapshotLease = null;
 
     const errors: unknown[] = [];
-    try { snapshotStore?.close(); }
-    catch (error: unknown) { errors.push(error); }
+    try {
+      snapshotStore?.close();
+    } catch (error: unknown) {
+      errors.push(error);
+    }
     for (let i = 0; i < statements.length; i++) {
       try {
         statements[i]!.free();
       } catch (error: unknown) {
         errors.push(error);
-      } finally { reservations[i]!.release(); }
+      } finally {
+        reservations[i]!.release();
+      }
     }
     if (db !== null) {
       try {
@@ -741,12 +923,19 @@ export class WorkerConnectionHost {
     // destructor failure, retain ownership until actual worker termination;
     // a successful second close on cleared fields is not cleanup evidence.
     if (errors.length === 0 && snapshotLease !== retainLease) {
-      try { await snapshotLease?.close(); }
-      catch (error: unknown) { errors.push(error); }
+      try {
+        await snapshotLease?.close();
+      } catch (error: unknown) {
+        errors.push(error);
+      }
     }
     if (errors.length !== 0) {
-      const failure = new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
-        "Database resource cleanup failed; the connection is unusable", { cause: errors[0] }, true);
+      const failure = new ManagedTransactionError(
+        "ERR_FSQLITE_TRANSACTION_CONNECTION_UNUSABLE",
+        "Database resource cleanup failed; the connection is unusable",
+        { cause: errors[0] },
+        true,
+      );
       failure.cleanupErrors.push(...errors.slice(1));
       throw failure;
     }
@@ -763,8 +952,11 @@ export class WorkerConnectionHost {
     const errors: unknown[] = [];
     for (const [statementId, owner] of this.#statementOwners) {
       if (owner !== transactionId) continue;
-      try { this.#statementFinalize(0, statementId); }
-      catch (error: unknown) { errors.push(error); }
+      try {
+        this.#statementFinalize(0, statementId);
+      } catch (error: unknown) {
+        errors.push(error);
+      }
     }
     if (errors.length !== 0) throw new AggregateError(errors, "Managed statement cleanup failed");
   }
@@ -786,10 +978,7 @@ export class WorkerConnectionHost {
   }
 }
 
-export function serializeFrankenError(
-  error: unknown,
-  depth = 0,
-): SerializedFrankenError {
+export function serializeFrankenError(error: unknown, depth = 0): SerializedFrankenError {
   if (error instanceof BulkExecutionError && depth < 4) {
     const cause = serializeFrankenError(error.cause, depth + 1);
     const serialized: SerializedFrankenError = {
@@ -803,14 +992,15 @@ export function serializeFrankenError(
       serialized.code = "ERR_FSQLITE_BULK_CONNECTION_UNUSABLE";
       serialized.transient = false;
       serialized.userRecoverable = false;
-      serialized.suggestion = "Reopen the database; do not retry on this connection. Inspect the original failure and rollback errors.";
+      serialized.suggestion =
+        "Reopen the database; do not retry on this connection. Inspect the original failure and rollback errors.";
     }
     return serialized;
   }
   const code =
     error instanceof UnsupportedPersistenceModeError
       ? error.code
-      : extractStringProperty(error, "code") ?? "ERR_FSQLITE_WORKER";
+      : (extractStringProperty(error, "code") ?? "ERR_FSQLITE_WORKER");
 
   const serialized: SerializedFrankenError = {
     code,
@@ -855,24 +1045,24 @@ export function serializeFrankenError(
   if (error instanceof CheckpointRollbackError) {
     serialized.transient = false;
     serialized.userRecoverable = false;
-    serialized.cleanupErrors = depth < 4
-      ? error.cleanupErrors.map((item) => serializeFrankenError(item, depth + 1)) : [];
+    serialized.cleanupErrors =
+      depth < 4 ? error.cleanupErrors.map((item) => serializeFrankenError(item, depth + 1)) : [];
   }
   if (error instanceof ManagedTransactionError) {
-    if (depth < 4 && error.cause !== undefined) serialized.cause = serializeFrankenError(error.cause, depth + 1);
+    if (depth < 4 && error.cause !== undefined)
+      serialized.cause = serializeFrankenError(error.cause, depth + 1);
     if (error.connectionUnusable) serialized.userRecoverable = false;
     if (error.cleanupErrors.length > 0 && depth < 4) {
-      serialized.cleanupErrors = error.cleanupErrors.map(item => serializeFrankenError(item, depth + 1));
+      serialized.cleanupErrors = error.cleanupErrors.map((item) =>
+        serializeFrankenError(item, depth + 1),
+      );
     }
   }
 
   return serialized;
 }
 
-function extractStringProperty(
-  value: unknown,
-  key: string,
-): string | undefined {
+function extractStringProperty(value: unknown, key: string): string | undefined {
   if (typeof value !== "object" || value === null) {
     return undefined;
   }
@@ -880,10 +1070,7 @@ function extractStringProperty(
   return typeof property === "string" ? property : undefined;
 }
 
-function extractNumberProperty(
-  value: unknown,
-  key: string,
-): number | undefined {
+function extractNumberProperty(value: unknown, key: string): number | undefined {
   if (typeof value !== "object" || value === null) {
     return undefined;
   }
@@ -891,10 +1078,7 @@ function extractNumberProperty(
   return typeof property === "number" ? property : undefined;
 }
 
-function extractBooleanProperty(
-  value: unknown,
-  key: string,
-): boolean | undefined {
+function extractBooleanProperty(value: unknown, key: string): boolean | undefined {
   if (typeof value !== "object" || value === null) {
     return undefined;
   }

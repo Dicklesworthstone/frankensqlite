@@ -1,4 +1,3 @@
-
 :root {
   --bg-color: #050505;
   --fg-color: #33ff00;
@@ -8,11 +7,13 @@
   --panel-bg: #0a0a0a;
   --border-color: #33ff00;
   --grid-line: #112211;
-  --font-mono: 'JetBrains Mono', monospace;
+  --font-mono: "JetBrains Mono", monospace;
   --glow: 0 0 10px rgba(51, 255, 0, 0.2);
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 
 body {
   background-color: var(--bg-color);
@@ -30,8 +31,12 @@ body::after {
   content: "";
   position: fixed;
   inset: 0;
-  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-  background-size: 100% 2px, 2px 100%;
+  background:
+    linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
+    linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+  background-size:
+    100% 2px,
+    2px 100%;
   pointer-events: none;
   z-index: 9999;
 }
@@ -75,7 +80,10 @@ body::after {
 .tui-panel::before {
   content: "";
   position: absolute;
-  top: -1px; left: -1px; right: -1px; bottom: -1px;
+  top: -1px;
+  left: -1px;
+  right: -1px;
+  bottom: -1px;
   border: 1px dashed var(--dim-color);
   pointer-events: none;
   z-index: 1;
@@ -118,7 +126,8 @@ button:active {
   transform: translateY(1px);
 }
 
-input, select {
+input,
+select {
   background: #000;
   border: 1px solid var(--dim-color);
   color: var(--fg-color);
@@ -126,32 +135,63 @@ input, select {
   padding: 0.5rem;
   width: 100%;
 }
-input:focus, select:focus {
+input:focus,
+select:focus {
   border-color: var(--fg-color);
   outline: none;
   box-shadow: var(--glow);
 }
 
 /* Scrollbar */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: var(--bg-color); border-left: 1px solid var(--dim-color); }
-::-webkit-scrollbar-thumb { background: var(--dim-color); border: 1px solid var(--bg-color); }
-::-webkit-scrollbar-thumb:hover { background: var(--fg-color); }
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-color);
+  border-left: 1px solid var(--dim-color);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--dim-color);
+  border: 1px solid var(--bg-color);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-color);
+}
 
 /* Utility */
-.hidden { display: none !important; }
-.flex { display: flex; }
-.gap-2 { gap: 0.5rem; }
-.items-center { align-items: center; }
-.justify-between { justify-content: space-between; }
-.w-full { width: 100%; }
-.mt-4 { margin-top: 1rem; }
-.text-xs { font-size: 0.75rem; }
-.font-bold { font-weight: bold; }
+.hidden {
+  display: none !important;
+}
+.flex {
+  display: flex;
+}
+.gap-2 {
+  gap: 0.5rem;
+}
+.items-center {
+  align-items: center;
+}
+.justify-between {
+  justify-content: space-between;
+}
+.w-full {
+  width: 100%;
+}
+.mt-4 {
+  margin-top: 1rem;
+}
+.text-xs {
+  font-size: 0.75rem;
+}
+.font-bold {
+  font-weight: bold;
+}
 
 /* Frankenstein Stitches Decoration */
 .stitch-marker {
   position: absolute;
-  width: 10px; height: 2px;
+  width: 10px;
+  height: 2px;
   background: var(--fg-color);
 }

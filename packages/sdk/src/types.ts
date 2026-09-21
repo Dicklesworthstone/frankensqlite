@@ -2,23 +2,31 @@ import type {
   ExecuteManyResult,
   InitConfig,
   PersistenceMode,
-  QueryResult as WorkerQueryResult,
-  SerializedFrankenError,
-  SqlScalar,
-  SqlBindings,
-  SnapshotMetadata,
+  PreparedStatementLimits,
   RequestLimits,
   RequestQueueStats,
   ResultEncoding,
-  PreparedStatementLimits,
+  SerializedFrankenError,
+  SnapshotMetadata,
+  SqlBindings,
+  SqlScalar,
+  QueryResult as WorkerQueryResult,
 } from "@frankensqlite/worker";
 
 import type { WorkerLike } from "./worker-client";
 
-export type { ExecuteManyResult, PersistenceMode, SerializedFrankenError, SqlScalar, SqlBindings, SnapshotMetadata };
-export type { RequestLimits, RequestQueueStats };
-export type { ResultEncoding };
-export type { PreparedStatementLimits };
+export type {
+  ExecuteManyResult,
+  PersistenceMode,
+  PreparedStatementLimits,
+  RequestLimits,
+  RequestQueueStats,
+  ResultEncoding,
+  SerializedFrankenError,
+  SnapshotMetadata,
+  SqlBindings,
+  SqlScalar,
+};
 
 export type QueryResult<Row extends Record<string, unknown> = Record<string, unknown>> =
   WorkerQueryResult<Row>;
@@ -40,9 +48,7 @@ export interface TransactionOptions {
 }
 
 /** A pull-based source. Each yielded value is one positional parameter set. */
-export type SqlRowSource =
-  | Iterable<readonly SqlScalar[]>
-  | AsyncIterable<readonly SqlScalar[]>;
+export type SqlRowSource = Iterable<readonly SqlScalar[]> | AsyncIterable<readonly SqlScalar[]>;
 
 export interface ExecuteStreamOptions {
   /** Maximum rows per worker request, 1..10,000. Defaults to 256. */
@@ -79,8 +85,7 @@ export interface CheckpointRecoveryIdentity {
   readonly parentRevision: string | null;
 }
 
-export interface FrankenDbOpenOptions
-  extends Omit<InitConfig, "snapshot"> {
+export interface FrankenDbOpenOptions extends Omit<InitConfig, "snapshot"> {
   snapshot?: Uint8Array;
   /**
    * Reopen only if authoritative storage restores exactly this checkpoint.

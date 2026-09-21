@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
 import type { WorkerRequest, WorkerResponse } from "@frankensqlite/worker";
+import { describe, expect, it } from "vitest";
 
 import { FrankenDB } from "../src/database";
 import { FrankenSQLiteError } from "../src/errors";
@@ -18,7 +18,11 @@ async function fixture() {
   // One typed child rollback includes both rollback-to and cleanup release.
   const stages = (request: WorkerRequest): string[] => {
     if (request.kind !== "transaction") return ["sql" in request ? request.sql : request.kind];
-    if (request.action === "begin" && request.parentId !== undefined && !names.has(request.transactionId)) {
+    if (
+      request.action === "begin" &&
+      request.parentId !== undefined &&
+      !names.has(request.transactionId)
+    ) {
       names.set(request.transactionId, `fsqlite_sdk_${names.size + 1}`);
     }
     const name = names.get(request.transactionId);
@@ -34,28 +38,68 @@ async function fixture() {
       const failure = failures.get(keys[i]!);
       if (failure !== undefined) {
         failedAt.set(request.requestId, i + 1);
-        worker.reply({ kind: "error", requestId: request.requestId,
-          error: { code: "SQLITE_ERROR", message: failure } });
+        worker.reply({
+          kind: "error",
+          requestId: request.requestId,
+          error: { code: "SQLITE_ERROR", message: failure },
+        });
         return;
       }
     }
     const requestId = request.requestId;
     let response: WorkerResponse;
     switch (request.kind) {
-      case "init": response = { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } }; break;
-      case "execute-batch": response = { kind: "execute-batch-result", requestId }; break;
-      case "transaction": response = { kind: "transaction-result", requestId }; break;
-      case "execute": case "statement-execute": response = { kind: "execute-result", requestId, changes: 1 }; break;
-      case "prepare": response = { kind: "prepare-result", requestId, data: {
-        statementId: String(requestId), sql: request.sql, columnCount: 1, columnNames: ["value"],
-      } }; break;
-      case "query": case "statement-query": response = { kind: "query-result", requestId, data: {
-        columns: ["value"], columnCount: 1, columnTypes: ["integer"], rows: [{ value: 1 }], rowArrays: [[1]], changes: 0,
-      } }; break;
-      case "statement-finalize": response = { kind: "statement-finalize-result", requestId }; break;
-      case "export": response = { kind: "export-result", requestId, data: Uint8Array.of(1) }; break;
-      case "close": response = { kind: "close-result", requestId }; break;
-      default: throw new Error(`Unexpected fixture request ${request.kind}`);
+      case "init":
+        response = { kind: "ready", requestId, data: { path: ":memory:", persistence: "memory" } };
+        break;
+      case "execute-batch":
+        response = { kind: "execute-batch-result", requestId };
+        break;
+      case "transaction":
+        response = { kind: "transaction-result", requestId };
+        break;
+      case "execute":
+      case "statement-execute":
+        response = { kind: "execute-result", requestId, changes: 1 };
+        break;
+      case "prepare":
+        response = {
+          kind: "prepare-result",
+          requestId,
+          data: {
+            statementId: String(requestId),
+            sql: request.sql,
+            columnCount: 1,
+            columnNames: ["value"],
+          },
+        };
+        break;
+      case "query":
+      case "statement-query":
+        response = {
+          kind: "query-result",
+          requestId,
+          data: {
+            columns: ["value"],
+            columnCount: 1,
+            columnTypes: ["integer"],
+            rows: [{ value: 1 }],
+            rowArrays: [[1]],
+            changes: 0,
+          },
+        };
+        break;
+      case "statement-finalize":
+        response = { kind: "statement-finalize-result", requestId };
+        break;
+      case "export":
+        response = { kind: "export-result", requestId, data: Uint8Array.of(1) };
+        break;
+      case "close":
+        response = { kind: "close-result", requestId };
+        break;
+      default:
+        throw new Error(`Unexpected fixture request ${request.kind}`);
     }
     worker.reply(response);
   }
@@ -66,8 +110,14 @@ async function fixture() {
   const db = await FrankenDB.open({ worker });
   worker.requests.length = 0;
   return {
-    db, worker, held, failures,
-    log: () => worker.requests.flatMap(request => stages(request).slice(0, failedAt.get(request.requestId))),
+    db,
+    worker,
+    held,
+    failures,
+    log: () =>
+      worker.requests.flatMap((request) =>
+        stages(request).slice(0, failedAt.get(request.requestId)),
+      ),
     release(sql: string) {
       held.delete(sql);
       for (const request of waiting.splice(0)) {
@@ -104,15 +154,22 @@ describe("managed transaction ownership", () => {
     const f = await fixture();
     const gate = deferred<void>();
     const started = deferred<void>();
-    const transaction = observe(f.db.transaction(async (tx) => {
-      await tx.execute("OWNED");
-      started.resolve();
-      await gate.promise;
-    }));
+    const transaction = observe(
+      f.db.transaction(async (tx) => {
+        await tx.execute("OWNED");
+        started.resolve();
+        await gate.promise;
+      }),
+    );
     await started.promise;
     const operations: Promise<unknown>[] = [
-      f.db.execute("FOREIGN"), f.db.query("FOREIGN"), f.db.executeBatch("FOREIGN"),
-      f.db.prepare("FOREIGN"), f.db.export(), f.db.transaction(async () => 0), f.db.close(),
+      f.db.execute("FOREIGN"),
+      f.db.query("FOREIGN"),
+      f.db.executeBatch("FOREIGN"),
+      f.db.prepare("FOREIGN"),
+      f.db.export(),
+      f.db.transaction(async () => 0),
+      f.db.close(),
     ];
     const observations = operations.map(observe);
     await drain();
@@ -144,7 +201,11 @@ describe("managed transaction ownership", () => {
     const f = await fixture();
     const statement = await f.db.prepare("SELECT 1");
     await f.db.transaction(async () => {
-      const operations = [observe(statement.execute()), observe(statement.query()), observe(statement.finalize())];
+      const operations = [
+        observe(statement.execute()),
+        observe(statement.query()),
+        observe(statement.finalize()),
+      ];
       await drain();
       for (const operation of operations) expectOwnershipError(rejected(operation));
     });
@@ -158,16 +219,24 @@ describe("managed transaction ownership", () => {
     for (const rollback of [false, true]) {
       const f = await fixture();
       let escaped!: FrankenTransaction;
-      const transaction = observe(f.db.transaction(async (tx) => {
-        escaped = tx;
-        if (rollback) throw new Error("stop");
-      }));
+      const transaction = observe(
+        f.db.transaction(async (tx) => {
+          escaped = tx;
+          if (rollback) throw new Error("stop");
+        }),
+      );
       await transaction.settled;
       const before = f.log();
-      const operations = [observe(escaped.execute("LATE")), observe(escaped.query("LATE")), observe(escaped.prepare("LATE"))];
+      const operations = [
+        observe(escaped.execute("LATE")),
+        observe(escaped.query("LATE")),
+        observe(escaped.prepare("LATE")),
+      ];
       await drain();
       for (const operation of operations) {
-        expect((rejected(operation) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_CLOSED");
+        expect((rejected(operation) as FrankenSQLiteError).code).toBe(
+          "ERR_FSQLITE_TRANSACTION_CLOSED",
+        );
       }
       expect(f.log()).toEqual(before);
       await f.db.close();
@@ -185,9 +254,17 @@ describe("managed transaction ownership", () => {
     const operations = [observe(escaped.execute()), observe(escaped.query())];
     await drain();
     for (const operation of operations) {
-      expect((rejected(operation) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_CLOSED");
+      expect((rejected(operation) as FrankenSQLiteError).code).toBe(
+        "ERR_FSQLITE_TRANSACTION_CLOSED",
+      );
     }
-    expect(before).toEqual(["BEGIN", "SELECT 1", "statement-query", "statement-finalize", "COMMIT"]);
+    expect(before).toEqual([
+      "BEGIN",
+      "SELECT 1",
+      "statement-query",
+      "statement-finalize",
+      "COMMIT",
+    ]);
     expect(f.log()).toEqual(before);
     await f.db.close();
   });
@@ -208,10 +285,12 @@ describe("managed transaction ownership", () => {
   it("waits for unawaited admitted work before committing", async () => {
     const f = await fixture();
     f.held.add("PENDING");
-    const transaction = observe(f.db.transaction(async (tx) => {
-      void tx.execute("PENDING");
-      return 9;
-    }));
+    const transaction = observe(
+      f.db.transaction(async (tx) => {
+        void tx.execute("PENDING");
+        return 9;
+      }),
+    );
     await drain();
     const before = f.log();
     f.release("PENDING");
@@ -226,9 +305,11 @@ describe("managed transaction ownership", () => {
     const f = await fixture();
     f.held.add("PENDING");
     f.failures.set("PENDING", "write failed");
-    const transaction = observe(f.db.transaction(async (tx) => {
-      void tx.execute("PENDING");
-    }));
+    const transaction = observe(
+      f.db.transaction(async (tx) => {
+        void tx.execute("PENDING");
+      }),
+    );
     await drain();
     f.release("PENDING");
     await transaction.settled;
@@ -241,7 +322,11 @@ describe("managed transaction ownership", () => {
     const f = await fixture();
     f.failures.set("BEGIN", "already in transaction");
     let called = false;
-    const transaction = observe(f.db.transaction(async () => { called = true; }));
+    const transaction = observe(
+      f.db.transaction(async () => {
+        called = true;
+      }),
+    );
     await transaction.settled;
     expect((rejected(transaction) as Error).message).toContain("already in transaction");
     expect(called).toBe(false);
@@ -254,7 +339,11 @@ describe("managed transaction ownership", () => {
   it("rolls back after COMMIT fails and releases ownership", async () => {
     const f = await fixture();
     f.failures.set("COMMIT", "commit failed");
-    const transaction = observe(f.db.transaction(async (tx) => { await tx.execute("OWNED"); }));
+    const transaction = observe(
+      f.db.transaction(async (tx) => {
+        await tx.execute("OWNED");
+      }),
+    );
     await transaction.settled;
     expect((rejected(transaction) as Error).message).toContain("commit failed");
     expect(f.log()).toEqual(["BEGIN", "OWNED", "COMMIT", "ROLLBACK"]);
@@ -266,7 +355,11 @@ describe("managed transaction ownership", () => {
     const f = await fixture();
     f.failures.set("ROLLBACK", "rollback failed");
     const cause = new Error("callback failed");
-    const transaction = observe(f.db.transaction(async () => { throw cause; }));
+    const transaction = observe(
+      f.db.transaction(async () => {
+        throw cause;
+      }),
+    );
     await transaction.settled;
     const error = rejected(transaction);
     expect(error instanceof AggregateError).toBe(true);
@@ -284,7 +377,11 @@ describe("managed transaction ownership", () => {
   it("drains and finalizes a preparation still pending at callback return", async () => {
     const f = await fixture();
     f.held.add("SELECT 1");
-    const transaction = observe(f.db.transaction(async (tx) => { void tx.prepare("SELECT 1"); }));
+    const transaction = observe(
+      f.db.transaction(async (tx) => {
+        void tx.prepare("SELECT 1");
+      }),
+    );
     await drain();
     const before = f.log();
     f.release("SELECT 1");
@@ -299,7 +396,10 @@ describe("managed transaction ownership", () => {
     const second = await fixture();
     const gate = deferred<void>();
     const started = deferred<void>();
-    const transaction = first.db.transaction(async () => { started.resolve(); await gate.promise; });
+    const transaction = first.db.transaction(async () => {
+      started.resolve();
+      await gate.promise;
+    });
     await started.promise;
     expect(await second.db.execute("INDEPENDENT")).toBe(1);
     gate.resolve();
@@ -320,8 +420,12 @@ describe("nested transaction savepoints", () => {
     });
     expect(result).toBe(42);
     expect(f.log()).toEqual([
-      "BEGIN", "PARENT", "SAVEPOINT fsqlite_sdk_1", "CHILD",
-      "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT",
+      "BEGIN",
+      "PARENT",
+      "SAVEPOINT fsqlite_sdk_1",
+      "CHILD",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "COMMIT",
     ]);
     await f.db.close();
   });
@@ -331,17 +435,25 @@ describe("nested transaction savepoints", () => {
     const cause = new Error("child failed");
     await f.db.transaction(async (parent) => {
       await parent.execute("SIBLING_BEFORE");
-      const child = observe(parent.transaction(async (tx) => {
-        await tx.execute("DISCARDED");
-        throw cause;
-      }));
+      const child = observe(
+        parent.transaction(async (tx) => {
+          await tx.execute("DISCARDED");
+          throw cause;
+        }),
+      );
       await child.settled;
       expect(rejected(child)).toBe(cause);
       await parent.execute("SIBLING_AFTER");
     });
     expect(f.log()).toEqual([
-      "BEGIN", "SIBLING_BEFORE", "SAVEPOINT fsqlite_sdk_1", "DISCARDED",
-      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "SIBLING_AFTER", "COMMIT",
+      "BEGIN",
+      "SIBLING_BEFORE",
+      "SAVEPOINT fsqlite_sdk_1",
+      "DISCARDED",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "SIBLING_AFTER",
+      "COMMIT",
     ]);
     await f.db.close();
   });
@@ -350,16 +462,23 @@ describe("nested transaction savepoints", () => {
     const f = await fixture();
     f.failures.set("BAD_CHILD_SQL", "constraint failed");
     await f.db.transaction(async (parent) => {
-      const child = observe(parent.transaction(async (tx) => {
-        await tx.execute("BAD_CHILD_SQL").catch(() => {});
-      }));
+      const child = observe(
+        parent.transaction(async (tx) => {
+          await tx.execute("BAD_CHILD_SQL").catch(() => {});
+        }),
+      );
       await child.settled;
       expect((rejected(child) as Error).message).toContain("constraint failed");
       await parent.execute("RECOVERED");
     });
     expect(f.log()).toEqual([
-      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "BAD_CHILD_SQL",
-      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "RECOVERED", "COMMIT",
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "BAD_CHILD_SQL",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "RECOVERED",
+      "COMMIT",
     ]);
     await f.db.close();
   });
@@ -370,11 +489,20 @@ describe("nested transaction savepoints", () => {
       const statement = await parent.prepare("SELECT 1");
       const gate = deferred<void>();
       const started = deferred<void>();
-      const child = parent.transaction(async (tx) => { started.resolve(); await gate.promise; await tx.execute("CHILD"); });
+      const child = parent.transaction(async (tx) => {
+        started.resolve();
+        await gate.promise;
+        await tx.execute("CHILD");
+      });
       await started.promise;
       const operations: Promise<unknown>[] = [
-        parent.execute("FOREIGN"), parent.query("FOREIGN"), parent.prepare("FOREIGN"),
-        parent.transaction(async () => 0), statement.execute(), statement.query(), statement.finalize(),
+        parent.execute("FOREIGN"),
+        parent.query("FOREIGN"),
+        parent.prepare("FOREIGN"),
+        parent.transaction(async () => 0),
+        statement.execute(),
+        statement.query(),
+        statement.finalize(),
       ];
       const results = operations.map(observe);
       await drain();
@@ -401,7 +529,12 @@ describe("nested transaction savepoints", () => {
       expect(await child).toBe(1);
       expectOwnershipError(rejected({ outcome }));
     });
-    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT"]);
+    expect(f.log()).toEqual([
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "COMMIT",
+    ]);
     await f.db.close();
   });
 
@@ -409,7 +542,9 @@ describe("nested transaction savepoints", () => {
     const f = await fixture();
     f.held.add("RELEASE SAVEPOINT fsqlite_sdk_1");
     await f.db.transaction(async (parent) => {
-      const child = parent.transaction(async (tx) => { await tx.execute("CHILD"); });
+      const child = parent.transaction(async (tx) => {
+        await tx.execute("CHILD");
+      });
       await drain();
       const foreign = observe(parent.execute("FOREIGN"));
       await drain();
@@ -419,18 +554,34 @@ describe("nested transaction savepoints", () => {
       expectOwnershipError(rejected({ outcome }));
       await parent.execute("AFTER");
     });
-    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1", "AFTER", "COMMIT"]);
+    expect(f.log()).toEqual([
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "CHILD",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "AFTER",
+      "COMMIT",
+    ]);
     await f.db.close();
   });
 
   it("supports multiple nesting levels in strict stack order", async () => {
     const f = await fixture();
-    await f.db.transaction((parent) => parent.transaction((child) => child.transaction(async (grandchild) => {
-      await grandchild.execute("DEEPEST");
-    })));
+    await f.db.transaction((parent) =>
+      parent.transaction((child) =>
+        child.transaction(async (grandchild) => {
+          await grandchild.execute("DEEPEST");
+        }),
+      ),
+    );
     expect(f.log()).toEqual([
-      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "SAVEPOINT fsqlite_sdk_2", "DEEPEST",
-      "RELEASE SAVEPOINT fsqlite_sdk_2", "RELEASE SAVEPOINT fsqlite_sdk_1", "COMMIT",
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "SAVEPOINT fsqlite_sdk_2",
+      "DEEPEST",
+      "RELEASE SAVEPOINT fsqlite_sdk_2",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "COMMIT",
     ]);
     await f.db.close();
   });
@@ -441,7 +592,10 @@ describe("nested transaction savepoints", () => {
       const child = await parent.transaction((tx) => tx);
       const late = [observe(child.execute("LATE")), observe(child.transaction(async () => 0))];
       await drain();
-      for (const result of late) expect((rejected(result) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_CLOSED");
+      for (const result of late)
+        expect((rejected(result) as FrankenSQLiteError).code).toBe(
+          "ERR_FSQLITE_TRANSACTION_CLOSED",
+        );
       await parent.execute("PARENT_STILL_VALID");
     });
     expect(f.log().includes("LATE")).toBe(false);
@@ -453,7 +607,11 @@ describe("nested transaction savepoints", () => {
     f.failures.set("SAVEPOINT fsqlite_sdk_1", "savepoint failed");
     await f.db.transaction(async (parent) => {
       let called = false;
-      const child = observe(parent.transaction(() => { called = true; }));
+      const child = observe(
+        parent.transaction(() => {
+          called = true;
+        }),
+      );
       await child.settled;
       expect((rejected(child) as Error).message).toContain("savepoint failed");
       expect(called).toBe(false);
@@ -467,13 +625,23 @@ describe("nested transaction savepoints", () => {
     const f = await fixture();
     f.failures.set("ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "rollback-to failed");
     const cause = new Error("child failure");
-    const transaction = observe(f.db.transaction((parent) => parent.transaction(() => { throw cause; })));
+    const transaction = observe(
+      f.db.transaction((parent) =>
+        parent.transaction(() => {
+          throw cause;
+        }),
+      ),
+    );
     await transaction.settled;
     const error = rejected(transaction);
     expect(error instanceof AggregateError).toBe(true);
     expect((error as AggregateError).cause).toBe(cause);
     expect(((error as AggregateError).errors[1] as Error).message).toContain("rollback-to failed");
-    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1"]);
+    expect(f.log()).toEqual([
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+    ]);
     expect(f.worker.terminateCount).toBe(1);
   });
 
@@ -481,16 +649,25 @@ describe("nested transaction savepoints", () => {
     const f = await fixture();
     f.failures.set("RELEASE SAVEPOINT fsqlite_sdk_1", "release failed");
     const cause = new Error("child failure");
-    const transaction = observe(f.db.transaction(async (parent) => {
-      await parent.transaction(() => { throw cause; }).catch(() => {});
-    }));
+    const transaction = observe(
+      f.db.transaction(async (parent) => {
+        await parent
+          .transaction(() => {
+            throw cause;
+          })
+          .catch(() => {});
+      }),
+    );
     await transaction.settled;
     const error = rejected(transaction);
     expect(error instanceof AggregateError).toBe(true);
     expect((error as AggregateError).cause).toBe(cause);
     expect(f.worker.terminateCount).toBe(1);
     expect(f.log()).toEqual([
-      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
     ]);
   });
 
@@ -498,22 +675,30 @@ describe("nested transaction savepoints", () => {
     const f = await fixture();
     const gate = deferred<void>();
     const started = deferred<void>();
-    const transaction = observe(f.db.transaction(async (parent) => {
-      void parent.transaction(async (child) => {
-        started.resolve();
-        await gate.promise;
-        await child.execute("CHILD");
-      });
-    }));
+    const transaction = observe(
+      f.db.transaction(async (parent) => {
+        void parent.transaction(async (child) => {
+          started.resolve();
+          await gate.promise;
+          await child.execute("CHILD");
+        });
+      }),
+    );
     await started.promise;
     await drain();
     const before = f.log();
     gate.resolve();
     await transaction.settled;
-    expect((rejected(transaction) as FrankenSQLiteError).code).toBe("ERR_FSQLITE_TRANSACTION_UNAWAITED");
+    expect((rejected(transaction) as FrankenSQLiteError).code).toBe(
+      "ERR_FSQLITE_TRANSACTION_UNAWAITED",
+    );
     expect(before).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1"]);
     expect(f.log()).toEqual([
-      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1", "ROLLBACK",
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "CHILD",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK",
     ]);
     await f.db.close();
   });
@@ -524,7 +709,11 @@ describe("savepoint cleanup failure preservation", () => {
     const f = await fixture();
     f.held.add("RELEASE SAVEPOINT fsqlite_sdk_1");
     await f.db.transaction(async (parent) => {
-      const child = observe(parent.transaction(async (tx) => { await tx.execute("CHILD"); }));
+      const child = observe(
+        parent.transaction(async (tx) => {
+          await tx.execute("CHILD");
+        }),
+      );
       await drain();
       f.failures.set("RELEASE SAVEPOINT fsqlite_sdk_1", "first release failed");
       f.release("RELEASE SAVEPOINT fsqlite_sdk_1");
@@ -534,8 +723,14 @@ describe("savepoint cleanup failure preservation", () => {
       await parent.execute("RECOVERED");
     });
     expect(f.log()).toEqual([
-      "BEGIN", "SAVEPOINT fsqlite_sdk_1", "CHILD", "RELEASE SAVEPOINT fsqlite_sdk_1",
-      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "RELEASE SAVEPOINT fsqlite_sdk_1", "RECOVERED", "COMMIT",
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "CHILD",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+      "RELEASE SAVEPOINT fsqlite_sdk_1",
+      "RECOVERED",
+      "COMMIT",
     ]);
     await f.db.close();
   });
@@ -545,10 +740,18 @@ describe("savepoint cleanup failure preservation", () => {
     f.failures.set("ROLLBACK TO SAVEPOINT fsqlite_sdk_1", "rollback-to failed");
     const cause = new Error("child failed");
     const cleanupError = new Error("terminate failed");
-    f.worker.onTerminate = () => { throw cleanupError; };
-    const transaction = observe(f.db.transaction(async (parent) => {
-      await parent.transaction(() => { throw cause; }).catch(() => {});
-    }));
+    f.worker.onTerminate = () => {
+      throw cleanupError;
+    };
+    const transaction = observe(
+      f.db.transaction(async (parent) => {
+        await parent
+          .transaction(() => {
+            throw cause;
+          })
+          .catch(() => {});
+      }),
+    );
     await transaction.settled;
     const error = rejected(transaction);
     expect(error instanceof AggregateError).toBe(true);
@@ -557,6 +760,10 @@ describe("savepoint cleanup failure preservation", () => {
     expect(((error as AggregateError).errors[1] as Error).message).toContain("rollback-to failed");
     expect((error as AggregateError).errors[2]).toBe(cleanupError);
     expect(f.worker.terminateCount).toBe(1);
-    expect(f.log()).toEqual(["BEGIN", "SAVEPOINT fsqlite_sdk_1", "ROLLBACK TO SAVEPOINT fsqlite_sdk_1"]);
+    expect(f.log()).toEqual([
+      "BEGIN",
+      "SAVEPOINT fsqlite_sdk_1",
+      "ROLLBACK TO SAVEPOINT fsqlite_sdk_1",
+    ]);
   });
 });

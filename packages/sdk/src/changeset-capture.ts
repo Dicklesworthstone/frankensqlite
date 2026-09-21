@@ -1,6 +1,12 @@
-import { encodeChangeset } from "./changeset-codec";
-import type { ChangesetChange, ChangesetField, ChangesetLimits, ChangesetTable, ChangesetValue } from "./changeset-codec";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
+import type {
+  ChangesetChange,
+  ChangesetField,
+  ChangesetLimits,
+  ChangesetTable,
+  ChangesetValue,
+} from "./changeset-codec";
+import { encodeChangeset } from "./changeset-codec";
 
 export interface CaptureChangesetOptions {
   /** Existing ordinary main tables with declared primary keys; at most 64. */
@@ -24,7 +30,8 @@ export interface CapturedChangeset<T> {
   readonly changes: number;
   readonly touchedRows: number;
 }
-export interface SnapshotChangesetOptions extends Omit<CaptureChangesetOptions, "maxRows" | "maxBytes" | "maxCells"> {
+export interface SnapshotChangesetOptions
+  extends Omit<CaptureChangesetOptions, "maxRows" | "maxBytes" | "maxCells"> {
   /** Total existing rows across all selected tables. Default 10,000. */
   maxRows?: number;
   /** Accounted collected row-image bytes, not heap/RSS. Default 8 MiB. */
@@ -56,11 +63,19 @@ export interface ChangesetSnapshotStreamResult {
   readonly byteLength: number;
 }
 export class ChangesetCaptureError extends Error {
-  constructor(readonly code: "ERR_FSQLITE_CAPTURE_INPUT" | "ERR_FSQLITE_CAPTURE_SCHEMA" |
-    "ERR_FSQLITE_CAPTURE_RESULT" | "ERR_FSQLITE_CAPTURE_CANCELLED" | "ERR_FSQLITE_CAPTURE_TIMEOUT" |
-    "ERR_FSQLITE_CAPTURE_LIMIT",
-    message: string, options?: ErrorOptions) {
-    super(message, options); this.name = "ChangesetCaptureError";
+  constructor(
+    readonly code:
+      | "ERR_FSQLITE_CAPTURE_INPUT"
+      | "ERR_FSQLITE_CAPTURE_SCHEMA"
+      | "ERR_FSQLITE_CAPTURE_RESULT"
+      | "ERR_FSQLITE_CAPTURE_CANCELLED"
+      | "ERR_FSQLITE_CAPTURE_TIMEOUT"
+      | "ERR_FSQLITE_CAPTURE_LIMIT",
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ChangesetCaptureError";
   }
 }
 
@@ -68,7 +83,7 @@ const PREFIX = "__fsqlite_capture_";
 const BUDGET = `${PREFIX}budget`;
 const quote = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 const literal = (name: string): string => `'${name.replaceAll("'", "''")}'`;
-const fold = (name: string): string => name.replace(/[A-Z]/g, c => c.toLowerCase());
+const fold = (name: string): string => name.replace(/[A-Z]/g, (c) => c.toLowerCase());
 function fail(kind: "INPUT" | "SCHEMA" | "RESULT" | "LIMIT", message: string): never {
   throw new ChangesetCaptureError(`ERR_FSQLITE_CAPTURE_${kind}`, message);
 }
@@ -77,13 +92,17 @@ function name(value: unknown): string {
     return fail("INPUT", "Invalid capture table or column name");
   }
   const bytes = new TextEncoder().encode(value);
-  if (bytes.length > 1024 || new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes) !== value) {
+  if (
+    bytes.length > 1024 ||
+    new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes) !== value
+  ) {
     return fail("INPUT", "Capture names require valid UTF-8 within 1024 bytes");
   }
   return value;
 }
 function count(value: unknown): number {
-  if (typeof value === "bigint" && value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(value);
+  if (typeof value === "bigint" && value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER))
+    return Number(value);
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
   return fail("RESULT", "Expected a nonnegative safe SQL integer");
 }
@@ -96,18 +115,35 @@ function bounded(value: unknown, fallback: number, ceiling: number): number {
 }
 function settings(options: CaptureChangesetOptions, streaming = false) {
   const input = options?.tables;
-  if (!Array.isArray(input) || !input.length || input.length > 64) fail("INPUT", "Capture 1..64 explicit tables");
-  const tables: string[] = [], seen = new Set<string>(), n = input.length;
+  if (!Array.isArray(input) || !input.length || input.length > 64)
+    fail("INPUT", "Capture 1..64 explicit tables");
+  const tables: string[] = [],
+    seen = new Set<string>(),
+    n = input.length;
   for (let i = 0; i < n; i++) {
-    const table = name(input[i]), key = fold(table);
+    const table = name(input[i]),
+      key = fold(table);
     if (seen.has(key) || key.startsWith("sqlite_") || key.startsWith("__fsqlite_")) {
       fail("INPUT", "Capture distinct application tables, not SDK/system tables");
     }
-    tables.push(table); seen.add(key);
+    tables.push(table);
+    seen.add(key);
   }
-  const maxRows = bounded(options.maxRows, streaming ? 1_000_000 : 10_000, streaming ? 10_000_000 : 100_000);
-  const maxBytes = bounded(options.maxBytes, (streaming ? 256 : 8) * 1024 * 1024, (streaming ? 1024 : 64) * 1024 * 1024);
-  const maxCells = bounded(options.maxCells, streaming ? 10_000_000 : 100_000, streaming ? 100_000_000 : 1_000_000);
+  const maxRows = bounded(
+    options.maxRows,
+    streaming ? 1_000_000 : 10_000,
+    streaming ? 10_000_000 : 100_000,
+  );
+  const maxBytes = bounded(
+    options.maxBytes,
+    (streaming ? 256 : 8) * 1024 * 1024,
+    (streaming ? 1024 : 64) * 1024 * 1024,
+  );
+  const maxCells = bounded(
+    options.maxCells,
+    streaming ? 10_000_000 : 100_000,
+    streaming ? 100_000_000 : 1_000_000,
+  );
   const indirect = options.indirect ?? false;
   if (typeof indirect !== "boolean") fail("INPUT", "indirect must be boolean");
   const inputLimits = streaming ? undefined : options.limits;
@@ -117,10 +153,14 @@ function settings(options: CaptureChangesetOptions, streaming = false) {
     if (value !== undefined) limits[key] = value;
   }
   encodeChangeset([], limits);
-  const signal = options.signal, timeoutMs = options.timeoutMs;
+  const signal = options.signal,
+    timeoutMs = options.timeoutMs;
   if (signal !== undefined) {
-    try { Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal); }
-    catch { fail("INPUT", "signal must be an AbortSignal"); }
+    try {
+      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
+    } catch {
+      fail("INPUT", "signal must be an AbortSignal");
+    }
   }
   if (timeoutMs !== undefined) bounded(timeoutMs, 1, 2_147_483_647);
   const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
@@ -128,64 +168,128 @@ function settings(options: CaptureChangesetOptions, streaming = false) {
   if (signal !== undefined) transactionOptions.signal = signal;
   if (timeoutMs !== undefined) transactionOptions.timeoutMs = timeoutMs;
   function checkpoint(): void {
-    if (signal?.aborted) throw new ChangesetCaptureError("ERR_FSQLITE_CAPTURE_CANCELLED", "Changeset capture cancelled", { cause: signal.reason });
+    if (signal?.aborted)
+      throw new ChangesetCaptureError(
+        "ERR_FSQLITE_CAPTURE_CANCELLED",
+        "Changeset capture cancelled",
+        { cause: signal.reason },
+      );
     if (deadline !== undefined && performance.now() >= deadline) {
-      throw new ChangesetCaptureError("ERR_FSQLITE_CAPTURE_TIMEOUT", "Changeset capture deadline expired");
+      throw new ChangesetCaptureError(
+        "ERR_FSQLITE_CAPTURE_TIMEOUT",
+        "Changeset capture deadline expired",
+      );
     }
   }
   return { tables, maxRows, maxBytes, maxCells, indirect, limits, transactionOptions, checkpoint };
 }
 type Settings = ReturnType<typeof settings>;
-interface Plan { table: string; columns: string[]; pk: number[]; keys: number[]; journal: string; rowidAlias: number | null }
+interface Plan {
+  table: string;
+  columns: string[];
+  pk: number[];
+  keys: number[];
+  journal: string;
+  rowidAlias: number | null;
+}
 
-async function read(tx: ChangesetExecutor, s: Settings, sql: string, params: readonly ChangesetValue[] = []) {
-  s.checkpoint(); const result = await tx.query(sql, params); s.checkpoint();
-  if (!Array.isArray(result.rowArrays) || result.rowArrays.some(row => !Array.isArray(row))) fail("RESULT", "Invalid capture query result");
+async function read(
+  tx: ChangesetExecutor,
+  s: Settings,
+  sql: string,
+  params: readonly ChangesetValue[] = [],
+) {
+  s.checkpoint();
+  const result = await tx.query(sql, params);
+  s.checkpoint();
+  if (!Array.isArray(result.rowArrays) || result.rowArrays.some((row) => !Array.isArray(row)))
+    fail("RESULT", "Invalid capture query result");
   return result.rowArrays;
 }
 async function execute(tx: ChangesetExecutor, s: Settings, sql: string) {
-  s.checkpoint(); await tx.execute(sql); s.checkpoint();
+  s.checkpoint();
+  await tx.execute(sql);
+  s.checkpoint();
 }
 async function scalar(tx: ChangesetExecutor, s: Settings, sql: string): Promise<number> {
   const rows = await read(tx, s, sql);
   if (rows.length !== 1 || rows[0]!.length !== 1) fail("RESULT", "Invalid capture scalar result");
   return count(rows[0]![0]);
 }
-async function plan(tx: ChangesetExecutor, s: Settings, requested: string, i: number, mutations = true): Promise<Plan> {
+async function plan(
+  tx: ChangesetExecutor,
+  s: Settings,
+  requested: string,
+  i: number,
+  mutations = true,
+): Promise<Plan> {
   const listed = await read(tx, s, `PRAGMA main.table_list(${literal(requested)})`);
-  const matches = listed.filter(row => row[0] === "main" && typeof row[1] === "string" && fold(row[1]) === fold(requested));
-  if (matches.length !== 1 || matches[0]![2] !== "table") fail("SCHEMA", "Capture requires ordinary existing main tables");
+  const matches = listed.filter(
+    (row) => row[0] === "main" && typeof row[1] === "string" && fold(row[1]) === fold(requested),
+  );
+  if (matches.length !== 1 || matches[0]![2] !== "table")
+    fail("SCHEMA", "Capture requires ordinary existing main tables");
   const table = name(matches[0]![1]);
   const info = await read(tx, s, `PRAGMA main.table_xinfo(${literal(table)})`);
-  if (!info.length || info.length > 256 || info.length !== count(matches[0]![3])) fail("SCHEMA", "Capture supports 1..256 columns per table");
-  const columns: string[] = [], pk: number[] = [], keys: number[] = [];
+  if (!info.length || info.length > 256 || info.length !== count(matches[0]![3]))
+    fail("SCHEMA", "Capture supports 1..256 columns per table");
+  const columns: string[] = [],
+    pk: number[] = [],
+    keys: number[] = [];
   for (let c = 0; c < info.length; c++) {
     const row = info[c]!;
-    if (count(row[0]) !== c || count(row[6]) !== 0) fail("SCHEMA", "Hidden/generated capture columns are not supported");
-    columns.push(name(row[1])); pk.push(count(row[5]));
+    if (count(row[0]) !== c || count(row[6]) !== 0)
+      fail("SCHEMA", "Hidden/generated capture columns are not supported");
+    columns.push(name(row[1]));
+    pk.push(count(row[5]));
     if (pk[c] !== 0) keys.push(c);
   }
-  if (!keys.length || keys.length > 16 || keys.map(c => pk[c]!).sort((a, b) => a - b).some((v, j) => v !== j + 1)) {
+  if (
+    !keys.length ||
+    keys.length > 16 ||
+    keys
+      .map((c) => pk[c]!)
+      .sort((a, b) => a - b)
+      .some((v, j) => v !== j + 1)
+  ) {
     fail("SCHEMA", "Capture requires a declared primary key of 1..16 columns");
   }
   // BEFORE/AFTER user triggers on this table can reorder observation around an
   // INSERT's generated key. Reject instead of relying on undocumented trigger order.
   for (const ns of mutations ? ["main", "temp"] : []) {
-    if ((await read(tx, s, `SELECT name FROM ${ns}.sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE LIMIT 1`, [table])).length) {
+    if (
+      (
+        await read(
+          tx,
+          s,
+          `SELECT name FROM ${ns}.sqlite_schema WHERE type = 'trigger' AND tbl_name = ? COLLATE NOCASE LIMIT 1`,
+          [table],
+        )
+      ).length
+    ) {
       fail("SCHEMA", "Capture tables with application triggers are not supported");
     }
   }
   const keyType = info[keys[0]!]![2];
-  const rowidAlias = count(matches[0]![4]) === 0 && keys.length === 1 &&
-    typeof keyType === "string" && keyType.toUpperCase() === "INTEGER" ? keys[0]! : null;
+  const rowidAlias =
+    count(matches[0]![4]) === 0 &&
+    keys.length === 1 &&
+    typeof keyType === "string" &&
+    keyType.toUpperCase() === "INTEGER"
+      ? keys[0]!
+      : null;
   return { table, columns, pk, keys, journal: `${PREFIX}${i}`, rowidAlias };
 }
 
 async function textDecoder(tx: ChangesetExecutor, s: Settings): Promise<TextDecoder> {
   const encoding = await read(tx, s, "PRAGMA encoding");
   const label = encoding[0]?.[0];
-  if (encoding.length !== 1 || encoding[0]!.length !== 1 ||
-      (label !== "UTF-8" && label !== "UTF-16le" && label !== "UTF-16be")) fail("RESULT", "Unsupported capture text encoding");
+  if (
+    encoding.length !== 1 ||
+    encoding[0]!.length !== 1 ||
+    (label !== "UTF-8" && label !== "UTF-16le" && label !== "UTF-16be")
+  )
+    fail("RESULT", "Unsupported capture text encoding");
   return new TextDecoder(label, { fatal: true, ignoreBOM: true });
 }
 
@@ -195,41 +299,74 @@ function valueCost(expression: string): string {
 }
 async function install(tx: ChangesetExecutor, s: Settings, p: Plan): Promise<void> {
   const fields = p.columns.map((_, i) => `v${i}`);
-  await execute(tx, s, `CREATE TEMP TABLE ${quote(p.journal)} (seq INTEGER PRIMARY KEY, inserted INTEGER NOT NULL, ${fields.map(c => `${c} BLOB`).join(", ")})`);
-  const index = p.keys.flatMap(i => [`typeof(v${i})`, `v${i} COLLATE BINARY`]).join(", ");
-  await execute(tx, s, `CREATE UNIQUE INDEX temp.${quote(`${p.journal}_pk`)} ON ${quote(p.journal)} (${index})`);
+  await execute(
+    tx,
+    s,
+    `CREATE TEMP TABLE ${quote(p.journal)} (seq INTEGER PRIMARY KEY, inserted INTEGER NOT NULL, ${fields.map((c) => `${c} BLOB`).join(", ")})`,
+  );
+  const index = p.keys.flatMap((i) => [`typeof(v${i})`, `v${i} COLLATE BINARY`]).join(", ");
+  await execute(
+    tx,
+    s,
+    `CREATE UNIQUE INDEX temp.${quote(`${p.journal}_pk`)} ON ${quote(p.journal)} (${index})`,
+  );
   for (const [suffix, event, image, inserted] of [
-    ["bu", "BEFORE UPDATE", "OLD", false], ["bd", "BEFORE DELETE", "OLD", false],
-    ["ai", "AFTER INSERT", "NEW", true], ["au", "AFTER UPDATE", "NEW", true],
+    ["bu", "BEFORE UPDATE", "OLD", false],
+    ["bd", "BEFORE DELETE", "OLD", false],
+    ["ai", "AFTER INSERT", "NEW", true],
+    ["au", "AFTER UPDATE", "NEW", true],
   ] as const) {
-    const values = p.columns.map((c, i) => inserted && p.pk[i] === 0 ? "NULL" : `${image}.${quote(c)}`);
-    const present = p.keys.map(i => `${image}.${quote(p.columns[i]!)} IS NOT NULL`).join(" AND ");
-    const same = p.keys.map(i => `typeof(v${i}) = typeof(${values[i]}) AND v${i} COLLATE BINARY IS ${values[i]}`).join(" AND ");
+    const values = p.columns.map((c, i) =>
+      inserted && p.pk[i] === 0 ? "NULL" : `${image}.${quote(c)}`,
+    );
+    const present = p.keys.map((i) => `${image}.${quote(p.columns[i]!)} IS NOT NULL`).join(" AND ");
+    const same = p.keys
+      .map((i) => `typeof(v${i}) = typeof(${values[i]}) AND v${i} COLLATE BINARY IS ${values[i]}`)
+      .join(" AND ");
     const bytes = `${64 + 16 * fields.length} + ${values.map(valueCost).join(" + ")}`;
-    await execute(tx, s, `CREATE TEMP TRIGGER ${quote(`${p.journal}_${suffix}`)} ${event} ON main.${quote(p.table)} ` +
-      `WHEN ${present} AND NOT EXISTS (SELECT 1 FROM ${quote(p.journal)} WHERE ${same}) BEGIN ` +
-      `SELECT CASE WHEN n >= ${s.maxRows} OR cells + ${fields.length} > ${s.maxCells} OR bytes + (${bytes}) > ${s.maxBytes} ` +
-      `THEN RAISE(ABORT, 'ERR_FSQLITE_CAPTURE_LIMIT') END FROM ${quote(BUDGET)}; ` +
-      `UPDATE ${quote(BUDGET)} SET n = n + 1, cells = cells + ${fields.length}, bytes = bytes + (${bytes}); ` +
-      `INSERT INTO ${quote(p.journal)} VALUES (NULL, ${Number(inserted)}, ${values.join(", ")}); END`);
+    await execute(
+      tx,
+      s,
+      `CREATE TEMP TRIGGER ${quote(`${p.journal}_${suffix}`)} ${event} ON main.${quote(p.table)} ` +
+        `WHEN ${present} AND NOT EXISTS (SELECT 1 FROM ${quote(p.journal)} WHERE ${same}) BEGIN ` +
+        `SELECT CASE WHEN n >= ${s.maxRows} OR cells + ${fields.length} > ${s.maxCells} OR bytes + (${bytes}) > ${s.maxBytes} ` +
+        `THEN RAISE(ABORT, 'ERR_FSQLITE_CAPTURE_LIMIT') END FROM ${quote(BUDGET)}; ` +
+        `UPDATE ${quote(BUDGET)} SET n = n + 1, cells = cells + ${fields.length}, bytes = bytes + (${bytes}); ` +
+        `INSERT INTO ${quote(p.journal)} VALUES (NULL, ${Number(inserted)}, ${values.join(", ")}); END`,
+    );
   }
 }
 
 /** Typed projections avoid losing large integers or NUL-containing SQL text. */
 function projection(expressions: readonly string[]): string {
-  return expressions.flatMap((c, i) => [`typeof(${c}) AS t${i}`, `CASE typeof(${c}) WHEN 'integer' THEN CAST(${c} AS TEXT) WHEN 'text' THEN CAST(${c} AS BLOB) ELSE ${c} END AS x${i}`]).join(", ");
+  return expressions
+    .flatMap((c, i) => [
+      `typeof(${c}) AS t${i}`,
+      `CASE typeof(${c}) WHEN 'integer' THEN CAST(${c} AS TEXT) WHEN 'text' THEN CAST(${c} AS BLOB) ELSE ${c} END AS x${i}`,
+    ])
+    .join(", ");
 }
 function decode(row: readonly unknown[], columns: number, text: TextDecoder): ChangesetValue[] {
   if (row.length !== columns * 2) fail("RESULT", "Invalid typed capture row width");
   return Array.from({ length: columns }, (_, i) => {
-    const tag = row[i * 2], value = row[i * 2 + 1];
+    const tag = row[i * 2],
+      value = row[i * 2 + 1];
     if (tag === "null" && value === null) return null;
     if (tag === "text" && value instanceof Uint8Array) {
-      try { return text.decode(value); } catch { return fail("RESULT", "Captured SQL text has invalid encoding"); }
+      try {
+        return text.decode(value);
+      } catch {
+        return fail("RESULT", "Captured SQL text has invalid encoding");
+      }
     }
     if (tag === "blob" && value instanceof Uint8Array) return new Uint8Array(value);
     if (tag === "real" && typeof value === "number" && !Number.isNaN(value)) return value;
-    if (tag === "integer" && typeof value === "string" && value.length <= 20 && /^-?(0|[1-9][0-9]*)$/.test(value)) {
+    if (
+      tag === "integer" &&
+      typeof value === "string" &&
+      value.length <= 20 &&
+      /^-?(0|[1-9][0-9]*)$/.test(value)
+    ) {
       const n = BigInt(value);
       if (n >= -(1n << 63n) && n < 1n << 63n) return n;
     }
@@ -237,53 +374,89 @@ function decode(row: readonly unknown[], columns: number, text: TextDecoder): Ch
   });
 }
 function equal(a: ChangesetValue, b: ChangesetValue): boolean {
-  if (a instanceof Uint8Array && b instanceof Uint8Array) return a.length === b.length && a.every((v, i) => v === b[i]);
+  if (a instanceof Uint8Array && b instanceof Uint8Array)
+    return a.length === b.length && a.every((v, i) => v === b[i]);
   return typeof a === typeof b && a === b;
 }
-async function collect(tx: ChangesetExecutor, s: Settings, p: Plan, retained: { bytes: number; cells: number }, text: TextDecoder): Promise<ChangesetTable | null> {
+async function collect(
+  tx: ChangesetExecutor,
+  s: Settings,
+  p: Plan,
+  retained: { bytes: number; cells: number },
+  text: TextDecoder,
+): Promise<ChangesetTable | null> {
   const changes: ChangesetChange[] = [];
   let after = 0;
-  const columns = p.columns.map(c => quote(c));
+  const columns = p.columns.map((c) => quote(c));
   const typed = projection(p.columns.map((_, i) => `v${i}`));
   while (true) {
-    const batch = await read(tx, s, `SELECT seq, inserted, ${typed} FROM temp.${quote(p.journal)} WHERE seq > ? ORDER BY seq LIMIT 32`, [BigInt(after)]);
+    const batch = await read(
+      tx,
+      s,
+      `SELECT seq, inserted, ${typed} FROM temp.${quote(p.journal)} WHERE seq > ? ORDER BY seq LIMIT 32`,
+      [BigInt(after)],
+    );
     if (batch.length > 32) fail("RESULT", "Capture journal exceeded its page bound");
     if (!batch.length) break;
     for (const entry of batch) {
-      const seq = count(entry[0]), inserted = count(entry[1]);
-      if (seq <= after || inserted > 1) fail("RESULT", "Invalid capture journal ordering or operation");
+      const seq = count(entry[0]),
+        inserted = count(entry[1]);
+      if (seq <= after || inserted > 1)
+        fail("RESULT", "Invalid capture journal ordering or operation");
       after = seq;
-      const old = decode(entry.slice(2), columns.length, text), params = p.keys.map(i => old[i]!);
-      if (params.some(v => v === null)) fail("RESULT", "Capture journal contained a NULL key");
+      const old = decode(entry.slice(2), columns.length, text),
+        params = p.keys.map((i) => old[i]!);
+      if (params.some((v) => v === null)) fail("RESULT", "Capture journal contained a NULL key");
       // Keep the declared index's affinity/collation for the seek, then compare
       // the returned key by storage class/BINARY value, as the journal does.
-      const where = p.keys.map((i, k) => `${columns[i]} = ${typeof params[k] === "number" ? "CAST(? AS REAL)" : "?"}`).join(" AND ");
-      const costs = await read(tx, s, `SELECT ${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")} FROM main.${quote(p.table)} WHERE ${where} LIMIT 2`, params);
-      if (costs.length > 1 || costs.some(row => row.length !== 1)) fail("RESULT", "Invalid capture row-size query");
+      const where = p.keys
+        .map((i, k) => `${columns[i]} = ${typeof params[k] === "number" ? "CAST(? AS REAL)" : "?"}`)
+        .join(" AND ");
+      const costs = await read(
+        tx,
+        s,
+        `SELECT ${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")} FROM main.${quote(p.table)} WHERE ${where} LIMIT 2`,
+        params,
+      );
+      if (costs.length > 1 || costs.some((row) => row.length !== 1))
+        fail("RESULT", "Invalid capture row-size query");
       if (costs.length) {
-        retained.bytes += count(costs[0]![0]); retained.cells += columns.length;
+        retained.bytes += count(costs[0]![0]);
+        retained.cells += columns.length;
         if (retained.bytes > s.maxBytes || retained.cells > s.maxCells) {
           // Check lengths before transferring/allocating potentially huge values.
-          throw new Error("ERR_FSQLITE_CAPTURE_LIMIT: collected row images exceed the capture budget");
+          throw new Error(
+            "ERR_FSQLITE_CAPTURE_LIMIT: collected row images exceed the capture budget",
+          );
         }
       }
-      const rows = await read(tx, s, `SELECT ${projection(columns)} FROM main.${quote(p.table)} WHERE ${where} LIMIT 2`, params);
-      if (rows.length !== costs.length) fail("RESULT", "Capture primary-key lookup changed within one transaction");
+      const rows = await read(
+        tx,
+        s,
+        `SELECT ${projection(columns)} FROM main.${quote(p.table)} WHERE ${where} LIMIT 2`,
+        params,
+      );
+      if (rows.length !== costs.length)
+        fail("RESULT", "Capture primary-key lookup changed within one transaction");
       let current = rows.length ? decode(rows[0]!, columns.length, text) : null;
-      if (current !== null && !p.keys.every(i => equal(old[i]!, current![i]!))) current = null;
+      if (current !== null && !p.keys.every((i) => equal(old[i]!, current![i]!))) current = null;
       if (inserted) {
-        if (current !== null) changes.push({ operation: "insert", indirect: s.indirect, new: current });
+        if (current !== null)
+          changes.push({ operation: "insert", indirect: s.indirect, new: current });
       } else if (current === null) {
         changes.push({ operation: "delete", indirect: s.indirect, old });
       } else {
-        const before: ChangesetField[] = [], next: ChangesetField[] = [];
+        const before: ChangesetField[] = [],
+          next: ChangesetField[] = [];
         let changed = false;
         for (let i = 0; i < columns.length; i++) {
           const modified = p.pk[i] === 0 && !equal(old[i]!, current[i]!);
           before.push(p.pk[i] !== 0 || modified ? old[i] : undefined);
-          next.push(modified ? current[i] : undefined); changed ||= modified;
+          next.push(modified ? current[i] : undefined);
+          changed ||= modified;
         }
-        if (changed) changes.push({ operation: "update", indirect: s.indirect, old: before, new: next });
+        if (changed)
+          changes.push({ operation: "update", indirect: s.indirect, old: before, new: next });
       }
     }
   }
@@ -297,62 +470,113 @@ async function collect(tx: ChangesetExecutor, s: Settings, p: Plan, retained: { 
  * Requires recursive_triggers=ON and no application triggers on captured tables.
  * No full-table snapshot, monkey-patched execute, persistent trigger or WASM shim.
  */
-export async function captureChangeset<T>(target: ChangesetTarget,
-  work: (tx: ChangesetExecutor) => T | Promise<T>, options: CaptureChangesetOptions): Promise<CapturedChangeset<T>> {
+export async function captureChangeset<T>(
+  target: ChangesetTarget,
+  work: (tx: ChangesetExecutor) => T | Promise<T>,
+  options: CaptureChangesetOptions,
+): Promise<CapturedChangeset<T>> {
   const capture = prepareChangesetCapture(work, options);
   return target.transaction(capture.run, capture.transactionOptions);
 }
 
 /** @internal Shared admission/collection boundary for atomic outbox composition. */
 export function prepareChangesetCapture<T>(
-  work: (tx: ChangesetExecutor) => T | Promise<T>, options: CaptureChangesetOptions) {
+  work: (tx: ChangesetExecutor) => T | Promise<T>,
+  options: CaptureChangesetOptions,
+) {
   if (typeof work !== "function") fail("INPUT", "Capture requires a callback");
-  const s = settings(options); s.checkpoint();
-  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
-    tables: Object.freeze([...s.tables]), indirect: s.indirect,
+  const s = settings(options);
+  s.checkpoint();
+  return {
+    transactionOptions: s.transactionOptions,
+    checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]),
+    indirect: s.indirect,
     run: async (tx: ChangesetExecutor): Promise<CapturedChangeset<T>> => {
-    s.checkpoint();
-    if (await scalar(tx, s, "PRAGMA recursive_triggers") !== 1) fail("SCHEMA", "Set PRAGMA recursive_triggers=ON before capture so REPLACE deletions cannot disappear");
-    if ((await read(tx, s, "SELECT name FROM temp.sqlite_schema WHERE name GLOB ? LIMIT 1", [`${PREFIX}*`])).length) {
-      fail("SCHEMA", "A capture scope or reserved TEMP object already exists on this connection");
-    }
-    const plans: Plan[] = [];
-    for (const table of s.tables) plans.push(await plan(tx, s, table, plans.length));
-    const text = await textDecoder(tx, s);
-    await execute(tx, s, `CREATE TEMP TABLE ${quote(BUDGET)} (n INTEGER NOT NULL, bytes INTEGER NOT NULL, cells INTEGER NOT NULL)`);
-    await execute(tx, s, `INSERT INTO temp.${quote(BUDGET)} VALUES (0, 0, 0)`);
-    for (const p of plans) await install(tx, s, p);
-    const mainVersion = await scalar(tx, s, "PRAGMA main.schema_version");
-    const tempVersion = await scalar(tx, s, "PRAGMA temp.schema_version");
-    const value = await work(tx); s.checkpoint();
-    if (await scalar(tx, s, "PRAGMA main.schema_version") !== mainVersion ||
-        await scalar(tx, s, "PRAGMA temp.schema_version") !== tempVersion ||
-        await scalar(tx, s, "PRAGMA recursive_triggers") !== 1) {
-      fail("SCHEMA", "Capture callbacks must not change schemas or recursive_triggers");
-    }
-    const budget = await read(tx, s, `SELECT n, bytes, cells FROM temp.${quote(BUDGET)}`);
-    if (budget.length !== 1 || budget[0]!.length !== 3) fail("RESULT", "Invalid capture budget row");
-    const touchedRows = count(budget[0]![0]);
-    const retained = { bytes: count(budget[0]![1]), cells: count(budget[0]![2]) };
-    if (touchedRows > s.maxRows || retained.bytes > s.maxBytes || retained.cells > s.maxCells) fail("RESULT", "Invalid capture budget");
-    const tables: ChangesetTable[] = [];
-    for (const p of plans) { const table = await collect(tx, s, p, retained, text); if (table !== null) tables.push(table); }
-    s.checkpoint(); const changeset = encodeChangeset(tables, s.limits); s.checkpoint();
-    for (const p of plans) {
-      for (const suffix of ["bu", "bd", "ai", "au"]) await execute(tx, s, `DROP TRIGGER temp.${quote(`${p.journal}_${suffix}`)}`);
-      await execute(tx, s, `DROP TABLE temp.${quote(p.journal)}`);
-    }
-    await execute(tx, s, `DROP TABLE temp.${quote(BUDGET)}`);
-    return { value, changeset, touchedRows, changes: tables.reduce((n, t) => n + t.changes.length, 0) };
+      s.checkpoint();
+      if ((await scalar(tx, s, "PRAGMA recursive_triggers")) !== 1)
+        fail(
+          "SCHEMA",
+          "Set PRAGMA recursive_triggers=ON before capture so REPLACE deletions cannot disappear",
+        );
+      if (
+        (
+          await read(tx, s, "SELECT name FROM temp.sqlite_schema WHERE name GLOB ? LIMIT 1", [
+            `${PREFIX}*`,
+          ])
+        ).length
+      ) {
+        fail("SCHEMA", "A capture scope or reserved TEMP object already exists on this connection");
+      }
+      const plans: Plan[] = [];
+      for (const table of s.tables) plans.push(await plan(tx, s, table, plans.length));
+      const text = await textDecoder(tx, s);
+      await execute(
+        tx,
+        s,
+        `CREATE TEMP TABLE ${quote(BUDGET)} (n INTEGER NOT NULL, bytes INTEGER NOT NULL, cells INTEGER NOT NULL)`,
+      );
+      await execute(tx, s, `INSERT INTO temp.${quote(BUDGET)} VALUES (0, 0, 0)`);
+      for (const p of plans) await install(tx, s, p);
+      const mainVersion = await scalar(tx, s, "PRAGMA main.schema_version");
+      const tempVersion = await scalar(tx, s, "PRAGMA temp.schema_version");
+      const value = await work(tx);
+      s.checkpoint();
+      if (
+        (await scalar(tx, s, "PRAGMA main.schema_version")) !== mainVersion ||
+        (await scalar(tx, s, "PRAGMA temp.schema_version")) !== tempVersion ||
+        (await scalar(tx, s, "PRAGMA recursive_triggers")) !== 1
+      ) {
+        fail("SCHEMA", "Capture callbacks must not change schemas or recursive_triggers");
+      }
+      const budget = await read(tx, s, `SELECT n, bytes, cells FROM temp.${quote(BUDGET)}`);
+      if (budget.length !== 1 || budget[0]!.length !== 3)
+        fail("RESULT", "Invalid capture budget row");
+      const touchedRows = count(budget[0]![0]);
+      const retained = { bytes: count(budget[0]![1]), cells: count(budget[0]![2]) };
+      if (touchedRows > s.maxRows || retained.bytes > s.maxBytes || retained.cells > s.maxCells)
+        fail("RESULT", "Invalid capture budget");
+      const tables: ChangesetTable[] = [];
+      for (const p of plans) {
+        const table = await collect(tx, s, p, retained, text);
+        if (table !== null) tables.push(table);
+      }
+      s.checkpoint();
+      const changeset = encodeChangeset(tables, s.limits);
+      s.checkpoint();
+      for (const p of plans) {
+        for (const suffix of ["bu", "bd", "ai", "au"])
+          await execute(tx, s, `DROP TRIGGER temp.${quote(`${p.journal}_${suffix}`)}`);
+        await execute(tx, s, `DROP TABLE temp.${quote(p.journal)}`);
+      }
+      await execute(tx, s, `DROP TABLE temp.${quote(BUDGET)}`);
+      return {
+        value,
+        changeset,
+        touchedRows,
+        changes: tables.reduce((n, t) => n + t.changes.length, 0),
+      };
     },
   };
 }
 
-interface SnapshotKey { column: number; expression: string; descending: boolean }
+interface SnapshotKey {
+  column: number;
+  expression: string;
+  descending: boolean;
+}
 async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promise<SnapshotKey[]> {
-  const indexes = (await read(tx, s, `PRAGMA main.index_list(${literal(p.table)})`)).filter(row => row[3] === "pk");
+  const indexes = (await read(tx, s, `PRAGMA main.index_list(${literal(p.table)})`)).filter(
+    (row) => row[3] === "pk",
+  );
   if (indexes.length === 0 && p.rowidAlias !== null) {
-    return [{ column: p.rowidAlias, expression: `s.${quote(p.columns[p.rowidAlias]!)}`, descending: false }];
+    return [
+      {
+        column: p.rowidAlias,
+        expression: `s.${quote(p.columns[p.rowidAlias]!)}`,
+        descending: false,
+      },
+    ];
   }
   if (indexes.length !== 1 || count(indexes[0]![2]) !== 1 || count(indexes[0]![4]) !== 0) {
     fail("SCHEMA", "Snapshot requires a complete primary-key index or INTEGER PRIMARY KEY alias");
@@ -362,12 +586,23 @@ async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promis
   for (const row of index) {
     const key = count(row[5]);
     if (key === 0) continue;
-    const column = count(row[1]), descending = count(row[3]);
-    if (key !== 1 || count(row[0]) !== keys.length || !p.keys.includes(column) ||
-        row[2] !== p.columns[column] || descending > 1 || keys.some(k => k.column === column)) {
+    const column = count(row[1]),
+      descending = count(row[3]);
+    if (
+      key !== 1 ||
+      count(row[0]) !== keys.length ||
+      !p.keys.includes(column) ||
+      row[2] !== p.columns[column] ||
+      descending > 1 ||
+      keys.some((k) => k.column === column)
+    ) {
       fail("RESULT", "Invalid snapshot primary-key index metadata");
     }
-    keys.push({ column, expression: `s.${quote(p.columns[column]!)} COLLATE ${quote(name(row[4]))}`, descending: descending === 1 });
+    keys.push({
+      column,
+      expression: `s.${quote(p.columns[column]!)} COLLATE ${quote(name(row[4]))}`,
+      descending: descending === 1,
+    });
   }
   if (keys.length !== p.keys.length) fail("RESULT", "Incomplete snapshot primary-key index");
   return keys;
@@ -378,17 +613,23 @@ async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promis
  * row data, not a database image or schema migration. No source DML or TEMP
  * objects are used; the caller's transaction must retain one snapshot.
  */
-export async function snapshotChangeset(target: ChangesetTarget,
-  options: SnapshotChangesetOptions): Promise<ChangesetSnapshot> {
+export async function snapshotChangeset(
+  target: ChangesetTarget,
+  options: SnapshotChangesetOptions,
+): Promise<ChangesetSnapshot> {
   const snapshot = prepareChangesetSnapshot(options);
   return target.transaction(snapshot.run, snapshot.transactionOptions);
 }
 
 /** @internal The outbox stores this seed in the SAME source transaction. */
 export function prepareChangesetSnapshot(options: SnapshotChangesetOptions) {
-  const s = settings(options); s.checkpoint();
-  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
-    tables: Object.freeze([...s.tables]), indirect: s.indirect,
+  const s = settings(options);
+  s.checkpoint();
+  return {
+    transactionOptions: s.transactionOptions,
+    checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]),
+    indirect: s.indirect,
     run: async (tx: ChangesetExecutor): Promise<ChangesetSnapshot> => {
       const tables: ChangesetTable[] = [];
       let current: ChangesetChange[] = [];
@@ -399,80 +640,121 @@ export function prepareChangesetSnapshot(options: SnapshotChangesetOptions) {
         }
         current.push({ operation: "insert", indirect: s.indirect, new: image });
       });
-      s.checkpoint(); const changeset = encodeChangeset(tables, s.limits); s.checkpoint();
+      s.checkpoint();
+      const changeset = encodeChangeset(tables, s.limits);
+      s.checkpoint();
       return Object.freeze({ changeset, changes: rows });
     },
   };
 }
 
 /** Shared indexed reader. A page is byte-admitted before any images cross SQL. */
-async function walkSnapshot(tx: ChangesetExecutor, s: Settings, pageBytes: number,
+async function walkSnapshot(
+  tx: ChangesetExecutor,
+  s: Settings,
+  pageBytes: number,
   visit: (p: Plan, image: ChangesetValue[], imageBytes: number) => void | Promise<void>,
-  finish: () => void | Promise<void> = () => {}): Promise<number> {
+  finish: () => void | Promise<void> = () => {},
+): Promise<number> {
   const plans: { plan: Plan; keys: SnapshotKey[] }[] = [];
   const version = await scalar(tx, s, "PRAGMA main.schema_version");
   for (const table of s.tables) {
     const p = await plan(tx, s, table, plans.length, false);
-    const nulls = await read(tx, s, `SELECT 1 FROM main.${quote(p.table)} WHERE ` +
-      p.keys.map(i => `${quote(p.columns[i]!)} IS NULL`).join(" OR ") + " LIMIT 1");
-    if (nulls.length) fail("SCHEMA", "Snapshot cannot represent rows with NULL primary-key components");
+    const nulls = await read(
+      tx,
+      s,
+      `SELECT 1 FROM main.${quote(p.table)} WHERE ` +
+        p.keys.map((i) => `${quote(p.columns[i]!)} IS NULL`).join(" OR ") +
+        " LIMIT 1",
+    );
+    if (nulls.length)
+      fail("SCHEMA", "Snapshot cannot represent rows with NULL primary-key components");
     plans.push({ plan: p, keys: await snapshotKeys(tx, s, p) });
   }
   const text = await textDecoder(tx, s);
-  let rows = 0, bytes = 0, cells = 0;
+  let rows = 0,
+    bytes = 0,
+    cells = 0;
   for (const { plan: p, keys } of plans) {
     // Qualify physical columns: ORDER BY t0/x0 must not resolve to projection
     // aliases when an application uses those perfectly valid key names.
-    const columns = p.columns.map(c => `s.${quote(c)}`);
+    const columns = p.columns.map((c) => `s.${quote(c)}`);
     const cost = `${64 + columns.length * 16} + ${columns.map(valueCost).join(" + ")}`;
-    const order = keys.map(k => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
+    const order = keys.map((k) => `${k.expression} ${k.descending ? "DESC" : "ASC"}`).join(", ");
     let last: ChangesetValue[] | null = null;
     pages: while (true) {
       const after: ChangesetValue[] | null = last;
       const stages = after === null ? [-1] : keys.map((_, i) => i).reverse();
       for (const stage of stages) {
-        const predicates: string[] = [], params: ChangesetValue[] = [];
+        const predicates: string[] = [],
+          params: ChangesetValue[] = [];
         if (after !== null) {
           for (let i = 0; i <= stage; i++) {
-            const k = keys[i]!, value = after[i]!;
-            predicates.push(`${k.expression} ${i < stage ? "=" : k.descending ? "<" : ">"} ` +
-              (typeof value === "number" ? "+CAST(? AS REAL)" : "?"));
+            const k = keys[i]!,
+              value = after[i]!;
+            predicates.push(
+              `${k.expression} ${i < stage ? "=" : k.descending ? "<" : ">"} ` +
+                (typeof value === "number" ? "+CAST(? AS REAL)" : "?"),
+            );
             params.push(value);
           }
         }
-        const tail = ` FROM main.${quote(p.table)} AS s` + (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
+        const tail =
+          ` FROM main.${quote(p.table)} AS s` +
+          (predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "") +
           ` ORDER BY ${order}`;
         const sizes = await read(tx, s, `SELECT ${cost}${tail} LIMIT 32`, params);
-        if (sizes.length > 32 || sizes.some(row => row.length !== 1)) fail("RESULT", "Invalid snapshot size page");
+        if (sizes.length > 32 || sizes.some((row) => row.length !== 1))
+          fail("RESULT", "Invalid snapshot size page");
         if (!sizes.length) continue;
         // Narrow the value query to a fitting PREFIX of the indexed size page.
         // A 32-row page of individually large blobs must not defeat chunkBytes.
-        let admitted = 0, pageCost = 0;
+        let admitted = 0,
+          pageCost = 0;
         for (const row of sizes) {
           const size = count(row[0]);
           if (size > pageBytes - pageCost) break;
-          pageCost += size; admitted++;
+          pageCost += size;
+          admitted++;
         }
         if (admitted === 0) fail("LIMIT", "A snapshot row cannot fit the image-page budget");
-        rows += admitted; bytes += pageCost; cells += admitted * columns.length;
-        if (rows > s.maxRows || bytes > s.maxBytes || cells > s.maxCells) fail("LIMIT", "Snapshot row images exceed the configured budget");
-        const page = await read(tx, s, `SELECT ${projection(columns)}${tail} LIMIT ${admitted}`, params);
-        if (page.length !== admitted) fail("RESULT", "Snapshot page changed between size and value reads");
+        rows += admitted;
+        bytes += pageCost;
+        cells += admitted * columns.length;
+        if (rows > s.maxRows || bytes > s.maxBytes || cells > s.maxCells)
+          fail("LIMIT", "Snapshot row images exceed the configured budget");
+        const page = await read(
+          tx,
+          s,
+          `SELECT ${projection(columns)}${tail} LIMIT ${admitted}`,
+          params,
+        );
+        if (page.length !== admitted)
+          fail("RESULT", "Snapshot page changed between size and value reads");
         for (let i = 0; i < page.length; i++) {
-          const image = decode(page[i]!, columns.length, text), next = keys.map(k => image[k.column]!);
-          if (next.some(v => v === null) || (last !== null && next.every((v, j) => equal(v, last![j]!)))) {
+          const image = decode(page[i]!, columns.length, text),
+            next = keys.map((k) => image[k.column]!);
+          if (
+            next.some((v) => v === null) ||
+            (last !== null && next.every((v, j) => equal(v, last![j]!)))
+          ) {
             fail("RESULT", "Snapshot key did not advance or contained NULL");
           }
           last = next;
-          s.checkpoint(); await visit(p, image, count(sizes[i]![0])); s.checkpoint();
+          s.checkpoint();
+          await visit(p, image, count(sizes[i]![0]));
+          s.checkpoint();
         }
         if (admitted < sizes.length || sizes.length === 32) continue pages;
       }
       break;
     }
   }
-  s.checkpoint(); await finish(); s.checkpoint();
-  if (await scalar(tx, s, "PRAGMA main.schema_version") !== version) fail("SCHEMA", "Schema changed during snapshot collection");
+  s.checkpoint();
+  await finish();
+  s.checkpoint();
+  if ((await scalar(tx, s, "PRAGMA main.schema_version")) !== version)
+    fail("SCHEMA", "Schema changed during snapshot collection");
   return rows;
 }
 
@@ -481,12 +763,15 @@ async function walkSnapshot(tx: ChangesetExecutor, s: Settings, pageBytes: numbe
  * provisional until the returned promise commits; sink effects are not rolled
  * back by this helper. Do not publish them as a completed baseline on failure.
  */
-export async function streamSnapshotChangesets(target: ChangesetTarget,
+export async function streamSnapshotChangesets(
+  target: ChangesetTarget,
   onChunk: (chunk: ChangesetSnapshotChunk) => void | Promise<void>,
-  options: SnapshotChangesetStreamOptions): Promise<ChangesetSnapshotStreamResult> {
+  options: SnapshotChangesetStreamOptions,
+): Promise<ChangesetSnapshotStreamResult> {
   const stream = prepareSnapshotChangesetStream(options);
-  if (typeof onChunk !== "function") fail("INPUT", "Snapshot streaming requires an awaited chunk sink");
-  return target.transaction(tx => stream.run(tx, onChunk), stream.transactionOptions);
+  if (typeof onChunk !== "function")
+    fail("INPUT", "Snapshot streaming requires an awaited chunk sink");
+  return target.transaction((tx) => stream.run(tx, onChunk), stream.transactionOptions);
 }
 
 /** @internal Chunked outbox publication uses this reader inside its own txn. */
@@ -496,31 +781,67 @@ export function prepareSnapshotChangesetStream(options: SnapshotChangesetStreamO
   const chunkBytes = bounded(options.chunkBytes, 1024 * 1024, 64 * 1024 * 1024);
   const maxChunks = bounded(options.maxChunks, 10_000, 100_000);
   s.checkpoint();
-  return { transactionOptions: s.transactionOptions, checkpoint: s.checkpoint,
-    tables: Object.freeze([...s.tables]), indirect: s.indirect,
-    run: async (tx: ChangesetExecutor, onChunk: (chunk: ChangesetSnapshotChunk) => void | Promise<void>): Promise<ChangesetSnapshotStreamResult> => {
-      let p: Plan | null = null, changes: ChangesetChange[] = [];
-      let imageBytes = 0, wireBound = 0, chunks = 0, byteLength = 0;
+  return {
+    transactionOptions: s.transactionOptions,
+    checkpoint: s.checkpoint,
+    tables: Object.freeze([...s.tables]),
+    indirect: s.indirect,
+    run: async (
+      tx: ChangesetExecutor,
+      onChunk: (chunk: ChangesetSnapshotChunk) => void | Promise<void>,
+    ): Promise<ChangesetSnapshotStreamResult> => {
+      let p: Plan | null = null,
+        changes: ChangesetChange[] = [];
+      let imageBytes = 0,
+        wireBound = 0,
+        chunks = 0,
+        byteLength = 0;
       const flush = async (): Promise<void> => {
         if (!changes.length && chunks !== 0) return;
         if (chunks >= maxChunks) fail("LIMIT", "Snapshot exceeds maxChunks");
         const count = changes.length;
-        const changeset = encodeChangeset(p === null ? [] : [{ name: p.table, primaryKey: p.pk, changes }], { maxBytes: chunkBytes });
+        const changeset = encodeChangeset(
+          p === null ? [] : [{ name: p.table, primaryKey: p.pk, changes }],
+          { maxBytes: chunkBytes },
+        );
         const length = changeset.byteLength;
-        changes = []; imageBytes = 0; wireBound = 0;
-        s.checkpoint(); await onChunk(Object.freeze({ index: chunks, changes: count, changeset })); s.checkpoint();
-        chunks++; byteLength += length;
+        changes = [];
+        imageBytes = 0;
+        wireBound = 0;
+        s.checkpoint();
+        await onChunk(Object.freeze({ index: chunks, changes: count, changeset }));
+        s.checkpoint();
+        chunks++;
+        byteLength += length;
       };
-      const rows = await walkSnapshot(tx, s, chunkBytes, async (next, image, cost) => {
-        const change: ChangesetChange = { operation: "insert", indirect: s.indirect, new: image };
-        // Sum of independently encoded rows conservatively bounds one combined
-        // header. This avoids repeatedly encoding a growing chunk (quadratic).
-        const size = encodeChangeset([{ name: next.table, primaryKey: next.pk, changes: [change] }], { maxBytes: chunkBytes }).byteLength;
-        if (changes.length && (p !== next || changes.length >= chunkRows ||
-            (changes.length + 1) * next.columns.length > 1_000_000 ||
-            imageBytes + cost > chunkBytes || wireBound + size > chunkBytes)) await flush();
-        p = next; changes.push(change); imageBytes += cost; wireBound += size;
-      }, flush);
+      const rows = await walkSnapshot(
+        tx,
+        s,
+        chunkBytes,
+        async (next, image, cost) => {
+          const change: ChangesetChange = { operation: "insert", indirect: s.indirect, new: image };
+          // Sum of independently encoded rows conservatively bounds one combined
+          // header. This avoids repeatedly encoding a growing chunk (quadratic).
+          const size = encodeChangeset(
+            [{ name: next.table, primaryKey: next.pk, changes: [change] }],
+            { maxBytes: chunkBytes },
+          ).byteLength;
+          if (
+            changes.length &&
+            (p !== next ||
+              changes.length >= chunkRows ||
+              (changes.length + 1) * next.columns.length > 1_000_000 ||
+              imageBytes + cost > chunkBytes ||
+              wireBound + size > chunkBytes)
+          )
+            await flush();
+          p = next;
+          changes.push(change);
+          imageBytes += cost;
+          wireBound += size;
+        },
+        flush,
+      );
       return Object.freeze({ chunks, changes: rows, byteLength });
     },
   };

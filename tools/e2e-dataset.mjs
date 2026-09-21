@@ -18,8 +18,8 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 
 const TEMP1 = "/tmp/e2e_dataset_1.json.gz";
 const TEMP2 = "/tmp/e2e_dataset_2.json.gz";
@@ -44,7 +44,8 @@ function run(cmd, label, allowFail) {
       return { ok: false, output: e.stdout || "", stderr: e.stderr || "", elapsed };
     }
     console.error(`  FAIL [${elapsed}s]: ${label}`);
-    if (e.stderr) console.error(`    stderr: ${e.stderr.trim().split("\n").slice(-3).join("\n    ")}`);
+    if (e.stderr)
+      console.error(`    stderr: ${e.stderr.trim().split("\n").slice(-3).join("\n    ")}`);
     stepsFailed++;
     return { ok: false, output: e.stdout || "", stderr: e.stderr || "", elapsed };
   }
@@ -52,7 +53,9 @@ function run(cmd, label, allowFail) {
 
 function cleanup() {
   for (const f of [TEMP1, TEMP2]) {
-    try { if (existsSync(f)) unlinkSync(f); } catch {}
+    try {
+      if (existsSync(f)) unlinkSync(f);
+    } catch {}
   }
 }
 
@@ -88,8 +91,9 @@ if (existsSync(TEMP1)) {
   if (!val.ok) {
     // Check if it's only the known patch-drift issue
     const output = val.output + (val.stderr || "");
-    const failLines = output.split("\n").filter(l => l.includes("FAIL:"));
-    const onlySnapshotDrift = failLines.length === 1 && failLines[0].includes("final snapshot mismatch");
+    const failLines = output.split("\n").filter((l) => l.includes("FAIL:"));
+    const onlySnapshotDrift =
+      failLines.length === 1 && failLines[0].includes("final snapshot mismatch");
     if (onlySnapshotDrift) {
       console.log("    (Known: applyPatchLines drift — not a tool bug)");
       stepsPassed++;
