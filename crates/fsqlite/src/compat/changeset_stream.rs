@@ -13,6 +13,8 @@
 //! than retrying. Cancellation is observed between reads; a pending transport
 //! must support its own cancellation or the caller must drop the operation.
 
+pub mod verified;
+
 use std::io;
 use std::sync::Arc;
 
