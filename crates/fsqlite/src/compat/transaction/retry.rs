@@ -107,10 +107,12 @@ impl std::error::Error for TransactionRetryError {
 /// Explicit whole-transaction retry; ordinary `transaction()` stays single-shot.
 ///
 /// The callback can run more than once. Keep external side effects outside it,
-/// reread database state on every attempt, and do not issue transaction-control
-/// SQL or use another alias of this connection until the helper completes.
-/// The helper alone owns BEGIN/COMMIT/ROLLBACK. An observed callback-driven
-/// transaction end is terminal, not an invitation to replay an uncertain write.
+/// reread database state on every attempt, and do not use another alias of this
+/// connection until the helper completes. The helper alone owns
+/// BEGIN/COMMIT/ROLLBACK. All callback SQL entry points preflight the complete
+/// batch and reject outer BEGIN, COMMIT/END and full ROLLBACK before effects;
+/// nested savepoints and ROLLBACK TO remain supported. A transaction end
+/// observed after bypassing the wrapper is terminal, never replay permission.
 ///
 /// Dropping the future or unwinding the callback records the same mandatory
 /// deferred rollback as dropping an ordinary [`Transaction`]. No synchronous
@@ -360,6 +362,7 @@ impl TransactionRetryExt for Connection {
             let mut tx = Transaction {
                 conn: self,
                 finalized: Cell::new(false),
+                allow_sql_transaction_control: false,
                 retryable_abort: Cell::new(false),
             };
             let failure = match run.attempt(&mut tx, &mut operation).await {

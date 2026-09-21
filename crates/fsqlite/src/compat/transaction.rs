@@ -12,7 +12,9 @@
 
 use std::{cell::Cell, future::Future};
 
+use fsqlite_ast::Statement;
 use fsqlite_error::FrankenError;
+use fsqlite_parser::Parser;
 use fsqlite_types::value::SqliteValue;
 
 use crate::{Connection, Row};
@@ -40,6 +42,9 @@ pub use retry::{RetryPolicy, RetryStopReason, TransactionRetryError, Transaction
 pub struct Transaction<'a> {
     conn: &'a Connection,
     finalized: Cell<bool>,
+    // Only the retry owner may end a replayable transaction. Ordinary scoped
+    // transactions keep their existing SQL transaction-control behavior.
+    allow_sql_transaction_control: bool,
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     retryable_abort: Cell<bool>,
 }
@@ -71,6 +76,7 @@ impl<'a> Transaction<'a> {
         let transaction = Self {
             conn,
             finalized: Cell::new(false),
+            allow_sql_transaction_control: true,
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             retryable_abort: Cell::new(false),
         };
@@ -86,6 +92,37 @@ impl<'a> Transaction<'a> {
         if !self.conn.in_transaction() {
             self.finalized.set(true);
             return Err(FrankenError::NoActiveTransaction);
+        }
+        Ok(())
+    }
+
+    fn ensure_sql_allowed(&self, sql: &str) -> Result<(), FrankenError> {
+        self.ensure_active()?;
+        if self.allow_sql_transaction_control {
+            return Ok(());
+        }
+
+        // A final in_transaction() check cannot detect COMMIT; BEGIN in a
+        // single batch, or undo writes already committed before a later error.
+        // Validate the complete input before invoking ANY engine entry point.
+        // Parsing, rather than token/semicolon matching, preserves trigger
+        // bodies, quoted keywords and ROLLBACK TO nested savepoints.
+        let (statements, errors) = Parser::from_sql(sql).parse_all();
+        if let Some(error) = errors.first() {
+            return Err(FrankenError::ParseError {
+                offset: error.span.start as usize,
+                detail: error.to_string(),
+            });
+        }
+        if statements.iter().any(|statement| match statement {
+            Statement::Begin(_) | Statement::Commit => true,
+            Statement::Rollback(rollback) => rollback.to_savepoint.is_none(),
+            _ => false,
+        }) {
+            return Err(FrankenError::FunctionError(
+                "transaction retry callback cannot execute BEGIN, COMMIT/END or full ROLLBACK"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -128,7 +165,7 @@ impl<'a> Transaction<'a> {
 
     /// Execute a SQL statement within this transaction.
     pub async fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.execute(sql).await;
         self.observe_transaction_state(result)
     }
@@ -139,7 +176,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.execute_with_params(sql, params).await;
         self.observe_transaction_state(result)
     }
@@ -152,7 +189,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self
             .conn
             .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
@@ -166,7 +203,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[ParamValue],
     ) -> Result<usize, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let result = self.conn.execute_with_params(sql, &values).await;
         self.observe_transaction_state(result)
@@ -174,7 +211,7 @@ impl<'a> Transaction<'a> {
 
     /// Query within this transaction.
     pub async fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.query(sql).await;
         self.observe_transaction_state(result)
     }
@@ -185,7 +222,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.query_with_params(sql, params).await;
         self.observe_transaction_state(result)
     }
@@ -196,7 +233,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[ParamValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let result = self.conn.query_with_params(sql, &values).await;
         self.observe_transaction_state(result)
@@ -204,7 +241,7 @@ impl<'a> Transaction<'a> {
 
     /// Query returning exactly one row within this transaction.
     pub async fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.query_row(sql).await;
         self.observe_transaction_state(result)
     }
@@ -215,7 +252,7 @@ impl<'a> Transaction<'a> {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = self.conn.query_row_with_params(sql, params).await;
         self.observe_transaction_state(result)
     }
@@ -232,7 +269,7 @@ impl<'a> Transaction<'a> {
     where
         F: FnOnce(&Row) -> Result<T, FrankenError>,
     {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let result = self.conn.query_row_with_params(sql, &values).await;
         let row = self.observe_transaction_state(result)?;
@@ -251,7 +288,7 @@ impl<'a> Transaction<'a> {
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let mut mapped = Vec::new();
         let result = self
@@ -270,7 +307,7 @@ impl<'a> Transaction<'a> {
     ///
     /// Analogous to `BatchExt::execute_batch` but within a transaction.
     pub async fn execute_batch(&self, sql: &str) -> Result<(), FrankenError> {
-        self.ensure_active()?;
+        self.ensure_sql_allowed(sql)?;
         let result = Connection::execute_batch(self.conn, sql).await;
         self.observe_transaction_state(result)
     }
@@ -332,6 +369,80 @@ impl TransactionExt for Connection {
 mod tests {
     use super::*;
     use crate::compat::RowExt;
+
+    #[test]
+    fn replayable_sql_preflight_covers_every_execute_and_query_entry_point() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let mut tx = conn.transaction().await.unwrap();
+            tx.allow_sql_transaction_control = false;
+            tx.execute("INSERT INTO data VALUES (1)").await.unwrap();
+            let sql = "INSERT INTO data VALUES (2); COMMIT; BEGIN; SELECT 3";
+            let callbacks = Cell::new(0);
+            macro_rules! refused {
+                ($operation:expr) => {
+                    assert!(matches!(
+                        $operation.await,
+                        Err(FrankenError::FunctionError(message))
+                            if message.contains("transaction retry callback")
+                    ));
+                };
+            }
+            refused!(tx.execute(sql));
+            refused!(tx.execute_with_params(sql, &[]));
+            refused!(tx.execute_with_params_skip_statement_savepoint(sql, &[]));
+            refused!(tx.execute_compat(sql, &[]));
+            refused!(tx.execute_batch(sql));
+            refused!(tx.query(sql));
+            refused!(tx.query_with_params(sql, &[]));
+            refused!(tx.query_params(sql, &[]));
+            refused!(tx.query_row(sql));
+            refused!(tx.query_row_with_params(sql, &[]));
+            refused!(tx.query_row_map(sql, &[], |_| {
+                callbacks.set(callbacks.get() + 1);
+                Ok(())
+            }));
+            refused!(tx.query_map_collect(sql, &[], |_| {
+                callbacks.set(callbacks.get() + 1);
+                Ok(())
+            }));
+            assert_eq!(callbacks.get(), 0);
+            assert!(!tx.finalized.get());
+            assert!(conn.in_transaction());
+            let rows = tx.query("SELECT value FROM data").await.unwrap();
+            assert_eq!(rows.len(), 1, "no prefix of a refused batch may run");
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            tx.rollback().await.unwrap();
+            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn replayable_preflight_preserves_savepoints_triggers_and_quoted_keywords() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let mut tx = conn.transaction().await.unwrap();
+            tx.allow_sql_transaction_control = false;
+            tx.execute_batch(
+                "CREATE TABLE data(value TEXT); CREATE TABLE audit(value TEXT); \
+                 CREATE TRIGGER log_insert AFTER INSERT ON data BEGIN \
+                     INSERT INTO audit VALUES ('COMMIT; BEGIN; ROLLBACK'); END; \
+                 SAVEPOINT inner_scope; INSERT INTO data VALUES ('discard'); \
+                 ROLLBACK TO inner_scope; RELEASE inner_scope; \
+                 /* COMMIT */ INSERT INTO data VALUES ('keep');",
+            )
+            .await
+            .unwrap();
+            assert_eq!(tx.query("SELECT value FROM data").await.unwrap().len(), 1);
+            assert_eq!(tx.query("SELECT value FROM audit").await.unwrap().len(), 1);
+            tx.commit().await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Text("keep".into()))
+            );
+        });
+    }
 
     #[test]
     fn new_transaction_settles_previous_abandoned_scope() {

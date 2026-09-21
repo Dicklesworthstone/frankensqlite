@@ -164,9 +164,9 @@ fn rejecting_a_nested_call_does_not_rollback_the_callers_transaction() {
 }
 
 #[test]
-fn callback_transaction_control_is_terminal_even_with_a_transient_error() {
+fn callback_transaction_control_is_refused_before_any_commit() {
     asupersync::test_utils::run_test(|| async {
-        for control in ["COMMIT", "ROLLBACK"] {
+        for control in ["COMMIT", "END TRANSACTION", "ROLLBACK", "BEGIN"] {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(value INTEGER)").await.unwrap();
             let calls = Cell::new(0);
@@ -176,13 +176,70 @@ fn callback_transaction_control_is_terminal_even_with_a_transient_error() {
                 tx.execute(control).await?;
                 Err::<(), _>(FrankenError::Busy)
             }).await.unwrap_err();
-            assert_eq!(failure.reason, RetryStopReason::TransactionEnded);
+            assert_eq!(failure.reason, RetryStopReason::NonTransient);
             assert_eq!(failure.attempts, 1);
             assert_eq!(calls.get(), 1);
+            assert!(matches!(failure.last_error.as_deref(), Some(FrankenError::FunctionError(_))));
             assert!(!conn.in_transaction());
-            assert_eq!(conn.query("SELECT * FROM t").await.unwrap().len(),
-                usize::from(control == "COMMIT"));
+            assert!(conn.query("SELECT * FROM t").await.unwrap().is_empty());
         }
+    });
+}
+
+#[test]
+fn callback_batches_cannot_commit_prefixes_or_hide_a_replacement_transaction() {
+    asupersync::test_utils::run_test(|| async {
+        for batch in [
+            "INSERT INTO t VALUES (2); COMMIT; BEGIN; INSERT INTO t VALUES (3)",
+            "INSERT INTO t VALUES (2); END TRANSACTION; BEGIN; SELECT 1",
+            "INSERT INTO t VALUES (2); ROLLBACK; BEGIN; INSERT INTO t VALUES (3)",
+            "INSERT INTO t VALUES (2); COMMIT; SELECT * FROM nonexistent",
+        ] {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(value INTEGER)").await.unwrap();
+            let calls = Cell::new(0);
+            let failure = conn
+                .transaction_with_retry(RetryPolicy::default(), async |tx| {
+                    calls.set(calls.get() + 1);
+                    tx.execute("INSERT INTO t VALUES (1)").await?;
+                    tx.execute_batch(batch).await?;
+                    Err::<(), _>(FrankenError::Busy)
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(failure.reason, RetryStopReason::NonTransient, "{batch}");
+            assert_eq!(calls.get(), 1);
+            assert_eq!(failure.attempts, 1);
+            assert!(!failure.transaction_open);
+            assert!(conn.query("SELECT * FROM t").await.unwrap().is_empty());
+        }
+    });
+}
+
+#[test]
+fn catching_refused_control_cannot_leak_a_batch_prefix_across_retries() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute("CREATE TABLE t(value INTEGER)").await.unwrap();
+        let mut calls = 0;
+        conn.transaction_with_retry(RetryPolicy::default(), async |tx| {
+            calls += 1;
+            tx.execute("INSERT INTO t VALUES (1)").await?;
+            let refused = tx
+                .execute_batch("INSERT INTO t VALUES (2); COMMIT; BEGIN")
+                .await;
+            assert!(matches!(refused, Err(FrankenError::FunctionError(_))));
+            if calls == 1 {
+                return Err(FrankenError::Busy);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        let rows = conn.query("SELECT value FROM t").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
     });
 }
 
