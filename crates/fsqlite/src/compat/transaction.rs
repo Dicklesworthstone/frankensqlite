@@ -40,6 +40,8 @@ pub use retry::{RetryPolicy, RetryStopReason, TransactionRetryError, Transaction
 pub struct Transaction<'a> {
     conn: &'a Connection,
     finalized: Cell<bool>,
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    retryable_abort: Cell<bool>,
 }
 
 impl<'a> Transaction<'a> {
@@ -48,6 +50,8 @@ impl<'a> Transaction<'a> {
         Ok(Self {
             conn,
             finalized: Cell::new(false),
+            #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+            retryable_abort: Cell::new(false),
         })
     }
 
@@ -68,6 +72,12 @@ impl<'a> Transaction<'a> {
     ) -> Result<T, FrankenError> {
         if !self.conn.in_transaction() {
             self.finalized.set(true);
+            // Only an observed transient engine failure certifies a retryable
+            // abort. Successful SQL COMMIT/ROLLBACK must never gain that
+            // status merely because the callback later returns Busy.
+            #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+            self.retryable_abort
+                .set(result.as_ref().is_err_and(FrankenError::is_transient));
         }
         result
     }

@@ -11,7 +11,7 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use asupersync::Cx as NativeCx;
+use asupersync::{Cx as NativeCx, types::Time};
 use fsqlite_error::FrankenError;
 
 use super::Transaction;
@@ -19,8 +19,9 @@ use crate::Connection;
 
 /// Bounds for an explicitly replayable transaction body.
 ///
-/// `timeout` is one cooperative wall-time budget for admission, the body,
-/// commit, cleanup retries, and backoff together. It is checked between engine
+/// `timeout` is one cooperative runtime-time budget for admission, the body,
+/// commit, cleanup retries, and backoff together (wall time in production,
+/// virtual time in a lab runtime). It is checked between engine
 /// calls; it does not preempt a running statement or an arbitrary user future.
 /// Set the connection's `busy_timeout` appropriately for the application's
 /// latency target. One rollback is attempted even after expiry, because
@@ -141,7 +142,7 @@ struct RetryRun<'a> {
     conn: &'a Connection,
     native: NativeCx,
     policy: RetryPolicy,
-    started: Instant,
+    started: Time,
     attempts: u32,
 }
 
@@ -152,7 +153,8 @@ struct AttemptFailure {
 
 impl AttemptFailure {
     fn database(error: FrankenError) -> Self {
-        Self { reason: None, error: Some(Box::new(error)) }
+        let reason = matches!(error, FrankenError::Interrupt).then_some(RetryStopReason::Cancelled);
+        Self { reason, error: Some(Box::new(error)) }
     }
 
     fn stopped(reason: RetryStopReason) -> Self {
@@ -161,10 +163,14 @@ impl AttemptFailure {
 }
 
 impl RetryRun<'_> {
+    fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.native.now().as_nanos().saturating_sub(self.started.as_nanos()))
+    }
+
     fn stop_reason(&self) -> Option<RetryStopReason> {
         if self.conn.root_cx().checkpoint().is_err() || self.native.checkpoint().is_err() {
             Some(RetryStopReason::Cancelled)
-        } else if self.started.elapsed() >= self.policy.timeout {
+        } else if self.elapsed() >= self.policy.timeout {
             Some(RetryStopReason::DeadlineExceeded)
         } else {
             None
@@ -180,7 +186,7 @@ impl RetryRun<'_> {
         TransactionRetryError {
             reason,
             attempts: self.attempts,
-            elapsed: self.started.elapsed(),
+            elapsed: self.elapsed(),
             last_error,
             rollback_error,
             transaction_open: self.conn.in_transaction(),
@@ -191,7 +197,7 @@ impl RetryRun<'_> {
         if let Some(reason) = self.stop_reason() {
             return Err(reason);
         }
-        let remaining = self.policy.timeout.saturating_sub(self.started.elapsed());
+        let remaining = self.policy.timeout.saturating_sub(self.elapsed());
         let cap = backoff_cap(self.policy, retry).min(remaining);
         let delay = full_jitter(cap, self.native.random_u64());
         tracing::debug!(target: "fsqlite::compat", event = "transaction_retry_wait",
@@ -212,7 +218,7 @@ impl RetryRun<'_> {
         if let Some(reason) = self.stop_reason() {
             return Err(reason);
         }
-        let delay = delay.min(self.policy.timeout.saturating_sub(self.started.elapsed()));
+        let delay = delay.min(self.policy.timeout.saturating_sub(self.elapsed()));
         let mut sleep = pin!(asupersync::time::sleep(self.native.now(), delay));
         let mut native_cancel = pin!(self.native.cancelled());
         let local_cx = self.conn.root_cx();
@@ -241,7 +247,11 @@ impl RetryRun<'_> {
             return Err(AttemptFailure::stopped(reason));
         }
         let result = operation(tx).await;
-        if tx.finalized.get() || !self.conn.in_transaction() {
+        // A typed transient engine abort can retire its own scope. That is
+        // not the same as a callback executing COMMIT then returning Busy.
+        let retryable_abort = tx.retryable_abort.get()
+            && result.as_ref().is_err_and(FrankenError::is_transient);
+        if (tx.finalized.get() || !self.conn.in_transaction()) && !retryable_abort {
             return Err(AttemptFailure {
                 reason: Some(RetryStopReason::TransactionEnded),
                 error: result.err().map(Box::new),
@@ -267,26 +277,46 @@ impl RetryRun<'_> {
             // accidentally roll back that replacement transaction.
             return Err(None);
         }
-        for attempt in 1..=self.policy.max_rollback_attempts {
-            let result = tx.rollback().await;
-            if result.is_ok() && !self.conn.in_transaction() {
-                return Ok(());
-            }
-            let error = result.err().map(Box::new);
-            if !self.conn.in_transaction() {
-                tx.finalized.set(true);
-                // A failing finalizer is not a rollback receipt. Fail closed.
-                return Err(error);
-            }
-            let transient = error.as_deref().is_some_and(FrankenError::is_transient);
-            if !transient || attempt == self.policy.max_rollback_attempts
-                || self.wait(attempt - 1).await.is_err()
-            {
-                return Err(error);
-            }
-        }
-        unreachable!("validated nonzero rollback attempt limit")
+        confirm_rollback(
+            self.policy.max_rollback_attempts,
+            async || tx.rollback().await,
+            || self.conn.in_transaction(),
+            async |retry| self.wait(retry).await,
+        ).await
     }
+}
+
+// Keep the rollback proof shared with fault-injection tests. The production
+// adapter above still uses the actual engine finalizer and transaction state;
+// no error is converted into success merely because a retry budget expired.
+async fn confirm_rollback<R, S, W>(
+    max_attempts: u32,
+    mut rollback: R,
+    is_active: S,
+    mut wait: W,
+) -> Result<(), Option<Box<FrankenError>>>
+where
+    R: AsyncFnMut() -> Result<(), FrankenError>,
+    S: Fn() -> bool,
+    W: AsyncFnMut(u32) -> Result<(), RetryStopReason>,
+{
+    for attempt in 1..=max_attempts {
+        let result = rollback().await;
+        if result.is_ok() && !is_active() {
+            return Ok(());
+        }
+        let error = result.err().map(Box::new);
+        if !is_active() {
+            // A failing finalizer is not a rollback receipt. Fail closed.
+            return Err(error);
+        }
+        let transient = error.as_deref().is_some_and(FrankenError::is_transient);
+        if !transient || attempt == max_attempts || wait(attempt - 1).await.is_err() {
+            return Err(error);
+        }
+    }
+    // Public policy validation forbids zero; keep the proof helper fail-closed.
+    Err(None)
 }
 
 impl TransactionRetryExt for Connection {
@@ -317,6 +347,7 @@ impl TransactionRetryExt for Connection {
         if !capabilities.time || !capabilities.entropy || self.root_cx().mask_depth() != 0 {
             return Err(rejected(RetryStopReason::RuntimeUnavailable));
         }
+        let started = native.now();
         let mut run = RetryRun { conn: self, native, policy, started, attempts: 0 };
         let mut last_error = None;
         loop {
@@ -326,7 +357,11 @@ impl TransactionRetryExt for Connection {
             run.attempts += 1;
             // Arm the cancellation guard BEFORE polling BEGIN. An abandoned
             // admission future must not bypass Transaction::drop cleanup.
-            let mut tx = Transaction { conn: self, finalized: Cell::new(false) };
+            let mut tx = Transaction {
+                conn: self,
+                finalized: Cell::new(false),
+                retryable_abort: Cell::new(false),
+            };
             let failure = match run.attempt(&mut tx, &mut operation).await {
                 Ok(value) => return Ok(value),
                 Err(failure) => failure,
@@ -428,4 +463,97 @@ mod tests {
             assert!(conn.query("SELECT * FROM t").await.unwrap().is_empty());
         });
     }
+
+    #[test]
+    fn busy_rollback_must_be_acknowledged_before_replay_is_allowed() {
+        asupersync::test_utils::run_test(|| async {
+            let calls = Cell::new(0);
+            let active = Cell::new(true);
+            let waits = Cell::new(0);
+            let outcome = confirm_rollback(3, async || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(FrankenError::Busy)
+                } else {
+                    active.set(false);
+                    Ok(())
+                }
+            }, || active.get(), async |_| {
+                waits.set(waits.get() + 1);
+                Ok(())
+            }).await;
+            assert!(outcome.is_ok());
+            assert_eq!(calls.get(), 3);
+            assert_eq!(waits.get(), 2);
+            assert!(!active.get());
+        });
+    }
+
+    #[test]
+    fn rollback_exhaustion_and_deadline_preserve_the_cleanup_failure() {
+        asupersync::test_utils::run_test(|| async {
+            for deadline in [false, true] {
+                let calls = Cell::new(0);
+                let failure = confirm_rollback(3, async || {
+                    calls.set(calls.get() + 1);
+                    Err(FrankenError::Busy)
+                }, || true, async |_| {
+                    if deadline { Err(RetryStopReason::DeadlineExceeded) } else { Ok(()) }
+                }).await.unwrap_err();
+                assert!(matches!(failure.as_deref(), Some(FrankenError::Busy)));
+                assert_eq!(calls.get(), if deadline { 1 } else { 3 });
+            }
+        });
+    }
+
+    #[test]
+    fn rollback_requires_both_success_and_an_idle_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            let unretired = confirm_rollback(2, async || Ok(()), || true,
+                async |_| panic!("a success without retirement must not retry")).await;
+            assert!(matches!(unretired, Err(None)));
+            let unacknowledged = confirm_rollback(2, async || Err(FrankenError::Busy),
+                || false, async |_| panic!("an unacknowledged outcome must not retry")).await;
+            assert!(matches!(unacknowledged, Err(Some(error)) if matches!(*error, FrankenError::Busy)));
+        });
+    }
+
+    #[test]
+    fn nontransient_rollback_failure_never_waits_or_retries() {
+        asupersync::test_utils::run_test(|| async {
+            let calls = Cell::new(0);
+            let failure = confirm_rollback(8, async || {
+                calls.set(calls.get() + 1);
+                Err(FrankenError::DatabaseCorrupt { detail: "injected rollback failure".into() })
+            }, || true, async |_| panic!("corruption must not be retried")).await;
+            assert!(failure.is_err());
+            assert_eq!(calls.get(), 1);
+        });
+    }
+
+    #[test]
+    fn an_engine_abort_receipt_is_distinct_from_successful_sql_finalization() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::compat::TransactionExt;
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let tx = conn.transaction().await.unwrap();
+            // Inject the two parts of an engine abort receipt: the engine
+            // retired its scope and the wrapper observes a typed conflict.
+            conn.rollback_transaction().await.unwrap();
+            let result = tx.observe_transaction_state(Err::<(), _>(FrankenError::Busy));
+            assert!(result.is_err());
+            assert!(tx.finalized.get());
+            assert!(tx.retryable_abort.get());
+            drop(tx);
+
+            let tx = conn.transaction().await.unwrap();
+            tx.execute("COMMIT").await.unwrap();
+            assert!(tx.finalized.get());
+            assert!(!tx.retryable_abort.get());
+            assert!(tx.execute("SELECT 1").await.is_err());
+            assert!(!tx.retryable_abort.get());
+        });
+    }
+
 }
