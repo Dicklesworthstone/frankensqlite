@@ -415,3 +415,6 @@ crates/fsqlite-e2e/tests/*_ignored.rs
 .skill-loop-progress-*.md
 # rustc metadata leftover at repo root (`librust_out.rmeta`); not cargo output.
 /*.rmeta
+# Accidental shell-redirect leftovers at repo root (`:> =`, `:> Apple`).
+/=
+/Apple
