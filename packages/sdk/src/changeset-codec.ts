@@ -55,7 +55,8 @@ const DEFAULTS = {
 type Limits = { readonly [K in keyof typeof DEFAULTS]: number };
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
-function limits(input: ChangesetLimits = {}): Limits {
+/** @internal Capture and validate the common codec/group policy once. */
+export function resolveChangesetLimits(input: ChangesetLimits = {}): Limits {
   const result = { ...DEFAULTS } as { -readonly [K in keyof Limits]: number };
   for (const key of Object.keys(DEFAULTS) as (keyof Limits)[]) {
     const value = input[key] ?? DEFAULTS[key];
@@ -78,6 +79,31 @@ function limit(message: string): never {
 }
 function input(message: string): never {
   throw new ChangesetError("ERR_FSQLITE_CHANGESET_INPUT", message);
+}
+function fixedInput(bytes: Uint8Array, maximum: number): Uint8Array {
+  if (!(bytes instanceof Uint8Array)) input("Changeset must be a Uint8Array");
+  // Read internal typed-array slots, not shadowable properties or subclass
+  // methods. A caller getter must not change the budget, offsets or group state
+  // while parsing. The ordinary fixed view below has no application callbacks.
+  const prototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+  try {
+    const get = (name: string): unknown =>
+      Object.getOwnPropertyDescriptor(prototype, name)!.get!.call(bytes);
+    const buffer = get("buffer");
+    const offset = get("byteOffset") as number;
+    const size = get("byteLength") as number;
+    if (size > maximum) limit("Changeset exceeds maxBytes");
+    if (
+      !(buffer instanceof ArrayBuffer) ||
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "resizable")?.get?.call(buffer)
+    )
+      input("Changeset requires a fixed, non-shared ArrayBuffer");
+    // Constructing this view also rejects detached buffers, even empty ones.
+    return new Uint8Array(buffer, offset, size);
+  } catch (error: unknown) {
+    if (error instanceof ChangesetError) throw error;
+    return input("Changeset requires an attached Uint8Array");
+  }
 }
 function nameBytes(name: string): Uint8Array {
   if (typeof name !== "string" || name.length === 0 || name.length > 1024 || name.includes("\0"))
@@ -127,17 +153,8 @@ export function decodeChangeset(
   bytes: Uint8Array,
   options?: ChangesetLimits,
 ): readonly ChangesetTable[] {
-  const policy = limits(options);
-  if (!(bytes instanceof Uint8Array)) input("Changeset must be a Uint8Array");
-  if (bytes.byteLength > policy.maxBytes) limit("Changeset exceeds maxBytes");
-  // Reject shared/resizable storage: another agent must not alter parsing state.
-  if (
-    !(bytes.buffer instanceof ArrayBuffer) ||
-    (bytes.buffer as ArrayBuffer & { resizable?: boolean }).resizable
-  ) {
-    input("Changeset requires a fixed, non-shared ArrayBuffer");
-  }
-  // Constructing the view also rejects detached buffers, including empty ones.
+  const policy = resolveChangesetLimits(options);
+  bytes = fixedInput(bytes, policy.maxBytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let pos = 0,
     rows = 0,
@@ -255,7 +272,7 @@ export function encodeChangeset(
   tables: readonly ChangesetTable[],
   options?: ChangesetLimits,
 ): Uint8Array {
-  const policy = limits(options);
+  const policy = resolveChangesetLimits(options);
   if (!Array.isArray(tables)) input("Changeset tables must be an array");
   if (tables.length > policy.maxTables) limit("Changeset exceeds maxTables");
   let buffer = new Uint8Array(Math.min(1024, policy.maxBytes)),
@@ -371,7 +388,7 @@ export function encodeChangeset(
 
 /** SQLite inversion preserves change order; primary keys stay in old UPDATE slots. */
 export function invertChangeset(bytes: Uint8Array, options?: ChangesetLimits): Uint8Array {
-  const policy = limits(options);
+  const policy = resolveChangesetLimits(options);
   const tables = decodeChangeset(bytes, policy).map((table) => ({
     ...table,
     changes: table.changes.map((change): ChangesetChange => {

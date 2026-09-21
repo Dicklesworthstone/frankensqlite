@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { decodeChangeset, encodeChangeset, invertChangeset } from "../src/changeset-codec.ts";
-import { ChangesetGroupError, concatChangesets } from "../src/changeset-group.ts";
+import { ChangesetGroup, ChangesetGroupError, concatChangesets } from "../src/changeset-group.ts";
 
 const empty = () => new Uint8Array();
 const table = (changes, primaryKey = [1, 0], name = "t") => ({ name, primaryKey, changes });
@@ -45,6 +45,7 @@ function nativeHistory(t, schema, seed, steps) {
   const whole = source.createSession();
   const parts = [];
   let composed = empty();
+  const group = new ChangesetGroup();
   try {
     for (const step of steps) {
       const session = source.createSession();
@@ -54,6 +55,11 @@ function nativeHistory(t, schema, seed, steps) {
         const part = session.changeset();
         parts.push(part);
         composed = concatChangesets(composed, part);
+        const stats = group.add(part);
+        const grouped = group.output();
+        assert.deepEqual(normalized(grouped), normalized(composed));
+        assert.equal(stats.byteLength, grouped.length);
+        assert.equal(stats.changes, changes(grouped).length);
       } finally {
         session.close();
       }
@@ -67,7 +73,7 @@ function nativeHistory(t, schema, seed, steps) {
   assert.deepEqual(snapshot(target), snapshot(source));
   assert.equal(target.applyChangeset(invertChangeset(composed)), true);
   assert.deepEqual(snapshot(target), initial);
-  return { composed, parts, source };
+  return { composed, parts, source, group };
 }
 
 test("SQLite oracle version is observable and both empty inputs are identities", (t) => {
@@ -253,4 +259,251 @@ test("deterministic multi-session histories match native Session aggregation, ap
     });
     nativeHistory(t,"CREATE TABLE t(id INTEGER PRIMARY KEY,a,b)","INSERT INTO t VALUES(1,'initial',7),(2,NULL,X'00')",steps);
   }
+});
+
+test("group limits reject atomically and a rejected chunk does not poison later additions", () => {
+  for (const policy of [
+    { maxChanges: 1 },
+    { maxCells: 3 },
+    { maxBytes: 20 },
+    { maxTables: 1 },
+  ]) {
+    const group = new ChangesetGroup(policy);
+    const a = bytes(insert([1n, "a"]));
+    group.add(a);
+    const before = group.output();
+    const stats = group.stats();
+    const b = bytes(insert([2n, "b"]), [1, 0], policy.maxTables ? "u" : "t");
+    assert.throws(() => group.add(b), limitError);
+    assert.deepEqual(group.output(), before);
+    assert.equal(group.stats(), stats);
+    group.add(bytes(remove([1n, "a"])));
+    assert.deepEqual(group.output(), empty());
+    assert.equal(group.stats().changes, 0);
+    assert.equal(group.stats().cells, 0);
+    assert.equal(group.stats().tables, 1);
+  }
+});
+
+test("late schema failure preserves earlier staged edits in other tables", () => {
+  const group = new ChangesetGroup();
+  group.add(encodeChangeset([
+    table([insert([1n, "a"])]),
+    table([insert([1n, "b"])], [1, 0], "u"),
+  ]));
+  const before = group.output();
+  const stats = group.stats();
+  const invalid = encodeChangeset([
+    table([update([1n, "a"], [undefined, "changed"])]),
+    table([insert([2n, "bad", null])], [1, 0, 0], "u"),
+  ]);
+  assert.throws(() => group.add(invalid), ChangesetGroupError);
+  assert.deepEqual(group.output(), before);
+  assert.equal(group.stats(), stats);
+  group.add(bytes(update([1n, "a"], [undefined, "changed"])));
+  assert.equal(decodeChangeset(group.output())[0].changes[0].new[1], "changed");
+});
+
+test("late retained-byte overflow rolls back a staged deletion as well as an insertion", () => {
+  const group = new ChangesetGroup({ maxBytes: 90 });
+  group.add(encodeChangeset([table([1n, 2n, 3n].map((id) => insert([id, "a".repeat(10)])))]));
+  const before = group.output();
+  const stats = group.stats();
+  const chunk = encodeChangeset([table([
+    remove([1n, "a".repeat(10)]),
+    insert([4n, "b".repeat(26)]),
+  ])]);
+  assert.ok(chunk.length <= 90); // The INPUT fits; retained merged state does not.
+  assert.throws(() => group.add(chunk), limitError);
+  assert.deepEqual(group.output(), before);
+  assert.equal(group.stats(), stats);
+});
+
+test("a later deletion in the same chunk frees the retained change budget", () => {
+  const group = new ChangesetGroup({ maxChanges: 2 });
+  group.add(encodeChangeset([table([insert([1n, "a"]), insert([2n, "b"])])]));
+  group.add(encodeChangeset([table([insert([3n, "c"]), remove([1n, "a"])])]));
+  assert.deepEqual(changes(group.output()), [insert([2n, "b"]), insert([3n, "c"])]);
+  assert.equal(group.stats().changes, 2);
+});
+
+test("delete/reinsert order and duplicate keys within one add match successive composition", () => {
+  const group = new ChangesetGroup();
+  const first = encodeChangeset([table([insert([1n, "a"]), insert([2n, "b"])])]);
+  const second = encodeChangeset([table([
+    remove([1n, "a"]), insert([3n, "c"]), insert([1n, "d"]),
+    update([1n, "d"], [undefined, "final"]),
+  ])]);
+  group.add(first);
+  group.add(second);
+  assert.deepEqual(group.output(), concatChangesets(first, second));
+  assert.equal(group.stats().changes, 3);
+});
+
+test("cancelled rows retain schema identity and table budget until explicit clear", () => {
+  const group = new ChangesetGroup({ maxTables: 1 });
+  group.add(bytes(insert([1n, "a"])));
+  group.add(bytes(remove([1n, "a"])));
+  assert.deepEqual(group.output(), empty());
+  assert.deepEqual(group.stats(), { tables: 1, changes: 0, cells: 0, byteLength: 0, schemaBytes: 6 });
+  assert.throws(() => group.add(bytes(insert([1n, "new", null]), [1, 0, 0])), ChangesetGroupError);
+  assert.throws(() => group.add(bytes(insert([1n, "new"]), [1, 0], "u")), limitError);
+  group.clear();
+  assert.deepEqual(group.stats(), { tables: 0, changes: 0, cells: 0, byteLength: 0, schemaBytes: 0 });
+  group.add(bytes(insert([1n, "new"]), [1, 0], "u"));
+  assert.equal(decodeChangeset(group.output())[0].name, "u");
+});
+
+test("schema-only churn consumes the retained byte budget even when output is empty", () => {
+  const group = new ChangesetGroup({ maxBytes: 34, maxTables: 100 });
+  const cancelled = (name) => encodeChangeset([
+    table([insert([1n, "a"]), remove([1n, "a"])], [1, 0], name),
+  ]);
+  for (const name of ["t", "u", "v", "w", "x"]) group.add(cancelled(name));
+  assert.equal(group.stats().schemaBytes, 30);
+  assert.equal(group.stats().byteLength, 0);
+  assert.equal(group.stats().tables, 5);
+  const before = group.stats();
+  assert.throws(() => group.add(cancelled("y")), limitError);
+  assert.equal(group.stats(), before);
+  group.clear();
+  group.add(cancelled("y"));
+  assert.equal(group.stats().tables, 1);
+});
+
+test("group owns input blobs and every output buffer; stats are immutable snapshots", () => {
+  const group = new ChangesetGroup();
+  const source = bytes(insert([1n, new Uint8Array([0, 255, 7])]));
+  const stats = group.add(source);
+  source.fill(0);
+  const first = group.output();
+  const expected = first.slice();
+  first.fill(0);
+  assert.deepEqual(group.output(), expected);
+  assert.deepEqual(changes(group.output())[0].new[1], new Uint8Array([0, 255, 7]));
+  assert.ok(Object.isFrozen(stats));
+  assert.throws(() => { stats.changes = 999; }, TypeError);
+  group.clear();
+  assert.equal(stats.changes, 1);
+  assert.equal(group.stats().changes, 0);
+});
+
+test("group measures UTF-8, blob, column-count and value-length varint boundaries exactly", () => {
+  for (const length of [0, 1, 127, 128, 16383, 16384]) {
+    const group = new ChangesetGroup();
+    const key = new Uint8Array(4097).fill(8);
+    const original = "λ🚀\0".repeat(length);
+    group.add(bytes(insert([key, original])));
+    assert.equal(group.stats().byteLength, group.output().length);
+    group.add(bytes(update([key, original], [undefined, new Uint8Array(length)])));
+    assert.equal(group.stats().byteLength, group.output().length);
+    assert.equal(group.stats().cells, 2); // Still a merged INSERT, not an UPDATE.
+    group.add(bytes(remove([key, new Uint8Array(length)])));
+    assert.equal(group.stats().byteLength, 0);
+    assert.equal(group.stats().cells, 0);
+  }
+  for (const columns of [127, 128, 2000]) {
+    const group = new ChangesetGroup();
+    const pk = Array(columns).fill(0);
+    pk[columns - 1] = 1;
+    const row = Array(columns).fill(null);
+    row[columns - 1] = "key";
+    group.add(bytes(insert(row), pk, "引号λ🚀"));
+    assert.equal(group.stats().cells, columns);
+    assert.equal(group.stats().byteLength, group.output().length);
+  }
+});
+
+test("group updates preserve paired slots and byte accounting when columns revert", () => {
+  const group = new ChangesetGroup();
+  group.add(bytes(update([1n, "a", undefined], [undefined, "b", undefined]), [1, 0, 0]));
+  assert.equal(group.stats().cells, 6);
+  group.add(bytes(update([1n, "b", null], [undefined, "a", "other"]), [1, 0, 0]));
+  assert.deepEqual(changes(group.output()), [
+    update([1n, undefined, null], [undefined, undefined, "other"]),
+  ]);
+  assert.equal(group.stats().cells, 6);
+  assert.equal(group.stats().byteLength, group.output().length);
+  group.add(bytes(remove([1n, "a", "other"]), [1, 0, 0]));
+  assert.deepEqual(changes(group.output()), [remove([1n, "a", null])]);
+  assert.equal(group.stats().cells, 3);
+  assert.equal(group.stats().byteLength, group.output().length);
+});
+
+test("decoder ignores shadowed typed-array accessors and methods during atomic group add", () => {
+  const group = new ChangesetGroup();
+  group.add(bytes(insert([1n, "existing"])));
+  const source = bytes(insert([2n, "incoming"]));
+  let calls = 0;
+  for (const name of ["length", "byteLength", "byteOffset", "buffer", "subarray"]) {
+    Object.defineProperty(source, name, {
+      get() {
+        calls++;
+        group.clear();
+        throw new Error("Application getter must not run during parsing");
+      },
+    });
+  }
+  group.add(source);
+  assert.equal(calls, 0);
+  assert.equal(group.stats().changes, 2);
+  assert.deepEqual(changes(group.output()), [insert([1n, "existing"]), insert([2n, "incoming"])]);
+});
+
+test("shadowed buffer metadata cannot bypass actual byte, shared or resizable limits", () => {
+  const a = bytes(insert([1n, "a"]));
+  const larger = bytes(insert([2n, "too large for the configured buffer budget"]));
+  Object.defineProperty(larger, "byteLength", { value: 0 });
+  const group = new ChangesetGroup({ maxBytes: a.length });
+  group.add(a);
+  const before = group.output();
+  const stats = group.stats();
+  assert.throws(() => group.add(larger), limitError);
+  const shared = new Uint8Array(new SharedArrayBuffer(a.length));
+  shared.set(a);
+  Object.defineProperty(shared, "buffer", { value: a.buffer });
+  assert.throws(() => group.add(shared), { code: "ERR_FSQLITE_CHANGESET_INPUT" });
+  const buffer = new ArrayBuffer(a.length, { maxByteLength: a.length * 2 });
+  new Uint8Array(buffer).set(a);
+  Object.defineProperty(buffer, "resizable", { value: false });
+  assert.throws(() => group.add(new Uint8Array(buffer)), { code: "ERR_FSQLITE_CHANGESET_INPUT" });
+  assert.deepEqual(group.output(), before);
+  assert.equal(group.stats(), stats);
+});
+
+test("detached, proxied, truncated and patchset chunks leave the existing group unchanged", () => {
+  const group = new ChangesetGroup();
+  const a = bytes(insert([1n, "a"]));
+  group.add(a);
+  const before = group.output();
+  const stats = group.stats();
+  const detached = new Uint8Array(a);
+  structuredClone(detached.buffer, { transfer: [detached.buffer] });
+  for (const invalid of [detached, new Proxy(a, {}), a.subarray(0, a.length - 1), new Uint8Array([80])]) {
+    assert.throws(() => group.add(invalid));
+    assert.deepEqual(group.output(), before);
+    assert.equal(group.stats(), stats);
+  }
+});
+
+test("group captures limit getters only at construction and later caller mutation has no effect", () => {
+  const reads = new Map();
+  const options = {};
+  for (const name of ["maxBytes", "maxTables", "maxColumns", "maxChanges", "maxCells"]) {
+    Object.defineProperty(options, name, {
+      configurable: true,
+      get() {
+        reads.set(name, (reads.get(name) ?? 0) + 1);
+        return name === "maxChanges" ? 1 : undefined;
+      },
+    });
+  }
+  const group = new ChangesetGroup(options);
+  Object.defineProperty(options, "maxChanges", { value: 100 });
+  group.add(bytes(insert([1n, "a"])));
+  assert.throws(() => group.add(bytes(insert([2n, "b"]))), limitError);
+  group.output();
+  group.clear();
+  group.add(bytes(insert([1n, "a"])));
+  assert.ok([...reads.values()].every((n) => n === 1));
 });
