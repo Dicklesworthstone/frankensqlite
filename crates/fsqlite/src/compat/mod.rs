@@ -30,6 +30,8 @@ pub use transaction::*;
 /// This is a FrankenSQLite replication extension, not a rusqlite API.
 #[cfg(all(feature = "native", not(target_arch = "wasm32"), unix))]
 pub mod snapshot {
+    pub mod transfer;
+
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
