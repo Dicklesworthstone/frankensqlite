@@ -1,472 +1,528 @@
+GH#423 shared-statement busy-budget integration candidate
+STATUS: UNAPPLIED; Rust tests, rustfmt, cargo check and Clippy NOT RUN.
+
+Targets the e550fe45 helper already present on main; modifies that file,
+rather than recreating the obsolete Rc-based candidate.
+Expected connection.rs blob: f3db10f5c4219cae76a280d2b5974eb42336bc90
+Expected busy_timeout.rs blob: 292be42bd02fd657259f344f039cfb7c7aae8f4a
+
+Hunk positions are hints. Literal edit contexts were retrieved through
+GitHub, but no full-checkout git apply --check or native validation was
+possible. Apply only after git apply --check succeeds on a clean checkout.
+The original persistent-lock and checkpoint integration guards are kept.
+Private Connection tests are separate from the portable helper included
+by path in bd_udetu_begin_busy_timeout_guard.
+
 diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
 --- a/crates/fsqlite-core/src/connection.rs
 +++ b/crates/fsqlite-core/src/connection.rs
-@@ -34,6 +34,8 @@
- )]
- 
+@@ -35,7 +35,11 @@ module/imports
 +mod busy_timeout;
++#[cfg(test)]
++mod busy_timeout_integration_tests;
  mod conformal_retry;
  mod pragma_maintenance;
  
-+use busy_timeout::{BusyTimeoutContext, BusyTimeoutState};
++use busy_timeout::{BusyTimeoutScope, BusyTimeoutState};
  use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
-@@ -12340,6 +12342,7 @@
+ 
+ use hashbrown::HashMap as HbHashMap;
+ use lru::LruCache;
+@@ -12310,11 +12314,12 @@ statement future ownership
+-/// Installs statement attribution only while its inner future is being polled.
++/// Installs statement attribution and the busy window only during a poll.
+ /// Keeping the guard across `Pending` would mistake an unrelated future for
+ /// nested execution and could restore a stale identity after cancellation.
  struct FallbackStatementFuture<'a, T> {
      conn: &'a Connection,
      statement_id: Option<u64>,
-+    busy_timeout: Option<BusyTimeoutContext>,
++    busy_timeout: Cell<BusyTimeoutState>,
      inner: Pin<Box<dyn Future<Output = T> + 'a>>,
  }
  
-@@ -12362,6 +12365,10 @@
+ impl<T> Future for FallbackStatementFuture<'_, T> {
+     type Output = T;
+@@ -12330,8 +12335,14 @@ statement future ownership
+         let previous = this.conn.fallback_statement_id.replace(this.statement_id);
          let _scope = FallbackStatementGuard {
              slot: &this.conn.fallback_statement_id,
              previous,
          };
-+        let _busy_scope = this
++        // GH#423: the future owns the budget. Never leave it installed on
++        // the connection across Pending, cancellation, completion, or unwind.
++        let _busy_timeout_scope = this
 +            .conn
 +            .statement_busy_timeout
-+            .enter(&mut this.busy_timeout);
++            .enter_poll(&this.busy_timeout);
          this.inner.as_mut().poll(cx)
      }
-@@ -13394,6 +13401,9 @@
+ }
+@@ -13400,6 +13411,9 @@ connection slot
      /// (`PRAGMA fsqlite.retry_slo_ms = <n>` to opt in). See
      /// `connection/conformal_retry.rs` for the coverage proof sketch.
      conformal_retry_budget: ConformalRetryBudgetCell,
-+    /// GH#423: a poll-scoped, lazily started budget shared by pager admission
-+    /// and whole-statement retry. Independent statement futures never share it.
-+    statement_busy_timeout: BusyTimeoutState,
++    /// GH#423: the retry window of the statement currently being polled.
++    /// Bootstrap, prepare refresh, and mandatory cleanup keep their own policy.
++    statement_busy_timeout: BusyTimeoutScope,
      // ── AAC-P6: Regenerative-renewal statement micro-batcher ────────────────
      /// PRAGMA fsqlite.stmt_microbatch — enable/disable the renewal-amortization
      /// ceremony coalescer for consecutive identical prepared-statement
-@@ -17000,9 +17010,10 @@
-             attach_env,
+@@ -17001,8 +17015,9 @@ first constructor
              attached_connections: RefCell::new(HashMap::new()),
              time_travel_snapshots: RefCell::new(Vec::new()),
              time_travel_active: Cell::new(false),
              time_travel_capture_enabled: Cell::new(true),
              conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
-+            statement_busy_timeout: BusyTimeoutState::default(),
++            statement_busy_timeout: BusyTimeoutScope::default(),
              // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
              // 16-row burst budget, 200 µs staleness deadline.
              stmt_microbatch_enabled: Cell::new(true),
-@@ -19000,9 +19011,10 @@
-             attached_connections: RefCell::new(HashMap::new()),
+@@ -19001,8 +19016,9 @@ second constructor
              // Time-travel MemDatabase snapshots (#23)
              time_travel_snapshots: RefCell::new(Vec::new()),
              time_travel_active: Cell::new(false),
              time_travel_capture_enabled: Cell::new(true),
+             time_travel_capture_enabled: Cell::new(true),
              conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
-+            statement_busy_timeout: BusyTimeoutState::default(),
++            statement_busy_timeout: BusyTimeoutScope::default(),
              // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
              // 16-row burst budget, 200 µs staleness deadline.
              stmt_microbatch_enabled: Cell::new(true),
-@@ -22000,7 +22012,8 @@
+@@ -22002,8 +22018,9 @@ future factory
+         inner: Pin<Box<dyn Future<Output = T> + 'a>>,
      ) -> FallbackStatementFuture<'a, T> {
          FallbackStatementFuture {
              conn: self,
              statement_id: None,
-+            busy_timeout: None,
++            busy_timeout: Cell::new(BusyTimeoutState::Unstarted),
              inner,
          }
      }
-@@ -24912,13 +24925,15 @@
-         let mut last_was_recovery = match pager.begin(cx, mode).await {
-             Ok(txn) => return Ok(txn),
-             Err(FrankenError::BusyRecovery) => true,
-             Err(FrankenError::Busy) => false,
+@@ -24914,12 +24931,17 @@ pager admission retry
              Err(err) => return Err(err),
          };
  
-+        // GH#423: admission and whole-statement replay spend one budget.
          let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
 -        let deadline = Duration::from_millis(busy_timeout_ms);
--        let started = Instant::now();
-+        let (started, deadline) = self
++        // The first admission attempt above remains unconditional, even
++        // for zero timeout. A later layer must not restart this busy window.
++        let window = self
 +            .statement_busy_timeout
-+            .timing(Duration::from_millis(busy_timeout_ms));
++            .window(Duration::from_millis(busy_timeout_ms));
++        // Preserve the conformal cap's existing per-loop elapsed-time policy.
+         let started = Instant::now();
          let mut handoff = BeginBusyRetryHandoff::default();
  
-         while let Some(wait) = handoff.next_wait(started, deadline) {
-@@ -37000,13 +37015,16 @@
-             // The failed autocommit dispatch has restored its prior state (the
-             // PRAGMA case that motivated bd-tc8u7 restores its PRAGMA state; a
-             // read has none), so retry the whole statement on the same
+-        while let Some(wait) = handoff.next_wait(started, deadline) {
++        while let Some(wait) = handoff.next_wait(window.started, window.timeout) {
+             // Conformal SLO cap: if the predicted total commit latency at
+             // miscoverage α already exceeds the configured SLO, stop
+             // retrying and surface BUSY immediately rather than wasting
+@@ -27483,6 +27505,19 @@ ad-hoc prepared owner
+     async fn execute_prepared_autocommit_with_conflict_retry(
++        &self,
++        stmt: &PreparedStatement<'_>,
++        params: &[SqliteValue],
++    ) -> Result<usize> {
++        // execute_impl's ad-hoc prepared fast lane has no enclosing
++        // FallbackStatementFuture. Keep ONE owner around the entire retry
++        // loop, not one fresh owner per completed admission/dispatch attempt.
++        self.statement_busy_timeout
++            .scope(self.execute_prepared_autocommit_with_conflict_retry_in_scope(stmt, params))
++            .await
++    }
++
++    async fn execute_prepared_autocommit_with_conflict_retry_in_scope(
+         &self,
+         stmt: &PreparedStatement<'_>,
+         params: &[SqliteValue],
+     ) -> Result<usize> {
+         let autocommit_entry = self.autocommit_conflict_retry_boundary();
+@@ -27510,11 +27545,13 @@ prepared retry window
+         {
+             return result;
+         }
+         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+-        let deadline = Duration::from_millis(busy_timeout_ms);
++        let window = self
++            .statement_busy_timeout
++            .window(Duration::from_millis(busy_timeout_ms));
+         let started = Instant::now();
+         let mut handoff = BeginBusyRetryHandoff::default();
+-        while let Some(wait) = handoff.next_wait(started, deadline) {
++        while let Some(wait) = handoff.next_wait(window.started, window.timeout) {
+             // Conformal SLO cap, matching the commit-path busy loop: stop
+             // retrying once the latency SLO disqualifies further attempts.
+             if !self
+@@ -37018,11 +37055,16 @@ statement retry window
              // busy-timeout handoff used by GH #333. Explicit transactions remain
              // outside this boundary, and a non-transient error returns above
              // without a second attempt.
-+            // GH#423: admission may already have spent some or all of this
-+            // statement's allowance. Do not start a new clock after dispatch.
              let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
 -            let deadline = Duration::from_millis(busy_timeout_ms);
--            let started = Instant::now();
-+            let (started, deadline) = self
++            // GH#423: publication can start the window here; pager
++            // admission can already have exhausted it. Never grant a second
++            // full timeout after that inner retry returns Busy.
++            let window = self
 +                .statement_busy_timeout
-+                .timing(Duration::from_millis(busy_timeout_ms));
++                .window(Duration::from_millis(busy_timeout_ms));
+             let started = Instant::now();
              let mut handoff = BeginBusyRetryHandoff::default();
-             while let Some(wait) = handoff.next_wait(started, deadline) {
+-            while let Some(wait) = handoff.next_wait(started, deadline) {
++            while let Some(wait) = handoff.next_wait(window.started, window.timeout) {
                  if !self
                      .conformal_retry_budget
+                     .borrow()
+@@ -71600,12 +71642,14 @@ commit lock-escalation window
+             // Busy-retry loop for commit-path lock escalation.
+             if matches!(commit_res, Err(FrankenError::Busy)) {
+                 let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+-                if busy_timeout_ms > 0 {
+-                    let deadline = Duration::from_millis(busy_timeout_ms);
++                let window = self
++                    .statement_busy_timeout
++                    .window(Duration::from_millis(busy_timeout_ms));
++                if !window.timeout.is_zero() {
+                     let started = Instant::now();
+                     let mut handoff = BeginBusyRetryHandoff::default();
+ 
+-                    while let Some(wait) = handoff.next_wait(started, deadline) {
++                    while let Some(wait) = handoff.next_wait(window.started, window.timeout) {
+                         // Conformal SLO cap: if continuing to retry would
+                         // violate the user-configured latency SLO with
+                         // probability > α, stop now.  This is a policy
 diff --git a/crates/fsqlite-core/src/connection/busy_timeout.rs b/crates/fsqlite-core/src/connection/busy_timeout.rs
-new file mode 100644
---- /dev/null
+--- a/crates/fsqlite-core/src/connection/busy_timeout.rs
 +++ b/crates/fsqlite-core/src/connection/busy_timeout.rs
-@@ -0,0 +1,358 @@
-+//! One busy timeout per statement, shared by admission and whole-statement retry.
-+//!
-+//! GH#423: starting a fresh clock in each retry layer doubles a contended
-+//! `BEGIN IMMEDIATE`'s wait. The statement future owns its context; the
-+//! connection exposes it only during a poll. Nested execution on that
-+//! connection inherits the context; independent suspended futures keep separate
-+//! clocks. The clock starts on first contention, not on an uncontended dispatch.
-+
-+use std::cell::{Cell, RefCell};
-+use std::rc::Rc;
-+use std::time::Duration;
-+
-+use fsqlite_types::sync_primitives::Instant;
-+
-+type Timing = (Instant, Duration);
-+
-+#[derive(Clone, Default)]
-+pub(super) struct BusyTimeoutContext(Rc<Cell<Option<Timing>>>);
-+
-+#[derive(Default)]
-+pub(super) struct BusyTimeoutState {
-+    active: RefCell<Option<BusyTimeoutContext>>,
-+}
-+
-+impl BusyTimeoutState {
-+    /// Install a future's context for one poll. Choose its parent on the first
-+    /// poll, not at construction: constructing a future is not executing it.
-+    pub(super) fn enter(
-+        &self,
-+        saved: &mut Option<BusyTimeoutContext>,
-+    ) -> BusyTimeoutGuard<'_> {
-+        let context = saved.get_or_insert_with(|| self.active.borrow().clone().unwrap_or_default());
-+        let previous = self.active.replace(Some(context.clone()));
-+        BusyTimeoutGuard {
-+            state: self,
-+            previous,
-+        }
+@@ -10,8 +10,9 @@
+ //! The caller must still make its initial admission attempt when the timeout
+ //! is zero and must retain its existing error/idempotence/cancellation checks.
+ 
+ use std::cell::Cell;
++use std::future::{Future, poll_fn};
+ use std::time::Duration;
+ 
+ use fsqlite_types::sync_primitives::Instant;
+ 
+@@ -46,8 +47,21 @@
+     active: Cell<Option<BusyTimeoutState>>,
+ }
+ 
+ impl BusyTimeoutScope {
++    /// Own a window around a retry future, including entry points that bypass
++    /// the attributed statement dispatcher. Pinning here needs no allocation.
++    /// The connection slot is restored before a poll returns, including Pending.
++    pub(super) async fn scope<F: Future>(&self, future: F) -> F::Output {
++        let owned = Cell::new(BusyTimeoutState::Unstarted);
++        let mut future = std::pin::pin!(future);
++        poll_fn(|cx| {
++            let _poll = self.enter_poll(&owned);
++            future.as_mut().poll(cx)
++        })
++        .await
 +    }
 +
-+    /// Return the original start and allowance, never a replenished budget.
-+    /// Outside statement dispatch (for example, connection bootstrap), the
-+    /// caller retains its existing independent retry-loop budget.
-+    #[must_use]
-+    pub(super) fn timing(&self, timeout: Duration) -> (Instant, Duration) {
-+        self.timing_at(timeout, Instant::now())
-+    }
-+
-+    fn timing_at(&self, timeout: Duration, now: Instant) -> Timing {
-+        let active = self.active.borrow();
-+        let Some(context) = active.as_ref() else {
-+            return (now, timeout);
-+        };
-+        if let Some(timing) = context.0.get() {
-+            return timing;
-+        }
-+        let timing = (now, timeout);
-+        context.0.set(Some(timing));
-+        timing
-+    }
-+}
-+
-+#[must_use = "keep the busy-timeout guard alive for exactly one poll"]
-+pub(super) struct BusyTimeoutGuard<'a> {
-+    state: &'a BusyTimeoutState,
-+    previous: Option<BusyTimeoutContext>,
-+}
-+
-+impl Drop for BusyTimeoutGuard<'_> {
-+    fn drop(&mut self) {
-+        self.state.active.replace(self.previous.take());
-+    }
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    fn remaining_at(timing: Timing, now: Instant) -> Duration {
-+        timing.1.saturating_sub(now.duration_since(timing.0))
-+    }
+     pub(super) fn enter_poll<'a>(
+         &'a self,
+         owned: &'a Cell<BusyTimeoutState>,
+     ) -> BusyTimeoutPollGuard<'a> {
+@@ -349,5 +363,90 @@
+         }
+         assert_eq!(parent.get(), BusyTimeoutState::Started(first));
+         assert_eq!(scope.active.get(), None);
+     }
+-}
 +
 +    #[test]
-+    fn issue423_admission_exhaustion_does_not_refill_outer_retry() {
-+        for timeout in [Duration::from_millis(250), Duration::from_secs(1)] {
-+            let state = BusyTimeoutState::default();
-+            let mut saved = None;
-+            let _scope = state.enter(&mut saved);
++    fn scoped_prepared_retry_inherits_a_completed_admission_window() {
++        for timeout in [Duration::from_millis(250), Duration::from_millis(1_000)] {
++            let scope = BusyTimeoutScope::default();
 +            let start = Instant::now();
-+            let admission = state.timing_at(timeout, start);
-+            let outer = state.timing_at(timeout, start + timeout);
-+            assert_eq!(outer, admission);
-+            assert_eq!(remaining_at(outer, start + timeout), Duration::ZERO);
++            let mut future = Box::pin(scope.scope(async {
++                assert_eq!(scope.active.get(), Some(BusyTimeoutState::Unstarted));
++                let admission = scope
++                    .scope(async { scope.window_with(timeout, || start) })
++                    .await;
++                let retry = scope.window_with(timeout, || {
++                    panic!("the completed admission must not grant a second timeout")
++                });
++                assert_eq!(retry, admission);
++                assert_eq!(remaining(retry, start + timeout), Duration::ZERO);
++            }));
++            // Constructing a future does not install a statement on the connection.
++            assert_eq!(scope.active.get(), None);
++            let mut cx = Context::from_waker(Waker::noop());
++            assert!(future.as_mut().poll(&mut cx).is_ready());
++            assert_eq!(scope.active.get(), None);
 +        }
 +    }
 +
 +    #[test]
-+    fn issue423_publication_and_nested_admission_share_only_the_remainder() {
-+        let state = BusyTimeoutState::default();
-+        let mut outer_saved = None;
-+        let mut inner_saved = None;
-+        let _outer_scope = state.enter(&mut outer_saved);
-+        let timeout = Duration::from_millis(100);
-+        let start = Instant::now();
-+        let publication = state.timing_at(timeout, start);
-+        {
-+            let _inner_scope = state.enter(&mut inner_saved);
-+            // Publication already consumed 70% before admission is reached.
-+            let now = start + Duration::from_millis(70);
-+            let admission = state.timing_at(timeout, now);
-+            assert_eq!(admission, publication);
-+            assert_eq!(remaining_at(admission, now), Duration::from_millis(30));
-+        }
-+        assert_eq!(state.timing_at(timeout, start + timeout), publication);
-+    }
-+
-+    #[test]
-+    fn issue423_first_contention_in_nested_execution_starts_parent_clock() {
-+        let state = BusyTimeoutState::default();
-+        let mut outer_saved = None;
-+        let mut inner_saved = None;
-+        let _outer_scope = state.enter(&mut outer_saved);
++    fn scoped_prepared_retry_isolates_pending_interleaving_and_cancellation() {
++        let scope = BusyTimeoutScope::default();
 +        let start = Instant::now();
 +        let timeout = Duration::from_millis(250);
-+        let admission = {
-+            let _inner_scope = state.enter(&mut inner_saved);
-+            state.timing_at(timeout, start)
-+        };
-+        assert_eq!(state.timing_at(timeout, start + timeout), admission);
-+    }
++        let now = Cell::new(start);
++        let mut first = Box::pin(scope.scope(poll_fn(|_| {
++            assert_eq!(scope.window_with(timeout, || now.get()).started, start);
++            Poll::<()>::Pending
++        })));
++        let mut cx = Context::from_waker(Waker::noop());
++        assert!(first.as_mut().poll(&mut cx).is_pending());
++        assert_eq!(scope.active.get(), None);
 +
-+    #[test]
-+    fn issue423_clock_is_lazy_and_zero_allowance_cannot_be_rearmed() {
-+        let state = BusyTimeoutState::default();
-+        let mut saved = None;
-+        let _scope = state.enter(&mut saved);
-+        assert!(saved.as_ref().unwrap().0.get().is_none());
-+        let start = Instant::now();
-+        let first = state.timing_at(Duration::ZERO, start);
-+        let later = state.timing_at(Duration::from_secs(1), start + Duration::from_secs(1));
-+        assert_eq!(later, first);
-+        assert_eq!(remaining_at(later, start), Duration::ZERO);
-+    }
-+
-+    #[test]
-+    fn issue423_standalone_admission_has_an_independent_budget() {
-+        let state = BusyTimeoutState::default();
-+        let start = Instant::now();
-+        let timeout = Duration::from_secs(1);
-+        assert_eq!(state.timing_at(timeout, start), (start, timeout));
-+        let later = start + timeout;
-+        assert_eq!(state.timing_at(timeout, later), (later, timeout));
-+        assert!(state.active.borrow().is_none());
-+    }
-+
-+    #[test]
-+    fn issue423_panic_restores_the_previously_active_context() {
-+        let state = BusyTimeoutState::default();
-+        let mut outer_saved = None;
-+        let _outer_scope = state.enter(&mut outer_saved);
-+        let start = Instant::now();
-+        let timeout = Duration::from_secs(1);
-+        let original = state.timing_at(timeout, start);
-+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+            let mut nested_saved = None;
-+            let _nested_scope = state.enter(&mut nested_saved);
-+            panic!("injected unwind while a nested statement is polled");
++        now.set(start + timeout);
++        let mut second = Box::pin(scope.scope(async {
++            let window = scope.window_with(timeout, || now.get());
++            assert_eq!(window.started, start + timeout);
++            assert_eq!(remaining(window, now.get()), timeout);
 +        }));
-+        assert!(panic.is_err());
-+        assert_eq!(state.timing_at(timeout, start + timeout), original);
++        assert!(second.as_mut().poll(&mut cx).is_ready());
++        assert_eq!(scope.active.get(), None);
++        assert!(first.as_mut().poll(&mut cx).is_pending());
++        assert_eq!(scope.active.get(), None);
++        drop(first);
++        assert_eq!(scope.active.get(), None);
++
++        let mut next = Box::pin(scope.scope(async {
++            assert_eq!(scope.window_with(timeout, || now.get()).started, now.get());
++        }));
++        assert!(next.as_mut().poll(&mut cx).is_ready());
++        assert_eq!(scope.active.get(), None);
 +    }
 +
 +    #[test]
-+    fn issue423_statement_wrapper_keeps_suspended_futures_independent() {
-+        use crate::connection::Connection;
-+        use std::future::{Future, poll_fn};
-+        use std::task::{Context, Poll, Waker};
++    fn scoped_prepared_retry_restores_the_slot_on_unwind() {
++        let scope = BusyTimeoutScope::default();
++        let start = Instant::now();
++        let timeout = Duration::from_millis(250);
++        let mut future = Box::pin(scope.scope(async {
++            let _ = scope.window_with(timeout, || start);
++            panic!("simulated prepared dispatch panic");
++        }));
++        let mut cx = Context::from_waker(Waker::noop());
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _ = future.as_mut().poll(&mut cx);
++        }));
++        assert!(result.is_err());
++        assert_eq!(scope.active.get(), None);
++        drop(future);
 +
-+        asupersync::test_utils::run_test(|| async {
-+            let conn = Connection::open(":memory:").await.unwrap();
-+            let timeout = Duration::from_millis(250);
-+            let start = Instant::now();
-+            let now = Cell::new(start);
-+            let observed_a = Cell::new(None);
-+            let observed_b = Cell::new(None);
-+            let finish_b = Cell::new(false);
-+            let mut a = Box::pin(conn.with_fallback_statement(Box::pin(poll_fn(|_| {
-+                let timing = conn.statement_busy_timeout.timing_at(timeout, now.get());
-+                if let Some(previous) = observed_a.replace(Some(timing)) {
-+                    assert_eq!(timing, previous);
-+                }
-+                Poll::<()>::Pending
-+            }))));
-+            let mut b = Box::pin(conn.with_fallback_statement(Box::pin(poll_fn(|_| {
-+                let timing = conn.statement_busy_timeout.timing_at(timeout, now.get());
-+                if let Some(previous) = observed_b.replace(Some(timing)) {
-+                    assert_eq!(timing, previous);
-+                }
-+                if finish_b.get() {
-+                    Poll::Ready(())
-+                } else {
-+                    Poll::Pending
-+                }
-+            }))));
-+            let mut cx = Context::from_waker(Waker::noop());
-+            assert!(a.as_mut().poll(&mut cx).is_pending());
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            now.set(start + timeout);
-+            assert!(b.as_mut().poll(&mut cx).is_pending());
-+            assert_ne!(observed_a.get(), observed_b.get());
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            now.set(start + timeout + timeout);
-+            assert!(a.as_mut().poll(&mut cx).is_pending());
-+            // Cancellation while another statement is suspended must not
-+            // restore the cancelled statement's context onto the connection.
-+            drop(a);
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            finish_b.set(true);
-+            assert!(b.as_mut().poll(&mut cx).is_ready());
-+            drop(b);
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            conn.with_fallback_statement(Box::pin(async {
-+                assert_eq!(
-+                    conn.statement_busy_timeout.timing_at(timeout, now.get()),
-+                    (now.get(), timeout)
-+                );
-+            }))
-+            .await;
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            conn.close().await.unwrap();
-+        });
++        let mut next = Box::pin(scope.scope(async {
++            assert_eq!(
++                scope.window_with(timeout, || start + timeout).started,
++                start + timeout
++            );
++        }));
++        assert!(next.as_mut().poll(&mut cx).is_ready());
++        assert_eq!(scope.active.get(), None);
 +    }
++}
+diff --git a/crates/fsqlite-core/src/connection/busy_timeout_integration_tests.rs b/crates/fsqlite-core/src/connection/busy_timeout_integration_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fsqlite-core/src/connection/busy_timeout_integration_tests.rs
+@@ -0,0 +1,203 @@
++//! GH#423: exercise the actual connection wrapper, not just its budget helper.
++//!
++//! Keep these private-connection tests separate from busy_timeout.rs: that
++//! portable helper is also included by path from an external integration test.
 +
-+    #[test]
-+    fn issue423_statement_wrapper_shares_the_parent_budget() {
-+        use crate::connection::Connection;
++use super::Connection;
++#[cfg(feature = "native")]
++use super::busy_timeout::{BusyTimeoutState, BusyTimeoutWindow};
++#[cfg(feature = "native")]
++use fsqlite_types::sync_primitives::Instant;
++use std::cell::Cell;
++use std::future::{Future, poll_fn};
++use std::task::{Context, Poll, Waker};
++use std::time::Duration;
 +
-+        asupersync::test_utils::run_test(|| async {
-+            let conn = Connection::open(":memory:").await.unwrap();
-+            let timeout = Duration::from_secs(1);
-+            let start = Instant::now();
++fn assert_no_installed_budget(conn: &Connection) {
++    // Outside a poll, window() must return a local zero window, not the
++    // positive window left behind by a suspended or completed statement.
++    assert!(
++        conn.statement_busy_timeout
++            .window(Duration::ZERO)
++            .timeout
++            .is_zero()
++    );
++}
++
++#[test]
++fn issue423_statement_wrapper_keeps_suspended_futures_independent() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let observed_a = Cell::new(None);
++        let observed_b = Cell::new(None);
++        let finish_b = Cell::new(false);
++        let mut a = Box::pin(conn.with_fallback_statement(Box::pin(poll_fn(|_| {
++            let window = conn
++                .statement_busy_timeout
++                .window(Duration::from_millis(250));
++            if let Some(previous) = observed_a.replace(Some(window)) {
++                assert_eq!(window, previous);
++            }
++            Poll::<()>::Pending
++        }))));
++        let mut b = Box::pin(conn.with_fallback_statement(Box::pin(poll_fn(|_| {
++            let window = conn.statement_busy_timeout.window(Duration::from_secs(1));
++            assert_eq!(window.timeout, Duration::from_secs(1));
++            if let Some(previous) = observed_b.replace(Some(window)) {
++                assert_eq!(window, previous);
++            }
++            if finish_b.get() {
++                Poll::Ready(())
++            } else {
++                Poll::Pending
++            }
++        }))));
++        let mut cx = Context::from_waker(Waker::noop());
++        assert!(a.as_mut().poll(&mut cx).is_pending());
++        assert_no_installed_budget(&conn);
++        assert!(b.as_mut().poll(&mut cx).is_pending());
++        assert_ne!(observed_a.get(), observed_b.get());
++        assert_no_installed_budget(&conn);
++        assert!(a.as_mut().poll(&mut cx).is_pending());
++        drop(a);
++        assert_no_installed_budget(&conn);
++        finish_b.set(true);
++        assert!(b.as_mut().poll(&mut cx).is_ready());
++        drop(b);
++        assert_no_installed_budget(&conn);
++        conn.with_fallback_statement(Box::pin(async {
++            assert_eq!(
++                conn.statement_busy_timeout
++                    .window(Duration::from_secs(2))
++                    .timeout,
++                Duration::from_secs(2)
++            );
++        }))
++        .await;
++        assert_no_installed_budget(&conn);
++        conn.close().await.unwrap();
++    });
++}
++
++#[test]
++fn issue423_statement_wrapper_shares_the_parent_budget() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        conn.with_fallback_statement(Box::pin(async {
++            let original = conn.statement_busy_timeout.window(Duration::from_secs(1));
 +            conn.with_fallback_statement(Box::pin(async {
-+                let original = conn.statement_busy_timeout.timing_at(timeout, start);
-+                conn.with_fallback_statement(Box::pin(async {
-+                    assert_eq!(
-+                        conn.statement_busy_timeout.timing_at(timeout, start + timeout),
-+                        original
-+                    );
-+                }))
-+                .await;
 +                assert_eq!(
-+                    conn.statement_busy_timeout.timing_at(timeout, start + timeout),
++                    conn.statement_busy_timeout.window(Duration::from_secs(5)),
 +                    original
 +                );
 +            }))
 +            .await;
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            conn.close().await.unwrap();
-+        });
-+    }
++            assert_eq!(
++                conn.statement_busy_timeout.window(Duration::from_secs(5)),
++                original
++            );
++        }))
++        .await;
++        assert_no_installed_budget(&conn);
++        conn.close().await.unwrap();
++    });
++}
 +
-+    #[test]
-+    fn issue423_future_constructed_in_parent_but_polled_later_is_independent() {
-+        use crate::connection::Connection;
-+
-+        asupersync::test_utils::run_test(|| async {
-+            let conn = Connection::open(":memory:").await.unwrap();
-+            let timeout = Duration::from_secs(1);
-+            let start = Instant::now();
-+            let later = start + timeout;
-+            let conn_ref = &conn;
-+            let deferred = conn_ref
-+                .with_fallback_statement(Box::pin(async move {
-+                    conn_ref.statement_busy_timeout.timing_at(timeout, start);
-+                    conn_ref.with_fallback_statement(Box::pin(async move {
-+                        assert_eq!(
-+                            conn_ref.statement_busy_timeout.timing_at(timeout, later),
-+                            (later, timeout)
-+                        );
-+                    }))
++#[test]
++fn issue423_future_constructed_in_parent_but_polled_later_is_independent() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let conn_ref = &conn;
++        let deferred = conn_ref
++            .with_fallback_statement(Box::pin(async move {
++                let _ = conn_ref
++                    .statement_busy_timeout
++                    .window(Duration::from_millis(250));
++                conn_ref.with_fallback_statement(Box::pin(async move {
++                    assert_eq!(
++                        conn_ref
++                            .statement_busy_timeout
++                            .window(Duration::from_secs(1))
++                            .timeout,
++                        Duration::from_secs(1)
++                    );
 +                }))
-+                .await;
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            deferred.await;
-+            assert!(conn.statement_busy_timeout.active.borrow().is_none());
-+            conn.close().await.unwrap();
-+        });
-+    }
++            }))
++            .await;
++        assert_no_installed_budget(&conn);
++        deferred.await;
++        assert_no_installed_budget(&conn);
++        conn.close().await.unwrap();
++    });
++}
 +
-+    #[cfg(feature = "native")]
-+    #[test]
-+    fn issue423_real_admission_after_publication_uses_remaining_time() {
-+        use crate::connection::Connection;
-+        use fsqlite_error::FrankenError;
++#[cfg(feature = "native")]
++#[test]
++fn issue423_real_admission_after_publication_uses_remaining_time() {
++    use fsqlite_error::FrankenError;
 +
-+        asupersync::test_utils::run_test(|| async {
-+            let dir = tempfile::tempdir().unwrap();
-+            let path = dir.path().join("issue423_shared_deadline.db");
-+            let path = path.to_str().unwrap();
-+            let holder = Connection::open(path).await.unwrap();
-+            holder.execute("PRAGMA journal_mode=WAL").await.unwrap();
-+            holder.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
-+            holder.execute("CREATE TABLE t(v INTEGER)").await.unwrap();
-+            let waiter = Connection::open(path).await.unwrap();
-+            waiter.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
-+            waiter.execute("PRAGMA busy_timeout=1000").await.unwrap();
-+            holder.execute("BEGIN IMMEDIATE").await.unwrap();
-+            holder.execute("INSERT INTO t VALUES(1)").await.unwrap();
++    asupersync::test_utils::run_test(|| async {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("issue423_shared_deadline.db");
++        let path = path.to_str().unwrap();
++        let holder = Connection::open(path).await.unwrap();
++        holder.execute("PRAGMA journal_mode=WAL").await.unwrap();
++        holder.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
++        holder.execute("CREATE TABLE t(v INTEGER)").await.unwrap();
++        let waiter = Connection::open(path).await.unwrap();
++        waiter.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
++        waiter.execute("PRAGMA busy_timeout=1000").await.unwrap();
++        holder.execute("BEGIN IMMEDIATE").await.unwrap();
++        holder.execute("INSERT INTO t VALUES(1)").await.unwrap();
 +
-+            let started = Instant::now();
-+            // Model an earlier publication-bind phase spending 750 ms without
-+            // sleeping or racing a checkpointer. The remaining admission and
-+            // outer retry are the real BEGIN IMMEDIATE execution paths.
-+            let publication_start = started
-+                .checked_sub(Duration::from_millis(750))
-+                .expect("monotonic clock supports the simulated prior phase");
-+            let result = waiter
-+                .with_fallback_statement(Box::pin(async {
-+                    waiter
-+                        .statement_busy_timeout
-+                        .timing_at(Duration::from_secs(1), publication_start);
-+                    waiter.execute("BEGIN IMMEDIATE").await
-+                }))
-+                .await;
-+            let elapsed = started.elapsed();
-+            let waiter_open = waiter.in_transaction();
-+            let holder_open = holder.in_transaction();
-+            let context_restored = waiter.statement_busy_timeout.active.borrow().is_none();
-+            if waiter_open {
-+                waiter.execute("ROLLBACK").await.unwrap();
-+            }
-+            holder.execute("ROLLBACK").await.unwrap();
-+            waiter.execute("BEGIN IMMEDIATE").await.unwrap();
++        let started = Instant::now();
++        // Seed the actual future's window as though publication spent 750 ms.
++        // The admission and outer retry below are real BEGIN execution paths.
++        let publication_start = started
++            .checked_sub(Duration::from_millis(750))
++            .expect("monotonic clock supports the simulated prior phase");
++        let future = waiter.with_fallback_statement(Box::pin(waiter.execute("BEGIN IMMEDIATE")));
++        future
++            .busy_timeout
++            .set(BusyTimeoutState::Started(BusyTimeoutWindow {
++                started: publication_start,
++                timeout: Duration::from_secs(1),
++            }));
++        let result = future.await;
++        let elapsed = started.elapsed();
++        let waiter_open = waiter.in_transaction();
++        let holder_open = holder.in_transaction();
++        let restored = waiter
++            .statement_busy_timeout
++            .window(Duration::ZERO)
++            .timeout
++            .is_zero();
++        if waiter_open {
 +            waiter.execute("ROLLBACK").await.unwrap();
-+            waiter.close().await.unwrap();
-+            holder.close().await.unwrap();
-+            assert!(
-+                matches!(
-+                    &result,
-+                    Err(
-+                        FrankenError::Busy
-+                            | FrankenError::BusyRecovery
-+                            | FrankenError::BusySnapshot { .. }
-+                    )
-+                ),
-+                "held writer must refuse BEGIN with a busy-family error: {result:?}"
-+            );
-+            assert!(!waiter_open, "a refused BEGIN must not leave a transaction");
-+            assert!(holder_open, "the waiter must not end the holder's transaction");
-+            assert!(context_restored, "the completed poll must restore its context");
-+            assert!(
-+                elapsed >= Duration::from_millis(200)
-+                    && elapsed <= Duration::from_millis(600),
-+                "GH#423: admission after 750 ms of a 1000 ms budget took {elapsed:?}; \
-+                 expected approximately the remaining 250 ms, not another full budget"
-+            );
-+        });
-+    }
++        }
++        holder.execute("ROLLBACK").await.unwrap();
++        waiter.execute("BEGIN IMMEDIATE").await.unwrap();
++        waiter.execute("ROLLBACK").await.unwrap();
++        waiter.close().await.unwrap();
++        holder.close().await.unwrap();
++        assert!(
++            matches!(
++                &result,
++                Err(
++                    FrankenError::Busy
++                        | FrankenError::BusyRecovery
++                        | FrankenError::BusySnapshot { .. }
++                )
++            ),
++            "held writer must refuse BEGIN with a busy-family error: {result:?}"
++        );
++        assert!(!waiter_open, "a refused BEGIN must not leave a transaction");
++        assert!(holder_open, "the waiter must not end the holder's transaction");
++        assert!(restored, "the completed poll must restore its context");
++        assert!(
++            elapsed >= Duration::from_millis(200) && elapsed <= Duration::from_millis(600),
++            "GH#423: admission after 750 ms of a 1000 ms budget took {elapsed:?}; \
++             expected approximately the remaining 250 ms, not another full budget"
++        );
++    });
 +}
