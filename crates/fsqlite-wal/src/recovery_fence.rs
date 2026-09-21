@@ -16,21 +16,23 @@
 //!    [`crate::execute_checkpoint`].
 //! 3. [`PidOwnedLockRegistry`] — lightweight PID tracker that pairs every
 //!    lock acquisition with the owning PID and exposes
-//!    `release_dead_pid_locks` for recovery start-up. Uses the `/proc`-based
-//!    liveness probe shared with MVCC lifecycle (`process_alive_os`).
+//!    `release_dead_pid_locks` for recovery start-up. Uses the conservative
+//!    VFS process-liveness probe, preserving registrations on unknown outcomes.
 //! 4. [`verify_checkpoint_checksum_prefix`] — verifies on-disk DB checksums
 //!    match the computed post-checkpoint state before truncating the WAL. On
 //!    mismatch, truncate is refused and the caller surfaces an
 //!    `UnrecoverableError`.
 //!
-//! All four are orthogonal and composable: [`execute_recovery_barrier`]
-//! wires them together for the common "about to truncate WAL" call-site.
+//! [`execute_recovery_barrier`] combines full DB sync and the optional XXH3
+//! trailer verifier. Callers still own fencing and completeness of the expected
+//! page set. The main checkpoint executor has a separate full-page read-back
+//! comparison; this helper is only for pages with the XXH3 reserved trailer.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::PageNumber;
+use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_types::sync_primitives::Mutex;
@@ -381,33 +383,19 @@ impl PidOwnedLockRegistry {
     }
 }
 
-/// OS-level liveness probe.
+/// Conservative PID-only OS liveness probe.
 ///
-/// On `unix`, checks `/proc/<pid>` existence. On non-unix targets we
-/// conservatively report `true` so we never force-release a lock we cannot
-/// verify is stale.
-///
-/// Mirrors the design in `fsqlite_mvcc::lifecycle::process_alive_os`, but
-/// is kept here to avoid pulling `fsqlite-mvcc` into `fsqlite-wal`'s
-/// dependency graph.
+/// Uses the VFS tri-state probe and retains ownership on `Unknown`, including
+/// hidden or unreadable procfs entries. The registry has no birth token, so
+/// PID reuse cannot be proved here; a live recycled PID must retain the entry.
+/// Sharing this primitive avoids duplicating platform-specific death tests in
+/// the WAL layer without adding a dependency on `fsqlite-mvcc`.
 #[must_use]
 pub fn pid_alive_os(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let proc_root = std::path::Path::new("/proc");
-        if !proc_root.exists() {
-            return true; // conservative fallback
-        }
-        proc_root.join(pid.to_string()).exists()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    !matches!(
+        fsqlite_vfs::process::process_alive(pid, 0),
+        fsqlite_vfs::process::ProcessLiveness::Dead
+    )
 }
 
 fn next_sequence() -> u64 {
@@ -419,11 +407,11 @@ fn next_sequence() -> u64 {
 // Checkpoint checksum validation
 // ---------------------------------------------------------------------------
 
-/// Result of [`verify_checkpoint_checksum_prefix`].
+/// Result of checkpoint page verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointChecksumVerdict {
-    /// On-disk DB checksums match every expected post-checkpoint page.
-    /// WAL truncate is safe to proceed.
+    /// Every supplied page matches its expected post-checkpoint state.
+    /// The caller still owns fencing and completeness of the expected set.
     Match,
     /// At least one page's on-disk checksum differs from the expected
     /// post-checkpoint value. WAL truncate MUST NOT proceed; the caller
@@ -438,26 +426,28 @@ pub enum CheckpointChecksumVerdict {
 
 /// Expected page checksum from the post-checkpoint state.
 ///
-/// The caller typically produces these by hashing the WAL frame data that
-/// was just backfilled, before issuing the corresponding `write_page` call.
+/// The caller produces these from the authoritative pages before writing
+/// them, using the XXH3 reserved-trailer format of `write_page_checksum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpectedPageChecksum {
     /// Page that was written during checkpoint.
     pub page: PageNumber,
-    /// Expected value of `read_page_checksum(data)` after the write lands
-    /// on disk.
+    /// Expected payload digest, which must match both the stored trailer and
+    /// a fresh hash of the page body after read-back.
     pub checksum: crate::checksum::Xxh3Checksum128,
 }
 
-/// Verify that the on-disk DB checksums match the expected post-checkpoint
-/// state before truncating the WAL.
+/// Verify checksummed pages against the expected post-checkpoint state.
 ///
-/// Reads each listed page from `db_file` and hashes its trailer. Any
-/// mismatch returns [`CheckpointChecksumVerdict::Mismatch`] — the caller
-/// MUST refuse the truncate on this verdict, per the audit finding.
+/// Reads each listed page from `db_file`, recomputes its body checksum and
+/// checks the stored XXH3 trailer against both the body and expected digest.
+/// A matching trailer alone is not proof that the page body was written.
+/// Mismatch returns [`CheckpointChecksumVerdict::Mismatch`]; the caller MUST
+/// preserve the WAL. This helper is not for stock SQLite pages without the
+/// XXH3 reserved trailer, and does not acquire the caller's publication locks.
 ///
-/// `page_size` must be the true on-disk page size; `expected` lists the
-/// post-checkpoint state. Empty `expected` short-circuits to `Match`.
+/// Nonempty `expected` requires a valid SQLite `page_size`, checked before
+/// allocation or I/O. Empty `expected` short-circuits to `Match`.
 pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
     cx: &Cx,
     db_file: &F,
@@ -466,6 +456,12 @@ pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
 ) -> Result<CheckpointChecksumVerdict> {
     if expected.is_empty() {
         return Ok(CheckpointChecksumVerdict::Match);
+    }
+    if PageSize::new(page_size).is_none() {
+        return Err(FrankenError::OutOfRange {
+            what: "page size for checksum verify".to_owned(),
+            value: page_size.to_string(),
+        });
     }
     let page_size_usize = usize::try_from(page_size).map_err(|_| FrankenError::OutOfRange {
         what: "page size for checksum verify".to_owned(),
@@ -493,11 +489,14 @@ pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
             });
         }
         let observed = crate::checksum::read_page_checksum(&page_buf)?;
-        if observed != exp.checksum {
+        let payload_valid = crate::checksum::verify_page_checksum(&page_buf)?;
+        if observed != exp.checksum || !payload_valid {
             error!(
                 target: "fsqlite.wal.recovery_fence",
                 page = exp.page.get(),
-                "on-disk page checksum mismatch; refusing to truncate WAL"
+                trailer_matches_expected = observed == exp.checksum,
+                payload_valid,
+                "on-disk page body or checksum mismatch; refusing to truncate WAL"
             );
             return Ok(CheckpointChecksumVerdict::Mismatch {
                 first_bad_page: exp.page,
@@ -507,7 +506,7 @@ pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
     info!(
         target: "fsqlite.wal.recovery_fence",
         verified_pages = expected.len(),
-        "checkpoint checksum prefix verified; WAL truncate safe"
+        "checkpoint checksum prefix verified"
     );
     Ok(CheckpointChecksumVerdict::Match)
 }
@@ -519,9 +518,11 @@ pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
 /// One-shot convenience that (a) fsyncs the DB full, then (b) verifies the
 /// post-checkpoint checksum prefix.
 ///
-/// Returns `Ok(())` when the WAL truncate may proceed;
+/// Returns `Ok(())` when the supplied checksum evidence matches;
 /// `Err(FrankenError::DatabaseCorrupt)` on mismatch, matching the
 /// audit-requested "do not truncate; log unrecoverable-error" policy.
+/// The caller must supply the complete required page set and hold the
+/// appropriate publication/reset gates before acting on success.
 pub async fn execute_recovery_barrier<W, F>(
     cx: &Cx,
     target: &mut W,
@@ -738,6 +739,25 @@ mod tests {
         assert_eq!(remaining[0].page, page_live);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_process_probe_preserves_registered_locks() {
+        let registry = PidOwnedLockRegistry::new();
+        let sequence = registry.register(PageNumber::ONE, u32::MAX);
+        let invalid_sequence = registry.register(PageNumber::new(2).unwrap(), 0);
+        let released = registry.release_dead_pid_locks(pid_alive_os);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].sequence, invalid_sequence);
+        assert_eq!(
+            registry.snapshot(),
+            vec![PidOwnedLockEntry {
+                page: PageNumber::ONE,
+                pid: u32::MAX,
+                sequence,
+            }]
+        );
+    }
+
     #[test]
     fn pid_alive_os_current_pid_is_alive() {
         // Our own PID must always register as alive.
@@ -870,6 +890,127 @@ mod tests {
         let verdict =
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).expect("verify");
         assert_eq!(verdict, CheckpointChecksumVerdict::Match);
+    }
+
+    #[test]
+    fn verify_body_corruption_with_matching_trailer_refuses_barrier() {
+        let cx = test_cx();
+        for page_size in [512_u32, 4096, 65_536] {
+            for damaged_offset in [0, 100, page_size - 17] {
+                let vfs = MemoryVfs::new();
+                let file = open_db_file(&vfs, &cx);
+                let page = PageNumber::ONE;
+                let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
+                file.write(&cx, &[0x54], u64::from(damaged_offset)).unwrap();
+                let mut read_back = vec![0; usize::try_from(page_size).unwrap()];
+                assert_eq!(file.read(&cx, &mut read_back, 0).wait().unwrap(), read_back.len());
+                assert_eq!(crate::checksum::read_page_checksum(&read_back).unwrap(), checksum);
+                assert!(!crate::checksum::verify_page_checksum(&read_back).unwrap());
+                let expected = [ExpectedPageChecksum { page, checksum }];
+                assert_eq!(
+                    verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected)
+                        .wait().unwrap(),
+                    CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+                );
+                let mut target = SyncAuditTarget::default();
+                let error = execute_recovery_barrier(&cx, &mut target, &file, page_size, &expected)
+                    .wait().unwrap_err();
+                assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+                assert_eq!(target.sync_count, 1);
+                assert!(target.truncate_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn verify_rejects_trailer_corruption_and_internally_valid_stale_pages() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_db_file(&vfs, &cx);
+        let page = PageNumber::ONE;
+        let checksum = write_page_with_checksum(&cx, &file, 4096, page, 0xAB);
+        let expected = [ExpectedPageChecksum { page, checksum }];
+        // The body is intact but its stored checksum was damaged.
+        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).unwrap();
+        assert_eq!(
+            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
+            CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+        );
+        // A different, internally consistent body+trailer still cannot match
+        // the authoritative post-checkpoint digest supplied by the caller.
+        let other = write_page_with_checksum(&cx, &file, 4096, page, 0x11);
+        assert_ne!(other, checksum);
+        assert_eq!(
+            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
+            CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+        );
+    }
+
+    #[test]
+    fn verify_reports_corruption_and_short_reads_after_a_valid_prefix() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_db_file(&vfs, &cx);
+        let page_size = 512;
+        let mut expected = Vec::new();
+        for number in 1..=2 {
+            let page = PageNumber::new(number).unwrap();
+            let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
+            expected.push(ExpectedPageChecksum { page, checksum });
+        }
+        let mut third = vec![0xAB; 512];
+        let checksum = crate::checksum::write_page_checksum(&mut third).unwrap();
+        let third_page = PageNumber::new(3).unwrap();
+        expected.push(ExpectedPageChecksum { page: third_page, checksum });
+        file.write(&cx, &third[..256], 1024).unwrap();
+        file.write(&cx, &[0x54], 612).unwrap();
+        assert_eq!(
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
+            CheckpointChecksumVerdict::Mismatch { first_bad_page: PageNumber::new(2).unwrap() }
+        );
+        write_page_with_checksum(&cx, &file, page_size, PageNumber::new(2).unwrap(), 0xAB);
+        assert_eq!(
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
+            CheckpointChecksumVerdict::Mismatch { first_bad_page: third_page }
+        );
+        file.write(&cx, &third, 1024).unwrap();
+        assert_eq!(
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
+            CheckpointChecksumVerdict::Match
+        );
+    }
+
+    #[test]
+    fn verify_invalid_page_sizes_are_rejected_before_allocating_or_reading() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_db_file(&vfs, &cx);
+        let expected = [ExpectedPageChecksum {
+            page: PageNumber::ONE,
+            checksum: crate::checksum::Xxh3Checksum128 { low: 0, high: 0 },
+        }];
+        for page_size in [0, 1, 16, 511, 513, 65_537, u32::MAX] {
+            let result = verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait();
+            assert!(matches!(result, Err(FrankenError::OutOfRange { .. })));
+        }
+    }
+
+    #[test]
+    fn recovery_barrier_requires_both_sync_and_verified_page_contents() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_db_file(&vfs, &cx);
+        let page = PageNumber::ONE;
+        let checksum = write_page_with_checksum(&cx, &file, 512, page, 0xAB);
+        let expected = [ExpectedPageChecksum { page, checksum }];
+        let mut target = SyncAuditTarget::default();
+        execute_recovery_barrier(&cx, &mut target, &file, 512, &expected).wait().unwrap();
+        assert_eq!(target.sync_count, 1);
+        assert!(target.truncate_at.is_none(), "the barrier itself never truncates");
+        target.sync_should_fail = true;
+        let result = execute_recovery_barrier(&cx, &mut target, &file, 512, &expected).wait();
+        assert!(result.is_err(), "matching pages cannot override a failed sync");
+        assert!(target.truncate_at.is_none());
     }
 
     #[test]
@@ -1142,13 +1283,12 @@ mod tests {
         assert!(dbg_mismatch.contains("Mismatch"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn pid_alive_os_nonexistent_high_pid() {
-        #[cfg(unix)]
-        {
-            let high_pid = 4_000_000_000;
-            assert!(!pid_alive_os(high_pid));
-        }
+    fn pid_alive_os_out_of_range_pid_is_inconclusive() {
+        // Conversion must not turn this identifier into a negative process
+        // group argument. Unknown retains ownership, not proof of death.
+        assert!(pid_alive_os(4_000_000_000));
     }
 
     #[test]
