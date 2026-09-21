@@ -46,13 +46,37 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     async fn new(conn: &'a Connection) -> Result<Self, FrankenError> {
-        conn.begin_transaction().await?;
-        Ok(Self {
+        Self::new_with_begin(conn, conn.begin_transaction()).await
+    }
+
+    // Keep admission and its rollback ownership in one path. Tests can suspend
+    // or fail admission after real SQL without adding engine-global hooks.
+    async fn new_with_begin(
+        conn: &'a Connection,
+        begin: impl Future<Output = Result<(), FrankenError>>,
+    ) -> Result<Self, FrankenError> {
+        // Core begin_transaction settles a dropped wrapper before BEGIN. Do
+        // that same settlement before our ownership check, or a replacement
+        // transaction would spuriously fail NestedTransaction after Drop.
+        // An empty batch settles obligations but executes no SQL statements,
+        // invokes no row callbacks, and does not acquire a read snapshot.
+        conn.execute_batch("").await?;
+        if conn.in_transaction() {
+            return Err(FrankenError::NestedTransaction);
+        }
+
+        // Guard ownership BEFORE polling BEGIN: admission may leave an active
+        // transaction and then fail, or this future may be dropped while it is
+        // Pending. A live caller's transaction was excluded above.
+        let transaction = Self {
             conn,
             finalized: Cell::new(false),
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             retryable_abort: Cell::new(false),
-        })
+        };
+        transaction.observe_transaction_state(begin.await)?;
+        transaction.ensure_active()?;
+        Ok(transaction)
     }
 
     fn ensure_active(&self) -> Result<(), FrankenError> {
@@ -289,7 +313,12 @@ pub trait TransactionExt {
     /// The returned `Transaction` must be finalized by awaiting `commit()` or
     /// `rollback()`. Dropping it records a mandatory rollback obligation on
     /// the connection; the next SQL entry point completes that rollback before
-    /// executing the caller's statement.
+    /// executing the caller's statement. The same obligation protects failed
+    /// or abandoned BEGIN admission, before a wrapper has been returned.
+    ///
+    /// A previous abandoned wrapper is settled first. A still-live caller
+    /// transaction is refused without rolling it back. Do not use the
+    /// connection through another alias while construction is pending.
     fn transaction(&self) -> impl Future<Output = Result<Transaction<'_>, FrankenError>>;
 }
 
@@ -303,6 +332,148 @@ impl TransactionExt for Connection {
 mod tests {
     use super::*;
     use crate::compat::RowExt;
+
+    #[test]
+    fn new_transaction_settles_previous_abandoned_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let previous = conn.transaction().await.unwrap();
+            previous.execute("INSERT INTO data VALUES (1)").await.unwrap();
+            drop(previous);
+            assert!(conn.in_transaction(), "Drop records rather than executes rollback");
+
+            // No intervening query: transaction() itself must settle the old
+            // scope rather than treating the abandoned transaction as live.
+            let mut replacement = conn.transaction().await.unwrap();
+            assert!(replacement.query("SELECT value FROM data").await.unwrap().is_empty());
+            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            replacement.commit().await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+        });
+    }
+
+    #[test]
+    fn nested_transaction_refusal_preserves_live_wrapper() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let mut caller = conn.transaction().await.unwrap();
+            caller.execute("INSERT INTO data VALUES (7)").await.unwrap();
+            let refused = conn.transaction().await;
+            assert!(matches!(refused, Err(FrankenError::NestedTransaction)));
+            assert!(conn.in_transaction());
+            assert_eq!(
+                caller.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(7))
+            );
+            caller.commit().await.unwrap();
+            assert_eq!(conn.query("SELECT value FROM data").await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn failed_admission_retires_partial_transaction_before_next_begin() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let refused = Transaction::new_with_begin(&conn, async {
+                conn.begin_transaction().await?;
+                conn.execute("INSERT INTO data VALUES (1)").await?;
+                Err(FrankenError::Busy)
+            })
+            .await;
+            assert!(matches!(refused, Err(FrankenError::Busy)));
+            assert!(conn.in_transaction(), "failed admission must leave an owned cleanup obligation");
+
+            let mut replacement = conn.transaction().await.unwrap();
+            assert!(replacement.query("SELECT value FROM data").await.unwrap().is_empty());
+            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            replacement.commit().await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_admission_future_retires_partial_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            use std::future::{pending, poll_fn};
+            use std::task::Poll;
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let parked = Cell::new(false);
+            let mut admission = Box::pin(Transaction::new_with_begin(&conn, async {
+                conn.begin_transaction().await?;
+                conn.execute("INSERT INTO data VALUES (1)").await?;
+                parked.set(true);
+                pending::<Result<(), FrankenError>>().await
+            }));
+            poll_fn(|cx| {
+                assert!(admission.as_mut().poll(cx).is_pending());
+                if parked.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            assert!(conn.in_transaction());
+            drop(admission);
+
+            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(!conn.in_transaction());
+            let mut replacement = conn.transaction().await.unwrap();
+            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            replacement.commit().await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+        });
+    }
+
+    #[test]
+    fn admission_error_before_begin_does_not_poison_later_scope() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let refused = Transaction::new_with_begin(
+                &conn,
+                std::future::ready(Err(FrankenError::BusyRecovery)),
+            )
+            .await;
+            assert!(matches!(refused, Err(FrankenError::BusyRecovery)));
+            assert!(!conn.in_transaction());
+            let mut replacement = conn.transaction().await.unwrap();
+            replacement.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            replacement.execute("INSERT INTO data VALUES (3)").await.unwrap();
+            replacement.commit().await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(3))
+            );
+        });
+    }
+
+    #[test]
+    fn successful_admission_requires_an_active_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let refused = Transaction::new_with_begin(&conn, std::future::ready(Ok(()))).await;
+            assert!(matches!(refused, Err(FrankenError::NoActiveTransaction)));
+            assert!(!conn.in_transaction());
+            let mut replacement = conn.transaction().await.unwrap();
+            replacement.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            replacement.commit().await.unwrap();
+            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn transaction_commit() {
