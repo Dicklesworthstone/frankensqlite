@@ -458,6 +458,8 @@ impl CellRef {
     /// Parse a cell from the given page at the specified byte offset.
     ///
     /// `usable_size` is the usable page size (page_size - reserved_bytes).
+    /// Every cell byte, including child pointers and header varints, must fit
+    /// within both the supplied slice and this usable extent.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn parse(
         page: &[u8],
@@ -465,6 +467,10 @@ impl CellRef {
         page_type: BtreePageType,
         usable_size: u32,
     ) -> Result<Self> {
+        // Bound the input before decoding headers, not just payloads. Interior
+        // table cells return early without a payload check; otherwise their
+        // child/rowid could silently consume reserved checksum or codec bytes.
+        let page = &page[..page.len().min(usable_size as usize)];
         if cell_offset > page.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -828,9 +834,9 @@ pub const MIN_CELL_ALLOCATION: usize = 4;
 ///
 /// The [`MIN_CELL_ALLOCATION`] floor mirrors SQLite's `cellSizePtr` so that
 /// freeing and defragmentation account undersized leaf-index cells at their
-/// true allocated span. The floor is clamped at the usable-area boundary so a
-/// legacy tight-packed page (written before the floor existed) never yields a
-/// span past the page.
+/// true allocated span. The floor is clamped at the available usable-area
+/// boundary so a legacy tight-packed page (written before the floor existed)
+/// or a shorter supplied slice never yields a span past its available bytes.
 ///
 /// Unlike [`CellRef::parse`] + [`crate::payload::cell_on_page_size`], this
 /// helper reads only the varints it needs and avoids the overflow-page
@@ -844,13 +850,17 @@ pub const MIN_CELL_ALLOCATION: usize = 4;
 /// logical payload contents.
 ///
 /// Returns `Err(DatabaseCorrupt)` when the cell header varints are
-/// truncated or extend past the page.
+/// truncated or extend past the available usable portion of the page.
 pub fn cell_on_page_size_fast(
     page: &[u8],
     cell_offset: usize,
     page_type: BtreePageType,
     usable_size: u32,
 ) -> Result<usize> {
+    // Keep the same byte boundary as CellRef::parse, including the early
+    // interior-table return. A copying caller must never receive a span
+    // containing reserved bytes or bytes beyond a short input slice.
+    let page = &page[..page.len().min(usable_size as usize)];
     if cell_offset >= page.len() {
         return Err(FrankenError::DatabaseCorrupt {
             detail: "cell offset past end of page".to_owned(),
@@ -924,11 +934,11 @@ pub fn cell_on_page_size_fast(
     };
 
     // SQLite format floor (bd-bfnlm): every cell occupies at least
-    // MIN_CELL_ALLOCATION bytes of the content area. Clamp at the usable
-    // boundary so legacy tight-packed pages never report a span past the page.
+    // MIN_CELL_ALLOCATION bytes of the content area. Clamp at the available
+    // usable boundary, which may be shorter than the declared usable size.
     Ok(total
         .max(MIN_CELL_ALLOCATION)
-        .min(usable_size as usize - cell_offset))
+        .min(page.len() - cell_offset))
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +949,139 @@ pub fn cell_on_page_size_fast(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cell_parsers_reject_interior_cells_crossing_reserved_boundary() {
+        use fsqlite_types::serial_type::write_varint;
+
+        let page_type = BtreePageType::InteriorTable;
+        for page_size in [512_usize, 4096, 65536] {
+            let usable = page_size - 32;
+            for key in [0_u64, 127, 128, 16383, 16384, (1_u64 << 63) - 1, 1_u64 << 63, u64::MAX] {
+                let mut varint = [0_u8; 9];
+                let width = write_varint(&mut varint, key);
+                let mut encoded = 7_u32.to_be_bytes().to_vec();
+                encoded.extend_from_slice(&varint[..width]);
+                // Every proper prefix is physically completed by bytes in
+                // the reserved trailer. Neither parser may consume them.
+                for available in 0..=encoded.len() {
+                    let offset = usable - available;
+                    let mut page = vec![0xa5; page_size];
+                    page[offset..offset + encoded.len()].copy_from_slice(&encoded);
+                    let parsed = CellRef::parse(&page, offset, page_type, usable as u32);
+                    let sized = cell_on_page_size_fast(&page, offset, page_type, usable as u32);
+                    if available == encoded.len() {
+                        let cell = parsed.unwrap();
+                        assert_eq!(cell.left_child, PageNumber::new(7));
+                        assert_eq!(cell.rowid, Some(i64::from_be_bytes(key.to_be_bytes())));
+                        assert_eq!(cell.payload_offset, usable);
+                        assert_eq!(sized.unwrap(), encoded.len());
+                    } else {
+                        assert!(matches!(parsed, Err(FrankenError::DatabaseCorrupt { .. })),
+                            "page_size={page_size} key={key} available={available}");
+                        assert!(matches!(sized, Err(FrankenError::DatabaseCorrupt { .. })),
+                            "page_size={page_size} key={key} available={available}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cell_parsers_preserve_payload_and_overflow_boundaries() {
+        use fsqlite_types::serial_type::write_varint;
+
+        let usable = 4064_u32;
+        for page_type in [BtreePageType::LeafTable, BtreePageType::LeafIndex, BtreePageType::InteriorIndex] {
+            for payload_size in [8, max_local_payload(usable, page_type) + 1] {
+                let mut encoded = Vec::new();
+                if page_type.is_interior() {
+                    encoded.extend_from_slice(&7_u32.to_be_bytes());
+                }
+                let mut varint = [0_u8; 9];
+                let width = write_varint(&mut varint, u64::from(payload_size));
+                encoded.extend_from_slice(&varint[..width]);
+                if page_type.is_table() {
+                    let width = write_varint(&mut varint, u64::MAX);
+                    encoded.extend_from_slice(&varint[..width]);
+                }
+                let local = local_payload_size(payload_size, usable, page_type);
+                encoded.resize(encoded.len() + local as usize, 0xab);
+                let overflow = local < payload_size;
+                if overflow {
+                    encoded.extend_from_slice(&11_u32.to_be_bytes());
+                }
+                for spill in [0, 1] {
+                    let offset = usable as usize - encoded.len() + spill;
+                    let mut page = vec![0xa5; 4096];
+                    page[offset..offset + encoded.len()].copy_from_slice(&encoded);
+                    let parsed = CellRef::parse(&page, offset, page_type, usable);
+                    let sized = cell_on_page_size_fast(&page, offset, page_type, usable);
+                    if spill == 0 {
+                        let cell = parsed.unwrap();
+                        assert_eq!(cell.payload_size, payload_size);
+                        assert_eq!(cell.local_size, local);
+                        assert_eq!(cell.local_payload(&page), vec![0xab; local as usize]);
+                        assert_eq!(cell.overflow_page, if overflow { PageNumber::new(11) } else { None });
+                        assert_eq!(sized.unwrap(), encoded.len());
+                    } else {
+                        assert!(matches!(parsed, Err(FrankenError::DatabaseCorrupt { .. })));
+                        assert!(matches!(sized, Err(FrankenError::DatabaseCorrupt { .. })));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cell_parsers_limit_reads_and_allocation_floor_to_available_bytes() {
+        // The declared usable size is not permission to read or return a copy
+        // span beyond a shorter slice. Preserve parsing of complete synthetic
+        // cells without requiring a full page-sized allocation from callers.
+        let cases: &[(BtreePageType, &[u8])] = &[
+            (BtreePageType::InteriorTable, &[0, 0, 0, 7, 0x81, 0x01]),
+            (BtreePageType::LeafTable, &[0, 42]),
+            (BtreePageType::LeafIndex, &[0]),
+            (BtreePageType::InteriorIndex, &[0, 0, 0, 7, 0]),
+        ];
+        for &(page_type, encoded) in cases {
+            for end in 0..encoded.len() {
+                assert!(matches!(
+                    CellRef::parse(&encoded[..end], 0, page_type, 4096),
+                    Err(FrankenError::DatabaseCorrupt { .. })
+                ));
+                assert!(matches!(
+                    cell_on_page_size_fast(&encoded[..end], 0, page_type, 4096),
+                    Err(FrankenError::DatabaseCorrupt { .. })
+                ));
+            }
+            let cell = CellRef::parse(encoded, 0, page_type, 4096).unwrap();
+            assert_eq!(cell.payload_offset, encoded.len());
+            assert_eq!(cell_on_page_size_fast(encoded, 0, page_type, 4096).unwrap(), encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_cell_parsers_reject_offsets_outside_usable_extent() {
+        let page = [0_u8; 512];
+        for page_type in [
+            BtreePageType::LeafTable, BtreePageType::LeafIndex,
+            BtreePageType::InteriorTable, BtreePageType::InteriorIndex,
+        ] {
+            for offset in [480, 481, 511, 512, usize::MAX] {
+                assert!(matches!(
+                    CellRef::parse(&page, offset, page_type, 480),
+                    Err(FrankenError::DatabaseCorrupt { .. })
+                ));
+                assert!(matches!(
+                    cell_on_page_size_fast(&page, offset, page_type, 480),
+                    Err(FrankenError::DatabaseCorrupt { .. })
+                ));
+            }
+            assert!(CellRef::parse(&page, 0, page_type, 0).is_err());
+            assert!(cell_on_page_size_fast(&page, 0, page_type, 0).is_err());
+        }
+    }
 
     // -- Page type tests --
 
