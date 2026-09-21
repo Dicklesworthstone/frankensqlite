@@ -78,7 +78,7 @@ fn live_wal_capture_stays_frozen_while_peer_writes_and_repairs_restore_sql() {
     run(async {
         let dir = tempfile::tempdir().unwrap(); let cx = cx();
         let source = dir.path().join("source.db"); seed_database(&source);
-        let conn = Connection::open(&source.to_string_lossy()).await.unwrap();
+        let conn = Connection::open(&*source.to_string_lossy()).await.unwrap();
         conn.execute("PRAGMA journal_mode=WAL").await.unwrap();
         conn.execute("PRAGMA wal_autocheckpoint=0").await.unwrap();
         conn.execute("BEGIN").await.unwrap();
@@ -91,7 +91,7 @@ fn live_wal_capture_stays_frozen_while_peer_writes_and_repairs_restore_sql() {
         let manifest = sender.manifest().clone();
         assert!(manifest.blocks().len() > 1, "real multiblock database required");
         let expected_hash = sender.image_blake3();
-        let peer = Connection::open(&source.to_string_lossy()).await.unwrap();
+        let peer = Connection::open(&*source.to_string_lossy()).await.unwrap();
         let journal = dir.path().join("transfer.spool");
         let mut spool = SnapshotSpool::create(&cx, file(&cx, &journal, true), receiver(&manifest), FILE_CAP).await.unwrap();
         let mut advanced = false;
@@ -128,7 +128,7 @@ fn live_wal_capture_stays_frozen_while_peer_writes_and_repairs_restore_sql() {
         drop(image.into_file());
         assert_eq!(host_fs::read(&restored).unwrap(), host_fs::read(&frozen).unwrap());
         assert_sql_image(&restored, 3, 1); // WAL-committed state, not the stale main file or later writes.
-        let replica = Connection::open(&restored.to_string_lossy()).await.unwrap();
+        let replica = Connection::open(&*restored.to_string_lossy()).await.unwrap();
         let count = replica.query_row("SELECT count(*) FROM items WHERE generation=1").await.unwrap();
         assert_eq!(count.get(0), Some(&SqliteValue::Integer(3)));
         replica.execute("INSERT INTO items VALUES (4,1,zeroblob(10))").await.unwrap();
@@ -144,7 +144,7 @@ fn capture_refuses_own_uncommitted_transaction_without_changing_it() {
     run(async {
         let dir = tempfile::tempdir().unwrap(); let cx = cx();
         let source = dir.path().join("source.db"); seed_database(&source);
-        let conn = Connection::open(&source.to_string_lossy()).await.unwrap();
+        let conn = Connection::open(&*source.to_string_lossy()).await.unwrap();
         conn.execute("BEGIN").await.unwrap();
         conn.execute("UPDATE items SET generation=9").await.unwrap();
         let destination = dir.path().join("uncommitted.db");
@@ -162,7 +162,7 @@ fn capture_refuses_existing_namespaces_and_pre_cancelled_or_invalid_requests() {
     run(async {
         let dir = tempfile::tempdir().unwrap(); let cx = cx();
         let source = dir.path().join("source.db"); seed_database(&source);
-        let conn = Connection::open(&source.to_string_lossy()).await.unwrap();
+        let conn = Connection::open(&*source.to_string_lossy()).await.unwrap();
         let destination = dir.path().join("existing.db");
         host_fs::write(&destination, b"owned sentinel").unwrap();
         assert!(conn.capture_snapshot_transfer(&cx, &destination, config(), limits()).await.is_err());
