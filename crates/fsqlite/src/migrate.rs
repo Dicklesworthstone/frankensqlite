@@ -32,6 +32,35 @@ use crate::Connection;
 const MIGRATION_BUSY_RETRY_BACKOFF: Duration = Duration::from_millis(2);
 const MIGRATION_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
+// Own only transactions admitted by this migration attempt. The guard must
+// exist before BEGIN is polled: admission and finalization can both suspend.
+// As with compat::Transaction, Drop records an obligation rather than running
+// an executor or attempting asynchronous rollback from a destructor.
+struct MigrationAttempt<'a> {
+    conn: &'a Connection,
+    settled: bool,
+}
+
+impl<'a> MigrationAttempt<'a> {
+    fn new(conn: &'a Connection) -> Result<Self, FrankenError> {
+        if conn.in_transaction() {
+            return Err(FrankenError::NestedTransaction);
+        }
+        Ok(Self {
+            conn,
+            settled: false,
+        })
+    }
+}
+
+impl Drop for MigrationAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.conn.mark_transaction_cleanup_required();
+        }
+    }
+}
+
 /// A single schema migration with a version number, descriptive name, and SQL to execute.
 #[derive(Debug, Clone)]
 pub struct Migration {
@@ -106,11 +135,22 @@ impl MigrationRunner {
     /// transaction so that concurrent initializers on the same database
     /// serialize instead of racing to apply the same migration.
     ///
+    /// The connection must be idle and must not be used through another alias
+    /// until this future completes. An existing caller transaction is refused
+    /// without modifying it. Dropping an in-flight attempt records mandatory
+    /// deferred rollback before the connection's next SQL entry point.
+    ///
     /// # Errors
     ///
     /// Returns `FrankenError` if any SQL statement fails or the tracking
     /// table cannot be created/queried.
     pub async fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
+        // Check before even creating metadata: a failed nested BEGIN must not
+        // enter our rollback path and discard the caller's unrelated writes.
+        if conn.in_transaction() {
+            return Err(FrankenError::NestedTransaction);
+        }
+
         // Ensure the tracking table exists.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_migrations (\
@@ -239,10 +279,9 @@ impl MigrationRunner {
         conn: &Connection,
         migration: &Migration,
     ) -> Result<bool, FrankenError> {
-        if let Err(error) = conn.execute("BEGIN IMMEDIATE;").await {
-            return Err(Self::rollback_failed_attempt(conn, error).await);
-        }
+        let mut attempt = MigrationAttempt::new(conn)?;
         let result: Result<bool, FrankenError> = async {
+            conn.execute("BEGIN IMMEDIATE;").await?;
             if Self::version_is_applied(conn, migration.version).await? {
                 conn.execute("COMMIT;").await?;
                 return Ok(false);
@@ -254,10 +293,14 @@ impl MigrationRunner {
         }
         .await;
 
-        match result {
+        let result = match result {
             Ok(applied) => Ok(applied),
             Err(error) => Err(Self::rollback_failed_attempt(conn, error).await),
-        }
+        };
+        // Leave the guard armed if cleanup failed with an active transaction.
+        // It also stays armed when this future is dropped at any await above.
+        attempt.settled = !conn.in_transaction();
+        result
     }
 
     /// End a failed migration attempt before the caller decides whether the
@@ -315,6 +358,102 @@ mod tests {
         Connection::open(":memory:")
             .await
             .expect("in-memory connection should open")
+    }
+
+    #[test]
+    fn run_refuses_caller_transaction_without_creating_metadata_or_losing_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            conn.execute("CREATE TABLE caller_data(value INTEGER)").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("INSERT INTO caller_data VALUES (42)").await.unwrap();
+
+            for runner in [
+                MigrationRunner::new(),
+                MigrationRunner::new().add(1, "must_not_run", "CREATE TABLE forbidden(id INTEGER)"),
+            ] {
+                let error = runner.run(&conn).await.unwrap_err();
+                assert!(matches!(error, FrankenError::NestedTransaction));
+                assert!(conn.in_transaction());
+                assert!(conn.query(
+                    "SELECT name FROM sqlite_master WHERE name IN ('_schema_migrations', 'forbidden')",
+                ).await.unwrap().is_empty());
+                assert_eq!(conn.query_row("SELECT value FROM caller_data").await.unwrap().get(0),
+                    Some(&SqliteValue::Integer(42)));
+            }
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(conn.query("SELECT value FROM caller_data").await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn apply_one_once_refuses_nested_begin_without_rolling_back_caller() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            conn.execute("CREATE TABLE caller_data(value INTEGER)").await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("INSERT INTO caller_data VALUES (7)").await.unwrap();
+            let migration = Migration { version: 1, name: "unused", up_sql: "SELECT 1" };
+            let error = MigrationRunner::apply_one_once(&conn, &migration).await.unwrap_err();
+            assert!(matches!(error, FrankenError::NestedTransaction));
+            assert!(conn.in_transaction());
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(conn.query_row("SELECT value FROM caller_data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(7)));
+        });
+    }
+
+    #[test]
+    fn abandoned_attempt_rolls_back_schema_and_data_before_next_sql() {
+        asupersync::test_utils::run_test(|| async {
+            use std::cell::Cell;
+            use std::future::{Future, pending, poll_fn};
+            use std::task::Poll;
+
+            let conn = mem_conn().await;
+            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            let parked = Cell::new(false);
+            // Exercise the same owner used by apply_one_once, with a
+            // deterministic suspension after real transactional DDL and DML.
+            let mut attempt = Box::pin(async {
+                let _owner = MigrationAttempt::new(&conn).unwrap();
+                conn.execute("BEGIN IMMEDIATE").await.unwrap();
+                conn.execute("CREATE TABLE abandoned(id INTEGER)").await.unwrap();
+                conn.execute("INSERT INTO data VALUES (1)").await.unwrap();
+                parked.set(true);
+                pending::<()>().await;
+            });
+            poll_fn(|cx| {
+                assert!(attempt.as_mut().poll(cx).is_pending());
+                if parked.get() { Poll::Ready(()) } else { Poll::Pending }
+            }).await;
+            assert!(conn.in_transaction());
+            drop(attempt);
+
+            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(!conn.in_transaction());
+            assert!(conn.query("SELECT name FROM sqlite_master WHERE name = 'abandoned'")
+                .await.unwrap().is_empty());
+            conn.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            assert_eq!(conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2)));
+        });
+    }
+
+    #[test]
+    fn settled_migration_does_not_mark_a_later_caller_transaction_for_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            MigrationRunner::new()
+                .add(1, "create_data", "CREATE TABLE data(value INTEGER)")
+                .run(&conn).await.unwrap();
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("INSERT INTO data VALUES (99)").await.unwrap();
+            assert!(conn.in_transaction());
+            conn.execute("COMMIT").await.unwrap();
+            assert_eq!(conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(99)));
+        });
     }
 
     #[test]
