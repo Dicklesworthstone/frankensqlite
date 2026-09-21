@@ -12,6 +12,8 @@
 #[cfg(unix)]
 #[path = "bin/native/repair.rs"]
 mod repair;
+#[path = "native_recovery_publication.rs"]
+mod publication;
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -67,6 +69,10 @@ impl Options {
 /// this library never constructs an executor. Source data is not changed.
 /// Namespace admission may create lock/SHM companions. On failure a created
 /// destination is retained, never silently removed or certified complete.
+/// Export writes, syncs and readback run on that blocking pool as an owned
+/// operation. Dropping the awaiter after submission may leave a partial or
+/// complete destination; it does not revoke the worker's file ownership or
+/// certify completion without a returned receipt.
 pub async fn export_database(cx: &Cx, options: &Options) -> Result<ExportReport> {
     preflight(cx, options)?;
     recover_to_new_database(&NativeVfs::new(), cx, options).await
@@ -357,7 +363,7 @@ async fn capture_held(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Cap
 fn is_source_artifact(source: &Path, destination: &Path) -> bool {
     source == destination
         || RECOVERY_COMPANION_SUFFIXES.iter()
-            .any(|suffix| destination == companion(source, suffix))
+            .any(|suffix| destination == companion(source, suffix).as_path())
 }
 
 fn refuse_destination_artifacts(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
@@ -449,27 +455,14 @@ async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) ->
         Ok::<_, FrankenError>((image, replay.committed_frames(), replay.repaired_frame_nos().len(),
             pages, replay.certificate_anchors().len()))
     }).await?;
-    checkpoint(cx)?;
-    let mut output = host_fs::reserve_new_file(&options.destination)?;
-    let publication = (|| {
-        refuse_destination_artifacts(vfs, cx, &options.destination)?;
-        write_image(&mut output, cx, &image, |file| file.sync_all())?;
-        let digest = verify_image(&mut output, cx, &image)?;
-        vfs.sync_parent_directory(cx, &options.destination)?;
-        Ok::<_, FrankenError>(digest)
-    })();
-    let digest = match publication {
-        Ok(digest) => digest,
-        Err(error) => {
-            eprintln!("Destination retained at {}; export completion is NOT certified", options.destination.display());
-            return Err(error);
-        }
-    };
-    drop(output);
-    Ok(ExportReport {
-        destination: options.destination, pages, wal_frames, repaired_frames, certificate_anchors,
-        digest, repaired_in_place: false,
-    })
+    publication::publish(cx, publication::ExportImage {
+        destination: options.destination,
+        bytes: image,
+        pages,
+        wal_frames,
+        repaired_frames,
+        certificate_anchors,
+    }).await
 }
 
 #[cfg(test)]
