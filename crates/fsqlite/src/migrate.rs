@@ -23,7 +23,9 @@
 //! # }
 //! ```
 
+use fsqlite_ast::Statement;
 use fsqlite_error::FrankenError;
+use fsqlite_parser::Parser;
 use fsqlite_types::value::SqliteValue;
 use std::time::{Duration, Instant};
 
@@ -69,6 +71,10 @@ pub struct Migration {
     /// Human-readable migration name (e.g., "create_users_table").
     pub name: &'static str,
     /// SQL statements to execute, separated by semicolons.
+    ///
+    /// The runner owns the outer transaction. BEGIN, COMMIT/END, and ROLLBACK
+    /// without TO are rejected before any statement in this migration runs.
+    /// Nested SAVEPOINT, ROLLBACK TO, and RELEASE remain supported.
     pub up_sql: &'static str,
 }
 
@@ -85,9 +91,9 @@ pub struct MigrationResult {
 
 /// Builds and executes an ordered set of schema migrations against a [`Connection`].
 ///
-/// Migrations are tracked in a `_schema_migrations` table that records each
-/// applied version and its timestamp. Only migrations newer than the most
-/// recent applied version are executed.
+/// Migrations are tracked in `main._schema_migrations`, independently of any
+/// temporary table with the same name. Each missing version is applied, including
+/// gaps below the maximum recorded version in a mixed-binary migration history.
 #[derive(Debug, Clone)]
 pub struct MigrationRunner {
     migrations: Vec<Migration>,
@@ -124,12 +130,14 @@ impl MigrationRunner {
 
     /// Runs all pending migrations against the given connection.
     ///
-    /// Creates the `_schema_migrations` tracking table if it does not exist.
-    /// Determines the current schema version, then applies each migration
-    /// whose version exceeds the current version, in order.
+    /// Creates the `main._schema_migrations` tracking table if it does not
+    /// exist, then applies each missing version in order.
     ///
     /// Each migration runs inside a transaction: if any statement fails,
     /// the entire migration is rolled back and the error is returned.
+    /// The complete pending migration is parsed before executing its first
+    /// statement, so transaction-control SQL cannot commit a partial migration.
+    /// Already-applied migrations are not revalidated or executed.
     ///
     /// The runner re-checks each version from inside an `IMMEDIATE`
     /// transaction so that concurrent initializers on the same database
@@ -143,7 +151,9 @@ impl MigrationRunner {
     /// # Errors
     ///
     /// Returns `FrankenError` if any SQL statement fails or the tracking
-    /// table cannot be created/queried.
+    /// table cannot be created/queried. A pending migration that attempts to
+    /// own the outer transaction returns `FrankenError::FunctionError` with
+    /// the migration version and name; malformed SQL returns `ParseError`.
     pub async fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
         // Check before even creating metadata: a failed nested BEGIN must not
         // enter our rollback path and discard the caller's unrelated writes.
@@ -151,9 +161,9 @@ impl MigrationRunner {
             return Err(FrankenError::NestedTransaction);
         }
 
-        // Ensure the tracking table exists.
+        // Always bind metadata to the durable main database, not a TEMP shadow.
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+            "CREATE TABLE IF NOT EXISTS main._schema_migrations (\
                 version INTEGER PRIMARY KEY, \
                 name TEXT NOT NULL, \
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
@@ -184,12 +194,12 @@ impl MigrationRunner {
         })
     }
 
-    /// Reads `MAX(version)` from `_schema_migrations`, returning 0 if empty.
+    /// Reads `MAX(version)` from `main._schema_migrations`, returning 0 if empty.
     async fn read_current_version(conn: &Connection) -> Result<i64, FrankenError> {
         let started = Instant::now();
         loop {
             match conn
-                .query("SELECT MAX(version) FROM _schema_migrations;")
+                .query("SELECT MAX(version) FROM main._schema_migrations;")
                 .await
             {
                 Ok(rows) => {
@@ -215,7 +225,7 @@ impl MigrationRunner {
         loop {
             match conn
                 .query_with_params(
-                    "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+                    "SELECT 1 FROM main._schema_migrations WHERE version = ?1 LIMIT 1;",
                     &[SqliteValue::Integer(version)],
                 )
                 .await
@@ -327,11 +337,40 @@ impl MigrationRunner {
         }
     }
 
+    fn validate_migration_sql(migration: &Migration) -> Result<(), FrankenError> {
+        let (statements, errors) = Parser::from_sql(migration.up_sql).parse_all();
+        if let Some(error) = errors.first() {
+            return Err(FrankenError::ParseError {
+                offset: error.span.start as usize,
+                detail: error.to_string(),
+            });
+        }
+        // Inspect complete statements, not semicolon splitting or keyword
+        // searches: triggers, comments and quoted values can contain BEGIN/END.
+        // Inner savepoints cannot commit the runner's enclosing BEGIN.
+        let changes_outer_transaction = statements.iter().any(|statement| match statement {
+            Statement::Begin(_) | Statement::Commit => true,
+            Statement::Rollback(rollback) => rollback.to_savepoint.is_none(),
+            _ => false,
+        });
+        if changes_outer_transaction {
+            return Err(FrankenError::FunctionError(format!(
+                "migration {} ({}) contains transaction-control SQL: \
+                 the runner owns BEGIN, COMMIT/END and full ROLLBACK",
+                migration.version, migration.name,
+            )));
+        }
+        Ok(())
+    }
+
     /// Executes migration SQL and records the version, without transaction management.
     async fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
+        // Validate the entire batch before any of its effects. Checking only
+        // conn.in_transaction() afterwards is too late to undo a SQL COMMIT.
+        Self::validate_migration_sql(migration)?;
         conn.execute_batch(migration.up_sql).await?;
         conn.execute_with_params(
-            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
+            "INSERT INTO main._schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
                 SqliteValue::Text(migration.name.into()),
@@ -364,9 +403,13 @@ mod tests {
     fn run_refuses_caller_transaction_without_creating_metadata_or_losing_writes() {
         asupersync::test_utils::run_test(|| async {
             let conn = mem_conn().await;
-            conn.execute("CREATE TABLE caller_data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE caller_data(value INTEGER)")
+                .await
+                .unwrap();
             conn.execute("BEGIN").await.unwrap();
-            conn.execute("INSERT INTO caller_data VALUES (42)").await.unwrap();
+            conn.execute("INSERT INTO caller_data VALUES (42)")
+                .await
+                .unwrap();
 
             for runner in [
                 MigrationRunner::new(),
@@ -375,14 +418,27 @@ mod tests {
                 let error = runner.run(&conn).await.unwrap_err();
                 assert!(matches!(error, FrankenError::NestedTransaction));
                 assert!(conn.in_transaction());
-                assert!(conn.query(
-                    "SELECT name FROM sqlite_master WHERE name IN ('_schema_migrations', 'forbidden')",
-                ).await.unwrap().is_empty());
-                assert_eq!(conn.query_row("SELECT value FROM caller_data").await.unwrap().get(0),
-                    Some(&SqliteValue::Integer(42)));
+                assert!(
+                    conn.query(
+                        "SELECT name FROM sqlite_master WHERE name IN ('_schema_migrations', 'forbidden')",
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+                );
+                assert_eq!(
+                    conn.query_row("SELECT value FROM caller_data")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Integer(42))
+                );
             }
             conn.execute("COMMIT").await.unwrap();
-            assert_eq!(conn.query("SELECT value FROM caller_data").await.unwrap().len(), 1);
+            assert_eq!(
+                conn.query("SELECT value FROM caller_data").await.unwrap().len(),
+                1
+            );
         });
     }
 
@@ -390,16 +446,31 @@ mod tests {
     fn apply_one_once_refuses_nested_begin_without_rolling_back_caller() {
         asupersync::test_utils::run_test(|| async {
             let conn = mem_conn().await;
-            conn.execute("CREATE TABLE caller_data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE caller_data(value INTEGER)")
+                .await
+                .unwrap();
             conn.execute("BEGIN").await.unwrap();
-            conn.execute("INSERT INTO caller_data VALUES (7)").await.unwrap();
-            let migration = Migration { version: 1, name: "unused", up_sql: "SELECT 1" };
-            let error = MigrationRunner::apply_one_once(&conn, &migration).await.unwrap_err();
+            conn.execute("INSERT INTO caller_data VALUES (7)")
+                .await
+                .unwrap();
+            let migration = Migration {
+                version: 1,
+                name: "unused",
+                up_sql: "SELECT 1",
+            };
+            let error = MigrationRunner::apply_one_once(&conn, &migration)
+                .await
+                .unwrap_err();
             assert!(matches!(error, FrankenError::NestedTransaction));
             assert!(conn.in_transaction());
             conn.execute("COMMIT").await.unwrap();
-            assert_eq!(conn.query_row("SELECT value FROM caller_data").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(7)));
+            assert_eq!(
+                conn.query_row("SELECT value FROM caller_data")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(7))
+            );
         });
     }
 
@@ -418,25 +489,38 @@ mod tests {
             let mut attempt = Box::pin(async {
                 let _owner = MigrationAttempt::new(&conn).unwrap();
                 conn.execute("BEGIN IMMEDIATE").await.unwrap();
-                conn.execute("CREATE TABLE abandoned(id INTEGER)").await.unwrap();
+                conn.execute("CREATE TABLE abandoned(id INTEGER)")
+                    .await
+                    .unwrap();
                 conn.execute("INSERT INTO data VALUES (1)").await.unwrap();
                 parked.set(true);
                 pending::<()>().await;
             });
             poll_fn(|cx| {
                 assert!(attempt.as_mut().poll(cx).is_pending());
-                if parked.get() { Poll::Ready(()) } else { Poll::Pending }
-            }).await;
+                if parked.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             assert!(conn.in_transaction());
             drop(attempt);
 
             assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
             assert!(!conn.in_transaction());
-            assert!(conn.query("SELECT name FROM sqlite_master WHERE name = 'abandoned'")
-                .await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT name FROM sqlite_master WHERE name = 'abandoned'")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             conn.execute("INSERT INTO data VALUES (2)").await.unwrap();
-            assert_eq!(conn.query_row("SELECT value FROM data").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(2)));
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2))
+            );
         });
     }
 
@@ -446,13 +530,220 @@ mod tests {
             let conn = mem_conn().await;
             MigrationRunner::new()
                 .add(1, "create_data", "CREATE TABLE data(value INTEGER)")
-                .run(&conn).await.unwrap();
+                .run(&conn)
+                .await
+                .unwrap();
             conn.execute("BEGIN").await.unwrap();
             conn.execute("INSERT INTO data VALUES (99)").await.unwrap();
             assert!(conn.in_transaction());
             conn.execute("COMMIT").await.unwrap();
-            assert_eq!(conn.query_row("SELECT value FROM data").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(99)));
+            assert_eq!(
+                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(99))
+            );
+        });
+    }
+
+    #[test]
+    fn transaction_control_is_rejected_before_any_migration_statement_runs() {
+        asupersync::test_utils::run_test(|| async {
+            for sql in [
+                "CREATE TABLE escaped(value INTEGER); COMMIT; INSERT INTO escaped VALUES (1);",
+                "CREATE TABLE escaped(value INTEGER); eNd TrAnSaCtIoN; INSERT INTO escaped VALUES (1);",
+                "CREATE TABLE escaped(value INTEGER); ROLLBACK; CREATE TABLE escaped(value INTEGER);",
+                "CREATE TABLE escaped(value INTEGER); /* nested */ BEGIN IMMEDIATE;",
+                "CREATE TABLE escaped(value INTEGER); -- premature publication\nCOMMIT; BEGIN;",
+            ] {
+                let conn = mem_conn().await;
+                let error = MigrationRunner::new()
+                    .add(1, "escape_attempt", sql)
+                    .run(&conn)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, FrankenError::FunctionError(ref message)
+                        if message.contains("transaction-control SQL")),
+                    "unexpected failure for {sql}: {error:?}"
+                );
+                assert!(!conn.in_transaction());
+                assert!(
+                    conn.query("SELECT name FROM sqlite_master WHERE name = 'escaped'")
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "no statement may run before the complete batch passes preflight: {sql}"
+                );
+                assert!(
+                    conn.query("SELECT version FROM main._schema_migrations")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn nested_savepoints_remain_inside_the_migration_transaction() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let result = MigrationRunner::new()
+                .add(
+                    1,
+                    "savepoint_body",
+                    "CREATE TABLE data(value INTEGER); \
+                     INSERT INTO data VALUES (1); \
+                     SAVEPOINT inner_step; \
+                     INSERT INTO data VALUES (2); \
+                     ROLLBACK TO inner_step; \
+                     RELEASE inner_step; \
+                     INSERT INTO data VALUES (3);",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
+            assert_eq!(result.applied, vec![1]);
+            assert!(!conn.in_transaction());
+            let rows = conn.query("SELECT value FROM data ORDER BY value").await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert_eq!(rows[1].get(0), Some(&SqliteValue::Integer(3)));
+        });
+    }
+
+    #[test]
+    fn trigger_bodies_comments_and_quoted_keywords_are_not_transaction_control() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            MigrationRunner::new()
+                .add(
+                    1,
+                    "trigger_body",
+                    "CREATE TABLE data(value INTEGER); \
+                     CREATE TABLE audit(value TEXT); \
+                     /* COMMIT; ROLLBACK; BEGIN; */ \
+                     CREATE TRIGGER record_insert AFTER INSERT ON data BEGIN \
+                         INSERT INTO audit VALUES ('BEGIN; COMMIT; ROLLBACK; END;'); \
+                     END; \
+                     INSERT INTO data VALUES (1);",
+                )
+                .run(&conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT value FROM audit").await.unwrap().get(0),
+                Some(&SqliteValue::Text("BEGIN; COMMIT; ROLLBACK; END;".into()))
+            );
+            assert!(!conn.in_transaction());
+        });
+    }
+
+    #[test]
+    fn malformed_tail_is_rejected_before_migration_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let error = MigrationRunner::new()
+                .add(1, "bad_tail", "CREATE TABLE escaped(value INTEGER); INSERT INTO")
+                .run(&conn)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, FrankenError::ParseError { .. }));
+            assert!(!conn.in_transaction());
+            assert!(
+                conn.query("SELECT name FROM sqlite_master WHERE name = 'escaped'")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT version FROM main._schema_migrations")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_migration_preserves_previously_committed_migrations() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            let error = MigrationRunner::new()
+                .add(1, "baseline", "CREATE TABLE baseline(value INTEGER); INSERT INTO baseline VALUES (9);")
+                .add(2, "premature_commit", "CREATE TABLE escaped(value INTEGER); COMMIT;")
+                .run(&conn)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, FrankenError::FunctionError(_)));
+            assert_eq!(
+                conn.query_row("SELECT value FROM baseline").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(9))
+            );
+            let versions = conn.query("SELECT version FROM main._schema_migrations")
+                .await.unwrap();
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].get(0), Some(&SqliteValue::Integer(1)));
+            assert!(
+                conn.query("SELECT name FROM sqlite_master WHERE name = 'escaped'")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn temp_tracking_table_cannot_shadow_durable_migration_history() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            conn.execute_batch(
+                "CREATE TEMP TABLE _schema_migrations(version INTEGER PRIMARY KEY, name TEXT); \
+                 INSERT INTO temp._schema_migrations VALUES (1, 'temporary_shadow');",
+            )
+            .await
+            .unwrap();
+            let runner = MigrationRunner::new()
+                .add(1, "durable", "CREATE TABLE durable_data(value INTEGER)");
+            let first = runner.run(&conn).await.unwrap();
+            assert!(first.was_fresh);
+            assert_eq!(first.applied, vec![1]);
+            assert_eq!(first.current, 1);
+            assert_eq!(
+                conn.query_row("SELECT name FROM main._schema_migrations")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("durable".into()))
+            );
+            assert_eq!(
+                conn.query_row("SELECT name FROM temp._schema_migrations")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("temporary_shadow".into()))
+            );
+            conn.execute("INSERT INTO durable_data VALUES (1)").await.unwrap();
+            let second = runner.run(&conn).await.unwrap();
+            assert!(second.applied.is_empty());
+            assert!(!second.was_fresh);
+        });
+    }
+
+    #[test]
+    fn already_applied_migration_sql_is_not_revalidated() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = mem_conn().await;
+            MigrationRunner::new().add(1, "baseline", "SELECT 1")
+                .run(&conn).await.unwrap();
+            let result = MigrationRunner::new()
+                .add(1, "historical", "COMMIT")
+                .add(2, "next", "SELECT 2")
+                .run(&conn)
+                .await
+                .unwrap();
+            assert_eq!(result.applied, vec![2]);
+            assert_eq!(result.current, 2);
+            assert!(!conn.in_transaction());
         });
     }
 
