@@ -5,10 +5,7 @@
   "golden_filename": "beads_viewer.db",
   "sha256_golden": "e80d29ccb19a796cda8caf4ac1c87c3f5df2a60f0735bc934b1da86a05f91835",
   "size_bytes": 6565888,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1603,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "beads",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["beads", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",
@@ -931,8 +923,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

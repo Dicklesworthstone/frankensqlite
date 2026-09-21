@@ -25,14 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "fts",
-    "many-indexes",
-    "medium",
-    "misc",
-    "page-size-4096",
-    "wal"
-  ],
+  "tags": ["fts", "many-indexes", "medium", "misc", "page-size-4096", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -741,10 +734,6 @@
     "ix_projects_human_key",
     "ix_projects_slug"
   ],
-  "triggers": [
-    "fts_messages_ad",
-    "fts_messages_ai",
-    "fts_messages_au"
-  ],
+  "triggers": ["fts_messages_ad", "fts_messages_ai", "fts_messages_au"],
   "views": []
 }

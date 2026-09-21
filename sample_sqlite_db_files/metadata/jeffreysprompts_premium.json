@@ -5,10 +5,7 @@
   "golden_filename": "jeffreysprompts_premium.db",
   "sha256_golden": "bfe77a7b8b4694548b2edb6f1e532b5f086a0d6015a9b73f7e3ec6b37e29553c",
   "size_bytes": 8364032,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 2042,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "many-indexes",
-    "misc",
-    "wal"
-  ],
+  "tags": ["large", "many-indexes", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

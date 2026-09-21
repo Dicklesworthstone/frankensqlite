@@ -25,15 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "fts",
-    "many-indexes",
-    "many-tables",
-    "medium",
-    "misc",
-    "page-size-4096",
-    "wal"
-  ],
+  "tags": ["fts", "many-indexes", "many-tables", "medium", "misc", "page-size-4096", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -1312,12 +1304,6 @@
     "idx_workflows_started",
     "idx_workflows_status"
   ],
-  "triggers": [
-    "output_segments_ad",
-    "output_segments_ai",
-    "output_segments_au"
-  ],
-  "views": [
-    "action_history"
-  ]
+  "triggers": ["output_segments_ad", "output_segments_ai", "output_segments_au"],
+  "views": ["action_history"]
 }

@@ -25,13 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "medium",
-    "misc",
-    "page-size-4096",
-    "vec0",
-    "wal"
-  ],
+  "tags": ["medium", "misc", "page-size-4096", "vec0", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -42,58 +36,217 @@
       "name": "api_keys",
       "row_count": 0,
       "columns": [
-        {"name": "id", "type": "INTEGER", "primary_key": true, "not_null": true, "default_value": null},
-        {"name": "key_hash", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "key_prefix", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "name", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "created_at", "type": "DATETIME", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "last_used_at", "type": "DATETIME", "primary_key": false, "not_null": false, "default_value": null},
-        {"name": "is_active", "type": "BOOLEAN", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "rate_limit", "type": "INTEGER", "primary_key": false, "not_null": false, "default_value": null},
-        {"name": "owner", "type": "VARCHAR", "primary_key": false, "not_null": false, "default_value": null}
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "key_hash",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "key_prefix",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_used_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "is_active",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rate_limit",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "owner",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
       ]
     },
     {
       "name": "runs",
       "row_count": 0,
       "columns": [
-        {"name": "id", "type": "VARCHAR", "primary_key": true, "not_null": true, "default_value": null},
-        {"name": "url", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "started_at", "type": "DATETIME", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "finished_at", "type": "DATETIME", "primary_key": false, "not_null": false, "default_value": null},
-        {"name": "status", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "cache_path", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "manifest_path", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null}
+        {
+          "name": "id",
+          "type": "VARCHAR",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "url",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "started_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "finished_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "cache_path",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "manifest_path",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
       ]
     },
     {
       "name": "links",
       "row_count": 0,
       "columns": [
-        {"name": "id", "type": "INTEGER", "primary_key": true, "not_null": true, "default_value": null},
-        {"name": "run_id", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "href", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "text", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "rel", "type": "VARCHAR", "primary_key": false, "not_null": false, "default_value": null},
-        {"name": "source", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null}
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "run_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "href",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "text",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rel",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "source",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
       ]
     },
     {
       "name": "webhooks",
       "row_count": 0,
       "columns": [
-        {"name": "id", "type": "INTEGER", "primary_key": true, "not_null": true, "default_value": null},
-        {"name": "job_id", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "url", "type": "VARCHAR", "primary_key": false, "not_null": true, "default_value": null},
-        {"name": "events", "type": "JSON", "primary_key": false, "not_null": false, "default_value": null},
-        {"name": "created_at", "type": "DATETIME", "primary_key": false, "not_null": true, "default_value": null}
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "job_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "url",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "events",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
       ]
     }
   ],
-  "indices": [
-    "ix_api_keys_key_hash",
-    "ix_api_keys_key_prefix"
-  ],
+  "indices": ["ix_api_keys_key_hash", "ix_api_keys_key_prefix"],
   "triggers": [],
   "views": [],
   "notes": "Contains vec0 virtual tables (section_embeddings) for vector search; profiling skipped vec0 shadow tables"

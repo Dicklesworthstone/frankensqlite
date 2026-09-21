@@ -5,10 +5,7 @@
   "golden_filename": "dp_level.db",
   "sha256_golden": "673acf23719e3406da902e78ed755658345506b284493ee8749f04831890a8ed",
   "size_bytes": 2985984,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 729,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "many-indexes",
-    "medium",
-    "misc",
-    "wal"
-  ],
+  "tags": ["many-indexes", "medium", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

@@ -5,10 +5,7 @@
   "golden_filename": "eidetic_memory.db",
   "sha256_golden": "4f50e7195e739fe28e12918c3423bc71436fa2b0003f6a6bb96be9c9ac1e5e8e",
   "size_bytes": 15175680,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 3705,
@@ -28,14 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "fts",
-    "large",
-    "many-indexes",
-    "misc",
-    "page-size-4096",
-    "wal"
-  ],
+  "tags": ["fts", "large", "many-indexes", "misc", "page-size-4096", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -1098,7 +1088,5 @@
     "trg_memlinks_rel_ins",
     "trg_memlinks_rel_up"
   ],
-  "views": [
-    "memories_meta"
-  ]
+  "views": ["memories_meta"]
 }

@@ -5,10 +5,7 @@
   "golden_filename": "destructive_command_guard.db",
   "sha256_golden": "118d9267785ca02e4d7b26b9812460ff726a385e5aa006463af41d729d3540d8",
   "size_bytes": 9871360,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 2410,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "many-indexes",
-    "misc",
-    "wal"
-  ],
+  "tags": ["large", "many-indexes", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

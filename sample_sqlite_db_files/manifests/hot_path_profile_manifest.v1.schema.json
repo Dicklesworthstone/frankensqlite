@@ -94,10 +94,7 @@
       "minLength": 1
     },
     "nullable_non_empty_string": {
-      "type": [
-        "string",
-        "null"
-      ],
+      "type": ["string", "null"],
       "minLength": 1
     },
     "string_list": {
@@ -141,10 +138,7 @@
     "command": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "tool",
-        "command_line"
-      ],
+      "required": ["tool", "command_line"],
       "properties": {
         "tool": {
           "$ref": "#/$defs/non_empty_string"
@@ -157,10 +151,7 @@
     "tool_version": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "tool",
-        "version"
-      ],
+      "required": ["tool", "version"],
       "properties": {
         "tool": {
           "$ref": "#/$defs/non_empty_string"
@@ -252,12 +243,7 @@
     "artifact_file": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "path",
-        "bytes",
-        "sha256",
-        "description"
-      ],
+      "required": ["path", "bytes", "sha256", "description"],
       "properties": {
         "path": {
           "$ref": "#/$defs/non_empty_string"

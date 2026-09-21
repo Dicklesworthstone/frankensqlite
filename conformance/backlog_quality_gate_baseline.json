@@ -3,16 +3,11 @@
   "entries": [
     {
       "issue_id": "bd-3plop.6",
-      "missing_requirements": [
-        "structured_logging"
-      ]
+      "missing_requirements": ["structured_logging"]
     },
     {
       "issue_id": "bd-mblr.7.1",
-      "missing_requirements": [
-        "unit_property_tests",
-        "structured_logging"
-      ]
+      "missing_requirements": ["unit_property_tests", "structured_logging"]
     }
   ]
 }

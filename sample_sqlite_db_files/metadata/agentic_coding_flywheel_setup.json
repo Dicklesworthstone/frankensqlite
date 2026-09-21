@@ -5,10 +5,7 @@
   "golden_filename": "agentic_coding_flywheel_setup.db",
   "sha256_golden": "6bef9ced8217337f7bf7196d1f3d8035752c67ec32c4952abc09ad6a0235c037",
   "size_bytes": 7966720,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1945,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "flywheel",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["flywheel", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

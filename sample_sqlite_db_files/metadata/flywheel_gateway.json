@@ -5,10 +5,7 @@
   "golden_filename": "flywheel_gateway.db",
   "sha256_golden": "89a42207ef62e498a535cf6e5a7ed412f32696f08b6d7912be6377f7530f4de7",
   "size_bytes": 13295616,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 3246,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "flywheel",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["flywheel", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

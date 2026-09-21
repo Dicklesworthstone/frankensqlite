@@ -12,14 +12,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "fts",
-        "many-indexes",
-        "medium",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["flywheel", "fts", "many-indexes", "medium", "page-size-4096", "wal"]
     },
     {
       "db_id": "agentic_coding_flywheel_setup",
@@ -32,12 +25,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["flywheel", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "asupersync",
@@ -50,12 +38,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "asupersync",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["asupersync", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "beads_rust_beads",
@@ -68,13 +51,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "beads",
-        "many-indexes",
-        "medium",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["beads", "many-indexes", "medium", "page-size-4096", "wal"]
     },
     {
       "db_id": "beads_viewer",
@@ -87,12 +64,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "beads",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["beads", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "brenner_bot",
@@ -105,12 +77,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "codexbar_build",
@@ -123,11 +90,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "medium",
-        "misc",
-        "page-size-4096"
-      ]
+      "tags": ["medium", "misc", "page-size-4096"]
     },
     {
       "db_id": "coding_agent_session_search",
@@ -140,12 +103,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "communitai_storage",
@@ -158,14 +116,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "fts",
-        "many-indexes",
-        "medium",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["fts", "many-indexes", "medium", "misc", "page-size-4096", "wal"]
     },
     {
       "db_id": "destructive_command_guard",
@@ -178,12 +129,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "dp_level",
@@ -196,12 +142,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "many-indexes",
-        "medium",
-        "misc",
-        "wal"
-      ]
+      "tags": ["many-indexes", "medium", "misc", "wal"]
     },
     {
       "db_id": "eidetic_memory",
@@ -214,14 +155,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "fts",
-        "large",
-        "many-indexes",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["fts", "large", "many-indexes", "misc", "page-size-4096", "wal"]
     },
     {
       "db_id": "fix_my_documents_backend",
@@ -234,12 +168,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["large", "misc", "page-size-4096", "wal"]
     },
     {
       "db_id": "flywheel_connectors",
@@ -252,12 +181,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["flywheel", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "flywheel_gateway",
@@ -270,12 +194,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["flywheel", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "flywheel_gateway_data",
@@ -288,13 +207,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "large",
-        "many-indexes",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["flywheel", "large", "many-indexes", "page-size-4096", "wal"]
     },
     {
       "db_id": "flywheel_private",
@@ -307,12 +220,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "flywheel",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["flywheel", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "frankensqlite",
@@ -325,12 +233,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "frankensqlite",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["frankensqlite", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "frankentui",
@@ -343,12 +246,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "frankentui",
-        "large",
-        "many-indexes",
-        "wal"
-      ]
+      "tags": ["frankentui", "large", "many-indexes", "wal"]
     },
     {
       "db_id": "historical_soldiers",
@@ -361,12 +259,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "jain_idea_analyzer_agent",
@@ -379,12 +272,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "jeffreys_skills_md",
@@ -397,12 +285,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "jeffreysprompts_premium",
@@ -415,12 +298,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "jsm",
@@ -433,12 +311,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "markdown_web_browser_runs",
@@ -451,13 +324,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "medium",
-        "misc",
-        "page-size-4096",
-        "vec0",
-        "wal"
-      ]
+      "tags": ["medium", "misc", "page-size-4096", "vec0", "wal"]
     },
     {
       "db_id": "mcp_agent_mail_storage",
@@ -470,14 +337,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "agent-mail",
-        "fts",
-        "large",
-        "many-indexes",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["agent-mail", "fts", "large", "many-indexes", "page-size-4096", "wal"]
     },
     {
       "db_id": "meta_skill",
@@ -490,12 +350,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "northwind",
@@ -508,11 +363,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "misc",
-        "page-size-4096"
-      ]
+      "tags": ["large", "misc", "page-size-4096"]
     },
     {
       "db_id": "ntm",
@@ -525,12 +376,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "remote_compilation_helper",
@@ -543,12 +389,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "many-indexes",
-        "misc",
-        "wal"
-      ]
+      "tags": ["large", "many-indexes", "misc", "wal"]
     },
     {
       "db_id": "smartedgar_factor_data",
@@ -561,12 +402,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "large",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["large", "misc", "page-size-4096", "wal"]
     },
     {
       "db_id": "smartedgar_risk_ops",
@@ -579,12 +415,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "many-indexes",
-        "medium",
-        "misc",
-        "page-size-4096"
-      ]
+      "tags": ["many-indexes", "medium", "misc", "page-size-4096"]
     },
     {
       "db_id": "toon_rust_storage",
@@ -597,14 +428,7 @@
         "user_version": 0,
         "application_id": 0
       },
-      "tags": [
-        "fts",
-        "many-indexes",
-        "medium",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["fts", "many-indexes", "medium", "misc", "page-size-4096", "wal"]
     },
     {
       "db_id": "wezterm_automata_wa",
@@ -617,15 +441,7 @@
         "user_version": 7,
         "application_id": 0
       },
-      "tags": [
-        "fts",
-        "many-indexes",
-        "many-tables",
-        "medium",
-        "misc",
-        "page-size-4096",
-        "wal"
-      ]
+      "tags": ["fts", "many-indexes", "many-tables", "medium", "misc", "page-size-4096", "wal"]
     }
   ]
 }

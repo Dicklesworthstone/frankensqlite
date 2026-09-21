@@ -5,10 +5,7 @@
   "golden_filename": "communitai_storage.db",
   "sha256_golden": "8cd3929fe0aa64fbde09f7dffb8a27456e289227b3449b25217ecc01485e1fda",
   "size_bytes": 159744,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 39,
@@ -28,14 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "fts",
-    "many-indexes",
-    "medium",
-    "misc",
-    "page-size-4096",
-    "wal"
-  ],
+  "tags": ["fts", "many-indexes", "medium", "misc", "page-size-4096", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -676,10 +666,6 @@
     "ix_projects_slug",
     "uq_agents_name_ci"
   ],
-  "triggers": [
-    "fts_messages_ad",
-    "fts_messages_ai",
-    "fts_messages_au"
-  ],
+  "triggers": ["fts_messages_ad", "fts_messages_ai", "fts_messages_au"],
   "views": []
 }

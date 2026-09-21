@@ -5,10 +5,7 @@
   "golden_filename": "frankentui.db",
   "sha256_golden": "ddf28ab6e9c272bb1cee80d11e6433c3945b6efbcb109d9fdeda34be6396f83e",
   "size_bytes": 8089600,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1975,
@@ -28,12 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "frankentui",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["frankentui", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",

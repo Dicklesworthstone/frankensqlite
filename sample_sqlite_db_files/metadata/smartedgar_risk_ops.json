@@ -25,12 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "many-indexes",
-    "medium",
-    "misc",
-    "page-size-4096"
-  ],
+  "tags": ["many-indexes", "medium", "misc", "page-size-4096"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",

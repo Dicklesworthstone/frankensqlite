@@ -16,15 +16,9 @@
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true,
     "paths": {
-      "@frankensqlite/core": [
-        "./packages/worker/src/core-module.d.ts"
-      ],
-      "@frankensqlite/worker": [
-        "./packages/worker/src/index.ts"
-      ],
-      "@frankensqlite/worker/*": [
-        "./packages/worker/src/*"
-      ]
+      "@frankensqlite/core": ["./packages/worker/src/core-module.d.ts"],
+      "@frankensqlite/worker": ["./packages/worker/src/index.ts"],
+      "@frankensqlite/worker/*": ["./packages/worker/src/*"]
     }
   }
 }

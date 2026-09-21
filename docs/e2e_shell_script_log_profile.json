@@ -1,12 +1,7 @@
 {
   "profile_version": "1.0.0",
   "log_schema_version": "1.0.0",
-  "required_fields": [
-    "run_id",
-    "timestamp",
-    "phase",
-    "event_type"
-  ],
+  "required_fields": ["run_id", "timestamp", "phase", "event_type"],
   "optional_fields": [
     "scenario_id",
     "seed",

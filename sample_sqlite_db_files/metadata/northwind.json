@@ -25,11 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "misc",
-    "page-size-4096"
-  ],
+  "tags": ["large", "misc", "page-size-4096"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",

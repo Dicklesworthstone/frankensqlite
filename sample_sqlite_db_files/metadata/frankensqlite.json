@@ -5,10 +5,7 @@
   "golden_filename": "frankensqlite.db",
   "sha256_golden": "74cca46d8b9364fb898e8aa9ad53a733c7dbf39d1d80771a35570a3a3f84f49f",
   "size_bytes": 10674176,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 2606,
@@ -28,12 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "frankensqlite",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["frankensqlite", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",

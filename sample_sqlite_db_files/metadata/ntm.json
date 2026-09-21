@@ -5,10 +5,7 @@
   "golden_filename": "ntm.db",
   "sha256_golden": "54ed55218773faf30f8fdcee4fc42db87a8afc6c071ceb38402f0e1ce192bc67",
   "size_bytes": 7168000,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1750,
@@ -28,12 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "many-indexes",
-    "misc",
-    "wal"
-  ],
+  "tags": ["large", "many-indexes", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",

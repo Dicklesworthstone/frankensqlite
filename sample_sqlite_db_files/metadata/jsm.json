@@ -5,10 +5,7 @@
   "golden_filename": "jsm.db",
   "sha256_golden": "45856f68596dcaf51c7934a652323778368d4c274bc217422481d7bf41145ceb",
   "size_bytes": 11345920,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 2770,
@@ -28,12 +25,7 @@
     "has_views": false,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "many-indexes",
-    "misc",
-    "wal"
-  ],
+  "tags": ["large", "many-indexes", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",

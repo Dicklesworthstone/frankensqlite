@@ -5,10 +5,7 @@
   "golden_filename": "asupersync.db",
   "sha256_golden": "8e91ff61cbbf4c63c68009e6dee7de0ac63f8e601d9555db3a4afbcb7f85acd0",
   "size_bytes": 12427264,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 3034,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "asupersync",
-    "large",
-    "many-indexes",
-    "wal"
-  ],
+  "tags": ["asupersync", "large", "many-indexes", "wal"],
   "safety": {
     "pii_risk": "unlikely",
     "secrets_risk": "unlikely",
@@ -932,8 +924,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

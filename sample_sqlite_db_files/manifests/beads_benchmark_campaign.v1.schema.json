@@ -104,26 +104,15 @@
     },
     "benchmark_mode": {
       "type": "string",
-      "enum": [
-        "sqlite_reference",
-        "fsqlite_mvcc",
-        "fsqlite_single_writer"
-      ]
+      "enum": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"]
     },
     "placement_profile_kind": {
       "type": "string",
-      "enum": [
-        "baseline",
-        "recommended_pinned",
-        "adversarial_topology"
-      ]
+      "enum": ["baseline", "recommended_pinned", "adversarial_topology"]
     },
     "placement_profile_availability": {
       "type": "string",
-      "enum": [
-        "universal",
-        "topology_aware"
-      ]
+      "enum": ["universal", "topology_aware"]
     },
     "placement_cpu_affinity_policy": {
       "type": "string",
@@ -135,19 +124,11 @@
     },
     "placement_smt_policy": {
       "type": "string",
-      "enum": [
-        "host_default",
-        "one_thread_per_core",
-        "avoid_primary_sibling_reuse"
-      ]
+      "enum": ["host_default", "one_thread_per_core", "avoid_primary_sibling_reuse"]
     },
     "placement_memory_policy": {
       "type": "string",
-      "enum": [
-        "host_default",
-        "bind_local",
-        "match_cross_domain_placement"
-      ]
+      "enum": ["host_default", "bind_local", "match_cross_domain_placement"]
     },
     "placement_helper_lane_policy": {
       "type": "string",
@@ -159,29 +140,20 @@
     },
     "placement_suite_selector_kind": {
       "type": "string",
-      "enum": [
-        "matrix_placement_variant"
-      ]
+      "enum": ["matrix_placement_variant"]
     },
     "placement_focused_rerun_selector_kind": {
       "type": "string",
-      "enum": [
-        "explicit_bindings"
-      ]
+      "enum": ["explicit_bindings"]
     },
     "placement_violation_disposition": {
       "type": "string",
-      "enum": [
-        "not_comparable"
-      ]
+      "enum": ["not_comparable"]
     },
     "placement_suite_selection_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "selector_kind",
-        "selector_field"
-      ],
+      "required": ["selector_kind", "selector_field"],
       "properties": {
         "selector_kind": {
           "$ref": "#/$defs/placement_suite_selector_kind"
@@ -194,10 +166,7 @@
     "placement_focused_rerun_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "selector_kind",
-        "required_bindings"
-      ],
+      "required": ["selector_kind", "required_bindings"],
       "properties": {
         "selector_kind": {
           "$ref": "#/$defs/placement_focused_rerun_selector_kind"
@@ -214,11 +183,7 @@
     "placement_claim_contract": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "mandatory_for",
-        "optional_for",
-        "avoid_for"
-      ],
+      "required": ["mandatory_for", "optional_for", "avoid_for"],
       "properties": {
         "mandatory_for": {
           "type": "array",
@@ -309,40 +274,24 @@
     },
     "retention_class": {
       "type": "string",
-      "enum": [
-        "quick_run",
-        "full_proof",
-        "failure_bundle",
-        "final_scorecard"
-      ]
+      "enum": ["quick_run", "full_proof", "failure_bundle", "final_scorecard"]
     },
     "hardware_os_family": {
       "type": "string",
-      "enum": [
-        "linux"
-      ]
+      "enum": ["linux"]
     },
     "hardware_cpu_architecture": {
       "type": "string",
-      "enum": [
-        "x86_64"
-      ]
+      "enum": ["x86_64"]
     },
     "hardware_topology_class": {
       "type": "string",
-      "enum": [
-        "any",
-        "many_core_numa"
-      ]
+      "enum": ["any", "many_core_numa"]
     },
     "hardware_class_id_fields": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "os_family",
-        "cpu_arch",
-        "topology_class"
-      ],
+      "required": ["os_family", "cpu_arch", "topology_class"],
       "properties": {
         "os_family": {
           "$ref": "#/$defs/hardware_os_family"
@@ -441,13 +390,7 @@
     "hardware_class": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "id_fields",
-        "min_logical_cores",
-        "min_numa_nodes",
-        "description"
-      ],
+      "required": ["id", "id_fields", "min_logical_cores", "min_numa_nodes", "description"],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
@@ -460,10 +403,7 @@
           "minimum": 1
         },
         "min_numa_nodes": {
-          "type": [
-            "integer",
-            "null"
-          ],
+          "type": ["integer", "null"],
           "minimum": 1
         },
         "description": {
@@ -474,13 +414,7 @@
     "retry_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "max_busy_retries",
-        "busy_backoff_ms",
-        "busy_backoff_max_ms",
-        "notes"
-      ],
+      "required": ["id", "max_busy_retries", "busy_backoff_ms", "busy_backoff_max_ms", "notes"],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
@@ -505,12 +439,7 @@
     "build_profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "cargo_profile",
-        "cargo_args",
-        "notes"
-      ],
+      "required": ["id", "cargo_profile", "cargo_args", "notes"],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
@@ -532,12 +461,7 @@
     "seed_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "id",
-        "kind",
-        "base_seed",
-        "notes"
-      ],
+      "required": ["id", "kind", "base_seed", "notes"],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
@@ -557,11 +481,7 @@
     "placement_variant": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "placement_profile_id",
-        "hardware_class_id",
-        "required"
-      ],
+      "required": ["placement_profile_id", "hardware_class_id", "required"],
       "properties": {
         "placement_profile_id": {
           "$ref": "#/$defs/id"
@@ -699,13 +619,7 @@
     "retention_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "class",
-        "description",
-        "superseded_by_newer",
-        "immutable",
-        "authoritative"
-      ],
+      "required": ["class", "description", "superseded_by_newer", "immutable", "authoritative"],
       "properties": {
         "class": {
           "$ref": "#/$defs/retention_class"

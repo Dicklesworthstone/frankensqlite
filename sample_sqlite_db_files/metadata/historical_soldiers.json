@@ -5,10 +5,7 @@
   "golden_filename": "historical_soldiers.db",
   "sha256_golden": "37b1f93e010cfb591e7f220df56a7cb96acb8b6b2f02315b2fb3821fd9100591",
   "size_bytes": 5279744,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1289,
@@ -28,12 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "large",
-    "many-indexes",
-    "misc",
-    "wal"
-  ],
+  "tags": ["large", "many-indexes", "misc", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -931,8 +923,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }

@@ -87,22 +87,11 @@
           "report_host_default_memory_policy",
           "disclose_helper_lane_policy_without_relocation"
         ],
-        "optional_knobs": [
-          "exact_scheduler_chosen_cpu_set",
-          "extra_profiler_capture"
-        ],
+        "optional_knobs": ["exact_scheduler_chosen_cpu_set", "extra_profiler_capture"],
         "claim_contract": {
-          "mandatory_for": [
-            "portable_baseline_claims",
-            "host_default_regression_checks"
-          ],
-          "optional_for": [
-            "smoke_reruns"
-          ],
-          "avoid_for": [
-            "transferable_many_core_win_claims",
-            "cross_node_sensitivity_claims"
-          ]
+          "mandatory_for": ["portable_baseline_claims", "host_default_regression_checks"],
+          "optional_for": ["smoke_reruns"],
+          "avoid_for": ["transferable_many_core_win_claims", "cross_node_sensitivity_claims"]
         },
         "violation_disposition": "not_comparable"
       }
@@ -157,16 +146,9 @@
           "extra_profiler_capture"
         ],
         "claim_contract": {
-          "mandatory_for": [
-            "transferable_many_core_win_claims",
-            "final_scorecard_primary_claims"
-          ],
-          "optional_for": [
-            "topology_aware_smoke_reruns"
-          ],
-          "avoid_for": [
-            "portable_baseline_claims"
-          ]
+          "mandatory_for": ["transferable_many_core_win_claims", "final_scorecard_primary_claims"],
+          "optional_for": ["topology_aware_smoke_reruns"],
+          "avoid_for": ["portable_baseline_claims"]
         },
         "violation_disposition": "not_comparable"
       }
@@ -221,17 +203,9 @@
           "extra_profiler_capture"
         ],
         "claim_contract": {
-          "mandatory_for": [
-            "cross_node_sensitivity_claims",
-            "placement_regression_guard_claims"
-          ],
-          "optional_for": [
-            "stress_reruns"
-          ],
-          "avoid_for": [
-            "headline_speedup_claims",
-            "portable_baseline_claims"
-          ]
+          "mandatory_for": ["cross_node_sensitivity_claims", "placement_regression_guard_claims"],
+          "optional_for": ["stress_reruns"],
+          "avoid_for": ["headline_speedup_claims", "portable_baseline_claims"]
         },
         "violation_disposition": "not_comparable"
       }
@@ -274,10 +248,7 @@
     {
       "id": "release_perf",
       "cargo_profile": "release-perf",
-      "cargo_args": [
-        "--profile",
-        "release-perf"
-      ],
+      "cargo_args": ["--profile", "release-perf"],
       "notes": "Canonical build profile for many-core performance evidence in Track A."
     }
   ],

@@ -8,23 +8,14 @@
       "change_groups": [
         {
           "summary": "Introduced the comprehensive V1 specification as a new, authoritative single-source document covering architecture, MVCC, RaptorQ, file format, SQL coverage, and testing.",
-          "categories": [
-            6,
-            4,
-            7,
-            8,
-            9
-          ],
+          "categories": [6, 4, 7, 8, 9],
           "primary_category": 6,
           "confidence": 0.62,
           "evidence": [
             "new file mode 100644",
             "+# COMPREHENSIVE SPECIFICATION FOR FRANKENSQLITE V1"
           ],
-          "changed_headings": [
-            "0. How to Read This Document",
-            "1. Project Identity"
-          ]
+          "changed_headings": ["0. How to Read This Document", "1. Project Identity"]
         }
       ]
     },
@@ -33,12 +24,7 @@
       "change_groups": [
         {
           "summary": "Promoted SSI to V1 concurrent mode and expanded MVCC structures with SIREAD tracking, sharded lock tables, and intent logs for deterministic rebase and merge policy.",
-          "categories": [
-            1,
-            4,
-            7,
-            8
-          ],
+          "categories": [1, 4, 7, 8],
           "primary_category": 4,
           "confidence": 0.72,
           "evidence": [
@@ -53,38 +39,25 @@
         },
         {
           "summary": "Added explicit crash model and formalized Compatibility vs Native operating modes with durable marker rules.",
-          "categories": [
-            4,
-            6,
-            7
-          ],
+          "categories": [4, 6, 7],
           "primary_category": 4,
           "confidence": 0.64,
           "evidence": [
             "+### 7.9 Crash Model (Explicit Contract):",
             "+### 7.10 Two Operating Modes"
           ],
-          "changed_headings": [
-            "7.9 Crash Model (Explicit Contract)",
-            "7.10 Two Operating Modes"
-          ]
+          "changed_headings": ["7.9 Crash Model (Explicit Contract)", "7.10 Two Operating Modes"]
         },
         {
           "summary": "Threaded `Cx` through storage and pager traits to make I/O and blocking operations cancelable and deadline-aware.",
-          "categories": [
-            7,
-            3
-          ],
+          "categories": [7, 3],
           "primary_category": 7,
           "confidence": 0.58,
           "evidence": [
             "+fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags)",
             "+fn commit(&self, cx: &Cx, txn: Transaction) -> Result<()>"
           ],
-          "changed_headings": [
-            "9. Trait Hierarchy",
-            "9.1 Storage Traits"
-          ]
+          "changed_headings": ["9. Trait Hierarchy", "9.1 Storage Traits"]
         }
       ]
     },
@@ -93,54 +66,36 @@
       "change_groups": [
         {
           "summary": "Reframed RaptorQ decoding guarantees to avoid hard-coded probabilities and require recoverable failure handling with monitoring.",
-          "categories": [
-            8,
-            1,
-            9
-          ],
+          "categories": [8, 1, 9],
           "primary_category": 8,
           "confidence": 0.67,
           "evidence": [
             "+**Decoding Failure Behavior (Normative):**",
             "+Correctness MUST NOT depend on decoding succeeding with exactly `K` symbols."
           ],
-          "changed_headings": [
-            "3.2 How RaptorQ Works (Essential Understanding)"
-          ]
+          "changed_headings": ["3.2 How RaptorQ Works (Essential Understanding)"]
         },
         {
           "summary": "Corrected SQLite legacy behaviors and details (WAL reader limit and integer overflow semantics).",
-          "categories": [
-            2,
-            1
-          ],
+          "categories": [2, 1],
           "primary_category": 2,
           "confidence": 0.6,
           "evidence": [
             "+caps the number of simultaneously active reader locks via `WAL_NREADER`",
             "+promote to REAL (floating point) rather than wrapping."
           ],
-          "changed_headings": [
-            "2.1 The Problem"
-          ]
+          "changed_headings": ["2.1 The Problem"]
         },
         {
           "summary": "Aligned asupersync module paths and API examples; clarified feature-flag placement and harness notes.",
-          "categories": [
-            3,
-            5,
-            9
-          ],
+          "categories": [3, 5, 9],
           "primary_category": 3,
           "confidence": 0.58,
           "evidence": [
             "+src/raptorq/gf256.rs        -- GF(256) arithmetic",
             "+Feature flags MUST live on a real package manifest"
           ],
-          "changed_headings": [
-            "3.3 Asupersync's RaptorQ Implementation",
-            "8.5 Feature Flags"
-          ]
+          "changed_headings": ["3.3 Asupersync's RaptorQ Implementation", "8.5 Feature Flags"]
         }
       ]
     },
@@ -149,11 +104,7 @@
       "change_groups": [
         {
           "summary": "Added non-negotiable scope doctrine, normative language rules, and a formal glossary to eliminate V1-scope escape hatches.",
-          "categories": [
-            6,
-            5,
-            9
-          ],
+          "categories": [6, 5, 9],
           "primary_category": 6,
           "confidence": 0.63,
           "evidence": [
@@ -169,26 +120,18 @@
         },
         {
           "summary": "Specified ECS substrate details and made erasure-coded page storage fully in-scope.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.6,
           "evidence": [
             "+### 3.5 ECS: The Erasure-Coded Stream Substrate",
             "+#### 3.5.1 ObjectId: Content-Addressed Identity"
           ],
-          "changed_headings": [
-            "3.5 ECS: The Erasure-Coded Stream Substrate"
-          ]
+          "changed_headings": ["3.5 ECS: The Erasure-Coded Stream Substrate"]
         },
         {
           "summary": "Introduced multi-process MVCC shared-memory coordination and cross-process lock table protocol.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.6,
           "evidence": [
@@ -207,19 +150,14 @@
       "change_groups": [
         {
           "summary": "Corrected WAL compatibility by moving RaptorQ repair data to a `.wal-fec` sidecar; standard WAL frames remain byte-for-byte SQLite-compatible.",
-          "categories": [
-            2,
-            7
-          ],
+          "categories": [2, 7],
           "primary_category": 2,
           "confidence": 0.7,
           "evidence": [
             "+Standard SQLite WAL frames are exactly 24 bytes (header) + page_size (data).",
             "+Instead, we use a **sidecar file** (`.wal-fec`) to store repair symbols."
           ],
-          "changed_headings": [
-            "Concrete WAL Commit Frame Layout (Compatibility Mode)"
-          ]
+          "changed_headings": ["Concrete WAL Commit Frame Layout (Compatibility Mode)"]
         }
       ]
     },
@@ -228,36 +166,25 @@
       "change_groups": [
         {
           "summary": "Added RaptorQ Everywhere doctrine, expanded glossary/TOC, and tightened mechanical sympathy constraints.",
-          "categories": [
-            6,
-            4,
-            9
-          ],
+          "categories": [6, 4, 9],
           "primary_category": 6,
           "confidence": 0.62,
           "evidence": [
             "+### 0.4 What \"RaptorQ Everywhere\" Means (No Weasel Words)",
             "+| **CommitSeq** | Monotonically increasing `u64` commit sequence number"
           ],
-          "changed_headings": [
-            "0.4 What \"RaptorQ Everywhere\" Means"
-          ]
+          "changed_headings": ["0.4 What \"RaptorQ Everywhere\" Means"]
         },
         {
           "summary": "Overhauled WAL-FEC sidecar model and ECS/replication architecture to unify repair symbols and replication into ECS objects.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.64,
           "evidence": [
             "+.wal contains ONLY standard SQLite WAL frames (source symbols);",
             "+### 3.4.7 Replication Architecture"
           ],
-          "changed_headings": [
-            "3.4.7 Replication Architecture"
-          ]
+          "changed_headings": ["3.4.7 Replication Architecture"]
         }
       ]
     },
@@ -266,37 +193,22 @@
       "change_groups": [
         {
           "summary": "Applied alien-artifact discipline: decision-theoretic SSI policy, VOI-driven granularity investment, BOCPD monitoring, and formal durability theorems.",
-          "categories": [
-            8,
-            1
-          ],
+          "categories": [8, 1],
           "primary_category": 8,
           "confidence": 0.66,
           "evidence": [
             "+**Decision-Theoretic SSI Abort Policy (Alien-Artifact Discipline).**",
             "+### 4.8 Bayesian Online Change-Point Detection (BOCPD)"
           ],
-          "changed_headings": [
-            "4.8 Bayesian Online Change-Point Detection (BOCPD)",
-            "5.7 SSI"
-          ]
+          "changed_headings": ["4.8 Bayesian Online Change-Point Detection (BOCPD)", "5.7 SSI"]
         },
         {
           "summary": "Added engineering guardrails: memory accounting, hash-tier strategy, and native-mode commit/recovery protocol details.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.56,
-          "evidence": [
-            "+### 6.9 Memory Accounting",
-            "+### 7.11 Native Mode Commit Protocol"
-          ],
-          "changed_headings": [
-            "6.9 Memory Accounting",
-            "7.11 Native Mode Commit Protocol"
-          ]
+          "evidence": ["+### 6.9 Memory Accounting", "+### 7.11 Native Mode Commit Protocol"],
+          "changed_headings": ["6.9 Memory Accounting", "7.11 Native Mode Commit Protocol"]
         }
       ]
     },
@@ -305,20 +217,14 @@
       "change_groups": [
         {
           "summary": "Replaced ephemeral SIREAD tables with a RaptorQ-native SSI witness plane (hot+cold planes, durable ECS evidence, cross-process support).",
-          "categories": [
-            4,
-            7,
-            8
-          ],
+          "categories": [4, 7, 8],
           "primary_category": 4,
           "confidence": 0.68,
           "evidence": [
             "+| **WitnessKey** | The canonical key-space for SSI read/write evidence",
             "+SSIWitnessPlane := (see Section 5.6.4)"
           ],
-          "changed_headings": [
-            "5.6.4 SSI Witness Plane"
-          ]
+          "changed_headings": ["5.6.4 SSI Witness Plane"]
         }
       ]
     },
@@ -327,21 +233,14 @@
       "change_groups": [
         {
           "summary": "Replaced magic-number defaults with formal derivations and cost models for tunable parameters (delta threshold, BOCPD priors, GC scheduling, etc.).",
-          "categories": [
-            8,
-            1
-          ],
+          "categories": [8, 1],
           "primary_category": 8,
           "confidence": 0.7,
           "evidence": [
             "+// COST MODEL (Extreme Optimization Discipline):",
             "+P(r_t | x_{1:t}) proportional to sum_{r_{t-1}} ..."
           ],
-          "changed_headings": [
-            "3.4.4 Delta Threshold",
-            "4.8 BOCPD",
-            "5.6.5 GC Coordination"
-          ]
+          "changed_headings": ["3.4.4 Delta Threshold", "4.8 BOCPD", "5.6.5 GC Coordination"]
         }
       ]
     },
@@ -350,10 +249,7 @@
       "change_groups": [
         {
           "summary": "Introduced performance-oriented data structures (VersionArena, AppendOnlyVec, CAR cache) and per-invariant monitoring calibration.",
-          "categories": [
-            7,
-            8
-          ],
+          "categories": [7, 8],
           "primary_category": 7,
           "confidence": 0.63,
           "evidence": [
@@ -374,19 +270,14 @@
       "change_groups": [
         {
           "summary": "Updated SSI transaction struct to use TxnToken edges and added eager abort semantics plus witness-plane-aware commit-time detection pseudocode.",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.62,
           "evidence": [
             "+marked_for_abort : bool",
             "+**Commit-time detection + proof emission pseudocode (witness plane):**"
           ],
-          "changed_headings": [
-            "5.7 SSI Algorithm"
-          ]
+          "changed_headings": ["5.7 SSI Algorithm"]
         }
       ]
     },
@@ -395,37 +286,25 @@
       "change_groups": [
         {
           "summary": "Clarified SSI detection algorithm as a two-pass pivot/completion check with eager abort marking.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.6,
           "evidence": [
             "+The on_commit(T) pseudocode specifies the two-pass check:",
             "+on_commit(T):"
           ],
-          "changed_headings": [
-            "5.7 SSI Algorithm"
-          ]
+          "changed_headings": ["5.7 SSI Algorithm"]
         },
         {
           "summary": "Adjusted object identity and Cx capability descriptions (ObjectId truncation and richer capability mechanics).",
-          "categories": [
-            4,
-            3,
-            9
-          ],
+          "categories": [4, 3, 9],
           "primary_category": 4,
           "confidence": 0.52,
           "evidence": [
             "+| **ObjectId** | Content-addressed identifier: 128-bit `Trunc128(BLAKE3(...))`",
             "+**Cooperative cancellation + progress checkpoints**"
           ],
-          "changed_headings": [
-            "0.3 Glossary",
-            "4.2 Asupersync Integration"
-          ]
+          "changed_headings": ["0.3 Glossary", "4.2 Asupersync Integration"]
         }
       ]
     },
@@ -434,19 +313,14 @@
       "change_groups": [
         {
           "summary": "Removed merge artifacts by restoring canonical ObjectId size and concise Cx glossary/API examples.",
-          "categories": [
-            5,
-            9
-          ],
+          "categories": [5, 9],
           "primary_category": 5,
           "confidence": 0.66,
           "evidence": [
             "-| **ObjectId** | Content-addressed identifier: 128-bit `Trunc128(...)",
             "+| **ObjectId** | Content-addressed identifier: `BLAKE3(canonical_encoding(object))`, 32 bytes."
           ],
-          "changed_headings": [
-            "0.3 Glossary"
-          ]
+          "changed_headings": ["0.3 Glossary"]
         }
       ]
     },
@@ -455,19 +329,11 @@
       "change_groups": [
         {
           "summary": "Restored canonical SSI detection algorithm and in-process edge representation after merge artifacts.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.64,
-          "evidence": [
-            "+has_incoming_rw : bool",
-            "+**Detection algorithm pseudocode:**"
-          ],
-          "changed_headings": [
-            "5.7 SSI Algorithm"
-          ]
+          "evidence": ["+has_incoming_rw : bool", "+**Detection algorithm pseudocode:**"],
+          "changed_headings": ["5.7 SSI Algorithm"]
         }
       ]
     },
@@ -476,19 +342,14 @@
       "change_groups": [
         {
           "summary": "Integrated SSI witness-plane evidence into native-mode commit protocol, adding CommitProof and new ordering constraints.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.63,
           "evidence": [
             "+`proof_object_id`",
             "+**Critical ordering:** Marker publication MUST happen AFTER capsule durability and AFTER `CommitProof` durability is satisfied."
           ],
-          "changed_headings": [
-            "7.11 Native Mode Commit Protocol"
-          ]
+          "changed_headings": ["7.11 Native Mode Commit Protocol"]
         }
       ]
     },
@@ -497,20 +358,14 @@
       "change_groups": [
         {
           "summary": "Aligned asupersync integration terminology, witness-plane naming, and ObjectId truncation details.",
-          "categories": [
-            3,
-            9,
-            4
-          ],
+          "categories": [3, 9, 4],
           "primary_category": 3,
           "confidence": 0.6,
           "evidence": [
             "+| **ObjectId** | Content-addressed identifier: `Trunc128(BLAKE3(\"fsqlite:ecs:v1\" || canonical_object_header || payload_hash))`",
             "+| **SIREAD witness (legacy term)** | ... represented by `ReadWitness` objects"
           ],
-          "changed_headings": [
-            "0.3 Glossary"
-          ]
+          "changed_headings": ["0.3 Glossary"]
         }
       ]
     },
@@ -519,10 +374,7 @@
       "change_groups": [
         {
           "summary": "Added systematic symbol fast-path flags and tiered storage semantics for ECS objects.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.6,
           "evidence": [
@@ -536,19 +388,11 @@
         },
         {
           "summary": "Introduced SchemaEpoch into MVCC snapshot to forbid intent replay across schema changes.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.56,
-          "evidence": [
-            "+SchemaEpoch := u64",
-            "+schema_epoch    : SchemaEpoch"
-          ],
-          "changed_headings": [
-            "5.1 Core Types"
-          ]
+          "evidence": ["+SchemaEpoch := u64", "+schema_epoch    : SchemaEpoch"],
+          "changed_headings": ["5.1 Core Types"]
         }
       ]
     },
@@ -557,19 +401,11 @@
       "change_groups": [
         {
           "summary": "Updated core MVCC types to CommitSeq-based snapshots and formalized SSI witness plane in place of SIREAD tables.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.62,
-          "evidence": [
-            "+CommitSeq   := u64",
-            "+SSIWitnessPlane := (see Section 5.6.4)"
-          ],
-          "changed_headings": [
-            "5.1 Core Types"
-          ]
+          "evidence": ["+CommitSeq   := u64", "+SSIWitnessPlane := (see Section 5.6.4)"],
+          "changed_headings": ["5.1 Core Types"]
         }
       ]
     },
@@ -578,19 +414,14 @@
       "change_groups": [
         {
           "summary": "Changed MVCC ARC cache keys from TxnId to CommitSeq and updated invariants accordingly.",
-          "categories": [
-            7,
-            1
-          ],
+          "categories": [7, 1],
           "primary_category": 7,
           "confidence": 0.62,
           "evidence": [
             "-Standard ARC keys on page number. Our variant keys on `(PageNumber, TxnId)`",
             "+Standard ARC keys on page number. Our variant keys on `(PageNumber, CommitSeq)`"
           ],
-          "changed_headings": [
-            "6.2 MVCC-Aware ARC Data Structures"
-          ]
+          "changed_headings": ["6.2 MVCC-Aware ARC Data Structures"]
         }
       ]
     },
@@ -599,18 +430,11 @@
       "change_groups": [
         {
           "summary": "Clarified the INV-1 monitor label to include CommitSeq monotonicity.",
-          "categories": [
-            9,
-            5
-          ],
+          "categories": [9, 5],
           "primary_category": 9,
           "confidence": 0.8,
-          "evidence": [
-            "+EProcess::new(\"INV-1: TxnId/CommitSeq Monotonicity\", EProcessConfig {"
-          ],
-          "changed_headings": [
-            "4.3 E-process Monitoring"
-          ]
+          "evidence": ["+EProcess::new(\"INV-1: TxnId/CommitSeq Monotonicity\", EProcessConfig {"],
+          "changed_headings": ["4.3 E-process Monitoring"]
         }
       ]
     },
@@ -619,21 +443,14 @@
       "change_groups": [
         {
           "summary": "Tightened glossary entries and fixed algebraic merge pseudocode types plus MVCC module descriptions.",
-          "categories": [
-            9,
-            5,
-            1
-          ],
+          "categories": [9, 5, 1],
           "primary_category": 9,
           "confidence": 0.62,
           "evidence": [
             "+| **CommitMarker** | The durable \"this commit exists\" record in Native mode: `(commit_seq, commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker, integrity_hash)`.",
             "+page_T2_committed: &PageData"
           ],
-          "changed_headings": [
-            "0.3 Glossary",
-            "5.10 Algebraic Write Merge"
-          ]
+          "changed_headings": ["0.3 Glossary", "5.10 Algebraic Write Merge"]
         }
       ]
     },
@@ -642,20 +459,11 @@
       "change_groups": [
         {
           "summary": "Corrected cross-process TxnSlot cleanup to defend against PID reuse and formalized lock-table tombstone semantics.",
-          "categories": [
-            7,
-            1
-          ],
+          "categories": [7, 1],
           "primary_category": 7,
           "confidence": 0.65,
-          "evidence": [
-            "+pid_birth       : AtomicU64",
-            "+TOMBSTONE := 0xFFFF_FFFF is reserved."
-          ],
-          "changed_headings": [
-            "5.6.2 TxnSlot",
-            "5.6.3 Cross-Process Page Lock Table"
-          ]
+          "evidence": ["+pid_birth       : AtomicU64", "+TOMBSTONE := 0xFFFF_FFFF is reserved."],
+          "changed_headings": ["5.6.2 TxnSlot", "5.6.3 Cross-Process Page Lock Table"]
         }
       ]
     },
@@ -664,35 +472,25 @@
       "change_groups": [
         {
           "summary": "Expanded asupersync integration glossary with Budget/Outcome/Region semantics and structured concurrency behavior.",
-          "categories": [
-            3,
-            6
-          ],
+          "categories": [3, 6],
           "primary_category": 3,
           "confidence": 0.6,
           "evidence": [
             "+| **Budget** | Asupersync resource budget (product semiring) carried by `Cx`",
             "+| **Region** | Asupersync structured concurrency scope"
           ],
-          "changed_headings": [
-            "0.3 Glossary"
-          ]
+          "changed_headings": ["0.3 Glossary"]
         },
         {
           "summary": "Corrected RaptorQ failure probability claims and clarified rules of thumb using RFC 6330 Annex B data.",
-          "categories": [
-            1,
-            8
-          ],
+          "categories": [1, 8],
           "primary_category": 1,
           "confidence": 0.6,
           "evidence": [
             "+**Caution on failure probability claims:**",
             "+Decoding with **exactly K** received symbols: ~99% success (P_fail < 0.01)."
           ],
-          "changed_headings": [
-            "3.1 RaptorQ Foundation"
-          ]
+          "changed_headings": ["3.1 RaptorQ Foundation"]
         }
       ]
     },
@@ -701,20 +499,11 @@
       "change_groups": [
         {
           "summary": "Deep audit fixes to MVCC formal model: CommitLog definition, SSI inequality correction, padding alignment, and cost model adjustments.",
-          "categories": [
-            1,
-            7
-          ],
+          "categories": [1, 7],
           "primary_category": 1,
           "confidence": 0.66,
-          "evidence": [
-            "+CommitLog := AppendOnlyVec<CommitRecord>",
-            "+_padding        : [u8; 64]"
-          ],
-          "changed_headings": [
-            "5.1 Core Types",
-            "5.6 Shared Memory"
-          ]
+          "evidence": ["+CommitLog := AppendOnlyVec<CommitRecord>", "+_padding        : [u8; 64]"],
+          "changed_headings": ["5.1 Core Types", "5.6 Shared Memory"]
         }
       ]
     },
@@ -723,20 +512,14 @@
       "change_groups": [
         {
           "summary": "Added normative memory-ordering rules for CommitSeq visibility and clarified SSI pivot abort overapproximation.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.64,
           "evidence": [
             "+MUST be incremented with `Release` ordering AFTER all version chain updates",
             "+**Note (deliberate overapproximation):**"
           ],
-          "changed_headings": [
-            "5.4 Visibility",
-            "5.7 SSI Algorithm"
-          ]
+          "changed_headings": ["5.4 Visibility", "5.7 SSI Algorithm"]
         }
       ]
     },
@@ -745,34 +528,22 @@
       "change_groups": [
         {
           "summary": "Corrected checksum/format details: WAL magic endianness, integrity check scoping, and symbol overhead interpretation.",
-          "categories": [
-            2,
-            1
-          ],
+          "categories": [2, 1],
           "primary_category": 2,
           "confidence": 0.62,
           "evidence": [
             "+0x377F0682 (bit 0 = 0) = little-endian word order",
             "+loss_fraction_max approx max(0, (R - slack) / (K_source + R))"
           ],
-          "changed_headings": [
-            "11. Checksums and Integrity"
-          ]
+          "changed_headings": ["11. Checksums and Integrity"]
         },
         {
           "summary": "Added family-wise error control for multiple e-process monitors using e-value aggregation.",
-          "categories": [
-            8
-          ],
+          "categories": [8],
           "primary_category": 8,
           "confidence": 0.56,
-          "evidence": [
-            "+E_global(t) := prod_i E_i(t)^{w_i}",
-            "+sum_i alpha_i <= alpha_total"
-          ],
-          "changed_headings": [
-            "4.3 E-process Monitoring"
-          ]
+          "evidence": ["+E_global(t) := prod_i E_i(t)^{w_i}", "+sum_i alpha_i <= alpha_total"],
+          "changed_headings": ["4.3 E-process Monitoring"]
         }
       ]
     },
@@ -781,35 +552,25 @@
       "change_groups": [
         {
           "summary": "Fixed crate layering to avoid dependency cycles and clarified mvcc/wal relationships.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.6,
           "evidence": [
             "+fsqlite-mvcc moved from Layer 6 to Layer 3.",
             "+Checkpoint now receives `&dyn CheckpointPageWriter` at runtime"
           ],
-          "changed_headings": [
-            "8. Architecture: Crate Map and Dependencies"
-          ]
+          "changed_headings": ["8. Architecture: Crate Map and Dependencies"]
         },
         {
           "summary": "Corrected SQLite expression precedence and VDBE p5 flag semantics.",
-          "categories": [
-            2
-          ],
+          "categories": [2],
           "primary_category": 2,
           "confidence": 0.58,
           "evidence": [
             "+**IMPORTANT:** `NOT` is NOT at the same precedence as unary `~`/`+`/`-`.",
             "+upper 8 bits MUST be zero."
           ],
-          "changed_headings": [
-            "12. SQL Coverage",
-            "VDBE Opcode Layout"
-          ]
+          "changed_headings": ["12. SQL Coverage", "VDBE Opcode Layout"]
         }
       ]
     },
@@ -818,20 +579,14 @@
       "change_groups": [
         {
           "summary": "Minor wording adjustments clarifying wal/pager dependency and header naming.",
-          "categories": [
-            5,
-            9
-          ],
+          "categories": [5, 9],
           "primary_category": 5,
           "confidence": 0.72,
           "evidence": [
             "+Does NOT depend on `fsqlite-pager`",
             "+| `sqliteInt.h` | Main internal header"
           ],
-          "changed_headings": [
-            "Crate Descriptions",
-            "C SQLite Reference Extraction"
-          ]
+          "changed_headings": ["Crate Descriptions", "C SQLite Reference Extraction"]
         }
       ]
     },
@@ -840,20 +595,14 @@
       "change_groups": [
         {
           "summary": "Clarified crate boundaries and added WAL header notes for SQLite format.",
-          "categories": [
-            4,
-            2
-          ],
+          "categories": [4, 2],
           "primary_category": 4,
           "confidence": 0.6,
           "evidence": [
             "+does not depend on `fsqlite-wal`.",
             "+Format version: 3007000 (constant for all WAL1 databases;"
           ],
-          "changed_headings": [
-            "Crate Descriptions",
-            "WAL Header"
-          ]
+          "changed_headings": ["Crate Descriptions", "WAL Header"]
         }
       ]
     },
@@ -862,34 +611,22 @@
       "change_groups": [
         {
           "summary": "Specified the exact SQLite WAL checksum algorithm and clarified wal-index layout details.",
-          "categories": [
-            2
-          ],
+          "categories": [2],
           "primary_category": 2,
           "confidence": 0.64,
           "evidence": [
             "+fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, native: bool) -> (u32, u32)",
             "+WalIndexHdr (first copy):"
           ],
-          "changed_headings": [
-            "11.9.1 WAL Checksum Algorithm",
-            "11.10 WAL Index (wal-index / SHM)"
-          ]
+          "changed_headings": ["11.9.1 WAL Checksum Algorithm", "11.10 WAL Index (wal-index / SHM)"]
         },
         {
           "summary": "Refined repair tail bounds with concrete orders of magnitude for small K.",
-          "categories": [
-            8,
-            1
-          ],
+          "categories": [8, 1],
           "primary_category": 8,
           "confidence": 0.54,
-          "evidence": [
-            "+K=4, R=1 (n=5): P(loss) approx C(5,2) p^2 approx 1e-7"
-          ],
-          "changed_headings": [
-            "Durability Bound"
-          ]
+          "evidence": ["+K=4, R=1 (n=5): P(loss) approx C(5,2) p^2 approx 1e-7"],
+          "changed_headings": ["Durability Bound"]
         }
       ]
     },
@@ -898,31 +635,18 @@
       "change_groups": [
         {
           "summary": "Added explicit SQLite page header field layout description.",
-          "categories": [
-            2,
-            6
-          ],
+          "categories": [2, 6],
           "primary_category": 2,
           "confidence": 0.62,
-          "evidence": [
-            "+**Page header field layout:**",
-            "+Offset  Size  Field"
-          ],
-          "changed_headings": [
-            "B-tree Page Header"
-          ]
+          "evidence": ["+**Page header field layout:**", "+Offset  Size  Field"],
+          "changed_headings": ["B-tree Page Header"]
         },
         {
           "summary": "Updated document version metadata.",
-          "categories": [
-            5
-          ],
+          "categories": [5],
           "primary_category": 5,
           "confidence": 0.6,
-          "evidence": [
-            "-*Document version: 1.8",
-            "+*Document version: 1.9"
-          ],
+          "evidence": ["-*Document version: 1.8", "+*Document version: 1.9"],
           "changed_headings": []
         }
       ]
@@ -932,19 +656,14 @@
       "change_groups": [
         {
           "summary": "Clarified fragmentation byte meaning and added explicit SQLite varint encoding spec.",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.65,
           "evidence": [
             "+### 11.2.1 Varint Encoding",
             "+minimum freeblock size is 4 bytes, so gaps of 1-3 bytes cannot be tracked"
           ],
-          "changed_headings": [
-            "11.2.1 Varint Encoding"
-          ]
+          "changed_headings": ["11.2.1 Varint Encoding"]
         }
       ]
     },
@@ -953,20 +672,14 @@
       "change_groups": [
         {
           "summary": "Fixed index local-payload math and clarified SQLite comparison affinity coercion rules.",
-          "categories": [
-            2,
-            1
-          ],
+          "categories": [2, 1],
           "primary_category": 2,
           "confidence": 0.64,
           "evidence": [
             "+index max_local = 1001.",
             "+**Comparison affinity rules** (applied before comparison; determines which operand gets type coercion)"
           ],
-          "changed_headings": [
-            "11.3 Cell Formats",
-            "12. SQL Coverage"
-          ]
+          "changed_headings": ["11.3 Cell Formats", "12. SQL Coverage"]
         }
       ]
     },
@@ -975,34 +688,22 @@
       "change_groups": [
         {
           "summary": "Documented SQLite pointer-map entry type semantics with explicit codes.",
-          "categories": [
-            2
-          ],
+          "categories": [2],
           "primary_category": 2,
           "confidence": 0.6,
-          "evidence": [
-            "+1 = PTRMAP_ROOTPAGE",
-            "+5 = PTRMAP_BTREE"
-          ],
-          "changed_headings": [
-            "Pointer Map"
-          ]
+          "evidence": ["+1 = PTRMAP_ROOTPAGE", "+5 = PTRMAP_BTREE"],
+          "changed_headings": ["Pointer Map"]
         },
         {
           "summary": "Swapped raw pread usage for safe `FileExt::read_exact_at` in page read example.",
-          "categories": [
-            7,
-            5
-          ],
+          "categories": [7, 5],
           "primary_category": 7,
           "confidence": 0.56,
           "evidence": [
             "+FileExt::read_exact_at is safe Rust; no `unsafe` needed.",
             "+async fn read_page(cx: &Cx, pool: &PageBufPool, file: &Arc<File>, offset: u64)"
           ],
-          "changed_headings": [
-            "VFS / Pager Example"
-          ]
+          "changed_headings": ["VFS / Pager Example"]
         }
       ]
     },
@@ -1011,34 +712,22 @@
       "change_groups": [
         {
           "summary": "Added SSI-related invariants and clarified e-process usage versus hard invariants.",
-          "categories": [
-            8,
-            1
-          ],
+          "categories": [8, 1],
           "primary_category": 8,
           "confidence": 0.6,
           "evidence": [
             "+**INV-5 (Snapshot Stability)**",
             "+**Recommendation:** Use `debug_assert!` for INV-1 through INV-7"
           ],
-          "changed_headings": [
-            "4.3 E-process Monitoring"
-          ]
+          "changed_headings": ["4.3 E-process Monitoring"]
         },
         {
           "summary": "Corrected index max_local formula for 4096-byte pages.",
-          "categories": [
-            2
-          ],
+          "categories": [2],
           "primary_category": 2,
           "confidence": 0.58,
-          "evidence": [
-            "+index max_local = 1002.",
-            "+`4084 * 64 / 255 - 23` = `1025 - 23` = 1002"
-          ],
-          "changed_headings": [
-            "11.3 Cell Formats"
-          ]
+          "evidence": ["+index max_local = 1002.", "+`4084 * 64 / 255 - 23` = `1025 - 23` = 1002"],
+          "changed_headings": ["11.3 Cell Formats"]
         }
       ]
     },
@@ -1047,36 +736,25 @@
       "change_groups": [
         {
           "summary": "Corrected budget algebra terminology and fixed BOCPD recursion by marginalizing over prior run length.",
-          "categories": [
-            1,
-            8
-          ],
+          "categories": [1, 8],
           "primary_category": 1,
           "confidence": 0.64,
           "evidence": [
             "+product meet-semilattice",
             "+P(r_t | x_{1:t}) proportional to sum_{r_{t-1}} ..."
           ],
-          "changed_headings": [
-            "0.3 Glossary",
-            "4.8 BOCPD"
-          ]
+          "changed_headings": ["0.3 Glossary", "4.8 BOCPD"]
         },
         {
           "summary": "Threaded `Cx` through VfsFile methods to make file operations cancelable/deadline-aware.",
-          "categories": [
-            3,
-            7
-          ],
+          "categories": [3, 7],
           "primary_category": 7,
           "confidence": 0.6,
           "evidence": [
             "+fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;",
             "+fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()>;"
           ],
-          "changed_headings": [
-            "9.1 Storage Traits"
-          ]
+          "changed_headings": ["9.1 Storage Traits"]
         }
       ]
     },
@@ -1085,20 +763,14 @@
       "change_groups": [
         {
           "summary": "Refined public API facade with `Database` wrapper and replaced Default-based function state with `initial_state()` factories for type erasure.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.6,
           "evidence": [
             "+pub struct Database(Connection);",
             "+fn initial_state(&self) -> Self::State;"
           ],
-          "changed_headings": [
-            "Public API",
-            "Scalar/Aggregate/Window Functions"
-          ]
+          "changed_headings": ["Public API", "Scalar/Aggregate/Window Functions"]
         }
       ]
     },
@@ -1107,33 +779,21 @@
       "change_groups": [
         {
           "summary": "Added `Cx` parameter to rollback for cancelation-aware abort path.",
-          "categories": [
-            3,
-            7
-          ],
+          "categories": [3, 7],
           "primary_category": 7,
           "confidence": 0.6,
-          "evidence": [
-            "+fn rollback(&self, cx: &Cx, txn: Transaction);"
-          ],
-          "changed_headings": [
-            "MvccPager Trait"
-          ]
+          "evidence": ["+fn rollback(&self, cx: &Cx, txn: Transaction);"],
+          "changed_headings": ["MvccPager Trait"]
         },
         {
           "summary": "Clarified recursive CTE semantics for UNION vs UNION ALL in SQLite.",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.58,
           "evidence": [
             "+Recursive CTEs use `UNION ALL` (keeps duplicates) or `UNION` (discards duplicates, providing implicit cycle detection)"
           ],
-          "changed_headings": [
-            "Recursive CTEs"
-          ]
+          "changed_headings": ["Recursive CTEs"]
         }
       ]
     }
@@ -1144,12 +804,7 @@
       "change_groups": [
         {
           "summary": "Fix WAL checksum endianness semantics and clarify WAL header magic meaning, correct WAL-index hash and lock region layout, and add rollback journal format details",
-          "categories": [
-            1,
-            2,
-            4,
-            9
-          ],
+          "categories": [1, 2, 4, 9],
           "primary_category": 2,
           "confidence": 0.84,
           "evidence": [
@@ -1166,18 +821,13 @@
         },
         {
           "summary": "Correct ARC competitive ratio claim",
-          "categories": [
-            1,
-            9
-          ],
+          "categories": [1, 9],
           "primary_category": 1,
           "confidence": 0.58,
           "evidence": [
             "ARC claim changed from competitive ratio 2 to containment/self-tuning wording"
           ],
-          "changed_headings": [
-            "6. Buffer Pool: ARC Cache"
-          ]
+          "changed_headings": ["6. Buffer Pool: ARC Cache"]
         }
       ]
     },
@@ -1186,52 +836,33 @@
       "change_groups": [
         {
           "summary": "Revert WAL checksum endianness guidance to match nativeCksum derivation; update examples accordingly",
-          "categories": [
-            1,
-            2,
-            9
-          ],
+          "categories": [1, 2, 9],
           "primary_category": 2,
           "confidence": 0.8,
           "evidence": [
             "big_end_cksum now feeds nativeCksum via target endianness; swap logic changed",
             "endianness table updated to per-reader nativeCksum outcomes"
           ],
-          "changed_headings": [
-            "7.1 WAL Checksum Algorithm",
-            "11.9.1 WAL Checksum Algorithm"
-          ]
+          "changed_headings": ["7.1 WAL Checksum Algorithm", "11.9.1 WAL Checksum Algorithm"]
         },
         {
           "summary": "Clarify Windows VFS inclusion and adjust layering/ARC placement notes",
-          "categories": [
-            4,
-            9
-          ],
+          "categories": [4, 9],
           "primary_category": 4,
           "confidence": 0.63,
           "evidence": [
             "WindowsVfs noted as in-scope; VFS locking/SHM mechanisms clarified",
             "ARC cache and MvccPager trait placement moved to pager layer"
           ],
-          "changed_headings": [
-            "15. VFS",
-            "8. Implementation Plan"
-          ]
+          "changed_headings": ["15. VFS", "8. Implementation Plan"]
         },
         {
           "summary": "Adjust B-tree depth capacity note",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.45,
-          "evidence": [
-            "B-tree depth capacity explanation rewritten"
-          ],
-          "changed_headings": [
-            "8. Implementation Plan"
-          ]
+          "evidence": ["B-tree depth capacity explanation rewritten"],
+          "changed_headings": ["8. Implementation Plan"]
         }
       ]
     },
@@ -1240,11 +871,7 @@
       "change_groups": [
         {
           "summary": "Reframe GF(256) byte algebra as encoding-only; forbid raw XOR merges for structured pages and introduce SAFE/LAB_UNSAFE write-merge policy",
-          "categories": [
-            1,
-            4,
-            9
-          ],
+          "categories": [1, 4, 9],
           "primary_category": 4,
           "confidence": 0.74,
           "evidence": [
@@ -1258,29 +885,18 @@
         },
         {
           "summary": "Specify commit marker stream format with fixed-size records, O(1) seek, and divergence checks",
-          "categories": [
-            4,
-            7,
-            9
-          ],
+          "categories": [4, 7, 9],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
             "New marker segment header and record layout; fixed-size records",
             "O(1) seek and binary search by time described"
           ],
-          "changed_headings": [
-            "3.5.4.1 Commit Marker Stream Format (Random-Access, Auditable)"
-          ]
+          "changed_headings": ["3.5.4.1 Commit Marker Stream Format (Random-Access, Auditable)"]
         },
         {
           "summary": "Harden ECS compaction publication ordering and ARC eviction edge case; add RaptorQ overhead slack + adaptive tuning note",
-          "categories": [
-            4,
-            1,
-            8,
-            9
-          ],
+          "categories": [4, 1, 8, 9],
           "primary_category": 4,
           "confidence": 0.67,
           "evidence": [
@@ -1298,11 +914,7 @@
         },
         {
           "summary": "Correct JSONB node types and size claim; rename R-tree to R*-Tree; tighten conflict model and retry policy",
-          "categories": [
-            1,
-            2,
-            9
-          ],
+          "categories": [1, 2, 9],
           "primary_category": 2,
           "confidence": 0.62,
           "evidence": [
@@ -1310,11 +922,7 @@
             "R*-Tree naming corrected; geometry trait name fixed",
             "Conflict modeling and retry policy clarified"
           ],
-          "changed_headings": [
-            "JSON1/JSONB section",
-            "14.4 R*-Tree",
-            "18. Conflict Modeling"
-          ]
+          "changed_headings": ["JSON1/JSONB section", "14.4 R*-Tree", "18. Conflict Modeling"]
         }
       ]
     },
@@ -1323,20 +931,14 @@
       "change_groups": [
         {
           "summary": "Clarify geopoly as built on R*-tree and refine conflict probability interpretation with explicit examples",
-          "categories": [
-            9,
-            1
-          ],
+          "categories": [9, 1],
           "primary_category": 9,
           "confidence": 0.6,
           "evidence": [
             "Geopoly extension description updated to R*-tree",
             "Birthday-paradox conflict probability explanation corrected with numeric examples"
           ],
-          "changed_headings": [
-            "14.4 R*-Tree",
-            "18.3 Conflict Probability (Uniform)"
-          ]
+          "changed_headings": ["14.4 R*-Tree", "18.3 Conflict Probability (Uniform)"]
         }
       ]
     },
@@ -1345,19 +947,14 @@
       "change_groups": [
         {
           "summary": "Refine Zipf conflict probability derivation with sum of squared probabilities and numerical comparison",
-          "categories": [
-            1,
-            9
-          ],
+          "categories": [1, 9],
           "primary_category": 1,
           "confidence": 0.74,
           "evidence": [
             "P(any conflict) expressed as exp(-C(N,2)*sum p(k)^2)",
             "Numeric comparison vs uniform added"
           ],
-          "changed_headings": [
-            "18.4 Non-Uniform Page Access: Zipf Distribution"
-          ]
+          "changed_headings": ["18.4 Non-Uniform Page Access: Zipf Distribution"]
         }
       ]
     },
@@ -1366,11 +963,7 @@
       "change_groups": [
         {
           "summary": "Clarify PageVersion hash storage and temper byte-conflict reduction claims; add retry policy",
-          "categories": [
-            9,
-            1,
-            7
-          ],
+          "categories": [9, 1, 7],
           "primary_category": 9,
           "confidence": 0.62,
           "evidence": [
@@ -1391,35 +984,22 @@
       "change_groups": [
         {
           "summary": "Harden ARC eviction failure path to skip dirty pages on WAL flush failure",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.7,
-          "evidence": [
-            "flush_to_wal errors cause candidate rotation instead of eviction"
-          ],
-          "changed_headings": [
-            "6.4 ARC Algorithm: REPLACE Subroutine"
-          ]
+          "evidence": ["flush_to_wal errors cause candidate rotation instead of eviction"],
+          "changed_headings": ["6.4 ARC Algorithm: REPLACE Subroutine"]
         },
         {
           "summary": "Add math-function compile flag note and geopoly_xform function",
-          "categories": [
-            6,
-            9
-          ],
+          "categories": [6, 9],
           "primary_category": 9,
           "confidence": 0.46,
           "evidence": [
             "SQLite math functions require compile flag; FrankenSQLite always includes",
             "geopoly_xform listed"
           ],
-          "changed_headings": [
-            "13.2 Math Functions",
-            "14.4 R*-Tree"
-          ]
+          "changed_headings": ["13.2 Math Functions", "14.4 R*-Tree"]
         }
       ]
     },
@@ -1428,22 +1008,14 @@
       "change_groups": [
         {
           "summary": "Deep audit fixes for ARC: flush under mutex note, eviction error handling, ghost list overhead corrected, cache_size=0 semantics corrected",
-          "categories": [
-            1,
-            2,
-            4,
-            9
-          ],
+          "categories": [1, 2, 4, 9],
           "primary_category": 1,
           "confidence": 0.75,
           "evidence": [
             "cache_size=0 now maps to SQLite default cache size behavior",
             "ghost list overhead recalculated; eviction path handles flush errors"
           ],
-          "changed_headings": [
-            "6. ARC Cache",
-            "PRAGMA cache_size"
-          ]
+          "changed_headings": ["6. ARC Cache", "PRAGMA cache_size"]
         }
       ]
     },
@@ -1452,11 +1024,7 @@
       "change_groups": [
         {
           "summary": "Add adaptive redundancy autopilot and merge-retry loop; add witness refinement policy",
-          "categories": [
-            4,
-            8,
-            9
-          ],
+          "categories": [4, 8, 9],
           "primary_category": 4,
           "confidence": 0.72,
           "evidence": [
@@ -1472,11 +1040,7 @@
         },
         {
           "summary": "Update merge model to structured patches and operator precedence tables (ESCAPE and relational/equality split)",
-          "categories": [
-            1,
-            2,
-            9
-          ],
+          "categories": [1, 2, 9],
           "primary_category": 1,
           "confidence": 0.68,
           "evidence": [
@@ -1496,11 +1060,7 @@
       "change_groups": [
         {
           "summary": "Fix SSI pseudocode edge direction and dangerous structure explanation; add claiming timestamp cleanup; cross-process note",
-          "categories": [
-            1,
-            4,
-            9
-          ],
+          "categories": [1, 4, 9],
           "primary_category": 1,
           "confidence": 0.74,
           "evidence": [
@@ -1508,19 +1068,11 @@
             "dangerous structure definition clarified; claiming cleanup via timeout",
             "cross-process visibility note added"
           ],
-          "changed_headings": [
-            "5.7 SSI",
-            "5.6.2 TxnSlot",
-            "SSI correctness"
-          ]
+          "changed_headings": ["5.7 SSI", "5.6.2 TxnSlot", "SSI correctness"]
         },
         {
           "summary": "Fix precedence tables and RETURNING semantics",
-          "categories": [
-            2,
-            1,
-            9
-          ],
+          "categories": [2, 1, 9],
           "primary_category": 2,
           "confidence": 0.65,
           "evidence": [
@@ -1535,20 +1087,14 @@
         },
         {
           "summary": "Rename merge terminology and fix RaptorQ size unit detail",
-          "categories": [
-            9,
-            1
-          ],
+          "categories": [9, 1],
           "primary_category": 9,
           "confidence": 0.42,
           "evidence": [
             "algebraic write merging renamed to safe write-merge ladder",
             "~220 MiB wording corrected"
           ],
-          "changed_headings": [
-            "3.1 SSI rationale",
-            "3.4 RaptorQ"
-          ]
+          "changed_headings": ["3.1 SSI rationale", "3.4 RaptorQ"]
         }
       ]
     },
@@ -1557,11 +1103,7 @@
       "change_groups": [
         {
           "summary": "Enforce gap-free commit_seq allocation from marker stream; tighten commit_seq publication semantics and memory ordering",
-          "categories": [
-            1,
-            4,
-            9
-          ],
+          "categories": [1, 4, 9],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -1576,11 +1118,7 @@
         },
         {
           "summary": "Clarify WAL-index layout details and rollback journal checksum loop; page size change rules",
-          "categories": [
-            2,
-            1,
-            9
-          ],
+          "categories": [2, 1, 9],
           "primary_category": 2,
           "confidence": 0.63,
           "evidence": [
@@ -1596,17 +1134,11 @@
         },
         {
           "summary": "Add SSI witness rollback note for savepoints",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.4,
-          "evidence": [
-            "Witness registrations not rolled back on savepoint"
-          ],
-          "changed_headings": [
-            "5.4 Savepoints"
-          ]
+          "evidence": ["Witness registrations not rolled back on savepoint"],
+          "changed_headings": ["5.4 Savepoints"]
         }
       ]
     },
@@ -1615,41 +1147,25 @@
       "change_groups": [
         {
           "summary": "Clarify commit_seq publication and cross-process visibility in native vs compatibility modes",
-          "categories": [
-            4,
-            9
-          ],
+          "categories": [4, 9],
           "primary_category": 4,
           "confidence": 0.7,
           "evidence": [
             "commit_seq described as published high-water mark; cross-process visibility split by mode"
           ],
-          "changed_headings": [
-            "5.6.1 SharedMemoryLayout",
-            "7.11 Commit Protocol"
-          ]
+          "changed_headings": ["5.6.1 SharedMemoryLayout", "7.11 Commit Protocol"]
         },
         {
           "summary": "Define witness hot-plane epoch lock protocol to avoid false negatives",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.66,
-          "evidence": [
-            "epoch_lock, bucket_epoch swap discipline defined to prevent lost updates"
-          ],
-          "changed_headings": [
-            "5.6.4 Hot Witness Plane"
-          ]
+          "evidence": ["epoch_lock, bucket_epoch swap discipline defined to prevent lost updates"],
+          "changed_headings": ["5.6.4 Hot Witness Plane"]
         },
         {
           "summary": "Add DB header forward-compat rules and lock-byte page reservation; move WAL checksum impl to §7.1 reference",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.6,
           "evidence": [
@@ -1669,19 +1185,14 @@
       "change_groups": [
         {
           "summary": "Restrict hot-plane epoch advancement to quiescent concurrent transactions; require epoch_lock refresh semantics",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.72,
           "evidence": [
             "Epoch advance allowed only when no active concurrent txns",
             "Bucket refresh under epoch_lock with Release semantics"
           ],
-          "changed_headings": [
-            "5.6.4 Hot Witness Plane"
-          ]
+          "changed_headings": ["5.6.4 Hot Witness Plane"]
         }
       ]
     },
@@ -1690,18 +1201,11 @@
       "change_groups": [
         {
           "summary": "Publish shm.commit_seq only after marker durable (post-fsync)",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.73,
-          "evidence": [
-            "commit_seq publish inserted after marker fsync"
-          ],
-          "changed_headings": [
-            "7.11 Commit Protocol"
-          ]
+          "evidence": ["commit_seq publish inserted after marker fsync"],
+          "changed_headings": ["7.11 Commit Protocol"]
         }
       ]
     },
@@ -1710,18 +1214,11 @@
       "change_groups": [
         {
           "summary": "Require commit_seq allocation from marker tip and align sequencer steps",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.73,
-          "evidence": [
-            "commit_seq allocated from marker stream tip within commit section"
-          ],
-          "changed_headings": [
-            "7.11 Commit Protocol"
-          ]
+          "evidence": ["commit_seq allocated from marker stream tip within commit section"],
+          "changed_headings": ["7.11 Commit Protocol"]
         }
       ]
     },
@@ -1730,35 +1227,22 @@
       "change_groups": [
         {
           "summary": "Define legacy writer exclusion for compatibility mode and hybrid SHM bridge to wal-index",
-          "categories": [
-            2,
-            4,
-            9
-          ],
+          "categories": [2, 4, 9],
           "primary_category": 2,
           "confidence": 0.74,
           "evidence": [
             "WAL_WRITE_LOCK exclusion required; concurrent mode must exclude legacy writers",
             "Hybrid protocol maintains standard wal-index and reader marks"
           ],
-          "changed_headings": [
-            "5.6.6 Compatibility",
-            "5.6.7 Compatibility Mode Hybrid SHM"
-          ]
+          "changed_headings": ["5.6.6 Compatibility", "5.6.7 Compatibility Mode Hybrid SHM"]
         },
         {
           "summary": "Clarify gc_horizon derivation from published commit_seq high-water mark",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.36,
-          "evidence": [
-            "begin_seq derived from published commit_seq"
-          ],
-          "changed_headings": [
-            "5.6.5 GC Horizon"
-          ]
+          "evidence": ["begin_seq derived from published commit_seq"],
+          "changed_headings": ["5.6.5 GC Horizon"]
         }
       ]
     },
@@ -1767,21 +1251,14 @@
       "change_groups": [
         {
           "summary": "Use Acquire load for snapshot commit_seq; constrain deterministic rebase scope and compatibility note",
-          "categories": [
-            1,
-            4,
-            9
-          ],
+          "categories": [1, 4, 9],
           "primary_category": 1,
           "confidence": 0.7,
           "evidence": [
             "begin snapshot uses Acquire load",
             "Rebase restricted: no splits/overflow/freelist/multi-page ops"
           ],
-          "changed_headings": [
-            "5.2 begin()",
-            "5.10 Deterministic Rebase"
-          ]
+          "changed_headings": ["5.2 begin()", "5.10 Deterministic Rebase"]
         }
       ]
     },
@@ -1790,10 +1267,7 @@
       "change_groups": [
         {
           "summary": "Reconcile shm.commit_seq to durable tip on open; add lock-table rebuild lease protocol and epoch_lock acquisition rules",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.73,
           "evidence": [
@@ -1808,20 +1282,11 @@
         },
         {
           "summary": "Add ARC patent note and clarify legacy writer exclusion reminder",
-          "categories": [
-            9,
-            2
-          ],
+          "categories": [9, 2],
           "primary_category": 9,
           "confidence": 0.4,
-          "evidence": [
-            "ARC patent expired note",
-            "Legacy writer exclusion restated"
-          ],
-          "changed_headings": [
-            "6. ARC Cache",
-            "7.11 Compatibility mode verifiability"
-          ]
+          "evidence": ["ARC patent expired note", "Legacy writer exclusion restated"],
+          "changed_headings": ["6. ARC Cache", "7.11 Compatibility mode verifiability"]
         }
       ]
     },
@@ -1830,53 +1295,36 @@
       "change_groups": [
         {
           "summary": "Make SharedPageLockTable key-stable (no tombstones), adjust acquire/release and rebuild rationale",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.76,
           "evidence": [
             "page_number no longer tombstoned; release only clears owner_txn",
             "Acquire CAS failure re-reads same slot; rebuild to clear keys"
           ],
-          "changed_headings": [
-            "5.6.3 SharedPageLockTable",
-            "5.6.3.1 Table Rebuild"
-          ]
+          "changed_headings": ["5.6.3 SharedPageLockTable", "5.6.3.1 Table Rebuild"]
         },
         {
           "summary": "Define marker stream byte-exact encoding constants and marker_id domain separation",
-          "categories": [
-            4,
-            9
-          ],
+          "categories": [4, 9],
           "primary_category": 4,
           "confidence": 0.69,
           "evidence": [
             "Marker header/record sizes fixed (36/88 bytes)",
             "MarkerId uses domain-separated BLAKE3"
           ],
-          "changed_headings": [
-            "3.5.4.1 Commit Marker Stream"
-          ]
+          "changed_headings": ["3.5.4.1 Commit Marker Stream"]
         },
         {
           "summary": "Tighten compatibility-mode legacy writer exclusion and merge terminology",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.6,
           "evidence": [
             "Legacy writer exclusion required whenever fsqlite-shm used",
             "Safe write merging terminology replaces algebraic merging"
           ],
-          "changed_headings": [
-            "5.6.6 Compatibility",
-            "5.10 Safe Write Merging"
-          ]
+          "changed_headings": ["5.6.6 Compatibility", "5.10 Safe Write Merging"]
         }
       ]
     },
@@ -1885,33 +1333,23 @@
       "change_groups": [
         {
           "summary": "Align lock-table rebuild prose with key-stability and load factor accounting",
-          "categories": [
-            9,
-            1
-          ],
+          "categories": [9, 1],
           "primary_category": 9,
           "confidence": 0.57,
           "evidence": [
             "Rebuild rationale now for non-deleted keys; load factor counts page_number!=0"
           ],
-          "changed_headings": [
-            "5.6.3.1 Table Rebuild"
-          ]
+          "changed_headings": ["5.6.3.1 Table Rebuild"]
         },
         {
           "summary": "Add database header constraints (usable_size >= 480) and db-size validity condition",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.66,
           "evidence": [
             "usable_size constraint added; db size valid only when version-valid-for matches change counter"
           ],
-          "changed_headings": [
-            "11.1 Database Header"
-          ]
+          "changed_headings": ["11.1 Database Header"]
         }
       ]
     },
@@ -1920,33 +1358,21 @@
       "change_groups": [
         {
           "summary": "Clarify ECS permeation map distinction between marker stream and coded objects",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.52,
-          "evidence": [
-            "CommitMarkerRecord separated from coded CommitCapsule/Proof"
-          ],
-          "changed_headings": [
-            "3.5.5 RootManifest / ECS map"
-          ]
+          "evidence": ["CommitMarkerRecord separated from coded CommitCapsule/Proof"],
+          "changed_headings": ["3.5.5 RootManifest / ECS map"]
         },
         {
           "summary": "Correct fragment limit semantics and cell payload local byte wording",
-          "categories": [
-            2,
-            1
-          ],
+          "categories": [2, 1],
           "primary_category": 2,
           "confidence": 0.65,
           "evidence": [
             "Fragment limit is threshold before insertion; cell payload references local_bytes"
           ],
-          "changed_headings": [
-            "11.2 B-Tree Page Layout",
-            "11.3 Cell Format"
-          ]
+          "changed_headings": ["11.2 B-Tree Page Layout", "11.3 Cell Format"]
         }
       ]
     },
@@ -1955,19 +1381,13 @@
       "change_groups": [
         {
           "summary": "Specify WAL-index SHM native byte order, iVersion constraint, and WalCkptInfo layout fix",
-          "categories": [
-            2,
-            1,
-            9
-          ],
+          "categories": [2, 1, 9],
           "primary_category": 2,
           "confidence": 0.74,
           "evidence": [
             "SHM fields are native endian; iVersion must be 3007000; WalCkptInfo 40-byte block"
           ],
-          "changed_headings": [
-            "11.10 WAL Index (wal-index / SHM)"
-          ]
+          "changed_headings": ["11.10 WAL Index (wal-index / SHM)"]
         }
       ]
     },
@@ -1976,35 +1396,22 @@
       "change_groups": [
         {
           "summary": "Add VFS shared-memory API methods and expand trait signatures (cursor ops, virtual tables)",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.72,
           "evidence": [
             "VfsFile adds shm_map/shm_lock/shm_barrier/shm_unmap",
             "BtreeCursorOps methods take &Cx and add first/last; VirtualTable lifecycle methods added"
           ],
-          "changed_headings": [
-            "VFS Trait Definitions",
-            "BtreeCursorOps",
-            "VirtualTable"
-          ]
+          "changed_headings": ["VFS Trait Definitions", "BtreeCursorOps", "VirtualTable"]
         },
         {
           "summary": "Clarify CommitMarkerRecord marker_id domain-separated hash reference",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.38,
-          "evidence": [
-            "marker_id comment updated to refer to domain-separated definition"
-          ],
-          "changed_headings": [
-            "3.5.4.1 Commit Marker Stream"
-          ]
+          "evidence": ["marker_id comment updated to refer to domain-separated definition"],
+          "changed_headings": ["3.5.4.1 Commit Marker Stream"]
         }
       ]
     },
@@ -2013,19 +1420,13 @@
       "change_groups": [
         {
           "summary": "Define CheckpointPageWriter trait for WAL checkpoint and add replication gate acceptance criteria",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.63,
           "evidence": [
             "CheckpointPageWriter trait added in pager; replication gate added in Phase 9"
           ],
-          "changed_headings": [
-            "9.1 Function Traits",
-            "Phase 9 Gates"
-          ]
+          "changed_headings": ["9.1 Function Traits", "Phase 9 Gates"]
         }
       ]
     },
@@ -2034,17 +1435,11 @@
       "change_groups": [
         {
           "summary": "Bump document version footer to 1.18 with summary of prior fixes",
-          "categories": [
-            5
-          ],
+          "categories": [5],
           "primary_category": 5,
           "confidence": 0.86,
-          "evidence": [
-            "Footer version line updated"
-          ],
-          "changed_headings": [
-            "Document footer"
-          ]
+          "evidence": ["Footer version line updated"],
+          "changed_headings": ["Document footer"]
         }
       ]
     },
@@ -2053,17 +1448,11 @@
       "change_groups": [
         {
           "summary": "Lock-table acquire must return BUSY on CAS race to avoid duplicate keys",
-          "categories": [
-            1
-          ],
+          "categories": [1],
           "primary_category": 1,
           "confidence": 0.69,
-          "evidence": [
-            "CAS failure now returns SQLITE_BUSY and forbids continued probing"
-          ],
-          "changed_headings": [
-            "5.6.3 SharedPageLockTable"
-          ]
+          "evidence": ["CAS failure now returns SQLITE_BUSY and forbids continued probing"],
+          "changed_headings": ["5.6.3 SharedPageLockTable"]
         }
       ]
     },
@@ -2072,11 +1461,7 @@
       "change_groups": [
         {
           "summary": "Move compatibility page-FEC repair symbols to sidecar; add UDP payload limits and MTU guidance",
-          "categories": [
-            2,
-            4,
-            9
-          ],
+          "categories": [2, 4, 9],
           "primary_category": 2,
           "confidence": 0.7,
           "evidence": [
@@ -2091,36 +1476,22 @@
         },
         {
           "summary": "Adjust WAL framing note, checkpoint chunk sizes, and recovery wording",
-          "categories": [
-            1,
-            9
-          ],
+          "categories": [1, 9],
           "primary_category": 1,
           "confidence": 0.46,
           "evidence": [
             "WAL frames are tightly packed; not sector-aligned",
             "Checkpoint chunk size guidance changed; Native mode recovery path tweak"
           ],
-          "changed_headings": [
-            "7. WAL Durability",
-            "3.5 ECS tuning",
-            "7.12 Recovery"
-          ]
+          "changed_headings": ["7. WAL Durability", "3.5 ECS tuning", "7.12 Recovery"]
         },
         {
           "summary": "Clarify cross-process MVCC phase gates and compat sidecars",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.38,
-          "evidence": [
-            "Phase 6 covers cross-process MVCC; .db-fec referenced"
-          ],
-          "changed_headings": [
-            "Phase gates",
-            "Implementation notes"
-          ]
+          "evidence": ["Phase 6 covers cross-process MVCC; .db-fec referenced"],
+          "changed_headings": ["Phase gates", "Implementation notes"]
         }
       ]
     },
@@ -2129,17 +1500,11 @@
       "change_groups": [
         {
           "summary": "Clarify MTU-aware checkpoint chunk sizing rationale",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.58,
-          "evidence": [
-            "CheckpointChunk sizing note updated to prefer <=1366 on UDP"
-          ],
-          "changed_headings": [
-            "3.5 ECS tuning"
-          ]
+          "evidence": ["CheckpointChunk sizing note updated to prefer <=1366 on UDP"],
+          "changed_headings": ["3.5 ECS tuning"]
         }
       ]
     },
@@ -2148,11 +1513,7 @@
       "change_groups": [
         {
           "summary": "Fix SQL coverage details: join types, LIMIT comma order, MATCH semantics, DROP COLUMN behavior, json(X) error behavior",
-          "categories": [
-            2,
-            1,
-            9
-          ],
+          "categories": [2, 1, 9],
           "primary_category": 2,
           "confidence": 0.76,
           "evidence": [
@@ -2169,17 +1530,11 @@
         },
         {
           "summary": "Replace hash-join mention in vectorized VDBE section",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.44,
-          "evidence": [
-            "Vectorized VDBE applies to nested-loop joins"
-          ],
-          "changed_headings": [
-            "21.7 Vectorized VDBE"
-          ]
+          "evidence": ["Vectorized VDBE applies to nested-loop joins"],
+          "changed_headings": ["21.7 Vectorized VDBE"]
         }
       ]
     },
@@ -2188,11 +1543,7 @@
       "change_groups": [
         {
           "summary": "Correct GF(256) worked example and add MMR/IBLT replication enhancements",
-          "categories": [
-            1,
-            8,
-            6
-          ],
+          "categories": [1, 8, 6],
           "primary_category": 1,
           "confidence": 0.72,
           "evidence": [
@@ -2207,27 +1558,15 @@
         },
         {
           "summary": "Rename WAL checksum variable names to hdr_cksum1/2 in chain description",
-          "categories": [
-            9,
-            1
-          ],
+          "categories": [9, 1],
           "primary_category": 1,
           "confidence": 0.46,
-          "evidence": [
-            "hdr_s0/hdr_s1 renamed to hdr_cksum1/2"
-          ],
-          "changed_headings": [
-            "7.1 WAL Checksum Chain",
-            "11.9.1 WAL Checksum Chain"
-          ]
+          "evidence": ["hdr_s0/hdr_s1 renamed to hdr_cksum1/2"],
+          "changed_headings": ["7.1 WAL Checksum Chain", "11.9.1 WAL Checksum Chain"]
         },
         {
           "summary": "Add policy controller and mixture e-process guidance; expand IntentFootprint and merge certificates",
-          "categories": [
-            8,
-            4,
-            6
-          ],
+          "categories": [8, 4, 6],
           "primary_category": 8,
           "confidence": 0.66,
           "evidence": [
@@ -2247,11 +1586,7 @@
       "change_groups": [
         {
           "summary": "Add policy controller, epochs, remote capability/idempotency/saga requirements, and symbol log format",
-          "categories": [
-            4,
-            8,
-            6
-          ],
+          "categories": [4, 8, 6],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -2269,37 +1604,25 @@
         },
         {
           "summary": "Revise hot witness plane to double-buffered epochs; add epoch-advance rules and candidate discovery over two epochs",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.69,
           "evidence": [
             "HotWitnessBucketEntry now has epoch_a/epoch_b buffers",
             "Candidate discovery unions both epochs; epoch advancement rule updated"
           ],
-          "changed_headings": [
-            "5.6.4 Hot Witness Plane",
-            "5.7 SSI"
-          ]
+          "changed_headings": ["5.6.4 Hot Witness Plane", "5.7 SSI"]
         },
         {
           "summary": "ARC eviction safety valve and flush_dirty_page naming; compaction saga requirement",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.58,
           "evidence": [
             "Case IV eviction adds safety valve and flush_dirty_page name",
             "Compaction must be a Saga"
           ],
-          "changed_headings": [
-            "6. ARC Cache",
-            "7.9 Compaction"
-          ]
+          "changed_headings": ["6. ARC Cache", "7.9 Compaction"]
         }
       ]
     },
@@ -2308,28 +1631,18 @@
       "change_groups": [
         {
           "summary": "Clarify SQLite 3.52.0 forward target and unsafe prefetch requirement; add symbol auth guidance and epoch helper semantics",
-          "categories": [
-            9,
-            4
-          ],
+          "categories": [9, 4],
           "primary_category": 9,
           "confidence": 0.57,
           "evidence": [
             "3.52.0 noted as forward target; prefetch must use helper crate due to unsafe_code forbid",
             "Symbol auth guidance refined"
           ],
-          "changed_headings": [
-            "1.1 What It Is",
-            "1.4 Constraints",
-            "3.5.2 Symbol Auth"
-          ]
+          "changed_headings": ["1.1 What It Is", "1.4 Constraints", "3.5.2 Symbol Auth"]
         },
         {
           "summary": "Add helper views for witness epoch buffers and refine epoch-advance conditions; planner NGQP note updated",
-          "categories": [
-            9,
-            4
-          ],
+          "categories": [9, 4],
           "primary_category": 4,
           "confidence": 0.55,
           "evidence": [
@@ -2337,10 +1650,7 @@
             "Epoch advancement criteria specified in terms of txn states",
             "NGQP described as N3 bounded algorithm"
           ],
-          "changed_headings": [
-            "5.6.4 Hot Witness Plane",
-            "10.5 Query Planning"
-          ]
+          "changed_headings": ["5.6.4 Hot Witness Plane", "10.5 Query Planning"]
         }
       ]
     },
@@ -2349,21 +1659,14 @@
       "change_groups": [
         {
           "summary": "Define symbol auth master key derivation and adjust VdbeOp p5 usage note",
-          "categories": [
-            4,
-            2,
-            9
-          ],
+          "categories": [4, 2, 9],
           "primary_category": 4,
           "confidence": 0.64,
           "evidence": [
             "master_key derived from DEK with domain separation or lab seed",
             "P5 note updated to allow full 16 bits per opcode"
           ],
-          "changed_headings": [
-            "4.18 Epoch-Scoped Symbol Auth",
-            "10.7 VDBE Instruction Format"
-          ]
+          "changed_headings": ["4.18 Epoch-Scoped Symbol Auth", "10.7 VDBE Instruction Format"]
         }
       ]
     },
@@ -2372,20 +1675,14 @@
       "change_groups": [
         {
           "summary": "Clarify symbol auth wording and refine planner cost model with ANALYZE note",
-          "categories": [
-            9,
-            2
-          ],
+          "categories": [9, 2],
           "primary_category": 2,
           "confidence": 0.6,
           "evidence": [
             "Symbol auth description adjusted to emphasize auth_tag",
             "Cost model formulas updated; ANALYZE note added"
           ],
-          "changed_headings": [
-            "3.5 ECS",
-            "10.5 Query Planning"
-          ]
+          "changed_headings": ["3.5 ECS", "10.5 Query Planning"]
         }
       ]
     },
@@ -2394,21 +1691,14 @@
       "change_groups": [
         {
           "summary": "Fix RaptorQ MTU and sub-blocking explanation; adjust symbol auth key derivation requirements",
-          "categories": [
-            1,
-            3,
-            9
-          ],
+          "categories": [1, 3, 9],
           "primary_category": 1,
           "confidence": 0.72,
           "evidence": [
             "MTU-safe T corrected to 1464; sub-symbol calculation fixed",
             "Symbol auth key derivation clarified with explicit master key capability"
           ],
-          "changed_headings": [
-            "3.4 Replication Packet",
-            "4.18 Symbol Auth"
-          ]
+          "changed_headings": ["3.4 Replication Packet", "4.18 Symbol Auth"]
         }
       ]
     },
@@ -2417,10 +1707,7 @@
       "change_groups": [
         {
           "summary": "Add lock references, row-value expression, and VDBE opcode examples; clarify blocking pool defaults",
-          "categories": [
-            7,
-            9
-          ],
+          "categories": [7, 9],
           "primary_category": 7,
           "confidence": 0.62,
           "evidence": [
@@ -2436,20 +1723,14 @@
         },
         {
           "summary": "Add ObjectId collision bound note; refine invariants monitor; several clarifications about WAL snapshot conflicts and risk sections",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.5,
           "evidence": [
             "ObjectId 128-bit truncation noted as ~2^64 birthday bound",
             "observe_lock_exclusivity now cross-checks lock table vs txn locks"
           ],
-          "changed_headings": [
-            "Glossary",
-            "4.3 Invariant Monitoring",
-            "7.4 Page Integrity"
-          ]
+          "changed_headings": ["Glossary", "4.3 Invariant Monitoring", "7.4 Page Integrity"]
         }
       ]
     },
@@ -2458,35 +1739,24 @@
       "change_groups": [
         {
           "summary": "Fix e-process aggregation to arithmetic mean and correct INV-1 violation detection comment",
-          "categories": [
-            1,
-            8
-          ],
+          "categories": [1, 8],
           "primary_category": 1,
           "confidence": 0.74,
           "evidence": [
             "E_global aggregation changed to sum of weighted e-values",
             "INV-1 comment corrected to ~20 violations for threshold"
           ],
-          "changed_headings": [
-            "4.3 E-processes"
-          ]
+          "changed_headings": ["4.3 E-processes"]
         },
         {
           "summary": "Minor clarifications: WAL snapshot conflict phrasing, opcode traces illustrative, sqliteInt.h size corrected",
-          "categories": [
-            9
-          ],
+          "categories": [9],
           "primary_category": 9,
           "confidence": 0.45,
           "evidence": [
             "WAL snapshot conflict clarified; opcode traces labeled illustrative; sqliteInt.h size corrected"
           ],
-          "changed_headings": [
-            "1.2 Innovations",
-            "10.6 Code Generation",
-            "21. Reference Files"
-          ]
+          "changed_headings": ["1.2 Innovations", "10.6 Code Generation", "21. Reference Files"]
         }
       ]
     },
@@ -2495,11 +1765,7 @@
       "change_groups": [
         {
           "summary": "Introduce UpdateExpression and RebaseExpr to enable deterministic rebase of read-modify-write; refine rebase safety and commutativity rules",
-          "categories": [
-            4,
-            1,
-            8
-          ],
+          "categories": [4, 1, 8],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -2515,20 +1781,14 @@
         },
         {
           "summary": "Require legacy WAL reader locks when updating read marks; cross-db atomic WAL transactions requirement",
-          "categories": [
-            2,
-            4
-          ],
+          "categories": [2, 4],
           "primary_category": 2,
           "confidence": 0.64,
           "evidence": [
             "Readers must hold WAL_READ_LOCK when writing aReadMark",
             "Cross-database atomic WAL transactions required via 2PC"
           ],
-          "changed_headings": [
-            "5.6.7 Compatibility Mode Hybrid SHM",
-            "12.11 ATTACH"
-          ]
+          "changed_headings": ["5.6.7 Compatibility Mode Hybrid SHM", "12.11 ATTACH"]
         }
       ]
     }
@@ -2539,28 +1799,18 @@
       "change_groups": [
         {
           "summary": "Move WAL-FEC generation fully off the commit critical path; distinguish design-time p_design from runtime living corruption-rate monitoring.",
-          "categories": [
-            7,
-            8,
-            4
-          ],
+          "categories": [7, 8, 4],
           "primary_category": 7,
           "confidence": 0.82,
           "evidence": [
             "Enqueue a background FEC job ... encoder reads source frames from .wal",
             "p_design = 10^-4; autopilot maintains living estimates + conservative bounds"
           ],
-          "changed_headings": [
-            "3.4.1 WAL-FEC",
-            "3.5.12 Durability Autopilot"
-          ]
+          "changed_headings": ["3.4.1 WAL-FEC", "3.5.12 Durability Autopilot"]
         },
         {
           "summary": "Add rigorous durability policy math: Bayesian posterior for p (diagnostics) plus anytime-valid p_upper for guarantees; VOI-based monitoring budgeting.",
-          "categories": [
-            8,
-            7
-          ],
+          "categories": [8, 7],
           "primary_category": 8,
           "confidence": 0.8,
           "evidence": [
@@ -2568,20 +1818,11 @@
             "derive p_upper via martingale inversion (anytime-valid under optional stopping)",
             "VOI(m) = E[ΔLoss(m) | evidence] - Cost(m)"
           ],
-          "changed_headings": [
-            "3.5.12.2.1 Living Corruption-Rate Estimates",
-            "4.16 Observability"
-          ]
+          "changed_headings": ["3.5.12.2.1 Living Corruption-Rate Estimates", "4.16 Observability"]
         },
         {
           "summary": "Reframe background compaction + retry as explicit decision policies: MDP compaction scheduling, online Zipf/s estimation, and optimal-stopping retry control; add interop notes (WAL-index locks, sqliteInt.h line count).",
-          "categories": [
-            8,
-            7,
-            2,
-            4,
-            5
-          ],
+          "categories": [8, 7, 2, 4, 5],
           "primary_category": 8,
           "confidence": 0.72,
           "evidence": [
@@ -2602,21 +1843,14 @@
       "change_groups": [
         {
           "summary": "Make UpdateExpression deterministic rebase correct: regenerate secondary-index ops from schema/row images during replay; forbid rebase for rowid/INTEGER PRIMARY KEY updates; refine commutativity check.",
-          "categories": [
-            4,
-            1,
-            2
-          ],
+          "categories": [4, 1, 2],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
             "Index regeneration (critical): stale IndexDelete/IndexInsert MUST be discarded",
             "No SET clause targets rowid/INTEGER PRIMARY KEY column"
           ],
-          "changed_headings": [
-            "5.10 Safe Write Merging",
-            "UpdateExpression"
-          ]
+          "changed_headings": ["5.10 Safe Write Merging", "UpdateExpression"]
         }
       ]
     },
@@ -2625,34 +1859,22 @@
       "change_groups": [
         {
           "summary": "Correct the maxLocal integer-division example by showing truncation and remainder explicitly.",
-          "categories": [
-            1,
-            5
-          ],
+          "categories": [1, 5],
           "primary_category": 1,
           "confidence": 0.76,
-          "evidence": [
-            "261376 / 255 = 1025 (truncated; remainder 1)"
-          ],
-          "changed_headings": [
-            "B-tree local payload"
-          ]
+          "evidence": ["261376 / 255 = 1025 (truncated; remainder 1)"],
+          "changed_headings": ["B-tree local payload"]
         },
         {
           "summary": "Add encryption deliverables/acceptance criteria and risk/complexity gates to the implementation phases.",
-          "categories": [
-            6,
-            7
-          ],
+          "categories": [6, 7],
           "primary_category": 6,
           "confidence": 0.7,
           "evidence": [
             "Page-level encryption: XChaCha20-Poly1305 with envelope DEK/KEK",
             "Encryption acceptance: PRAGMA key/rekey + AAD swap resistance"
           ],
-          "changed_headings": [
-            "Implementation Plan"
-          ]
+          "changed_headings": ["Implementation Plan"]
         }
       ]
     },
@@ -2661,52 +1883,33 @@
       "change_groups": [
         {
           "summary": "Split BtreeCursorOps into table/index-specific methods to mirror SQLite's dual B-tree APIs (table vs index move/insert semantics).",
-          "categories": [
-            4,
-            2
-          ],
+          "categories": [4, 2],
           "primary_category": 4,
           "confidence": 0.84,
           "evidence": [
             "sqlite3BtreeTableMoveTo(i64) vs sqlite3BtreeIndexMoveto(UnpackedRecord*)",
             "Replace key()/data() with payload()"
           ],
-          "changed_headings": [
-            "Trait Hierarchy",
-            "BtreeCursorOps"
-          ]
+          "changed_headings": ["Trait Hierarchy", "BtreeCursorOps"]
         },
         {
           "summary": "Make SHM mapping spec memory-safe: change shm_map return type to a safe ShmRegion wrapper; update unsafe-code policy boundary for VFS.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
             "fn shm_map(...) -> Result<ShmRegion>",
             "ShmRegion wraps mmap'd shared memory behind bounds-checked APIs"
           ],
-          "changed_headings": [
-            "VFS",
-            "Shared Memory"
-          ]
+          "changed_headings": ["VFS", "Shared Memory"]
         },
         {
           "summary": "Fix release profile optimization level inconsistency (size-opt to throughput-opt) and add a release-perf profile description.",
-          "categories": [
-            7,
-            5
-          ],
+          "categories": [7, 5],
           "primary_category": 7,
           "confidence": 0.74,
-          "evidence": [
-            "opt-level = 3  # Full optimization (database engine needs throughput)"
-          ],
-          "changed_headings": [
-            "Release Profile"
-          ]
+          "evidence": ["opt-level = 3  # Full optimization (database engine needs throughput)"],
+          "changed_headings": ["Release Profile"]
         }
       ]
     },
@@ -2715,35 +1918,22 @@
       "change_groups": [
         {
           "summary": "Fix TxnSlot struct sizing math so shared-memory slot stride is exactly 128 bytes.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.83,
-          "evidence": [
-            "_padding was 52 -> 132B total; corrected to 128B stride"
-          ],
-          "changed_headings": [
-            "5.6.2 TxnSlot"
-          ]
+          "evidence": ["_padding was 52 -> 132B total; corrected to 128B stride"],
+          "changed_headings": ["5.6.2 TxnSlot"]
         },
         {
           "summary": "Tighten group-commit and request semantics: use TxnSlot.mode via request.txn, clarify durability point for batched capsules, and fix term usage (K_source + R).",
-          "categories": [
-            4,
-            7,
-            5
-          ],
+          "categories": [4, 7, 5],
           "primary_category": 4,
           "confidence": 0.72,
           "evidence": [
             "PublishRequest has no mode field; derive mode via request.txn -> TxnSlot.mode",
             "Coordinator FSYNC_1 is the durability point for batched capsule symbols"
           ],
-          "changed_headings": [
-            "7.11 Group Commit"
-          ]
+          "changed_headings": ["7.11 Group Commit"]
         }
       ]
     },
@@ -2752,21 +1942,14 @@
       "change_groups": [
         {
           "summary": "Add RecentlyCommittedReadersIndex to preserve committed readers' SSI read evidence so incoming rw-edges aren\"t lost when TxnSlots are freed; enforce T3 rule for committed pivots.",
-          "categories": [
-            4,
-            1,
-            6,
-            7
-          ],
+          "categories": [4, 1, 6, 7],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
             "RecentlyCommittedReadersIndex retains committed transactions' read witness summary",
             "If entry.has_in_rw is true, committer MUST abort (T3 rule for committed pivots)"
           ],
-          "changed_headings": [
-            "5.6.2.1 Recently Committed Readers"
-          ]
+          "changed_headings": ["5.6.2.1 Recently Committed Readers"]
         }
       ]
     },
@@ -2775,50 +1958,27 @@
       "change_groups": [
         {
           "summary": "Fix lexer/identifier semantics: double-quoted strings are TK_ID; DQS reinterpretation happens in name resolution, not tokenization.",
-          "categories": [
-            2,
-            5
-          ],
+          "categories": [2, 5],
           "primary_category": 2,
           "confidence": 0.8,
-          "evidence": [
-            "SQLite tokenize.c emits TK_ID for \"...\"; resolve.c reinterprets"
-          ],
-          "changed_headings": [
-            "Lexer",
-            "QuotedId"
-          ]
+          "evidence": ["SQLite tokenize.c emits TK_ID for \"...\"; resolve.c reinterprets"],
+          "changed_headings": ["Lexer", "QuotedId"]
         },
         {
           "summary": "Correct planner range-scan cost model by adding index-leaf scanning term; avoids preferring long-range index scans incorrectly.",
-          "categories": [
-            1,
-            7
-          ],
+          "categories": [1, 7],
           "primary_category": 1,
           "confidence": 0.86,
-          "evidence": [
-            "cost = log2(N_idx_pages) + sel*N_idx_pages + sel*N_tbl_pages"
-          ],
-          "changed_headings": [
-            "Planner Cost Model"
-          ]
+          "evidence": ["cost = log2(N_idx_pages) + sel*N_idx_pages + sel*N_tbl_pages"],
+          "changed_headings": ["Planner Cost Model"]
         },
         {
           "summary": "Fix UPDATE VDBE trace example: MakeRecord must encode all columns (overlay updated column on full-row image).",
-          "categories": [
-            2,
-            6
-          ],
+          "categories": [2, 6],
           "primary_category": 2,
           "confidence": 0.74,
-          "evidence": [
-            "Overlay updated column, then MakeRecord(all columns)"
-          ],
-          "changed_headings": [
-            "VDBE",
-            "UPDATE"
-          ]
+          "evidence": ["Overlay updated column, then MakeRecord(all columns)"],
+          "changed_headings": ["VDBE", "UPDATE"]
         }
       ]
     },
@@ -2827,21 +1987,14 @@
       "change_groups": [
         {
           "summary": "Specify required asupersync networking + deterministic VirtualTcp testing and map FrankenSQLite work onto scheduler priority lanes (cancel/timed/ready) for tail-latency control.",
-          "categories": [
-            3,
-            7,
-            6
-          ],
+          "categories": [3, 7, 6],
           "primary_category": 3,
           "confidence": 0.82,
           "evidence": [
             "MUST use asupersync cancel-safe network stack; lab transport swappable to VirtualTcp",
             "Scheduler lanes: Cancel (highest), Timed (EDF), Ready (background)"
           ],
-          "changed_headings": [
-            "4.19.6 Networking Stack",
-            "4.20 Scheduler Priority Lanes"
-          ]
+          "changed_headings": ["4.19.6 Networking Stack", "4.20 Scheduler Priority Lanes"]
         }
       ]
     },
@@ -2850,20 +2003,14 @@
       "change_groups": [
         {
           "summary": "Correct MVCC version-chain compression: use sparse XOR deltas between adjacent versions (compression), not RaptorQ repair symbols; RaptorQ remains the durability layer for delta objects.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
             "V2 delta: XOR(V2,V3)",
             "RaptorQ applies at ECS object level for durability"
           ],
-          "changed_headings": [
-            "Version Chains",
-            "Compression"
-          ]
+          "changed_headings": ["Version Chains", "Compression"]
         }
       ]
     },
@@ -2872,20 +2019,14 @@
       "change_groups": [
         {
           "summary": "Add independent per-source hashes to WAL-FEC metadata so recovery can validate surviving source frames after the WAL checksum chain breaks.",
-          "categories": [
-            7,
-            2,
-            4
-          ],
+          "categories": [7, 2, 4],
           "primary_category": 7,
           "confidence": 0.86,
           "evidence": [
             "WalFecGroupMeta.source_page_xxh3: Vec<u64> (length=K)",
             "frames at/after checksum mismatch validate via .wal-fec hashes"
           ],
-          "changed_headings": [
-            "3.4.1 WAL-FEC"
-          ]
+          "changed_headings": ["3.4.1 WAL-FEC"]
         }
       ]
     },
@@ -2894,36 +2035,22 @@
       "change_groups": [
         {
           "summary": "Clarify cumulative WAL checksums: after first mismatch, frames i+1.. aren\"t WAL-validated; require random-access validation via WAL-FEC and attempt repair-before-truncate.",
-          "categories": [
-            2,
-            7,
-            4
-          ],
+          "categories": [2, 7, 4],
           "primary_category": 2,
           "confidence": 0.86,
           "evidence": [
             "Because checksum is cumulative, WAL format alone cannot validate frames i+1..",
             "Attempt repair first if matching .wal-fec group exists"
           ],
-          "changed_headings": [
-            "7.5 WAL Checksums",
-            "7.8 Error Recovery"
-          ]
+          "changed_headings": ["7.5 WAL Checksums", "7.8 Error Recovery"]
         },
         {
           "summary": "Correct SQLite header semantics: file change counter is updated when header page is written (not forced on every WAL commit).",
-          "categories": [
-            2,
-            9
-          ],
+          "categories": [2, 9],
           "primary_category": 2,
           "confidence": 0.78,
-          "evidence": [
-            "In WAL mode, file change counter is NOT forced on every commit"
-          ],
-          "changed_headings": [
-            "11.1 Database Header"
-          ]
+          "evidence": ["In WAL mode, file change counter is NOT forced on every commit"],
+          "changed_headings": ["11.1 Database Header"]
         }
       ]
     },
@@ -2932,34 +2059,19 @@
       "change_groups": [
         {
           "summary": "Prevent lock-table rebuild deadlocks: transactions holding page locks must not busy-wait on rebuild-busy; abort/retry to reach lock quiescence.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.8,
-          "evidence": [
-            "MUST NOT spin on SQLITE_BUSY while holding page locks; abort/retry"
-          ],
-          "changed_headings": [
-            "PageLockTable Rebuild"
-          ]
+          "evidence": ["MUST NOT spin on SQLITE_BUSY while holding page locks; abort/retry"],
+          "changed_headings": ["PageLockTable Rebuild"]
         },
         {
           "summary": "Add research note: view ARC p-update as online learning (OCO-style) while keeping canonical ARC update rules normative.",
-          "categories": [
-            8,
-            7,
-            6
-          ],
+          "categories": [8, 7, 6],
           "primary_category": 8,
           "confidence": 0.64,
-          "evidence": [
-            "p_{t+1} = clamp(p_t + η_t * s_t, 0, capacity)"
-          ],
-          "changed_headings": [
-            "6.4.1 Optional: p-Update as Online Learning"
-          ]
+          "evidence": ["p_{t+1} = clamp(p_t + η_t * s_t, 0, capacity)"],
+          "changed_headings": ["6.4.1 Optional: p-Update as Online Learning"]
         }
       ]
     },
@@ -2968,20 +2080,14 @@
       "change_groups": [
         {
           "summary": "Harden UpdateExpression replay: enforce NOT NULL/CHECK semantics at replay time; restrict V1 to no foreign keys and rebase-safe CHECK constraints.",
-          "categories": [
-            4,
-            1,
-            2
-          ],
+          "categories": [4, 1, 2],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
             "Constraint checks (normative): NOT NULL + CHECK enforced during replay",
             "Foreign keys (V1 restriction): fall back to materialized Update"
           ],
-          "changed_headings": [
-            "UpdateExpression"
-          ]
+          "changed_headings": ["UpdateExpression"]
         }
       ]
     },
@@ -2990,32 +2096,19 @@
       "change_groups": [
         {
           "summary": "Add explicit WAL-FEC invariants tying group metadata to WAL frame geometry and commit db_size.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.75,
-          "evidence": [
-            "k_source == end_frame_no - start_frame_no + 1"
-          ],
-          "changed_headings": [
-            "WalFecGroupMeta"
-          ]
+          "evidence": ["k_source == end_frame_no - start_frame_no + 1"],
+          "changed_headings": ["WalFecGroupMeta"]
         },
         {
           "summary": "Fix UpdateExpression rebase step numbering after inserting constraint-check step.",
-          "categories": [
-            5
-          ],
+          "categories": [5],
           "primary_category": 5,
           "confidence": 0.9,
-          "evidence": [
-            "Index regeneration step renumbered (6 -> 7)"
-          ],
-          "changed_headings": [
-            "UpdateExpression"
-          ]
+          "evidence": ["Index regeneration step renumbered (6 -> 7)"],
+          "changed_headings": ["UpdateExpression"]
         }
       ]
     },
@@ -3024,19 +2117,14 @@
       "change_groups": [
         {
           "summary": "Update built-in function coverage to match SQLite 3.52 target: add missing strftime specifiers and document ORDER BY inside group_concat/string_agg aggregates.",
-          "categories": [
-            2,
-            6
-          ],
+          "categories": [2, 6],
           "primary_category": 2,
           "confidence": 0.84,
           "evidence": [
             "strftime adds: %e %k %I %l %p %P %R %T %u %G %g %V",
             "group_concat(name, ', ' ORDER BY name)"
           ],
-          "changed_headings": [
-            "Built-in Functions"
-          ]
+          "changed_headings": ["Built-in Functions"]
         }
       ]
     },
@@ -3045,49 +2133,27 @@
       "change_groups": [
         {
           "summary": "Clarify Compatibility-mode I/O constraints: WAL frames are 24+page_size and break sector alignment, so O_DIRECT must not be required for .wal.",
-          "categories": [
-            2,
-            7,
-            9
-          ],
+          "categories": [2, 7, 9],
           "primary_category": 2,
           "confidence": 0.8,
-          "evidence": [
-            "SQLite .wal frames are 24+page_size; MUST NOT require O_DIRECT for .wal"
-          ],
-          "changed_headings": [
-            "Mechanical Sympathy"
-          ]
+          "evidence": ["SQLite .wal frames are 24+page_size; MUST NOT require O_DIRECT for .wal"],
+          "changed_headings": ["Mechanical Sympathy"]
         },
         {
           "summary": "Tighten safety boundary: prefetch and VFS platform ops must use safe abstractions (or move behind external dependency boundary), not unsafe inside workspace crates.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.76,
-          "evidence": [
-            "Workspace members forbid unsafe; VFS MUST rely on safe SHM/locking APIs"
-          ],
-          "changed_headings": [
-            "Unsafe Policy",
-            "VFS"
-          ]
+          "evidence": ["Workspace members forbid unsafe; VFS MUST rely on safe SHM/locking APIs"],
+          "changed_headings": ["Unsafe Policy", "VFS"]
         },
         {
           "summary": "Correct FTS5 query semantics: NOT is strictly a binary operator; unary NOT is a syntax error in FTS5 (unlike FTS3/4).",
-          "categories": [
-            2
-          ],
+          "categories": [2],
           "primary_category": 2,
           "confidence": 0.86,
-          "evidence": [
-            "FTS5 NOT: expr NOT expr (binary only); unary NOT not in fts5parse.y"
-          ],
-          "changed_headings": [
-            "FTS5"
-          ]
+          "evidence": ["FTS5 NOT: expr NOT expr (binary only); unary NOT not in fts5parse.y"],
+          "changed_headings": ["FTS5"]
         }
       ]
     },
@@ -3096,20 +2162,14 @@
       "change_groups": [
         {
           "summary": "Define replication changeset_bytes encoding as a self-delimiting header + sorted PageEntry records with per-page xxh3; receivers validate hashes before applying.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
             "ChangesetHeader.total_len (u64) before padding",
             "PageEntry: page_number + page_xxh3 + page_bytes"
           ],
-          "changed_headings": [
-            "Replication"
-          ]
+          "changed_headings": ["Replication"]
         }
       ]
     },
@@ -3118,11 +2178,7 @@
       "change_groups": [
         {
           "summary": "Harden crash cleanup and SQLite WAL-index interop: reclaim stuck CLEANING slots; enforce WAL_READ_LOCK discipline (exclusive update then shared hold) and state the 5-reader mark limitation explicitly.",
-          "categories": [
-            4,
-            2,
-            7
-          ],
+          "categories": [4, 2, 7],
           "primary_category": 4,
           "confidence": 0.84,
           "evidence": [
@@ -3130,44 +2186,26 @@
             "Acquire WAL_READ_LOCK(i) EXCLUSIVE to write aReadMark, then downgrade to SHARED",
             "Legacy WAL-index has only 5 reader marks/locks"
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot",
-            "Hybrid SHM Interop"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot", "Hybrid SHM Interop"]
         },
         {
           "summary": "Fix ARC replacement liveness: track rotations per list so a pinned preferred list can\"t spin forever; add explicit fall-through path.",
-          "categories": [
-            1,
-            7,
-            4
-          ],
+          "categories": [1, 7, 4],
           "primary_category": 1,
           "confidence": 0.8,
-          "evidence": [
-            "if rotations_t1 >= |T1| AND rotations_t2 >= |T2|: safety valve triggers"
-          ],
-          "changed_headings": [
-            "ARC Cache"
-          ]
+          "evidence": ["if rotations_t1 >= |T1| AND rotations_t2 >= |T2|: safety valve triggers"],
+          "changed_headings": ["ARC Cache"]
         },
         {
           "summary": "Add deterministic safety directives: triggers must be non-recursive in Rust (explicit frame stack); correct conformal baseline sample size math under Bonferroni across M metrics.",
-          "categories": [
-            8,
-            7,
-            4
-          ],
+          "categories": [8, 7, 4],
           "primary_category": 8,
           "confidence": 0.76,
           "evidence": [
             "Trigger execution MUST NOT use Rust call-stack recursion",
             "N_base >= ceil(M/alpha_total) to satisfy split conformal per-metric alpha"
           ],
-          "changed_headings": [
-            "Triggers",
-            "Conformal No-Regression"
-          ]
+          "changed_headings": ["Triggers", "Conformal No-Regression"]
         }
       ]
     },
@@ -3176,18 +2214,11 @@
       "change_groups": [
         {
           "summary": "Ensure cleanup fully resets TxnSlot to a Free/Serialized state (not Aborted) when reclaiming or freeing slots.",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.82,
-          "evidence": [
-            "slot.state = Free; slot.mode = Serialized during cleanup"
-          ],
-          "changed_headings": [
-            "5.6.2 TxnSlot"
-          ]
+          "evidence": ["slot.state = Free; slot.mode = Serialized during cleanup"],
+          "changed_headings": ["5.6.2 TxnSlot"]
         }
       ]
     },
@@ -3196,12 +2227,7 @@
       "change_groups": [
         {
           "summary": "Specify Compatibility-mode .db-fec as a checkpoint-owned sidecar: only checkpointer mutates .db/.db-fec; enforce WAL truncation ordering; add independent per-source validation and repair writeback discipline.",
-          "categories": [
-            7,
-            4,
-            2,
-            6
-          ],
+          "categories": [7, 4, 2, 6],
           "primary_category": 7,
           "confidence": 0.84,
           "evidence": [
@@ -3209,10 +2235,7 @@
             "WAL truncation safety: RESTART/TRUNCATE only after .db-fec updated+fsync'd",
             "DbFecGroupMeta.source_page_xxh3_128 for random-access validation"
           ],
-          "changed_headings": [
-            "3.4.6 .db-fec",
-            "Read Path with On-the-Fly Repair"
-          ]
+          "changed_headings": ["3.4.6 .db-fec", "Read Path with On-the-Fly Repair"]
         }
       ]
     },
@@ -3221,19 +2244,14 @@
       "change_groups": [
         {
           "summary": "Add out-of-the-box, bounded auto-tuning knobs and derived defaults to prevent self-DoS on many-core CPUs (bg_cpu_max, remote_max_in_flight, commit_encode_max; profile-based scaling).",
-          "categories": [
-            7,
-            6
-          ],
+          "categories": [7, 6],
           "primary_category": 7,
           "confidence": 0.83,
           "evidence": [
             "PRAGMA fsqlite.auto_tune=ON (default) + PRAGMA fsqlite.profile",
             "Defaults scale sublinearly: bg_cpu_max_default = clamp(P/8,1,16)"
           ],
-          "changed_headings": [
-            "4.17.1 Out-of-the-Box Auto-Tuning"
-          ]
+          "changed_headings": ["4.17.1 Out-of-the-Box Auto-Tuning"]
         }
       ]
     },
@@ -3242,34 +2260,21 @@
       "change_groups": [
         {
           "summary": "Clarify SERIALIZABLE phantom protection: predicate/range reads must register leaf-page witnesses that intersect any phantom-producing writes.",
-          "categories": [
-            4,
-            2,
-            6
-          ],
+          "categories": [4, 2, 6],
           "primary_category": 4,
           "confidence": 0.74,
           "evidence": [
             "Predicate reads MUST register witnesses (e.g., WitnessKey::Page(leaf_pgno))"
           ],
-          "changed_headings": [
-            "Witness Plane"
-          ]
+          "changed_headings": ["Witness Plane"]
         },
         {
           "summary": "Warn against common SQLite WAL checksum mis-transcriptions that would break binary interoperability.",
-          "categories": [
-            2,
-            1
-          ],
+          "categories": [2, 1],
           "primary_category": 2,
           "confidence": 0.74,
-          "evidence": [
-            "walChecksumBytes: s1 += a + s2; s2 += b + s1 (no avalanche)"
-          ],
-          "changed_headings": [
-            "WAL Checksums"
-          ]
+          "evidence": ["walChecksumBytes: s1 += a + s2; s2 += b + s1 (no avalanche)"],
+          "changed_headings": ["WAL Checksums"]
         }
       ]
     },
@@ -3278,52 +2283,35 @@
       "change_groups": [
         {
           "summary": "Place deterministic rebase outside the sequencer: committing txn must rebase before entering serialized commit section; coordinator validates certificates but must not execute B-tree/expression logic.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.84,
           "evidence": [
             "Deterministic rebase MUST run before entering WriteCoordinator serialized section",
             "coordinator MUST NOT perform B-tree traversal or index-key regeneration"
           ],
-          "changed_headings": [
-            "5.10 Safe Write Merging"
-          ]
+          "changed_headings": ["5.10 Safe Write Merging"]
         },
         {
           "summary": "Harden UpdateExpression index regeneration: handle partial/expression indexes, participation predicates, and enforce UNIQUE constraints during replay.",
-          "categories": [
-            4,
-            2,
-            1
-          ],
+          "categories": [4, 2, 1],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
             "Partial indexes: evaluate WHERE predicate; base/updated participation drives delete/insert"
           ],
-          "changed_headings": [
-            "UpdateExpression"
-          ]
+          "changed_headings": ["UpdateExpression"]
         },
         {
           "summary": "Replace Zipf-only policy input with model-free write-set skew estimation: define collision mass M2 / effective pool P_eff, add second-moment estimators and keep Zipf s_hat interpretability-only.",
-          "categories": [
-            8,
-            7,
-            9
-          ],
+          "categories": [8, 7, 9],
           "primary_category": 8,
           "confidence": 0.8,
           "evidence": [
             "Collision mass M2 := Σ q(pgno)^2; P_eff := 1/M2",
             "Zipf is interpretability-only; policy should prefer M2_hat/P_eff_hat"
           ],
-          "changed_headings": [
-            "18.4.1 Estimating Write-Set Skew Online"
-          ]
+          "changed_headings": ["18.4.1 Estimating Write-Set Skew Online"]
         }
       ]
     },
@@ -3332,19 +2320,11 @@
       "change_groups": [
         {
           "summary": "Correct planner join-ordering description: SQLite NGQP uses beam search (mxChoice), not an exhaustive search threshold; update the corresponding phase write-up.",
-          "categories": [
-            2,
-            1,
-            4
-          ],
+          "categories": [2, 1, 4],
           "primary_category": 2,
           "confidence": 0.82,
-          "evidence": [
-            "wherePathSolver uses beam search; mxChoice=12/18 for 3+ tables"
-          ],
-          "changed_headings": [
-            "Planner"
-          ]
+          "evidence": ["wherePathSolver uses beam search; mxChoice=12/18 for 3+ tables"],
+          "changed_headings": ["Planner"]
         }
       ]
     },
@@ -3353,19 +2333,11 @@
       "change_groups": [
         {
           "summary": "Fix a second instance of the join-ordering error: beam search for all 3+ table joins, no exhaustive join enumeration path.",
-          "categories": [
-            2,
-            1,
-            5
-          ],
+          "categories": [2, 1, 5],
           "primary_category": 2,
           "confidence": 0.8,
-          "evidence": [
-            "No greedy/exhaustive split; beam search modeled on SQLite NGQP"
-          ],
-          "changed_headings": [
-            "Planner"
-          ]
+          "evidence": ["No greedy/exhaustive split; beam search modeled on SQLite NGQP"],
+          "changed_headings": ["Planner"]
         }
       ]
     },
@@ -3374,22 +2346,14 @@
       "change_groups": [
         {
           "summary": "Add a witness hot-index sizing manifest driven by skew: introduce deterministic second-moment (AMS F2) sketch and heavy-hitter decomposition for explainability; use M2_shard to derive S_eff under skew.",
-          "categories": [
-            8,
-            7,
-            4,
-            6
-          ],
+          "categories": [8, 7, 4, 6],
           "primary_category": 8,
           "confidence": 0.82,
           "evidence": [
             "M2_shard := Σ q(shard)^2; S_eff := 1/M2_shard",
             "AMS F2 sketch (normative default)"
           ],
-          "changed_headings": [
-            "18.4.1.3 Estimator A",
-            "HotWitnessIndex"
-          ]
+          "changed_headings": ["18.4.1.3 Estimator A", "HotWitnessIndex"]
         }
       ]
     },
@@ -3398,20 +2362,13 @@
       "change_groups": [
         {
           "summary": "Clarify skew section naming (write-set skew, not page access) and make commit-ledger requirements explicit when contention telemetry influences commit/abort and policy actions.",
-          "categories": [
-            9,
-            8,
-            6
-          ],
+          "categories": [9, 8, 6],
           "primary_category": 9,
           "confidence": 0.72,
           "evidence": [
             "Ledger must include regime_id, writers_active, M2_hat/P_eff_hat, expected losses"
           ],
-          "changed_headings": [
-            "18.4 Non-Uniform Write-Set Skew",
-            "Evidence Ledger"
-          ]
+          "changed_headings": ["18.4 Non-Uniform Write-Set Skew", "Evidence Ledger"]
         }
       ]
     },
@@ -3420,19 +2377,11 @@
       "change_groups": [
         {
           "summary": "Tighten Zipf s_hat guidance: require deterministic windowing under LabRuntime and prohibit using s_hat as a direct policy input when M2_hat is available.",
-          "categories": [
-            9,
-            7,
-            8
-          ],
+          "categories": [9, 7, 8],
           "primary_category": 9,
           "confidence": 0.72,
-          "evidence": [
-            "s_hat MUST NOT be used as direct policy input when M2_hat is available"
-          ],
-          "changed_headings": [
-            "Zipf s_hat"
-          ]
+          "evidence": ["s_hat MUST NOT be used as direct policy input when M2_hat is available"],
+          "changed_headings": ["Zipf s_hat"]
         }
       ]
     },
@@ -3441,20 +2390,14 @@
       "change_groups": [
         {
           "summary": "Define Compatibility .db-fec physical layout for O(1) seek and specify crash-consistent group updates (meta-as-commit-record discipline).",
-          "categories": [
-            7,
-            4,
-            6
-          ],
+          "categories": [7, 4, 6],
           "primary_category": 7,
           "confidence": 0.82,
           "evidence": [
             "segment_off = sizeof(DbFecHeader) + SEG1_LEN + g*SEGG_LEN",
             "Write SymbolRecords first, DbFecGroupMeta last"
           ],
-          "changed_headings": [
-            ".db-fec physical layout"
-          ]
+          "changed_headings": [".db-fec physical layout"]
         }
       ]
     },
@@ -3463,19 +2406,11 @@
       "change_groups": [
         {
           "summary": "Reserve TxnId sentinel values for shared-memory protocol and guard TxnId allocation from ever producing them (fail fast on overflow).",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.82,
-          "evidence": [
-            "TxnId allocation MUST never produce u64::MAX/u64::MAX-1 sentinels"
-          ],
-          "changed_headings": [
-            "TxnId",
-            "TxnSlot"
-          ]
+          "evidence": ["TxnId allocation MUST never produce u64::MAX/u64::MAX-1 sentinels"],
+          "changed_headings": ["TxnId", "TxnSlot"]
         }
       ]
     },
@@ -3484,54 +2419,35 @@
       "change_groups": [
         {
           "summary": "Clarify replication identifier semantics: rename changeset_object_id to ChangesetId, validate K_source and symbol_size consistency, and truncate decoded bytes using total_len.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
             "ChangesetId is NOT ECS ObjectId; parse ChangesetHeader.total_len to drop padding"
           ],
-          "changed_headings": [
-            "Replication"
-          ]
+          "changed_headings": ["Replication"]
         },
         {
           "summary": "Harden TxnId allocation and witness semantics: forbid fetch_add wrap; use CAS loop to avoid publishing illegal TxnIds; tighten predicate-witness registration to include initial seek inspection.",
-          "categories": [
-            4,
-            1,
-            2
-          ],
+          "categories": [4, 1, 2],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
             "fetch_add forbidden; CAS loop prevents wrap into TxnId=0",
             "Register leaf-page witnesses during initial Seek*/MoveTo and OP_Next/Prev"
           ],
-          "changed_headings": [
-            "TxnId",
-            "Witness Plane"
-          ]
+          "changed_headings": ["TxnId", "Witness Plane"]
         },
         {
           "summary": "Make ARC cache cancel-safe and singleflight-friendly: add flush_inflight flag + protocol, define Loading watch status enum, and require cancellation to resolve latches.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.8,
           "evidence": [
             "flush_inflight: false -> true via CAS; must clear on all paths",
             "Loading state uses watch::Receiver<LoadStatus>"
           ],
-          "changed_headings": [
-            "ARC Cache",
-            "Cancellation Safety"
-          ]
+          "changed_headings": ["ARC Cache", "Cancellation Safety"]
         }
       ]
     },
@@ -3540,33 +2456,19 @@
       "change_groups": [
         {
           "summary": "Update the monotonic TxnId proof text to match the CAS-loop allocator and explicitly fail closed on wrap/reserved-sentinel values.",
-          "categories": [
-            1,
-            4
-          ],
+          "categories": [1, 4],
           "primary_category": 1,
           "confidence": 0.8,
-          "evidence": [
-            "Abort with FATAL_TXN_ID_OVERFLOW rather than publish illegal TxnId"
-          ],
-          "changed_headings": [
-            "TxnId Invariants"
-          ]
+          "evidence": ["Abort with FATAL_TXN_ID_OVERFLOW rather than publish illegal TxnId"],
+          "changed_headings": ["TxnId Invariants"]
         },
         {
           "summary": "Clarify interpretation of P_eff: it\"s an effective collision pool for transaction write sets, not an estimate of physical page count.",
-          "categories": [
-            9,
-            8
-          ],
+          "categories": [9, 8],
           "primary_category": 9,
           "confidence": 0.76,
-          "evidence": [
-            "P_eff plays role of \"year length\" in birthday paradox for transactions"
-          ],
-          "changed_headings": [
-            "18.4.1.1 Collision Mass (M2)"
-          ]
+          "evidence": ["P_eff plays role of \"year length\" in birthday paradox for transactions"],
+          "changed_headings": ["18.4.1.1 Collision Mass (M2)"]
         }
       ]
     },
@@ -3575,19 +2477,11 @@
       "change_groups": [
         {
           "summary": "Require deterministic RaptorQ block seeding for replication changesets by deriving the seed from ChangesetId (matches asupersync determinism expectations).",
-          "categories": [
-            3,
-            7,
-            4
-          ],
+          "categories": [3, 7, 4],
           "primary_category": 3,
           "confidence": 0.8,
-          "evidence": [
-            "seed = xxh3_64(changeset_id_bytes); decoder stores seed"
-          ],
-          "changed_headings": [
-            "Replication"
-          ]
+          "evidence": ["seed = xxh3_64(changeset_id_bytes); decoder stores seed"],
+          "changed_headings": ["Replication"]
         }
       ]
     },
@@ -3596,49 +2490,31 @@
       "change_groups": [
         {
           "summary": "Tighten TxnSlot acquisition safety: seed claiming_timestamp via CAS after slot claim; document publish-phase CAS to detect cleanup reclaim.",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
             "Phase 3 publish uses CAS(TXN_ID_CLAIMING -> real_txn_id); store is forbidden"
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot"]
         },
         {
           "summary": "Expand ARC implementation guidance and ensure REPLACE terminates: treat prefer_t1 as a hint and fall back to the other list when preferred list is exhausted.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.78,
           "evidence": [
             "prefer_t1 is a hint, not a mandate; fallback to other list to ensure termination"
           ],
-          "changed_headings": [
-            "ARC Cache"
-          ]
+          "changed_headings": ["ARC Cache"]
         },
         {
           "summary": "Adopt NGQP-style beam search join ordering for V1 (mxChoice bounded best-first search) and remove the exhaustive/greedy split narrative.",
-          "categories": [
-            2,
-            4,
-            7
-          ],
+          "categories": [2, 4, 7],
           "primary_category": 2,
           "confidence": 0.84,
-          "evidence": [
-            "Maintain up to mxChoice best partial join paths; no N! exhaustive path"
-          ],
-          "changed_headings": [
-            "Join Ordering"
-          ]
+          "evidence": ["Maintain up to mxChoice best partial join paths; no N! exhaustive path"],
+          "changed_headings": ["Join Ordering"]
         }
       ]
     },
@@ -3647,33 +2523,19 @@
       "change_groups": [
         {
           "summary": "Make TxnSlot publish phase robust against cleanup races: publish real TxnId via CAS so a reclaimed slot can\"t be silently overwritten.",
-          "categories": [
-            4,
-            1
-          ],
+          "categories": [4, 1],
           "primary_category": 4,
           "confidence": 0.82,
-          "evidence": [
-            "if !slot.txn_id.CAS(TXN_ID_CLAIMING, real_txn_id): restart_slot_acquire()"
-          ],
-          "changed_headings": [
-            "TxnSlot acquire protocol"
-          ]
+          "evidence": ["if !slot.txn_id.CAS(TXN_ID_CLAIMING, real_txn_id): restart_slot_acquire()"],
+          "changed_headings": ["TxnSlot acquire protocol"]
         },
         {
           "summary": "Correct beam-search complexity statement to reflect bounded worst-case candidate expansions (~O(mxChoice*N^2)).",
-          "categories": [
-            1,
-            2
-          ],
+          "categories": [1, 2],
           "primary_category": 1,
           "confidence": 0.8,
-          "evidence": [
-            "Complexity: worst-case ~O(mxChoice * N^2) candidate expansions"
-          ],
-          "changed_headings": [
-            "Join Ordering"
-          ]
+          "evidence": ["Complexity: worst-case ~O(mxChoice * N^2) candidate expansions"],
+          "changed_headings": ["Join Ordering"]
         }
       ]
     },
@@ -3682,55 +2544,32 @@
       "change_groups": [
         {
           "summary": "Make snapshots self-consistent across (commit_seq, schema_epoch) and enforce schema-epoch publication ordering to prevent mixed-schema rebase.",
-          "categories": [
-            4,
-            1,
-            7
-          ],
+          "categories": [4, 1, 7],
           "primary_category": 4,
           "confidence": 0.82,
-          "evidence": [
-            "load_consistent_snapshot() reads commit_seq twice around schema_epoch"
-          ],
-          "changed_headings": [
-            "5.4 BEGIN",
-            "Memory ordering"
-          ]
+          "evidence": ["load_consistent_snapshot() reads commit_seq twice around schema_epoch"],
+          "changed_headings": ["5.4 BEGIN", "Memory ordering"]
         },
         {
           "summary": "Replace toy WAL timing constants with measured distributions (fsync dominates); require histograms and policy-driven batching; add I/O-stall semantics that prefer safety over liveness.",
-          "categories": [
-            7,
-            6,
-            4
-          ],
+          "categories": [7, 6, 4],
           "primary_category": 7,
           "confidence": 0.8,
           "evidence": [
             "T_wal = T_wal_write + T_fsync + T_wal_overhead; fsync can be multi-ms",
             "Coordinator MUST record histogram of T_fsync"
           ],
-          "changed_headings": [
-            "Group Commit",
-            "Cancellation Safety"
-          ]
+          "changed_headings": ["Group Commit", "Cancellation Safety"]
         },
         {
           "summary": "Add a normative conformance mode matrix: fixtures must declare required operating modes (compatibility/native) and CI must check both against Oracle and each other.",
-          "categories": [
-            6,
-            4,
-            5
-          ],
+          "categories": [6, 4, 5],
           "primary_category": 6,
           "confidence": 0.8,
           "evidence": [
             "Fixture field: fsqlite_modes: [\"compatibility\",\"native\"] (default both)"
           ],
-          "changed_headings": [
-            "Harness",
-            "Mode matrix"
-          ]
+          "changed_headings": ["Harness", "Mode matrix"]
         }
       ]
     },
@@ -3739,50 +2578,31 @@
       "change_groups": [
         {
           "summary": "Tighten serialized-mode correctness: add FCW freshness validation (reader-turned-writer stale snapshot must abort) and simplify commit sequencing in the COMMIT table.",
-          "categories": [
-            4,
-            1,
-            2
-          ],
+          "categories": [4, 1, 2],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
             "Commit (Serialized): FCW freshness validation still required; abort with SQLITE_BUSY_SNAPSHOT"
           ],
-          "changed_headings": [
-            "5.4 COMMIT semantics"
-          ]
+          "changed_headings": ["5.4 COMMIT semantics"]
         },
         {
           "summary": "Harden open-sequence invariants: initialize and reconcile shm.schema_epoch from durable schema cookie/manifest and forbid shared-memory schema_epoch ahead of durable reality.",
-          "categories": [
-            4,
-            2
-          ],
+          "categories": [4, 2],
           "primary_category": 4,
           "confidence": 0.8,
-          "evidence": [
-            "On open: set shm.schema_epoch to durable schema cookie (offset 40)"
-          ],
-          "changed_headings": [
-            "SharedMemoryLayout",
-            "Schema epoch"
-          ]
+          "evidence": ["On open: set shm.schema_epoch to durable schema cookie (offset 40)"],
+          "changed_headings": ["SharedMemoryLayout", "Schema epoch"]
         },
         {
           "summary": "Refine rebase read-footprint semantics: footprint.reads captures non-replayable blocking reads; uniqueness checks for written keys are revalidated during replay and must not be recorded as blocking reads.",
-          "categories": [
-            4,
-            9
-          ],
+          "categories": [4, 9],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
             "Do NOT include uniqueness checks in footprint.reads; re-validated during replay"
           ],
-          "changed_headings": [
-            "IntentFootprint"
-          ]
+          "changed_headings": ["IntentFootprint"]
         }
       ]
     },
@@ -3791,11 +2611,7 @@
       "change_groups": [
         {
           "summary": "Make TxnSlot crash cleanup retryable: add cleanup_txn_id, broaden claiming_timestamp to sentinel states, and define release_page_locks_for(txn_id) for crashed writers.",
-          "categories": [
-            1,
-            7,
-            4
-          ],
+          "categories": [1, 7, 4],
           "primary_category": 1,
           "confidence": 0.9,
           "evidence": [
@@ -3811,11 +2627,7 @@
         },
         {
           "summary": "Reconcile single-process vs multi-process lock semantics: SharedPageLockTable is canonical in Concurrent mode; in-process lock tables are reference-only; resolve() must materialize committed versions from durable storage when caches are stale.",
-          "categories": [
-            4,
-            7,
-            9
-          ],
+          "categories": [4, 7, 9],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
@@ -3831,38 +2643,25 @@
         },
         {
           "summary": "Tighten deterministic rebase correctness: treat existence/uniqueness probes as blocking reads for branchy conflict policies (OR IGNORE/REPLACE/UPSERT) unless the chosen branch is encoded in intent.",
-          "categories": [
-            4,
-            2,
-            1
-          ],
+          "categories": [4, 2, 1],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
             "For OR IGNORE/REPLACE/UPSERT, probes can change observable behavior; replay must not silently take a different branch.",
             "Until intent encodes the chosen branch, V1 deterministic rebase requires recording the probe in footprint.reads (blocking) or forbids the op."
           ],
-          "changed_headings": [
-            "5.10.2 Deterministic Rebase",
-            "IntentFootprint"
-          ]
+          "changed_headings": ["5.10.2 Deterministic Rebase", "IntentFootprint"]
         },
         {
           "summary": "Correct schema-cookie assumptions: the SQLite schema cookie is a 32-bit counter modulo 2^32; merge safety requires equality checks, not numeric monotonicity.",
-          "categories": [
-            2,
-            1,
-            9
-          ],
+          "categories": [2, 1, 9],
           "primary_category": 2,
           "confidence": 0.78,
           "evidence": [
             "SQLite schema cookie increments modulo 2^32; numeric decreases are not necessarily corruption.",
             "For safety we require schema cookie equality across participants; any change must produce a different cookie."
           ],
-          "changed_headings": [
-            "Schema epoch / schema cookie"
-          ]
+          "changed_headings": ["Schema epoch / schema cookie"]
         }
       ]
     },
@@ -3871,20 +2670,14 @@
       "change_groups": [
         {
           "summary": "Scrivening + minor clarification: normalize Vfs trait doc formatting and refine cleanup_txn_id comments (ignored unless txn_id==TXN_ID_CLEANING; should be zeroed on free).",
-          "categories": [
-            5,
-            9
-          ],
+          "categories": [5, 9],
           "primary_category": 5,
           "confidence": 0.96,
           "evidence": [
             "Reindent Vfs trait docs for consistent Rustdoc rendering.",
             "cleanup_txn_id is meaningful only when txn_id==TXN_ID_CLEANING; otherwise ignored; must be zeroed when freeing the slot."
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot",
-            "VFS trait"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot", "VFS trait"]
         }
       ]
     },
@@ -3893,28 +2686,18 @@
       "change_groups": [
         {
           "summary": "Clarify deterministic rebase semantics for rowid reuse: re-execution is defined on the semantic key (rowid); reused rowids can be updated and this matches commit-time serial order semantics.",
-          "categories": [
-            2,
-            9,
-            4
-          ],
+          "categories": [2, 9, 4],
           "primary_category": 2,
           "confidence": 0.84,
           "evidence": [
             "SQLite rowids may be reused unless AUTOINCREMENT is used.",
             "Deterministic rebase is merge-by-reexecution on the semantic key; a delete/insert that reuses a rowid can cause replay to update the new row at that key."
           ],
-          "changed_headings": [
-            "5.10.2 Deterministic Rebase"
-          ]
+          "changed_headings": ["5.10.2 Deterministic Rebase"]
         },
         {
           "summary": "Harden page-encryption metadata + AAD rules: define stable DatabaseId, keep AAD independent of encrypted bytes (no circular dependencies), and allow optional pre-decrypt page_context_tag only when known.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.86,
           "evidence": [
@@ -3922,29 +2705,18 @@
             "AAD inputs must be known before decryption; do not derive AAD from encrypted page bytes such as B-tree flags.",
             "Optional page_context_tag is permitted only when known pre-decrypt; otherwise use a fixed constant."
           ],
-          "changed_headings": [
-            "Page Encryption",
-            "AAD (swap resistance)"
-          ]
+          "changed_headings": ["Page Encryption", "AAD (swap resistance)"]
         },
         {
           "summary": "Ministerial cleanup: normalize indentation in VersionArena / ARC prose blocks and sharpen reserved-space checksum interoperability wording.",
-          "categories": [
-            5,
-            9,
-            2
-          ],
+          "categories": [5, 9, 2],
           "primary_category": 5,
           "confidence": 0.76,
           "evidence": [
             "Normalize indentation in long code-comment blocks for readability.",
             "Clarify that C SQLite can read reserved-space checksums (reserved bytes are opaque) but default remains OFF for interoperability."
           ],
-          "changed_headings": [
-            "VersionArena",
-            "ARC/CAR",
-            "Reserved-space checksums"
-          ]
+          "changed_headings": ["VersionArena", "ARC/CAR", "Reserved-space checksums"]
         }
       ]
     },
@@ -3953,17 +2725,11 @@
       "change_groups": [
         {
           "summary": "Scrivening: fix ARC/CAR commentary indentation so rendered docs align with surrounding prose.",
-          "categories": [
-            5
-          ],
+          "categories": [5],
           "primary_category": 5,
           "confidence": 0.99,
-          "evidence": [
-            "Indentation-only change in ARC/CAR explanatory comments."
-          ],
-          "changed_headings": [
-            "ARC/CAR"
-          ]
+          "evidence": ["Indentation-only change in ARC/CAR explanatory comments."],
+          "changed_headings": ["ARC/CAR"]
         }
       ]
     },
@@ -3972,19 +2738,14 @@
       "change_groups": [
         {
           "summary": "Clarify what 'zero-copy' means in this spec: no extra heap allocations or staging copies in hot paths, but not kernel-bypass I/O; small stack buffers are allowed.",
-          "categories": [
-            9,
-            6
-          ],
+          "categories": [9, 6],
           "primary_category": 9,
           "confidence": 0.9,
           "evidence": [
             "Zero-copy excludes userspace staging buffers/allocations, not buffered syscalls.",
             "Fixed-size header stack buffers are permitted."
           ],
-          "changed_headings": [
-            "1.5 Hot-path constraints"
-          ]
+          "changed_headings": ["1.5 Hot-path constraints"]
         }
       ]
     },
@@ -3993,21 +2754,14 @@
       "change_groups": [
         {
           "summary": "Define canonical page-encryption AAD bytes: be_u32(page_number) || database_id_bytes; forbid native-endian encodings for cross-endian opens.",
-          "categories": [
-            4,
-            7,
-            5
-          ],
+          "categories": [4, 7, 5],
           "primary_category": 4,
           "confidence": 0.92,
           "evidence": [
             "aad = be_u32(page_number) || database_id_bytes (normative).",
             "Native-endian integer encoding is forbidden for AAD (cross-endian open must work)."
           ],
-          "changed_headings": [
-            "Page Encryption",
-            "AAD (swap resistance)"
-          ]
+          "changed_headings": ["Page Encryption", "AAD (swap resistance)"]
         }
       ]
     },
@@ -4016,11 +2770,7 @@
       "change_groups": [
         {
           "summary": "Add a cross-cutting 'Critical Implementation Controls' checklist to make corruption/deadlock-sensitive invariants impossible to miss.",
-          "categories": [
-            6,
-            7,
-            4
-          ],
+          "categories": [6, 7, 4],
           "primary_category": 6,
           "confidence": 0.88,
           "evidence": [
@@ -4028,25 +2778,18 @@
             "Witness instrumentation must be semantic/sub-page for point ops (avoid whole-page reads that collapse merge/rebase).",
             "RaptorQ repair generation must be off the commit critical path; rebuild quiescence is 'no lock holders', not 'no txns'."
           ],
-          "changed_headings": [
-            "1.6 Critical Implementation Controls (Non-Negotiable)"
-          ]
+          "changed_headings": ["1.6 Critical Implementation Controls (Non-Negotiable)"]
         },
         {
           "summary": "Tighten TxnSlot cleanup: stamp a fresh sentinel-time when transitioning into TXN_ID_CLEANING so stuck-cleaner detection measures time in CLEANING (not inherited CLAIMING time).",
-          "categories": [
-            1,
-            7
-          ],
+          "categories": [1, 7],
           "primary_category": 1,
           "confidence": 0.84,
           "evidence": [
             "On CAS into TXN_ID_CLEANING, set claiming_timestamp = now to start the CLEANING timeout window.",
             "Overwrite stale CLAIMING timestamps when entering CLEANING."
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot cleanup"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot cleanup"]
         }
       ]
     },
@@ -4055,21 +2798,14 @@
       "change_groups": [
         {
           "summary": "Clarification pass: make rowid reuse semantics explicit as a serial-order effect for deterministic rebase, and define DatabaseId precisely as 16 opaque bytes stable across rekey.",
-          "categories": [
-            9,
-            2,
-            4
-          ],
+          "categories": [9, 2, 4],
           "primary_category": 9,
           "confidence": 0.9,
           "evidence": [
             "Rowid reuse is expected: replay matches serial order (delete/insert then update) rather than implying corruption.",
             "DatabaseId is 16 opaque bytes (not host-endian integer) and must remain stable across PRAGMA rekey."
           ],
-          "changed_headings": [
-            "5.10.2 Deterministic Rebase",
-            "Page Encryption"
-          ]
+          "changed_headings": ["5.10.2 Deterministic Rebase", "Page Encryption"]
         }
       ]
     },
@@ -4078,11 +2814,7 @@
       "change_groups": [
         {
           "summary": "Draw a hard durability boundary: ARC eviction is memory-only and MUST NOT append to .wal; only the write coordinator may append WAL frames, with large write sets spilled to per-txn temp files.",
-          "categories": [
-            4,
-            7,
-            1
-          ],
+          "categories": [4, 7, 1],
           "primary_category": 4,
           "confidence": 0.9,
           "evidence": [
@@ -4096,10 +2828,7 @@
         },
         {
           "summary": "Simplify ARC REQUEST/REPLACE behavior around pinned pages: remove flush-dirty loops, allow temporary over-capacity as a safety valve when all candidates are pinned, and update resize protocol accordingly.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.82,
           "evidence": [
@@ -4113,21 +2842,14 @@
         },
         {
           "summary": "Clarify interoperability boundary for encryption: encrypted databases are not readable by stock C SQLite; fail closed rather than attempting legacy interop on ciphertext pages.",
-          "categories": [
-            9,
-            2,
-            4
-          ],
+          "categories": [9, 2, 4],
           "primary_category": 9,
           "confidence": 0.78,
           "evidence": [
             "Encrypted databases are not readable by stock C SQLite; compatibility interop applies only to plaintext.",
             "If encryption is enabled, FrankenSQLite fails closed rather than letting legacy clients treat ciphertext as page bytes."
           ],
-          "changed_headings": [
-            "Page Encryption",
-            "Compatibility mode interoperability"
-          ]
+          "changed_headings": ["Page Encryption", "Compatibility mode interoperability"]
         }
       ]
     },
@@ -4136,11 +2858,7 @@
       "change_groups": [
         {
           "summary": "Clarify pipelined WAL-FEC semantics: commits can be durable before they are repairable; if wal-fec metadata is missing at recovery, fall back to SQLite truncation semantics; optional synchronous mode can require immediate repairability.",
-          "categories": [
-            7,
-            4,
-            9
-          ],
+          "categories": [7, 4, 9],
           "primary_category": 7,
           "confidence": 0.86,
           "evidence": [
@@ -4148,17 +2866,11 @@
             "If wal-fec metadata is missing, recovery truncates before the affected group (SQLite semantics).",
             "An opt-in synchronous mode may wait for wal-fec fsync before acknowledging COMMIT."
           ],
-          "changed_headings": [
-            "3.4.1 Self-Healing WAL (Erasure-Coded Durability)"
-          ]
+          "changed_headings": ["3.4.1 Self-Healing WAL (Erasure-Coded Durability)"]
         },
         {
           "summary": "Specify Compatibility-mode write-set spilling and coordinator-only WAL append: introduce CommitWriteSet (Inline vs Spilled) and PRAGMA fsqlite.txn_write_set_mem_bytes with a bounded auto default.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.88,
           "evidence": [
@@ -4174,11 +2886,7 @@
         },
         {
           "summary": "Add a V1 rule for OP_NewRowid under concurrent writers: allocate rowids from a snapshot-independent per-table allocator and record the concrete RowId in the Insert intent at execution time.",
-          "categories": [
-            4,
-            2,
-            7
-          ],
+          "categories": [4, 2, 7],
           "primary_category": 4,
           "confidence": 0.84,
           "evidence": [
@@ -4196,28 +2904,18 @@
       "change_groups": [
         {
           "summary": "Correct the RFC 6330 LDPC constraint description: each source column updates exactly three LDPC rows using stride a=1+floor(j/S), implying total nonzeros=3*K'.",
-          "categories": [
-            1,
-            6
-          ],
+          "categories": [1, 6],
           "primary_category": 1,
           "confidence": 0.82,
           "evidence": [
             "For j in 0..K'-1: a=1+floor(j/S); b=j%S; set A[b][j]=1 then advance b=(b+a)%S twice more.",
             "Each source column contributes exactly 3 nonzeros; average LDPC row has ~3*K'/S nonzeros."
           ],
-          "changed_headings": [
-            "RaptorQ LDPC rows",
-            "RFC 6330 §5.3.3.3"
-          ]
+          "changed_headings": ["RaptorQ LDPC rows", "RFC 6330 §5.3.3.3"]
         },
         {
           "summary": "Harden WAL-FEC metadata + recovery: require per-source xxh3_128 validation hashes, add SQLite fallback when wal-fec is missing, and widen OTI.T to u32 to represent page_size=65536 with explicit corruption invariants.",
-          "categories": [
-            4,
-            7,
-            1
-          ],
+          "categories": [4, 7, 1],
           "primary_category": 4,
           "confidence": 0.9,
           "evidence": [
@@ -4225,62 +2923,40 @@
             "WalFecGroupMeta stores source_page_xxh3_128: Vec<[u8;16]> for random-access validation.",
             "OTI.T is widened to u32 so symbol_size can equal page_size=65536; mismatches are treated as corruption."
           ],
-          "changed_headings": [
-            "3.4.1 Self-Healing WAL",
-            "WalFecGroupMeta",
-            "SymbolRecord / OTI"
-          ]
+          "changed_headings": ["3.4.1 Self-Healing WAL", "WalFecGroupMeta", "SymbolRecord / OTI"]
         },
         {
           "summary": "Make ECS root pointer updates truly crash-safe: fsync temp file before rename and fsync the directory after rename to persist the rename itself.",
-          "categories": [
-            7,
-            1
-          ],
+          "categories": [7, 1],
           "primary_category": 7,
           "confidence": 0.88,
           "evidence": [
             "Crash-safe sequence: write temp, fsync(temp), rename(temp, ecs/root), fsync(directory).",
             "Omitting fsync(temp) risks garbage content; omitting fsync(dir) risks losing the rename after crash."
           ],
-          "changed_headings": [
-            "ECS directory layout",
-            "ecs/root"
-          ]
+          "changed_headings": ["ECS directory layout", "ecs/root"]
         },
         {
           "summary": "Fix TxnSlot cleanup race: snapshot txn_id once per slot iteration (Acquire load) to avoid branching on multiple unsynchronized reads while sentinels are changing.",
-          "categories": [
-            1,
-            7
-          ],
+          "categories": [1, 7],
           "primary_category": 1,
           "confidence": 0.86,
           "evidence": [
             "Snapshot txn_id once: tid = slot.txn_id.load(Acquire); skip tid==0 early.",
             "Avoid freeing a slot while another cleaner is still releasing locks due to inconsistent reads of sentinel states."
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot cleanup"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot cleanup"]
         },
         {
           "summary": "Clarify ESCAPE handling in the Pratt parser: ESCAPE is not an infix operator; it is parsed as an optional suffix of LIKE/GLOB/MATCH productions (parse.y %right ESCAPE is for Lemon conflict resolution).",
-          "categories": [
-            2,
-            9,
-            5
-          ],
+          "categories": [2, 9, 5],
           "primary_category": 2,
           "confidence": 0.8,
           "evidence": [
             "ESCAPE is parsed inside the LIKE/GLOB handler after the pattern expression, not in the infix dispatch table.",
             "C SQLite declares %right ESCAPE for conflict resolution, but it is not a standalone expression operator."
           ],
-          "changed_headings": [
-            "SQL operator precedence",
-            "LIKE/GLOB ESCAPE handling"
-          ]
+          "changed_headings": ["SQL operator precedence", "LIKE/GLOB ESCAPE handling"]
         }
       ]
     },
@@ -4289,36 +2965,24 @@
       "change_groups": [
         {
           "summary": "Correct GF(256) elimination language: use nonzero pivot selection (no rounding error over fields), avoiding misleading 'partial pivoting' phrasing.",
-          "categories": [
-            1,
-            9
-          ],
+          "categories": [1, 9],
           "primary_category": 1,
           "confidence": 0.9,
           "evidence": [
             "Over exact fields, pivot choice is simply selecting any nonzero pivot; numerical stability concerns do not apply."
           ],
-          "changed_headings": [
-            "GF(256) Gaussian solve"
-          ]
+          "changed_headings": ["GF(256) Gaussian solve"]
         },
         {
           "summary": "Strengthen random-access WAL-FEC source-frame validation: compute xxh3_128(page_data) and compare against source_page_xxh3_128 before feeding symbols into the decoder.",
-          "categories": [
-            7,
-            4,
-            1
-          ],
+          "categories": [7, 4, 1],
           "primary_category": 7,
           "confidence": 0.88,
           "evidence": [
             "Validate candidate frames with xxh3_128 and compare to WalFecGroupMeta.source_page_xxh3_128.",
             "Random-access validation remains valid even when the cumulative WAL checksum chain is broken."
           ],
-          "changed_headings": [
-            "3.4.1 Self-Healing WAL",
-            "WAL recovery"
-          ]
+          "changed_headings": ["3.4.1 Self-Healing WAL", "WAL recovery"]
         }
       ]
     },
@@ -4327,51 +2991,34 @@
       "change_groups": [
         {
           "summary": "Clarify GF(256) elimination commentary: in exact fields there is no rounding error, so the pivot rule is nonzero selection, not numerical 'partial pivoting'.",
-          "categories": [
-            1,
-            9
-          ],
+          "categories": [1, 9],
           "primary_category": 1,
           "confidence": 0.9,
           "evidence": [
             "Explicitly note that pivoting is for finding a nonzero pivot; there is no floating-point stability issue over GF(256)."
           ],
-          "changed_headings": [
-            "GF(256) Gaussian elimination"
-          ]
+          "changed_headings": ["GF(256) Gaussian elimination"]
         },
         {
           "summary": "Add replication endianness boundary note: UDP packet headers use big-endian network order, while the decoded changeset payload uses little-endian per canonical encoding rules.",
-          "categories": [
-            6,
-            7
-          ],
+          "categories": [6, 7],
           "primary_category": 6,
           "confidence": 0.84,
           "evidence": [
             "Replication packet header fields are big-endian; the boundary is symbol_data, whose decoded changeset payload is little-endian."
           ],
-          "changed_headings": [
-            "UDP Packet Format",
-            "Canonical encodings"
-          ]
+          "changed_headings": ["UDP Packet Format", "Canonical encodings"]
         },
         {
           "summary": "Bound version-chain delta reconstruction cost and clarify ECS root file format: chain depth is kept small by GC scheduling targets, and ecs/root includes a magic+version prefix with manifest id + checksum.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.86,
           "evidence": [
             "Reconstructing the oldest version in a chain of depth L requires L-1 sequential delta applications; GC scheduling targets depth ~8.",
             "ecs/root contains: magic (\"FSRT\"), version, manifest_object_id, checksum."
           ],
-          "changed_headings": [
-            "Version chain deltas",
-            "ECS root file format"
-          ]
+          "changed_headings": ["Version chain deltas", "ECS root file format"]
         }
       ]
     },
@@ -4380,19 +3027,13 @@
       "change_groups": [
         {
           "summary": "Fix GC scheduling cross-references: point Theorem-5 discussion at the GC scheduling policy section (5.6.5), not the lock-table section.",
-          "categories": [
-            5,
-            9
-          ],
+          "categories": [5, 9],
           "primary_category": 5,
           "confidence": 0.95,
           "evidence": [
             "Replace incorrect §5.6.3 references with §5.6.5 for GC scheduling policy citations."
           ],
-          "changed_headings": [
-            "GC scheduling policy",
-            "Theorem 5 discussion"
-          ]
+          "changed_headings": ["GC scheduling policy", "Theorem 5 discussion"]
         }
       ]
     },
@@ -4401,12 +3042,7 @@
       "change_groups": [
         {
           "summary": "Clarify .db-fec generation binding and repair terminology: specify db_gen_digest derivation inputs, use RFC 6330 ESI naming for symbols, and make commit_time_unix_ns monotonicity enforcement explicit.",
-          "categories": [
-            9,
-            5,
-            1,
-            7
-          ],
+          "categories": [9, 5, 1, 7],
           "primary_category": 9,
           "confidence": 0.86,
           "evidence": [
@@ -4414,11 +3050,7 @@
             "Repair pseudocode switches from ISI to ESI terminology and uses repair_rec.esi rather than deriving ids from loop indices.",
             "Binary-search-by-time note now cites the protocol rule: commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)."
           ],
-          "changed_headings": [
-            "Compatibility DB-FEC",
-            "Repair pseudocode",
-            "Commit protocol time"
-          ]
+          "changed_headings": ["Compatibility DB-FEC", "Repair pseudocode", "Commit protocol time"]
         }
       ]
     },
@@ -4427,12 +3059,7 @@
       "change_groups": [
         {
           "summary": "Add `.db-fec` freshness and foreign-sidecar guardrails: define db_gen_digest derivation from DB header, require digest match before using repair symbols, and make the .db-fec header update the commit record (fsync-ordered).",
-          "categories": [
-            7,
-            1,
-            2,
-            4
-          ],
+          "categories": [7, 1, 2, 4],
           "primary_category": 7,
           "confidence": 0.85,
           "evidence": [
@@ -4440,19 +3067,11 @@
             "If repairing page 1, recompute digest from repaired bytes; mismatch fails closed (SQLITE_CORRUPT).",
             "Checkpoint must fsync .db, then write db_gen_digest + header checksum, then fsync .db-fec before WAL RESTART/TRUNCATE."
           ],
-          "changed_headings": [
-            "Compatibility DB-FEC",
-            "DbFecHeader",
-            "DbFecGroupMeta"
-          ]
+          "changed_headings": ["Compatibility DB-FEC", "DbFecHeader", "DbFecGroupMeta"]
         },
         {
           "summary": "Harden shared-memory coordination: introduce snapshot_seq seqlock for consistent snapshot capture, add serialized-writer indicator fields (token/pid/lease), and define a stale-indicator clearing algorithm for concurrent writers.",
-          "categories": [
-            4,
-            7,
-            1
-          ],
+          "categories": [4, 7, 1],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
@@ -4467,11 +3086,7 @@
         },
         {
           "summary": "Replace constant TxnSlot sentinels with a tagged txn_id word to prevent ABA claim/cleanup races; update cleanup_orphaned_slots and gc_horizon logic to treat sentinel-tagged slots as blockers.",
-          "categories": [
-            4,
-            1,
-            7
-          ],
+          "categories": [4, 1, 7],
           "primary_category": 4,
           "confidence": 0.85,
           "evidence": [
@@ -4479,18 +3094,11 @@
             "Phase 3 publish is CAS(claim_word -> real_txn_id); claim timestamps are cleared after publish.",
             "cleanup_orphaned_slots branches on decode_tag(tid) and transitions to encode_cleaning(payload)."
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot",
-            "cleanup_orphaned_slots()",
-            "raise_gc_horizon()"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot", "cleanup_orphaned_slots()", "raise_gc_horizon()"]
         },
         {
           "summary": "Make recently-committed-readers summaries cross-process stable: specify a fixed-layout SHM ring with a per-entry Bloom filter (fail-closed on overflow) instead of RoaringBitmap-in-SHM.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.78,
           "evidence": [
@@ -4498,17 +3106,11 @@
             "Each entry includes a 4096-bit Bloom filter with k=3 probes over pgno (xxh3_64 domain-separated).",
             "If inserting would evict an entry with commit_seq > gc_horizon, the committer aborts with SQLITE_BUSY_SNAPSHOT (no false negatives)."
           ],
-          "changed_headings": [
-            "RecentlyCommittedReadersRing",
-            "Committed readers index"
-          ]
+          "changed_headings": ["RecentlyCommittedReadersRing", "Committed readers index"]
         },
         {
           "summary": "Redesign shared page-lock rebuild as a rolling rotate+drain protocol using two tables (active+draining) to avoid stop-the-world abort storms; update acquire/release/crash-cleanup to consult both tables.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
@@ -4516,10 +3118,7 @@
             "try_acquire consults draining table first for idempotent re-acquire and conflict detection; release probes both tables.",
             "Rebuild rotates quickly, drains in background, and clears only after lock-quiescence; capacity defaults to 1,048,576 entries."
           ],
-          "changed_headings": [
-            "5.6.3.1 Table Rebuild",
-            "SharedPageLockTable"
-          ]
+          "changed_headings": ["5.6.3.1 Table Rebuild", "SharedPageLockTable"]
         }
       ]
     },
@@ -4528,11 +3127,7 @@
       "change_groups": [
         {
           "summary": "Specify the coordinator IPC transport for multi-process deployments: Unix domain sockets, framed messages, two-phase reserve/submit discipline, SCM_RIGHTS spill-fd passing, and TxnToken idempotency.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
@@ -4540,35 +3135,22 @@
             "Framing: len_be + version/kind/request_id + payload; RESERVE returns permit_id or BUSY; SUBMIT_* binds to permit_id.",
             "Large write sets are passed via spill fd using SCM_RIGHTS; duplicates keyed by (txn_id, txn_epoch) are idempotent."
           ],
-          "changed_headings": [
-            "5.9.0 Coordinator IPC Transport"
-          ]
+          "changed_headings": ["5.9.0 Coordinator IPC Transport"]
         },
         {
           "summary": "Make snapshot capture explicitly seqlock-based: load_consistent_snapshot reads snapshot_seq, retries on odd or change, and returns a self-consistent (commit_seq, schema_epoch) pair.",
-          "categories": [
-            4,
-            1,
-            7
-          ],
+          "categories": [4, 1, 7],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
             "Read s1=snapshot_seq; if odd retry; read commit_seq + schema_epoch; read s2; accept only if s1==s2 and even.",
             "Cross-process snapshot correctness is now specified as a seqlock read, not two commit_seq loads."
           ],
-          "changed_headings": [
-            "Snapshot capture",
-            "load_consistent_snapshot()"
-          ]
+          "changed_headings": ["Snapshot capture", "load_consistent_snapshot()"]
         },
         {
           "summary": "Clarify in-process vs cross-process commit schemas and harden spill semantics: use OwnedFd for spill transfer, allow optional diagnostic path, and recommend unlink-after-open for crash robustness.",
-          "categories": [
-            7,
-            4,
-            6
-          ],
+          "categories": [7, 4, 6],
           "primary_category": 7,
           "confidence": 0.75,
           "evidence": [
@@ -4576,10 +3158,7 @@
             "SpilledWriteSet carries an OwnedFd; cross-process commits MUST use CommitWriteSet::Spilled with SCM_RIGHTS fd passing.",
             "Recommends creator unlink spill file after open so cleanup is automatic on crash."
           ],
-          "changed_headings": [
-            "CommitRequest (compatibility/WAL)",
-            "Write-set spilling"
-          ]
+          "changed_headings": ["CommitRequest (compatibility/WAL)", "Write-set spilling"]
         }
       ]
     },
@@ -4588,44 +3167,29 @@
       "change_groups": [
         {
           "summary": "Expand and harden the TxnSlot acquire/publish protocol: make the 3-phase claim/init/publish sequence explicit and require begin_seq/snapshot_high derive from a self-consistent snapshot (seqlock).",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.82,
           "evidence": [
             "acquire_and_publish_txn_slot() wraps claim (CAS 0->claim_word), initializes slot fields, captures snap via load_consistent_snapshot, then publishes real TxnId via CAS(claim_word->txn_id).",
             "Clears claiming_timestamp after publish to avoid polluting stuck-cleaner detection."
           ],
-          "changed_headings": [
-            "TxnSlot acquire protocol",
-            "5.6.2 TxnSlot"
-          ]
+          "changed_headings": ["TxnSlot acquire protocol", "5.6.2 TxnSlot"]
         },
         {
           "summary": "Fix write_page idempotency for cross-process hints: only increment write_set_pages on first lock acquisition per page; clarify hints are not correctness sources of truth.",
-          "categories": [
-            1,
-            7
-          ],
+          "categories": [1, 7],
           "primary_category": 1,
           "confidence": 0.8,
           "evidence": [
             "Guard write_set_pages.fetch_add(1) behind `newly_locked` to prevent inflated counts on repeated writes to the same page.",
             "States explicitly that lock tables, not write_set_pages, are the correctness source of truth."
           ],
-          "changed_headings": [
-            "write_page()"
-          ]
+          "changed_headings": ["write_page()"]
         },
         {
           "summary": "SHM layout hardening: define layout_checksum over immutable metadata only; forbid unsafe reinterpret casts in this repo; and state DDL publication ordering relies on snapshot_seq seqlock windows.",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -4633,10 +3197,7 @@
             "Adds normative safe-Rust constraint: SHM access uses safe offset-based accessors; no &[u8] -> &SharedMemoryLayout casts.",
             "Clarifies mixed snapshots are prevented by snapshot_seq + load_consistent_snapshot, not store ordering alone."
           ],
-          "changed_headings": [
-            "5.6.1 Shared-Memory Coordination Region",
-            "Alignment requirement"
-          ]
+          "changed_headings": ["5.6.1 Shared-Memory Coordination Region", "Alignment requirement"]
         }
       ]
     },
@@ -4645,12 +3206,7 @@
       "change_groups": [
         {
           "summary": "Fix coordinator IPC framing math and add canonical V1 wire payload schemas (including strict size caps and exact SCM_RIGHTS rules).",
-          "categories": [
-            1,
-            4,
-            7,
-            6
-          ],
+          "categories": [1, 4, 7, 6],
           "primary_category": 4,
           "confidence": 0.8,
           "evidence": [
@@ -4658,18 +3214,11 @@
             "Defines Reserve/SubmitNativePublish/SubmitWalCommit/RowIdReserve payload schemas + size caps; SUBMIT_WAL_COMMIT requires exactly one spill fd in SCM_RIGHTS.",
             "CommitRequest identity updated to TxnToken for cross-process stability."
           ],
-          "changed_headings": [
-            "Coordinator IPC Transport",
-            "Wire payload schemas"
-          ]
+          "changed_headings": ["Coordinator IPC Transport", "Wire payload schemas"]
         },
         {
           "summary": "Define coordinator-owned per-table RowId allocator state and ROWID_RESERVE semantics (schema_epoch validation, monotone non-reusable ranges, gaps permitted).",
-          "categories": [
-            4,
-            7,
-            6
-          ],
+          "categories": [4, 7, 6],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -4677,10 +3226,7 @@
             "Initialize next_rowid from max_committed_rowid+1 (AUTOINCREMENT override); reject schema_epoch mismatch with SQLITE_SCHEMA.",
             "Coordinator advances by count even if caller later aborts (gaps permitted)."
           ],
-          "changed_headings": [
-            "ROWID_RESERVE",
-            "RowId allocator"
-          ]
+          "changed_headings": ["ROWID_RESERVE", "RowId allocator"]
         }
       ]
     },
@@ -4689,10 +3235,7 @@
       "change_groups": [
         {
           "summary": "Define serialized writer exclusion acquire/release pseudocode and ordering: acquire global exclusion, publish token/pid/lease, drain concurrent writers, and clear indicator before releasing the global exclusion.",
-          "categories": [
-            4,
-            7
-          ],
+          "categories": [4, 7],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -4706,40 +3249,25 @@
         },
         {
           "summary": "Make write_set_summary cross-process canonical (sorted u32_le array, no roaring dependency) and add response payload schemas for SUBMIT_NATIVE_PUBLISH and SUBMIT_WAL_COMMIT.",
-          "categories": [
-            4,
-            7,
-            1,
-            6
-          ],
+          "categories": [4, 7, 1, 6],
           "primary_category": 4,
           "confidence": 0.74,
           "evidence": [
             "write_set_summary_len must be a multiple of 4; pages are sorted ascending with no duplicates.",
             "Adds NativePublishRespV1 and WalCommitRespV1 Ok/Conflict/Err variants with explicit fields."
           ],
-          "changed_headings": [
-            "Wire payload schemas",
-            "write_set_summary encoding"
-          ]
+          "changed_headings": ["Wire payload schemas", "write_set_summary encoding"]
         },
         {
           "summary": "Remove duplicate expression precedence table and centralize parsing rules: NOT precedence, ESCAPE not an operator, and unary-vs-COLLATE binding.",
-          "categories": [
-            2,
-            5,
-            9
-          ],
+          "categories": [2, 5, 9],
           "primary_category": 2,
           "confidence": 0.7,
           "evidence": [
             "12.15 now points to the normative Pratt precedence table in §10.2 instead of restating the full table.",
             "Key rules reiterated: NOT x=y parses as NOT(x=y); ESCAPE is parsed as part of LIKE; unary binds tighter than COLLATE."
           ],
-          "changed_headings": [
-            "12.15 Expression Syntax",
-            "Pratt precedence table"
-          ]
+          "changed_headings": ["12.15 Expression Syntax", "Pratt precedence table"]
         }
       ]
     },
@@ -4748,11 +3276,7 @@
       "change_groups": [
         {
           "summary": "Apply the no-unsafe constraint to aligned allocation: require safe page-aligned buffers and make PageBuf explicitly page-sized + page-aligned in both the I/O model and formal type definitions.",
-          "categories": [
-            7,
-            4,
-            6
-          ],
+          "categories": [7, 4, 6],
           "primary_category": 7,
           "confidence": 0.75,
           "evidence": [
@@ -4767,21 +3291,14 @@
         },
         {
           "summary": "Fix TxnSlot acquire pseudocode: detect lost claim before seeding claiming_timestamp; clean up indentation and clarify omitted fields for brevity.",
-          "categories": [
-            1,
-            4,
-            5
-          ],
+          "categories": [1, 4, 5],
           "primary_category": 1,
           "confidence": 0.72,
           "evidence": [
             "After CAS(0->claim_word), re-load txn_id and require it still equals claim_word before writing claiming_timestamp.",
             "Normalizes indentation and clarifies begin() pseudocode omits fields that default to empty/false."
           ],
-          "changed_headings": [
-            "TxnSlot acquire protocol",
-            "acquire_and_publish_txn_slot()"
-          ]
+          "changed_headings": ["TxnSlot acquire protocol", "acquire_and_publish_txn_slot()"]
         }
       ]
     },
@@ -4790,11 +3307,7 @@
       "change_groups": [
         {
           "summary": "Tighten coordinator IPC framing and capability discipline: enforce len/version/kind validity, bind permit_id to a connection as a single-use capability, and make responses canonically tagged.",
-          "categories": [
-            4,
-            7,
-            1
-          ],
+          "categories": [4, 7, 1],
           "primary_category": 4,
           "confidence": 0.78,
           "evidence": [
@@ -4802,25 +3315,17 @@
             "Permit binding: SUBMIT_* must reference a permit_id previously returned by RESERVE on the same connection; consumed permits cannot be reused.",
             "Response payloads become explicit tag+padding+body wrappers (ReserveRespV1, NativePublishRespV1, WalCommitRespV1, RowIdReserveRespV1)."
           ],
-          "changed_headings": [
-            "5.9.0 Coordinator IPC Transport",
-            "Wire payload schemas"
-          ]
+          "changed_headings": ["5.9.0 Coordinator IPC Transport", "Wire payload schemas"]
         },
         {
           "summary": "Fix BEGIN TxnId allocation pseudocode to use SharedMemoryLayout.next_txn_id (cross-process global), not a per-manager field.",
-          "categories": [
-            1,
-            5
-          ],
+          "categories": [1, 5],
           "primary_category": 1,
           "confidence": 0.9,
           "evidence": [
             "begin() pseudocode now reads manager.shm.next_txn_id and CASes it for TxnId allocation."
           ],
-          "changed_headings": [
-            "BEGIN / TxnId allocation"
-          ]
+          "changed_headings": ["BEGIN / TxnId allocation"]
         }
       ]
     },
@@ -4829,11 +3334,7 @@
       "change_groups": [
         {
           "summary": "Harden TAG_CLAIMING liveness safety: require early pid/pid_birth/lease publication before snapshot capture and forbid reclaiming live claimers; add conservative timeouts when pid identity is still unknown.",
-          "categories": [
-            4,
-            1,
-            7
-          ],
+          "categories": [4, 1, 7],
           "primary_category": 4,
           "confidence": 0.85,
           "evidence": [
@@ -4841,44 +3342,29 @@
             "cleanup_orphaned_slots never reclaims a CLAIMING slot if pid/birth are non-zero and process_alive(pid,birth) is true.",
             "Split timeouts: short fast-path timeout vs longer no-pid fallback timeout."
           ],
-          "changed_headings": [
-            "5.6.2 TxnSlot",
-            "cleanup_orphaned_slots()"
-          ]
+          "changed_headings": ["5.6.2 TxnSlot", "cleanup_orphaned_slots()"]
         },
         {
           "summary": "Fix check_serialized_writer_exclusion stale-token cleanup: retry on CAS failure so we never return Ok while a new serialized writer installs a fresh token.",
-          "categories": [
-            1,
-            4,
-            7
-          ],
+          "categories": [1, 4, 7],
           "primary_category": 1,
           "confidence": 0.8,
           "evidence": [
             "Stale indicator clearing loops: if CAS(tok->0) fails, retry because token changed (cleared or replaced).",
             "CAS uses AcqRel/Acquire to ensure correct publication edges."
           ],
-          "changed_headings": [
-            "Indicator check algorithm"
-          ]
+          "changed_headings": ["Indicator check algorithm"]
         },
         {
           "summary": "Make IPC payload set-ordering canonical: ObjectId arrays sorted/deduped, conflict page arrays sorted, and spill_pages sorted by pgno with no duplicates.",
-          "categories": [
-            7,
-            4
-          ],
+          "categories": [7, 4],
           "primary_category": 7,
           "confidence": 0.75,
           "evidence": [
             "Any payload field that semantically represents a set must be encoded in sorted order without duplicates.",
             "Applies to witness/edge/merge arrays, conflict page lists, and spill_pages ordering."
           ],
-          "changed_headings": [
-            "Framing",
-            "Canonical ordering"
-          ]
+          "changed_headings": ["Framing", "Canonical ordering"]
         }
       ]
     },
@@ -4887,18 +3373,13 @@
       "change_groups": [
         {
           "summary": "Update Round 16 audit note wording to explicitly include TAG_CLAIMING liveness hardening as part of the round's scope.",
-          "categories": [
-            5,
-            9
-          ],
+          "categories": [5, 9],
           "primary_category": 5,
           "confidence": 0.9,
           "evidence": [
             "Footer audit note now mentions early pid/birth publication and forbidding reclaim of live claimers."
           ],
-          "changed_headings": [
-            "Document version footer"
-          ]
+          "changed_headings": ["Document version footer"]
         }
       ]
     }

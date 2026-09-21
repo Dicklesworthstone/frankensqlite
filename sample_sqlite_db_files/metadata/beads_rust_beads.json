@@ -5,10 +5,7 @@
   "golden_filename": "beads_rust_beads.db",
   "sha256_golden": "650d2a7c44665c35dbd64c6afe6b15581b2065169aff5a0fd2fcb7fb60c3a28c",
   "size_bytes": 4120576,
-  "sidecars_present": [
-    "-wal",
-    "-shm"
-  ],
+  "sidecars_present": ["-wal", "-shm"],
   "sqlite_meta": {
     "page_size": 4096,
     "page_count": 1006,
@@ -28,14 +25,7 @@
     "has_views": true,
     "has_foreign_keys": true
   },
-  "tags": [
-    "beads",
-    "invalid",
-    "many-indexes",
-    "medium",
-    "page-size-4096",
-    "wal"
-  ],
+  "tags": ["beads", "invalid", "many-indexes", "medium", "page-size-4096", "wal"],
   "safety": {
     "pii_risk": "unknown",
     "secrets_risk": "unknown",
@@ -940,8 +930,5 @@
     "idx_snapshots_level"
   ],
   "triggers": [],
-  "views": [
-    "blocked_issues",
-    "ready_issues"
-  ]
+  "views": ["blocked_issues", "ready_issues"]
 }
