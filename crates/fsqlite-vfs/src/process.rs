@@ -9,8 +9,9 @@
 //! A liveness answer is `Alive`, `Dead`, or `Unknown`. Callers treat `Unknown`
 //! (an ambiguous OS error such as `EACCES`/`ERROR_ACCESS_DENIED`) as alive:
 //! never reclaim a possibly-live writer's lease on the strength of a probe we
-//! could not complete. That matches the pre-existing "return true" stubs this
-//! replaces on macOS and Windows.
+//! could not complete. A missing Linux procfs entry is not proof of death:
+//! `hidepid` mounts can conceal live processes, so an unavailable start time
+//! requires an independent signal-zero probe before reporting absence.
 //!
 //! ## PID-reuse safety
 //!
@@ -43,13 +44,12 @@ pub const PID_BIRTH_FILETIME_TAG: u64 = 1_u64 << 61;
 
 /// Mask isolating the payload bits (all three platform tags cleared).
 ///
-/// Only the macOS/Windows probes and the unit tests read this; a Linux
-/// non-test build (whose procfs probe lives in `fsqlite-mvcc`) never does, so
-/// gate it to avoid a `dead_code` warning under `-D warnings`.
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
+/// Gate native-only helpers so unsupported targets retain their conservative
+/// fallback without dead-code warnings.
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 const PAYLOAD_MASK: u64 = !(PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | PID_BIRTH_FILETIME_TAG);
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 const fn has_exact_platform_tag(token: u64, expected_tag: u64) -> bool {
     token & !PAYLOAD_MASK == expected_tag
 }
@@ -59,14 +59,14 @@ const fn has_exact_platform_tag(token: u64, expected_tag: u64) -> bool {
 /// Only an error code that unambiguously means "no such process" may release
 /// shared ownership. Every other error remains ambiguous and therefore maps to
 /// [`ProcessLiveness::Unknown`] at the platform boundary.
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeFailure {
     Absent,
     Ambiguous,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 const fn classify_probe_failure(
     error_code: Option<i64>,
     definitive_absence_code: i64,
@@ -85,6 +85,10 @@ pub fn current_process_birth_token() -> Option<u64> {
     // ubs:ignore - the "birth token" is a process start time used only to
     // distinguish a recycled PID; it is not a security token / secret / nonce.
     let pid = std::process::id();
+    #[cfg(target_os = "linux")]
+    {
+        linux::birth_token(pid)
+    }
     #[cfg(target_os = "macos")]
     {
         macos::birth_token(pid)
@@ -93,7 +97,7 @@ pub fn current_process_birth_token() -> Option<u64> {
     {
         windows_impl::birth_token(pid)
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         None
@@ -103,13 +107,18 @@ pub fn current_process_birth_token() -> Option<u64> {
 /// Probe whether `pid` (with the reuse-safe `pid_birth` token) is still the same
 /// live process.
 ///
-/// Only macOS and Windows are implemented here; every other target
-/// (including Linux, whose procfs probe stays in `fsqlite-mvcc`) returns
-/// `Unknown` so the caller keeps its own logic.
+/// Linux, macOS and Windows are implemented here. Unsupported targets return
+/// `Unknown`. An untagged or foreign-platform birth token cannot prove PID
+/// reuse. Linux callers sharing owner records must use the same PID namespace
+/// and a procfs mount corresponding to that namespace.
 #[must_use]
 pub fn process_alive(pid: u32, pid_birth: u64) -> ProcessLiveness {
     if pid == 0 {
         return ProcessLiveness::Dead;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::alive(pid, pid_birth)
     }
     #[cfg(target_os = "macos")]
     {
@@ -119,10 +128,270 @@ pub fn process_alive(pid: u32, pid_birth: u64) -> ProcessLiveness {
     {
         windows_impl::alive(pid, pid_birth)
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid_birth;
         ProcessLiveness::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io;
+
+    use super::{
+        PID_BIRTH_PROCFS_TAG, ProbeFailure, ProcessLiveness, classify_probe_failure,
+        has_exact_platform_tag,
+    };
+
+    fn read_stat(pid: u32) -> io::Result<Vec<u8>> {
+        let path = std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat");
+        // comm is an arbitrary byte string, not necessarily UTF-8. Restrict
+        // text decoding to the numeric fields rather than the whole record.
+        std::fs::read(path)
+    }
+
+    fn start_ticks(stat: &[u8], expected_pid: u32) -> Option<u64> {
+        let comm_start = stat.iter().position(|byte| *byte == b'(')?;
+        let recorded_pid = std::str::from_utf8(&stat[..comm_start])
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        if recorded_pid != expected_pid {
+            return None;
+        }
+        // comm may contain spaces, newlines and ')'. The fields following its
+        // final ')' are ASCII; field 22 is the twentieth token starting at state.
+        let comm_end = stat.iter().rposition(|byte| *byte == b')')?;
+        if comm_end < comm_start {
+            return None;
+        }
+        std::str::from_utf8(stat.get(comm_end + 1..)?)
+            .ok()?
+            .split_ascii_whitespace()
+            .nth(19)?
+            .parse::<u64>()
+            .ok()
+    }
+
+    pub(super) fn birth_token(pid: u32) -> Option<u64> {
+        let stat = read_stat(pid).ok()?;
+        let ticks = start_ticks(&stat, pid)?;
+        // Preserve the existing Linux token encoding used by MVCC mappings.
+        Some(PID_BIRTH_PROCFS_TAG | (ticks & !PID_BIRTH_PROCFS_TAG))
+    }
+
+    fn presence(pid: u32) -> ProcessLiveness {
+        let Ok(native_pid) = libc::pid_t::try_from(pid) else {
+            return ProcessLiveness::Unknown;
+        };
+        if native_pid <= 0 {
+            // Never turn an invalid u32 PID into a process-group probe.
+            return ProcessLiveness::Unknown;
+        }
+        // SAFETY: native_pid is strictly positive and representable in pid_t;
+        // signal zero only probes existence/permission and sends no signal.
+        if unsafe { libc::kill(native_pid, 0) } == 0 {
+            return ProcessLiveness::Alive;
+        }
+        // Capture errno immediately. EPERM, seccomp refusal and every other
+        // ambiguous failure must not authorize releasing another writer.
+        let error_code = io::Error::last_os_error().raw_os_error().map(i64::from);
+        match classify_probe_failure(error_code, i64::from(libc::ESRCH)) {
+            ProbeFailure::Absent => ProcessLiveness::Dead,
+            ProbeFailure::Ambiguous => ProcessLiveness::Unknown,
+        }
+    }
+
+    fn alive_with(
+        pid: u32,
+        pid_birth: u64,
+        read: impl FnOnce(u32) -> io::Result<Vec<u8>>,
+        probe_presence: impl FnOnce(u32) -> ProcessLiveness,
+    ) -> ProcessLiveness {
+        if let Some(ticks) = read(pid).ok().and_then(|stat| start_ticks(&stat, pid)) {
+            if !has_exact_platform_tag(pid_birth, PID_BIRTH_PROCFS_TAG) {
+                return ProcessLiveness::Alive;
+            }
+            return if (ticks & !PID_BIRTH_PROCFS_TAG) == (pid_birth & !PID_BIRTH_PROCFS_TAG) {
+                ProcessLiveness::Alive
+            } else {
+                ProcessLiveness::Dead
+            };
+        }
+        // ENOENT may be hidepid=2, an unmounted procfs, or actual process death.
+        // Even a successful presence probe cannot establish the birth token,
+        // so preserve Unknown unless the kernel independently proves absence.
+        match probe_presence(pid) {
+            ProcessLiveness::Dead => ProcessLiveness::Dead,
+            ProcessLiveness::Alive | ProcessLiveness::Unknown => ProcessLiveness::Unknown,
+        }
+    }
+
+    pub(super) fn alive(pid: u32, pid_birth: u64) -> ProcessLiveness {
+        alive_with(pid, pid_birth, read_stat, presence)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::*;
+        use crate::process::{PID_BIRTH_FILETIME_TAG, PID_BIRTH_SYSCTL_TAG};
+
+        fn stat(pid: u32, comm: &[u8], ticks: u64) -> Vec<u8> {
+            let mut bytes = format!("{pid} (").into_bytes();
+            bytes.extend_from_slice(comm);
+            bytes.extend_from_slice(b") R");
+            for field in 4..22 {
+                bytes.extend_from_slice(format!(" {field}").as_bytes());
+            }
+            bytes.extend_from_slice(format!(" {ticks} 23 24\n").as_bytes());
+            bytes
+        }
+
+        #[test]
+        fn proc_stat_parsing_ignores_arbitrary_comm_bytes() {
+            for comm in [b"writer".as_slice(), b"a (b) c)", b"a\nb", b"invalid\xff\xfe"] {
+                for ticks in [0, 42, u64::MAX] {
+                    assert_eq!(start_ticks(&stat(123, comm, ticks), 123), Some(ticks));
+                }
+            }
+        }
+
+        #[test]
+        fn malformed_stat_never_supplies_a_birth_token() {
+            let valid = stat(123, b"writer", 9876);
+            assert_eq!(start_ticks(&valid, 124), None);
+            for bytes in [
+                b"".as_slice(),
+                b"123 writer R",
+                b"bad (writer) R",
+                b"123 ) (",
+                b"123 (writer) R 1 2 3",
+                b"123 (writer) \xff",
+            ] {
+                assert_eq!(start_ticks(bytes, 123), None);
+            }
+            let mut bad_ticks = b"123 (writer) R".to_vec();
+            for _ in 4..22 {
+                bad_ticks.extend_from_slice(b" 0");
+            }
+            bad_ticks.extend_from_slice(b" 18446744073709551616");
+            assert_eq!(start_ticks(&bad_ticks, 123), None);
+        }
+
+        #[test]
+        fn only_an_exact_linux_token_can_prove_pid_reuse() {
+            for (birth, expected) in [
+                (PID_BIRTH_PROCFS_TAG | 1234, ProcessLiveness::Alive),
+                (PID_BIRTH_PROCFS_TAG | 1235, ProcessLiveness::Dead),
+                (0, ProcessLiveness::Alive),
+                (1235, ProcessLiveness::Alive),
+                (PID_BIRTH_SYSCTL_TAG | 1235, ProcessLiveness::Alive),
+                (PID_BIRTH_FILETIME_TAG | 1235, ProcessLiveness::Alive),
+                (
+                    PID_BIRTH_PROCFS_TAG | PID_BIRTH_SYSCTL_TAG | 1235,
+                    ProcessLiveness::Alive,
+                ),
+                (
+                    PID_BIRTH_PROCFS_TAG | PID_BIRTH_FILETIME_TAG | 1235,
+                    ProcessLiveness::Alive,
+                ),
+            ] {
+                assert_eq!(
+                    alive_with(
+                        123,
+                        birth,
+                        |pid| Ok(stat(pid, b"writer", 1234)),
+                        |_| panic!("valid stat does not require a fallback probe"),
+                    ),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn proc_read_failures_require_independent_proof_of_absence() {
+            for kind in [
+                io::ErrorKind::NotFound,
+                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::Interrupted,
+                io::ErrorKind::InvalidData,
+                io::ErrorKind::Other,
+            ] {
+                for presence in [
+                    ProcessLiveness::Alive,
+                    ProcessLiveness::Unknown,
+                    ProcessLiveness::Dead,
+                ] {
+                    let probes = Cell::new(0);
+                    let verdict = alive_with(
+                        123,
+                        PID_BIRTH_PROCFS_TAG | 1234,
+                        |_| Err(kind.into()),
+                        |pid| {
+                            assert_eq!(pid, 123);
+                            probes.set(probes.get() + 1);
+                            presence
+                        },
+                    );
+                    assert_eq!(probes.get(), 1);
+                    assert_eq!(
+                        verdict,
+                        if presence == ProcessLiveness::Dead {
+                            ProcessLiveness::Dead
+                        } else {
+                            ProcessLiveness::Unknown
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn invalid_stat_keeps_a_possibly_live_owner() {
+            for bytes in [b"truncated".to_vec(), stat(124, b"wrong pid", 1234)] {
+                assert_eq!(
+                    alive_with(
+                        123,
+                        PID_BIRTH_PROCFS_TAG | 1234,
+                        |_| Ok(bytes),
+                        |_| ProcessLiveness::Alive,
+                    ),
+                    ProcessLiveness::Unknown
+                );
+            }
+        }
+
+        #[test]
+        fn signal_zero_never_uses_a_process_group_pid() {
+            assert_eq!(presence(0), ProcessLiveness::Unknown);
+            assert_eq!(presence(u32::MAX), ProcessLiveness::Unknown);
+        }
+
+        #[test]
+        fn signal_probe_requires_esrch_for_absence() {
+            assert_eq!(
+                classify_probe_failure(Some(i64::from(libc::ESRCH)), i64::from(libc::ESRCH)),
+                ProbeFailure::Absent
+            );
+            for code in [
+                None,
+                Some(0),
+                Some(libc::EPERM),
+                Some(libc::EACCES),
+                Some(libc::EINVAL),
+            ] {
+                assert_eq!(
+                    classify_probe_failure(code.map(i64::from), i64::from(libc::ESRCH)),
+                    ProbeFailure::Ambiguous
+                );
+            }
+        }
     }
 }
 
@@ -385,12 +654,10 @@ mod tests {
         );
     }
 
-    // The live probes below run only on the platforms they are implemented for;
-    // on Linux `process_alive` intentionally returns `Unknown` (mvcc keeps its
-    // procfs probe), which is asserted here.
-    #[cfg(not(any(target_os = "macos", windows)))]
+    // Unsupported platforms must keep the conservative fallback.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     #[test]
-    fn non_macos_non_windows_returns_unknown() {
+    fn unsupported_platform_returns_unknown() {
         assert_eq!(
             process_alive(std::process::id(), 0),
             ProcessLiveness::Unknown
@@ -398,7 +665,7 @@ mod tests {
         assert!(current_process_birth_token().is_none());
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn current_process_is_alive_with_its_own_birth_token() {
         let birth = current_process_birth_token().expect("own birth token available");
@@ -409,7 +676,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn recycled_pid_birth_mismatch_reads_dead() {
         // Same PID, deliberately wrong birth payload -> reused-PID -> Dead.
