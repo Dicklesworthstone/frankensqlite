@@ -562,6 +562,8 @@ pub mod streaming {
     pub enum StreamApplyError {
         Input(ChangesetStreamError),
         Sql(SqlChangesetApplyError),
+        LengthMismatch { expected: u64, consumed: u64 },
+        Verification { detail: String },
         Rollback { cause: Box<Self>, rollback: FrankenError },
     }
 
@@ -570,6 +572,10 @@ pub mod streaming {
             match self {
                 Self::Input(error) => write!(f, "{error}"),
                 Self::Sql(error) => write!(f, "{error}"),
+                Self::LengthMismatch { expected, consumed } => {
+                    write!(f, "changeset message length mismatch: expected {expected}, consumed {consumed}")
+                }
+                Self::Verification { detail } => write!(f, "changeset message verification failed: {detail}"),
                 Self::Rollback { cause, rollback } => {
                     write!(f, "{cause}; stream rollback also failed: {rollback}")
                 }
@@ -583,6 +589,7 @@ pub mod streaming {
                 Self::Input(error) => Some(error),
                 Self::Sql(error) => Some(error),
                 Self::Rollback { cause, .. } => Some(cause.as_ref()),
+                Self::LengthMismatch { .. } | Self::Verification { .. } => None,
             }
         }
     }
@@ -605,7 +612,8 @@ pub mod streaming {
     /// format has no outer length, authentication, or commit-sequence field.
     /// In particular, EOF at a row boundary cannot establish that a transport
     /// delivered every row intended by its sender. Authenticate and frame the
-    /// input outside this API when that guarantee is required.
+    /// input outside this API when that guarantee is required, or use
+    /// [`apply_verified`] to gate COMMIT on its length and completion verifier.
     ///
     /// Existing transactions are refused before input is read. A late schema,
     /// row, decoding, resource-limit, or input-I/O failure rolls back all prior
@@ -640,16 +648,101 @@ pub mod streaming {
         cx: &Cx,
         input: R,
         limits: ChangesetStreamLimits,
-        mut handler: F,
+        handler: F,
     ) -> Result<SqlChangesetApplyReport, StreamApplyError>
     where
         R: AsyncRead + Unpin,
         F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
     {
+        apply_checked(conn, cx, input, limits, None, |_| Ok(()), handler).await
+    }
+
+    /// Apply an exact-length message only after its completion verifier accepts.
+    ///
+    /// `verify` receives the SAME owned input after clean EOF, before COMMIT,
+    /// and is called exactly once on an otherwise successful input, including
+    /// an empty message. It can check an incremental digest or authenticated
+    /// transport receipt against metadata trusted by the caller. A rejection
+    /// rolls back all SQL effects and never produces a success receipt.
+    ///
+    /// The verifier must inspect state derived from the bytes this input
+    /// actually returned, not re-read a replaceable pathname. This API supplies
+    /// no hashing algorithm, trusted key, signature protocol or replay ordering.
+    /// Its length check also rejects truncation at a valid row boundary. Extra
+    /// input is an error, not an implicitly accepted second message; the source
+    /// must terminate at EOF rather than leave a persistent socket open.
+    ///
+    /// Verification gates DATABASE COMMIT, not execution: SQL triggers and
+    /// conflict callbacks can run before verification. Their external effects
+    /// cannot be rolled back. Authenticate chunks before ingestion when these
+    /// callbacks or SQL functions can perform external side effects.
+    pub async fn apply_verified<R, V>(
+        conn: &mut Connection,
+        cx: &Cx,
+        input: R,
+        limits: ChangesetStreamLimits,
+        expected_bytes: u64,
+        verify: V,
+    ) -> Result<SqlChangesetApplyReport, StreamApplyError>
+    where
+        R: AsyncRead + Unpin,
+        V: FnOnce(&R) -> Result<(), String>,
+    {
+        apply_verified_with_handler(conn, cx, input, limits, expected_bytes, verify, |_| {
+            ConflictAction::Abort
+        }).await
+    }
+
+    /// Exact-message verification with the ordinary strict conflict handler.
+    /// See [`apply_verified`] for trust, EOF and callback-side-effect semantics.
+    pub async fn apply_verified_with_handler<R, V, F>(
+        conn: &mut Connection,
+        cx: &Cx,
+        input: R,
+        limits: ChangesetStreamLimits,
+        expected_bytes: u64,
+        verify: V,
+        handler: F,
+    ) -> Result<SqlChangesetApplyReport, StreamApplyError>
+    where
+        R: AsyncRead + Unpin,
+        V: FnOnce(&R) -> Result<(), String>,
+        F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
+    {
+        apply_checked(conn, cx, input, limits, Some(expected_bytes), verify, handler).await
+    }
+
+    async fn apply_checked<R, V, F>(
+        conn: &mut Connection,
+        cx: &Cx,
+        mut input: R,
+        mut limits: ChangesetStreamLimits,
+        expected_bytes: Option<u64>,
+        verify: V,
+        mut handler: F,
+    ) -> Result<SqlChangesetApplyReport, StreamApplyError>
+    where
+        R: AsyncRead + Unpin,
+        V: FnOnce(&R) -> Result<(), String>,
+        F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
+    {
         if conn.in_transaction() { return Err(FrankenError::NestedTransaction.into()); }
         checkpoint(cx)?;
-        let mut reader = ChangesetStreamReader::new(input, limits);
+        if let Some(expected) = expected_bytes {
+            if expected > limits.max_input_bytes {
+                return Err(ChangesetStreamError::Limit {
+                    offset: 0, resource: "declared input bytes",
+                }.into());
+            }
+            // Bound work by the declared message too, not just the caller's
+            // general policy. Never apply an attacker-supplied extra stream.
+            limits.max_input_bytes = expected;
+        }
+        let mut reader = ChangesetStreamReader::new(&mut input, limits);
         let Some(first) = reader.next(cx).await? else {
+            let consumed = reader.bytes_consumed();
+            drop(reader);
+            verify_input(&input, expected_bytes, consumed, verify)?;
             checkpoint(cx)?;
             return Ok(SqlChangesetApplyReport::default());
         };
@@ -664,6 +757,11 @@ pub mod streaming {
             Ok(report) => report,
             Err(error) => return Err(rollback(&mut transaction, error).await),
         };
+        let consumed = reader.bytes_consumed();
+        drop(reader);
+        if let Err(error) = verify_input(&input, expected_bytes, consumed, verify) {
+            return Err(rollback(&mut transaction, error).await);
+        }
         if let Err(error) = checkpoint(cx) {
             return Err(rollback(&mut transaction, error).await);
         }
@@ -672,6 +770,23 @@ pub mod streaming {
         }
         transaction.armed = false;
         Ok(report)
+    }
+
+    fn verify_input<R, V>(
+        input: &R,
+        expected_bytes: Option<u64>,
+        consumed: u64,
+        verify: V,
+    ) -> Result<(), StreamApplyError>
+    where
+        V: FnOnce(&R) -> Result<(), String>,
+    {
+        if let Some(expected) = expected_bytes
+            && consumed != expected
+        {
+            return Err(StreamApplyError::LengthMismatch { expected, consumed });
+        }
+        verify(input).map_err(|detail| StreamApplyError::Verification { detail })
     }
 
     fn checkpoint(cx: &Cx) -> Result<(), StreamApplyError> {
@@ -1269,7 +1384,7 @@ mod tests {
 
 #[cfg(all(test, feature = "native", not(target_arch = "wasm32")))]
 mod streaming_apply_tests {
-    use super::streaming::{StreamApplyError, apply, apply_with_handler};
+    use super::streaming::{StreamApplyError, apply, apply_verified, apply_with_handler};
     use super::*;
     use crate::compat::changeset_stream::{ChangesetStreamError, ChangesetStreamLimits};
     use asupersync::io::{AsyncRead, ReadBuf};
@@ -1281,6 +1396,7 @@ mod streaming_apply_tests {
     use std::pin::Pin;
     use std::rc::Rc;
     use std::task::{Context, Poll};
+    use sha2::{Digest, Sha256};
 
     struct Input {
         bytes: Vec<u8>,
@@ -1317,6 +1433,41 @@ mod streaming_apply_tests {
             buf.put_slice(&this.bytes[this.offset..this.offset + n]);
             this.offset += n;
             Poll::Ready(Ok(()))
+        }
+    }
+
+    // A transport-owned digest: production does not depend on a second hash
+    // implementation or read the source again after applying it. sha2 is an
+    // existing dev dependency, used here to exercise a real completion check.
+    struct HashedInput {
+        input: Input,
+        digest: Sha256,
+    }
+
+    impl HashedInput {
+        fn new(bytes: Vec<u8>, chunk: usize) -> Self {
+            Self { input: Input::new(bytes, chunk), digest: Sha256::new() }
+        }
+
+        fn check_digest(&self, expected: [u8; 32]) -> Result<(), String> {
+            let actual: [u8; 32] = self.digest.clone().finalize().into();
+            if actual == expected { Ok(()) } else { Err("SHA-256 mismatch".to_owned()) }
+        }
+    }
+
+    impl AsyncRead for HashedInput {
+        fn poll_read(
+            self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            match Pin::new(&mut this.input).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    this.digest.update(&buf.filled()[before..]);
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
         }
     }
 
@@ -1568,6 +1719,159 @@ mod streaming_apply_tests {
             assert_eq!(reopened.query_row("PRAGMA integrity_check").await.unwrap().get(0),
                 Some(&SqliteValue::Text("ok".into())));
             reopened.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn exact_message_is_verified_once_from_the_actual_fragmented_input() {
+        asupersync::test_utils::run_test(|| async {
+            for chunk in [1, 3, 8192] {
+                let mut conn = setup().await;
+                let bytes = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "beta")])]);
+                let expected: [u8; 32] = Sha256::digest(&bytes).into();
+                let length = u64::try_from(bytes.len()).unwrap();
+                let mut checks = 0;
+                let report = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, chunk),
+                    ChangesetStreamLimits::default(), length, |input| {
+                        checks += 1;
+                        assert!(input.input.at_end.get(), "verify only after actual EOF");
+                        input.check_digest(expected)
+                    }).await.unwrap();
+                assert_eq!(checks, 1);
+                assert_eq!(report.applied, 2);
+                assert_eq!(count(&conn, "t").await, 2);
+                assert_eq!(count(&conn, "audit").await, 2);
+            }
+        });
+    }
+
+    #[test]
+    fn digest_rejection_of_well_formed_sql_rolls_back_the_whole_message() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            let intended = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "beta")])]);
+            let altered = wire(vec![table("t", vec![insert(1, "ALPHA"), insert(2, "beta")])]);
+            assert_eq!(intended.len(), altered.len());
+            let expected: [u8; 32] = Sha256::digest(&intended).into();
+            let length = u64::try_from(intended.len()).unwrap();
+            let error = apply_verified(&mut conn, &Cx::new(), HashedInput::new(altered, 1),
+                ChangesetStreamLimits::default(), length, |input| input.check_digest(expected)).await.unwrap_err();
+            assert!(matches!(error, StreamApplyError::Verification { .. }));
+            assert_empty(&conn).await;
+        });
+    }
+
+    #[test]
+    fn a_missing_final_row_is_not_accepted_as_a_complete_verified_message() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            let complete = wire(vec![table("t", vec![insert(1, "first"), insert(2, "second")])]);
+            let prefix = wire(vec![table("t", vec![insert(1, "first")])]);
+            let length = u64::try_from(complete.len()).unwrap();
+            let prefix_length = u64::try_from(prefix.len()).unwrap();
+            let mut checks = 0;
+            let result = apply_verified(&mut conn, &Cx::new(), HashedInput::new(prefix, 1),
+                ChangesetStreamLimits::default(), length, |_| { checks += 1; Ok(()) }).await;
+            assert!(matches!(result, Err(StreamApplyError::LengthMismatch { expected, consumed })
+                if expected == length && consumed == prefix_length));
+            assert_eq!(checks, 0, "a completion callback cannot waive missing bytes");
+            assert_empty(&conn).await;
+        });
+    }
+
+    #[test]
+    fn extra_valid_rows_and_oversized_declarations_cannot_extend_the_boundary() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            let complete = wire(vec![table("t", vec![insert(1, "first"), insert(2, "extra")])]);
+            let first = wire(vec![table("t", vec![insert(1, "first")])]);
+            let mut checks = 0;
+            let result = apply_verified(&mut conn, &Cx::new(), Input::new(complete, 8192),
+                ChangesetStreamLimits::default(), u64::try_from(first.len()).unwrap(), |_| {
+                    checks += 1; Ok(())
+                }).await;
+            assert!(matches!(result, Err(StreamApplyError::Input(ChangesetStreamError::Limit { resource: "input bytes", .. }))));
+            assert_eq!(checks, 0);
+            assert_empty(&conn).await;
+
+            let input = Input::new(first, 1);
+            let reads = Rc::clone(&input.reads);
+            let limits = ChangesetStreamLimits { max_input_bytes: 1, ..ChangesetStreamLimits::default() };
+            assert!(matches!(apply_verified(&mut conn, &Cx::new(), input, limits, 2, |_| Ok(())).await,
+                Err(StreamApplyError::Input(ChangesetStreamError::Limit { offset: 0, resource: "declared input bytes" }))));
+            assert_eq!(reads.get(), 0);
+            assert_empty(&conn).await;
+        });
+    }
+
+    #[test]
+    fn empty_and_header_only_messages_still_require_verification() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            for bytes in [Vec::new(), wire(vec![table("t", Vec::new())])] {
+                let length = u64::try_from(bytes.len()).unwrap();
+                let expected: [u8; 32] = Sha256::digest(&bytes).into();
+                let mut checks = 0;
+                let report = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes.clone(), 1),
+                    ChangesetStreamLimits::default(), length, |input| {
+                        checks += 1; input.check_digest(expected)
+                    }).await.unwrap();
+                assert_eq!(checks, 1);
+                assert_eq!(report, SqlChangesetApplyReport::default());
+                assert!(matches!(apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, 1),
+                    ChangesetStreamLimits::default(), length, |_| Err("untrusted envelope".to_owned())).await,
+                    Err(StreamApplyError::Verification { .. })));
+                assert_empty(&conn).await;
+            }
+        });
+    }
+
+    #[test]
+    fn completion_callback_panic_and_cancellation_preserve_rollback_ownership() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            let bytes = wire(vec![table("t", vec![insert(1, "abandoned")])]);
+            let length = u64::try_from(bytes.len()).unwrap();
+            let cx = Cx::new();
+            let mut operation = Box::pin(apply_verified(&mut conn, &cx, Input::new(bytes.clone(), 1),
+                ChangesetStreamLimits::default(), length, |_| panic!("completion verifier panic")));
+            let panicked = poll_fn(|task_cx| {
+                match catch_unwind(AssertUnwindSafe(|| operation.as_mut().poll(task_cx))) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(_)) => Poll::Ready(false),
+                    Err(_) => Poll::Ready(true),
+                }
+            }).await;
+            assert!(panicked);
+            drop(operation);
+            assert_empty(&conn).await;
+
+            let result = apply_verified(&mut conn, &cx, Input::new(bytes, 1),
+                ChangesetStreamLimits::default(), length, |_| { cx.cancel(); Ok(()) }).await;
+            assert!(matches!(result, Err(StreamApplyError::Input(ChangesetStreamError::Cancelled))));
+            assert_empty(&conn).await;
+        });
+    }
+
+    #[test]
+    fn a_verified_message_still_has_to_pass_the_database_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
+            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+                .await.unwrap();
+            let bytes = wire(vec![table("t", vec![insert(1, "99")])]);
+            let length = u64::try_from(bytes.len()).unwrap();
+            let expected: [u8; 32] = Sha256::digest(&bytes).into();
+            let mut checks = 0;
+            let result = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, 1),
+                ChangesetStreamLimits::default(), length, |input| { checks += 1; input.check_digest(expected) }).await;
+            assert_eq!(checks, 1, "the completed message was verified before COMMIT");
+            assert!(matches!(result, Err(StreamApplyError::Sql(_))));
+            assert_eq!(count(&conn, "t").await, 0);
+            assert!(!conn.in_transaction());
         });
     }
 }
