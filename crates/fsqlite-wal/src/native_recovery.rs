@@ -34,6 +34,12 @@ type NativeFile = <NativeVfs as Vfs>::File;
 const IO_CHUNK: usize = 64 * 1024;
 const DATABASE_HEADER_BYTES: usize = 100;
 
+// These names belong to a database even when their entries do not yet exist.
+// In particular, an absent certificate is not a safe export destination.
+const RECOVERY_COMPANION_SUFFIXES: [&str; 7] = [
+    "-journal", "-wal", "-shm", "-wal-fec", "-wal-fec.lock", "-wal-cert", ".fsqlite-shm",
+];
+
 /// Bounded native recovery request. The destination is a new database for
 /// export, or a mandatory new original-WAL backup for in-place repair.
 #[derive(Debug, Clone)]
@@ -348,8 +354,14 @@ async fn capture_held(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Cap
     })
 }
 
+fn is_source_artifact(source: &Path, destination: &Path) -> bool {
+    source == destination
+        || RECOVERY_COMPANION_SUFFIXES.iter()
+            .any(|suffix| destination == companion(source, suffix))
+}
+
 fn refuse_destination_artifacts(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
-    for suffix in ["-journal", "-wal", "-shm", "-wal-fec", "-wal-cert", ".fsqlite-shm"] {
+    for suffix in RECOVERY_COMPANION_SUFFIXES {
         let artifact = companion(path, suffix);
         if vfs.path_entry_exists(cx, &artifact)? { return Err(FrankenError::CannotOpen { path: artifact }); }
     }
@@ -412,7 +424,10 @@ pub struct ExportReport {
 async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<ExportReport> {
     let source = vfs.full_pathname(cx, &options.source)?;
     let destination = vfs.full_pathname(cx, &options.destination)?;
-    if source == destination || vfs.path_entry_exists(cx, &destination)? {
+    // Check reserved names before capture can create source lock/SHM files.
+    // Merely requiring a NEW destination would allow export to poison an
+    // absent source FEC/certificate/journal companion with database bytes.
+    if is_source_artifact(&source, &destination) || vfs.path_entry_exists(cx, &destination)? {
         return Err(FrankenError::CannotOpen { path: destination });
     }
     refuse_destination_artifacts(vfs, cx, &destination)?;
@@ -460,3 +475,7 @@ async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) ->
 #[cfg(test)]
 #[path = "native_recovery_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_recovery_export_tests.rs"]
+mod export_tests;
