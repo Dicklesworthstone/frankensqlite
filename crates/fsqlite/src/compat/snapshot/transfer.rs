@@ -106,7 +106,7 @@ fn image_geometry(image: &[u8], limit: usize) -> Result<(u32, u32)> {
         return Err(corrupt("snapshot source has invalid geometry or journal format"));
     }
     let size = usize::try_from(page_size).map_err(|_| FrankenError::TooBig)?;
-    if image.len() < size || image.len() % size != 0 {
+    if image.len() < size || !image.len().is_multiple_of(size) {
         return Err(corrupt("snapshot source contains an incomplete database page"));
     }
     let page_count = u32::try_from(image.len() / size).map_err(|_| FrankenError::TooBig)?;
@@ -236,7 +236,7 @@ mod tests {
              INSERT INTO t VALUES(1,'before');"
         )).unwrap();
         stock.close().unwrap();
-        fsqlite_vfs::host_fs::read(path).unwrap()
+        fsqlite_vfs::host_fs::read(&path).unwrap()
     }
 
     async fn install(cx: &Cx, source: &mut CapturedSnapshot) -> Connection {

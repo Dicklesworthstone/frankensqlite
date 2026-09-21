@@ -56,7 +56,7 @@ fn source_image(path: &Path) -> Vec<u8> {
 }
 
 fn transfer(image: &[u8], repairs: bool) -> (SnapshotManifest, Vec<ReplicationPacket>) {
-    let mut pages: Vec<_> = image.chunks_exact(PAGE_SIZE as usize).enumerate()
+    let mut pages: Vec<_> = image.as_chunks::<{ PAGE_SIZE as usize }>().0.iter().enumerate()
         .map(|(index, data)| PageEntry::new(index as u32 + 1, data.to_vec())).collect();
     let mut sender = SnapshotSender::prepare(PAGE_SIZE, &mut pages, SenderConfig {
         symbol_size: 4096, max_isi_multiplier: if repairs { 8 } else { 1 },

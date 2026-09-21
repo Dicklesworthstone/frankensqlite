@@ -103,7 +103,7 @@ impl SnapshotManifest {
             return Err(corrupt("invalid snapshot manifest block count or length"));
         }
         let mut blocks = Vec::with_capacity(count);
-        for bytes in bytes[HEADER_BYTES..].chunks_exact(BLOCK_BYTES) {
+        for bytes in bytes[HEADER_BYTES..].as_chunks::<BLOCK_BYTES>().0 {
             blocks.push(SnapshotBlockManifest {
                 changeset_id: ChangesetId::from_bytes(bytes[..16].try_into().expect("block width")),
                 first_page: u32::from_le_bytes(bytes[16..20].try_into().expect("block width")),

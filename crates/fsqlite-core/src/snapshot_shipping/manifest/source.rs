@@ -20,8 +20,9 @@ use crate::replication_sender::{
     symbol_schedule_end,
 };
 
-/// Explicit disk-image and encoded-block admission limits. The block limit
-/// excludes codec scratch and the returned packet; the codec's existing work
+/// Explicit disk-image and encoded-block admission limits.
+///
+/// The block limit excludes codec scratch and the returned packet; the codec's existing work
 /// admission applies separately. Neither limit is a total RSS guarantee.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotSourceLimits {
@@ -39,7 +40,9 @@ impl SnapshotSourceLimits {
 }
 
 /// Owns a frozen image descriptor, at most 256 manifest entries, one encoded
-/// block, and the existing bounded repair encoder. It never retains all pages.
+/// block, and the existing bounded repair encoder.
+///
+/// It never retains all pages.
 /// Outgoing packets are unsigned, like SnapshotSender's packets; authenticate
 /// them with ReplicationPacket::attach_auth_tag before remote transmission.
 pub struct SnapshotFileSender<F: VfsFile> {
@@ -316,7 +319,7 @@ mod tests {
             let bytes = image(512, 4);
             let (_vfs, file) = fixture(&cx, &bytes).await;
             let mut file_sender = SnapshotFileSender::open(&cx, file, config(4), limits(8192)).await.unwrap();
-            let mut pages: Vec<_> = bytes.chunks_exact(512).enumerate()
+            let mut pages: Vec<_> = bytes.as_chunks::<512>().0.iter().enumerate()
                 .map(|(i, page)| PageEntry::new(i as u32 + 1, page.to_vec())).collect();
             let mut original = SnapshotSender::prepare(512, &mut pages, config(4)).unwrap();
             assert_eq!(file_sender.manifest(), &original.manifest().unwrap());

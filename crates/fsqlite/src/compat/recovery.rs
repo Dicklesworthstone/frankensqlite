@@ -29,7 +29,9 @@ pub struct RepairedOpen {
 }
 
 /// Repair an existing Unix WAL and open the same database with the default
-/// connection environment. Uses the caller's active native runtime and `Cx`;
+/// connection environment.
+///
+/// Uses the caller's active native runtime and `Cx`;
 /// no subprocess, executor, or second recovery algorithm is constructed.
 ///
 /// See [`repair_and_open_with_env`] for failure and ownership semantics.

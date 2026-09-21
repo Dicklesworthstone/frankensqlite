@@ -57,7 +57,7 @@ const fn bound_flag(code: u8) -> Option<i32> {
     }
 }
 
-pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
+pub fn best_index(info: &mut IndexInfo) -> Result<()> {
     if info.constraint_usage.len() != info.constraints.len() {
         return Err(invalid_plan());
     }
@@ -152,7 +152,7 @@ pub(super) fn best_index(info: &mut IndexInfo) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn filter(
+pub fn filter(
     cursor: &mut GenerateSeriesCursor,
     cx: &Cx,
     index: i32,
@@ -316,7 +316,7 @@ fn intersect_sequence(cursor: &mut GenerateSeriesCursor, lower: i128, upper: i12
     Ok(())
 }
 
-pub(super) fn next(cursor: &mut GenerateSeriesCursor, cx: &Cx) -> Result<()> {
+pub fn next(cursor: &mut GenerateSeriesCursor, cx: &Cx) -> Result<()> {
     if cursor.done {
         return Ok(());
     }

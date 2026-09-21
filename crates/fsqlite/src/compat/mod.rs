@@ -474,7 +474,7 @@ pub mod snapshot {
 
         fn packetize_image(bytes: &[u8]) -> (SnapshotManifest, Vec<ReplicationPacket>) {
             assert_eq!(bytes.len() % 512, 0);
-            let mut pages: Vec<_> = bytes.chunks_exact(512).enumerate().map(|(index, page)| {
+            let mut pages: Vec<_> = bytes.as_chunks::<512>().0.iter().enumerate().map(|(index, page)| {
                 PageEntry::new(u32::try_from(index + 1).unwrap(), page.to_vec())
             }).collect();
             let mut sender = SnapshotSender::prepare(512, &mut pages, SenderConfig {
