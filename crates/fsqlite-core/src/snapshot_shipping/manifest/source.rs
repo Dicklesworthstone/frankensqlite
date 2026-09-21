@@ -421,3 +421,106 @@ mod tests {
         });
     }
 }
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32"), any(unix, windows)))]
+pub use capture::CapturedSnapshotSender;
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32"), any(unix, windows)))]
+mod capture {
+    use std::path::{Path, PathBuf};
+
+    use super::{SnapshotFileSender, SnapshotSourceLimits, checkpoint, corrupt};
+    use crate::connection::{BackupReport, Connection};
+    use crate::replication_sender::SenderConfig;
+    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_types::{cx::Cx, flags::VfsOpenFlags};
+    use fsqlite_vfs::{FileIdentity, host_fs, traits::{Vfs, VfsFile}};
+
+    #[cfg(unix)]
+    use fsqlite_vfs::{UnixFile as NativeFile, UnixVfs as NativeVfs};
+    #[cfg(windows)]
+    use fsqlite_vfs::{WindowsFile as NativeFile, WindowsVfs as NativeVfs};
+
+    /// Native read-only transfer source returned by Connection capture.
+    pub type CapturedSnapshotSender = SnapshotFileSender<NativeFile>;
+
+    fn require_standalone(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if vfs.path_entry_exists(cx, &sidecar)? {
+                return Err(FrankenError::CannotOpen { path: sidecar });
+            }
+        }
+        Ok(())
+    }
+
+    impl Connection {
+        /// Capture committed SQL state through the engine's verified backup
+        /// path, then prepare a bounded file-backed transfer source.
+        ///
+        /// The destination must be absent inside a caller-controlled private
+        /// namespace, kept exclusively owned and immutable for the sender's
+        /// lifetime. Existing files and journal/WAL/SHM entries are refused.
+        /// The live source may keep its WAL; backup_exact_to, NOT a raw main-file
+        /// copy or forced checkpoint here, owns the coherent source snapshot.
+        /// An active transaction on this connection is refused by that API.
+        ///
+        /// SnapshotSourceLimits govern admission/encoding of the resulting
+        /// frozen image, not allocation or disk writes inside backup_exact_to.
+        /// Backup retains its ConnectionEnv cancellation/resource policy; cx
+        /// is checked before/after it and governs the subsequent VFS reads.
+        /// A rejected/cancelled attempt may leave a backup file. It is preserved,
+        /// never deleted or reused by this method. Directory durability and
+        /// cleanup remain caller obligations, as for the backup API itself.
+        /// Quiesce abandoned backup I/O before reusing its namespace; retries
+        /// should use a fresh private destination rather than replacing a file.
+        ///
+        /// The original BackupReport is returned unchanged as provenance. The
+        /// sender's raw image hash is a separate digest, not a reinterpretation
+        /// of the backup API's logical hash. Obtain the manifest ID locally here
+        /// and convey it to receivers over a trusted control plane.
+        pub async fn capture_snapshot_transfer(
+            &self,
+            cx: &Cx,
+            destination: &Path,
+            config: SenderConfig,
+            limits: SnapshotSourceLimits,
+        ) -> Result<(BackupReport, CapturedSnapshotSender)> {
+            checkpoint(cx)?;
+            config.validate()?;
+            limits.validate()?;
+            let vfs = NativeVfs::new();
+            // Resolve once so a process-wide cwd change across awaits cannot
+            // redirect the backup, identity probe and stream to different files.
+            let destination = vfs.full_pathname(cx, destination)?;
+            if vfs.path_entry_exists(cx, &destination)? {
+                return Err(FrankenError::CannotOpen { path: destination });
+            }
+            require_standalone(&vfs, cx, &destination)?;
+            let report = self.backup_exact_to(&destination).await?;
+            checkpoint(cx)?;
+            if report.byte_len > limits.max_image_bytes { return Err(FrankenError::TooBig); }
+            require_standalone(&vfs, cx, &destination)?;
+
+            // Reject final symlinks/reparse points and verify the native VFS
+            // opened the same file as this no-follow descriptor. This is not a
+            // substitute for caller-owned namespace exclusion during backup.
+            let probe = host_fs::open_existing_regular_file_no_follow(&destination)?;
+            let expected = FileIdentity::from_file(&probe)?.ok_or(FrankenError::BusyRecovery)?;
+            let (file, _) = vfs.open(cx, Some(&destination), VfsOpenFlags::READONLY)?;
+            if file.file_identity()? != Some(expected) { return Err(FrankenError::BusyRecovery); }
+            drop(probe); // The private backup has no database lock owners.
+            let sender = SnapshotFileSender::open(cx, file, config, limits).await?;
+            let pages: u64 = sender.manifest().blocks().iter()
+                .map(|block| u64::from(block.page_count())).sum();
+            if sender.byte_len() != report.byte_len || sender.manifest().page_size() != report.page_size
+                || pages != u64::from(report.page_count)
+            {
+                return Err(corrupt("frozen transfer image disagrees with verified backup geometry"));
+            }
+            Ok((report, sender))
+        }
+    }
+}
