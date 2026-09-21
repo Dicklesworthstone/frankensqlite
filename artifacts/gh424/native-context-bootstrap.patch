@@ -1,0 +1,24 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -3,13 +3,14 @@
+         self.io_native_cx
+             .get_or_init(|| {
+                 let handle = self.native_runtime_handle.as_ref()?;
+-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
++                // GH#424: spawning a minting task and then recv_timeout-ing
++                // blocks the very executor that must poll that task on a
++                // current-thread runtime. Mint directly from the retained
++                // owning handle instead. This preserves runtime-rooted spawn
++                // authority without borrowing the ambient root task's Cx.
+                 handle
+-                    .try_spawn_with_cx(move |cx: asupersync::Cx| async move {
+-                        let _ = tx.send(cx.clone());
+-                    })
+-                    .ok()?;
+-                rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
++                    .try_request_cx_with_budget(asupersync::types::Budget::new())
++                    .ok()
+             })
+             .clone()
+     }
