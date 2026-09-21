@@ -10,13 +10,17 @@
 //! The transport must provide a bounded, authenticated message where needed.
 //! Dropping `next` after polling it, or any decoding error, poisons the reader:
 //! consumed bytes cannot safely be replayed as a new record. Discard it rather
-//! than retrying. Cancellation is observed between reads; a pending transport
-//! must support its own cancellation or the caller must drop the operation.
+//! than retrying. Ready input and Interrupted retries share a cooperative work
+//! budget across rows, yielding with a wakeup before decoding more input.
+//! Cancellation is checked on resume. A pending transport must still support
+//! its own cancellation or the caller must drop the operation.
 
 pub mod verified;
 
+use std::future::poll_fn;
 use std::io;
 use std::sync::Arc;
+use std::task::Poll;
 
 use asupersync::io::{AsyncRead, AsyncReadExt};
 use fsqlite_ext_session::{
@@ -25,6 +29,11 @@ use fsqlite_ext_session::{
 use fsqlite_types::cx::Cx;
 
 const BUFFER_SIZE: usize = 8192;
+// One unit is a buffered input access or an underlying Interrupted retry.
+// This is a scheduling bound on decoder steps, not a wall-time guarantee for
+// an arbitrary transport or allocation. Keep the budget across next() calls:
+// a caller may consume many immediately-ready rows within one executor poll.
+const DECODE_WORK_BUDGET: usize = 256;
 
 /// Resource policy for one EOF-delimited input. Row bytes count value tags,
 /// fixed payloads, and variable payloads (not the input buffer or Rust enum
@@ -117,6 +126,7 @@ pub struct ChangesetStreamReader<R> {
     kind: Option<ChangesetKind>,
     poisoned: bool,
     finished: bool,
+    work_remaining: usize,
 }
 
 impl<R> ChangesetStreamReader<R> {
@@ -126,6 +136,7 @@ impl<R> ChangesetStreamReader<R> {
             input, limits, buffer: [0; BUFFER_SIZE], start: 0, end: 0,
             offset: 0, rows: 0, section: 0, row_index: 0, table: None,
             kind: None, poisoned: false, finished: false,
+            work_remaining: DECODE_WORK_BUDGET,
         }
     }
 
@@ -164,6 +175,31 @@ impl<R> ChangesetStreamReader<R> {
         *used = next;
         Ok(())
     }
+
+    async fn cooperate(&mut self, cx: &Cx) -> Result<(), ChangesetStreamError> {
+        cx.checkpoint().map_err(|_| ChangesetStreamError::Cancelled)?;
+        if self.work_remaining == 0 {
+            // Checkpoints alone cannot schedule another task on this executor.
+            // Self-wake once, then return Pending without a timer or a task.
+            let mut yielded = false;
+            poll_fn(|task_cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    task_cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            self.work_remaining = DECODE_WORK_BUDGET;
+            // A cancellation task may have run while we yielded. Do not touch
+            // the input or publish another row before observing its request.
+            cx.checkpoint().map_err(|_| ChangesetStreamError::Cancelled)?;
+        }
+        self.work_remaining -= 1;
+        Ok(())
+    }
 }
 
 impl<R: AsyncRead + Unpin> ChangesetStreamReader<R> {
@@ -181,17 +217,18 @@ impl<R: AsyncRead + Unpin> ChangesetStreamReader<R> {
     }
 
     async fn refill(&mut self, cx: &Cx) -> Result<bool, ChangesetStreamError> {
-        cx.checkpoint().map_err(|_| ChangesetStreamError::Cancelled)?;
+        self.cooperate(cx).await?;
         if self.start < self.end { return Ok(true); }
         loop {
-            cx.checkpoint().map_err(|_| ChangesetStreamError::Cancelled)?;
             match self.input.read(&mut self.buffer).await {
                 Ok(count) => {
                     self.start = 0;
                     self.end = count;
                     return Ok(count != 0);
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    self.cooperate(cx).await?;
+                }
                 Err(error) => return Err(ChangesetStreamError::Io(error)),
             }
         }
@@ -366,8 +403,10 @@ impl<R: AsyncRead + Unpin> ChangesetStreamReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
     use asupersync::io::ReadBuf;
     use fsqlite_ext_session::{Changeset, TableChangeset};
 
@@ -388,6 +427,43 @@ mod tests {
         Fragments { bytes, offset: 0, chunk, pending_at: None }
     }
 
+    // Always ready, including its bounded Interrupted prefix. The old decoder
+    // finishes these inputs in one poll, so red tests fail promptly, not hang.
+    struct ImmediateSource {
+        inner: Fragments,
+        interruptions: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ImmediateSource {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.calls.fetch_add(1, Ordering::Relaxed);
+            if this.interruptions > 0 {
+                this.interruptions -= 1;
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
+            Pin::new(&mut this.inner).poll_read(cx, out)
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn fixture() -> Changeset {
         Changeset { kind: ChangesetKind::Changeset, tables: vec![TableChangeset {
             info: TableInfo { name: "quoted\"table".to_owned(), column_count: 3, pk_flags: vec![false, true, true] },
@@ -403,6 +479,170 @@ mod tests {
                 ], new_values: vec![] },
             ],
         }] }
+    }
+
+    #[test]
+    fn interrupted_ready_input_yields_and_observes_cancellation_before_retrying() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = ImmediateSource {
+            inner: input(fixture().encode(), BUFFER_SIZE),
+            interruptions: DECODE_WORK_BUDGET * 2,
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = ChangesetStreamReader::new(source, ChangesetStreamLimits::default());
+        let cx = Cx::new();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut next = Box::pin(reader.next(&cx));
+        assert!(next.as_mut().poll(&mut task).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), DECODE_WORK_BUDGET);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        cx.cancel();
+        assert!(matches!(
+            next.as_mut().poll(&mut task),
+            Poll::Ready(Err(ChangesetStreamError::Cancelled))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), DECODE_WORK_BUDGET);
+        drop(next);
+        assert_eq!(reader.bytes_consumed(), 0);
+        assert!(matches!(
+            Box::pin(reader.next(&cx)).as_mut().poll(&mut task),
+            Poll::Ready(Err(ChangesetStreamError::Poisoned))
+        ));
+    }
+
+    #[test]
+    fn interrupted_ready_input_resumes_without_losing_or_repeating_rows() {
+        asupersync::test_utils::run_test(|| async {
+            let expected = fixture();
+            let wire = expected.encode();
+            let wire_len = u64::try_from(wire.len()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = ImmediateSource {
+                inner: input(wire, 3),
+                interruptions: DECODE_WORK_BUDGET * 2 + 7,
+                calls: Arc::clone(&calls),
+            };
+            let mut reader = ChangesetStreamReader::new(source, ChangesetStreamLimits::default());
+            let cx = Cx::new();
+            for (index, row) in expected.tables[0].rows.iter().enumerate() {
+                let actual = reader.next(&cx).await.unwrap().unwrap();
+                assert_eq!(&actual.change, row);
+                assert_eq!(actual.row_index, index);
+                assert_eq!(actual.section, 1);
+            }
+            assert!(reader.next(&cx).await.unwrap().is_none());
+            assert_eq!(reader.bytes_consumed(), wire_len);
+            assert_eq!(reader.rows_decoded(), 3);
+            assert!(calls.load(Ordering::Relaxed) > DECODE_WORK_BUDGET * 2);
+        });
+    }
+
+    #[test]
+    fn one_byte_ready_input_yields_within_a_row_and_resumes_exactly() {
+        let mut expected = fixture();
+        expected.tables[0].rows.truncate(1);
+        expected.tables[0].rows[0].new_values[0] =
+            ChangesetValue::Text("x".repeat(DECODE_WORK_BUDGET * 2));
+        let wire = expected.encode();
+        let wire_len = wire.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = ImmediateSource {
+            inner: input(wire, 1),
+            interruptions: 0,
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = ChangesetStreamReader::new(source, ChangesetStreamLimits::default());
+        let cx = Cx::new();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut next = Box::pin(reader.next(&cx));
+        assert!(next.as_mut().poll(&mut task).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), DECODE_WORK_BUDGET);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        let mut completed = None;
+        for _ in 0..wire_len {
+            if let Poll::Ready(result) = next.as_mut().poll(&mut task) {
+                completed = Some(result);
+                break;
+            }
+        }
+        let row = completed.expect("bounded ready source must complete").unwrap().unwrap();
+        assert_eq!(row.change, expected.tables[0].rows[0]);
+        drop(next);
+        assert_eq!(reader.bytes_consumed(), u64::try_from(wire_len).unwrap());
+        assert_eq!(reader.rows_decoded(), 1);
+    }
+
+    #[test]
+    fn buffered_rows_share_the_budget_between_next_calls() {
+        let mut expected = fixture();
+        expected.tables[0].rows = vec![expected.tables[0].rows[0].clone(); DECODE_WORK_BUDGET];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = ImmediateSource {
+            inner: input(expected.encode(), BUFFER_SIZE),
+            interruptions: 0,
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = ChangesetStreamReader::new(source, ChangesetStreamLimits::default());
+        let cx = Cx::new();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        for index in 0..DECODE_WORK_BUDGET {
+            let mut next = Box::pin(reader.next(&cx));
+            match next.as_mut().poll(&mut task) {
+                Poll::Ready(Ok(Some(row))) => {
+                    assert_eq!(row.row_index, index);
+                    assert_eq!(row.change, expected.tables[0].rows[index]);
+                }
+                Poll::Pending => {
+                    assert!(index > 0, "small rows should not unconditionally yield");
+                    assert_eq!(calls.load(Ordering::Relaxed), 1, "work was already buffered");
+                    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+                    cx.cancel();
+                    assert!(matches!(
+                        next.as_mut().poll(&mut task),
+                        Poll::Ready(Err(ChangesetStreamError::Cancelled))
+                    ));
+                    drop(next);
+                    assert_eq!(reader.rows_decoded(), u64::try_from(index).unwrap());
+                    return;
+                }
+                other => panic!("unexpected decode outcome: {other:?}"),
+            }
+        }
+        panic!("ready rows must not reset the shared work budget");
+    }
+
+    #[test]
+    fn buffered_empty_sections_yield_and_dropped_decode_stays_poisoned() {
+        let wire = [b'T', 1, 1, b't', 0].repeat(DECODE_WORK_BUDGET * 2);
+        assert!(wire.len() < BUFFER_SIZE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = ImmediateSource {
+            inner: input(wire, BUFFER_SIZE),
+            interruptions: 0,
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = ChangesetStreamReader::new(source, ChangesetStreamLimits::default());
+        let cx = Cx::new();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut next = Box::pin(reader.next(&cx));
+        assert!(next.as_mut().poll(&mut task).is_pending());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        drop(next);
+        assert_eq!(reader.rows_decoded(), 0);
+        assert!(matches!(
+            Box::pin(reader.next(&cx)).as_mut().poll(&mut task),
+            Poll::Ready(Err(ChangesetStreamError::Poisoned))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
