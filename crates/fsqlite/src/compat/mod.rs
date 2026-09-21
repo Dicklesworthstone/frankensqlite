@@ -47,7 +47,8 @@ pub mod snapshot {
     pub use fsqlite_core::replication_sender::ReplicationPacket;
     pub use fsqlite_core::snapshot_shipping::SnapshotPacketResult;
     pub use fsqlite_core::snapshot_shipping::manifest::{
-        ManifestSnapshotReceiver, SnapshotImageReceipt, SnapshotImageState, SnapshotManifest,
+        ManifestSnapshotReceiver, SnapshotCheckpoint, SnapshotImageReceipt, SnapshotImageState,
+        SnapshotManifest, SnapshotSpool, SnapshotSpoolState,
     };
     use fsqlite_core::snapshot_shipping::manifest::SnapshotImageWriter;
 
@@ -78,8 +79,9 @@ pub mod snapshot {
 
     /// A dedicated, empty output directory in a caller-controlled namespace.
     ///
-    /// Missing directories are created. An existing nonempty directory is
-    /// refused, including one left by a previous failed or completed import.
+    /// The parent must already exist; a missing output directory is created.
+    /// An existing nonempty directory is refused, including one left by a
+    /// previous failed or completed import.
     /// `manifest.fsqlite` is reserved with create-new semantics before any
     /// database is created. Neither it nor a failed database is ever deleted.
     /// Treat the directory as private staging until the returned open receipt;
@@ -126,6 +128,8 @@ pub mod snapshot {
     /// Successful open may initialize ordinary WAL/metadata and subsequent
     /// writes may change the image. An SQL-open error does not undo installation
     /// or delete its evidence. The connection retains normal writer defaults.
+    /// Content verification is not a B-tree integrity certificate; run
+    /// PRAGMA integrity_check before trusting a recovered source's SQL data.
     #[derive(Debug)]
     #[must_use = "inspect both the installed image receipt and SQL open result"]
     pub struct SnapshotOpen {
@@ -174,7 +178,7 @@ pub mod snapshot {
         }).ok_or(FrankenError::TooBig)?;
         let bytes = page_count.checked_mul(u64::from(page_size)).ok_or(FrankenError::TooBig)?;
         if page_count == 0 || page_count >= u64::from(u32::MAX)
-            || bytes > limits.max_file_bytes || limits.max_payload_bytes == 0
+            || bytes > limits.max_file_bytes
         {
             return Err(FrankenError::TooBig);
         }
@@ -372,6 +376,57 @@ pub mod snapshot {
         }
     }
 
+    /// Recover a persisted packet transfer into a new SQL database.
+    ///
+    /// Open the source with SnapshotSpool::open and an independently trusted
+    /// manifest, key and (when available) previously acknowledged checkpoint.
+    /// Do not replay any records before calling this function. The source may
+    /// be opened read-only; recovery does not truncate, rewrite or delete it.
+    /// A complete verified prefix with an unacknowledged torn suffix is usable,
+    /// but a missing or mismatched required checkpoint is never waived.
+    ///
+    /// This is a new-image restore, not in-place resume of an abandoned image.
+    /// It drains one replayed block at a time to the same guarded destination
+    /// and uses the same verification/publication/SQL-open boundary as live
+    /// receive. Failed output stays preserved in its own directory.
+    ///
+    /// max_file_bytes limits the output image. The source's retained-payload
+    /// and journal limits are those already established by SnapshotSpool::open;
+    /// BootstrapLimits::max_payload_bytes configures live receive only.
+    pub async fn restore_spool_and_open<F: VfsFile>(
+        cx: &Cx,
+        options: &BootstrapOptions,
+        spool: &mut SnapshotSpool<F>,
+        expected_id: [u8; 32],
+    ) -> Result<SnapshotOpen> {
+        restore_spool_and_open_with_env(cx, options, spool, expected_id, ConnectionEnv::default()).await
+    }
+
+    /// Restore with an explicit SQL environment; see restore_spool_and_open.
+    pub async fn restore_spool_and_open_with_env<F: VfsFile>(
+        cx: &Cx,
+        options: &BootstrapOptions,
+        spool: &mut SnapshotSpool<F>,
+        expected_id: [u8; 32],
+        env: ConnectionEnv,
+    ) -> Result<SnapshotOpen> {
+        checkpoint(cx)?;
+        // Refuse a live append owner or an already-consumed replay before
+        // creating output artifacts. Only the existing replay implementation
+        // may certify the required source checkpoint and full page coverage.
+        if spool.state() != SnapshotSpoolState::Replaying || spool.record_count() != 0
+            || spool.receiver().blocks_decoded() != 0
+            || spool.receiver().retained_payload_bytes() != 0
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let mut destination = Destination::create(
+            cx, options, spool.receiver().manifest().clone(), expected_id,
+        )?;
+        spool.replay_into_image(cx, &mut destination.image).await?;
+        destination.finish_and_open(cx, env).await
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -411,6 +466,11 @@ pub mod snapshot {
             stock.close().unwrap();
             let bytes = host_fs::read(&source).unwrap();
             let length = u64::try_from(bytes.len()).unwrap();
+            let (manifest, packets) = packetize_image(&bytes);
+            (root, manifest, packets, length)
+        }
+
+        fn packetize_image(bytes: &[u8]) -> (SnapshotManifest, Vec<ReplicationPacket>) {
             assert_eq!(bytes.len() % 512, 0);
             let mut pages: Vec<_> = bytes.chunks_exact(512).enumerate().map(|(index, page)| {
                 PageEntry::new(u32::try_from(index + 1).unwrap(), page.to_vec())
@@ -426,7 +486,7 @@ pub mod snapshot {
                 packet.attach_auth_tag(&KEY);
                 packets.push(packet);
             }
-            (root, manifest, packets, length)
+            (manifest, packets)
         }
 
         async fn receive_all(bootstrap: &mut SnapshotBootstrap, cx: &Cx, packets: &[ReplicationPacket]) {
@@ -435,6 +495,139 @@ pub mod snapshot {
             }
             assert!(bootstrap.progress().ready_to_finish());
             assert_eq!(bootstrap.progress().retained_payload_bytes, 0);
+        }
+
+        fn spool_receiver(manifest: &SnapshotManifest) -> ManifestSnapshotReceiver {
+            ManifestSnapshotReceiver::new(manifest.clone(), manifest.id(), KEY, 1 << 20).unwrap()
+        }
+
+        async fn persist_spool(
+            cx: &Cx, path: &Path, manifest: &SnapshotManifest,
+            packets: &[ReplicationPacket], torn_tail: bool,
+        ) -> SnapshotCheckpoint {
+            let vfs = UnixVfs::new();
+            let (file, _) = vfs.open(cx, Some(path),
+                VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+            ).unwrap();
+            let mut spool = SnapshotSpool::create(cx, file, spool_receiver(manifest), 1 << 20).await.unwrap();
+            for packet in packets {
+                spool.append(cx, packet).await.unwrap();
+                drop(spool.take_decoded_blocks());
+            }
+            let receipt = spool.checkpoint(cx).unwrap();
+            let mut file = spool.into_file();
+            if torn_tail {
+                // Deliberately unacknowledged and shorter than a record header.
+                // A checkpointed complete prefix must remain recoverable.
+                file.write(cx, b"torn", receipt.end_offset).await.unwrap();
+            }
+            file.close(cx).unwrap();
+            vfs.sync_parent_directory(cx, path).unwrap();
+            receipt
+        }
+
+        async fn open_spool(
+            cx: &Cx, path: &Path, manifest: &SnapshotManifest, receipt: SnapshotCheckpoint,
+        ) -> SnapshotSpool<UnixFile> {
+            let (file, _) = UnixVfs::new().open(cx, Some(path), VfsOpenFlags::READONLY).unwrap();
+            SnapshotSpool::open(cx, file, spool_receiver(manifest), 1 << 20, Some(receipt)).await.unwrap()
+        }
+
+        #[test]
+        fn reopened_readonly_spool_restores_sql_and_preserves_clean_or_torn_source() {
+            with_runtime(async {
+                for torn_tail in [false, true] {
+                    let (root, manifest, packets, byte_len) = fixture();
+                    let cx = context();
+                    let path = root.join("saved-transfer.spool");
+                    let receipt = persist_spool(&cx, &path, &manifest, &packets, torn_tail).await;
+                    let original = host_fs::read(&path).unwrap();
+                    let mut spool = open_spool(&cx, &path, &manifest, receipt).await;
+                    let options = BootstrapOptions::new(root.join("restored"));
+                    let opened = restore_spool_and_open(&cx, &options, &mut spool, manifest.id()).await.unwrap();
+                    assert_eq!(opened.image.byte_len, byte_len);
+                    assert_eq!(opened.image.manifest_id, manifest.id());
+                    assert_eq!(spool.state(), if torn_tail { SnapshotSpoolState::TornTail } else { SnapshotSpoolState::Ready });
+                    assert_eq!(spool.receiver().retained_payload_bytes(), 0);
+                    assert_eq!(spool.record_count(), receipt.record_count);
+                    let conn = opened.connection.unwrap();
+                    assert_eq!(
+                        conn.query_row("SELECT sum(qty) FROM items").await.unwrap().get(0),
+                        Some(&SqliteValue::Integer(10))
+                    );
+                    assert_eq!(
+                        conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                        Some(&SqliteValue::Text("ok".into()))
+                    );
+                    conn.execute("BEGIN; UPDATE items SET qty=11 WHERE id=2; COMMIT;").await.unwrap();
+                    conn.close().await.unwrap();
+                    let mut file = spool.into_file();
+                    file.close(&cx).unwrap();
+                    assert_eq!(host_fs::read(&path).unwrap(), original);
+                }
+            });
+        }
+
+        #[test]
+        fn spool_restore_rejects_wrong_trust_root_before_output_creation() {
+            with_runtime(async {
+                let (root, manifest, packets, _) = fixture();
+                let cx = context();
+                let path = root.join("saved-transfer.spool");
+                let receipt = persist_spool(&cx, &path, &manifest, &packets, false).await;
+                let mut spool = open_spool(&cx, &path, &manifest, receipt).await;
+                let options = BootstrapOptions::new(root.join("wrong-root"));
+                let mut wrong = manifest.id();
+                wrong[0] ^= 1;
+                assert!(restore_spool_and_open(&cx, &options, &mut spool, wrong).await.is_err());
+                assert!(!options.directory.exists());
+                assert_eq!(spool.record_count(), 0);
+                assert_eq!(spool.state(), SnapshotSpoolState::Replaying);
+                let mut file = spool.into_file();
+                file.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn spool_restore_never_waives_a_required_checkpoint_or_missing_blocks() {
+            with_runtime(async {
+                for bad_checkpoint in [false, true] {
+                    let (root, manifest, packets, _) = fixture();
+                    let cx = context();
+                    let path = root.join("saved-transfer.spool");
+                    let input = if bad_checkpoint { packets.as_slice() } else { &packets[..1] };
+                    let mut receipt = persist_spool(&cx, &path, &manifest, input, false).await;
+                    if bad_checkpoint { receipt.chain_hash[0] ^= 1; }
+                    let original = host_fs::read(&path).unwrap();
+                    let mut spool = open_spool(&cx, &path, &manifest, receipt).await;
+                    let options = BootstrapOptions::new(root.join("not-certified"));
+                    assert!(restore_spool_and_open(&cx, &options, &mut spool, manifest.id()).await.is_err());
+                    assert!(options.directory.join(MANIFEST_NAME).exists());
+                    let mut file = spool.into_file();
+                    file.close(&cx).unwrap();
+                    assert_eq!(host_fs::read(&path).unwrap(), original);
+                }
+            });
+        }
+
+        #[test]
+        fn spool_restore_refuses_an_already_consumed_replay_without_output() {
+            with_runtime(async {
+                let (root, manifest, packets, _) = fixture();
+                let cx = context();
+                let path = root.join("saved-transfer.spool");
+                let receipt = persist_spool(&cx, &path, &manifest, &packets, false).await;
+                let mut spool = open_spool(&cx, &path, &manifest, receipt).await;
+                assert!(spool.replay_next(&cx).await.unwrap().is_some());
+                let options = BootstrapOptions::new(root.join("not-fresh"));
+                assert!(matches!(
+                    restore_spool_and_open(&cx, &options, &mut spool, manifest.id()).await,
+                    Err(FrankenError::BusyRecovery)
+                ));
+                assert!(!options.directory.exists());
+                let mut file = spool.into_file();
+                file.close(&cx).unwrap();
+            });
         }
 
         #[test]
@@ -521,6 +714,30 @@ pub mod snapshot {
                     Err(FrankenError::TooBig)
                 ));
                 assert!(!options.directory.exists());
+            });
+        }
+
+        #[test]
+        fn installed_image_receipt_survives_sql_open_failure() {
+            with_runtime(async {
+                let (root, _, _, byte_len) = fixture();
+                let mut bytes = host_fs::read(&root.join("source.db")).unwrap();
+                // A trusted content digest certifies bytes, not SQL structural
+                // validity. Keep the SQLite header intact but corrupt page
+                // one's B-tree flag so SQL ingress must reject the image.
+                bytes[100] = 0xFF;
+                let (manifest, packets) = packetize_image(&bytes);
+                let id = manifest.id();
+                let options = BootstrapOptions::new(root.join("invalid-schema"));
+                let cx = context();
+                let mut bootstrap = SnapshotBootstrap::begin(&cx, &options, manifest, id, KEY).unwrap();
+                receive_all(&mut bootstrap, &cx, &packets).await;
+                let opened = bootstrap.finish_and_open(&cx).await.unwrap();
+                assert_eq!(opened.image.manifest_id, id);
+                assert_eq!(opened.image.byte_len, byte_len);
+                assert!(opened.connection.is_err());
+                assert!(opened.database_path.exists());
+                assert!(options.directory.join(MANIFEST_NAME).exists());
             });
         }
 
