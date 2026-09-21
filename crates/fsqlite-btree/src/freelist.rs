@@ -22,6 +22,7 @@
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::limits::MAX_PAGE_COUNT;
+use std::collections::HashSet;
 
 /// Maximum leaf entries that fit on a single trunk page.
 #[must_use]
@@ -40,6 +41,10 @@ pub struct FreelistTrunk {
 
 impl FreelistTrunk {
     /// Parse a trunk page from raw page data.
+    ///
+    /// Only a zero next-trunk pointer terminates the chain. Every declared
+    /// leaf entry must name a valid non-header page; silently skipping an
+    /// invalid entry would lose free-page accounting and conceal corruption.
     pub fn parse(page: &[u8]) -> Result<Self> {
         if page.len() < 8 {
             return Err(FrankenError::DatabaseCorrupt {
@@ -48,7 +53,17 @@ impl FreelistTrunk {
         }
 
         let next_raw = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
-        let next_trunk = PageNumber::new(next_raw);
+        let next_trunk = if next_raw == 0 {
+            None
+        } else {
+            Some(
+                PageNumber::new(next_raw)
+                    .filter(|page| *page != PageNumber::ONE)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("invalid freelist next-trunk page number {next_raw}"),
+                    })?,
+            )
+        };
 
         let leaf_count = u32::from_be_bytes([page[4], page[5], page[6], page[7]]);
 
@@ -72,10 +87,12 @@ impl FreelistTrunk {
                 page[offset + 2],
                 page[offset + 3],
             ]);
-            if let Some(pn) = PageNumber::new(pgno) {
-                leaf_pages.push(pn);
-            }
-            // Skip zero entries (shouldn't happen in valid DB, but defensive).
+            let pn = PageNumber::new(pgno)
+                .filter(|page| *page != PageNumber::ONE)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid freelist leaf page number {pgno} at entry {i}"),
+                })?;
+            leaf_pages.push(pn);
         }
 
         Ok(Self {
@@ -420,6 +437,10 @@ pub const fn ptrmap_entry_offset(
 /// `read_page` reads a raw page by page number.
 ///
 /// Returns all free page numbers collected from the freelist.
+///
+/// Rejects duplicate references across both trunk and leaf pages before a
+/// caller can allocate the same physical page twice. Trunk cycles are caught
+/// before rereading the repeated page, not merely by the chain-length bound.
 pub fn read_freelist<F>(
     first_trunk: Option<PageNumber>,
     read_page: &mut F,
@@ -428,10 +449,22 @@ where
     F: FnMut(PageNumber) -> Result<Vec<u8>>,
 {
     let mut all_pages = Vec::new();
+    let mut seen = HashSet::new();
     let mut current = first_trunk;
     let mut visited = 0usize;
 
     while let Some(trunk_pgno) = current {
+        if trunk_pgno == PageNumber::ONE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "database header page used as freelist trunk".to_owned(),
+            });
+        }
+        seen.try_reserve(1).map_err(|_| FrankenError::OutOfMemory)?;
+        if !seen.insert(trunk_pgno) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("duplicate page {trunk_pgno} in freelist"),
+            });
+        }
         visited += 1;
         if visited > 1_000_000 {
             return Err(FrankenError::DatabaseCorrupt {
@@ -442,9 +475,21 @@ where
         let page_data = read_page(trunk_pgno)?;
         let trunk = FreelistTrunk::parse(&page_data)?;
 
+        seen.try_reserve(trunk.leaf_pages.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        all_pages
+            .try_reserve(trunk.leaf_pages.len() + 1)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         // The trunk page itself is also free (it's part of the freelist).
         all_pages.push(trunk_pgno);
-        all_pages.extend_from_slice(&trunk.leaf_pages);
+        for &leaf_pgno in &trunk.leaf_pages {
+            if !seen.insert(leaf_pgno) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("duplicate page {leaf_pgno} in freelist"),
+                });
+            }
+            all_pages.push(leaf_pgno);
+        }
 
         current = trunk.next_trunk;
     }
@@ -577,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trunk_parse_rejects_over_capacity_and_skips_zero_entries() {
+    fn test_trunk_parse_rejects_over_capacity_and_invalid_leaf_entries() {
         // A trunk page whose declared leaf_count exceeds what the page can hold
         // is corruption. A 16-byte page holds max (16/4 - 2) = 2 leaf entries.
         let mut over = vec![0u8; 16];
@@ -590,19 +635,60 @@ mod tests {
             "leaf_count over capacity must be rejected"
         );
 
-        // Zero page-number entries in the leaf array are defensively skipped: a
-        // valid DB never stores them, and parse must never surface page 0.
+        // Invalid entries inside the declared count are corruption, not
+        // padding. In particular, never silently turn three entries into two.
         let mut page = vec![0u8; 4096];
         page[0..4].copy_from_slice(&0u32.to_be_bytes()); // no next trunk
         page[4..8].copy_from_slice(&3u32.to_be_bytes()); // 3 declared entries
         page[8..12].copy_from_slice(&20u32.to_be_bytes());
-        page[12..16].copy_from_slice(&0u32.to_be_bytes()); // zero -> skipped
         page[16..20].copy_from_slice(&40u32.to_be_bytes());
+        for invalid in [0u32, 1, u32::MAX] {
+            page[12..16].copy_from_slice(&invalid.to_be_bytes());
+            let error = FreelistTrunk::parse(&page).unwrap_err();
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+            assert!(error.to_string().contains("invalid freelist leaf page number"));
+        }
+    }
+
+    #[test]
+    fn test_trunk_parse_distinguishes_terminator_from_invalid_next_page() {
+        let mut page = [0u8; 8];
+        for invalid in [1u32, u32::MAX] {
+            page[..4].copy_from_slice(&invalid.to_be_bytes());
+            let error = FreelistTrunk::parse(&page).unwrap_err();
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid freelist next-trunk page number")
+            );
+        }
+        for valid in [0u32, 2, u32::MAX - 1] {
+            page[..4].copy_from_slice(&valid.to_be_bytes());
+            let parsed = FreelistTrunk::parse(&page).unwrap();
+            assert_eq!(parsed.next_trunk, PageNumber::new(valid));
+            assert!(parsed.leaf_pages.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_trunk_parse_keeps_valid_boundaries_and_ignores_unused_slots() {
+        // Bytes beyond leaf_count are unused, even if they resemble invalid
+        // page numbers. Only the two declared entries must be validated.
+        let mut page = [0xFFu8; 32];
+        page[..4].copy_from_slice(&0u32.to_be_bytes());
+        page[4..8].copy_from_slice(&2u32.to_be_bytes());
+        page[8..12].copy_from_slice(&2u32.to_be_bytes());
+        page[12..16].copy_from_slice(&(u32::MAX - 1).to_be_bytes());
         let parsed = FreelistTrunk::parse(&page).unwrap();
         assert!(parsed.next_trunk.is_none());
-        assert_eq!(parsed.leaf_pages.len(), 2, "zero entry must be skipped");
-        assert_eq!(parsed.leaf_pages[0].get(), 20);
-        assert_eq!(parsed.leaf_pages[1].get(), 40);
+        assert_eq!(
+            parsed.leaf_pages,
+            vec![
+                PageNumber::new(2).unwrap(),
+                PageNumber::new(u32::MAX - 1).unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -791,6 +877,79 @@ mod tests {
 
         // Trunk 3 + leaves 5,6 + Trunk 8 + leaf 9 = 5 pages.
         assert_eq!(result.len(), 5);
+        assert_eq!(
+            result.iter().map(|page| page.get()).collect::<Vec<_>>(),
+            vec![3, 5, 6, 8, 9],
+            "validation must preserve trunk/leaf order"
+        );
+        let mut freelist = Freelist::with_pages(result, 9, 4096);
+        for expected in [9, 8, 6, 5, 3] {
+            assert_eq!(freelist.allocate().unwrap().get(), expected);
+        }
+        assert_eq!(freelist.free_count(), 0);
+        assert_eq!(freelist.allocate().unwrap().get(), 10);
+    }
+
+    #[test]
+    fn test_read_freelist_rejects_cycles_and_cross_role_aliases() {
+        for (trunks, expected_reads) in [
+            (vec![(3, 3, vec![])], 1),
+            (vec![(3, 8, vec![]), (8, 3, vec![])], 2),
+            (vec![(3, 0, vec![5, 5])], 1),
+            (vec![(3, 8, vec![5]), (8, 0, vec![5])], 2),
+            (vec![(3, 0, vec![3])], 1),
+            (vec![(3, 8, vec![8]), (8, 0, vec![])], 1),
+            (vec![(3, 8, vec![]), (8, 0, vec![3])], 2),
+            (vec![(3, 8, vec![9]), (8, 9, vec![])], 2),
+        ] {
+            let mut pages = HashMap::new();
+            for (page_no, next, leaves) in trunks {
+                let trunk = FreelistTrunk {
+                    next_trunk: PageNumber::new(next),
+                    leaf_pages: leaves
+                        .into_iter()
+                        .map(|page| PageNumber::new(page).unwrap())
+                        .collect(),
+                };
+                let mut bytes = vec![0u8; 32];
+                trunk.write(&mut bytes).unwrap();
+                pages.insert(page_no, bytes);
+            }
+            let mut reads = 0;
+            let error = read_freelist(Some(PageNumber::new(3).unwrap()), &mut |page| {
+                reads += 1;
+                pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+            })
+            .unwrap_err();
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+            assert!(error.to_string().contains("duplicate page"));
+            assert_eq!(reads, expected_reads, "must not reread or follow an alias");
+        }
+    }
+
+    #[test]
+    fn test_read_freelist_rejects_header_before_io() {
+        let result = read_freelist(Some(PageNumber::ONE), &mut |_| {
+            panic!("database header must not be read as a freelist trunk")
+        });
+        assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+    }
+
+    #[test]
+    fn test_read_freelist_propagates_late_backend_error() {
+        let mut page = vec![0u8; 8];
+        page[..4].copy_from_slice(&8u32.to_be_bytes());
+        let mut reads = 0;
+        let result = read_freelist(Some(PageNumber::new(3).unwrap()), &mut |page_no| {
+            reads += 1;
+            if page_no.get() == 3 {
+                Ok(page.clone())
+            } else {
+                Err(FrankenError::Busy)
+            }
+        });
+        assert!(matches!(result, Err(FrankenError::Busy)));
+        assert_eq!(reads, 2, "must not return a partial freelist as success");
     }
 
     #[test]
