@@ -28,6 +28,13 @@
 //! cargo test -p fsqlite-core --test bd_udetu_begin_busy_timeout_guard issue423_ -- --nocapture --test-threads=1
 //! ```
 
+// Exercise the actual shared-budget implementation alongside the black-box
+// BEGIN probes. These deterministic ownership tests do not replace the real
+// contention tests: passing them alone does not establish that dispatch is
+// wired to the scope or that BEGIN honors the requested elapsed-time bound.
+#[path = "../src/connection/busy_timeout.rs"]
+mod issue423_busy_timeout;
+
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
 use std::sync::atomic::{AtomicBool, Ordering};
