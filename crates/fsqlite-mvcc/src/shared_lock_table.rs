@@ -37,11 +37,9 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 
 /// Default rebuild lease duration in seconds.
 const DEFAULT_LEASE_SECS: u64 = 5;
-// The `/proc`-backed birth marker is Linux-only; the tests also reference this
-// tag. A bare `#[cfg(unix)]` left it dead in the macOS lib build, breaking the
-// workspace-wide `clippy -D warnings` gate there.
-#[cfg(any(target_os = "linux", test))]
-const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
+// Retained only for the independent procfs child-process test fixtures.
+#[cfg(test)]
+const PID_BIRTH_PROCFS_TAG: u64 = fsqlite_vfs::process::PID_BIRTH_PROCFS_TAG;
 const OCCUPANCY_STRIPE_COUNT: usize = 16;
 const REBUILD_DRAIN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(100);
 const REBUILD_DRAIN_HANDOFF_BASE_SPINS: u32 = 64;
@@ -100,7 +98,7 @@ fn perform_rebuild_drain_handoff(wait: RebuildDrainWait) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
     let stat_path = std::path::Path::new("/proc")
         .join(pid.to_string())
@@ -112,69 +110,34 @@ fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
 }
 
 fn current_process_birth_token(now_fallback: u64) -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if !std::path::Path::new("/proc").exists() {
-            return now_fallback;
-        }
-        // ubs:ignore - procfs start ticks distinguish PID reuse; not a security token.
-        if let Some(start_ticks) = read_proc_start_time_ticks(std::process::id()) {
-            return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
-        }
-        now_fallback
-    }
-    // bd-4dr7g: macOS/Windows mint a platform-tagged birth token via the
-    // fsqlite-vfs FFI probe (sysctl `p_starttime` / process-creation FILETIME);
-    // any other target falls back to the caller-supplied token.
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        fsqlite_vfs::process::current_process_birth_token().unwrap_or(now_fallback)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        now_fallback
-    }
+    fsqlite_vfs::process::current_process_birth_token().unwrap_or(now_fallback)
 }
 
 fn process_alive_os(pid: u32, pid_birth: u64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if pid == 0 {
-            return false;
-        }
+    // An unreadable or hidden procfs record must never authorize takeover.
+    // Share the same tri-state OS proof as snapshot publication and WAL recovery.
+    !matches!(
+        fsqlite_vfs::process::process_alive(pid, pid_birth),
+        fsqlite_vfs::process::ProcessLiveness::Dead
+    )
+}
 
-        if !std::path::Path::new("/proc").exists() {
-            return true;
-        }
-        let proc_dir = std::path::Path::new("/proc").join(pid.to_string());
-        if !proc_dir.exists() {
-            return false;
-        }
-
-        if pid_birth & PID_BIRTH_PROCFS_TAG == 0 {
-            // Legacy token format: keep conservative behavior to avoid
-            // false stale clears for already-published leases.
-            return true;
-        }
-
-        let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
-        read_proc_start_time_ticks(pid).is_some_and(|start_ticks| start_ticks == expected_ticks)
-    }
-    // bd-4dr7g: macOS/Windows liveness via the fsqlite-vfs FFI probe. `Unknown`
-    // (an ambiguous OS error) is treated as alive, matching the prior stub that
-    // returned `true` on these platforms.
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        !matches!(
-            fsqlite_vfs::process::process_alive(pid, pid_birth),
-            fsqlite_vfs::process::ProcessLiveness::Dead
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = (pid, pid_birth);
-        true
-    }
+#[cfg(all(target_os = "linux", test))]
+#[test]
+fn unknown_process_probe_preserves_unexpired_rebuild_lease() {
+    // Not representable as a positive pid_t: a deterministic Unknown probe
+    // without changing procfs permissions or depending on a racing live PID.
+    let owner = u32::MAX;
+    let birth = PID_BIRTH_PROCFS_TAG | 1;
+    let table = SharedPageLockTable::new(16);
+    table.acquire_rebuild_lease(owner, birth, 100).unwrap();
+    assert!(process_alive_os(owner, birth));
+    assert_eq!(
+        table.acquire_rebuild_lease(std::process::id(), birth, 100),
+        Err(RebuildLeaseError::LeaseHeld { pid: owner })
+    );
+    assert_eq!(table.rebuild_pid.load(Ordering::Acquire), owner);
+    assert_eq!(table.rebuild_pid_birth.load(Ordering::Acquire), birth);
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,16 +2499,25 @@ mod tests {
         assert!(!process_alive_os(pid, mismatched));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn test_rebuild_lease_stolen_when_holder_process_dead_before_expiry() {
+    fn test_rebuild_lease_stolen_when_holder_identity_dead_before_expiry() {
         let table = SharedPageLockTable::new(TEST_CAP);
-
-        // Holder publishes a future expiry but with a dead process identity.
-        assert!(table.acquire_rebuild_lease(u32::MAX, 42, 1000).is_ok());
+        let pid = std::process::id();
+        let birth = fsqlite_vfs::process::current_process_birth_token()
+            .expect("current process birth token available");
+        // Model a prior incarnation of an actual positive PID, not an invalid
+        // integer whose OS probe must remain Unknown. The live process with
+        // its real birth is retained; only a checked mismatch permits takeover.
+        assert!(table.acquire_rebuild_lease(pid, birth, 1000).is_ok());
+        assert_eq!(
+            table.acquire_rebuild_lease(1002, 7, 1001),
+            Err(RebuildLeaseError::LeaseHeld { pid })
+        );
+        let previous_birth = birth ^ 1;
+        assert!(!process_alive_os(pid, previous_birth));
+        table.rebuild_pid_birth.store(previous_birth, Ordering::Release);
         assert_eq!(table.rebuild_lease_expiry.load(Ordering::Relaxed), 1005);
-
-        // Another process can steal before expiry because holder is dead.
         assert!(table.acquire_rebuild_lease(1002, 7, 1001).is_ok());
         assert_eq!(table.rebuild_pid.load(Ordering::Relaxed), 1002);
     }
