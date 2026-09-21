@@ -19,6 +19,11 @@ use crate::{Connection, Row};
 
 use super::params::ParamValue;
 
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod retry;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use retry::{RetryPolicy, RetryStopReason, TransactionRetryError, TransactionRetryExt};
+
 /// Scoped transaction wrapper. Finalize by awaiting `commit()` or
 /// `rollback()`; dropping without either rolls back (deferred to the next
 /// statement — see [`Drop`]).
