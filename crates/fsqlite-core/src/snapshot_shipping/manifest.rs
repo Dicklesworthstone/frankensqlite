@@ -9,6 +9,8 @@ pub mod image;
 pub use image::{SnapshotImageReceipt, SnapshotImageState, SnapshotImageWriter};
 pub mod spool;
 pub use spool::{SnapshotCheckpoint, SnapshotSpool, SnapshotSpoolState};
+pub mod source;
+pub use source::{SnapshotFileSender, SnapshotSourceLimits};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
