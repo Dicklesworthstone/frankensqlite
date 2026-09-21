@@ -69,6 +69,7 @@ export {
   ChangesetDeliveryPump,
   ChangesetReceiver,
 } from "./changeset-delivery";
+export { ChangesetGroupError, concatChangesets } from "./changeset-group";
 export type {
   ChangesetHttpAuthorization,
   ChangesetHttpHandler,
