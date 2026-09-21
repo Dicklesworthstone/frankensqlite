@@ -11,5 +11,21 @@
 # FrankenSQLite parity. FrankenSQLite already implements these correctly.
 LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 
+# Give test threads 8 MiB instead of the 2 MiB default. A stack overflow in a
+# test does not fail that test -- it aborts the whole test binary with SIGABRT,
+# so every other test in the crate reports nothing, which is what
+# `cargo test -p fsqlite-core --lib` did before this.
+#
+# The cost is debug-build async state-machine frames, not unbounded recursion:
+# on the first offender, 2 MiB overflowed, 3 MiB passed, and 128 MiB behaved
+# exactly like 3 MiB. Fixing offenders one at a time does not converge -- pinning
+# a helper stack on the first simply revealed a second -- so raise the default
+# once here. Release builds collapse most of these frames and are unaffected.
+#
+# 8 MiB is virtual, committed lazily, so this costs nothing per idle thread.
+# Individual tests that need a documented, tighter budget still pin their own
+# helper stack (see `recursive-trigger-depth-limit` in fsqlite-core).
+RUST_MIN_STACK = "8388608"
+
 [build]
 rustflags = ["-Z", "threads=4"]
