@@ -131,13 +131,6 @@ const LAYOUT_VERSION: u32 = 1;
 /// Default max transaction slots when not specified.
 const DEFAULT_MAX_TXN_SLOTS: u32 = 128;
 
-/// High bit identifying a `/proc/<pid>/stat` start-time birth marker.
-// Only the `/proc`-backed birth marker (Linux) uses this tag; a bare
-// `#[cfg(unix)]` left it dead on other unixes (macOS), breaking the
-// workspace-wide `clippy -D warnings` gate there.
-#[cfg(target_os = "linux")]
-const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
-
 /// High bit identifying an owner token whose birth marker is not published yet.
 const SNAPSHOT_PUBLISHER_INITIALIZING: u64 = 1_u64 << 63;
 
@@ -164,29 +157,9 @@ fn next_snapshot_publisher_generation_counter() -> &'static AtomicU64 {
     })
 }
 
-#[cfg(target_os = "linux")]
-fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
-    let stat_path = std::path::Path::new("/proc")
-        .join(pid.to_string())
-        .join("stat");
-    let stat = std::fs::read_to_string(stat_path).ok()?;
-    let comm_end = stat.rfind(')')?;
-    let tail = stat.get(comm_end + 1..)?.trim_start();
-    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
-}
-
 fn current_process_birth_marker() -> u64 {
     static FALLBACK_BIRTH: OnceLock<u64> = OnceLock::new();
 
-    #[cfg(target_os = "linux")]
-    if std::path::Path::new("/proc").exists()
-        && let Some(start_ticks) = read_proc_start_time_ticks(std::process::id())
-    {
-        return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
-    }
-
-    // bd-4dr7g: macOS/Windows mint a platform-tagged birth token via fsqlite-vfs.
-    #[cfg(any(target_os = "macos", windows))]
     if let Some(token) = fsqlite_vfs::process::current_process_birth_token() {
         return token;
     }
@@ -200,38 +173,12 @@ fn current_process_birth_marker() -> u64 {
 }
 
 fn snapshot_publisher_alive_os(pid: u32, pid_birth: u64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if pid == 0 {
-            return false;
-        }
-        if !std::path::Path::new("/proc").exists() {
-            return true;
-        }
-        let proc_dir = std::path::Path::new("/proc").join(pid.to_string());
-        if !proc_dir.exists() {
-            return false;
-        }
-        if pid_birth == 0 || pid_birth & PID_BIRTH_PROCFS_TAG == 0 {
-            return true;
-        }
-        let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
-        read_proc_start_time_ticks(pid).is_none_or(|start_ticks| start_ticks == expected_ticks)
-    }
-    // bd-4dr7g: macOS/Windows liveness via the fsqlite-vfs FFI probe. `Unknown`
-    // (an ambiguous OS error) is treated as alive, matching the prior stub.
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        !matches!(
-            fsqlite_vfs::process::process_alive(pid, pid_birth),
-            fsqlite_vfs::process::ProcessLiveness::Dead
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = (pid, pid_birth);
-        true
-    }
+    // Unknown is not permission to replace an initializing or active publisher.
+    // The VFS probe distinguishes hidden procfs entries from proven death.
+    !matches!(
+        fsqlite_vfs::process::process_alive(pid, pid_birth),
+        fsqlite_vfs::process::ProcessLiveness::Dead
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +768,7 @@ impl SharedMemoryLayout {
             // During the short initialization window the birth marker is not
             // published yet. PID existence is sufficient to avoid stealing
             // from a live initializer; a dead initializer can still be
-            // recovered because the callback returns false for a missing PID.
+            // recovered because the callback returns false for proven absence.
             return owner_alive(pid, 0);
         }
         let pid_birth = self.load_u64_field(
@@ -981,14 +928,12 @@ impl SharedMemoryLayout {
     ///
     /// Protocol constraints (deliberate, documented trade-offs):
     ///
-    /// - **Dead-owner detection is procfs-based.** All publishers sharing a
-    ///   region must live in one PID namespace; a peer in a different
-    ///   namespace could judge a live publisher dead (its PID is not visible
-    ///   in `/proc`) and steal the critical section. On platforms without
-    ///   `/proc` (and on non-unix), a stamped owner is presumed alive
-    ///   forever, so crash recovery of an owner-stamped odd sequence is
-    ///   unavailable there — publishers wait until `reconcile` semantics or
-    ///   process restart clear the region.
+    /// - **Dead-owner detection uses the VFS process probe.** Linux publishers
+    ///   sharing a region must use one PID namespace and a matching procfs
+    ///   mount. Hidden or unreadable entries require independent proof of
+    ///   absence; an inconclusive probe retains the owner. Linux, macOS and
+    ///   Windows compare platform-tagged birth markers when available.
+    ///   Unsupported platforms cannot prove death and retain stamped owners.
     /// - **Legacy unowned-odd sequences** (left by a pre-ownership binary
     ///   crashing mid-publish) are recovered only by the explicit
     ///   `force_recovery` reconcile path; ordinary publishers wait. Callers
@@ -1718,6 +1663,61 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::thread;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_process_probe_preserves_snapshot_publisher_identity() {
+        let local = SharedMemoryLayout::new(PageSize::DEFAULT, 16);
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        let backed = SharedMemoryLayout::open_or_initialize_region(
+            region, PageSize::DEFAULT, 16,
+        ).unwrap();
+        let identity = SnapshotPublisherIdentity::for_test(
+            u32::MAX, 1, fsqlite_vfs::process::PID_BIRTH_PROCFS_TAG | 1,
+        );
+        // Exercise both storage adapters and both publication phases. Unknown
+        // must leave the odd sequence and all owner evidence untouched.
+        for layout in [&local, &backed] {
+            for owner in [identity.initializing_token, identity.active_token] {
+                layout.store_u64_field(
+                    offsets::SNAPSHOT_PUBLISHER_OWNER,
+                    &layout.snapshot_publisher_owner, owner, Ordering::Release,
+                );
+                layout.store_u64_field(
+                    offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
+                    &layout.snapshot_publisher_pid_birth, identity.pid_birth, Ordering::Release,
+                );
+                layout.store_u64_field(
+                    offsets::SNAPSHOT_SEQ, &layout.snapshot_seq, 7, Ordering::Release,
+                );
+                let before = layout.to_bytes();
+                assert!(layout.snapshot_publisher_is_alive(owner, &snapshot_publisher_alive_os));
+                assert_eq!(layout.to_bytes(), before);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn snapshot_process_probe_preserves_live_and_detects_reused_identity() {
+        let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 16);
+        let birth = fsqlite_vfs::process::current_process_birth_token()
+            .expect("own process birth token available");
+        let identity = SnapshotPublisherIdentity::for_test(std::process::id(), 1, birth);
+        layout.snapshot_publisher_pid_birth.store(birth, Ordering::Release);
+        assert!(layout.snapshot_publisher_is_alive(
+            identity.active_token, &snapshot_publisher_alive_os,
+        ));
+        layout.snapshot_publisher_pid_birth.store(birth ^ 1, Ordering::Release);
+        assert!(!layout.snapshot_publisher_is_alive(
+            identity.active_token, &snapshot_publisher_alive_os,
+        ));
+        // An initializer has not published its birth yet; a previous owner's
+        // mismatching birth must not be used to declare that live PID dead.
+        assert!(layout.snapshot_publisher_is_alive(
+            identity.initializing_token, &snapshot_publisher_alive_os,
+        ));
+    }
 
     // -- Construction / serialization --
 
