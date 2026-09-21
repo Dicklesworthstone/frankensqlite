@@ -82,7 +82,6 @@ diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/con
              time_travel_snapshots: RefCell::new(Vec::new()),
              time_travel_active: Cell::new(false),
              time_travel_capture_enabled: Cell::new(true),
-             time_travel_capture_enabled: Cell::new(true),
              conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
 +            statement_busy_timeout: BusyTimeoutScope::default(),
              // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
