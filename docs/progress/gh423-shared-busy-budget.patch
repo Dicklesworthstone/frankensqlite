@@ -107,7 +107,7 @@ diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/con
              while let Some(wait) = handoff.next_wait(started, deadline) {
                  if !self
                      .conformal_retry_budget
- diff --git a/crates/fsqlite-core/src/connection/busy_timeout.rs b/crates/fsqlite-core/src/connection/busy_timeout.rs
+diff --git a/crates/fsqlite-core/src/connection/busy_timeout.rs b/crates/fsqlite-core/src/connection/busy_timeout.rs
 new file mode 100644
 --- /dev/null
 +++ b/crates/fsqlite-core/src/connection/busy_timeout.rs
