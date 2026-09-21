@@ -1,10 +1,13 @@
-//! Capture an open SQL database for authenticated snapshot transfer.
+//! Capture and durably receive authenticated database snapshots.
 //!
 //! The source is captured by `Connection::export_bytes`, not by reading a live
 //! main file and WAL independently. Export owns its existing pager quiescence,
 //! checkpoint and read-fence protocol. Once capture returns, packet generation
 //! owns immutable encoded bytes and no source connection or database locks.
 //! This is a whole-image bootstrap, not an incremental replication log.
+//!
+//! JournaledSnapshotBootstrap joins the saved packet stream to the guarded
+//! SQL image installer, including replay of partial transfers after restart.
 
 use std::fmt;
 
@@ -135,7 +138,7 @@ impl CapturedSnapshot {
     /// are not included, and no database is opened by pathname here.
     ///
     /// Export uses the connection's configured context. `cx` controls admission
-    /// and packetization; configure related lineages when both must share
+    /// and packetization; configure related lineages when both should share
     /// cancellation. Cancellation after export cannot undo its checkpoint.
     /// The image limit is checked *after* export; see `CaptureOptions`.
     pub async fn capture(
@@ -273,6 +276,51 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
             cx, options, spool.receiver().manifest().clone(), expected_id,
         )?;
         Ok(Self { destination, spool, write_in_flight: false })
+    }
+
+    /// Rebuild a fresh image from a reopened journal, then continue live receive.
+    ///
+    /// Pass an untouched `SnapshotSpool::open` owner with the independently
+    /// trusted manifest/key and last acknowledged checkpoint. Replay verifies
+    /// the ENTIRE saved prefix, including that checkpoint, before returning a
+    /// live owner. It need not contain a complete snapshot: partial decoder
+    /// state survives replay and previously decoded blocks are reapplied to
+    /// the new image. Retransmitted packets remain idempotent.
+    /// Open the journal writable when more packets will be received; use the
+    /// existing spool restore API for a complete read-only transfer.
+    ///
+    /// A torn suffix never becomes appendable. On `BusyRecovery` with the
+    /// spool in `TornTail`, preserve it and call `fork_verified_prefix` with a
+    /// fresh journal file, then resume that fork into another empty directory.
+    /// A complete torn journal can instead use `restore_spool_and_open`.
+    ///
+    /// Errors/dropped futures preserve the borrowed journal but can leave its
+    /// replay cursor advanced and the new image partially written. Quiesce
+    /// old I/O, reopen from the beginning, and use a new destination rather
+    /// than reusing that cursor or an abandoned image. No hidden retry,
+    /// truncation, checkpoint waiver or background I/O is introduced.
+    pub async fn resume(
+        cx: &Cx,
+        options: &BootstrapOptions,
+        spool: &'a mut SnapshotSpool<F>,
+        expected_id: [u8; 32],
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        Self::require_fresh(spool, SnapshotSpoolState::Replaying)?;
+        let destination = Destination::create(
+            cx, options, spool.receiver().manifest().clone(), expected_id,
+        )?;
+        let mut bootstrap = Self { destination, spool, write_in_flight: false };
+        // Do not stop merely because the receiver has decoded every block:
+        // a later record or the required checkpoint can still invalidate the
+        // journal. No externally usable bootstrap exists until replay ends.
+        while bootstrap.spool.replay_next(cx).await?.is_some() {
+            bootstrap.drain_blocks(cx).await?;
+        }
+        if bootstrap.spool.state() != SnapshotSpoolState::Ready {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(bootstrap)
     }
 
     fn require_fresh(spool: &SnapshotSpool<F>, state: SnapshotSpoolState) -> Result<()> {
@@ -667,6 +715,240 @@ mod tests {
             assert!(host_fs::metadata(&options.directory).is_err());
             assert_eq!(spool.record_count(), 1);
             spool.into_file().close(&cx).unwrap();
+        });
+    }
+
+    async fn multiblock_packets(
+        cx: &Cx, root: &std::path::Path, repairs: bool,
+    ) -> (SnapshotManifest, Vec<ReplicationPacket>, [u8; 32]) {
+        use fsqlite_core::snapshot_shipping::manifest::{SnapshotFileSender, SnapshotSourceLimits};
+
+        let (file, _) = UnixVfs::new().open(cx, Some(&root.join("frozen.db")),
+            VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+        ).unwrap();
+        file.write(cx, &image(512), 0).await.unwrap();
+        // An exclusively owned, immutable image; one database page per block
+        // makes restart boundaries cover both complete and partial decoders.
+        let mut sender = SnapshotFileSender::open(cx, file,
+            SenderConfig { symbol_size: 256, max_isi_multiplier: if repairs { 4 } else { 1 } },
+            SnapshotSourceLimits {
+                max_image_bytes: 1 << 20,
+                max_block_bytes: fsqlite_core::replication_sender::CHANGESET_HEADER_SIZE + 512 + 12,
+            },
+        ).await.unwrap();
+        let manifest = sender.manifest().clone();
+        let hash = sender.image_blake3();
+        assert!(manifest.blocks().len() > 1);
+        let mut packets = Vec::new();
+        while let Some(mut packet) = sender.next_packet(cx).await.unwrap() {
+            packet.attach_auth_tag(&KEY);
+            packets.push(packet);
+        }
+        sender.into_file().close(cx).unwrap();
+        (manifest, packets, hash)
+    }
+
+    #[test]
+    fn journaled_resume_continues_every_multiblock_packet_prefix() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let (manifest, packets, hash) = multiblock_packets(&cx, &root, false).await;
+            // Includes an empty journal, a decoded first block plus partial
+            // next block, and a fully received but not yet installed image.
+            for split in 0..=packets.len() {
+                let path = root.join(format!("prefix-{split}.spool"));
+                let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
+                let abandoned = BootstrapOptions::new(root.join(format!("abandoned-{split}")));
+                let mut bootstrap = JournaledSnapshotBootstrap::begin(
+                    &cx, &abandoned, &mut spool, manifest.id(),
+                ).unwrap();
+                for packet in &packets[..split] {
+                    bootstrap.receive_packet(&cx, packet).await.unwrap();
+                }
+                let progress = bootstrap.progress();
+                let saved = bootstrap.checkpoint(&cx).unwrap();
+                drop(bootstrap);
+                spool.into_file().close(&cx).unwrap();
+
+                let mut reopened = reopen_journal(&cx, &path, &manifest, saved, true).await;
+                let options = BootstrapOptions::new(root.join(format!("resumed-{split}")));
+                let mut resumed = JournaledSnapshotBootstrap::resume(
+                    &cx, &options, &mut reopened, manifest.id(),
+                ).await.unwrap();
+                assert_eq!(resumed.progress(), progress);
+                if split > 0 {
+                    let duplicate = resumed.receive_packet(&cx, &packets[0]).await.unwrap();
+                    assert!(matches!(duplicate,
+                        SnapshotPacketResult::Duplicate | SnapshotPacketResult::BlockAlreadyDecoded
+                    ));
+                }
+                assert_eq!(resumed.checkpoint(&cx).unwrap(), saved);
+                for packet in &packets[split..] {
+                    resumed.receive_packet(&cx, packet).await.unwrap();
+                }
+                assert!(resumed.progress().ready_to_finish());
+                assert_eq!(resumed.progress().retained_payload_bytes, 0);
+                let opened = resumed.finish_and_open(&cx).await.unwrap();
+                assert_eq!(opened.installed.image.image_blake3, hash);
+                let conn = opened.installed.connection.unwrap();
+                assert_eq!(conn.query_row("SELECT v FROM t WHERE id=1").await.unwrap().get(0),
+                    Some(&SqliteValue::Text("before".into())));
+                conn.execute("BEGIN; INSERT INTO t VALUES(2,'resumed'); COMMIT;").await.unwrap();
+                assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                    Some(&SqliteValue::Text("ok".into())));
+                conn.close().await.unwrap();
+                reopened.into_file().close(&cx).unwrap();
+                assert!(host_fs::metadata(&abandoned.directory).unwrap().is_dir());
+            }
+        });
+    }
+
+    #[test]
+    fn journaled_resume_preserves_torn_source_and_continues_a_verified_fork_with_repairs() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let (manifest, mut packets, hash) = multiblock_packets(&cx, &root, true).await;
+            // Permanently erase source symbol zero from EVERY source block.
+            packets.retain(|packet| packet.esi != 0);
+            let path = root.join("torn.spool");
+            let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
+            let initial = BootstrapOptions::new(root.join("initial"));
+            let mut bootstrap = JournaledSnapshotBootstrap::begin(
+                &cx, &initial, &mut spool, manifest.id(),
+            ).unwrap();
+            bootstrap.receive_packet(&cx, &packets[0]).await.unwrap();
+            let saved = bootstrap.checkpoint(&cx).unwrap();
+            drop(bootstrap);
+            let mut file = spool.into_file();
+            file.write(&cx, b"torn", saved.end_offset).await.unwrap();
+            file.close(&cx).unwrap();
+            let original = host_fs::read(&path).unwrap();
+            let mut reopened = reopen_journal(&cx, &path, &manifest, saved, false).await;
+            assert!(matches!(JournaledSnapshotBootstrap::resume(
+                &cx, &BootstrapOptions::new(root.join("torn-attempt")), &mut reopened, manifest.id(),
+            ).await, Err(FrankenError::BusyRecovery)));
+            assert_eq!(reopened.state(), SnapshotSpoolState::TornTail);
+
+            let fork_path = root.join("fork.spool");
+            let (file, _) = UnixVfs::new().open(&cx, Some(&fork_path),
+                VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+            ).unwrap();
+            let mut fork = reopened.fork_verified_prefix(&cx, file).await.unwrap();
+            UnixVfs::new().sync_parent_directory(&cx, &fork_path).unwrap();
+            let options = BootstrapOptions::new(root.join("fork-image"));
+            let mut resumed = JournaledSnapshotBootstrap::resume(
+                &cx, &options, &mut fork, manifest.id(),
+            ).await.unwrap();
+            assert_eq!(resumed.checkpoint(&cx).unwrap(), saved);
+            // Retransmit the saved symbol as well; it must not add a record.
+            for packet in &packets {
+                resumed.receive_packet(&cx, packet).await.unwrap();
+            }
+            assert!(resumed.progress().ready_to_finish());
+            let opened = resumed.finish_and_open(&cx).await.unwrap();
+            assert!(opened.checkpoint.record_count > saved.record_count);
+            assert_eq!(opened.installed.image.image_blake3, hash);
+            let conn = opened.installed.connection.unwrap();
+            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into())));
+            conn.close().await.unwrap();
+            fork.into_file().close(&cx).unwrap();
+            reopened.into_file().close(&cx).unwrap();
+            assert_eq!(host_fs::read(&path).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn journaled_resume_requires_the_checkpoint_even_after_all_blocks_decode() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let (manifest, packets, _) = multiblock_packets(&cx, &root, false).await;
+            let path = root.join("complete.spool");
+            let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
+            for packet in &packets {
+                spool.append(&cx, packet).await.unwrap();
+                drop(spool.take_decoded_blocks());
+            }
+            let saved = spool.checkpoint(&cx).unwrap();
+            spool.into_file().close(&cx).unwrap();
+            let original = host_fs::read(&path).unwrap();
+            let mut wrong = saved;
+            wrong.chain_hash[0] ^= 1;
+            let mut reopened = reopen_journal(&cx, &path, &manifest, wrong, false).await;
+            let options = BootstrapOptions::new(root.join("bad-checkpoint"));
+            assert!(matches!(JournaledSnapshotBootstrap::resume(
+                &cx, &options, &mut reopened, manifest.id(),
+            ).await, Err(FrankenError::DatabaseCorrupt { .. })));
+            assert!(reopened.receiver().is_complete());
+            assert_eq!(reopened.record_count(), saved.record_count);
+            assert_eq!(reopened.state(), SnapshotSpoolState::Poisoned);
+            // The failed owner has dropped; inspecting its preserved file no
+            // longer closes a descriptor alongside an active database lock.
+            let failed = host_fs::read(&options.directory.join("database.db")).unwrap();
+            assert!(!failed.starts_with(b"SQLite format 3\0"));
+            reopened.into_file().close(&cx).unwrap();
+            assert_eq!(host_fs::read(&path).unwrap(), original);
+
+            let mut fresh = reopen_journal(&cx, &path, &manifest, saved, false).await;
+            let refused = BootstrapOptions::new(root.join("refused-resume"));
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(JournaledSnapshotBootstrap::resume(
+                &cancelled, &refused, &mut fresh, manifest.id(),
+            ).await, Err(FrankenError::Interrupt)));
+            assert!(host_fs::metadata(&refused.directory).is_err());
+            assert_eq!(fresh.record_count(), 0);
+            fresh.replay_next(&cx).await.unwrap().unwrap();
+            assert!(matches!(JournaledSnapshotBootstrap::resume(
+                &cx, &refused, &mut fresh, manifest.id(),
+            ).await, Err(FrankenError::BusyRecovery)));
+            assert!(host_fs::metadata(&refused.directory).is_err());
+            fresh.into_file().close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn journaled_cancelled_drain_blocks_publication_but_preserves_packet_recovery() {
+        with_runtime(async {
+            let cx = context();
+            let root = tempfile::tempdir().unwrap().keep();
+            let mut source = captured_image(&cx);
+            let manifest = source.manifest().clone();
+            let path = root.join("drain.spool");
+            let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
+            let options = BootstrapOptions::new(root.join("failed-drain"));
+            let mut bootstrap = JournaledSnapshotBootstrap::begin(
+                &cx, &options, &mut spool, manifest.id(),
+            ).unwrap();
+            // Reach the exact post-append/pre-drain boundary deterministically.
+            while let Some(packet) = source.next_packet(&cx).unwrap() {
+                bootstrap.spool.append(&cx, &packet).await.unwrap();
+            }
+            assert!(bootstrap.spool.receiver().is_complete());
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(bootstrap.drain_blocks(&cancelled).await, Err(FrankenError::Abort)));
+            assert!(bootstrap.progress().poisoned);
+            assert!(matches!(bootstrap.checkpoint(&cx), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(bootstrap.finish_and_open(&cx).await, Err(FrankenError::BusyRecovery)));
+            // Image failure is terminal for that owner, not loss of the saved
+            // authenticated packets. Reopen them into a different destination.
+            let saved = spool.checkpoint(&cx).unwrap();
+            spool.into_file().close(&cx).unwrap();
+            let mut reopened = reopen_journal(&cx, &path, &manifest, saved, true).await;
+            let fresh = BootstrapOptions::new(root.join("recovered-drain"));
+            let resumed = JournaledSnapshotBootstrap::resume(
+                &cx, &fresh, &mut reopened, manifest.id(),
+            ).await.unwrap();
+            assert!(resumed.progress().ready_to_finish());
+            let conn = resumed.finish_and_open(&cx).await.unwrap().installed.connection.unwrap();
+            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into())));
+            conn.close().await.unwrap();
+            reopened.into_file().close(&cx).unwrap();
         });
     }
 }
