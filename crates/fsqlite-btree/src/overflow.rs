@@ -89,12 +89,18 @@ impl OverflowReadState {
                 detail: "overflow chain points to the database header page".to_owned(),
             });
         }
-        if let Some(next_page) = PageNumber::new(next)
-            && self.visited.contains(&next_page)
-        {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("cycle in overflow chain at page {next}"),
-            });
+        if next != 0 {
+            // Validate every observed link, even if a prefix read stops on
+            // this page. Only zero is a terminator; an unrepresentable page
+            // number must not bypass validation when no next read is needed.
+            let next_page = PageNumber::new(next).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid next overflow page number {next}"),
+            })?;
+            if self.visited.contains(&next_page) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("cycle in overflow chain at page {next}"),
+                });
+            }
         }
 
         let available = self.remaining.min(self.usable_size - 4);
@@ -1031,6 +1037,74 @@ mod tests {
                 5, 13, 13, "header page", 1,
             )
             .await;
+        });
+    }
+
+    #[test]
+    fn overflow_readers_reject_invalid_next_page_even_when_prefix_fits() {
+        run_async(async {
+            for prefix in [1, 12, 13, 100] {
+                assert_invalid_overflow(
+                    HashMap::from([(5, linked_page(u32::MAX))]),
+                    5,
+                    13,
+                    prefix,
+                    "invalid next overflow page number",
+                    1,
+                )
+                .await;
+            }
+            // Exercise the same defect after a valid first link, including
+            // prefixes that consume only part of the second page's payload.
+            for prefix in [13, 24, 25, 100] {
+                assert_invalid_overflow(
+                    HashMap::from([(5, linked_page(6)), (6, linked_page(u32::MAX))]),
+                    5,
+                    25,
+                    prefix,
+                    "invalid next overflow page number",
+                    2,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_readers_accept_largest_valid_next_page() {
+        run_async(async {
+            let last = u32::MAX - 1;
+            let store = TestPageStore::from_pages(HashMap::from([
+                (5, linked_page(last)),
+                (last, linked_page(0)),
+            ]));
+            let first = PageNumber::new(5).unwrap();
+            let cx = Cx::new();
+            let mut out = Vec::new();
+            for prefix in [1, 12, 13, 100] {
+                let count = prefix.min(13);
+                let expected_reads = count.div_ceil(12);
+                store.reads.set(0);
+                let mut read_page = |page: PageNumber| {
+                    store.reads.set(store.reads.get() + 1);
+                    store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+                };
+                read_overflow_chain_prefix_into(
+                    &[], first, 13, 16, prefix, &mut read_page, &mut out,
+                )
+                .unwrap();
+                assert_eq!(out, vec![b'x'; count]);
+                assert_eq!(store.reads.get(), expected_reads);
+
+                store.reads.set(0);
+                read_overflow_chain_prefix_into_async(
+                    &cx, &[], first, 13, 16, prefix, &store, &mut out,
+                )
+                .await
+                .unwrap();
+                assert_eq!(out, vec![b'x'; count]);
+                assert_eq!(store.reads.get(), expected_reads);
+            }
         });
     }
 
