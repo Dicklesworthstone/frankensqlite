@@ -97,6 +97,13 @@ export type {
   OutboxRecordResult,
 } from "./changeset-outbox";
 export { CHANGESET_OUTBOX_TABLE, ChangesetOutbox, ChangesetOutboxError } from "./changeset-outbox";
+export type {
+  ChangesetDeliveryDriver,
+  ChangesetDeliveryWorkerOptions,
+  ChangesetDeliveryWorkerStats,
+  ChangesetDeliveryWorkerStopOptions,
+} from "./changeset-worker";
+export { ChangesetDeliveryWorker, ChangesetDeliveryWorkerError } from "./changeset-worker";
 export { FrankenDB } from "./database";
 export type {
   DurableJobCompletion,
