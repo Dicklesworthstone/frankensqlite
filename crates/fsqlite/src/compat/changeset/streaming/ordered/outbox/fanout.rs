@@ -82,13 +82,15 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
     let stream_id = current.produced.stream_id;
     let parameter = [blob(stream_id)];
     let rows = conn.query_with_params(
-        "SELECT start_sequence,length(start_tip),typeof(start_tip),length(members),typeof(members) FROM main._fsqlite_source_fanout_v1 WHERE stream_id=?1 LIMIT 2",
+        "SELECT CASE WHEN typeof(start_sequence)='integer' THEN start_sequence END,\
+         length(start_tip),typeof(start_tip),length(members),typeof(members) \
+         FROM main._fsqlite_source_fanout_v1 WHERE stream_id=?1 LIMIT 2",
         &parameter,
     ).await?;
     let row = match rows.as_slice() {
         [] => {
             let orphan = conn.query_with_params(
-                "SELECT replica_id FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 LIMIT 1",
+                "SELECT 1 FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 LIMIT 1",
                 &parameter,
             ).await?;
             if !orphan.is_empty() { return Err(protocol("orphaned fanout replica progress")); }
@@ -133,6 +135,7 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
     let rows = conn.query_with_params(
         "SELECT replica_id,sequence,tip FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 \
          AND typeof(replica_id)='blob' AND length(replica_id)=32 AND typeof(tip)='blob' AND length(tip)=32 \
+         AND typeof(sequence)='integer' \
          ORDER BY replica_id LIMIT 257",
         &parameter,
     ).await?;
@@ -395,6 +398,19 @@ mod tests {
     }
 
     #[test]
+    fn fanout_roster_accepts_the_exact_limit_and_sorts_all_byte_identities() {
+        let members: Vec<_> = (0_u8..=u8::MAX).rev().map(hash).collect();
+        let sorted = roster(&members).unwrap();
+        assert_eq!(sorted.len(), MAX_REPLICAS);
+        assert_eq!(sorted.first(), Some(&hash(0)));
+        assert_eq!(sorted.last(), Some(&hash(255)));
+        assert_eq!(roster(&[hash(1)]).unwrap(), vec![hash(1)]);
+        let mut duplicate = members;
+        duplicate[0] = duplicate[1];
+        assert!(roster(&duplicate).is_err());
+    }
+
+    #[test]
     fn fanout_fast_replicas_progress_without_reclaiming_slow_replica_history() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
@@ -511,6 +527,195 @@ mod tests {
             assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
             assert_eq!(count(&source, "t").await, 1);
             assert!(!source.in_transaction());
+            source.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fanout_reopen_recovers_independent_positions_and_lost_remote_ack() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let directory = tempfile::tempdir().unwrap().keep();
+            let source_path = directory.join("source.db");
+            let replica_path = directory.join("slow.db");
+            let mut source = source(source_path.to_str().unwrap()).await;
+            let mut slow = database(replica_path.to_str().unwrap()).await;
+            let mut fast = database(":memory:").await;
+            for target in [&mut fast, &mut slow] {
+                ordered::initialize(target, &cx, baseline()).await.unwrap();
+            }
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
+            let first = produce(&mut source, baseline(), 1).await;
+            let second = produce(&mut source, first, 2).await;
+            for _ in 0..2 {
+                let message = next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20).await.unwrap().unwrap();
+                let receipt = ordered::apply(&mut fast, &cx, &mut Bytes(message.body()), message.envelope(),
+                    message.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
+                acknowledge(&mut source, &cx, hash(10), receipt.checkpoint, 1 << 20).await.unwrap();
+            }
+            fast.close().await.unwrap();
+            let message = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
+            let lost = ordered::apply(&mut slow, &cx, &mut Bytes(message.body()), message.envelope(),
+                message.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
+            assert_eq!(lost.checkpoint, first);
+            // Lose the remote response before source acknowledgement. Both
+            // sides reopen; the fast member must not rewind to the slow one.
+            source.close().await.unwrap();
+            slow.close().await.unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
+            let mut slow = Connection::open(replica_path.to_str().unwrap()).await.unwrap();
+            assert!(next_pending(&mut source, &cx, hash(1), hash(10), 0).await.unwrap().is_none());
+            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
+            assert_eq!(pending.envelope().sequence(), 1);
+            let duplicate = ordered::apply(&mut slow, &cx, &mut Bytes(pending.body()), pending.envelope(),
+                pending.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
+            assert_eq!(duplicate.disposition, ordered::ReplicaDisposition::AlreadyApplied);
+            let saved = acknowledge(&mut source, &cx, hash(11), duplicate.checkpoint, 1 << 20).await.unwrap();
+            assert_eq!(saved.outbox.acknowledged, first);
+            source.close().await.unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
+            assert_eq!(acknowledge(&mut source, &cx, hash(11), first, 0).await.unwrap(), saved);
+            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
+            assert_eq!(pending.envelope().sequence(), 2);
+            let receipt = ordered::apply(&mut slow, &cx, &mut Bytes(pending.body()), pending.envelope(),
+                pending.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
+            let empty = acknowledge(&mut source, &cx, hash(11), receipt.checkpoint, 1 << 20).await.unwrap();
+            assert_eq!(empty.outbox.acknowledged, second);
+            assert_eq!(empty.outbox.pending_bytes, 0);
+            assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 0);
+            assert_eq!(count(&slow, "audit").await, 2);
+            assert_eq!(slow.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                Some(&SqliteValue::Text("ok".into())));
+            source.close().await.unwrap();
+            slow.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fanout_capacity_empty_messages_and_caller_transactions_preserve_work() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut source = source(":memory:").await;
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
+            let limits = OutboxLimits { max_pending_messages: 1, max_pending_bytes: 0, ..OutboxLimits::default() };
+            let first = position(&record(&mut source, &cx, baseline(), &[], limits).await.unwrap());
+            acknowledge(&mut source, &cx, hash(10), first, 0).await.unwrap();
+            assert!(matches!(record(&mut source, &cx, first, &[], limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            let cleared = acknowledge(&mut source, &cx, hash(11), first, 0).await.unwrap();
+            assert_eq!(cleared.outbox.pending_messages(), 0);
+            let second = position(&record(&mut source, &cx, first, &[], limits).await.unwrap());
+            let saved = state(&mut source, &cx, hash(1)).await.unwrap();
+            assert_eq!(saved.outbox.pending_messages(), 1);
+            source.execute("BEGIN; INSERT INTO t VALUES(7,'caller');").await.unwrap();
+            assert!(matches!(acknowledge(&mut source, &cx, hash(10), second, 0).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
+            assert!(matches!(state(&mut source, &cx, hash(1)).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
+            assert!(matches!(configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
+            assert!(source.in_transaction());
+            assert_eq!(count(&source, "t").await, 1);
+            source.execute("ROLLBACK").await.unwrap();
+            assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), saved);
+            source.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fanout_source_cannot_replace_even_a_structurally_valid_roster() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut source = source(":memory:").await;
+            let saved = configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+            for name in [GROUP_TABLE, REPLICA_TABLE] {
+                let body = Changeset {
+                    kind: ChangesetKind::Changeset,
+                    tables: vec![TableChangeset {
+                        info: TableInfo { name: name.to_ascii_uppercase(), column_count: 1, pk_flags: vec![true] },
+                        rows: vec![ChangesetRow { op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
+                            new_values: vec![ChangesetValue::Integer(1)] }],
+                    }],
+                }.encode();
+                assert!(matches!(record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await,
+                    Err(ReplicaApplyError::Protocol { detail: "source message targets replication metadata" })));
+            }
+            // Rewrite BOTH roster and matching progress rows. The altered
+            // metadata would pass structural validation; equality with the
+            // pre-DML snapshot must nevertheless reject this implicit change.
+            source.execute(&format!("CREATE TRIGGER replace_member AFTER INSERT ON t BEGIN \
+                UPDATE _fsqlite_source_replica_v1 SET replica_id=x'{}' WHERE replica_id=x'{}'; \
+                UPDATE _fsqlite_source_fanout_v1 SET members=x'{}{}'; END;",
+                "0c".repeat(32), "0b".repeat(32), "0a".repeat(32), "0c".repeat(32)))
+                .await.unwrap();
+            assert!(matches!(record(&mut source, &cx, baseline(), &wire(1), OutboxLimits::default()).await,
+                Err(ReplicaApplyError::Protocol { detail: "source metadata changed during row application" })));
+            assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), saved);
+            assert_eq!(count(&source, "t").await, 0);
+            assert_eq!(count(&source, "audit").await, 0);
+            assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 0);
+            source.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn fanout_corrupt_payload_roster_and_metadata_triggers_never_discard_work() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            for tamper in [
+                "UPDATE _fsqlite_source_fanout_v1 SET members=zeroblob(8193)",
+                "UPDATE _fsqlite_source_fanout_v1 SET start_sequence=zeroblob(4096)",
+                "UPDATE _fsqlite_source_replica_v1 SET tip=zeroblob(4096)",
+                "UPDATE _fsqlite_source_replica_v1 SET sequence=zeroblob(4096)",
+                "UPDATE _fsqlite_source_outbox_v1 SET body=zeroblob(length(body))",
+            ] {
+                let mut source = source(":memory:").await;
+                configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+                let first = produce(&mut source, baseline(), 1).await;
+                assert!(matches!(next_pending(&mut source, &cx, hash(1), hash(10), 0).await,
+                    Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+                source.execute(tamper).await.unwrap();
+                assert!(next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20).await.is_err());
+                assert!(acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await.is_err());
+                assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
+                assert_eq!(source.query_row("SELECT ack_sequence FROM _fsqlite_source_stream_v1")
+                    .await.unwrap().get(0), Some(&SqliteValue::Integer(0)));
+                assert!(!source.in_transaction());
+                source.close().await.unwrap();
+            }
+            for temporary in [false, true] {
+                let mut source = source(":memory:").await;
+                configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+                let first = produce(&mut source, baseline(), 1).await;
+                let prefix = if temporary { "TEMP " } else { "" };
+                source.execute(&format!("CREATE {prefix}TRIGGER ignore_ack BEFORE UPDATE ON main._fsqlite_source_replica_v1 \
+                    BEGIN SELECT RAISE(IGNORE); END;")).await.unwrap();
+                assert!(matches!(acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await,
+                    Err(ReplicaApplyError::Protocol { detail: "outbox metadata must not have triggers" })));
+                assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
+                source.close().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn fanout_other_streams_remain_independent_and_backlog_cannot_be_adopted() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut source = source(":memory:").await;
+            configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+            let first = produce(&mut source, baseline(), 1).await;
+            let saved = state(&mut source, &cx, hash(1)).await.unwrap();
+            let other = ReplicaCheckpoint { stream_id: hash(20), sequence: 0, tip: hash(21) };
+            super::super::initialize(&mut source, &cx, other).await.unwrap();
+            let unrelated = produce(&mut source, other, 9).await;
+            assert!(configure(&mut source, &cx, other, &[hash(10)]).await.is_err());
+            let released = super::super::acknowledge(&mut source, &cx, unrelated, 1 << 20).await.unwrap();
+            assert_eq!(released.pending_messages(), 0);
+            assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), saved);
+            assert!(super::super::acknowledge(&mut source, &cx, first, 1 << 20).await.is_err());
+            assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
+            assert!(next_pending(&mut source, &cx, hash(20), hash(10), 1 << 20).await.is_err());
             source.close().await.unwrap();
         });
     }
