@@ -64,7 +64,7 @@ fn json5_jsonb_functions_bd_qear2() {
             "SELECT json_type(jsonb('{a:NaN}'),'$.a')",
             "SELECT json(jsonb_set(jsonb('{keep:Infinity}'),'$.added',1))",
             "SELECT json(jsonb_remove(jsonb('{keep:-Infinity,other:0}'),'$.other'))",
-            "SELECT json(jsonb('{Infinity:\"Infinity\",NaN:\"NaN\",v:Infinity}'))",
+            "SELECT json(jsonb('{\"Infinity\":\"Infinity\",\"NaN\":\"NaN\",v:Infinity}'))",
             // jsonb(JSON5) round-tripped back to text via json()
             "SELECT json(jsonb('{a:1, b:2}'))",
             "SELECT json(jsonb('[1, 2, 3,]'))",

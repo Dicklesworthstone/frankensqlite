@@ -82,7 +82,7 @@ fn json5_read_functions_bd_qear2() {
             "SELECT json_patch('{keep:Infinity,removed:1}','{removed:NaN}')",
             "SELECT json_pretty('{keep:Infinity,nan:NaN}') = json_pretty('{\"keep\":9e999,\"nan\":null}')",
             // Identifier keys and quoted/escaped strings remain ordinary text.
-            "SELECT json_extract('{Infinity:7,NaN:\"kept\",v:Infinity}','$.Infinity','$.NaN'), json_type('{Infinity:7,NaN:\"kept\",v:Infinity}','$.v')",
+            "SELECT json_extract('{\"Infinity\":7,\"NaN\":\"kept\",v:Infinity}','$.Infinity','$.NaN'), json_type('{\"Infinity\":7,\"NaN\":\"kept\",v:Infinity}','$.v')",
             r#"SELECT json_extract('{a:"Infinity",b:"-Infinity",c:"NaN",d:"Infini\u0074y"}','$.a','$.b','$.c','$.d')"#,
             "SELECT json_extract('{v:/* Infinity */-Infinity,s:''NaN''}','$.v'), json_extract('{v:/* Infinity */-Infinity,s:''NaN''}','$.s')",
             // The custom value visitor must preserve ordinary numeric variants.
