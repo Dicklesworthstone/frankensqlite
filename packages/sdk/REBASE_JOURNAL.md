@@ -182,6 +182,101 @@ Work is linear in the prefix length; no constant-time or RSS guarantee is made.
 Numeric endpoints remain an explicit position-only selection and cannot detect
 a coherent alternative history without a saved bookmark.
 
+## Durable original local changes
+
+`captureLocal(operationId, work, options)` closes the gap between applying local
+SQL and preserving the original changeset with its exact remote-history basis.
+It runs the existing SQL-trigger capture path, verifies the history bookmark,
+and saves the original bytes in the **same owned transaction** as the callback's
+application writes. No separately timed bookmark read or application-managed
+byte journal is required:
+
+```ts
+const captured = await history.captureLocal(
+  'device-42:local-operation-109', // Permanently identifies this same work.
+  async tx => {
+    await tx.execute('UPDATE notes SET body = ? WHERE id = ?', ['local edit', 7n]);
+    return { edited: 7n };
+  },
+  { tables: ['notes'], timeoutMs: 10_000 },
+);
+
+// After reopening this same database and journal:
+const original = await history.readLocal('device-42:local-operation-109');
+const outgoing = await history.rebaseLocal('device-42:local-operation-109', {
+  through: savedRemoteTip, // Optional number/bookmark; omit for this snapshot's tip.
+});
+// outgoing.changeset is derived output; original.changeset remains unchanged.
+```
+
+Capture inherits `captureChangeset`'s explicit table allowlist and limitations:
+ordinary main tables with declared primary keys, `recursive_triggers=ON`, no
+application triggers on captured tables, and no callback schema changes. Enable
+that PRAGMA before entering capture, not inside its callback. The callback must
+await its SQL operations, and its external effects are not transactional. The
+allowlist is not a sandbox. Do not mix remote journal application into a local
+capture callback: changed history causes the entire capture to roll back.
+
+A fresh result has `replayed: false`, the callback's `value`, and a `record`.
+The saved `RebaseJournalLocalRecord` contains the operation ID, original bytes,
+verified `basis` bookmark, payload `sha256`, `recordSha256`, byte length, change
+count, and touched-row count. Metadata and the basis are frozen; every read owns
+fresh mutable byte storage. The record checksum binds the payload digest, basis,
+identity, capture scope, and counters. These hashes detect corruption; they do
+not authenticate a writer or authorize local SQL.
+
+An existing exact operation ID returns `replayed: true` and the original record
+without calling `work`, recapturing today's rows, or advancing its saved basis.
+Callback values are not persisted and are absent on replay. The capture scope
+(table set and indirect flag) must match the original; table case/order alone
+may differ. The ID is the application's assertion of the same work, not a hash
+of the callback. Never reuse it for another edit. Empty/net-zero operations
+retain records too, so their callbacks are not repeated after a lost response.
+
+`readLocal(id)` returns null for unknown IDs without creating storage. It
+verifies bounded metadata, payload, counts, and the bound basis checksum, but
+does not require the remote history still to exist. This allows recovery of the
+original bytes for explicit reconciliation even after a history restore or loss.
+Deleting a record, losing the entire local table, or restoring a backup from
+before capture removes this deduplication evidence. Absence is not proof that an
+operation never committed elsewhere or before that restore. No automatic replay
+or retry policy is supplied.
+
+`rebaseLocal(id)` loads that saved original and verifies its original basis and
+selected remote prefix in **one SQL snapshot**. It does not take replacement
+bytes or an `after` override. Every invocation starts from the retained original,
+never the output of the previous rebasing. It shares the existing `rebase`
+algorithm, range checks, full-prefix bookmarks, cancellation, and deadline
+checks. Missing originals/history fail explicitly; a coherent fork with the
+same numeric basis fails the history check. Both returned bookmarks identify
+that same snapshot, not a separate later head read. Neither original bytes nor
+application rows are modified by rebasing.
+
+Original retention uses the optional reserved
+`__fsqlite_rebase_journal_locals` table, created only for local capture. Its
+WITHOUT ROWID/BINARY primary key, columns, and lack of metadata triggers or
+foreign keys are validated using the existing journal checks. Existing remote
+journal schemas are unchanged. `maxLocalEntries` defaults to 10,000 (maximum
+100,000), including empty operations; `maxLocalBytes` defaults to 64 MiB
+(maximum 1 GiB) of retained original wire bytes. These budgets are independent
+of remote decision retention. Full entry capacity refuses work before the
+callback, and an over-byte-budget capture rolls back the callback's writes.
+Per-message codec limits still apply. Budgets are not database-file or RSS caps.
+
+Original capture verifies the complete remote prefix before and after work;
+that cost is linear in retained history. There is no automatic expiry, pruning,
+local queue enumeration, outgoing delivery-ID assignment, payload rewriting,
+sending, or acknowledgement. In particular, never replace bytes already bound
+to an outbox delivery identity with new rebased output. Multiple local operations
+still require an application-owned synchronization and ordering protocol; these
+APIs alone do not implement complete bidirectional synchronization.
+
+Transaction and durability boundaries remain the target's own: a nested target
+is provisional until its outer commit; snapshot-backed SQL still needs an
+explicit successful checkpoint of the same database. If acknowledgement is lost,
+reopen/reconcile the authoritative database and look up the same operation ID.
+Do not infer rollback from an error after commit or choose a fresh operation ID.
+
 ## Bounds and integrity
 
 `maxEntries` defaults to 10,000 and has a hard maximum of 100,000.
@@ -213,7 +308,8 @@ who can coherently rewrite both journal and inbox. Authenticate remote input.
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
   --test packages/sdk/tests/changeset-rebase.test.mjs \
-  packages/sdk/tests/changeset-rebase-bookmark.test.mjs
+  packages/sdk/tests/changeset-rebase-bookmark.test.mjs \
+  packages/sdk/tests/changeset-local-capture.test.mjs
 ```
 
 The tests execute production TypeScript journal SQL against Node SQLite and
@@ -236,3 +332,12 @@ prefix without modifying storage. It also checks exact reopen, empty decisions,
 message/policy identity, all valid small ranges, excluded-prefix corruption,
 untrusted bookmark fields, input ownership, cancellation, deadlines, provisional
 outer rollback, and same-snapshot result identities.
+
+The local-capture suite runs the production SQL-trigger capture, journal, and
+stored-original rebaser over real Node SQLite. Native session comparisons check
+captured changes, and native changeset application checks OMIT/REPLACE rebasing
+outcomes. It covers lost ACK plus reopen, actual child-process exits immediately
+before/after COMMIT, rollback, deferred FK commit errors, cancellation, deadlines,
+retention limits, malformed metadata, composite keys/scalars, same-snapshot
+reads, and a valid saved original transplanted onto a coherent history fork.
+Process-exit recovery is not simulated power-loss or browser durability proof.

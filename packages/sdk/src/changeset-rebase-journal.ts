@@ -576,17 +576,48 @@ export class ChangesetRebaseJournal {
     const through = end === undefined ? undefined : boundary(end, this.#id), op = operation(options);
     const wire = owned(local, this.#policy.maxBytes);
     decodeChangeset(wire, this.#policy);
+    return this.#target.transaction((tx) => this.#rebaseAt(tx, op, wire, after, through), op.transactionOptions);
+  }
+
+  /**
+   * Recover an ORIGINAL by ID and verify its saved basis and selected history
+   * in ONE SQL snapshot. Never accepts replacement bytes or an alternate basis.
+   * Does not mutate the original, apply SQL, send a payload, or acknowledge it.
+   */
+  async rebaseLocal(
+    operationId: string,
+    options: Omit<RebaseJournalRangeOptions, "after"> = {},
+  ): Promise<RebaseJournalResult> {
+    const id = identity(operationId);
+    if ((options as RebaseJournalRangeOptions).after !== undefined)
+      fail("INPUT", "rebaseLocal always uses the original operation's saved basis");
+    const end = options.through;
+    const through = end === undefined ? undefined : boundary(end, this.#id);
+    const op = operation(options);
     return this.#target.transaction(async (tx) => {
-      const present = await ensure(tx, op, false);
-      const head = present ? await this.#head(tx, op, false) : { position: 0 };
-      const tip = through ?? { position: head.position, sha256: null };
-      if (after.position > tip.position || tip.position > head.position) fail("MISSING", "Requested journal range is not available");
-      const rebaser = new ChangesetRebaser(this.#policy);
-      const bookmarks = await this.#history(tx, op, after, tip, rebaser);
-      op.checkpoint();
-      const changeset = rebaser.rebase(wire);
-      op.checkpoint();
-      return Object.freeze({ journalId: this.#id, after: after.position, through: tip.position, changeset, ...bookmarks });
+      if (!await ensureLocals(tx, op, false)) fail("MISSING", "Original local changeset is not retained");
+      const saved = await this.#localEntry(tx, op, id);
+      if (saved === null) fail("MISSING", "Original local changeset is not retained");
+      return this.#rebaseAt(tx, op, saved.record.changeset, boundary(saved.record.basis, this.#id), through);
     }, op.transactionOptions);
+  }
+
+  async #rebaseAt(
+    tx: ChangesetExecutor,
+    op: Operation,
+    wire: Uint8Array,
+    after: HistoryBoundary,
+    through: HistoryBoundary | undefined,
+  ): Promise<RebaseJournalResult> {
+    const present = await ensure(tx, op, false);
+    const head = present ? await this.#head(tx, op, false) : { position: 0 };
+    const tip = through ?? { position: head.position, sha256: null };
+    if (after.position > tip.position || tip.position > head.position) fail("MISSING", "Requested journal range is not available");
+    const rebaser = new ChangesetRebaser(this.#policy);
+    const bookmarks = await this.#history(tx, op, after, tip, rebaser);
+    op.checkpoint();
+    const changeset = rebaser.rebase(wire);
+    op.checkpoint();
+    return Object.freeze({ journalId: this.#id, after: after.position, through: tip.position, changeset, ...bookmarks });
   }
 }

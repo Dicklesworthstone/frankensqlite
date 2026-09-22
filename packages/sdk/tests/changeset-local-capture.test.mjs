@@ -252,3 +252,172 @@ for (let seed=1; seed<=20; seed++) test(`native SQLite session comparison for ca
   }, opts);
   assert.deepEqual(normal(result.record.changeset), normal(new Uint8Array(session.changeset())));
 });
+
+for (const policy of ["omit", "replace"]) test(`rebaseLocal reconciles stored originals using real ${policy} decisions`, async t => {
+  const f = fixture(t);
+  const original = await f.journal.captureLocal("original", tx => tx.execute("INSERT INTO t VALUES (1,'local')"), opts);
+  const bytes = encodeChangeset([{ name: "t", primaryKey: [1,0], changes: [{ operation: "insert", indirect: false, new: [1n,"remote"] }] }]);
+  await f.journal.apply(bytes, { ...opts, deliveryId: "incoming:1", onConflict: () => policy });
+  const tip = await f.journal.bookmark();
+  const result = await f.journal.rebaseLocal("original", { through: tip });
+  assert.deepEqual(result.afterBookmark, original.record.basis);
+  assert.deepEqual(result.throughBookmark, tip);
+  const destination = fixture(t); destination.db.exec("INSERT INTO t VALUES (1,'remote')");
+  assert.equal(destination.db.applyChangeset(result.changeset), true);
+  assert.deepEqual(readRows(destination), readRows(f));
+  assert.deepEqual((await f.journal.readLocal("original")).changeset, original.record.changeset);
+  const expected = new Uint8Array(result.changeset); result.changeset.fill(255);
+  assert.deepEqual((await f.journal.rebaseLocal("original", { through: tip })).changeset, expected);
+  await remote(f, "incoming:2", 9n);
+  const newer = await f.journal.rebaseLocal("original");
+  assert.equal(newer.after, 0); assert.equal(newer.through, 2);
+  assert.deepEqual(newer.changeset, expected);
+});
+
+test("stored basis excludes prior remote history and cannot be overridden", async t => {
+  const f = fixture(t); await remote(f);
+  await f.journal.captureLocal("after-one", tx => tx.execute("INSERT INTO t VALUES (1,'local')"), opts);
+  await remote(f, "remote:2", 10n);
+  const result = await f.journal.rebaseLocal("after-one");
+  assert.equal(result.after, 1); assert.equal(result.through, 2);
+  await assert.rejects(f.journal.rebaseLocal("after-one", { after: 0 }), code("INPUT"));
+  for (const through of [0,3]) await assert.rejects(f.journal.rebaseLocal("after-one", { through }), code("MISSING"));
+});
+
+test("rebaseLocal uses one owned SQL snapshot and does not read a later tip", async t => {
+  const f = fixture(t); await f.journal.captureLocal("one", () => undefined, opts);
+  let calls = 0; const transaction = f.target.transaction.bind(f.target);
+  f.target.transaction = (...args) => { calls++; return transaction(...args); };
+  const result = await f.journal.rebaseLocal("one");
+  assert.equal(calls, 1); assert.deepEqual(result.afterBookmark, result.throughBookmark);
+  assert.equal(result.changeset.length, 0);
+});
+
+test("stored original refuses a coherent restored history fork with the same numeric basis", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "fsqlite-local-fork-"));
+  const original = fixture(t, join(dir,"original.db"));
+  await remote(original);
+  const local = await original.journal.captureLocal("retained", tx => tx.execute("INSERT INTO t VALUES (1,'local')"), opts);
+  original.close();
+  const fork = fixture(t, join(dir,"fork.db"));
+  await fork.journal.apply(encodeChangeset([{ name: "t", primaryKey: [1,0], changes: [{ operation: "insert", indirect: false, new: [9n,"forked"] }] }]), { ...opts, deliveryId: "remote:1" });
+  await fork.journal.captureLocal("seed", () => undefined, opts);
+  fork.db.prepare("ATTACH DATABASE ? AS preserved").run(join(dir,"original.db"));
+  fork.db.exec(`INSERT INTO ${table} SELECT * FROM preserved."${LOCAL}" WHERE operation_id='retained'; DETACH DATABASE preserved`);
+  assert.deepEqual(await fork.journal.readLocal("retained"), local.record);
+  const before = readRows(fork);
+  await assert.rejects(fork.journal.rebaseLocal("retained"), code("HISTORY"));
+  await assert.rejects(fork.journal.rebaseLocal("retained", { through: 1 }), code("HISTORY"));
+  assert.deepEqual(readRows(fork), before);
+  assert.deepEqual(await fork.journal.readLocal("retained"), local.record);
+});
+
+test("selected through bookmark is captured before asynchronous admission", async t => {
+  const f = fixture(t); await f.journal.captureLocal("one", () => undefined, opts); await remote(f);
+  const tip = structuredClone(await f.journal.bookmark());
+  const expected = { ...tip };
+  const pending = f.journal.rebaseLocal("one", { through: tip });
+  tip.position = 0; tip.sha256 = "0".repeat(64);
+  assert.deepEqual((await pending).throughBookmark, expected);
+  await assert.rejects(f.journal.rebaseLocal("one", { through: { ...expected, sha256: "0".repeat(64) } }), code("HISTORY"));
+});
+
+for (const position of [0,1,2]) test(`exact local range ending at ${position} preserves the stored original`, async t => {
+  const f = fixture(t); const local = await f.journal.captureLocal("one", () => undefined, opts);
+  await remote(f); await remote(f,"remote:2",10n);
+  const result = await f.journal.rebaseLocal("one", { through: position });
+  assert.equal(result.through, position); assert.equal(result.changeset.length, 0);
+  assert.deepEqual(await f.journal.readLocal("one"), local.record);
+});
+
+test("missing locals reject without creating replacement storage or running SQL", async t => {
+  const f = fixture(t);
+  await assert.rejects(f.journal.rebaseLocal("missing"), code("MISSING"));
+  assert.equal(f.db.prepare("SELECT count(*) n FROM sqlite_schema WHERE name=?").get(LOCAL).n, 0);
+  await f.journal.captureLocal("exists", () => undefined, opts);
+  await assert.rejects(f.journal.rebaseLocal("missing"), code("MISSING"));
+});
+
+test("local recovery survives missing remote evidence but rebasing refuses it", async t => {
+  const f = fixture(t); await remote(f);
+  const local = await f.journal.captureLocal("one", () => undefined, opts);
+  f.db.exec(`DELETE FROM main."${ENTRIES}"`);
+  assert.deepEqual(await f.journal.readLocal("one"), local.record);
+  await assert.rejects(f.journal.rebaseLocal("one"), code("CORRUPT"));
+});
+
+test("local capture uses the original total deadline and rolls back on expiry", async t => {
+  const f = fixture(t); const descriptor = Object.getOwnPropertyDescriptor(performance,"now"); let now=0;
+  Object.defineProperty(performance,"now",{ configurable:true, value:()=>now });
+  try {
+    await assert.rejects(f.journal.captureLocal("expired", async tx => {
+      await tx.execute("INSERT INTO t VALUES (1,'local')"); now=10;
+    }, { ...opts, timeoutMs:5 }), error=>/TIMEOUT/.test(error.code));
+  } finally {
+    if (descriptor) Object.defineProperty(performance,"now",descriptor);
+    else Reflect.deleteProperty(performance,"now");
+  }
+  assert.deepEqual(readRows(f), []); assert.equal(await f.journal.readLocal("expired"), null);
+});
+
+test("cancelled rebasing leaves retained originals and application rows intact", async t => {
+  const f = fixture(t); const local = await f.journal.captureLocal("one", tx=>tx.execute("INSERT INTO t VALUES (1,'local')"), opts);
+  const ac = new AbortController(); ac.abort();
+  await assert.rejects(f.journal.rebaseLocal("one",{signal:ac.signal}),code("CANCELLED"));
+  assert.deepEqual(await f.journal.readLocal("one"),local.record); assert.deepEqual(readRows(f),[[1,"local"]]);
+});
+
+for (const cut of ["before", "after"]) test(`fresh-process recovery at ${cut} COMMIT retains exactly the committed local work`, async t => {
+  const { spawnSync } = await import("node:child_process");
+  const path = join(mkdtempSync(join(tmpdir(),"fsqlite-local-crash-")),"database.db");
+  fixture(t,path).close();
+  const child = `
+    import { DatabaseSync } from 'node:sqlite';
+    import { ChangesetRebaseJournal } from './packages/sdk/src/changeset-rebase-journal.ts';
+    const db = new DatabaseSync(${JSON.stringify(path)});
+    db.exec('PRAGMA recursive_triggers=ON');
+    const tx = {
+      async execute(sql,params=[]) { return Number(db.prepare(sql).run(...params).changes); },
+      async query(sql,params=[]) { const stmt=db.prepare(sql); stmt.setReadBigInts(true); return {rowArrays:stmt.all(...params).map(Object.values)}; }
+    };
+    const target = { async transaction(work) {
+      db.exec('BEGIN'); const result=await work(tx);
+      ${cut === "after" ? "db.exec('COMMIT');" : ""}
+      process.exit(71);
+    }};
+    const journal=new ChangesetRebaseJournal(target,{journalId:'local-device'});
+    await journal.captureLocal('crash',tx=>tx.execute("INSERT INTO t VALUES(1,'committed')"),{tables:['t']});
+    process.exit(99);
+  `;
+  const result=spawnSync(process.execPath,["--experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs","--input-type=module","-e",child],{encoding:"utf8",env:process.env});
+  assert.equal(result.status,71,result.stderr);
+  const reopened=fixture(t,path,""); const saved=await reopened.journal.readLocal("crash");
+  if(cut === "after") {
+    assert.ok(saved); assert.deepEqual(readRows(reopened),[[1,"committed"]]);
+    assert.equal((await reopened.journal.captureLocal("crash",()=>assert.fail("replayed committed SQL"),opts)).replayed,true);
+    assert.deepEqual((await reopened.journal.rebaseLocal("crash")).changeset,saved.changeset);
+  } else { assert.equal(saved,null); assert.deepEqual(readRows(reopened),[]); }
+  assert.equal(reopened.db.prepare("PRAGMA integrity_check").get().integrity_check,"ok");
+});
+
+test("composite keys and all scalar storage classes retain native original values", async t => {
+  const f=fixture(t,":memory:","CREATE TABLE t(id BLOB NOT NULL,k TEXT NOT NULL,n INTEGER,r REAL,s TEXT,b BLOB,z,PRIMARY KEY(id,k)) WITHOUT ROWID;");
+  const session=f.db.createSession({table:"t"}); f.cleanup.push(()=>session.close());
+  const captured=await f.journal.captureLocal("scalars",tx=>tx.execute("INSERT INTO t VALUES(?,?,?,CAST(? AS REAL),?,?,NULL)",[
+    new Uint8Array([1,0,255]),"κ'key",9223372036854775807n,1.5,"a\0b",new Uint8Array([0,255]),
+  ]),opts);
+  assert.deepEqual(decodeChangeset(captured.record.changeset),decodeChangeset(new Uint8Array(session.changeset())));
+  assert.deepEqual((await f.journal.rebaseLocal("scalars")).changeset,captured.record.changeset);
+});
+
+test("unsupported capture tables fail before callback and do not retain local metadata",async t=>{
+  const f=fixture(t); f.db.exec("CREATE TRIGGER application_trigger AFTER INSERT ON t BEGIN SELECT 1; END");
+  await assert.rejects(f.journal.captureLocal("trigger",()=>assert.fail("callback ran"),opts),{code:"ERR_FSQLITE_CAPTURE_SCHEMA"});
+  assert.equal(await f.journal.readLocal("trigger"),null);
+});
+
+test("a view impersonating local storage is rejected without replacing it",async t=>{
+  const f=fixture(t); f.db.exec(`CREATE VIEW "${LOCAL}" AS SELECT 1 AS journal_id`);
+  await assert.rejects(f.journal.captureLocal("view",()=>assert.fail("callback ran"),opts),code("SCHEMA"));
+  assert.equal(f.db.prepare("SELECT type FROM sqlite_schema WHERE name=?").get(LOCAL).type,"view");
+});
