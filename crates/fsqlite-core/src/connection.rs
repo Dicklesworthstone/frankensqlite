@@ -25438,6 +25438,9 @@ impl Connection {
             }
         }
 
+        self._shared_mvcc_state
+            .stop_write_coordinator_before_last_release()
+            .await;
         if best_effort {
             let _ = self
                 ._shared_mvcc_state
@@ -113204,6 +113207,37 @@ impl SharedMvccState {
                     lock_unpoisoned(state_map).remove(&state.key);
                 }
             }
+        }
+    }
+
+    /// Stop the database's WriteCoordinator before the last connection's
+    /// synchronous region drain, waiting for it cooperatively.
+    ///
+    /// `release_connection` drains the root region by spinning until its task
+    /// count reaches zero. The coordinator only exits once it is polled after
+    /// its shutdown sender drops, and on a current-thread runtime the only
+    /// thread that can poll it is the one closing the connection, so that spin
+    /// never ended: every file-backed `fsqlite` CLI invocation hung at exit
+    /// (bd-viyz2). Yielding here lets the caller's executor run the coordinator
+    /// to completion first, and the drain then finds its region already empty.
+    /// Quiescence is still awaited in full; nothing is abandoned or timed out.
+    async fn stop_write_coordinator_before_last_release(&self) {
+        let region = {
+            let mut state = lock_unpoisoned(&self.runtime_state);
+            if state.open_connections != 1 || state.write_coordinator_shutdown.is_none() {
+                return;
+            }
+            state.write_coordinator_service_starting = false;
+            state.write_coordinator_service_running = false;
+            let _ = state.write_coordinator_shutdown.take();
+            state.write_coordinator_region
+        };
+        while lock_unpoisoned(&self.runtime_state)
+            .regions
+            .active_tasks(region)
+            > 0
+        {
+            asupersync::runtime::yield_now().await;
         }
     }
 
