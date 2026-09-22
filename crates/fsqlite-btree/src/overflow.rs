@@ -21,11 +21,56 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::MAX_ALLOCATION_SIZE;
 use fsqlite_types::{PageData, PageNumber};
+use smallvec::SmallVec;
 use std::collections::HashSet;
 
 /// Maximum number of overflow pages in a chain (safety bound to prevent
 /// infinite loops on corrupt databases).
 pub const MAX_OVERFLOW_CHAIN: usize = 1_000_000;
+
+/// Inline capacity of [`VisitedPages`]; chains up to this many pages are
+/// tracked without touching the heap.
+const VISITED_INLINE_PAGES: usize = 8;
+
+/// Pages already visited on one overflow chain.
+///
+/// Every overflow read runs this check, and nearly every chain is a few pages
+/// long, so membership is a linear scan over an inline array; only a chain
+/// longer than [`VISITED_INLINE_PAGES`] moves into a `HashSet`. This keeps the
+/// per-read cost free of heap allocation and hashing without weakening cycle
+/// detection.
+#[derive(Debug, Default)]
+struct VisitedPages {
+    inline: SmallVec<[PageNumber; VISITED_INLINE_PAGES]>,
+    spilled: HashSet<PageNumber>,
+}
+
+impl VisitedPages {
+    fn len(&self) -> usize {
+        self.inline.len() + self.spilled.len()
+    }
+
+    fn contains(&self, page_no: PageNumber) -> bool {
+        self.inline.contains(&page_no) || self.spilled.contains(&page_no)
+    }
+
+    /// Record `page_no`; `Ok(false)` if it was already visited.
+    fn insert(&mut self, page_no: PageNumber) -> Result<bool> {
+        if self.contains(page_no) {
+            return Ok(false);
+        }
+        if self.spilled.is_empty() && self.inline.len() < VISITED_INLINE_PAGES {
+            self.inline.push(page_no);
+            return Ok(true);
+        }
+        self.spilled
+            .try_reserve(self.inline.len() + 1)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        self.spilled.extend(self.inline.drain(..));
+        self.spilled.insert(page_no);
+        Ok(true)
+    }
+}
 
 /// Validation shared by the callback and async readers. A payload length is
 /// not a cycle detector: a corrupt chain can repeat bytes until that length
@@ -33,7 +78,7 @@ pub const MAX_OVERFLOW_CHAIN: usize = 1_000_000;
 /// payload, even when the caller only requests a prefix.
 #[derive(Debug)]
 struct OverflowReadState {
-    visited: HashSet<PageNumber>,
+    visited: VisitedPages,
     usable_size: usize,
     remaining: usize,
 }
@@ -41,7 +86,7 @@ struct OverflowReadState {
 impl OverflowReadState {
     fn new(usable_size: u32, remaining: usize) -> Self {
         Self {
-            visited: HashSet::new(),
+            visited: VisitedPages::default(),
             usable_size: usable_size as usize,
             remaining,
         }
@@ -60,10 +105,7 @@ impl OverflowReadState {
                 ),
             });
         }
-        self.visited
-            .try_reserve(1)
-            .map_err(|_| FrankenError::OutOfMemory)?;
-        if !self.visited.insert(page_no) {
+        if !self.visited.insert(page_no)? {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("cycle in overflow chain at page {}", page_no.get()),
             });
@@ -96,7 +138,7 @@ impl OverflowReadState {
             let next_page = PageNumber::new(next).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("invalid next overflow page number {next}"),
             })?;
-            if self.visited.contains(&next_page) {
+            if self.visited.contains(next_page) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("cycle in overflow chain at page {next}"),
                 });
@@ -994,6 +1036,36 @@ mod tests {
     }
 
     #[test]
+    fn overflow_readers_reject_cycles_after_the_visited_set_spills() {
+        run_async(async {
+            // Pages 5..=16 chain in order, then 16 links back to 10: the
+            // repeat is seen only after the inline visited array spilled.
+            let mut pages: HashMap<u32, Vec<u8>> =
+                (5..16).map(|page| (page, linked_page(page + 1))).collect();
+            pages.insert(16, linked_page(10));
+            assert_invalid_overflow(pages, 5, 1000, 1000, "cycle in overflow chain", 12).await;
+        });
+    }
+
+    #[test]
+    fn visited_pages_detects_repeats_across_the_inline_spill() {
+        let page = |n: u32| PageNumber::new(n).expect("nonzero page");
+        let mut visited = VisitedPages::default();
+        for n in 2..(2 + VISITED_INLINE_PAGES as u32 + 4) {
+            assert!(
+                visited.insert(page(n)).expect("insert"),
+                "first visit of {n}"
+            );
+        }
+        assert_eq!(visited.len(), VISITED_INLINE_PAGES + 4);
+        for n in 2..(2 + VISITED_INLINE_PAGES as u32 + 4) {
+            assert!(visited.contains(page(n)));
+            assert!(!visited.insert(page(n)).expect("insert"), "repeat of {n}");
+        }
+        assert!(!visited.contains(page(1000)));
+    }
+
+    #[test]
     fn overflow_readers_reject_short_pages_even_when_prefix_fits() {
         run_async(async {
             for size in [0, 1, 4, 5, 15] {
@@ -1081,7 +1153,7 @@ mod tests {
             let first = PageNumber::new(5).unwrap();
             let cx = Cx::new();
             let mut out = Vec::new();
-            for prefix in [1, 12, 13, 100] {
+            for prefix in [1_usize, 12, 13, 100] {
                 let count = prefix.min(13);
                 let expected_reads = count.div_ceil(12);
                 store.reads.set(0);
