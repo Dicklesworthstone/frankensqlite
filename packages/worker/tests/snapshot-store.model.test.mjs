@@ -105,6 +105,145 @@ test("model: byte corruption is found by the actual Web Crypto digest", async ()
   store.close();
 });
 
+for (const [label, damage] of [
+  [
+    "payload",
+    (record) => {
+      new Uint8Array(record.bytes)[200] ^= 1;
+    },
+  ],
+  [
+    "digest",
+    (record) => {
+      record.sha256 = "0".repeat(64);
+    },
+  ],
+  [
+    "self-parent lineage",
+    (record) => {
+      record.parentRevision = record.revision;
+    },
+  ],
+]) {
+  test(`model: ${label} corruption cannot be hidden by a replacement checkpoint`, async () => {
+    const { name, store } = await fixture();
+    try {
+      const saved = await store.save(image(1), null);
+      damage(state(name).values.get("head"));
+      const damaged = structuredClone(state(name).values.get("head"));
+      await assert.rejects(store.load(), code("ERR_FSQLITE_SNAPSHOT_CORRUPT"));
+      await assert.rejects(
+        store.save(image(2), saved.revision),
+        code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+      );
+      assert.deepEqual(state(name).values.get("head"), damaged);
+    } finally {
+      store.close();
+    }
+  });
+}
+
+for (const [label, damage] of [
+  [
+    "payload",
+    (record) => {
+      new Uint8Array(record.bytes)[200] ^= 1;
+    },
+  ],
+  [
+    "digest",
+    (record) => {
+      record.sha256 = "0".repeat(64);
+    },
+  ],
+  [
+    "parent",
+    (record) => {
+      record.parentRevision = crypto.randomUUID();
+    },
+  ],
+]) {
+  test(`model: ${label} mutation between verification and CAS aborts publication`, async () => {
+    const { name, store } = await fixture();
+    const saved = await store.save(image(1), null);
+    const original = ModelObjectStore.prototype.get;
+    let damaged;
+    ModelObjectStore.prototype.get = function (key) {
+      if (this.transaction.mode === "readwrite") {
+        damage(state(name).values.get("head"));
+        damaged = structuredClone(state(name).values.get("head"));
+      }
+      return original.call(this, key);
+    };
+    try {
+      await assert.rejects(
+        store.save(image(2), saved.revision),
+        code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+      );
+      assert.ok(damaged, "the write-time mutation must have been exercised");
+      assert.deepEqual(state(name).values.get("head"), damaged);
+    } finally {
+      ModelObjectStore.prototype.get = original;
+      store.close();
+    }
+  });
+}
+
+test("model: a new revision between verification and CAS preserves the competing head", async () => {
+  const { name, store } = await fixture();
+  const saved = await store.save(image(1), null);
+  const original = ModelObjectStore.prototype.get;
+  let winner;
+  ModelObjectStore.prototype.get = function (key) {
+    if (this.transaction.mode === "readwrite") {
+      const head = state(name).values.get("head");
+      head.parentRevision = saved.revision;
+      head.revision = crypto.randomUUID();
+      winner = structuredClone(head);
+    }
+    return original.call(this, key);
+  };
+  try {
+    await assert.rejects(
+      store.save(image(2), saved.revision),
+      code("ERR_FSQLITE_SNAPSHOT_CONFLICT"),
+    );
+    assert.ok(winner, "the competing publication must have been exercised");
+    assert.deepEqual(state(name).values.get("head"), winner);
+  } finally {
+    ModelObjectStore.prototype.get = original;
+    store.close();
+  }
+});
+
+test("model: close during head verification prevents delayed publication", async () => {
+  const { name, store } = await fixture();
+  const saved = await store.save(image(1), null);
+  const original = ModelObjectStore.prototype.get;
+  let closed = false;
+  ModelObjectStore.prototype.get = function (key) {
+    const request = original.call(this, key);
+    if (this.transaction.mode === "readonly") {
+      request.addEventListener("success", () => {
+        closed = true;
+        store.close();
+      });
+    }
+    return request;
+  };
+  try {
+    await assert.rejects(
+      store.save(image(2), saved.revision),
+      code("ERR_FSQLITE_SNAPSHOT_CLOSED"),
+    );
+    assert.equal(closed, true);
+    assert.equal(state(name).values.get("head").revision, saved.revision);
+  } finally {
+    ModelObjectStore.prototype.get = original;
+    store.close();
+  }
+});
+
 test("model: invalid and over-limit inputs never enter a write transaction", async () => {
   const { store } = await fixture();
   const baseline = await store.save(image(2), null);

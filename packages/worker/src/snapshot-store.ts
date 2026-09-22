@@ -106,6 +106,10 @@ export class IndexedDbSnapshotStore {
   }
 
   async load(): Promise<StoredSnapshot | null> {
+    return this.#readVerified();
+  }
+
+  async #readVerified(): Promise<StoredSnapshot | null> {
     this.#assertOpen();
     // Read and complete the transaction BEFORE awaiting the asynchronous hash.
     // Otherwise IndexedDB may auto-commit while the request is suspended.
@@ -163,6 +167,10 @@ export class IndexedDbSnapshotStore {
       sha256: await checksum(owned),
       bytes: owned.buffer,
     };
+    // Hash the authoritative head before replacing it. Crypto must run outside
+    // a transaction: awaiting it inside onsuccess can let IndexedDB commit.
+    const previous = await this.#readVerified();
+    assertRevision(previous?.revision ?? null, expectedRevision);
     this.#assertOpen();
     await new Promise<void>((resolve, reject) => {
       const transaction = this.#db.transaction(STORE, "readwrite", { durability: "strict" });
@@ -184,16 +192,13 @@ export class IndexedDbSnapshotStore {
       const request = store.get(HEAD);
       request.onsuccess = () => {
         try {
-          const actual =
-            request.result === undefined
-              ? null
-              : validateRecord(request.result, this.#name).revision;
-          if (actual !== expectedRevision) {
-            throw new SnapshotStoreError(
-              "ERR_FSQLITE_SNAPSHOT_CONFLICT",
-              `Snapshot changed: expected ${expectedRevision ?? "no snapshot"}, found ${actual ?? "no snapshot"}. Reopen and merge; do not blindly retry.`,
-            );
-          }
+          const current =
+            request.result === undefined ? null : validateRecord(request.result, this.#name);
+          assertRevision(current?.revision ?? null, expectedRevision);
+          // Recheck the exact verified envelope and bytes under the atomic CAS
+          // transaction. A same-revision mutation must not bypass the digest
+          // check, and a legitimate competing revision must remain a conflict.
+          if (current !== null) assertVerifiedHead(current, previous);
           store.put(record, HEAD);
         } catch (error: unknown) {
           failure = error;
@@ -303,6 +308,7 @@ function validateRecord(value: unknown, name: string): SnapshotRecord {
     record.name !== name ||
     !validRevision(record.revision) ||
     (record.parentRevision !== null && !validRevision(record.parentRevision)) ||
+    record.parentRevision === record.revision ||
     typeof record.sha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(record.sha256) ||
     !(record.bytes instanceof ArrayBuffer) ||
@@ -312,6 +318,32 @@ function validateRecord(value: unknown, name: string): SnapshotRecord {
   }
   validateSnapshotBytes(new Uint8Array(record.bytes));
   return record as SnapshotRecord;
+}
+
+function assertRevision(actual: string | null, expected: string | null): void {
+  if (actual !== expected) {
+    throw new SnapshotStoreError(
+      "ERR_FSQLITE_SNAPSHOT_CONFLICT",
+      `Snapshot changed: expected ${expected ?? "no snapshot"}, found ${actual ?? "no snapshot"}. Reopen and merge; do not blindly retry.`,
+    );
+  }
+}
+
+function assertVerifiedHead(current: SnapshotRecord, verified: StoredSnapshot | null): void {
+  if (
+    verified === null ||
+    current.revision !== verified.revision ||
+    current.parentRevision !== verified.parentRevision ||
+    current.byteLength !== verified.byteLength ||
+    current.sha256 !== verified.sha256
+  ) {
+    throw corrupt("Snapshot changed without advancing its revision");
+  }
+  const bytes = new Uint8Array(current.bytes);
+  for (let index = 0; index < bytes.length; index++) {
+    if (bytes[index] !== verified.bytes[index])
+      throw corrupt("Snapshot changed without advancing its revision");
+  }
 }
 
 function metadata(record: SnapshotRecord): SnapshotMetadata {
