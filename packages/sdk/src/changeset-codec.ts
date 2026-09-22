@@ -41,6 +41,25 @@ export interface PatchsetTable {
   readonly primaryKey: readonly number[];
   readonly changes: readonly PatchsetChange[];
 }
+/** @internal Native apply_v2 rebase records, NOT executable changesets. */
+export interface ChangesetRebaseTable {
+  readonly name: string;
+  readonly primaryKey: readonly number[];
+  readonly changes: readonly {
+    readonly operation: "insert" | "delete";
+    readonly replace: boolean;
+    readonly values: readonly ChangesetField[];
+  }[];
+}
+type SessionChange =
+  | { readonly operation: "insert"; readonly indirect: boolean; readonly new: readonly ChangesetField[] }
+  | { readonly operation: "delete"; readonly indirect: boolean; readonly old: readonly ChangesetField[] }
+  | Extract<ChangesetChange, { readonly operation: "update" }>;
+interface SessionTable {
+  readonly name: string;
+  readonly primaryKey: readonly number[];
+  readonly changes: readonly SessionChange[];
+}
 export interface ChangesetLimits {
   maxBytes?: number;
   maxTables?: number;
@@ -138,7 +157,7 @@ function textBytes(text: string, maximum: number): Uint8Array {
 }
 function validateChange(
   pk: readonly number[],
-  change: PatchsetChange,
+  change: SessionChange,
   patchset: boolean,
 ): void {
   const before = change.operation === "insert" ? undefined : change.old;
@@ -189,6 +208,41 @@ export function decodePatchset(
   return decodeSession(bytes, options, true);
 }
 
+/** @internal Reuse strict wire/scalar/budget admission for native rebase info. */
+export function decodeRebaseInfo(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): readonly ChangesetRebaseTable[] {
+  return Object.freeze(decodeSession(bytes, options, false, true).map((table) =>
+    Object.freeze({
+      name: table.name,
+      primaryKey: table.primaryKey,
+      changes: Object.freeze(table.changes.map((change) => {
+        if (change.operation === "update") format("UPDATE is not a rebase record");
+        return Object.freeze({
+          operation: change.operation,
+          replace: change.indirect,
+          values: change.operation === "insert" ? change.new : change.old,
+        });
+      })),
+    }),
+  ));
+}
+
+/** @internal Emits apply_v2's decision format, not an executable changeset. */
+export function encodeRebaseInfo(
+  tables: readonly ChangesetRebaseTable[],
+  options?: ChangesetLimits,
+): Uint8Array {
+  return encodeSession(tables.map((table) => ({
+    name: table.name,
+    primaryKey: table.primaryKey,
+    changes: table.changes.map((change): SessionChange => change.operation === "insert"
+      ? { operation: "insert", indirect: change.replace, new: change.values }
+      : { operation: "delete", indirect: change.replace, old: change.values }),
+  })), options, false, true);
+}
+
 function decodeSession(
   bytes: Uint8Array,
   options: ChangesetLimits | undefined,
@@ -202,8 +256,15 @@ function decodeSession(
 function decodeSession(
   bytes: Uint8Array,
   options: ChangesetLimits | undefined,
+  patchset: false,
+  rebasing: true,
+): readonly SessionTable[];
+function decodeSession(
+  bytes: Uint8Array,
+  options: ChangesetLimits | undefined,
   patchset: boolean,
-): readonly PatchsetTable[] {
+  rebasing = false,
+): readonly SessionTable[] {
   const policy = resolveChangesetLimits(options);
   bytes = fixedInput(bytes, policy.maxBytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -253,7 +314,7 @@ function decodeSession(
       return format("Invalid changeset UTF-8", pos - size);
     }
   };
-  const result: PatchsetTable[] = [];
+  const result: SessionTable[] = [];
   const names = new Set<string>();
   while (pos < bytes.length) {
     const header = byte();
@@ -284,13 +345,14 @@ function decodeSession(
     const folded = name.replace(/[A-Z]/g, (c) => c.toLowerCase());
     if (names.has(folded)) format("Repeated changeset table header", start);
     names.add(folded);
-    const changes: PatchsetChange[] = [];
+    const changes: SessionChange[] = [];
     const keyCount = pk.filter((value) => value !== 0).length;
     while (pos < bytes.length && bytes[pos] !== 84 && bytes[pos] !== 80) {
       const op = byte(),
         flag = byte();
       if (![18, 9, 23].includes(op) || flag > 1)
         format("Invalid change operation or indirect flag", pos - 2);
+      if (rebasing && op === 23) format("UPDATE is not a rebase record", pos - 2);
       if (++rows > policy.maxChanges) limit("Changeset exceeds maxChanges");
       cells += count * (op === 23 ? 2 : 1);
       if (cells > policy.maxCells) limit("Changeset exceeds maxCells");
@@ -303,7 +365,7 @@ function decodeSession(
             keysOnly && pk[i] === 0 ? undefined : field(),
           ),
         );
-      let change: PatchsetChange;
+      let change: SessionChange;
       if (op === 18)
         change = {
           operation: "insert",
@@ -331,7 +393,15 @@ function decodeSession(
           new: Object.freeze(next),
         };
       } else change = { operation: "update", indirect: flag === 1, old: record(), new: record() };
-      validateChange(pk, change, patchset);
+      if (rebasing) {
+        const values = change.operation === "insert" ? change.new : change.old;
+        for (let i = 0; i < count; i++) {
+          if (pk[i] !== 0 && (values[i] === undefined || values[i] === null))
+            format("Rebase record is missing its primary key", pos);
+          if (op === 9 && values[i] === undefined)
+            format("Rebase DELETE requires a complete before-image", pos);
+        }
+      } else validateChange(pk, change, patchset);
       changes.push(Object.freeze(change));
     }
     if (changes.length === 0) format("Table header has no changes", pos);
@@ -359,9 +429,10 @@ export function encodePatchset(
 }
 
 function encodeSession(
-  tables: readonly PatchsetTable[],
+  tables: readonly SessionTable[],
   options: ChangesetLimits | undefined,
   patchset: boolean,
+  rebasing = false,
 ): Uint8Array {
   const policy = resolveChangesetLimits(options);
   if (!Array.isArray(tables)) input("Changeset tables must be an array");
@@ -488,7 +559,8 @@ function encodeSession(
   }
   const output = buffer.slice(0, pos);
   // One shared semantic validator, including caller-created row/key combinations.
-  decodeSession(output, policy, patchset);
+  if (rebasing) decodeSession(output, policy, false, true);
+  else decodeSession(output, policy, patchset);
   return output;
 }
 

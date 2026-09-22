@@ -82,6 +82,13 @@ export {
 } from "./changeset-delivery";
 export type { ChangesetGroupStats } from "./changeset-group";
 export { ChangesetGroup, ChangesetGroupError, concatChangesets } from "./changeset-group";
+export type { ChangesetRebaseResolution, ChangesetRebaseStats } from "./changeset-rebase";
+export {
+  ChangesetRebaseError,
+  ChangesetRebaser,
+  createChangesetRebaseInfo,
+  rebaseChangeset,
+} from "./changeset-rebase";
 export type {
   ChangesetHttpAuthorization,
   ChangesetHttpHandler,
