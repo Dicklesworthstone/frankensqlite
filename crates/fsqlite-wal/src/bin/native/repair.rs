@@ -100,8 +100,11 @@ impl Options {
     }
 }
 
-/// All offsets are into the original physical WAL. The header, inode, file
-/// length, unchanged frames and uncommitted suffix are never replaced.
+/// Physical frame ranges to repair in the original WAL inode.
+///
+/// The generation header, unchanged frames and uncommitted suffix are never
+/// replaced. Length grows only for a verified torn terminal payload; rollback
+/// must restore the exact original EOF as well as the original damaged bytes.
 struct RepairPlan {
     target: Vec<u8>,
     changed: Vec<Range<usize>>,
@@ -134,14 +137,19 @@ impl RepairPlan {
         let frame_size = page_size.checked_add(WAL_FRAME_HEADER_SIZE)
             .ok_or(FrankenError::TooBig)?;
         let prefix = replay.replayable_prefix();
-        if prefix.len() > snapshot.wal.len()
-            || prefix.get(..WAL_HEADER_SIZE) != snapshot.wal.get(..WAL_HEADER_SIZE)
-        {
+        if prefix.get(..WAL_HEADER_SIZE) != snapshot.wal.get(..WAL_HEADER_SIZE) {
             return Err(corruption("repair cannot replace a WAL generation"));
         }
+        let target_len = snapshot.wal.len().max(prefix.len());
+        if target_len - snapshot.wal.len() != replay.restored_tail_bytes()
+            || replay.restored_tail_bytes() > page_size
+        {
+            return Err(corruption("repair growth lacks verified terminal payload provenance"));
+        }
         let mut target = Vec::new();
-        target.try_reserve_exact(snapshot.wal.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        target.try_reserve_exact(target_len).map_err(|_| FrankenError::OutOfMemory)?;
         target.extend_from_slice(&snapshot.wal);
+        target.resize(target_len, 0);
         target[..prefix.len()].copy_from_slice(prefix);
         let frame_count = replay.committed_frames();
         let mut changed = Vec::new();
@@ -149,7 +157,7 @@ impl RepairPlan {
             .map_err(|_| FrankenError::OutOfMemory)?;
         for offset in (WAL_HEADER_SIZE..prefix.len()).step_by(frame_size) {
             let range = offset..offset + frame_size;
-            if snapshot.wal[range.clone()] != target[range.clone()] {
+            if snapshot.wal.get(range.clone()) != Some(&target[range.clone()]) {
                 changed.push(range);
             }
         }
@@ -215,18 +223,35 @@ impl Drop for IndexPublication {
     }
 }
 
-fn write_ranges(file: &mut (impl Write + Seek), image: &[u8], ranges: &[Range<usize>]) -> io::Result<()> {
+/// Physical rollback must be able to undo an append, not only overwrite bytes.
+trait RepairFile: Read + Write + Seek {
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl RepairFile for std::fs::File {
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)
+    }
+}
+
+fn write_ranges(
+    file: &mut (impl Write + Seek),
+    image: &[u8],
+    ranges: impl IntoIterator<Item = Range<usize>>,
+) -> io::Result<()> {
     for range in ranges {
+        let bytes = image.get(range.clone())
+            .ok_or_else(|| io::Error::other("WAL repair range exceeds its source image"))?;
         file.seek(SeekFrom::Start(u64::try_from(range.start)
             .map_err(|_| io::Error::other("WAL repair offset overflow"))?))?;
-        file.write_all(&image[range.clone()])?;
+        file.write_all(bytes)?;
     }
     Ok(())
 }
 
 /// Settle mutation, or restore and verify the exact original damaged bytes.
 /// The caller masks cancellation and keeps the recovery owner alive throughout.
-fn settle_writes<W: Read + Write + Seek>(
+fn settle_writes<W: RepairFile>(
     file: &mut W,
     cx: &Cx,
     original: &[u8],
@@ -234,7 +259,7 @@ fn settle_writes<W: Read + Write + Seek>(
     mut sync: impl FnMut(&mut W) -> io::Result<()>,
 ) -> Result<blake3::Hash> {
     let write = (|| {
-        write_ranges(file, &plan.target, &plan.changed)?;
+        write_ranges(file, &plan.target, plan.changed.iter().cloned())?;
         sync(file)?;
         verify_image(file, cx, &plan.target)
     })();
@@ -242,7 +267,17 @@ fn settle_writes<W: Read + Write + Seek>(
         Ok(digest) => Ok(digest),
         Err(error) => {
             let restore = (|| {
-                write_ranges(file, original, &plan.changed)?;
+                // The final repair range may extend beyond the captured EOF.
+                // Restore only bytes that physically existed, then remove the
+                // append before sync/readback can certify the original image.
+                let ranges = plan.changed.iter().filter_map(|range| {
+                    let end = range.end.min(original.len());
+                    (range.start < end).then_some(range.start..end)
+                });
+                write_ranges(file, original, ranges)?;
+                if plan.target.len() > original.len() {
+                    file.truncate(u64::try_from(original.len()).map_err(|_| FrankenError::TooBig)?)?;
+                }
                 sync(file)?;
                 verify_image(file, cx, original)
             })();
@@ -399,6 +434,14 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
+
+    impl RepairFile for Cursor<Vec<u8>> {
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            let len = usize::try_from(len).map_err(|_| io::Error::other("test file size overflow"))?;
+            self.get_mut().truncate(len);
+            Ok(())
+        }
+    }
 
     fn with_runtime<F: Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
@@ -696,6 +739,94 @@ mod tests {
         });
     }
 
+    #[test]
+    fn torn_tail_handoff_preserves_inode_and_backs_up_exact_original_eof() {
+        use std::os::unix::fs::MetadataExt;
+
+        with_runtime(async {
+            for missing in [1, 256, 512] {
+                let (options, mut original, repaired) = handoff_fixture();
+                original.truncate(original.len() - missing);
+                let wal_path = companion(&options.source, "-wal");
+                host_fs::write(&wal_path, &original).unwrap();
+                let before = host_fs::metadata(&wal_path).unwrap();
+                let main_before = host_fs::read(&options.source).unwrap();
+                let cx = attached_context();
+                let calls = Cell::new(0);
+                let (opened, report) = options.repair_and_open(&cx, |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(()))
+                }).await.unwrap();
+                opened.unwrap();
+                let after = host_fs::metadata(&wal_path).unwrap();
+                assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+                assert_eq!(calls.get(), 1);
+                assert_eq!(report.wal_frames, 3);
+                assert_eq!(report.repaired_frames, 2);
+                assert!(report.repaired_in_place);
+                assert_eq!(report.digest, blake3::hash(&repaired));
+                assert_eq!(host_fs::read(&wal_path).unwrap(), repaired);
+                assert_eq!(host_fs::read(&options.destination).unwrap(), original);
+                assert_eq!(host_fs::read(&options.source).unwrap(), main_before);
+                assert_recovery_available(&options.source, &cx);
+            }
+        });
+    }
+
+    #[test]
+    fn torn_tail_export_materializes_latest_page_without_modifying_sources() {
+        with_runtime(async {
+            for missing in [1, 512] {
+                let (options, mut original, repaired) = handoff_fixture();
+                original.truncate(original.len() - missing);
+                let wal_path = companion(&options.source, "-wal");
+                host_fs::write(&wal_path, &original).unwrap();
+                let main_before = host_fs::read(&options.source).unwrap();
+                let sidecar_path = companion(&options.source, "-wal-fec");
+                let sidecar_before = host_fs::read(&sidecar_path).unwrap();
+                let cx = attached_context();
+                let report = crate::native_recovery::export_database(&cx, &options).await.unwrap();
+                let expected = &repaired[repaired.len() - 512..];
+                assert_eq!(host_fs::read(&report.destination).unwrap(), expected);
+                assert_eq!(report.digest, blake3::hash(expected));
+                assert_eq!(report.wal_frames, 3);
+                assert_eq!(report.repaired_frames, 2);
+                assert!(!report.repaired_in_place);
+                assert_eq!(host_fs::read(&options.source).unwrap(), main_before);
+                assert_eq!(host_fs::read(&wal_path).unwrap(), original);
+                assert_eq!(host_fs::read(&sidecar_path).unwrap(), sidecar_before);
+                assert_recovery_available(&options.source, &cx);
+            }
+        });
+    }
+
+    #[test]
+    fn torn_tail_refusals_leave_source_and_backup_namespace_untouched() {
+        with_runtime(async {
+            for exceed_budget in [false, true] {
+                let (mut options, mut original, _) = handoff_fixture();
+                if !exceed_budget {
+                    let terminal = original.len() - 512 - WAL_FRAME_HEADER_SIZE;
+                    original[terminal + 16] ^= 1;
+                }
+                original.truncate(original.len() - 1);
+                if exceed_budget { options.replay.max_wal_bytes = original.len(); }
+                let wal_path = companion(&options.source, "-wal");
+                host_fs::write(&wal_path, &original).unwrap();
+                let cx = attached_context();
+                let calls = Cell::new(0);
+                assert!(options.repair_and_open(&cx, |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(()))
+                }).await.is_err());
+                assert_eq!(calls.get(), 0);
+                assert_eq!(host_fs::read(&wal_path).unwrap(), original);
+                assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
+                assert_recovery_available(&options.source, &cx);
+            }
+        });
+    }
+
     fn byte_plan(original: &[u8]) -> RepairPlan {
         let mut target = original.to_vec();
         target[40..60].fill(0x77);
@@ -768,6 +899,7 @@ mod tests {
         file: Cursor<Vec<u8>>,
         bytes_until_failure: usize,
         failed: bool,
+        fail_truncate: bool,
     }
 
     impl Read for TornWrite {
@@ -799,6 +931,15 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
     }
 
+    impl RepairFile for TornWrite {
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            if self.fail_truncate {
+                return Err(io::Error::other("injected rollback truncation failure"));
+            }
+            RepairFile::truncate(&mut self.file, len)
+        }
+    }
+
     #[test]
     fn every_partial_write_boundary_restores_the_exact_original() {
         let original = vec![0x11; 256];
@@ -806,6 +947,7 @@ mod tests {
         for prefix_bytes in 0..50 {
             let mut file = TornWrite {
                 file: Cursor::new(original.clone()), bytes_until_failure: prefix_bytes, failed: false,
+                fail_truncate: false,
             };
             let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(()))
                 .unwrap_err();
@@ -827,5 +969,105 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(file.into_inner(), plan.target);
+    }
+
+    fn growth_plan(original: &[u8]) -> RepairPlan {
+        let mut plan = byte_plan(original);
+        plan.target.resize(320, 0x55);
+        plan.target[240..].fill(0x55);
+        plan.changed.push(240..320);
+        plan
+    }
+
+    #[test]
+    fn growth_settlement_syncs_exact_target_without_replacing_file_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let original = vec![0x11; 256];
+        let plan = growth_plan(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&original).unwrap();
+        let before = file.metadata().unwrap();
+        let digest = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| file.sync_all())
+            .unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(after.len(), 320);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, plan.target);
+        assert_eq!(digest, blake3::hash(&plan.target));
+    }
+
+    #[test]
+    fn every_partial_growth_write_boundary_restores_original_bytes_and_eof() {
+        let original = vec![0x11; 256];
+        let plan = growth_plan(&original);
+        for prefix_bytes in 0..130 {
+            let mut file = TornWrite {
+                file: Cursor::new(original.clone()), bytes_until_failure: prefix_bytes,
+                failed: false, fail_truncate: false,
+            };
+            let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(()))
+                .unwrap_err();
+            assert!(file.failed);
+            assert_eq!(file.file.into_inner(), original);
+            assert!(error.to_string().contains("original WAL restored and synced"));
+        }
+    }
+
+    #[test]
+    fn failed_growth_sync_truncates_before_syncing_and_verifying_rollback() {
+        let original = vec![0x11; 256];
+        let plan = growth_plan(&original);
+        let mut file = Cursor::new(original.clone());
+        let mut calls = 0;
+        let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(file.get_ref().len(), 320);
+                Err(io::Error::other("injected growth sync failure"))
+            } else {
+                assert_eq!(file.get_ref(), &original);
+                Ok(())
+            }
+        }).unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(file.into_inner(), original);
+        assert!(error.to_string().contains("original WAL restored and synced"));
+    }
+
+    #[test]
+    fn failed_growth_readback_removes_the_corrupted_append() {
+        let original = vec![0x11; 256];
+        let plan = growth_plan(&original);
+        let mut file = Cursor::new(original.clone());
+        let mut calls = 0;
+        let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| {
+            calls += 1;
+            if calls == 1 { file.get_mut()[319] ^= 1; }
+            Ok(())
+        }).unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(file.into_inner(), original);
+        assert!(error.to_string().contains("original WAL restored and synced"));
+    }
+
+    #[test]
+    fn failed_growth_rollback_truncation_is_indeterminate_not_restored() {
+        let original = vec![0x11; 256];
+        let plan = growth_plan(&original);
+        let mut file = TornWrite {
+            file: Cursor::new(original.clone()), bytes_until_failure: usize::MAX,
+            failed: false, fail_truncate: true,
+        };
+        let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| {
+            Err(io::Error::other("injected growth sync failure"))
+        }).unwrap_err();
+        assert_eq!(file.file.get_ref().len(), 320);
+        assert!(error.to_string().contains("indeterminate"));
+        assert!(error.to_string().contains("rollback truncation failure"));
+        assert!(!error.to_string().contains("original WAL restored and synced"));
     }
 }
