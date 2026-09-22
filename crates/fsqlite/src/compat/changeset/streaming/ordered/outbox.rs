@@ -17,9 +17,13 @@
 //! Acknowledgements refer to ONE configured downstream delivery obligation
 //! per stream. Authenticate the replica and its committed checkpoint before
 //! calling `acknowledge`; a constructed checkpoint is not a signature. For
-//! fan-out, obtain the required downstream confirmations before acknowledging
-//! here. This queue neither tracks a replica membership set nor makes quorum
-//! durability promises. Reclamation changes SQL queue rows, never files.
+//! fan-out, configure [`fanout`] before recording work: its persisted roster
+//! and per-replica cursors retain each message until every member confirms it.
+//! The single-recipient acknowledgement API refuses roster-managed streams.
+//! Neither mode makes quorum durability promises. Reclamation changes SQL
+//! queue rows, never files.
+
+pub mod fanout;
 
 use std::io;
 use std::pin::Pin;
@@ -172,7 +176,11 @@ fn definition(sql: &str) -> Result<CreateTableStatement> {
 }
 
 async fn validate_schema(conn: &Connection) -> Result<()> {
-    for (name, expected) in [(STREAM_TABLE, CREATE_STREAM), (QUEUE_TABLE, CREATE_QUEUE)] {
+    validate_tables(conn, &[(STREAM_TABLE, CREATE_STREAM), (QUEUE_TABLE, CREATE_QUEUE)]).await
+}
+
+async fn validate_tables(conn: &Connection, tables: &[(&str, &str)]) -> Result<()> {
+    for &(name, expected) in tables {
         let parameter = SqliteValue::Text(name.into());
         let rows = conn.query_with_params(
             "SELECT type,sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE",
@@ -316,7 +324,9 @@ pub async fn state(conn: &mut Connection, cx: &Cx, stream_id: PayloadHash) -> Re
     let owner = begin(conn).await?;
     let result = async {
         validate_schema(conn).await?;
-        load_state(conn, stream_id).await
+        let current = load_state(conn, stream_id).await?;
+        let _ = fanout::snapshot(conn, current).await?;
+        Ok(current)
     }.await;
     complete(owner, cx, result).await
 }
@@ -324,7 +334,7 @@ pub async fn state(conn: &mut Connection, cx: &Cx, stream_id: PayloadHash) -> Re
 async fn preflight(cx: &Cx, body: &[u8], limits: ChangesetStreamLimits) -> Result<()> {
     let mut reader = ChangesetStreamReader::new(Bytes(body), limits);
     while let Some(row) = reader.next(cx).await.map_err(StreamApplyError::from)? {
-        if [STREAM_TABLE, QUEUE_TABLE, super::CURSOR_TABLE].iter()
+        if [STREAM_TABLE, QUEUE_TABLE, super::CURSOR_TABLE, fanout::GROUP_TABLE, fanout::REPLICA_TABLE].iter()
             .any(|name| name.eq_ignore_ascii_case(&row.table.name))
         {
             return Err(protocol("source message targets replication metadata"));
@@ -360,6 +370,7 @@ pub async fn record(
     let result = async {
         validate_schema(conn).await?;
         let current = load_state(conn, previous.stream_id).await?;
+        let audience = fanout::snapshot(conn, current).await?;
         if !super::classify(current.produced, &envelope, identity)? {
             return Ok(ReplicaDisposition::AlreadyApplied);
         }
@@ -380,7 +391,9 @@ pub async fn record(
         drop(reader);
         // A trigger may have changed current-source metadata indirectly.
         validate_schema(conn).await?;
-        if load_state(conn, previous.stream_id).await? != current {
+        if load_state(conn, previous.stream_id).await? != current
+            || fanout::snapshot(conn, current).await? != audience
+        {
             return Err(protocol("source metadata changed during row application"));
         }
         let mut payload = Vec::new();
@@ -402,11 +415,20 @@ pub async fn record(
     Ok(OutboxCommit { envelope, disposition })
 }
 
-async fn read_head(
-    conn: &Connection, cx: &Cx, current: OutboxState, max_message_bytes: u64,
+async fn read_after(
+    conn: &Connection, cx: &Cx, current: OutboxState, after: ReplicaCheckpoint,
+    max_message_bytes: u64,
 ) -> Result<Option<OutboxMessage>> {
-    if current.pending_messages() == 0 { return Ok(None); }
-    let sequence = current.acknowledged.sequence + 1;
+    if after.stream_id != current.produced.stream_id
+        || after.sequence < current.acknowledged.sequence || after.sequence > current.produced.sequence
+    {
+        return Err(protocol("outbox read position is outside retained history"));
+    }
+    if after.sequence == current.produced.sequence {
+        if after != current.produced { return Err(protocol("outbox read position has a conflicting tip")); }
+        return Ok(None);
+    }
+    let sequence = after.sequence + 1;
     let params = [blob(current.produced.stream_id), integer(sequence)?];
     // Check length before requesting an owned payload result. The engine may
     // still read/decode storage pages to evaluate this scalar length query.
@@ -418,7 +440,7 @@ async fn read_head(
     let previous = hash_column(row, 0)?;
     let tip = hash_column(row, 1)?;
     let length = unsigned(row, 2)?;
-    if previous != current.acknowledged.tip || row_text(row, 3) != Some("blob") {
+    if previous != after.tip || row_text(row, 3) != Some("blob") {
         return Err(protocol("outbox head predecessor or payload type mismatch"));
     }
     if length > max_message_bytes { return Err(FrankenError::TooBig.into()); }
@@ -449,7 +471,8 @@ pub async fn next_pending(
     let result = async {
         validate_schema(conn).await?;
         let current = load_state(conn, stream_id).await?;
-        read_head(conn, cx, current, max_message_bytes).await
+        let _ = fanout::snapshot(conn, current).await?;
+        read_after(conn, cx, current, current.acknowledged, max_message_bytes).await
     }.await;
     complete(owner, cx, result).await
 }
@@ -479,6 +502,9 @@ pub async fn acknowledge(
     let result = async {
         validate_schema(conn).await?;
         let current = load_state(conn, confirmed.stream_id).await?;
+        if fanout::snapshot(conn, current).await?.is_some() {
+            return Err(protocol("fanout acknowledgement requires a replica identity"));
+        }
         if confirmed.sequence < current.acknowledged.sequence {
             return Err(ReplicaApplyError::Stale {
                 current: current.acknowledged.sequence,
@@ -495,7 +521,7 @@ pub async fn acknowledge(
         if confirmed.sequence != expected {
             return Err(ReplicaApplyError::Gap { expected, received: confirmed.sequence });
         }
-        let message = read_head(conn, cx, current, max_message_bytes).await?
+        let message = read_after(conn, cx, current, current.acknowledged, max_message_bytes).await?
             .ok_or_else(|| protocol("acknowledgement has no queued message"))?;
         if message.envelope.id() != confirmed.tip {
             return Err(ReplicaApplyError::Diverged { sequence: confirmed.sequence });
