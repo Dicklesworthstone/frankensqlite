@@ -10,6 +10,7 @@ import { decodeChangeset, decodePatchset, decodeRebaseInfo, encodeChangeset, enc
 import { ChangesetRebaser, createChangesetRebaseInfo, rebaseChangeset } from "../src/changeset-rebase.ts";
 import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
 import { ChangesetRebaseJournal, REBASE_JOURNAL_ENTRIES_TABLE as ENTRIES, REBASE_JOURNAL_HEADS_TABLE as HEADS } from "../src/changeset-rebase-journal.ts";
+import { CHANGESET_DELIVERY_PROTOCOL, ChangesetReceiver } from "../src/changeset-delivery.ts";
 
 const oraclePath = fileURLToPath(new URL("./helpers/rebase-oracle.py", import.meta.url));
 function oracle(input) {
@@ -768,3 +769,253 @@ test("journal pre-cancelled work never enters SQL and late post-COMMIT cancellat
     assert.equal(result.replayed, false); assert.equal(result.entry.position, 1);
   } finally { db.close(); }
 });
+
+// The production receiver, not a replacement apply callback, owns this journal.
+// Receipt framing stays unchanged; local proof is never remote authentication.
+function receiver(host, options = {}) {
+  return new ChangesetReceiver(host, {
+    receiverId: "receiver-1", tables: ["t"], onConflict: () => "omit",
+    confirmCommit: async () => {},
+    rebaseJournal: { journalId: "received-history" }, ...options,
+  });
+}
+async function envelope(wire = remoteFirst(), deliveryId = "remote:1") {
+  return {
+    protocol: CHANGESET_DELIVERY_PROTOCOL, receiverId: "receiver-1", deliveryId,
+    sha256: hex(new Uint8Array(await crypto.subtle.digest("SHA-256", wire))),
+    changeset: wire,
+  };
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
+
+test("journal receiver saves native decisions before confirming an unchanged receipt", async () => {
+  const { db, host } = opened();
+  let confirmations = 0, policies = 0;
+  const r = receiver(host, {
+    onConflict: () => { policies++; return "omit"; },
+    async confirmCommit() {
+      assert.equal(journalCount(db), 1); assert.equal(inboxCount(db), 1);
+      assert.equal((await r.rebaseJournal.head()).position, 1);
+      confirmations++;
+    },
+  });
+  try {
+    const message = await envelope();
+    const result = await r.receive(message);
+    assert.deepEqual(result, {
+      protocol: CHANGESET_DELIVERY_PROTOCOL, receiverId: "receiver-1", deliveryId: "remote:1",
+      sha256: message.sha256, byteLength: message.changeset.length,
+      applied: 0, omitted: 1, replayed: false, confirmed: true,
+    });
+    assert.ok(Object.isFrozen(result));
+    const proof = await r.rebaseJournal.read("remote:1");
+    assert.deepEqual(decodeRebaseInfo(proof.rebaseInfo), decodeRebaseInfo(rbInfo()));
+    assert.deepEqual(records((await r.rebaseJournal.rebase(local())).changeset), first.expectedRecords);
+    assert.deepEqual(await r.receive(message), { ...result, replayed: true });
+    assert.equal(confirmations, 2); assert.equal(policies, 1); assert.equal(journalCount(db), 1);
+  } finally { db.close(); }
+});
+
+test("journal receiver cannot ACK while confirmation is suspended or queue a second receive", async () => {
+  const { db, host } = opened(), entered = deferred(), release = deferred();
+  let settled = false;
+  const r = receiver(host, { async confirmCommit() { entered.resolve(); await release.promise; } });
+  const message = await envelope();
+  const pending = r.receive(message).finally(() => { settled = true; });
+  try {
+    await entered.promise;
+    assert.equal(settled, false); assert.equal(journalCount(db), 1);
+    assert.equal((await r.rebaseJournal.read("remote:1")).position, 1);
+    const admissions = host.admissions;
+    await assert.rejects(r.receive(message), { code: "ERR_FSQLITE_DELIVERY_BUSY", phase: "admission" });
+    assert.equal(host.admissions, admissions); assert.equal(settled, false);
+    release.resolve(); assert.equal((await pending).confirmed, true);
+  } finally { release.resolve(); await pending.catch(() => {}); db.close(); }
+});
+
+test("journal receiver confirmation failure preserves history and replay confirms again", async () => {
+  const { db, host } = opened();
+  let confirmations = 0, policies = 0;
+  const r = receiver(host, {
+    onConflict: () => { policies++; return "omit"; },
+    async confirmCommit() { if (++confirmations === 1) throw new Error("checkpoint not acknowledged"); },
+  });
+  try {
+    const message = await envelope();
+    await assert.rejects(r.receive(message), { phase: "receiver-confirm" });
+    const before = await r.rebaseJournal.read("remote:1");
+    const replay = await r.receive(message);
+    assert.equal(replay.confirmed, true); assert.equal(replay.replayed, true);
+    assert.deepEqual(await r.rebaseJournal.read("remote:1"), before);
+    assert.equal(confirmations, 2); assert.equal(policies, 1);
+  } finally { db.close(); }
+});
+
+test("journal receiver lost SQL ACK and file reopen recover before remote acknowledgement", async () => {
+  const filename = join(mkdtempSync(join(tmpdir(), "fsqlite-journal-receiver-")), "receiver.db");
+  let { db, host } = opened(first, filename);
+  let confirmations = 0;
+  const message = await envelope();
+  try {
+    const firstReceiver = receiver(host, { async confirmCommit() { confirmations++; } });
+    host.loseAcknowledgement = true;
+    await assert.rejects(firstReceiver.receive(message), { phase: "receiver-apply" });
+    assert.equal(confirmations, 0); assert.equal(journalCount(db), 1);
+    db.close(); db = new DatabaseSync(filename); host = sqlTarget(db);
+    const reopened = receiver(host, {
+      onConflict: () => assert.fail("reopen must not rerun conflict policy"),
+      async confirmCommit() { confirmations++; },
+    });
+    const saved = await reopened.rebaseJournal.read("remote:1");
+    const result = await reopened.receive(message);
+    assert.equal(result.replayed, true); assert.equal(result.confirmed, true);
+    assert.equal(confirmations, 1); assert.equal(journalCount(db), 1);
+    assert.deepEqual(await reopened.rebaseJournal.read("remote:1"), saved);
+    assert.deepEqual(records((await reopened.rebaseJournal.rebase(local())).changeset), first.expectedRecords);
+    assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  } finally { db.close(); }
+});
+
+for (const settings of [{ maxEntries: 1 }, { maxBytes: 1 }]) {
+  test(`journal receiver ${Object.keys(settings)[0]} backpressure cannot ACK or partially apply`, async () => {
+    const { db, host } = opened();
+    let confirmations = 0;
+    const r = receiver(host, {
+      rebaseJournal: { journalId: "bounded", ...settings },
+      onConflict: () => "replace", async confirmCommit() { confirmations++; },
+    });
+    try {
+      if (settings.maxEntries) await r.receive(await envelope(new Uint8Array(), "empty"));
+      const initial = confirmations;
+      await assert.rejects(r.receive(await envelope()), (error) =>
+        error.phase === "receiver-apply" && error.cause?.code === "ERR_FSQLITE_REBASE_JOURNAL_LIMIT");
+      assert.equal(confirmations, initial); assert.equal(journalCount(db), initial);
+      assert.equal(inboxCount(db), initial); assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    } finally { db.close(); }
+  });
+}
+
+test("journal receiver corrupt proof blocks a replay ACK without repeating SQL", async () => {
+  const { db, host } = opened();
+  let confirmations = 0, policies = 0;
+  const r = receiver(host, {
+    onConflict: () => { policies++; return "omit"; },
+    async confirmCommit() { confirmations++; },
+  });
+  try {
+    const message = await envelope(); await r.receive(message);
+    db.exec(`UPDATE ${ENTRIES} SET sha256='${"0".repeat(64)}'`);
+    await assert.rejects(r.receive(message), (e) => e.phase === "receiver-apply" && e.cause?.code === "ERR_FSQLITE_REBASE_JOURNAL_CORRUPT");
+    assert.equal(confirmations, 1); assert.equal(policies, 1); assert.equal(journalCount(db), 1);
+  } finally { db.close(); }
+});
+
+for (const previousJournal of [undefined, { journalId: "another-history" }]) {
+  test(`journal receiver refuses ${previousJournal ? "another journal's" : "unjournaled"} prior receipt`, async () => {
+    const { db, host } = opened();
+    let confirmations = 0;
+    try {
+      const message = await envelope();
+      await receiver(host, { rebaseJournal: previousJournal }).receive(message);
+      const r = receiver(host, {
+        onConflict: () => assert.fail("a retained receipt must not rerun its policy"),
+        async confirmCommit() { confirmations++; },
+      });
+      await assert.rejects(r.receive(message), (e) => e.phase === "receiver-apply" && e.cause?.code === "ERR_FSQLITE_REBASE_JOURNAL_MISSING");
+      assert.equal(confirmations, 0); assert.equal((await r.rebaseJournal.head()).position, 0);
+      assert.equal(journalCount(db), previousJournal ? 1 : 0);
+    } finally { db.close(); }
+  });
+}
+
+test("journal receiver default path stays unjournaled and remote policy fields cannot enable it", async () => {
+  const { db, host } = opened();
+  try {
+    const r = receiver(host, { rebaseJournal: undefined });
+    assert.equal(r.rebaseJournal, null);
+    const message = { ...await envelope(), rebaseJournal: { journalId: "remote-selected" } };
+    assert.equal((await r.receive(message)).confirmed, true);
+    assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 1);
+  } finally { db.close(); }
+});
+
+test("journal receiver captures configured identity and limits once and ignores remote replacements", async () => {
+  const { db, host } = opened();
+  let reads = 0;
+  const config = { journalId: "configured", maxEntries: 1 };
+  const r = receiver(host, { get rebaseJournal() { reads++; return config; } });
+  try {
+    config.journalId = "changed"; config.maxEntries = 100;
+    const message = { ...await envelope(), rebaseJournal: { journalId: "remote" } };
+    assert.equal(r.rebaseJournal.journalId, "configured");
+    await r.receive(message);
+    await assert.rejects(r.receive(await envelope(new Uint8Array(), "over")), (e) => e.cause?.code === "ERR_FSQLITE_REBASE_JOURNAL_LIMIT");
+    assert.equal(reads, 1); assert.equal((await r.rebaseJournal.head()).position, 1);
+  } finally { db.close(); }
+});
+
+test("journal receiver validates constructor policy without starting SQL", () => {
+  const { db, host } = opened();
+  try {
+    for (const rebaseJournal of [null, false, {}, { journalId: "" }, { journalId: "ok", maxEntries: 0 }])
+      assert.throws(() => receiver(host, { rebaseJournal }));
+    assert.equal(host.admissions, 0); assert.equal(journalCount(db), 0);
+  } finally { db.close(); }
+});
+
+test("journal receiver cancellation within append rolls back and never confirms", async () => {
+  const { db, host } = opened(), c = new AbortController();
+  let confirmations = 0;
+  const target = intercepted(host, (sql) => {
+    if (sql.startsWith("INSERT OR ABORT") && sql.includes(ENTRIES)) c.abort();
+  });
+  try {
+    const r = receiver(target, { onConflict: () => "replace", async confirmCommit() { confirmations++; } });
+    await assert.rejects(r.receive(await envelope(), { signal: c.signal }), { phase: "receiver-apply" });
+    assert.equal(confirmations, 0); assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+  } finally { db.close(); }
+});
+
+for (const cut of ["after-commit", "during-confirmation"]) {
+  test(`journal receiver cancellation ${cut} preserves committed proof but withholds ACK`, async () => {
+    const { db, host } = opened(), c = new AbortController();
+    let confirmations = 0;
+    const target = cut === "after-commit" ? {
+      async transaction(work, options) { const result = await host.transaction(work, options); c.abort(); return result; },
+    } : host;
+    const r = receiver(target, {
+      async confirmCommit() { confirmations++; if (cut === "during-confirmation") c.abort(); },
+    });
+    try {
+      const message = await envelope();
+      await assert.rejects(r.receive(message, { signal: c.signal }), { code: "ERR_FSQLITE_DELIVERY_CANCELLED" });
+      assert.equal(confirmations, cut === "after-commit" ? 0 : 1);
+      assert.equal(journalCount(db), 1); assert.equal(inboxCount(db), 1);
+      const reopened = receiver(host, { onConflict: () => assert.fail("no policy replay") });
+      assert.equal((await reopened.receive(message)).replayed, true);
+      assert.equal((await reopened.rebaseJournal.read("remote:1")).position, 1);
+    } finally { db.close(); }
+  });
+}
+
+for (const c of generated.cases.filter((c) => c.remoteWires.length > 1).slice(0, 8)) {
+  test(`journal receiver ordered native history: ${c.name}`, async () => {
+    const { db, host } = opened(c);
+    let policy = "omit", confirmations = 0;
+    const r = receiver(host, { onConflict: () => policy, async confirmCommit() { confirmations++; } });
+    try {
+      for (let i = 0; i < c.remoteWires.length; i++) {
+        policy = c.remote[i].policy;
+        await r.receive(await envelope(bytes(c.remoteWires[i]), `ordered:${i}`));
+      }
+      const output = await r.rebaseJournal.rebase(bytes(c.localWire));
+      assert.deepEqual(records(output.changeset), c.expectedRecords);
+      assert.equal(output.through, c.remoteWires.length); assert.equal(confirmations, c.remoteWires.length);
+    } finally { db.close(); }
+  });
+}

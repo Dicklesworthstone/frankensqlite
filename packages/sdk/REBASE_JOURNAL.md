@@ -64,6 +64,51 @@ same database before externally acknowledging durability. A memory database is
 not durable merely because it has journal tables. A lost commit response is
 uncertain: reopen/reconcile and retry the same ID and bytes, never a new ID.
 
+## Receiving deliveries with persistent history
+
+`ChangesetReceiver` accepts an optional `rebaseJournal` configuration. It creates
+the journal on its own SQL target, not a separately supplied database, and runs
+received changes through that journal before the existing confirmation barrier:
+
+```ts
+import { ChangesetReceiver } from '@frankensqlite/sdk';
+
+const receiver = new ChangesetReceiver(db, {
+  receiverId: 'device-42',
+  tables: ['notes'],
+  rebaseJournal: { journalId: 'device-42:local-history', maxEntries: 10_000 },
+  // Application-owned checkpoint/recovery barrier for this same database.
+  confirmCommit: confirmDatabaseCommit,
+  onConflict: conflict => conflict.kind === 'data' ? 'omit' : 'abort',
+});
+const receipt = await receiver.receive(authenticatedEnvelope);
+const history = receiver.rebaseJournal!;
+const savedDecision = await history.read(receipt.deliveryId);
+const rebased = await history.rebase(originalLocalChangeset, { after: localHistoryBasis });
+```
+
+The receipt and delivery protocol are unchanged: no journal payload, position,
+or local policy is added to the wire. The accessor returns local history, or
+`null` when the feature is not configured. Configure it in trusted application
+code; fields in an incoming message cannot enable or replace it. Coordinate
+direct accessor use with the same database ownership and lifecycle as other SQL.
+
+A journaled SQL commit does not by itself produce a receiver ACK. Confirmation
+must finish, including on an exact replay. If SQL commits but confirmation or
+response delivery fails, the original journal entry remains available; retry the
+same envelope after reconciliation instead of rerunning SQL or selecting a new
+identity. Cancellation after commit can withhold the receiver ACK without undoing
+committed history. The existing receiver still refuses concurrent receives rather
+than queuing unbounded work. A full/corrupt journal or an unjournaled prior receipt
+prevents confirmation; it never silently falls back to the unjournaled path.
+
+Reopen with the same local `journalId`. Turning journaling on for previously
+unjournaled deliveries cannot reconstruct their decisions; those receipt replays
+fail explicitly. Receivers without this option retain their previous application
+path and do not create journal tables. Existing transports and pumps keep their
+unchanged confirmation/receipt rules; this does not turn local history into an
+authenticated remote rebase protocol or automatically rewrite queued payloads.
+
 ## Ordered rebasing
 
 `rebase(originalLocalBytes, { after, through })` reads one SQL snapshot and
@@ -124,5 +169,10 @@ session/apply_v2/rebaser APIs. They cover persistent reopen, lost ACK, exact
 replay, scoped positions, empty decisions, entry/byte bounds, checksum/accounting
 corruption, missing receipts, main/TEMP triggers, cancellation around both writes,
 I/O exceptions, deferred COMMIT failure and enclosing-transaction rollback.
+Receiver integration tests also execute the actual `ChangesetReceiver` with the
+production journal: suspended/failed confirmation, busy admission, lost SQL ACK
+and file reopen, exact wire receipts, local configuration capture, unchanged
+unjournaled default, backpressure, corrupt/missing history, ordered native-oracle
+rebasing, and cancellation before or after committed history.
 They are not certification of the FrankenSQLite Rust/WASM engine, browser
 storage, native ECS, or power-loss behavior.
