@@ -13,6 +13,8 @@
 //! verified chunk plus one decoded row, not the entire changeset. Transaction
 //! storage can still grow with the write set.
 
+pub mod outbox;
+
 use std::fmt;
 
 use asupersync::io::AsyncRead;
