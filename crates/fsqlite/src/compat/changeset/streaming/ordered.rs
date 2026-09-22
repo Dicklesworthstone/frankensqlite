@@ -36,6 +36,16 @@ const CURSOR_TABLE: &str = "_fsqlite_replica_cursor_v1";
 const CREATE_CURSOR: &str = "CREATE TABLE IF NOT EXISTS main._fsqlite_replica_cursor_v1(\
     stream_id BLOB PRIMARY KEY NOT NULL, sequence INTEGER NOT NULL, tip BLOB NOT NULL)";
 
+/// Domain-separated BLAKE3 through the shared types crate, not a new facade
+/// dependency. The canonical hash input is domain || NUL || envelope bytes.
+fn envelope_id(bytes: &[u8]) -> PayloadHash {
+    let mut input = Vec::with_capacity(ID_DOMAIN.len() + 1 + bytes.len());
+    input.extend_from_slice(ID_DOMAIN.as_bytes());
+    input.push(0);
+    input.extend_from_slice(bytes);
+    PayloadHash::blake3(&input)
+}
+
 /// Immutable ordering and content commitment for a single Session message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationEnvelope {
@@ -87,7 +97,7 @@ impl ReplicationEnvelope {
 
     #[must_use]
     pub fn id(&self) -> PayloadHash {
-        PayloadHash::from_bytes(blake3::derive_key(ID_DOMAIN, &self.encode()))
+        envelope_id(&self.encode())
     }
 
     /// Verify the independently trusted envelope root before allocating its
@@ -102,7 +112,7 @@ impl ReplicationEnvelope {
         {
             return Err(protocol("invalid ordered changeset envelope"));
         }
-        if PayloadHash::from_bytes(blake3::derive_key(ID_DOMAIN, bytes)) != expected_id {
+        if envelope_id(bytes) != expected_id {
             return Err(protocol("ordered changeset envelope identity mismatch"));
         }
         let stream_id = PayloadHash::from_bytes(bytes[8..40].try_into().expect("header width"));
@@ -190,7 +200,7 @@ impl From<StreamApplyError> for ReplicaApplyError {
     fn from(error: StreamApplyError) -> Self { Self::Stream(error) }
 }
 
-fn protocol(detail: &'static str) -> ReplicaApplyError {
+const fn protocol(detail: &'static str) -> ReplicaApplyError {
     ReplicaApplyError::Protocol { detail }
 }
 
@@ -245,7 +255,7 @@ async fn begin(conn: &Connection) -> Result<ApplyTransaction<'_>, ReplicaApplyEr
 async fn validate_cursor_schema(conn: &Connection) -> Result<(), ReplicaApplyError> {
     let name = SqliteValue::Text(CURSOR_TABLE.into());
     let objects = conn.query_with_params(
-        "SELECT type, sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE", &[name.clone()],
+        "SELECT type, sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE", std::slice::from_ref(&name),
     ).await?;
     let [object] = objects.as_slice() else { return Err(protocol("replication cursor table is missing or ambiguous")); };
     if row_text(object, 0) != Some("table") { return Err(protocol("replication cursor is not an ordinary table")); }
@@ -474,8 +484,12 @@ mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, ReadBuf};
     use fsqlite_ext_session::{ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, TableChangeset, TableInfo};
+    use crate::compat::changeset_stream::verified::CHANGESET_FRAME_CHUNK_BYTES;
+    use std::cell::Cell;
+    use std::future::{Future, poll_fn};
     use std::io;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::task::{Context, Poll};
 
     struct Input {
@@ -500,9 +514,9 @@ mod tests {
         }
     }
 
-    fn hash(byte: u8) -> PayloadHash { PayloadHash::from_bytes([byte; 32]) }
+    const fn hash(byte: u8) -> PayloadHash { PayloadHash::from_bytes([byte; 32]) }
 
-    fn baseline() -> ReplicaCheckpoint {
+    const fn baseline() -> ReplicaCheckpoint {
         ReplicaCheckpoint { stream_id: hash(1), sequence: 0, tip: hash(2) }
     }
 
@@ -557,6 +571,7 @@ mod tests {
         let message = envelope(baseline(), &bytes);
         let encoded = message.encode();
         assert_eq!(ReplicationEnvelope::decode(&encoded, message.id(), 1 << 20).unwrap(), message);
+        assert_ne!(message.id(), PayloadHash::blake3(&encoded), "envelope hashes are domain separated");
         for offset in [0, 8, 40, 48, encoded.len() - 1] {
             let mut altered = encoded.clone();
             altered[offset] ^= 1;
@@ -689,6 +704,236 @@ mod tests {
             assert_eq!(count(&conn, "t").await, 1);
             conn.execute("ROLLBACK").await.unwrap();
             assert_unapplied(&mut conn).await;
+        });
+    }
+
+    #[test]
+    fn ordered_file_reopen_reconciles_cursor_and_deduplicates_trigger_effects() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("ordered.db");
+            let cx = Cx::new();
+            let mut conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE); \
+                CREATE TABLE audit(id INTEGER PRIMARY KEY); \
+                CREATE TRIGGER log_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;")
+                .await.unwrap();
+            initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let bytes = wire(vec![insert(1, "first")]);
+            let message = envelope(baseline(), &bytes);
+            let receipt = apply(&mut conn, &cx, &mut Input::new(bytes), &message,
+                message.id(), ChangesetStreamLimits::default()).await.unwrap();
+            conn.close().await.unwrap();
+
+            let mut reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(current_checkpoint(&mut reopened, &cx, baseline().stream_id).await.unwrap(),
+                Some(receipt.checkpoint));
+            assert!(initialize(&mut reopened, &cx, baseline()).await.is_err(), "never reset progress");
+            let mut duplicate = Input::new(Vec::new());
+            assert_eq!(apply(&mut reopened, &cx, &mut duplicate, &message, message.id(),
+                ChangesetStreamLimits::default()).await.unwrap().disposition, ReplicaDisposition::AlreadyApplied);
+            assert_eq!(duplicate.reads, 0);
+            assert_eq!(count(&reopened, "audit").await, 1);
+            let fork = envelope(baseline(), &wire(vec![insert(1, "fork")]));
+            assert!(matches!(apply(&mut reopened, &cx, &mut duplicate, &fork, fork.id(),
+                ChangesetStreamLimits::default()).await, Err(ReplicaApplyError::Diverged { sequence: 1 })));
+            assert_eq!(duplicate.reads, 0);
+
+            let next = wire(vec![ChangesetRow {
+                op: ChangeOp::Delete, indirect: false,
+                old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("first".to_owned())],
+                new_values: Vec::new(),
+            }, insert(2, "second")]);
+            let next_message = envelope(receipt.checkpoint, &next);
+            let next_receipt = apply(&mut reopened, &cx, &mut Input::new(next), &next_message,
+                next_message.id(), ChangesetStreamLimits::default()).await.unwrap();
+            reopened.close().await.unwrap();
+
+            let mut final_open = Connection::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(current_checkpoint(&mut final_open, &cx, baseline().stream_id).await.unwrap(),
+                Some(next_receipt.checkpoint));
+            assert_eq!(count(&final_open, "t").await, 1);
+            assert_eq!(count(&final_open, "audit").await, 2);
+            assert_eq!(final_open.query_row("SELECT v FROM t WHERE id=2").await.unwrap().get(0),
+                Some(&SqliteValue::Text("second".into())));
+            assert_eq!(final_open.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                Some(&SqliteValue::Text("ok".into())));
+            final_open.close().await.unwrap();
+        });
+    }
+
+    fn multichunk_message() -> Vec<u8> {
+        // The first row fits in verified chunk zero and is applied before the
+        // second row needs another chunk. Failures there must undo that prefix.
+        wire(vec![insert(1, "verified prefix"), insert(2, &"x".repeat(CHANGESET_FRAME_CHUNK_BYTES + 17))])
+    }
+
+    #[test]
+    fn ordered_late_chunk_corruption_truncation_and_limits_undo_the_prefix() {
+        asupersync::test_utils::run_test(|| async {
+            let bytes = multichunk_message();
+            let message = envelope(baseline(), &bytes);
+            assert!(bytes.len() > CHANGESET_FRAME_CHUNK_BYTES);
+            let mut altered = bytes.clone();
+            let tail = altered.len() - 1;
+            altered[tail] ^= 1; // Still valid text, but not the trusted content.
+            for input_bytes in [altered, bytes[..CHANGESET_FRAME_CHUNK_BYTES].to_vec()] {
+                let mut conn = setup().await;
+                let mut input = Input::new(input_bytes);
+                input.chunk = 8192;
+                let error = apply(&mut conn, &Cx::new(), &mut input, &message, message.id(),
+                    ChangesetStreamLimits::default()).await.unwrap_err();
+                assert!(matches!(error, ReplicaApplyError::Stream(StreamApplyError::Input(_))));
+                assert!(input.offset >= CHANGESET_FRAME_CHUNK_BYTES);
+                assert_unapplied(&mut conn).await;
+            }
+            let mut conn = setup().await;
+            let mut input = Input::new(bytes);
+            input.chunk = 8192;
+            let limits = ChangesetStreamLimits { max_rows: 1, ..ChangesetStreamLimits::default() };
+            assert!(matches!(apply(&mut conn, &Cx::new(), &mut input, &message, message.id(), limits).await,
+                Err(ReplicaApplyError::Stream(StreamApplyError::Input(
+                    crate::compat::changeset_stream::ChangesetStreamError::Limit { resource: "rows", .. }
+                )))));
+            assert_unapplied(&mut conn).await;
+        });
+    }
+
+    struct PausedInput {
+        input: Input,
+        stop: usize,
+        reached: Rc<Cell<bool>>,
+    }
+
+    impl AsyncRead for PausedInput {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, out: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if out.remaining() == 0 { return Poll::Ready(Ok(())); }
+            if this.input.offset == this.stop {
+                this.reached.set(true);
+                return Poll::Pending;
+            }
+            let n = out.remaining().min(this.input.chunk)
+                .min(this.input.bytes.len() - this.input.offset)
+                .min(this.stop - this.input.offset);
+            out.put_slice(&this.input.bytes[this.input.offset..this.input.offset + n]);
+            this.input.offset += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn ordered_dropped_future_waiting_for_later_chunk_rolls_back_before_reconciliation() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = setup().await;
+            let cx = Cx::new();
+            let bytes = multichunk_message();
+            let message = envelope(baseline(), &bytes);
+            let reached = Rc::new(Cell::new(false));
+            let mut input = PausedInput {
+                input: Input { bytes: bytes.clone(), offset: 0, chunk: 8192, reads: 0 },
+                stop: CHANGESET_FRAME_CHUNK_BYTES,
+                reached: Rc::clone(&reached),
+            };
+            let mut operation = Box::pin(apply(&mut conn, &cx, &mut input, &message,
+                message.id(), ChangesetStreamLimits::default()));
+            poll_fn(|task_cx| {
+                assert!(operation.as_mut().poll(task_cx).is_pending(), "the second chunk must suspend");
+                if reached.get() { Poll::Ready(()) } else { Poll::Pending }
+            }).await;
+            drop(operation);
+            // Reconciliation itself must settle deferred cleanup. Do not run
+            // a separate SQL statement first that could conceal a missing guard.
+            assert_eq!(current_checkpoint(&mut conn, &cx, baseline().stream_id).await.unwrap(), Some(baseline()));
+            assert_unapplied(&mut conn).await;
+            let mut retry = Input::new(bytes);
+            retry.chunk = 8192;
+            assert_eq!(apply(&mut conn, &cx, &mut retry, &message, message.id(),
+                ChangesetStreamLimits::default()).await.unwrap().checkpoint.sequence, 1);
+            assert_eq!(count(&conn, "t").await, 2);
+            assert_eq!(count(&conn, "audit").await, 2);
+        });
+    }
+
+    #[test]
+    fn ordered_commit_time_foreign_key_failure_rolls_back_advanced_cursor() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = Connection::open(":memory:").await.unwrap();
+            let cx = Cx::new();
+            conn.execute("PRAGMA foreign_keys=ON; CREATE TABLE parent(id INTEGER PRIMARY KEY); \
+                CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED); \
+                CREATE TABLE audit(id INTEGER PRIMARY KEY); \
+                CREATE TRIGGER log_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;")
+                .await.unwrap();
+            initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let bytes = wire(vec![insert(1, "99")]);
+            let message = envelope(baseline(), &bytes);
+            assert!(matches!(apply(&mut conn, &cx, &mut Input::new(bytes.clone()), &message,
+                message.id(), ChangesetStreamLimits::default()).await, Err(ReplicaApplyError::Database(_))));
+            assert_unapplied(&mut conn).await;
+            conn.execute("INSERT INTO parent VALUES(99)").await.unwrap();
+            assert_eq!(apply(&mut conn, &cx, &mut Input::new(bytes), &message,
+                message.id(), ChangesetStreamLimits::default()).await.unwrap().checkpoint.sequence, 1);
+            assert_eq!(count(&conn, "t").await, 1);
+            assert_eq!(count(&conn, "audit").await, 1);
+        });
+    }
+
+    #[test]
+    fn ordered_empty_messages_checkpoint_without_input_and_stop_at_signed_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let mut conn = Connection::open(":memory:").await.unwrap();
+            let cx = Cx::new();
+            let max_sequence = u64::try_from(i64::MAX).unwrap();
+            let near_limit = ReplicaCheckpoint { sequence: max_sequence - 1, ..baseline() };
+            initialize(&mut conn, &cx, near_limit).await.unwrap();
+            let message = envelope(near_limit, &[]);
+            let mut input = Input::new(b"next message must stay unread".to_vec());
+            let receipt = apply(&mut conn, &cx, &mut input, &message, message.id(),
+                ChangesetStreamLimits::default()).await.unwrap();
+            assert_eq!(receipt.checkpoint.sequence, max_sequence);
+            assert_eq!(receipt.disposition, ReplicaDisposition::Applied(SqlChangesetApplyReport::default()));
+            assert_eq!(input.reads, 0);
+            assert_eq!(current_checkpoint(&mut conn, &cx, baseline().stream_id).await.unwrap(), Some(receipt.checkpoint));
+            assert!(ReplicationEnvelope::new(hash(1), max_sequence + 1, message.id(), message.frame.clone()).is_err());
+            let absent = ReplicationEnvelope::new(hash(3), 1, hash(2), message.frame.clone()).unwrap();
+            assert!(matches!(apply(&mut conn, &cx, &mut input, &absent, absent.id(),
+                ChangesetStreamLimits::default()).await, Err(ReplicaApplyError::Uninitialized)));
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(apply(&mut conn, &cancelled, &mut input, &message, message.id(),
+                ChangesetStreamLimits::default()).await, Err(ReplicaApplyError::Database(FrankenError::Interrupt))));
+            assert_eq!(input.reads, 0);
+        });
+    }
+
+    #[test]
+    fn ordered_cursor_schema_collisions_and_metadata_triggers_are_not_adopted() {
+        asupersync::test_utils::run_test(|| async {
+            for definition in [
+                "CREATE TABLE _fsqlite_replica_cursor_v1(stream_id TEXT PRIMARY KEY NOT NULL, sequence INTEGER NOT NULL, tip BLOB NOT NULL)",
+                "CREATE VIEW _fsqlite_replica_cursor_v1 AS SELECT 1 AS stream_id, 0 AS sequence, NULL AS tip",
+            ] {
+                let mut conn = Connection::open(":memory:").await.unwrap();
+                conn.execute(definition).await.unwrap();
+                let original = conn.query_row("SELECT sql FROM main.sqlite_schema WHERE name='_fsqlite_replica_cursor_v1'")
+                    .await.unwrap().get(0).unwrap().clone();
+                assert!(initialize(&mut conn, &Cx::new(), baseline()).await.is_err());
+                assert_eq!(conn.query_row("SELECT sql FROM main.sqlite_schema WHERE name='_fsqlite_replica_cursor_v1'")
+                    .await.unwrap().get(0), Some(&original));
+                assert!(!conn.in_transaction());
+            }
+            for temporary in [false, true] {
+                let mut conn = Connection::open(":memory:").await.unwrap();
+                conn.execute(CREATE_CURSOR).await.unwrap();
+                let prefix = if temporary { "TEMP " } else { "" };
+                conn.execute(&format!("CREATE {prefix}TRIGGER reject_cursor BEFORE INSERT ON main._fsqlite_replica_cursor_v1 \
+                    BEGIN SELECT RAISE(ABORT,'metadata trigger must not run'); END")).await.unwrap();
+                assert!(matches!(initialize(&mut conn, &Cx::new(), baseline()).await,
+                    Err(ReplicaApplyError::Protocol { detail: "replication cursor must not have triggers" })));
+                assert_eq!(count(&conn, CURSOR_TABLE).await, 0);
+                assert!(!conn.in_transaction());
+            }
         });
     }
 }
