@@ -13,6 +13,13 @@
 //! total RSS. SQL uses the caller's unchanged connection environment; `Cx`
 //! governs ingestion and publication checkpoints. No runtime or writer mutex
 //! is created, and the ordinary concurrent-writer mode is never disabled.
+//!
+//! Acknowledgements refer to ONE configured downstream delivery obligation
+//! per stream. Authenticate the replica and its committed checkpoint before
+//! calling `acknowledge`; a constructed checkpoint is not a signature. For
+//! fan-out, obtain the required downstream confirmations before acknowledging
+//! here. This queue neither tracks a replica membership set nor makes quorum
+//! durability promises. Reclamation changes SQL queue rows, never files.
 
 use std::io;
 use std::pin::Pin;
@@ -210,8 +217,9 @@ async fn load_state(conn: &Connection, stream_id: PayloadHash) -> Result<OutboxS
     {
         return Err(protocol("inconsistent outbox positions"));
     }
-    // Validate accounting without materializing queued bodies. With the
-    // validated composite PK, count/min/max prove contiguous sequence coverage.
+    // Return scalar accounting, not an owned collection of queued bodies.
+    // Engine execution/storage allocations remain outside the wire budget.
+    // With the validated composite PK, count/min/max prove sequence coverage.
     let rows = conn.query_with_params(
         "SELECT count(*),coalesce(sum(length(body)),0),min(sequence),max(sequence) FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1",
         &[blob(stream_id)],
@@ -265,7 +273,8 @@ async fn complete<T>(mut owner: ApplyTransaction<'_>, cx: &Cx, result: Result<T>
 
 /// Establish the source position of an already coherent baseline. Provision
 /// the receiver from that SAME baseline separately. Never infer it from input.
-/// Existing streams are accepted only at their original, empty baseline.
+/// Existing streams are accepted only at the same already-empty position;
+/// initialization never moves either cursor or resets progressed history.
 pub async fn initialize(conn: &mut Connection, cx: &Cx, baseline: ReplicaCheckpoint) -> Result<OutboxState> {
     checkpoint(cx)?;
     let sequence = integer(baseline.sequence)?;
@@ -399,7 +408,8 @@ async fn read_head(
     if current.pending_messages() == 0 { return Ok(None); }
     let sequence = current.acknowledged.sequence + 1;
     let params = [blob(current.produced.stream_id), integer(sequence)?];
-    // Admission precedes the payload SELECT/allocation, including on restart.
+    // Check length before requesting an owned payload result. The engine may
+    // still read/decode storage pages to evaluate this scalar length query.
     let rows = conn.query_with_params(
         "SELECT previous,tip,length(body),typeof(body) FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1 AND sequence=?2",
         &params,
@@ -444,6 +454,68 @@ pub async fn next_pending(
     complete(owner, cx, result).await
 }
 
+/// Confirm exactly the oldest pending message and reclaim its saved body.
+///
+/// Supply a checkpoint obtained from the configured replica over a trusted
+/// channel AFTER its successful commit (or committed-state reconciliation).
+/// A successful send or local source commit is not sufficient. The identity,
+/// stream and immediate next sequence must match the reverified queue head.
+/// Skipping messages or replacing history is never implicit.
+///
+/// Body deletion and acknowledgement advancement commit together. The current
+/// exact acknowledgement is idempotent after a lost response, even though its
+/// body has been reclaimed. Older confirmations are Stale, not certified from
+/// missing history. Failure/drop uses the same deferred rollback ownership as
+/// recording; inspect `state` after uncertain commit outcomes.
+pub async fn acknowledge(
+    conn: &mut Connection,
+    cx: &Cx,
+    confirmed: ReplicaCheckpoint,
+    max_message_bytes: u64,
+) -> Result<OutboxState> {
+    checkpoint(cx)?;
+    let _ = integer(confirmed.sequence)?;
+    let owner = begin(conn).await?;
+    let result = async {
+        validate_schema(conn).await?;
+        let current = load_state(conn, confirmed.stream_id).await?;
+        if confirmed.sequence < current.acknowledged.sequence {
+            return Err(ReplicaApplyError::Stale {
+                current: current.acknowledged.sequence,
+                received: confirmed.sequence,
+            });
+        }
+        if confirmed.sequence == current.acknowledged.sequence {
+            if confirmed != current.acknowledged {
+                return Err(ReplicaApplyError::Diverged { sequence: confirmed.sequence });
+            }
+            return Ok(current);
+        }
+        let expected = current.acknowledged.sequence + 1;
+        if confirmed.sequence != expected {
+            return Err(ReplicaApplyError::Gap { expected, received: confirmed.sequence });
+        }
+        let message = read_head(conn, cx, current, max_message_bytes).await?
+            .ok_or_else(|| protocol("acknowledgement has no queued message"))?;
+        if message.envelope.id() != confirmed.tip {
+            return Err(ReplicaApplyError::Diverged { sequence: confirmed.sequence });
+        }
+        let length = u64::try_from(message.body.len()).map_err(|_| FrankenError::TooBig)?;
+        let pending_bytes = current.pending_bytes.checked_sub(length)
+            .ok_or_else(|| protocol("outbox byte accounting underflow"))?;
+        checkpoint(cx)?;
+        let changed = conn.execute_with_params(
+            "DELETE FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1 AND sequence=?2 AND tip=?3",
+            &[blob(confirmed.stream_id), integer(confirmed.sequence)?, blob(confirmed.tip)],
+        ).await?;
+        if changed != 1 { return Err(protocol("outbox acknowledgement did not remove exactly one message")); }
+        let next = OutboxState { acknowledged: confirmed, pending_bytes, ..current };
+        save_state(conn, current, next).await?;
+        Ok(next)
+    }.await;
+    complete(owner, cx, result).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +551,14 @@ mod tests {
         let row = conn.query_row(&format!("SELECT count(*) FROM {name}")).await.unwrap();
         let Some(SqliteValue::Integer(value)) = row.get(0) else { panic!("integer count"); };
         *value
+    }
+
+    fn committed_position(commit: &OutboxCommit) -> ReplicaCheckpoint {
+        ReplicaCheckpoint {
+            stream_id: commit.envelope.stream_id(),
+            sequence: commit.envelope.sequence(),
+            tip: commit.envelope.id(),
+        }
     }
 
     #[test]
@@ -566,6 +646,175 @@ mod tests {
             assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
             assert_eq!(count(&conn, "audit").await, 0);
             assert_eq!(count(&conn, QUEUE_TABLE).await, 0);
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn outbox_restart_and_lost_remote_ack_keep_source_and_replica_exactly_once() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let directory = tempfile::tempdir().unwrap().keep();
+            let source_path = directory.join("source.db");
+            let replica_path = directory.join("replica.db");
+            let mut source = setup(source_path.to_str().unwrap()).await;
+            let mut replica = setup(replica_path.to_str().unwrap()).await;
+            initialize(&mut source, &cx, baseline()).await.unwrap();
+            super::super::initialize(&mut replica, &cx, baseline()).await.unwrap();
+            let body = wire(&[(1, "one")]);
+            let first = record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
+            let second = record(&mut source, &cx, committed_position(&first),
+                &wire(&[(2, "two")]), OutboxLimits::default()).await.unwrap();
+            source.close().await.unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
+            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            assert_eq!(pending.envelope(), &first.envelope);
+            let receipt = super::super::apply(&mut replica, &cx, &mut Bytes(pending.body()),
+                pending.envelope(), first.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            // Lose the response before persisting source acknowledgement.
+            replica.close().await.unwrap();
+            source.close().await.unwrap();
+            let mut replica = Connection::open(replica_path.to_str().unwrap()).await.unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
+            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            let duplicate = super::super::apply(&mut replica, &cx, &mut Bytes(pending.body()),
+                pending.envelope(), first.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            assert_eq!(duplicate.disposition, ReplicaDisposition::AlreadyApplied);
+            assert_eq!(duplicate.checkpoint, receipt.checkpoint);
+            let acknowledged = acknowledge(&mut source, &cx, duplicate.checkpoint, 1 << 20).await.unwrap();
+            assert_eq!(acknowledged.pending_messages(), 1);
+            source.close().await.unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
+            assert_eq!(acknowledge(&mut source, &cx, duplicate.checkpoint, 0).await.unwrap(), acknowledged);
+            let next = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            assert_eq!(next.envelope(), &second.envelope);
+            let receipt = super::super::apply(&mut replica, &cx, &mut Bytes(next.body()),
+                next.envelope(), second.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            let empty = acknowledge(&mut source, &cx, receipt.checkpoint, 1 << 20).await.unwrap();
+            assert_eq!(empty.pending_messages(), 0);
+            assert_eq!(empty.pending_bytes, 0);
+            assert!(next_pending(&mut source, &cx, baseline().stream_id, 0).await.unwrap().is_none());
+            assert_eq!(count(&source, QUEUE_TABLE).await, 0);
+            for conn in [&source, &replica] {
+                assert_eq!(count(conn, "t").await, 2);
+                assert_eq!(count(conn, "audit").await, 2);
+                assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                    Some(&SqliteValue::Text("ok".into())));
+            }
+            source.close().await.unwrap();
+            replica.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn outbox_ack_cannot_skip_or_forge_history_and_releases_only_confirmed_capacity() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut conn = setup(":memory:").await;
+            initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let limits = OutboxLimits { max_pending_messages: 2, ..OutboxLimits::default() };
+            let first = record(&mut conn, &cx, baseline(), &wire(&[(1,"one")]), limits).await.unwrap();
+            let second = record(&mut conn, &cx, committed_position(&first), &wire(&[(2,"two")]), limits).await.unwrap();
+            let before = state(&mut conn, &cx, baseline().stream_id).await.unwrap();
+            let third = wire(&[(3,"three")]);
+            assert!(matches!(record(&mut conn, &cx, committed_position(&second), &third, limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            assert!(matches!(acknowledge(&mut conn, &cx, committed_position(&second), 1 << 20).await,
+                Err(ReplicaApplyError::Gap { expected: 1, received: 2 })));
+            let forged = ReplicaCheckpoint { tip: PayloadHash::from_bytes([9; 32]), ..committed_position(&first) };
+            assert!(matches!(acknowledge(&mut conn, &cx, forged, 1 << 20).await,
+                Err(ReplicaApplyError::Diverged { sequence: 1 })));
+            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), before);
+            let after = acknowledge(&mut conn, &cx, committed_position(&first), 1 << 20).await.unwrap();
+            assert_eq!(after.pending_messages(), 1);
+            assert!(after.pending_bytes < before.pending_bytes);
+            assert!(matches!(acknowledge(&mut conn, &cx, baseline(), 1 << 20).await,
+                Err(ReplicaApplyError::Stale { .. })));
+            let third = record(&mut conn, &cx, committed_position(&second), &third, limits).await.unwrap();
+            assert_eq!(third.envelope.sequence(), 3);
+            assert_eq!(count(&conn, "t").await, 3);
+            assert_eq!(next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap().envelope(), &second.envelope);
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn outbox_read_and_ack_refuse_corrupt_payload_without_losing_the_record() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut conn = setup(":memory:").await;
+            initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let body = wire(&[(1,"one")]);
+            let commit = record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
+            let before = state(&mut conn, &cx, baseline().stream_id).await.unwrap();
+            assert!(matches!(next_pending(&mut conn, &cx, baseline().stream_id, body.len() as u64 - 1).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            // Preserve length/accounting but change authenticated content.
+            conn.execute("UPDATE _fsqlite_source_outbox_v1 SET body=zeroblob(length(body))").await.unwrap();
+            assert!(matches!(next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20).await,
+                Err(ReplicaApplyError::Protocol { .. })));
+            assert!(matches!(acknowledge(&mut conn, &cx, committed_position(&commit), 1 << 20).await,
+                Err(ReplicaApplyError::Protocol { .. })));
+            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), before);
+            assert_eq!(count(&conn, QUEUE_TABLE).await, 1);
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn outbox_deferred_commit_failure_removes_provisional_source_and_delivery() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("PRAGMA foreign_keys=ON; CREATE TABLE parent(id INTEGER PRIMARY KEY); \
+                CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);")
+                .await.unwrap();
+            let initial = initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let body = wire(&[(1,"99")]);
+            assert!(matches!(record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await,
+                Err(ReplicaApplyError::Database(_))));
+            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+            assert_eq!(count(&conn, "t").await, 0);
+            assert_eq!(count(&conn, QUEUE_TABLE).await, 0);
+            conn.execute("INSERT INTO parent VALUES(99)").await.unwrap();
+            assert_eq!(record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap().envelope.sequence(), 1);
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn outbox_empty_message_capacity_cancel_and_metadata_admission() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut conn = setup(":memory:").await;
+            initialize(&mut conn, &cx, baseline()).await.unwrap();
+            let limits = OutboxLimits { max_pending_messages: 1, max_pending_bytes: 0, ..OutboxLimits::default() };
+            let first = record(&mut conn, &cx, baseline(), &[], limits).await.unwrap();
+            assert!(matches!(record(&mut conn, &cx, committed_position(&first), &[], limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(acknowledge(&mut conn, &cancelled, committed_position(&first), 0).await,
+                Err(ReplicaApplyError::Database(FrankenError::Interrupt))));
+            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap().pending_messages(), 1);
+            let cleared = acknowledge(&mut conn, &cx, committed_position(&first), 0).await.unwrap();
+            assert_eq!(cleared.pending_messages(), 0);
+            assert!(initialize(&mut conn, &cx, baseline()).await.is_err());
+            // Direct mutation is rejected even with a valid Session row shape.
+            for name in [STREAM_TABLE, QUEUE_TABLE, super::super::CURSOR_TABLE] {
+                let body = Changeset { kind: ChangesetKind::Changeset, tables: vec![TableChangeset {
+                    info: TableInfo { name: name.to_ascii_uppercase(), column_count: 1, pk_flags: vec![true] },
+                    rows: vec![ChangesetRow { op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
+                        new_values: vec![ChangesetValue::Integer(1)] }],
+                }] }.encode();
+                assert!(matches!(record(&mut conn, &cx, committed_position(&first), &body, OutboxLimits::default()).await,
+                    Err(ReplicaApplyError::Protocol { detail: "source message targets replication metadata" })));
+            }
+            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), cleared);
+            conn.execute("CREATE TEMP TRIGGER metadata BEFORE INSERT ON main._fsqlite_source_outbox_v1 \
+                BEGIN SELECT RAISE(ABORT,'must not run'); END;").await.unwrap();
+            assert!(matches!(record(&mut conn, &cx, committed_position(&first), &[], limits).await,
+                Err(ReplicaApplyError::Protocol { detail: "outbox metadata must not have triggers" })));
             conn.close().await.unwrap();
         });
     }
