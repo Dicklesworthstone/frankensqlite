@@ -34,6 +34,8 @@ use crate::wal::WalGenerationIdentity;
 /// These bound input sizes and source/repair counts, not total process RSS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalFecReplayLimits {
+    /// Bounds both the captured WAL and the reconstructed WAL, including a
+    /// restored terminal payload. This is not a total process memory budget.
     pub max_wal_bytes: usize,
     pub max_sidecar_bytes: usize,
     pub max_sidecar_groups: usize,
@@ -99,6 +101,7 @@ pub struct WalFecReplayResult<'a> {
     committed_frames: u32,
     db_size_pages: Option<u32>,
     discarded_tail_bytes: usize,
+    restored_tail_bytes: usize,
     repaired_frame_nos: Vec<u32>,
     decode_proofs: Vec<WalFecDecodeProof>,
     certificate_anchors: Vec<WalFecReplayCertificateAnchor>,
@@ -136,6 +139,15 @@ impl<'a> WalFecReplayResult<'a> {
     #[must_use]
     pub const fn discarded_tail_bytes(&self) -> usize {
         self.discarded_tail_bytes
+    }
+
+    /// Missing terminal payload bytes restored in the accepted image.
+    ///
+    /// This is zero for rejected tentative repairs. It describes private
+    /// reconstructed bytes, not writes to the captured WAL or a durability receipt.
+    #[must_use]
+    pub const fn restored_tail_bytes(&self) -> usize {
+        self.restored_tail_bytes
     }
 
     /// Accepted repairs only, including headers with intact payloads. Tentative
@@ -272,7 +284,9 @@ impl<'a> WalFecReplayResult<'a> {
         Ok(output)
     }
 
-    /// Return the image only when every complete input frame was validated.
+    /// Return the image only when all input damage has been resolved.
+    ///
+    /// A restored terminal payload requires its original checksum anchor.
     /// A valid, non-committed suffix is omitted according to SQLite replay rules.
     pub fn complete_image(self) -> Result<Cow<'a, [u8]>> {
         if let Some(stop) = self.stop {
@@ -324,6 +338,12 @@ fn authoritative_database_size(bytes: &[u8]) -> Option<u32> {
 /// commits are excluded, even when every payload was successfully decoded.
 /// These are accidental-corruption checks, not cryptographic authentication.
 ///
+/// A torn final payload is an erasure only when the entire original frame
+/// header survives. Its original terminal checksum must accept the decoded
+/// group; certificates cannot authorize extending a physically incomplete frame.
+/// No absent whole frame or partial header is manufactured from sidecar metadata.
+/// The reconstructed output is bounded by `max_wal_bytes` before decoding.
+///
 /// Later frames are checked against their ORIGINAL checksum fields. Repairing
 /// one group never recomputes checksums over an unrelated damaged later group.
 /// Input bytes remain unchanged on every success, error, and fallback path.
@@ -374,8 +394,14 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         .checked_add(page_size)
         .ok_or_else(|| corrupt("WAL frame size overflow"))?;
     let physical_frames = (wal_bytes.len() - WAL_HEADER_SIZE) / frame_size;
-    let frame_count = u32::try_from(physical_frames)
+    let complete_frame_count = u32::try_from(physical_frames)
         .map_err(|_| corrupt("WAL frame count exceeds SQLite's domain"))?;
+    let partial_frame_bytes = (wal_bytes.len() - WAL_HEADER_SIZE) % frame_size;
+    // Only an original, physically present checksum header can authorize the
+    // one additional payload. Certificates retain the stricter complete count.
+    let frame_count = complete_frame_count
+        .checked_add(u32::from(partial_frame_bytes >= WAL_FRAME_HEADER_SIZE))
+        .ok_or_else(|| corrupt("partial WAL frame number overflow"))?;
     let mut image = Cow::Borrowed(wal_bytes);
     let mut frame_index = 0_u32;
     let mut running = header.checksum;
@@ -391,28 +417,29 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
 
     while frame_index < frame_count {
         let offset = frame_offset(frame_index, frame_size)?;
-        let frame = &image[offset..offset + frame_size];
-        let frame_header = WalFrameHeader::from_bytes(frame)?;
-        let expected = WalChecksumTransform::for_wal_frame(
-            frame, page_size, header.big_endian_checksum(),
-        )?.apply(running);
-        if PageNumber::new(frame_header.page_number).is_some()
-            && (frame_header.db_size == 0 || PageNumber::new(frame_header.db_size).is_some())
-            && frame_header.salts == header.salts
-            && frame_header.checksum == expected
-        {
-            // This frame has not been reconstructed. Its original checksum
-            // validates every tentative preceding group, even if this frame
-            // belongs to a still-uncommitted successor transaction.
-            pending_anchor = None;
-            running = expected;
-            frame_index += 1;
-            if frame_header.is_commit() {
-                committed_frames = frame_index;
-                committed_checksum = running;
-                db_size_pages = Some(frame_header.db_size);
+        if let Some(frame) = image.get(offset..offset + frame_size) {
+            let frame_header = WalFrameHeader::from_bytes(frame)?;
+            let expected = WalChecksumTransform::for_wal_frame(
+                frame, page_size, header.big_endian_checksum(),
+            )?.apply(running);
+            if PageNumber::new(frame_header.page_number).is_some()
+                && (frame_header.db_size == 0 || PageNumber::new(frame_header.db_size).is_some())
+                && frame_header.salts == header.salts
+                && frame_header.checksum == expected
+            {
+                // This frame has not been reconstructed. Its original checksum
+                // validates every tentative preceding group, even if this frame
+                // belongs to a still-uncommitted successor transaction.
+                pending_anchor = None;
+                running = expected;
+                frame_index += 1;
+                if frame_header.is_commit() {
+                    committed_frames = frame_index;
+                    committed_checksum = running;
+                    db_size_pages = Some(frame_header.db_size);
+                }
+                continue;
             }
-            continue;
         }
 
         let damaged_frame_no = frame_index + 1;
@@ -445,16 +472,28 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
             });
             break;
         }
+        let group_start = frame_offset(committed_frames, frame_size)?;
+        let group_end = frame_offset(meta.end_frame_no, frame_size)?;
+        if group_end > limits.max_wal_bytes {
+            stop = Some(WalFecReplayStop {
+                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::ResourceLimit,
+            });
+            break;
+        }
 
         // Include independently verified sources after the chain break. Their
         // cumulative WAL checksum failures do not make their payloads erasures.
+        // A partial payload is omitted entirely, never padded into a purported
+        // source symbol, even when its missing suffix happens to be all zeroes.
         let mut candidates = Vec::with_capacity(source_pages);
         for number in meta.start_frame_no..=meta.end_frame_no {
             let offset = frame_offset(number - 1, frame_size)?;
-            candidates.push(WalFrameCandidate {
-                frame_no: number,
-                page_data: image[offset + WAL_FRAME_HEADER_SIZE..offset + frame_size].to_vec(),
-            });
+            if let Some(payload) = image.get(offset + WAL_FRAME_HEADER_SIZE..offset + frame_size) {
+                candidates.push(WalFrameCandidate {
+                    frame_no: number,
+                    page_data: payload.to_vec(),
+                });
+            }
         }
         let mut decode = wal_fec_raptorq_decode;
         let outcome = recover_wal_fec_group_record_with_decoder(
@@ -472,7 +511,9 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
                 break;
             }
         };
-        let mut rebuilt = Vec::with_capacity(source_pages * frame_size);
+        let mut rebuilt = Vec::new();
+        rebuilt.try_reserve_exact(group_end - group_start)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let mut rebuilt_checksum = committed_checksum;
         for (index, page) in recovered.recovered_pages.iter().enumerate() {
             let is_last = index + 1 == source_pages;
@@ -490,8 +531,6 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
             rebuilt[start + 16..start + 20].copy_from_slice(&rebuilt_checksum.s1.to_be_bytes());
             rebuilt[start + 20..start + 24].copy_from_slice(&rebuilt_checksum.s2.to_be_bytes());
         }
-        let group_start = frame_offset(committed_frames, frame_size)?;
-        let group_end = frame_offset(meta.end_frame_no, frame_size)?;
         let verified_len = frame_offset(frame_index, frame_size)? - group_start;
         let original_terminal = group_end - frame_size;
         let original_checksum = WalFrameHeader::from_bytes(
@@ -520,16 +559,17 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         // an independently stored later checksum closes the pending anchor.
         for (index, frame) in rebuilt.chunks_exact(frame_size).enumerate() {
             let offset = group_start + index * frame_size;
-            if image[offset..offset + frame_size] != *frame {
+            if image.get(offset..offset + frame_size) != Some(frame) {
                 repaired_frame_nos.push(meta.start_frame_no + u32::try_from(index)
                     .map_err(|_| corrupt("repaired frame index overflow"))?);
             }
         }
+        grow_replay_image(&mut image, group_end)?;
         image.to_mut()[group_start..group_end].copy_from_slice(&rebuilt);
         if let Some(pending) = pending_anchor {
             let records = certificates.get_or_insert_with(|| {
                 read_replay_certificates(
-                    certificate_bytes, database_file_id, &header, frame_count, limits,
+                    certificate_bytes, database_file_id, &header, complete_frame_count, limits,
                 )
             });
             if let Some(anchor) = match_replay_certificate(
@@ -559,9 +599,9 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
             });
         }
     }
-    if stop.is_none() && !(wal_bytes.len() - WAL_HEADER_SIZE).is_multiple_of(frame_size) {
+    if stop.is_none() && partial_frame_bytes != 0 && committed_frames <= complete_frame_count {
         stop = Some(WalFecReplayStop {
-            frame_no: frame_count.checked_add(1)
+            frame_no: complete_frame_count.checked_add(1)
                 .ok_or_else(|| corrupt("partial WAL frame number overflow"))?,
             reason: WalFecReplayStopReason::PartialFrame,
         });
@@ -573,9 +613,30 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
     };
     Ok(WalFecReplayResult {
         image, header, committed_frames, db_size_pages,
-        discarded_tail_bytes: wal_bytes.len() - prefix_len,
+        discarded_tail_bytes: wal_bytes.len().saturating_sub(prefix_len),
+        restored_tail_bytes: prefix_len.saturating_sub(wal_bytes.len()),
         repaired_frame_nos, decode_proofs, certificate_anchors, stop,
     })
+}
+
+/// Reserve the bounded private repair image without an infallible Cow clone.
+/// Zero-filled allocation space is overwritten by decoded bytes before use.
+fn grow_replay_image(image: &mut Cow<'_, [u8]>, required_len: usize) -> Result<()> {
+    let len = required_len.max(image.len());
+    match image {
+        Cow::Borrowed(bytes) => {
+            let mut owned = Vec::new();
+            owned.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+            owned.extend_from_slice(bytes);
+            owned.resize(len, 0);
+            *image = Cow::Owned(owned);
+        }
+        Cow::Owned(bytes) => {
+            bytes.try_reserve_exact(len - bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            bytes.resize(len, 0);
+        }
+    }
+    Ok(())
 }
 
 /// Parse at most the admitted number of bounded records, once per replay.
@@ -1287,6 +1348,121 @@ mod tests {
         assert_eq!(result.discarded_tail_bytes, 17);
         assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::PartialFrame);
         assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn torn_terminal_payload_is_reconstructed_from_real_symbols_and_original_checksum() {
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            for tag in [0, 71] {
+                let mut original = header(magic).to_bytes().unwrap().to_vec();
+                append_group(&mut original, 2, 8, 70);
+                let sidecar = append_group(&mut original, 3, 8, tag);
+                let terminal = frame_offset(4, FRAME_SIZE).unwrap();
+                for retained in [0, 1, 17, PAGE_SIZE / 2, PAGE_SIZE - 1] {
+                    for earlier_damage in [false, true] {
+                        let mut damaged = original.clone();
+                        if earlier_damage { corrupt_payload(&mut damaged, 4); }
+                        damaged.truncate(terminal + WAL_FRAME_HEADER_SIZE + retained);
+                        let saved = damaged.clone();
+                        let result = recover_wal_fec_image(
+                            &damaged, &sidecar, WalFecReplayLimits::default(),
+                        ).unwrap();
+                        assert!(result.stop().is_none());
+                        assert_eq!(result.committed_frames(), 5);
+                        assert_eq!(result.restored_tail_bytes(), PAGE_SIZE - retained);
+                        assert_eq!(result.discarded_tail_bytes(), 0);
+                        assert_eq!(result.repaired_frame_nos(),
+                            if earlier_damage { &[4, 5][..] } else { &[5][..] });
+                        assert!(result.decode_proofs()[0].decode_attempted,
+                            "missing zero suffixes must be erasures, not padded source symbols");
+                        assert_eq!(result.complete_image().unwrap().as_ref(), original);
+                        assert_eq!(damaged, saved);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn torn_terminal_payload_checks_output_budget_before_decoding() {
+        let mut original = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut original, 3, 8, 72);
+        let damaged = &original[..original.len() - 1];
+        let limits = WalFecReplayLimits { max_wal_bytes: damaged.len(), ..WalFecReplayLimits::default() };
+        let result = recover_wal_fec_image(damaged, &sidecar, limits).unwrap();
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::ResourceLimit);
+        assert!(result.decode_proofs().is_empty());
+        assert!(result.repaired_frame_nos().is_empty());
+        assert_eq!(result.restored_tail_bytes(), 0);
+        assert_eq!(result.committed_frames(), 0);
+        let limits = WalFecReplayLimits { max_wal_bytes: original.len(), ..limits };
+        assert_eq!(recover_wal_fec_image(damaged, &sidecar, limits).unwrap()
+            .complete_image().unwrap().as_ref(), original);
+    }
+
+    #[test]
+    fn torn_terminal_payload_with_insufficient_symbols_keeps_the_previous_commit() {
+        let mut wal = header(WAL_MAGIC_BE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 8, 73);
+        let accepted = wal.clone();
+        let sidecar = append_group(&mut wal, 3, 1, 74);
+        corrupt_payload(&mut wal, 4);
+        wal.truncate(wal.len() - 1);
+        let saved = wal.clone();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
+        assert_eq!(result.stop().unwrap().reason,
+            WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols));
+        assert_eq!(result.committed_frames(), 2);
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert_eq!(result.restored_tail_bytes(), 0);
+        assert!(result.repaired_frame_nos().is_empty());
+        assert!(result.complete_image().is_err());
+        assert_eq!(wal, saved);
+    }
+
+    #[test]
+    fn torn_terminal_header_or_absent_frame_is_never_synthesized() {
+        let mut original = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut original, 2, 8, 75);
+        let accepted = original.clone();
+        let sidecar = append_group(&mut original, 3, 8, 76);
+        let certificate = certificate_for(&original, 3, 5).to_bytes();
+        let terminal = frame_offset(4, FRAME_SIZE).unwrap();
+        for retained_header in 0..WAL_FRAME_HEADER_SIZE {
+            let damaged = &original[..terminal + retained_header];
+            let result = certificate_recovery(damaged, &sidecar, &certificate);
+            assert_eq!(result.committed_frames(), 2);
+            assert_eq!(result.replayable_prefix(), accepted);
+            assert_eq!(result.restored_tail_bytes(), 0);
+            assert!(result.repaired_frame_nos().is_empty());
+            assert!(result.certificate_anchors().is_empty());
+            if retained_header != 0 {
+                assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::PartialFrame);
+                assert!(result.complete_image().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn torn_terminal_payload_cannot_use_a_certificate_instead_of_its_original_checksum() {
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 8, 77);
+        let accepted = wal.clone();
+        let sidecar = append_group(&mut wal, 3, 8, 78);
+        let certificate = certificate_for(&wal, 3, 5).to_bytes();
+        corrupt_checksum(&mut wal, 5);
+        wal.truncate(wal.len() - 1);
+        let saved = wal.clone();
+        let result = certificate_recovery(&wal, &sidecar, &certificate);
+        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(result.replayable_prefix(), accepted);
+        assert_eq!(result.committed_frames(), 2);
+        assert_eq!(result.restored_tail_bytes(), 0);
+        assert_eq!(result.discarded_tail_bytes(), wal.len() - accepted.len());
+        assert!(result.repaired_frame_nos().is_empty());
+        assert!(result.certificate_anchors().is_empty());
+        assert!(result.complete_image().is_err());
+        assert_eq!(wal, saved);
     }
 
     fn database_page_one(page_size: u32, pages: u32) -> Vec<u8> {
