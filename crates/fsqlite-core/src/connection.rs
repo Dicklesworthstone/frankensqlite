@@ -36990,9 +36990,43 @@ impl Connection {
             // open, a failed autocommit statement leaves no partial state, and
             // `statement_retry_is_idempotent` below still bars any statement
             // that calls an application function.
-            let autocommit_retry_entry = !matches!(
+            // bd-di2yu: back to an ALLOWLIST. 4c018b93b armed this by exclusion
+            // -- everything but transaction completion -- on the argument that
+            // the exposure is universal, which it is: every autocommit statement
+            // passes through the publication bind that raises the transient.
+            // But that argument is about the plumbing, and retry safety is a
+            // property of the STATEMENT. Arming VACUUM broke
+            // test_vacuum_into_rejects_source_commit_between_receipt_and_hydration,
+            // bisected to that commit (parent f725a70a5 ok, 4c018b93b FAILED):
+            // VACUUM's transient says the source moved between receipt and
+            // hydration, and retrying turns a correct refusal into a silent
+            // success on a fresh receipt.
+            //
+            // Each shape below is here because a measurement put it here:
+            //   Pragma, Select   GH#333 / #335 / #367
+            //   Begin            bd-udetu, 347_671 instant refusals -> 0
+            //   Savepoint        bd-orwh0, 45_492 refusals at min/p50 = 0 ms
+            //   Analyze          bd-orwh0, 53_879 refusals, 0 completions
+            //   schema mutation  bd-orwh0, CREATE TABLE 8_164 refusals at 0 ms;
+            //                    CREATE INDEX 7_497 refusals, 0 completions
+            //
+            // Vacuum, Attach, Detach, Reindex and Explain stay out: no measured
+            // exposure, and in VACUUM's case a measured reason not to. DML keeps
+            // its own prepared-retry path and is untouched.
+            let autocommit_retry_entry = matches!(
                 statement,
-                Statement::Commit | Statement::Rollback(_) | Statement::Release(_)
+                Statement::Pragma(_)
+                    | Statement::Select(_)
+                    | Statement::Begin(_)
+                    | Statement::Savepoint(_)
+                    | Statement::Analyze(_)
+                    | Statement::CreateTable(_)
+                    | Statement::CreateIndex(_)
+                    | Statement::CreateView(_)
+                    | Statement::CreateTrigger(_)
+                    | Statement::CreateVirtualTable(_)
+                    | Statement::Drop(_)
+                    | Statement::AlterTable(_)
             ) && self.autocommit_conflict_retry_boundary();
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
