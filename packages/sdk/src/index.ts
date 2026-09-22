@@ -97,6 +97,17 @@ export {
   ChangesetDeliveryPump,
   ChangesetReceiver,
 } from "./changeset-delivery";
+export type {
+  ChangesetFanoutProgress,
+  ChangesetReplicaOutbox,
+  ChangesetReplicaProgress,
+} from "./changeset-fanout";
+export {
+  CHANGESET_FANOUT_TABLE,
+  CHANGESET_FANOUT_PROGRESS_TABLE,
+  ChangesetFanout,
+  ChangesetFanoutError,
+} from "./changeset-fanout";
 export type { ChangesetGroupStats } from "./changeset-group";
 export { ChangesetGroup, ChangesetGroupError, concatChangesets } from "./changeset-group";
 export type { ChangesetRebaseResolution, ChangesetRebaseStats } from "./changeset-rebase";
