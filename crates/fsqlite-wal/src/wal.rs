@@ -654,6 +654,9 @@ impl<F: VfsFile> WalFile<F> {
             checksum: SqliteWalChecksum::default(), // computed by to_bytes()
         };
         let header_bytes = header.to_bytes()?;
+        // Cache the actual on-disk checksum, not the serialization placeholder.
+        // Native generation validation compares parsed headers with this value.
+        let header = WalHeader::from_bytes(&header_bytes)?;
         file.write(cx, &header_bytes, 0).await?;
         file.truncate(
             cx,
@@ -1996,6 +1999,33 @@ mod tests {
             salt1: 0xDEAD_BEEF,
             salt2: 0xCAFE_BABE,
         }
+    }
+
+    #[test]
+    fn fresh_wal_header_matches_durable_header_and_reopen() {
+        let vfs = MemoryVfs::new();
+        let cx = test_cx();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let expected = *wal.header();
+        assert_eq!(expected.checksum, wal.running_checksum());
+        let mut bytes = [0_u8; WAL_HEADER_SIZE];
+        assert_eq!(
+            wal.file()
+                .read(&cx, &mut bytes, 0)
+                .expect("read header"),
+            WAL_HEADER_SIZE
+        );
+        assert_eq!(
+            WalHeader::from_bytes(&bytes).expect("decode header"),
+            expected
+        );
+        wal.close(&cx).expect("close original");
+        let reopened =
+            WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("reopen WAL");
+        assert_eq!(*reopened.header(), expected);
+        reopened.close(&cx).expect("close reopened");
     }
 
     fn sample_page(seed: u8) -> Vec<u8> {
