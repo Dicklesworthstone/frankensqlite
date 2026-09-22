@@ -1,5 +1,9 @@
 //! Connection extension traits for rusqlite-style query patterns.
 
+#[cfg(feature = "session")]
+#[path = "changeset_capture.rs"]
+pub mod capture;
+
 use std::future::Future;
 
 use fsqlite_error::FrankenError;
