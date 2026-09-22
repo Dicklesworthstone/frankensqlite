@@ -24,6 +24,23 @@ export interface ChangesetTable {
   readonly primaryKey: readonly number[];
   readonly changes: readonly ChangesetChange[];
 }
+/**
+ * Compact session records. DELETE old and UPDATE old contain keys ONLY;
+ * undefined non-key slots are absent evidence, never a NULL before-image.
+ * INSERT is complete; UPDATE new contains only modified non-key columns.
+ */
+export type PatchsetChange =
+  | Exclude<ChangesetChange, { readonly operation: "delete" }>
+  | {
+      readonly operation: "delete";
+      readonly indirect: boolean;
+      readonly old: readonly ChangesetField[];
+    };
+export interface PatchsetTable {
+  readonly name: string;
+  readonly primaryKey: readonly number[];
+  readonly changes: readonly PatchsetChange[];
+}
 export interface ChangesetLimits {
   maxBytes?: number;
   maxTables?: number;
@@ -119,7 +136,11 @@ function textBytes(text: string, maximum: number): Uint8Array {
     input("Changeset text must not contain unpaired UTF-16 surrogates");
   return bytes;
 }
-function validateChange(pk: readonly number[], change: ChangesetChange): void {
+function validateChange(
+  pk: readonly number[],
+  change: PatchsetChange,
+  patchset: boolean,
+): void {
   const before = change.operation === "insert" ? undefined : change.old;
   const after = change.operation === "delete" ? undefined : change.new;
   if (
@@ -134,13 +155,17 @@ function validateChange(pk: readonly number[], change: ChangesetChange): void {
       next = after?.[i];
     if (change.operation !== "update") {
       const value = change.operation === "insert" ? next : old;
-      if (value === undefined || (pk[i] !== 0 && value === null))
+      if (patchset && change.operation === "delete" && pk[i] === 0) {
+        if (value !== undefined) format("Patchset DELETE contains a non-key before-image");
+      } else if (value === undefined || (pk[i] !== 0 && value === null))
         format("Incomplete row or NULL primary key");
     } else if (pk[i] !== 0) {
       if (old === undefined || old === null || next !== undefined)
         format("UPDATE must retain its original primary key");
     } else {
-      if ((old === undefined) !== (next === undefined))
+      if (patchset && old !== undefined)
+        format("Patchset UPDATE contains a non-key before-image");
+      if (!patchset && (old === undefined) !== (next === undefined))
         format("UPDATE requires paired old/new values");
       if (next !== undefined) modified = true;
     }
@@ -153,6 +178,32 @@ export function decodeChangeset(
   bytes: Uint8Array,
   options?: ChangesetLimits,
 ): readonly ChangesetTable[] {
+  return decodeSession(bytes, options, false);
+}
+
+/** Explicit weaker format: cannot detect DATA conflicts and cannot be inverted. */
+export function decodePatchset(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): readonly PatchsetTable[] {
+  return decodeSession(bytes, options, true);
+}
+
+function decodeSession(
+  bytes: Uint8Array,
+  options: ChangesetLimits | undefined,
+  patchset: false,
+): readonly ChangesetTable[];
+function decodeSession(
+  bytes: Uint8Array,
+  options: ChangesetLimits | undefined,
+  patchset: boolean,
+): readonly PatchsetTable[];
+function decodeSession(
+  bytes: Uint8Array,
+  options: ChangesetLimits | undefined,
+  patchset: boolean,
+): readonly PatchsetTable[] {
   const policy = resolveChangesetLimits(options);
   bytes = fixedInput(bytes, policy.maxBytes);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -202,12 +253,16 @@ export function decodeChangeset(
       return format("Invalid changeset UTF-8", pos - size);
     }
   };
-  const result: ChangesetTable[] = [];
+  const result: PatchsetTable[] = [];
   const names = new Set<string>();
   while (pos < bytes.length) {
     const header = byte();
-    if (header === 80) format("Patchsets are not reversible changesets", pos - 1);
-    if (header !== 84) format("Expected changeset table header", pos - 1);
+    if (!patchset && header === 80) format("Patchsets are not reversible changesets", pos - 1);
+    if (header !== (patchset ? 80 : 84))
+      format(
+        patchset ? "Expected patchset table header" : "Expected changeset table header",
+        pos - 1,
+      );
     if (result.length >= policy.maxTables) limit("Changeset exceeds maxTables");
     const count = length(policy.maxColumns);
     if (count === 0) format("Changeset table has no columns", pos);
@@ -229,7 +284,8 @@ export function decodeChangeset(
     const folded = name.replace(/[A-Z]/g, (c) => c.toLowerCase());
     if (names.has(folded)) format("Repeated changeset table header", start);
     names.add(folded);
-    const changes: ChangesetChange[] = [];
+    const changes: PatchsetChange[] = [];
+    const keyCount = pk.filter((value) => value !== 0).length;
     while (pos < bytes.length && bytes[pos] !== 84 && bytes[pos] !== 80) {
       const op = byte(),
         flag = byte();
@@ -238,11 +294,16 @@ export function decodeChangeset(
       if (++rows > policy.maxChanges) limit("Changeset exceeds maxChanges");
       cells += count * (op === 23 ? 2 : 1);
       if (cells > policy.maxCells) limit("Changeset exceeds maxCells");
-      // Every slot needs at least a tag; validate before allocating row arrays.
-      need(count * (op === 23 ? 2 : 1));
-      const record = (): readonly ChangesetField[] =>
-        Object.freeze(Array.from({ length: count }, field));
-      let change: ChangesetChange;
+      // Charge NORMALIZED slots above, not just wire fields: a sparse DELETE
+      // must not amplify a small input into unbounded full-width arrays.
+      need(patchset && op === 9 ? keyCount : count * (!patchset && op === 23 ? 2 : 1));
+      const record = (keysOnly = false): readonly ChangesetField[] =>
+        Object.freeze(
+          Array.from({ length: count }, (_, i) =>
+            keysOnly && pk[i] === 0 ? undefined : field(),
+          ),
+        );
+      let change: PatchsetChange;
       if (op === 18)
         change = {
           operation: "insert",
@@ -253,10 +314,24 @@ export function decodeChangeset(
         change = {
           operation: "delete",
           indirect: flag === 1,
-          old: record() as readonly ChangesetValue[],
+          old: record(patchset),
         };
-      else change = { operation: "update", indirect: flag === 1, old: record(), new: record() };
-      validateChange(pk, change);
+      else if (patchset) {
+        const old: ChangesetField[] = [],
+          next: ChangesetField[] = [];
+        for (let i = 0; i < count; i++) {
+          const value = field();
+          old.push(pk[i] !== 0 ? value : undefined);
+          next.push(pk[i] === 0 ? value : undefined);
+        }
+        change = {
+          operation: "update",
+          indirect: flag === 1,
+          old: Object.freeze(old),
+          new: Object.freeze(next),
+        };
+      } else change = { operation: "update", indirect: flag === 1, old: record(), new: record() };
+      validateChange(pk, change, patchset);
       changes.push(Object.freeze(change));
     }
     if (changes.length === 0) format("Table header has no changes", pos);
@@ -271,6 +346,22 @@ export function decodeChangeset(
 export function encodeChangeset(
   tables: readonly ChangesetTable[],
   options?: ChangesetLimits,
+): Uint8Array {
+  return encodeSession(tables, options, false);
+}
+
+/** Encode explicit key-only before-images; never silently discard supplied data. */
+export function encodePatchset(
+  tables: readonly PatchsetTable[],
+  options?: ChangesetLimits,
+): Uint8Array {
+  return encodeSession(tables, options, true);
+}
+
+function encodeSession(
+  tables: readonly PatchsetTable[],
+  options: ChangesetLimits | undefined,
+  patchset: boolean,
 ): Uint8Array {
   const policy = resolveChangesetLimits(options);
   if (!Array.isArray(tables)) input("Changeset tables must be an array");
@@ -350,7 +441,7 @@ export function encodeChangeset(
     if (!Array.isArray(pk) || pk.length === 0 || pk.length > policy.maxColumns)
       input("Invalid changeset column count");
     if (!Array.isArray(changes) || changes.length === 0) input("Each table needs changes");
-    put(84);
+    put(patchset ? 80 : 84);
     length(pk.length);
     for (let i = 0; i < pk.length; i++) {
       const key = pk[i]!;
@@ -376,13 +467,28 @@ export function encodeChangeset(
       for (const record of records) {
         if (!Array.isArray(record) || record.length !== pk.length)
           input("Invalid changeset row shape");
-        for (let col = 0; col < pk.length; col++) field(record[col]);
+      }
+      if (patchset && op !== "insert") {
+        for (let col = 0; col < pk.length; col++) {
+          const before = records[0]![col];
+          const after = op === "update" ? records[1]![col] : undefined;
+          if (pk[col] !== 0) {
+            if (after !== undefined) input("Patchset UPDATE cannot change a primary key");
+            field(before);
+          } else {
+            if (before !== undefined) input("Patchsets cannot encode non-key before-images");
+            if (op === "update") field(after);
+          }
+        }
+      } else {
+        for (const record of records)
+          for (let col = 0; col < pk.length; col++) field(record[col]);
       }
     }
   }
   const output = buffer.slice(0, pos);
   // One shared semantic validator, including caller-created row/key combinations.
-  decodeChangeset(output, policy);
+  decodeSession(output, policy, patchset);
   return output;
 }
 

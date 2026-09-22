@@ -2,12 +2,19 @@ export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type {
   ApplyChangesetOptions,
   ApplyChangesetResult,
+  ApplyPatchsetOptions,
   ChangesetConflict,
   ChangesetConflictKind,
   ChangesetExecutor,
   ChangesetTarget,
+  PatchsetConflict,
 } from "./changeset-apply";
-export { applyChangeset, CHANGESET_RECEIPTS_TABLE, ChangesetApplyError } from "./changeset-apply";
+export {
+  applyChangeset,
+  applyPatchset,
+  CHANGESET_RECEIPTS_TABLE,
+  ChangesetApplyError,
+} from "./changeset-apply";
 export type {
   BootstrapInstallReceipt,
   BootstrapManifest,
@@ -45,11 +52,15 @@ export type {
   ChangesetLimits,
   ChangesetTable,
   ChangesetValue,
+  PatchsetChange,
+  PatchsetTable,
 } from "./changeset-codec";
 export {
   ChangesetError,
   decodeChangeset,
+  decodePatchset,
   encodeChangeset,
+  encodePatchset,
   invertChangeset,
 } from "./changeset-codec";
 export type {

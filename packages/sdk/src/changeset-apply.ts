@@ -1,11 +1,11 @@
 import type {
   ChangesetChange,
-  ChangesetField,
   ChangesetLimits,
-  ChangesetTable,
   ChangesetValue,
+  PatchsetChange,
+  PatchsetTable,
 } from "./changeset-codec";
-import { decodeChangeset } from "./changeset-codec";
+import { decodeChangeset, decodePatchset } from "./changeset-codec";
 
 /** The ordinary SQL surface used inside one owned transaction/savepoint. */
 export interface ChangesetExecutor {
@@ -30,17 +30,20 @@ export interface ChangesetTarget {
 }
 
 export type ChangesetConflictKind = "data" | "not-found" | "conflict";
-export interface ChangesetConflict {
+export interface ChangesetConflict<Change extends PatchsetChange = ChangesetChange> {
   readonly kind: ChangesetConflictKind;
   readonly table: string;
   /** Zero-based position in the complete changeset, not just this table. */
   readonly changeIndex: number;
   readonly columns: readonly string[];
   /** Owned before/after images; mutating a blob cannot change pending SQL. */
-  readonly change: ChangesetChange;
+  readonly change: Change;
 }
 
-export interface ApplyChangesetOptions {
+/** Patchset callbacks never receive DATA conflicts: there is no non-key old data. */
+export type PatchsetConflict = ChangesetConflict<PatchsetChange>;
+
+export interface ApplyChangesetOptions<Change extends PatchsetChange = ChangesetChange> {
   /** Explicit allowlist of direct target tables in main; NOT a SQL sandbox. */
   tables: readonly string[];
   /** Stable source-qualified delivery identity; atomically recorded with the rows. */
@@ -50,12 +53,15 @@ export interface ApplyChangesetOptions {
    * missing rows. SQL/constraint errors still abort the entire owned scope.
    */
   onConflict?: (
-    conflict: ChangesetConflict,
+    conflict: ChangesetConflict<Change>,
   ) => "abort" | "omit" | "replace" | Promise<"abort" | "omit" | "replace">;
   limits?: ChangesetLimits;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
+
+/** Explicitly choose the format without before-image conflict detection. */
+export type ApplyPatchsetOptions = ApplyChangesetOptions<PatchsetChange>;
 
 export interface ApplyChangesetResult {
   /** Direct row changes, excluding trigger and foreign-key side effects. */
@@ -80,7 +86,7 @@ export class ChangesetApplyError extends Error {
       | "ERR_FSQLITE_CHANGESET_DELIVERY_REUSE"
       | "ERR_FSQLITE_CHANGESET_RECEIPT",
     message: string,
-    readonly conflict?: ChangesetConflict,
+    readonly conflict?: ChangesetConflict<PatchsetChange>,
     options?: ErrorOptions,
   ) {
     super(message, options);
@@ -116,7 +122,7 @@ function integer(value: unknown): number {
   return badResult();
 }
 
-function capture(options: ApplyChangesetOptions) {
+function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<Change>) {
   const source = options?.tables,
     onConflict = options?.onConflict,
     limits = options?.limits;
@@ -190,9 +196,10 @@ function capture(options: ApplyChangesetOptions) {
   return { names, onConflict, limits, deliveryId, transactionOptions, checkpoint };
 }
 
-type Settings = ReturnType<typeof capture>;
-interface TablePlan {
-  wire: ChangesetTable;
+type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
+type Checkpoints = Pick<Settings<PatchsetChange>, "checkpoint">;
+interface TablePlan<Change extends PatchsetChange = PatchsetChange> {
+  wire: Omit<PatchsetTable, "changes"> & { readonly changes: readonly Change[] };
   name: string;
   columns: readonly string[];
   sqlName: string;
@@ -200,7 +207,7 @@ interface TablePlan {
 
 async function read(
   tx: ChangesetExecutor,
-  settings: Settings,
+  settings: Checkpoints,
   sql: string,
   params: readonly ChangesetValue[] = [],
 ) {
@@ -238,7 +245,7 @@ async function fingerprint(bytes: Uint8Array, id: string, changes: number): Prom
 /** Validate local inbox authority instead of trusting CREATE IF NOT EXISTS. */
 async function prepareReceipts(
   tx: ChangesetExecutor,
-  settings: Settings,
+  settings: Checkpoints,
   create: boolean,
 ): Promise<void> {
   let listed = await read(
@@ -343,7 +350,7 @@ async function prepareReceipts(
 
 async function readReceipt(
   tx: ChangesetExecutor,
-  settings: Settings,
+  settings: Checkpoints,
   delivery: Delivery,
 ): Promise<ApplyChangesetResult | null> {
   const rows = await read(
@@ -382,11 +389,11 @@ async function readReceipt(
   return Object.freeze({ applied, omitted, replayed: true });
 }
 
-async function planTable(
+async function planTable<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
-  settings: Settings,
-  wire: ChangesetTable,
-): Promise<TablePlan> {
+  settings: Checkpoints,
+  wire: TablePlan<Change>["wire"],
+): Promise<TablePlan<Change>> {
   const listed = await read(tx, settings, `PRAGMA main.table_list(${literal(wire.name)})`);
   const matches = listed.filter(
     (row) => row[0] === "main" && typeof row[1] === "string" && fold(row[1]) === fold(wire.name),
@@ -435,7 +442,7 @@ function parameter(value: ChangesetValue, params: ChangesetValue[]): string {
   return typeof value === "number" ? "+CAST(? AS REAL)" : "?";
 }
 
-function predicates(plan: TablePlan, change: ChangesetChange) {
+function predicates(plan: TablePlan, change: PatchsetChange) {
   const record = change.operation === "insert" ? change.new : change.old;
   const keys: string[] = [],
     before: string[] = [],
@@ -455,21 +462,20 @@ function predicates(plan: TablePlan, change: ChangesetChange) {
   return { key: conjunction(keys), before: conjunction(before), keyParams, beforeParams };
 }
 
-function copyChange(change: ChangesetChange): ChangesetChange {
-  const copy = <T extends ChangesetField>(row: readonly T[]): readonly T[] =>
-    Object.freeze(
-      row.map((value) => (value instanceof Uint8Array ? (new Uint8Array(value) as T) : value)),
-    );
-  if (change.operation === "insert") return Object.freeze({ ...change, new: copy(change.new) });
-  if (change.operation === "delete") return Object.freeze({ ...change, old: copy(change.old) });
-  return Object.freeze({ ...change, old: copy(change.old), new: copy(change.new) });
+function copyChange<Change extends PatchsetChange>(change: Change): Change {
+  // Only decoder-owned plain records reach this function. Clone preserves the
+  // exact format's field types while isolating policy callbacks from its blobs.
+  const copy = structuredClone(change);
+  if (copy.operation !== "insert") Object.freeze(copy.old);
+  if (copy.operation !== "delete") Object.freeze(copy.new);
+  return Object.freeze(copy);
 }
 
-async function applyRow(
+async function applyRow<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
-  settings: Settings,
-  plan: TablePlan,
-  change: ChangesetChange,
+  settings: Settings<Change>,
+  plan: TablePlan<Change>,
+  change: Change,
   changeIndex: number,
 ): Promise<boolean> {
   const where = predicates(plan, change);
@@ -481,7 +487,9 @@ async function applyRow(
   );
   if (
     probe.length > 1 ||
-    (probe.length === 1 && (probe[0]!.length !== 1 || integer(probe[0]![0]) > 1))
+    (probe.length === 1 &&
+      (probe[0]!.length !== 1 || integer(probe[0]![0]) > 1 ||
+        (where.before === "1" && integer(probe[0]![0]) !== 1)))
   )
     badResult();
   const kind: ChangesetConflictKind | undefined =
@@ -576,15 +584,38 @@ async function applyRow(
  * synthesized. Explicit data/primary-key replacement stays inside the owned
  * scope. No manual BEGIN or global writer serialization is introduced.
  */
-export async function applyChangeset(
+export function applyChangeset(
   target: ChangesetTarget,
   bytes: Uint8Array,
   options: ApplyChangesetOptions,
 ): Promise<ApplyChangesetResult> {
+  return applySession(target, bytes, options, decodeChangeset);
+}
+
+/**
+ * Apply a compact SQLite patchset through the same owned SQL/receipt path.
+ * UPDATE/DELETE match keys without before-images. Missing rows and duplicate
+ * keys still invoke policy; constraints still abort. No DATA conflict can be
+ * inferred, and a patchset cannot be inverted into an undo changeset.
+ */
+export function applyPatchset(
+  target: ChangesetTarget,
+  bytes: Uint8Array,
+  options: ApplyPatchsetOptions,
+): Promise<ApplyChangesetResult> {
+  return applySession(target, bytes, options, decodePatchset);
+}
+
+async function applySession<Change extends PatchsetChange>(
+  target: ChangesetTarget,
+  bytes: Uint8Array,
+  options: ApplyChangesetOptions<Change>,
+  decode: (bytes: Uint8Array, limits?: ChangesetLimits) => readonly TablePlan<Change>["wire"][],
+): Promise<ApplyChangesetResult> {
   const settings = capture(options);
   settings.checkpoint();
   // Decode before the first await: caller mutation cannot change admitted work.
-  const tables = decodeChangeset(bytes, settings.limits);
+  const tables = decode(bytes, settings.limits);
   for (const table of tables) {
     if (!settings.names.has(fold(table.name))) invalid(`Table is not authorized: ${table.name}`);
   }
@@ -603,7 +634,7 @@ export async function applyChangeset(
       const prior = await readReceipt(tx, settings, delivery);
       if (prior !== null) return prior;
     }
-    const plans: TablePlan[] = [];
+    const plans: TablePlan<Change>[] = [];
     // Validate ALL table layouts before executing the first application write.
     for (const table of tables) plans.push(await planTable(tx, settings, table));
     let applied = 0,

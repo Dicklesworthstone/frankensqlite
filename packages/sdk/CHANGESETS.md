@@ -2,7 +2,8 @@
 
 `decodeChangeset`, `encodeChangeset` and `invertChangeset` read and write the
 SQLite session extension's binary changeset format. This is row-level change
-interchange, not a whole database image, SQL dump, patchset, or new wire format.
+interchange, not a whole database image, SQL dump, or new wire format.
+Compact SQLite patchsets have separate explicit APIs described below.
 It is independent of the native Rust session facade and does not pretend the
 WASM handle has automatic session capture methods that it does not expose.
 
@@ -41,11 +42,11 @@ uses the same semantic validator. These are protocol/allocation bounds, not
 bounds on SQL execution memory or process RSS. Both operations materialize the
 bounded changeset; neither is advertised as streaming.
 
-Compact SQLite patchsets deliberately reject: they omit before-images and
-cannot provide the same conflict detection or inversion guarantees. The codec
-also does not implement changegroup coalescing, rebasing, automatic capture,
-or authentication. Validate the source of received changes before applying
-anything to application tables; format validation is not authorization.
+The changeset APIs deliberately reject compact patchsets: they omit before-images
+and cannot provide the same conflict detection or inversion guarantees. Use the
+explicit patchset APIs below to choose that weaker contract. Neither wire codec
+implements rebasing, automatic capture, or authentication. Validate the source
+of received changes before applying anything; format validation is not authorization.
 
 ## Transactional SQL application
 
@@ -165,11 +166,71 @@ also restores an older inbox. Only a digest and fixed counters are retained per
 ID, not the entire changeset. Hashing temporarily copies the already byte-bounded
 input; this is not a streaming ingestion API or a process-RSS bound.
 
+## Compact SQLite patchsets
+
+`decodePatchset`, `encodePatchset` and `applyPatchset` support the native SQLite
+session patchset format (the `P` table header, not a renamed changeset). Choose
+it explicitly when before-image conflict detection and inversion are not needed:
+
+```ts
+import { decodePatchset, encodePatchset, applyPatchset } from '@frankensqlite/sdk';
+
+const tables = decodePatchset(receivedPatchset);
+const exactBytes = encodePatchset(tables);
+const result = await applyPatchset(db, exactBytes, {
+  tables: ['notes', 'tags'],
+  deliveryId: 'trusted-source-42:patchset-109',
+  onConflict: conflict => conflict.kind === 'conflict' ? 'replace' : 'abort',
+});
+```
+
+`PatchsetTable` preserves the table name and primary-key bytes in physical column
+order. Its `PatchsetChange` records use the same operation names and indirect
+flag as changesets. INSERT has a complete `new` array. DELETE's `old` array has
+only key values; all non-key slots are `undefined`. UPDATE's `old` contains only
+keys, and `new` has only modified non-key values. Arrays retain full column
+width even though the binary DELETE stores only its key fields. Undefined never
+means SQL NULL. The encoder rejects supplied non-key before-images rather than
+silently discarding them; converting changesets to patchsets requires an explicit
+application decision to remove that evidence.
+
+Application shares the same schema preflight, owned transaction/savepoint,
+allowlist, SQL affinity/collation, scalar storage preservation, cancellation,
+deadline, constraint/trigger checks and retained receipt machinery as changesets.
+UPDATE and DELETE use only the primary key: **DATA conflicts cannot be detected**.
+An UPDATE preserves columns absent from its `new` array, including receiver-only
+trailing columns. A matching DELETE removes the row regardless of its non-key
+values. Missing rows and duplicate primary keys still abort by default; `omit`
+is explicit, and `replace` is permitted only for a duplicate INSERT key. SQL
+constraints remain fatal and rollback remains atomic. `PatchsetConflict` and
+`ApplyPatchsetOptions` expose this surface; the result uses `ApplyChangesetResult`.
+
+All codec byte/table/column/change limits still apply. `maxCells` counts the
+full normalized arrays, including omitted slots and both UPDATE arrays, not just
+the compact wire's field count. Small sparse inputs cannot evade that allocation
+bound. Decoded blobs are owned copies; shared/resizable/detached input rejects.
+The implementation is bounded materialization, not streaming or an RSS budget.
+
+Nonempty format mixing and substitution reject: `decodeChangeset`,
+`applyChangeset`, and `invertChangeset` do not accept patchsets, while the patchset
+APIs do not accept changesets. There is no invented patchset inversion. Receipts
+bind exact payload bytes, so reusing an ID across nonempty changeset/patchset
+encodings rejects even when their row operations are equivalent. Replaying a
+patchset receipt does not apply its writes or callback again. Both formats use
+the same reserved receipt table and error-code family.
+
+`ChangesetReceiver`, outbox/group and HTTP delivery continue to require their
+existing full changeset protocol. Patchsets are not silently enabled in that
+transport; callers must authenticate patchset input and explicitly choose
+`applyPatchset`. As with changesets, snapshot-backed application requires a
+separate successful checkpoint before claiming durable publication.
+
 ## Verification
 
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
-  --test packages/sdk/tests/changeset-codec.test.mjs packages/sdk/tests/changeset-apply.test.mjs
+  --test packages/sdk/tests/changeset-codec.test.mjs packages/sdk/tests/changeset-apply.test.mjs \
+  packages/sdk/tests/patchset.test.mjs
 ```
 
 Tests use Node's actual SQLite session extension to generate binary inputs,
@@ -188,3 +249,9 @@ Node's SQLite SQL adapter; they do not claim a built FrankenSQLite WASM test.
 Inbox tests cover duplicate delivery, same-ID payload substitution, lost commit
 acknowledgements, rollback/constraint/cancellation cuts, retained omissions,
 invalid schema/receipts, and a separate process reopening a real database file.
+
+Patchset tests compare native `session.patchset()` bytes and native application
+with the production codec/SQL path, including twenty deterministic mutation
+workloads, mixed operations, composite keys, all storage classes, absent
+before-images, retained local columns, sparse allocation limits, malformed and
+mixed formats, constraints/cancellation, lost ACK and file-reopen replay.
