@@ -34,6 +34,9 @@
 //! // committed.bytes is a full SQLite Session changeset, not a patchset.
 //! ```
 
+#[path = "changeset_outbox.rs"]
+pub mod outbox;
+
 use std::fmt;
 
 use fsqlite_ast::{QualifiedName, Statement};
@@ -115,6 +118,9 @@ pub enum CaptureError {
     Schema(&'static str),
     Limit(&'static str),
     Poisoned,
+    /// A prior committed request owns this identity. Look it up rather than
+    /// committing the newly repeated application work.
+    DuplicateMessage { sequence: i64 },
     Engine(FrankenError),
     Commit(FrankenError),
     Rollback { cause: Box<Self>, error: FrankenError },
@@ -129,6 +135,7 @@ impl fmt::Display for CaptureError {
             Self::Schema(detail) => write!(f, "changeset capture schema: {detail}"),
             Self::Limit(resource) => write!(f, "changeset capture {resource} limit exceeded"),
             Self::Poisoned => f.write_str("changeset capture failed or was interrupted; rollback required"),
+            Self::DuplicateMessage { sequence } => write!(f, "outbox message already committed at sequence {sequence}; new capture commit refused"),
             Self::Engine(error) => write!(f, "changeset capture: {error}"),
             Self::Commit(error) => write!(f, "changeset capture COMMIT not acknowledged: {error}"),
             Self::Rollback { cause, error } => write!(f, "{cause}; rollback also failed: {error}"),
