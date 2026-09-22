@@ -600,9 +600,13 @@ impl MemoryFile {
                 proposed_reserved,
                 inner.config.max_bytes,
             )?;
+            // Vec reserves additional elements relative to LEN, not capacity.
+            // Using old_reserved here can under-reserve when spare capacity
+            // exists, leaving resize/extend to grow infallibly past the budget
+            // we just checked. Reserve the entire target before changing data.
             storage
                 .data
-                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_len))
                 .map_err(|_| FrankenError::OutOfMemory)?;
         }
 
@@ -1058,9 +1062,12 @@ impl VfsFile for MemoryFile {
                 proposed_reserved,
                 inner.config.max_bytes,
             )?;
+            // As in write_into_storage, additional capacity is measured from
+            // the current length. The whole batch must reserve its approved
+            // target fallibly before resize or the first byte is overwritten.
             storage
                 .data
-                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_len))
                 .map_err(|_| FrankenError::OutOfMemory)?;
         }
 
@@ -1477,6 +1484,134 @@ mod tests {
     }
 
     #[test]
+    fn growth_reservation_uses_length_with_spare_or_truncated_capacity() {
+        for mode in 0..3 {
+            for truncated in [false, true] {
+                let cx = Cx::new();
+                let vfs = MemoryVfs::new_with_config(MemoryVfsConfig {
+                    initial_reserve_bytes: 64,
+                    growth_chunk_bytes: 1,
+                    max_bytes: Some(128),
+                });
+                let flags =
+                    VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+                let (mut file, _) = vfs
+                    .open(&cx, Some(Path::new("growth.db")), flags)
+                    .unwrap();
+                if truncated {
+                    file.write(&cx, &[0x11; 64], 0).unwrap();
+                    file.truncate(&cx, 32).unwrap();
+                } else {
+                    file.write(&cx, &[0x11; 32], 0).unwrap();
+                }
+                let before = vfs.usage_snapshot().unwrap();
+                assert_eq!(before.file_bytes, 32);
+                assert_eq!(before.file_reserved_bytes, 64);
+                let tail = [0x22; 68];
+                // Ordinary writes (also used by tracked writes), one-element
+                // batches and the independent multi-element batch path.
+                match mode {
+                    0 => file.write(&cx, &tail, 32).unwrap(),
+                    1 => file.write_page_batch(&cx, &[(32, &tail)]).unwrap(),
+                    _ => file
+                        .write_page_batch(&cx, &[(32, &tail[..34]), (66, &tail[34..])])
+                        .unwrap(),
+                }
+                let after = vfs.usage_snapshot().unwrap();
+                assert_eq!(after.file_bytes, 100);
+                assert_eq!(
+                    after.file_reserved_bytes, 128,
+                    "mode={mode}, truncated={truncated}"
+                );
+                assert_eq!(after.peak_reserved_bytes, 128);
+                assert_eq!(after.growth_events, before.growth_events + 1);
+                let mut contents = [0_u8; 100];
+                assert_eq!(file.read(&cx, &mut contents, 0).unwrap(), contents.len());
+                assert_eq!(&contents[..32], &[0x11; 32]);
+                assert_eq!(&contents[32..], &tail);
+
+                // Writes inside the already approved allocation must not
+                // reserve again, including growth within its spare capacity.
+                file.write(&cx, &[0x33; 28], 100).unwrap();
+                let filled = vfs.usage_snapshot().unwrap();
+                assert_eq!(filled.file_bytes, 128);
+                assert_eq!(filled.file_reserved_bytes, 128);
+                assert_eq!(filled.growth_events, after.growth_events);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_growth_respects_aggregate_quota_and_zero_fills_gap() {
+        for batch in [false, true] {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new_with_config(MemoryVfsConfig {
+                initial_reserve_bytes: 64,
+                growth_chunk_bytes: 1,
+                max_bytes: Some(192),
+            });
+            let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+            let (file, _) = vfs
+                .open(&cx, Some(Path::new("sparse.db")), flags)
+                .unwrap();
+            let (peer, _) = vfs.open(&cx, Some(Path::new("peer.db")), flags).unwrap();
+            file.write(&cx, &[0x11; 32], 0).unwrap();
+            peer.write(&cx, b"peer", 0).unwrap();
+            if batch {
+                file.write_page_batch(&cx, &[(0, &[0x11]), (99, &[0x22])])
+                    .unwrap();
+            } else {
+                file.write(&cx, &[0x22], 99).unwrap();
+            }
+            let usage = vfs.usage_snapshot().unwrap();
+            assert_eq!(usage.file_bytes, 104);
+            assert_eq!(usage.file_reserved_bytes, 192);
+            assert_eq!(usage.reserved_bytes(), usage.max_bytes.unwrap());
+            let mut contents = [0xff_u8; 100];
+            assert_eq!(file.read(&cx, &mut contents, 0).unwrap(), contents.len());
+            assert_eq!(&contents[..32], &[0x11; 32]);
+            assert!(contents[32..99].iter().all(|byte| *byte == 0));
+            assert_eq!(contents[99], 0x22);
+            let mut peer_contents = [0_u8; 4];
+            assert_eq!(peer.read(&cx, &mut peer_contents, 0).unwrap(), 4);
+            assert_eq!(&peer_contents, b"peer");
+        }
+    }
+
+    #[test]
+    fn refused_growth_preserves_bytes_and_accounting_for_entire_batch() {
+        for batch in [false, true] {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new_with_config(MemoryVfsConfig {
+                initial_reserve_bytes: 64,
+                growth_chunk_bytes: 1,
+                max_bytes: Some(127),
+            });
+            let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+            let (file, _) = vfs
+                .open(&cx, Some(Path::new("limited.db")), flags)
+                .unwrap();
+            file.write(&cx, &[0x11; 32], 0).unwrap();
+            let before = vfs.usage_snapshot().unwrap();
+            let result = if batch {
+                // A later growth refusal must not leave the earlier overwrite.
+                file.write_page_batch(&cx, &[(0, &[0x55]), (99, &[0x22])])
+            } else {
+                file.write(&cx, &[0x22; 100], 0)
+            };
+            assert!(matches!(result, Err(FrankenError::OutOfMemory)));
+            assert_eq!(vfs.usage_snapshot().unwrap(), before);
+            let mut contents = [0_u8; 32];
+            assert_eq!(file.read(&cx, &mut contents, 0).unwrap(), contents.len());
+            assert_eq!(contents, [0x11; 32]);
+            // Refusal must leave the file usable within its existing budget.
+            file.write(&cx, &[0x44; 32], 32).unwrap();
+            assert_eq!(file.file_size(&cx).unwrap(), 64);
+            assert_eq!(vfs.usage_snapshot().unwrap().file_reserved_bytes, 64);
+        }
+    }
+
+    #[test]
     fn create_and_read_file() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -1711,7 +1846,6 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-
         let (mut file, _) = vfs.open(&cx, Some(Path::new("lock.db")), flags).unwrap();
 
         file.lock(&cx, LockLevel::Shared).unwrap();
