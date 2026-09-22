@@ -10,9 +10,9 @@ use std::io;
 use std::path::PathBuf;
 
 use asupersync::runtime::spawn_blocking;
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_vfs::{Vfs, host_fs};
+use fsqlite_vfs::{FileIdentity, Vfs, host_fs};
 
 use super::{
     ExportReport, NativeVfs, checkpoint, refuse_destination_artifacts, verify_image, write_image,
@@ -54,10 +54,21 @@ impl ExportImage {
         refuse_destination_artifacts(&vfs, cx, &self.destination)?;
         let mut output = host_fs::reserve_new_file(&self.destination)?;
         let publication: Result<blake3::Hash> = (|| {
-            refuse_destination_artifacts(&vfs, cx, &self.destination)?;
+            let identity = FileIdentity::from_file(&output)?.ok_or(FrankenError::Unsupported)?;
+            let validate_destination = || {
+                host_fs::validate_reserved_file_identity(&self.destination, identity)?;
+                refuse_destination_artifacts(&vfs, cx, &self.destination)
+            };
+            validate_destination()?;
             write_image(&mut output, cx, &self.bytes, &mut sync)?;
             let digest = verify_image(&mut output, cx, &self.bytes)?;
+            // Readback authenticates the retained descriptor, not its name.
+            // Refuse a disappeared/replaced path or late recovery companion
+            // before and after the directory durability boundary. Unix uses
+            // metadata-only probes so a replacement cannot shed peer locks.
+            validate_destination()?;
             vfs.sync_parent_directory(cx, &self.destination)?;
+            validate_destination()?;
             Ok(digest)
         })();
         // Close on this worker, not on a potentially cancelled async awaiter.
@@ -66,7 +77,7 @@ impl ExportImage {
             Ok(digest) => digest,
             Err(error) => {
                 eprintln!(
-                    "Destination retained at {}; export completion is NOT certified",
+                    "Export completion is NOT certified for {}; no output or replacement was removed",
                     self.destination.display()
                 );
                 return Err(error);
@@ -87,9 +98,10 @@ impl ExportImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_recovery::{DATABASE_HEADER_BYTES, IO_CHUNK, companion, request_context};
+    use crate::native_recovery::{
+        DATABASE_HEADER_BYTES, IO_CHUNK, RECOVERY_COMPANION_SUFFIXES, companion, request_context,
+    };
     use asupersync::runtime::RuntimeBuilder;
-    use fsqlite_error::FrankenError;
     use std::future::Future;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
@@ -176,6 +188,79 @@ mod tests {
             assert!(publish(&cx, image).await.is_err());
             assert_eq!(host_fs::read(&destination).unwrap(), b"another owner");
         });
+    }
+
+    #[test]
+    fn publication_refuses_missing_or_replaced_destination_after_either_sync() {
+        for replace_at in [1, 2] {
+            for install_replacement in [false, true] {
+                run(async {
+                    let directory = tempfile::tempdir().unwrap();
+                    let image = image(directory.path());
+                    let destination = image.destination.clone();
+                    let retained = directory.path().join("retained-export.db");
+                    let expected = image.bytes.clone();
+                    let replacement = expected.clone();
+                    let changed_path = destination.clone();
+                    let retained_path = retained.clone();
+                    let cx = request_context().unwrap();
+                    let mut syncs = 0;
+                    let result = publish_with_sync(&cx, image, move |file| {
+                        file.sync_all()?;
+                        syncs += 1;
+                        if syncs == replace_at {
+                            host_fs::rename(&changed_path, &retained_path).unwrap();
+                            if install_replacement {
+                                // Identical bytes cannot substitute for ownership.
+                                host_fs::write(&changed_path, &replacement).unwrap();
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await;
+                    if install_replacement {
+                        assert!(matches!(result, Err(FrankenError::BusyRecovery)));
+                        assert_eq!(host_fs::read(&destination).unwrap(), expected);
+                    } else {
+                        assert!(matches!(result, Err(FrankenError::Io(error))
+                            if error.kind() == io::ErrorKind::NotFound));
+                        assert!(!destination.exists());
+                    }
+                    assert_eq!(host_fs::read(&retained).unwrap(), expected);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn publication_refuses_all_recovery_companions_created_during_sync() {
+        for suffix in RECOVERY_COMPANION_SUFFIXES {
+            for create_at in [1, 2] {
+                run(async {
+                    let directory = tempfile::tempdir().unwrap();
+                    let image = image(directory.path());
+                    let destination = image.destination.clone();
+                    let expected = image.bytes.clone();
+                    let artifact = companion(&destination, suffix);
+                    let created_path = artifact.clone();
+                    let cx = request_context().unwrap();
+                    let mut syncs = 0;
+                    let result = publish_with_sync(&cx, image, move |file| {
+                        file.sync_all()?;
+                        syncs += 1;
+                        if syncs == create_at {
+                            host_fs::write(&created_path, b"unowned recovery artifact").unwrap();
+                        }
+                        Ok(())
+                    })
+                    .await;
+                    assert!(matches!(result, Err(FrankenError::CannotOpen { path })
+                        if path == artifact));
+                    assert_eq!(host_fs::read(&destination).unwrap(), expected);
+                    assert_eq!(host_fs::read(&artifact).unwrap(), b"unowned recovery artifact");
+                });
+            }
+        }
     }
 
     #[test]

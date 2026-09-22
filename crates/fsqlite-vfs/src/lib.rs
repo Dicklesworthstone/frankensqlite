@@ -82,6 +82,44 @@ pub mod host_fs {
         Ok(options.open(path)?)
     }
 
+    /// Revalidate a reserved file's pathname against its retained descriptor identity.
+    ///
+    /// On Unix this deliberately uses metadata only. Opening and closing an
+    /// independent descriptor for a replacement could release another local
+    /// connection's POSIX locks on that file. Final symlinks, non-regular files
+    /// and hard-link aliases are refused. Windows compares the full native
+    /// handle identity through the existing no-follow ingress.
+    ///
+    /// The caller must keep the descriptor that supplied `expected_identity`
+    /// alive. This is an observation, not a namespace lock: the same trusted,
+    /// cooperative parent-directory contract as native database admission
+    /// applies. Nothing is created, rewritten, truncated or removed.
+    #[cfg(any(unix, windows))]
+    pub fn validate_reserved_file_identity(
+        path: &Path,
+        expected_identity: super::FileIdentity,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || super::FileIdentity::from_unix_parts(metadata.dev(), metadata.ino())
+                    != expected_identity
+            {
+                return Err(fsqlite_error::FrankenError::BusyRecovery);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let file = open_existing_regular_file_no_follow(path)?;
+            if super::FileIdentity::from_file(&file)? != Some(expected_identity) {
+                return Err(fsqlite_error::FrankenError::BusyRecovery);
+            }
+        }
+        Ok(())
+    }
+
     pub fn open_file(path: &Path) -> Result<File> {
         Ok(File::open(path)?)
     }
@@ -217,6 +255,47 @@ mod host_fs_security_tests {
 
     use super::host_fs::{open_existing_regular_file_no_follow, open_wal_for_guarded_repair, reserve_new_file};
     use super::FileIdentity;
+
+    #[test]
+    fn reserved_identity_revalidation_refuses_missing_and_replaced_paths() {
+        use super::host_fs::validate_reserved_file_identity;
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("reserved.db");
+        let retained = directory.join("retained.db");
+        let mut original = reserve_new_file(&path).unwrap();
+        original.write_all(b"same bytes, different identity").unwrap();
+        let identity = FileIdentity::from_file(&original).unwrap().unwrap();
+        validate_reserved_file_identity(&path, identity).unwrap();
+        std::fs::rename(&path, &retained).unwrap();
+        assert!(validate_reserved_file_identity(&path, identity).is_err());
+        assert!(!path.exists(), "validation must not recreate a missing reservation");
+        std::fs::write(&path, b"same bytes, different identity").unwrap();
+        assert!(matches!(
+            validate_reserved_file_identity(&path, identity),
+            Err(fsqlite_error::FrankenError::BusyRecovery)
+        ));
+        assert_eq!(FileIdentity::from_file(&original).unwrap(), Some(identity));
+        assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&retained).unwrap());
+    }
+
+    #[test]
+    fn reserved_identity_revalidation_refuses_symlinks_and_hard_link_aliases() {
+        use super::host_fs::validate_reserved_file_identity;
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("reserved.db");
+        let original = reserve_new_file(&path).unwrap();
+        let identity = FileIdentity::from_file(&original).unwrap().unwrap();
+        let link = directory.join("symlink.db");
+        symlink(&path, &link).unwrap();
+        assert!(validate_reserved_file_identity(&link, identity).is_err());
+        validate_reserved_file_identity(&path, identity).unwrap();
+        let alias = directory.join("alias.db");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(validate_reserved_file_identity(&path, identity).is_err());
+        assert!(validate_reserved_file_identity(&alias, identity).is_err());
+    }
 
     #[test]
     fn guarded_wal_open_is_existing_only_and_preserves_bytes_and_identity() {
