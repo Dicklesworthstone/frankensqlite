@@ -544,6 +544,8 @@ where
 /// ordinary SQL transaction storage may still grow with the write set.
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod streaming {
+    pub mod ordered;
+
     use asupersync::io::AsyncRead;
     use fsqlite_types::cx::Cx;
 
@@ -752,7 +754,7 @@ pub mod streaming {
         if let Err(error) = conn.begin_transaction().await {
             return Err(rollback(&mut transaction, error.into()).await);
         }
-        let result = apply_rows(conn, cx, &mut reader, first, &mut handler).await;
+        let result = apply_rows(conn, cx, &mut reader, first, &mut handler, None).await;
         let report = match result {
             Ok(report) => report,
             Err(error) => return Err(rollback(&mut transaction, error).await),
@@ -813,6 +815,7 @@ pub mod streaming {
         reader: &mut ChangesetStreamReader<R>,
         first: StreamedChange,
         handler: &mut F,
+        excluded_table: Option<&str>,
     ) -> Result<SqlChangesetApplyReport, StreamApplyError>
     where
         R: AsyncRead + Unpin,
@@ -831,6 +834,12 @@ pub mod streaming {
         let mut report = SqlChangesetApplyReport::default();
         while let Some(event) = next {
             checkpoint(cx)?;
+            if excluded_table.is_some_and(|name| name.eq_ignore_ascii_case(&event.table.name)) {
+                return Err(SqlChangesetApplyError::Schema {
+                    table: event.table.name.clone(),
+                    detail: "changeset targets replication-owned metadata",
+                }.into());
+            }
             if event.section != section {
                 section = event.section;
                 single.kind = event.kind;
