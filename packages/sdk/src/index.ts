@@ -248,3 +248,21 @@ export type {
   TransactionOptions,
 } from "./types";
 export type { WorkerLike } from "./worker-client";
+export type {
+  ChangesetOrderOptions,
+  ChangesetOrderOperationOptions,
+  OrderedChangeset,
+  ChangesetOrderHead,
+  ChangesetOrderResult,
+  OrderedChangesetApply,
+} from "./changeset-order";
+export { ChangesetOrder, ChangesetOrderError, CHANGESET_ORDER_TABLE, CHANGESET_ORDER_HEAD_TABLE } from "./changeset-order";
+export type {
+  ChangesetWireOrder,
+  OrderedChangesetEnvelope,
+  OrderedChangesetReceipt,
+  OrderedDeliveryApply,
+  OrderedChangesetReceiverOptions,
+  OrderedChangesetReceiver,
+} from "./changeset-ordered-delivery";
+export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver } from "./changeset-ordered-delivery";
