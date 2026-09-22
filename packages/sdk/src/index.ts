@@ -130,9 +130,13 @@ export type {
 export {
   CHANGESET_HTTP_CONTENT_TYPE,
   CHANGESET_HTTP_RECEIPT_TYPE,
+  CHANGESET_ORDERED_HTTP_CONTENT_TYPE,
+  CHANGESET_ORDERED_HTTP_RECEIPT_TYPE,
   ChangesetHttpError,
   createChangesetHttpHandler,
   createChangesetHttpTransport,
+  createOrderedChangesetHttpHandler,
+  createOrderedChangesetHttpTransport,
 } from "./changeset-http";
 export type {
   ChangesetOutboxOptions,

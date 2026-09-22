@@ -5,12 +5,38 @@ import type {
   ChangesetReceiver,
   ChangesetTransport,
 } from "./changeset-delivery";
+import type {
+  ChangesetWireOrder,
+  OrderedChangesetEnvelope,
+  OrderedChangesetReceipt,
+  OrderedChangesetReceiver,
+} from "./changeset-ordered-delivery";
 
 // Type-checked against the delivery protocol without loading the SQL runtime in
 // a transport-only client. Changing that protocol requires a wire-version review.
 const PROTOCOL: ChangesetEnvelope["protocol"] = "fsqlite-changeset-v1";
 export const CHANGESET_HTTP_CONTENT_TYPE = "application/vnd.fsqlite.changeset.v1";
 export const CHANGESET_HTTP_RECEIPT_TYPE = "application/vnd.fsqlite.changeset-receipt.v1+json";
+export const CHANGESET_ORDERED_HTTP_CONTENT_TYPE = "application/vnd.fsqlite.ordered-changeset.v1";
+export const CHANGESET_ORDERED_HTTP_RECEIPT_TYPE =
+  "application/vnd.fsqlite.ordered-changeset-receipt.v1+json";
+const ORDER_PROTOCOL: ChangesetWireOrder["protocol"] = "fsqlite-ordered-changeset-v1";
+interface WireFormat {
+  readonly ordered: boolean;
+  readonly tag: number;
+  readonly contentType: string;
+  readonly receiptType: string;
+}
+const LEGACY_WIRE: WireFormat = Object.freeze({
+  ordered: false, tag: 68,
+  contentType: CHANGESET_HTTP_CONTENT_TYPE, receiptType: CHANGESET_HTTP_RECEIPT_TYPE,
+});
+const ORDERED_WIRE: WireFormat = Object.freeze({
+  ordered: true, tag: 79,
+  contentType: CHANGESET_ORDERED_HTTP_CONTENT_TYPE, receiptType: CHANGESET_ORDERED_HTTP_RECEIPT_TYPE,
+});
+type WireEnvelope = ChangesetEnvelope & { readonly order?: Readonly<ChangesetWireOrder> };
+type WireReceipt = ChangesetDeliveryReceipt & { readonly order?: Readonly<ChangesetWireOrder> };
 const MAX_PAYLOAD = 64 * 1024 * 1024;
 const MAX_METADATA = 8192;
 const MAX_RECEIPT = 8192;
@@ -90,18 +116,40 @@ interface Metadata {
   readonly deliveryId: string;
   readonly sha256: string;
   readonly byteLength: number;
+  readonly order?: Readonly<ChangesetWireOrder>;
 }
-function metadata(value: unknown, maximum: number): Metadata {
+/** No negotiation or downgrade: an ordered endpoint requires order on both legs. */
+function captureOrder(value: unknown, format: WireFormat): Readonly<ChangesetWireOrder> | undefined {
+  if (!format.ordered) {
+    if (typeof value === "object" && value !== null && "order" in value)
+      fail("PROTOCOL", "Ordered deliveries require the ordered HTTP endpoint");
+    return undefined;
+  }
+  const order = field(value, "order");
+  if (field(order, "protocol") !== ORDER_PROTOCOL)
+    fail("PROTOCOL", "Unsupported HTTP order protocol");
+  const streamId = identity(field(order, "streamId"), 256);
+  const sequence = field(order, "sequence");
+  if (
+    typeof sequence !== "string" || !/^[1-9][0-9]{0,18}$/.test(sequence) ||
+    BigInt(sequence) >= 1n << 63n
+  ) fail("PROTOCOL", "HTTP sequence must be a canonical positive signed-int64 string");
+  return Object.freeze({ protocol: ORDER_PROTOCOL, streamId, sequence });
+}
+function metadata(value: unknown, maximum: number, format: WireFormat): Metadata {
   if (field(value, "protocol") !== PROTOCOL) fail("PROTOCOL", "Unsupported changeset protocol");
+  const order = captureOrder(value, format);
   return Object.freeze({
     protocol: PROTOCOL,
     receiverId: identity(field(value, "receiverId"), 256),
     deliveryId: identity(field(value, "deliveryId"), 512),
     sha256: digest(field(value, "sha256")),
     byteLength: integer(field(value, "byteLength"), maximum),
+    ...(order === undefined ? {} : { order }),
   });
 }
-function encode(message: ChangesetEnvelope, maximum: number) {
+function encode(message: WireEnvelope, maximum: number, format: WireFormat) {
+  const order = captureOrder(message, format);
   const bytes = ownedBytes(field(message, "changeset"), maximum);
   const meta = metadata(
     {
@@ -110,13 +158,16 @@ function encode(message: ChangesetEnvelope, maximum: number) {
       deliveryId: field(message, "deliveryId"),
       sha256: field(message, "sha256"),
       byteLength: bytes.length,
+      ...(order === undefined ? {} : { order }),
     },
     maximum,
+    format,
   );
   const json = encoder.encode(JSON.stringify(meta));
   if (json.length > MAX_METADATA) fail("LIMIT", "HTTP delivery metadata is too large");
   const wire = new Uint8Array(8 + json.length + bytes.length);
-  wire.set([70, 67, 68, 49]); // FCD1; uint32 BE JSON length; JSON; unmodified binary payload.
+  // FCD1 (unordered) or FCO1 (ordered); uint32 BE JSON length; JSON; raw payload.
+  wire.set([70, 67, format.tag, 49]);
   new DataView(wire.buffer).setUint32(4, json.length);
   wire.set(json, 8);
   wire.set(bytes, 8 + json.length);
@@ -129,13 +180,13 @@ function parseJson(bytes: Uint8Array): unknown {
     return fail("PROTOCOL", "Invalid HTTP delivery JSON or UTF-8");
   }
 }
-function decode(wire: Uint8Array, maximum: number): ChangesetEnvelope {
-  if (wire.length < 8 || wire[0] !== 70 || wire[1] !== 67 || wire[2] !== 68 || wire[3] !== 49)
+function decode(wire: Uint8Array, maximum: number, format: WireFormat): WireEnvelope {
+  if (wire.length < 8 || wire[0] !== 70 || wire[1] !== 67 || wire[2] !== format.tag || wire[3] !== 49)
     fail("PROTOCOL", "Invalid HTTP delivery frame");
   const length = new DataView(wire.buffer, wire.byteOffset, wire.byteLength).getUint32(4);
   if (length === 0 || length > MAX_METADATA || length > wire.length - 8)
     fail("PROTOCOL", "Invalid HTTP metadata length");
-  const meta = metadata(parseJson(wire.subarray(8, 8 + length)), maximum);
+  const meta = metadata(parseJson(wire.subarray(8, 8 + length)), maximum, format);
   if (wire.length - 8 - length !== meta.byteLength)
     fail("PROTOCOL", "HTTP payload length does not match metadata");
   return Object.freeze({
@@ -144,9 +195,13 @@ function decode(wire: Uint8Array, maximum: number): ChangesetEnvelope {
     deliveryId: meta.deliveryId,
     sha256: meta.sha256,
     changeset: wire.subarray(8 + length),
+    ...(meta.order === undefined ? {} : { order: meta.order }),
   });
 }
-function receipt(value: unknown, meta: Metadata): ChangesetDeliveryReceipt {
+function receipt(value: unknown, meta: Metadata, format: WireFormat): WireReceipt {
+  const order = captureOrder(value, format);
+  if (order?.streamId !== meta.order?.streamId || order?.sequence !== meta.order?.sequence)
+    fail("PROTOCOL", "The HTTP receipt does not confirm this exact source sequence");
   if (
     field(value, "protocol") !== PROTOCOL ||
     field(value, "receiverId") !== meta.receiverId ||
@@ -335,7 +390,7 @@ export interface ChangesetHttpTransportOptions {
   allowInsecureLoopback?: boolean;
   /** Trusted credentials provider. Does not receive payload bytes. Cookies are omitted. */
   headers?: (
-    delivery: Readonly<Omit<ChangesetEnvelope, "changeset">>,
+    delivery: Readonly<Omit<WireEnvelope, "changeset">>,
     signal: AbortSignal,
   ) => HeadersInit | Promise<HeadersInit>;
   /** Defaults to global fetch. Custom implementations must honor Request policies. */
@@ -346,6 +401,25 @@ export function createChangesetHttpTransport(
   url: string | URL,
   options: ChangesetHttpTransportOptions = {},
 ): ChangesetTransport {
+  return createHttpTransport(url, options, LEGACY_WIRE);
+}
+/** Ordered binary POST. Supply it as createOrderedChangesetTransport's deliver callback. */
+export function createOrderedChangesetHttpTransport(
+  url: string | URL,
+  options: ChangesetHttpTransportOptions = {},
+): (message: OrderedChangesetEnvelope, controls?: ChangesetDeliveryOptions) => Promise<OrderedChangesetReceipt> {
+  const send = createHttpTransport(url, options, ORDERED_WIRE);
+  return async (message, controls) => {
+    const result = await send(message, controls);
+    if (result.order === undefined) fail("PROTOCOL", "Missing ordered HTTP receipt");
+    return Object.freeze({ ...result, order: result.order });
+  };
+}
+function createHttpTransport(
+  url: string | URL,
+  options: ChangesetHttpTransportOptions,
+  format: WireFormat,
+): (message: WireEnvelope, controls?: ChangesetDeliveryOptions) => Promise<WireReceipt> {
   const maximum = bound(options.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
   const timeout = bound(options.timeoutMs, 30_000, 2_147_483_647),
     insecure = options.allowInsecureLoopback ?? false;
@@ -371,7 +445,7 @@ export function createChangesetHttpTransport(
       budget = new Budget({ ...controls, timeoutMs });
       budget.checkpoint();
       // Capture before invoking application code or awaiting credentials/fetch.
-      const { wire, meta } = encode(message, maximum);
+      const { wire, meta } = encode(message, maximum, format);
       budget.checkpoint();
       const headers = new Headers(
         credentials === undefined ? undefined : await credentials(meta, budget.signal),
@@ -399,8 +473,8 @@ export function createChangesetHttpTransport(
         )
           fail("INPUT", "Credential headers may not override transport policies");
       }
-      headers.set("content-type", CHANGESET_HTTP_CONTENT_TYPE);
-      headers.set("accept", CHANGESET_HTTP_RECEIPT_TYPE);
+      headers.set("content-type", format.contentType);
+      headers.set("accept", format.receiptType);
       const request = new Request(address, {
         method: "POST",
         headers,
@@ -430,11 +504,11 @@ export function createChangesetHttpTransport(
           "unknown",
           response.status,
         );
-      if (!contentType(response.headers, CHANGESET_HTTP_RECEIPT_TYPE))
+      if (!contentType(response.headers, format.receiptType))
         fail("PROTOCOL", "Unexpected changeset receipt content type");
       const bytes = await readBody(response.body, response.headers, MAX_RECEIPT, budget);
       budget.checkpoint();
-      return receipt(parseJson(bytes), meta);
+      return receipt(parseJson(bytes), meta, format);
     } catch (cause: unknown) {
       // Never return remote messages, URLs, headers or SQL errors as diagnostics.
       if (cause instanceof ChangesetHttpError) {
@@ -488,7 +562,7 @@ export interface ChangesetHttpHandlerOptions {
   /** Optional sender-namespace/business policy, after framing and before SQL. */
   authorizeDelivery?: (
     request: ChangesetHttpAuthorization,
-    delivery: Readonly<Omit<ChangesetEnvelope, "changeset">>,
+    delivery: Readonly<Omit<WireEnvelope, "changeset">>,
   ) => boolean | Promise<boolean>;
   maxMessageBytes?: number;
   /** Bounds admission, authorization, upload and awaited receiver execution; default 30s. */
@@ -554,6 +628,7 @@ function httpResponse(
   value: unknown,
   origin: string | null,
   extra?: HeadersInit,
+  format: WireFormat = LEGACY_WIRE,
 ): Response {
   const headers = new Headers(extra);
   headers.set("cache-control", "no-store");
@@ -561,7 +636,7 @@ function httpResponse(
   headers.set("vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
   if (origin !== null) headers.set("access-control-allow-origin", origin);
   if (status === 204) return new Response(null, { status, headers });
-  headers.set("content-type", status === 200 ? CHANGESET_HTTP_RECEIPT_TYPE : "application/json");
+  headers.set("content-type", status === 200 ? format.receiptType : "application/json");
   return new Response(JSON.stringify(value), { status, headers });
 }
 function errorResponse(status: number, origin: string | null, extra?: HeadersInit): Response {
@@ -583,6 +658,22 @@ function errorResponse(status: number, origin: string | null, extra?: HeadersIni
 export function createChangesetHttpHandler(
   receiver: Pick<ChangesetReceiver, "receiverId" | "receive">,
   options: ChangesetHttpHandlerOptions,
+): ChangesetHttpHandler {
+  return createHttpHandler(receiver, options, LEGACY_WIRE);
+}
+/** Mount only an explicitly provisioned ordered receiver; no stream enrollment from the wire. */
+export function createOrderedChangesetHttpHandler(
+  receiver: OrderedChangesetReceiver,
+  options: ChangesetHttpHandlerOptions,
+): ChangesetHttpHandler {
+  const streamId = identity(receiver?.streamId, 256);
+  return createHttpHandler(receiver, options, ORDERED_WIRE, streamId);
+}
+function createHttpHandler(
+  receiver: Pick<ChangesetReceiver, "receiverId" | "receive">,
+  options: ChangesetHttpHandlerOptions,
+  format: WireFormat,
+  streamId?: string,
 ): ChangesetHttpHandler {
   const id = identity(receiver?.receiverId, 256),
     method = receiver?.receive;
@@ -643,7 +734,7 @@ export function createChangesetHttpHandler(
         });
       }
       if (request.method !== "POST") return errorResponse(405, origin, { allow: "POST, OPTIONS" });
-      if (!contentType(request.headers, CHANGESET_HTTP_CONTENT_TYPE))
+      if (!contentType(request.headers, format.contentType))
         return errorResponse(415, origin);
       if (active >= capacity) return errorResponse(503, origin);
       active++;
@@ -671,15 +762,17 @@ export function createChangesetHttpHandler(
         8 + MAX_METADATA + maximum,
         budget,
       );
-      const envelope = decode(wire, maximum);
+      const envelope = decode(wire, maximum, format);
       budget.checkpoint();
       if (envelope.receiverId !== id) return errorResponse(400, origin);
+      if (format.ordered && envelope.order?.streamId !== streamId) return errorResponse(400, origin);
       const meta = Object.freeze({
         protocol: envelope.protocol,
         receiverId: id,
         deliveryId: envelope.deliveryId,
         sha256: envelope.sha256,
         byteLength: envelope.changeset.byteLength,
+        ...(envelope.order === undefined ? {} : { order: envelope.order }),
       });
       if (authorizeDelivery !== undefined) {
         try {
@@ -700,7 +793,7 @@ export function createChangesetHttpHandler(
         timeoutMs: budget.remaining(),
       });
       budget.checkpoint();
-      return httpResponse(200, receipt(result, meta), origin);
+      return httpResponse(200, receipt(result, meta, format), origin, undefined, format);
     } catch (cause: unknown) {
       if (cause instanceof ChangesetHttpError) {
         if (cause.code.endsWith("TIMEOUT") || cause.code.endsWith("CANCELLED"))
@@ -712,7 +805,9 @@ export function createChangesetHttpHandler(
         typeof cause === "object" && cause !== null
           ? Object.getOwnPropertyDescriptor(cause, "code")?.value
           : undefined;
-      return errorResponse(code === "ERR_FSQLITE_DELIVERY_BUSY" ? 503 : 500, origin);
+      const busy = code === "ERR_FSQLITE_DELIVERY_BUSY" || code === "ERR_FSQLITE_ORDERED_BUSY" ||
+        code === "ERR_FSQLITE_ORDER_BUSY";
+      return errorResponse(busy ? 503 : code === "ERR_FSQLITE_ORDER_GAP" ? 409 : 500, origin);
     } finally {
       try {
         // A denied request never acquires a reader or buffers its payload. Cancel
