@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { decodeChangeset, decodePatchset, decodeRebaseInfo, encodeChangeset, encodePatchset, encodeRebaseInfo } from "../src/changeset-codec.ts";
 import { ChangesetRebaser, createChangesetRebaseInfo, rebaseChangeset } from "../src/changeset-rebase.ts";
 import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
+import { ChangesetRebaseJournal, REBASE_JOURNAL_ENTRIES_TABLE as ENTRIES, REBASE_JOURNAL_HEADS_TABLE as HEADS } from "../src/changeset-rebase-journal.ts";
 
 const oraclePath = fileURLToPath(new URL("./helpers/rebase-oracle.py", import.meta.url));
 function oracle(input) {
@@ -513,4 +514,257 @@ test("shared codec preserves 64 native changeset/patchset roundtrips and default
       assert.equal(result.applied, 3); assert.deepEqual(rows(replica), rows(source));
     } finally { session.close(); source.close(); replica.close(); }
   }
+});
+
+// Real ordered SQL journal. Native decisions and native rebasing are still the
+// independent C oracle above; these tests execute production journal SQL.
+function journal(host, options = {}) {
+  return new ChangesetRebaseJournal(host, { journalId: "local-history", ...options });
+}
+const remoteFirst = () => bytes(first.remoteWires[0]);
+const journalOptions = (deliveryId = "remote:1", extra = {}) => ({ tables: ["t"], deliveryId, onConflict: () => "omit", ...extra });
+function intercepted(host, intercept) {
+  return {
+    transaction: (work, options) => host.transaction((tx) => work({
+      query: (...args) => tx.query(...args),
+      async execute(sql, params) {
+        const result = await tx.execute(sql, params);
+        await intercept(sql, tx);
+        return result;
+      },
+    }), options),
+  };
+}
+function journalCount(db) {
+  return db.prepare("SELECT 1 FROM sqlite_schema WHERE name=?").get(ENTRIES) ? rowCount(db, ENTRIES) : 0;
+}
+for (const c of generated.cases) {
+  test(`persistent journal/native oracle: ${c.name}`, async () => {
+    const { db, host } = opened(c), j = journal(host);
+    try {
+      assert.deepEqual(await j.head(), { journalId: "local-history", position: 0, byteLength: 0 });
+      let totalBytes = 0;
+      for (let i = 0; i < c.remoteWires.length; i++) {
+        const wire = bytes(c.remoteWires[i]), deliveryId = `peer:${i}`;
+        const options = { tables: decodeChangeset(wire).map((t) => t.name), deliveryId, onConflict: () => c.remote[i].policy ?? "omit" };
+        const result = await j.apply(wire, options);
+        assert.equal(result.replayed, false);
+        assert.equal(result.entry.position, i + 1);
+        assert.deepEqual(decodeRebaseInfo(result.entry.rebaseInfo), decodeRebaseInfo(bytes(c.rebaseBuffers[i])));
+        totalBytes += result.entry.rebaseInfo.length;
+        const repeat = await j.apply(wire, { ...options, onConflict: () => assert.fail("journal replay must not run policy") });
+        assert.deepEqual(repeat, { ...result, replayed: true });
+        assert.deepEqual(await j.read(deliveryId), result.entry);
+        result.entry.rebaseInfo.fill(0);
+        assert.deepEqual(decodeRebaseInfo((await j.read(deliveryId)).rebaseInfo), decodeRebaseInfo(bytes(c.rebaseBuffers[i])));
+        assert.deepEqual(await j.head(), { journalId: "local-history", position: i + 1, byteLength: totalBytes });
+      }
+      const rebased = await j.rebase(bytes(c.localWire));
+      assert.deepEqual(records(rebased.changeset), c.expectedRecords);
+      assert.equal(rebased.through, c.remoteWires.length);
+      assert.equal(journalCount(db), c.remoteWires.length);
+      assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+    } finally { db.close(); }
+  });
+}
+
+test("journal lost ACK and fresh file reopen retain decisions without replaying SQL", async () => {
+  const filename = join(mkdtempSync(join(tmpdir(), "fsqlite-journal-")), "history.db");
+  let { db, host } = opened(first, filename);
+  try {
+    host.loseAcknowledgement = true;
+    await assert.rejects(journal(host).apply(remoteFirst(), journalOptions()), /lost commit acknowledgement/);
+    db.close(); db = new DatabaseSync(filename); host = sqlTarget(db);
+    const j = journal(host), saved = await j.read("remote:1");
+    assert.equal(saved.position, 1);
+    const result = await j.apply(remoteFirst(), journalOptions("remote:1", { onConflict: () => assert.fail("no replay") }));
+    assert.equal(result.replayed, true); assert.deepEqual(result.entry, saved);
+    assert.deepEqual(records((await j.rebase(local())).changeset), first.expectedRecords);
+    assert.equal(journalCount(db), 1); assert.equal(inboxCount(db), 1);
+    assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  } finally { db.close(); }
+});
+
+test("journal read and empty-range rebase do not install storage", async () => {
+  const { db, host } = opened(), j = journal(host);
+  try {
+    assert.equal(await j.read("unknown"), null);
+    assert.deepEqual((await j.rebase(local())).changeset, local());
+    assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name LIKE '__fsqlite_rebase_journal_%'").get().n, 0);
+    await assert.rejects(j.rebase(local(), { through: 1 }), { code: "ERR_FSQLITE_REBASE_JOURNAL_MISSING" });
+  } finally { db.close(); }
+});
+
+test("journal full by entries counts empty decisions and preserves exact replay", async () => {
+  const { db, host } = opened(), j = journal(host, { maxEntries: 1 });
+  try {
+    const empty = new Uint8Array();
+    const saved = await j.apply(empty, journalOptions("empty"));
+    assert.equal(saved.entry.rebaseInfo.length, 0);
+    await assert.rejects(j.apply(remoteFirst(), journalOptions("over")), { code: "ERR_FSQLITE_REBASE_JOURNAL_LIMIT" });
+    assert.equal(journalCount(db), 1); assert.equal(inboxCount(db), 1);
+    assert.equal((await j.apply(empty, journalOptions("empty"))).replayed, true);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+  } finally { db.close(); }
+});
+
+test("journal byte backpressure atomically rejects rows, receipt and history", async () => {
+  const { db, host } = opened(), j = journal(host, { maxBytes: 1 });
+  try {
+    await assert.rejects(j.apply(remoteFirst(), journalOptions("too-large", { onConflict: () => "replace" })), { code: "ERR_FSQLITE_REBASE_JOURNAL_LIMIT" });
+    assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal((await j.head()).position, 0);
+  } finally { db.close(); }
+});
+for (const step of [ENTRIES, HEADS]) {
+  test(`journal cancellation after ${step} SQL rolls everything back`, async () => {
+    const { db, host } = opened(), controller = new AbortController();
+    const adapter = intercepted(host, (sql) => { if (sql.startsWith(step === ENTRIES ? "INSERT OR ABORT" : "UPDATE OR ABORT") && sql.includes(step)) controller.abort(); });
+    try {
+      await assert.rejects(journal(adapter).apply(remoteFirst(), journalOptions("cut", { onConflict: () => "replace", signal: controller.signal })), { code: "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED" });
+      assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+      assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    } finally { db.close(); }
+  });
+  test(`journal IO failure after ${step} SQL cannot leave partial history`, async () => {
+    const { db, host } = opened();
+    const adapter = intercepted(host, (sql) => { if (sql.startsWith(step === ENTRIES ? "INSERT OR ABORT" : "UPDATE OR ABORT") && sql.includes(step)) throw new Error("injected journal I/O"); });
+    try {
+      await assert.rejects(journal(adapter).apply(remoteFirst(), journalOptions("cut", { onConflict: () => "replace" })), /injected journal I\/O/);
+      assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+      assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    } finally { db.close(); }
+  });
+}
+
+test("journal child application remains provisional until outer COMMIT", async () => {
+  const { db, host } = opened();
+  try {
+    await assert.rejects(host.transaction(async () => {
+      await journal(host).apply(remoteFirst(), journalOptions());
+      assert.equal(journalCount(db), 1);
+      throw new Error("outer failed");
+    }), /outer failed/);
+    assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+
+test("journal deferred COMMIT failure rolls back data, proof and inbox", async () => {
+  const { db, host } = opened();
+  db.exec("PRAGMA foreign_keys=ON; CREATE TABLE p(k PRIMARY KEY); CREATE TABLE child(k REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER side_effect AFTER INSERT ON t BEGIN INSERT INTO child VALUES(42); END;");
+  try {
+    await assert.rejects(journal(host).apply(remoteFirst(), journalOptions("deferred", { onConflict: () => "replace" })), /FOREIGN KEY/);
+    assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 0);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "child"), 0);
+  } finally { db.close(); }
+});
+
+test("journal never fabricates decisions for an old unjournaled receipt", async () => {
+  const { db, host } = opened();
+  try {
+    await applyChangeset(host, remoteFirst(), journalOptions());
+    await assert.rejects(journal(host).apply(remoteFirst(), journalOptions("remote:1", { onConflict: () => assert.fail("no replay") })), { code: "ERR_FSQLITE_REBASE_JOURNAL_MISSING" });
+    assert.equal(journalCount(db), 0); assert.equal(inboxCount(db), 1);
+  } finally { db.close(); }
+});
+
+for (const damage of [
+  `DELETE FROM ${ENTRIES}`,
+  `DELETE FROM ${HEADS}`,
+  `UPDATE ${HEADS} SET position=position+1`,
+  `UPDATE ${HEADS} SET byte_length=byte_length+1`,
+  `UPDATE ${ENTRIES} SET byte_length=byte_length+1`,
+  `UPDATE ${ENTRIES} SET sha256='${"0".repeat(64)}'`,
+  `UPDATE ${ENTRIES} SET rebase_info=zeroblob(byte_length)`,
+  `UPDATE ${ENTRIES} SET message_sha256='${"0".repeat(64)}'`,
+  `DELETE FROM __fsqlite_changeset_receipts`,
+]) {
+  test(`journal corruption fails closed: ${damage.slice(0, 65)}`, async () => {
+    const { db, host } = opened(), j = journal(host);
+    try {
+      await j.apply(remoteFirst(), journalOptions()); db.exec(damage);
+      const before = JSON.stringify(db.prepare(`SELECT * FROM ${HEADS}`).all());
+      await assert.rejects(j.read("remote:1"));
+      await assert.rejects(j.rebase(local()));
+      assert.equal(JSON.stringify(db.prepare(`SELECT * FROM ${HEADS}`).all()), before);
+    } finally { db.close(); }
+  });
+}
+for (const ns of ["", "TEMP "]) {
+  test(`journal rejects ${ns || "main "}metadata triggers before application`, async () => {
+    const { db, host } = opened(), j = journal(host);
+    try {
+      await j.apply(new Uint8Array(), journalOptions("initial"));
+      db.exec(`CREATE ${ns}TRIGGER bad AFTER INSERT ON ${ENTRIES} BEGIN SELECT 1; END;`);
+      await assert.rejects(j.apply(remoteFirst(), journalOptions("bad")), { code: "ERR_FSQLITE_REBASE_JOURNAL_SCHEMA" });
+      assert.equal(journalCount(db), 1); assert.equal(inboxCount(db), 1);
+    } finally { db.close(); }
+  });
+}
+
+test("journal snapshots inputs, options and exact subarray bounds before yielding", async () => {
+  const { db, host } = opened(), j = journal(host);
+  try {
+    const backing = new Uint8Array(remoteFirst().length + 64), wire = backing.subarray(32, backing.length - 32);
+    wire.set(remoteFirst());
+    const options = journalOptions();
+    const pending = j.apply(wire, options);
+    wire.fill(0); options.deliveryId = "changed"; options.tables[0] = "nope";
+    const saved = await pending;
+    assert.equal(saved.entry.deliveryId, "remote:1");
+    assert.equal(saved.entry.messageBytes, remoteFirst().length);
+    assert.equal(await j.read("changed"), null);
+  } finally { db.close(); }
+});
+
+test("journal positions are scoped and global delivery receipts cannot migrate histories", async () => {
+  const { db, host } = opened(), a = journal(host, { journalId: "a" }), b = journal(host, { journalId: "b" });
+  try {
+    await a.apply(new Uint8Array(), journalOptions("a1"));
+    await b.apply(new Uint8Array(), journalOptions("b1"));
+    await b.apply(new Uint8Array(), journalOptions("b2"));
+    assert.equal((await a.head()).position, 1); assert.equal((await b.head()).position, 2);
+    await assert.rejects(b.apply(new Uint8Array(), journalOptions("a1")), { code: "ERR_FSQLITE_REBASE_JOURNAL_MISSING" });
+    assert.equal(await a.read("b1"), null); assert.equal(journalCount(db), 3);
+  } finally { db.close(); }
+});
+
+test("journal same ID with different input cannot change data or proof", async () => {
+  const { db, host } = opened(), j = journal(host);
+  try {
+    const saved = await j.apply(remoteFirst(), journalOptions());
+    await assert.rejects(j.apply(new Uint8Array(), journalOptions()), { code: "ERR_FSQLITE_CHANGESET_DELIVERY_REUSE" });
+    assert.deepEqual(await j.read("remote:1"), saved.entry); assert.equal(journalCount(db), 1);
+  } finally { db.close(); }
+});
+
+test("journal applies a bounded prefix range, never silently substitutes its latest tip", async () => {
+  const c = generated.cases.find((x) => x.name === "replacement tombstone survives later omission");
+  const { db, host } = opened(c), j = journal(host);
+  try {
+    for (let i = 0; i < c.remoteWires.length; i++) await j.apply(bytes(c.remoteWires[i]), journalOptions(`r${i}`, { onConflict: () => c.remote[i].policy }));
+    for (const [after, through] of [[0, 0], [0, 1], [0, 2], [1, 2], [2, 2]]) {
+      const expected = oracle({ local: c.localWire, buffers: c.rebaseBuffers.slice(after, through) });
+      const result = await j.rebase(bytes(c.localWire), { after, through });
+      assert.deepEqual(records(result.changeset), expected.records);
+      assert.equal(result.after, after); assert.equal(result.through, through);
+    }
+    for (const options of [{ after: 3 }, { through: 3 }, { after: 2, through: 1 }])
+      await assert.rejects(j.rebase(bytes(c.localWire), options), { code: "ERR_FSQLITE_REBASE_JOURNAL_MISSING" });
+  } finally { db.close(); }
+});
+
+test("journal pre-cancelled work never enters SQL and late post-COMMIT cancellation is success", async () => {
+  const { db, host } = opened(), c = new AbortController();
+  try {
+    c.abort(); const before = host.admissions;
+    await assert.rejects(journal(host).apply(remoteFirst(), journalOptions("cancel", { signal: c.signal })), { code: "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED" });
+    assert.equal(host.admissions, before);
+    const late = new AbortController();
+    const target = { async transaction(work, opts) { const result = await host.transaction(work, opts); late.abort(); return result; } };
+    const result = await journal(target).apply(remoteFirst(), journalOptions("late", { signal: late.signal }));
+    assert.equal(result.replayed, false); assert.equal(result.entry.position, 1);
+  } finally { db.close(); }
 });

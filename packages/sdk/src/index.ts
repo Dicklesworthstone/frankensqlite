@@ -1,5 +1,21 @@
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type {
+  ChangesetRebaseJournalOptions,
+  RebaseJournalApplyOptions,
+  RebaseJournalApplyResult,
+  RebaseJournalEntry,
+  RebaseJournalHead,
+  RebaseJournalOperationOptions,
+  RebaseJournalRangeOptions,
+  RebaseJournalResult,
+} from "./changeset-rebase-journal";
+export {
+  ChangesetRebaseJournal,
+  REBASE_JOURNAL_ENTRIES_TABLE,
+  REBASE_JOURNAL_HEADS_TABLE,
+  RebaseJournalError,
+} from "./changeset-rebase-journal";
+export type {
   ApplyChangesetOptions,
   ApplyChangesetResult,
   ApplyPatchsetOptions,
