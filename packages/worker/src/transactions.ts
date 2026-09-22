@@ -41,8 +41,121 @@ export function validateManagedSql(sql: string, script = false): void {
   }
 }
 
+/**
+ * Classify one SELECT, optionally preceded by ordinary/recursive CTEs. This is
+ * an ownership/replay fence, not a SQL sandbox: the core still checks syntax,
+ * and SELECT functions must be side-effect free. In particular, WITH alone is
+ * not evidence of a read: its outer statement may be INSERT/UPDATE/DELETE.
+ *
+ * Share the managed scanner so quotes, comments and opaque Tcl bind suffixes
+ * cannot forge parentheses or statement boundaries. The prefix state machine
+ * retains no token array and uses no recursion, including for nested CTEs.
+ */
+export function isSelectStatement(sql: string): boolean {
+  type State =
+    | "start"
+    | "with"
+    | "name"
+    | "after-name"
+    | "column"
+    | "after-column"
+    | "as"
+    | "hint"
+    | "materialized"
+    | "open"
+    | "body-start"
+    | "body"
+    | "after-body"
+    | "done";
+  let state: State = "start";
+  let depth = 0;
+  let selected = false;
+  const visit = (word: string, char: string): void => {
+    const name = word !== "" || char === "'" || char === '"' || char === "`" || char === "[";
+    switch (state) {
+      case "done":
+        return;
+      case "start":
+        if (char === ";") return;
+        if (word === "WITH") {
+          state = "with";
+          return;
+        }
+        selected = word === "SELECT";
+        state = "done";
+        return;
+      case "with":
+        if (word === "RECURSIVE") {
+          state = "name";
+          return;
+        }
+        state = name ? "after-name" : "done";
+        return;
+      case "name":
+        state = name ? "after-name" : "done";
+        return;
+      case "after-name":
+        state = char === "(" ? "column" : word === "AS" ? "hint" : "done";
+        return;
+      case "column":
+        state = name ? "after-column" : "done";
+        return;
+      case "after-column":
+        state = char === "," ? "column" : char === ")" ? "as" : "done";
+        return;
+      case "as":
+        state = word === "AS" ? "hint" : "done";
+        return;
+      case "hint":
+        if (word === "NOT") {
+          state = "materialized";
+          return;
+        }
+        if (word === "MATERIALIZED") {
+          state = "open";
+          return;
+        }
+        // With no hint, this token must be the CTE body's opening parenthesis.
+        state = char === "(" ? "body-start" : "done";
+        depth = 1;
+        return;
+      case "materialized":
+        state = word === "MATERIALIZED" ? "open" : "done";
+        return;
+      case "open":
+        state = char === "(" ? "body-start" : "done";
+        depth = 1;
+        return;
+      case "body-start":
+        state = ["SELECT", "VALUES", "WITH"].includes(word) ? "body" : "done";
+        return;
+      case "body":
+        if (char === "(") depth++;
+        else if (char === ")" && --depth === 0) state = "after-body";
+        else if (char === ";") state = "done";
+        return;
+      case "after-body":
+        if (char === ",") state = "name";
+        else {
+          selected = word === "SELECT";
+          state = "done";
+        }
+    }
+  };
+  // Do not return early on SELECT: malformed tokens or another statement in
+  // the tail must still be refused before the caller submits any SQL.
+  for (const _end of managedStatementEnds(sql, false, visit)) {
+    /* validation and classification */
+  }
+  return selected;
+}
+
 /** Statement end offsets, sharing exactly the managed preflight's lexer. */
-function* managedStatementEnds(sql: string, script: boolean): Generator<number> {
+function* managedStatementEnds(
+  sql: string,
+  script: boolean,
+  visit?: (word: string, char: string) => void,
+): Generator<number> {
   const reject = (message: string): never => {
     throw new ManagedTransactionError("ERR_FSQLITE_TRANSACTION_SQL", message);
   };
@@ -70,6 +183,7 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
       continue;
     }
     if (char === ";") {
+      visit?.("", char);
       i++;
       if (trigger && triggerTail !== 2) {
         triggerTail = 1;
@@ -108,6 +222,7 @@ function* managedStatementEnds(sql: string, script: boolean): Generator<number> 
     } else {
       i++;
     }
+    visit?.(word, char);
     if (start) {
       if (["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"].includes(word)) {
         reject("Transaction boundaries belong to the SDK; use transaction() for nesting");

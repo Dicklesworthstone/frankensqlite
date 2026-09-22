@@ -39,7 +39,7 @@ export {
   PreparedStatementError,
   resolvePreparedStatementLimits,
 } from "./statement-budget";
-export { validateManagedSql } from "./transactions";
+export { isSelectStatement, validateManagedSql } from "./transactions";
 export {
   assertSupportedPersistenceMode,
   createReadyResult,
