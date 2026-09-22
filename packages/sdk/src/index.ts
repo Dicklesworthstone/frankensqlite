@@ -4,6 +4,8 @@ export type {
   RebaseJournalApplyOptions,
   RebaseJournalApplyResult,
   RebaseJournalBookmark,
+  RebaseJournalCaptureResult,
+  RebaseJournalLocalRecord,
   RebaseJournalEntry,
   RebaseJournalHead,
   RebaseJournalOperationOptions,
@@ -14,6 +16,7 @@ export {
   ChangesetRebaseJournal,
   REBASE_JOURNAL_ENTRIES_TABLE,
   REBASE_JOURNAL_HEADS_TABLE,
+  REBASE_JOURNAL_LOCALS_TABLE,
   RebaseJournalError,
 } from "./changeset-rebase-journal";
 export type {

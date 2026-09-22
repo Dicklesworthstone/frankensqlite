@@ -8,9 +8,12 @@ import { applyChangeset, CHANGESET_RECEIPTS_TABLE } from "./changeset-apply";
 import type { ChangesetLimits, ChangesetValue } from "./changeset-codec";
 import { decodeChangeset, decodeRebaseInfo, resolveChangesetLimits } from "./changeset-codec";
 import { ChangesetRebaser } from "./changeset-rebase";
+import type { CaptureChangesetOptions } from "./changeset-capture";
+import { prepareChangesetCapture } from "./changeset-capture";
 
 export const REBASE_JOURNAL_HEADS_TABLE = "__fsqlite_rebase_journal_heads";
 export const REBASE_JOURNAL_ENTRIES_TABLE = "__fsqlite_rebase_journal_entries";
+export const REBASE_JOURNAL_LOCALS_TABLE = "__fsqlite_rebase_journal_locals";
 export interface ChangesetRebaseJournalOptions {
   /** Stable identity for ONE local history, not the sending peer's identity. */
   journalId: string;
@@ -18,6 +21,10 @@ export interface ChangesetRebaseJournalOptions {
   maxEntries?: number;
   /** Retained rebase wire bytes, not database/heap/RSS. Default 64 MiB, max 1 GiB. */
   maxBytes?: number;
+  /** Retained original local operations, including net-zero work. Default 10,000. */
+  maxLocalEntries?: number;
+  /** Retained original local wire bytes. Default 64 MiB, maximum 1 GiB. */
+  maxLocalBytes?: number;
   /** Per-message and in-memory combined rebaser limits. */
   limits?: ChangesetLimits;
 }
@@ -53,6 +60,22 @@ export interface RebaseJournalBookmark {
   readonly position: number;
   readonly sha256: string;
 }
+/** Immutable metadata and fresh owned ORIGINAL bytes, never previously rebased output. */
+export interface RebaseJournalLocalRecord {
+  readonly journalId: string;
+  readonly operationId: string;
+  readonly basis: RebaseJournalBookmark;
+  readonly sha256: string;
+  /** Binds the payload digest, basis, capture scope and counters; not authentication. */
+  readonly recordSha256: string;
+  readonly byteLength: number;
+  readonly changes: number;
+  readonly touchedRows: number;
+  readonly changeset: Uint8Array;
+}
+export type RebaseJournalCaptureResult<T> =
+  | { readonly replayed: false; readonly value: T; readonly record: RebaseJournalLocalRecord }
+  | { readonly replayed: true; readonly record: RebaseJournalLocalRecord };
 export interface RebaseJournalRangeOptions extends RebaseJournalOperationOptions {
   /** Exclusive basis. A bookmark also verifies the excluded prefix. Default zero. */
   after?: number | RebaseJournalBookmark;
@@ -87,6 +110,7 @@ export class RebaseJournalError extends Error {
 }
 const HEADS = `main."${REBASE_JOURNAL_HEADS_TABLE}"`;
 const ENTRIES = `main."${REBASE_JOURNAL_ENTRIES_TABLE}"`;
+const LOCALS = `main."${REBASE_JOURNAL_LOCALS_TABLE}"`;
 const MAX_WIRE = 64 * 1024 * 1024;
 function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "HISTORY" | "CANCELLED" | "TIMEOUT", message: string): never {
   throw new RebaseJournalError(`ERR_FSQLITE_REBASE_JOURNAL_${kind}`, message);
@@ -208,7 +232,17 @@ async function ensure(tx: ChangesetExecutor, op: Operation, create: boolean): Pr
     op.checkpoint();
     await tx.execute(`CREATE TABLE ${ENTRIES} (journal_id TEXT NOT NULL COLLATE BINARY, position INTEGER NOT NULL, delivery_id TEXT NOT NULL COLLATE BINARY, message_sha256 TEXT NOT NULL, message_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL, rebase_info BLOB NOT NULL, PRIMARY KEY(journal_id,position), UNIQUE(journal_id,delivery_id)) WITHOUT ROWID`);
   } else if (found.length !== 2) fail("SCHEMA", "Incomplete rebase journal schema");
-  for (const layout of layouts) {
+  await validateLayouts(tx, op, layouts);
+  return true;
+}
+interface JournalLayout {
+  readonly name: string;
+  readonly columns: readonly string[];
+  readonly types: readonly string[];
+  readonly keys: readonly (readonly string[])[];
+}
+async function validateLayouts(tx: ChangesetExecutor, op: Operation, selected: readonly JournalLayout[]): Promise<void> {
+  for (const layout of selected) {
     const listed = (await query(tx, op, `PRAGMA main.table_list('${layout.name}')`)).filter((r) => r[0] === "main" && r[1] === layout.name);
     if (listed.length !== 1 || listed[0]![2] !== "table" || integer(listed[0]![3]) !== layout.columns.length || integer(listed[0]![4]) !== 1)
       fail("SCHEMA", "Journal storage must be the expected ordinary WITHOUT ROWID table");
@@ -234,7 +268,29 @@ async function ensure(tx: ChangesetExecutor, op: Operation, create: boolean): Pr
       if ((await query(tx, op, `SELECT 1 FROM ${ns}.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1`, [layout.name])).length)
         fail("SCHEMA", "Journal triggers are unsupported");
   }
+}
+const localLayout: JournalLayout = {
+  name: REBASE_JOURNAL_LOCALS_TABLE,
+  columns: ["journal_id", "operation_id", "scope_sha256", "basis_position", "basis_sha256", "sha256", "record_sha256", "byte_length", "change_count", "touched_rows", "changeset"],
+  types: ["TEXT", "TEXT", "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT", "INTEGER", "INTEGER", "INTEGER", "BLOB"],
+  keys: [["journal_id", "operation_id"]],
+};
+async function ensureLocals(tx: ChangesetExecutor, op: Operation, create: boolean): Promise<boolean> {
+  const found = await query(tx, op, "SELECT 1 FROM main.sqlite_schema WHERE name=? COLLATE NOCASE LIMIT 2", [REBASE_JOURNAL_LOCALS_TABLE]);
+  if (!found.length) {
+    if (!create) return false;
+    op.checkpoint();
+    await tx.execute(`CREATE TABLE ${LOCALS} (journal_id TEXT NOT NULL COLLATE BINARY, operation_id TEXT NOT NULL COLLATE BINARY, scope_sha256 TEXT NOT NULL, basis_position INTEGER NOT NULL, basis_sha256 TEXT NOT NULL, sha256 TEXT NOT NULL, record_sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL, change_count INTEGER NOT NULL, touched_rows INTEGER NOT NULL, changeset BLOB NOT NULL, PRIMARY KEY(journal_id,operation_id)) WITHOUT ROWID`);
+  } else if (found.length !== 1) fail("SCHEMA", "Ambiguous local changeset storage");
+  await validateLayouts(tx, op, [localLayout]);
   return true;
+}
+async function localRecordDigest(record: Omit<RebaseJournalLocalRecord, "changeset" | "recordSha256">, scope: string): Promise<string> {
+  return hash(new TextEncoder().encode(JSON.stringify([
+    "fsqlite-local-changeset-v1", record.journalId, record.operationId, scope,
+    record.basis.position, record.basis.sha256, record.sha256, record.byteLength,
+    record.changes, record.touchedRows,
+  ])));
 }
 
 /**
@@ -252,15 +308,123 @@ export class ChangesetRebaseJournal {
   readonly #id: string;
   readonly #maxEntries: number;
   readonly #maxBytes: number;
+  readonly #maxLocalEntries: number;
+  readonly #maxLocalBytes: number;
   readonly #policy: ReturnType<typeof resolveChangesetLimits>;
   constructor(target: ChangesetTarget, options: ChangesetRebaseJournalOptions) {
     this.#target = target;
     this.#id = identity(options?.journalId);
     this.#maxEntries = bound(options.maxEntries, 10_000, 100_000);
     this.#maxBytes = bound(options.maxBytes, MAX_WIRE, 1024 ** 3);
+    this.#maxLocalEntries = bound(options.maxLocalEntries, 10_000, 100_000);
+    this.#maxLocalBytes = bound(options.maxLocalBytes, MAX_WIRE, 1024 ** 3);
     this.#policy = Object.freeze(resolveChangesetLimits(options.limits));
   }
   get journalId(): string { return this.#id; }
+
+  /**
+   * Save original local changes AND their verified remote-history basis with
+   * the application writes. The ID must permanently identify the same work.
+   * Replay does not run work, recapture current rows, or move the saved basis.
+   * Callback results are not persisted; external effects cannot be rolled back.
+   */
+  async captureLocal<T>(
+    operationId: string,
+    work: (tx: ChangesetExecutor) => T | Promise<T>,
+    options: CaptureChangesetOptions,
+  ): Promise<RebaseJournalCaptureResult<T>> {
+    const id = identity(operationId);
+    const capture = prepareChangesetCapture(work, options);
+    // Reuse the captured signal/deadline; never read caller options twice or
+    // restart the deadline after queueing, hashing or transaction admission.
+    const op: Operation = capture;
+    const tables = capture.tables.map((name) => name.replace(/[A-Z]/g, (c) => c.toLowerCase())).sort();
+    const scope = await hash(new TextEncoder().encode(JSON.stringify(["fsqlite-local-scope-v1", tables, capture.indirect])));
+    op.checkpoint();
+    return this.#target.transaction(async (tx) => {
+      await ensureLocals(tx, op, true);
+      const prior = await this.#localEntry(tx, op, id);
+      if (prior !== null) {
+        if (prior.scope !== scope) fail("HISTORY", "Local operation ID already belongs to a different capture scope");
+        return Object.freeze({ replayed: true, record: prior.record });
+      }
+      const usage = await this.#localUsage(tx, op);
+      if (usage.entries >= this.#maxLocalEntries) fail("LIMIT", "Local changeset retention is full; work was not started");
+      const basis = await this.#currentBookmark(tx, op);
+      const captured = await capture.run(tx);
+      await ensureLocals(tx, op, false);
+      const after = await this.#currentBookmark(tx, op);
+      if (after.position !== basis.position || after.sha256 !== basis.sha256)
+        fail("HISTORY", "Remote history changed inside local capture; roll back and separate those operations");
+      const current = await this.#localUsage(tx, op);
+      if (current.entries !== usage.entries || current.bytes !== usage.bytes)
+        fail("CORRUPT", "Local retention changed inside the capture callback");
+      const bytes = owned(captured.changeset, this.#policy.maxBytes);
+      const changes = decodeChangeset(bytes, this.#policy).reduce((n, t) => n + t.changes.length, 0);
+      if (bytes.length > this.#maxLocalBytes - usage.bytes) fail("LIMIT", "Local changeset bytes exceed retention; work must roll back");
+      const metadata = {
+        journalId: this.#id, operationId: id, basis, sha256: await hash(bytes),
+        byteLength: bytes.length, changes, touchedRows: captured.touchedRows,
+      };
+      const recordSha256 = await localRecordDigest(metadata, scope);
+      op.checkpoint();
+      const params: ChangesetValue[] = [this.#id, id, scope, BigInt(basis.position), basis.sha256, metadata.sha256, recordSha256, BigInt(bytes.length), BigInt(changes), BigInt(captured.touchedRows)];
+      if (bytes.length) params.push(bytes);
+      await write(tx, op, `INSERT OR ABORT INTO ${LOCALS} VALUES (?,?,?,?,?,?,?,?,?,?,${bytes.length ? "?" : "zeroblob(0)"})`, params);
+      const saved = await this.#localEntry(tx, op, id);
+      if (saved === null || saved.scope !== scope || saved.record.recordSha256 !== recordSha256)
+        fail("CORRUPT", "Original local changeset was not retained exactly");
+      // No post-commit checkpoint: a durable success is not a rollback.
+      return Object.freeze({ replayed: false, value: captured.value, record: saved.record });
+    }, op.transactionOptions);
+  }
+
+  /** Read-only recovery; remains usable even if the saved remote basis is missing. */
+  async readLocal(operationId: string, options?: RebaseJournalOperationOptions): Promise<RebaseJournalLocalRecord | null> {
+    const id = identity(operationId), op = operation(options);
+    return this.#target.transaction(async (tx) => {
+      if (!await ensureLocals(tx, op, false)) return null;
+      return (await this.#localEntry(tx, op, id))?.record ?? null;
+    }, op.transactionOptions);
+  }
+
+  async #localUsage(tx: ChangesetExecutor, op: Operation): Promise<{ entries: number; bytes: number }> {
+    const valid = `typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${MAX_WIRE} AND typeof(changeset)='blob' AND length(changeset)=byte_length`;
+    const rows = await query(tx, op, `SELECT count(*), coalesce(sum(CASE WHEN ${valid} THEN byte_length ELSE 0 END),0), count(CASE WHEN ${valid} THEN 1 END) FROM ${LOCALS} WHERE journal_id=?`, [this.#id]);
+    if (rows.length !== 1 || rows[0]!.length !== 3) fail("CORRUPT", "Invalid local retention accounting");
+    const entries = integer(rows[0]![0]), bytes = integer(rows[0]![1]);
+    if (integer(rows[0]![2]) !== entries) fail("CORRUPT", "Invalid retained local payload shape");
+    if (entries > this.#maxLocalEntries || bytes > this.#maxLocalBytes) fail("LIMIT", "Local retention exceeds configured limits");
+    return { entries, bytes };
+  }
+
+  async #localEntry(tx: ChangesetExecutor, op: Operation, id: string): Promise<{ scope: string; record: RebaseJournalLocalRecord } | null> {
+    const hashes = ["scope_sha256", "basis_sha256", "sha256", "record_sha256"].map((c) => `CASE WHEN typeof(${c})='text' AND length(CAST(${c} AS BLOB))=64 THEN ${c} END`);
+    const counters = ["basis_position", "byte_length", "change_count", "touched_rows"].map((c) => `CASE WHEN typeof(${c})='integer' THEN ${c} END`);
+    const rows = await query(tx, op, `SELECT ${[...hashes, ...counters].join(",")}, CASE WHEN typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${this.#policy.maxBytes} AND typeof(changeset)='blob' AND length(changeset)=byte_length THEN changeset END FROM ${LOCALS} WHERE journal_id=? AND operation_id=? LIMIT 2`, [this.#id, id]);
+    if (!rows.length) return null;
+    if (rows.length !== 1 || rows[0]!.length !== 9) fail("CORRUPT", "Invalid original local record");
+    const r = rows[0]!, scope = digest(r[0]), basisSha = digest(r[1]), sha256 = digest(r[2]), recordSha256 = digest(r[3]);
+    const at = integer(r[4]), byteLength = integer(r[5]), changes = integer(r[6]), touchedRows = integer(r[7]);
+    if (at > 100_000 || byteLength > this.#policy.maxBytes || changes > this.#policy.maxChanges || touchedRows > 100_000 || !(r[8] instanceof Uint8Array))
+      fail("CORRUPT", "Invalid or over-limit original local metadata");
+    const changeset = owned(r[8], this.#policy.maxBytes);
+    const basis: RebaseJournalBookmark = Object.freeze({ format: BOOKMARK_FORMAT, journalId: this.#id, position: at, sha256: basisSha });
+    const record = Object.freeze({ journalId: this.#id, operationId: id, basis, sha256, recordSha256, byteLength, changes, touchedRows, changeset });
+    if (await hash(changeset) !== sha256 || await localRecordDigest(record, scope) !== recordSha256)
+      fail("CORRUPT", "Original local payload or basis checksum mismatch");
+    op.checkpoint();
+    if (decodeChangeset(changeset, this.#policy).reduce((n, t) => n + t.changes.length, 0) !== changes)
+      fail("CORRUPT", "Original local change count does not match its payload");
+    op.checkpoint();
+    return { scope, record };
+  }
+
+  async #currentBookmark(tx: ChangesetExecutor, op: Operation): Promise<RebaseJournalBookmark> {
+    const present = await ensure(tx, op, false);
+    const head = present ? await this.#head(tx, op, false) : { position: 0 };
+    return (await this.#history(tx, op, { position: 0, sha256: null }, { position: head.position, sha256: null })).throughBookmark;
+  }
 
   async #head(tx: ChangesetExecutor, op: Operation, create: boolean): Promise<RebaseJournalHead> {
     const rows = await query(tx, op, `SELECT CASE WHEN typeof(position)='integer' THEN position END, CASE WHEN typeof(byte_length)='integer' THEN byte_length END FROM ${HEADS} WHERE journal_id=?`, [this.#id]);
