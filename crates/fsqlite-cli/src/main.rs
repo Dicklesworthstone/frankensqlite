@@ -154,6 +154,8 @@ struct OutputOptions {
     mode: OutputMode,
     headers: bool,
     headers_explicit: bool,
+    /// `.timer on`: print stock sqlite3's `Run Time:` line after each statement.
+    timer: bool,
 }
 
 impl Default for OutputOptions {
@@ -162,6 +164,7 @@ impl Default for OutputOptions {
             mode: OutputMode::List,
             headers: false,
             headers_explicit: false,
+            timer: false,
         }
     }
 }
@@ -949,9 +952,16 @@ where
         };
         let statement_sql = sql[statement_start..tail_offset].trim_start();
         let column_names = infer_result_column_names(connection, statement_sql).await;
+        let timer = output_options.timer.then(StatementTimer::start);
         match connection.query(statement_sql).await {
             Ok(rows) => {
                 if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
+                    let _ = writeln!(err, "error: failed writing query results");
+                    return false;
+                }
+                if let Some(timer) = timer
+                    && writeln!(out, "{}", timer.report()).is_err()
+                {
                     let _ = writeln!(err, "error: failed writing query results");
                     return false;
                 }
@@ -963,6 +973,55 @@ where
         }
         statement_start = tail_offset;
     }
+}
+
+/// Wall-clock and process CPU time for one statement, reported in stock
+/// sqlite3's `.timer on` format: `Run Time: real 0.049 user 0.031250 sys 0.015625`.
+///
+/// The statement runs on the shell's own runtime thread, so process CPU
+/// time is the right denominator; it is sampled from `getrusage(RUSAGE_SELF)`
+/// where that exists. Rendering rows is excluded, matching the stock shell,
+/// which stops its clock when `sqlite3_exec` returns.
+struct StatementTimer {
+    started: std::time::Instant,
+    cpu_at_start: Option<(f64, f64)>,
+}
+
+impl StatementTimer {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            cpu_at_start: process_cpu_seconds(),
+        }
+    }
+
+    fn report(&self) -> String {
+        let real = self.started.elapsed().as_secs_f64();
+        match (self.cpu_at_start, process_cpu_seconds()) {
+            (Some((user0, sys0)), Some((user1, sys1))) => format!(
+                "Run Time: real {real:.3} user {:.6} sys {:.6}",
+                (user1 - user0).max(0.0),
+                (sys1 - sys0).max(0.0)
+            ),
+            _ => format!("Run Time: real {real:.3}"),
+        }
+    }
+}
+
+/// `(user, system)` CPU seconds consumed by this process so far.
+#[cfg(unix)]
+fn process_cpu_seconds() -> Option<(f64, f64)> {
+    use nix::sys::resource::{UsageWho, getrusage};
+    let usage = getrusage(UsageWho::RUSAGE_SELF).ok()?;
+    let seconds = |tv: nix::sys::time::TimeVal| {
+        tv.tv_sec() as f64 + tv.tv_usec() as f64 / 1_000_000.0
+    };
+    Some((seconds(usage.user_time()), seconds(usage.system_time())))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_seconds() -> Option<(f64, f64)> {
+    None
 }
 
 fn write_rows<W>(
@@ -1820,6 +1879,21 @@ where
         return DotCommandResult::Continue;
     }
 
+    if let Some(arg) = dot_command_arg(trimmed, ".timer") {
+        let Some(value) = parse_optional_quoted_arg(arg) else {
+            let _ = writeln!(err, "error: .timer requires `on` or `off`");
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        let Some(timer) = parse_on_off(&value) else {
+            let _ = writeln!(err, "error: .timer expects `on` or `off`, got `{value}`");
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        output_options.timer = timer;
+        return DotCommandResult::Continue;
+    }
+
     if let Some(arg) =
         dot_command_arg(trimmed, ".headers").or_else(|| dot_command_arg(trimmed, ".header"))
     {
@@ -2430,6 +2504,7 @@ where
          .dump ?PAT    Emit SQL text for schema + table contents\n\
          .mode MODE    Set output mode: list, column, csv, tabs, line\n\
          .headers on|off Toggle column headers for row output (`.header` alias also works)\n\
+         .timer on|off Print `Run Time: real ... user ... sys ...` after each statement\n\
          .quit         Exit the shell\n\
          .exit         Exit the shell\n\
          .read FILE    Execute SQL from file\n\
@@ -3012,6 +3087,72 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 );
                 assert!(err.is_empty(), "SQL: {sql}; stderr: {err:?}");
                 assert_eq!(out, expected.as_bytes(), "SQL: {sql}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_timer_dot_command_reports_run_time_per_statement() {
+        asupersync::test_utils::run_test(|| async {
+            // GH#418 asked for `.timer`; mirror the stock shell's line.
+            let mut input = Cursor::new(
+                b".timer on\nSELECT 1;\nSELECT 2; SELECT 3;\n.timer off\nSELECT 4;\n".to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+            assert!(err.is_empty(), "stderr: {err:?}");
+            let out = String::from_utf8(out).expect("utf8 stdout");
+            let lines: Vec<&str> = out.lines().collect();
+            let is_run_time = |line: &str| {
+                let Some(rest) = line.strip_prefix("Run Time: real ") else {
+                    return false;
+                };
+                let mut fields = rest.split_whitespace();
+                let real_ok = fields.next().is_some_and(|v| v.parse::<f64>().is_ok());
+                // user/sys are present wherever getrusage exists; either way
+                // the fields must pair up as `user N sys N`.
+                let cpu_ok = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                    (None, ..) => true,
+                    (Some("user"), Some(u), Some("sys"), Some(sy)) => {
+                        u.parse::<f64>().is_ok() && sy.parse::<f64>().is_ok()
+                    }
+                    _ => false,
+                };
+                real_ok && cpu_ok && fields.next().is_none()
+            };
+            // One timing line per statement while on; none after `.timer off`.
+            assert_eq!(lines.len(), 7, "unexpected shell output: {out:?}");
+            assert_eq!(lines[0], "1");
+            assert!(is_run_time(lines[1]), "line 2: {:?}", lines[1]);
+            assert_eq!(lines[2], "2");
+            assert!(is_run_time(lines[3]), "line 4: {:?}", lines[3]);
+            assert_eq!(lines[4], "3");
+            assert!(is_run_time(lines[5]), "line 6: {:?}", lines[5]);
+            assert_eq!(lines[6], "4");
+
+            // Missing or unknown argument is an error, not a silent no-op.
+            for script in [".timer\n", ".timer maybe\n"] {
+                let mut input = Cursor::new(script.as_bytes().to_vec());
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let args = vec![OsString::from("fsqlite")];
+                let exit_code = run_with_shell_options(
+                    args,
+                    &mut input,
+                    &mut out,
+                    &mut err,
+                    ShellOptions::batch(),
+                )
+                .await;
+                assert_eq!(exit_code, 1, "batch mode fails on a bad dot command: {script:?}");
+                let err = String::from_utf8_lossy(&err);
+                assert!(err.starts_with("error: .timer "), "script {script:?}: {err:?}");
+                assert!(out.is_empty(), "script {script:?}: {out:?}");
             }
         });
     }

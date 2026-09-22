@@ -44,6 +44,11 @@ serde_json = { workspace = true }
 # itself never builds a runtime).
 asupersync = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `.timer on` reports user/sys CPU via getrusage, as the stock shell does;
+# `nix` keeps the FFI outside this workspace, which forbids `unsafe_code`.
+nix = { workspace = true, features = ["resource"] }
+
 [dev-dependencies]
 # The inline `#[cfg(test)]` module drives the async `run`/`run_with_shell_options`
 # entry points through `asupersync::test_utils::run_test`, which lives behind
