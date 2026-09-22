@@ -1,5 +1,22 @@
 export { MAX_EXECUTE_MANY_ROWS } from "@frankensqlite/worker";
 export type {
+  ChangesetRebaseJournalOptions,
+  RebaseJournalApplyOptions,
+  RebaseJournalApplyResult,
+  RebaseJournalBookmark,
+  RebaseJournalEntry,
+  RebaseJournalHead,
+  RebaseJournalOperationOptions,
+  RebaseJournalRangeOptions,
+  RebaseJournalResult,
+} from "./changeset-rebase-journal";
+export {
+  ChangesetRebaseJournal,
+  REBASE_JOURNAL_ENTRIES_TABLE,
+  REBASE_JOURNAL_HEADS_TABLE,
+  RebaseJournalError,
+} from "./changeset-rebase-journal";
+export type {
   ApplyChangesetOptions,
   ApplyChangesetResult,
   ApplyPatchsetOptions,
@@ -81,6 +98,17 @@ export {
   ChangesetDeliveryPump,
   ChangesetReceiver,
 } from "./changeset-delivery";
+export type {
+  ChangesetFanoutProgress,
+  ChangesetReplicaOutbox,
+  ChangesetReplicaProgress,
+} from "./changeset-fanout";
+export {
+  CHANGESET_FANOUT_TABLE,
+  CHANGESET_FANOUT_PROGRESS_TABLE,
+  ChangesetFanout,
+  ChangesetFanoutError,
+} from "./changeset-fanout";
 export type { ChangesetGroupStats } from "./changeset-group";
 export { ChangesetGroup, ChangesetGroupError, concatChangesets } from "./changeset-group";
 export type { ChangesetRebaseResolution, ChangesetRebaseStats } from "./changeset-rebase";

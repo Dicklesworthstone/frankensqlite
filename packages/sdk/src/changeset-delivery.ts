@@ -6,6 +6,8 @@ import type {
 import { applyChangeset } from "./changeset-apply";
 import { decodeChangeset } from "./changeset-codec";
 import type { ChangesetOutbox, OutboxDelivery } from "./changeset-outbox";
+import type { ChangesetRebaseJournalOptions } from "./changeset-rebase-journal";
+import { ChangesetRebaseJournal } from "./changeset-rebase-journal";
 
 export const CHANGESET_DELIVERY_PROTOCOL = "fsqlite-changeset-v1";
 export interface ChangesetEnvelope {
@@ -73,6 +75,12 @@ export interface ChangesetReceiverOptions {
    */
   confirmCommit: () => Promise<unknown>;
   onConflict?: ApplyChangesetOptions["onConflict"];
+  /**
+   * Opt-in local ordered conflict history on this receiver's SAME SQL target.
+   * Rows, decisions and inbox receipt share one transaction and confirmation.
+   * Existing unjournaled receipts cannot be retroactively assigned decisions.
+   */
+  rebaseJournal?: ChangesetRebaseJournalOptions;
   /** Before copying or decoding a received payload. Default 8 MiB, max 64 MiB. */
   maxMessageBytes?: number;
 }
@@ -247,6 +255,7 @@ export class ChangesetReceiver {
   readonly #tables: readonly string[];
   readonly #confirm: () => Promise<unknown>;
   readonly #onConflict: ApplyChangesetOptions["onConflict"];
+  readonly #rebaseJournal: ChangesetRebaseJournal | null;
   readonly #maxBytes: number;
   #active = false;
   constructor(target: ChangesetTarget, options: ChangesetReceiverOptions) {
@@ -255,6 +264,7 @@ export class ChangesetReceiver {
     const source = options?.tables,
       confirm = options?.confirmCommit,
       onConflict = options?.onConflict;
+    const rebaseJournal = options?.rebaseJournal;
     this.#maxBytes = bound(options?.maxMessageBytes, 8 * 1024 * 1024, HARD_BYTES);
     if (!Array.isArray(source) || source.length > 256)
       input("An explicit table allowlist is required");
@@ -276,9 +286,19 @@ export class ChangesetReceiver {
     this.#tables = Object.freeze(tables);
     this.#confirm = confirm;
     this.#onConflict = onConflict;
+    // Construct on the receiver's own target. An independently supplied journal
+    // could commit another database which this receiver's barrier never confirms.
+    this.#rebaseJournal = rebaseJournal === undefined
+      ? null
+      : new ChangesetRebaseJournal(target, rebaseJournal);
   }
   get receiverId(): string {
     return this.#id;
+  }
+
+  /** Local history access; not a remotely supplied policy or receipt payload. */
+  get rebaseJournal(): ChangesetRebaseJournal | null {
+    return this.#rebaseJournal;
   }
 
   async receive(
@@ -311,7 +331,7 @@ export class ChangesetReceiver {
       if ((await hash(bytes)) !== sha256) input("Payload does not match its advertised digest");
       budget.checkpoint();
       phase = "receiver-apply";
-      const applyOptions: ApplyChangesetOptions = {
+      const applyOptions: ApplyChangesetOptions & { deliveryId: string } = {
         tables: this.#tables,
         deliveryId: id,
         signal: budget.signal,
@@ -319,7 +339,12 @@ export class ChangesetReceiver {
       const remaining = budget.remainingMs();
       if (remaining !== undefined) applyOptions.timeoutMs = remaining;
       if (this.#onConflict !== undefined) applyOptions.onConflict = this.#onConflict;
-      const result = resultCounts(await applyChangeset(this.#target, bytes, applyOptions), changes);
+      const applied = this.#rebaseJournal === null
+        ? await applyChangeset(this.#target, bytes, applyOptions)
+        : await this.#rebaseJournal.apply(bytes, applyOptions);
+      // Keep the existing wire receipt unchanged. Rebase bytes are local
+      // history, not remote evidence or an alternative confirmation boundary.
+      const result = resultCounts(applied, changes);
       budget.checkpoint();
       phase = "receiver-confirm";
       // Replays MUST confirm too: the first call may have committed only in
