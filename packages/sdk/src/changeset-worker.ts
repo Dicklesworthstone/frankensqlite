@@ -16,6 +16,8 @@ export interface ChangesetDeliveryWorkerOptions {
   maxBytesPerRun?: number;
   /** Optional cooperative pump budget, 1..2147483647 ms. */
   runTimeoutMs?: number;
+  /** Concurrent flush waiters, 1..65536; defaults to 1024. */
+  maxPendingFlushes?: number;
   /** Stop after observing an empty outbox; defaults to false. */
   stopWhenIdle?: boolean;
   /** Stop admission and signal the active run, then await its actual outcome. */
@@ -28,11 +30,32 @@ export interface ChangesetDeliveryWorkerStopOptions {
   reason?: unknown;
 }
 
+export interface ChangesetDeliveryFlushOptions {
+  /** Cancels only this waiter, never a shared delivery or confirmation. */
+  signal?: AbortSignal;
+  /** Monotonic wait budget, 1..2147483647 ms; no default deadline. */
+  timeoutMs?: number;
+}
+
+/** Failure to observe a fresh empty outbox is not evidence of rollback. */
+export class ChangesetDeliveryFlushError extends Error {
+  readonly code: `ERR_FSQLITE_DELIVERY_FLUSH_${"INPUT" | "LIMIT" | "CANCELLED" | "TIMEOUT" | "STOPPED"}`;
+  constructor(
+    kind: "INPUT" | "LIMIT" | "CANCELLED" | "TIMEOUT" | "STOPPED",
+    cause?: unknown,
+  ) {
+    super(`Changeset delivery flush ${kind.toLowerCase()}; delivery may still be in progress`, { cause });
+    this.name = "ChangesetDeliveryFlushError";
+    this.code = `ERR_FSQLITE_DELIVERY_FLUSH_${kind}`;
+  }
+}
+
 export interface ChangesetDeliveryWorkerStats {
   readonly state: "running" | "idle" | "draining" | "aborting" | "stopped" | "failed";
   readonly active: boolean;
   readonly attempts: number;
   readonly successfulRuns: number;
+  readonly pendingFlushes: number;
   /** Counts from successful, confirmed runs only; a failed run may have committed work. */
   readonly deliveries: number;
   readonly bytes: number;
@@ -61,8 +84,19 @@ interface Policy {
   readonly maxDeliveriesPerRun: number;
   readonly maxBytesPerRun: number;
   readonly runTimeoutMs: number | undefined;
+  readonly maxPendingFlushes: number;
   readonly stopWhenIdle: boolean;
   readonly signal: AbortSignal | undefined;
+}
+
+interface FlushWaiter {
+  readonly afterAttempt: number;
+  readonly signal: AbortSignal | undefined;
+  readonly deadline: number | undefined;
+  readonly resolve: (stats: ChangesetDeliveryWorkerStats) => void;
+  readonly reject: (error: ChangesetDeliveryFlushError) => void;
+  readonly onAbort: () => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
 }
 
 function bound(value: unknown, fallback: number, maximum: number): number {
@@ -79,13 +113,15 @@ function capturePolicy(options: ChangesetDeliveryWorkerOptions): Policy {
   const maxBytesPerRun = bound(options.maxBytesPerRun, 64 * 1024 * 1024, 1024 * 1024 * 1024);
   const timeout = options.runTimeoutMs;
   const runTimeoutMs = timeout === undefined ? undefined : bound(timeout, 1, 2_147_483_647);
+  const maxPendingFlushes = bound(options.maxPendingFlushes, 1024, 65_536);
   const stopWhenIdle = options.stopWhenIdle ?? false;
   const signal = options.signal;
   if (typeof stopWhenIdle !== "boolean") throw new TypeError("stopWhenIdle must be a boolean");
   if (signal !== undefined) {
     Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
   }
-  return { pollIntervalMs, maxDeliveriesPerRun, maxBytesPerRun, runTimeoutMs, stopWhenIdle, signal };
+  return { pollIntervalMs, maxDeliveriesPerRun, maxBytesPerRun, runTimeoutMs,
+    maxPendingFlushes, stopWhenIdle, signal };
 }
 
 function resultField(value: unknown, key: string): unknown {
@@ -141,6 +177,8 @@ export class ChangesetDeliveryWorker {
   readonly #policy: Policy;
   readonly #cancel = new AbortController();
   readonly #onAbort: () => void;
+  readonly #flushes = new Set<FlushWaiter>();
+  #failure: ChangesetDeliveryWorkerError | undefined;
   #state: ChangesetDeliveryWorkerStats["state"] = "running";
   #active = false;
   #notified = false;
@@ -182,11 +220,16 @@ export class ChangesetDeliveryWorker {
   }
 
   get stats(): ChangesetDeliveryWorkerStats {
+    return this.#snapshot();
+  }
+
+  #snapshot(): ChangesetDeliveryWorkerStats {
     return Object.freeze({
       state: this.#state,
       active: this.#active,
       attempts: this.#attempts,
       successfulRuns: this.#successfulRuns,
+      pendingFlushes: this.#flushes.size,
       ...this.#totals,
     });
   }
@@ -197,6 +240,58 @@ export class ChangesetDeliveryWorker {
     this.#notified = true;
     this.#wake?.();
     return true;
+  }
+
+  /**
+   * Await an empty observation from a run STARTED after this call. Await the
+   * source commit first. This is neither permanent emptiness nor a durable
+   * cursor, and an older in-flight empty read cannot satisfy the barrier.
+   */
+  flush(options: ChangesetDeliveryFlushOptions = {}): Promise<ChangesetDeliveryWorkerStats> {
+    let signal: AbortSignal | undefined;
+    let timeoutMs: number | undefined;
+    try {
+      // Capture getters before reserving a waiter: they may re-enter stop().
+      signal = options.signal;
+      const timeout = options.timeoutMs;
+      timeoutMs = timeout === undefined ? undefined : bound(timeout, 1, 2_147_483_647);
+      if (signal !== undefined) {
+        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
+      }
+    } catch (cause: unknown) {
+      return Promise.reject(new ChangesetDeliveryFlushError("INPUT", cause));
+    }
+    if (this.#stopping()) {
+      return Promise.reject(new ChangesetDeliveryFlushError("STOPPED", this.#failure));
+    }
+    if (signal !== undefined &&
+      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal)) {
+      return Promise.reject(new ChangesetDeliveryFlushError("CANCELLED",
+        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "reason")!.get!.call(signal)));
+    }
+    if (this.#flushes.size >= this.#policy.maxPendingFlushes) {
+      return Promise.reject(new ChangesetDeliveryFlushError("LIMIT"));
+    }
+    const promise = new Promise<ChangesetDeliveryWorkerStats>((resolve, reject) => {
+      const waiter: FlushWaiter = {
+        afterAttempt: this.#attempts,
+        signal,
+        deadline: timeoutMs === undefined ? undefined : performance.now() + timeoutMs,
+        resolve, reject,
+        onAbort: () => { this.#checkFlush(waiter); },
+        timer: undefined,
+      };
+      this.#flushes.add(waiter);
+      if (signal !== undefined) {
+        EventTarget.prototype.addEventListener.call(signal, "abort", waiter.onAbort, { once: true });
+      }
+      this.#armFlush(waiter);
+      this.#notified = true;
+      this.#wake?.();
+    });
+    // Retain the rejection for the caller without a detached unhandled task.
+    void promise.catch(() => {});
+    return promise;
   }
 
   /** Join the active run, including its confirmation/cleanup. Never closes the database. */
@@ -220,6 +315,53 @@ export class ChangesetDeliveryWorker {
       this.#cancel.abort(reason);
     }
     this.#wake?.();
+  }
+
+  #removeFlush(waiter: FlushWaiter): boolean {
+    if (!this.#flushes.delete(waiter)) return false;
+    clearTimeout(waiter.timer);
+    waiter.timer = undefined;
+    if (waiter.signal !== undefined) {
+      EventTarget.prototype.removeEventListener.call(waiter.signal, "abort", waiter.onAbort);
+    }
+    return true;
+  }
+
+  #checkFlush(waiter: FlushWaiter): boolean {
+    if (!this.#flushes.has(waiter)) return false;
+    let error: ChangesetDeliveryFlushError | undefined;
+    if (waiter.signal !== undefined &&
+      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(waiter.signal)) {
+      error = new ChangesetDeliveryFlushError("CANCELLED",
+        Object.getOwnPropertyDescriptor(AbortSignal.prototype, "reason")!.get!.call(waiter.signal));
+    } else if (waiter.deadline !== undefined && performance.now() >= waiter.deadline) {
+      error = new ChangesetDeliveryFlushError("TIMEOUT");
+    }
+    if (error === undefined) return true;
+    this.#removeFlush(waiter);
+    waiter.reject(error);
+    return false;
+  }
+
+  #armFlush(waiter: FlushWaiter): void {
+    if (!this.#checkFlush(waiter) || waiter.deadline === undefined) return;
+    waiter.timer = setTimeout(() => {
+      waiter.timer = undefined;
+      // Early timers re-arm; starved timers are checked again before success.
+      this.#armFlush(waiter);
+    }, Math.max(1, Math.ceil(waiter.deadline - performance.now())));
+  }
+
+  #resolveFlushes(): void {
+    const ready: FlushWaiter[] = [];
+    for (const waiter of this.#flushes) {
+      if (this.#checkFlush(waiter) && this.#attempts > waiter.afterAttempt) {
+        this.#removeFlush(waiter);
+        ready.push(waiter);
+      }
+    }
+    const stats = this.#snapshot();
+    for (const waiter of ready) waiter.resolve(stats);
   }
 
   #record(result: ChangesetPumpResult): void {
@@ -258,6 +400,7 @@ export class ChangesetDeliveryWorker {
         phase = "result";
         const result = captureResult(raw, this.#policy);
         this.#record(result);
+        if (result.stopped === "empty") this.#resolveFlushes();
         if (this.#stopping()) break;
         if (result.stopped === "empty" && !this.#notified && this.#policy.stopWhenIdle) break;
         // Even endless immediately-resolved limit runs must yield to task-level
@@ -274,9 +417,14 @@ export class ChangesetDeliveryWorker {
       this.#state = "failed";
       // Do not hide storage or transport failure just because stop/abort raced
       // it. The original phase and uncertain outcome remain available as cause.
-      throw new ChangesetDeliveryWorkerError(phase, cause);
+      this.#failure = new ChangesetDeliveryWorkerError(phase, cause);
+      throw this.#failure;
     } finally {
       this.#wake?.();
+      for (const waiter of this.#flushes) {
+        this.#removeFlush(waiter);
+        waiter.reject(new ChangesetDeliveryFlushError("STOPPED", this.#failure));
+      }
       if (this.#policy.signal !== undefined) {
         EventTarget.prototype.removeEventListener.call(this.#policy.signal, "abort", this.#onAbort);
       }

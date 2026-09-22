@@ -23,6 +23,10 @@ const delivery = ChangesetDeliveryWorker.start(pump, {
 // After awaiting a new outbox.record(...) commit:
 delivery.notify(); // a wakeup, not a delivery acknowledgement
 
+// Await a fresh confirmed empty observation after that source commit.
+const observed = await delivery.flush({ timeoutMs: 30_000 });
+console.log(observed.deliveries); // cumulative successful-run count
+
 // Finish the current bounded run, then release this runner's ownership.
 await delivery.stop();
 // Only now close the source connection or replace the runner.
@@ -38,6 +42,44 @@ Every completed run yields a task turn before another run, even when all pump
 promises resolve immediately and notifications arrive continuously. Notifications
 are a single coalescing flag, not an unbounded queue. They never skip the pump's
 oldest pending entry, source confirmation or exact receiver acknowledgement.
+
+## Awaited delivery barriers
+
+After awaiting the source/outbox commit, `await delivery.flush()` requests a
+fresh drain and waits for a successful `empty` result from a pump run that
+**started after the flush call**. An older in-flight empty read cannot satisfy
+it: that read could have happened before the source commit. Limited pages are
+followed by further runs until an eligible empty read is observed. Multiple
+callers coalesce onto the same single-flight drain, not parallel pump calls.
+
+The returned immutable statistics snapshot is cumulative, not a per-call delta.
+The empty observation is not permanent emptiness, a persistent delivery cursor,
+or protection from a producer appending later. It retains the existing pump's
+source-confirmation and receiver-acknowledgement meaning; it adds no stronger
+storage guarantee. Never use a wakeup alone as proof of delivery.
+
+`flush({ signal, timeoutMs })` bounds only that caller's wait. Cancellation or
+timeout removes the waiter and its timer/listener without cancelling shared
+transport, SQL, confirmation, or another waiter. The monotonic deadline is
+checked before accepting an empty result even when timer delivery is starved.
+The worker continues delivery after a waiter stops waiting. Use and await
+`stop({ abort: true })` to stop the worker itself.
+
+By default at most 1024 flush waiters can be outstanding; set
+`maxPendingFlushes` in 1..65536 to change that bound. Overload rejects with
+`ERR_FSQLITE_DELIVERY_FLUSH_LIMIT`; `stats.pendingFlushes` exposes current
+admission. Invalid inputs, cancellation, timeout and stopped ownership use
+the corresponding `ChangesetDeliveryFlushError` code suffixes `INPUT`,
+`CANCELLED`, `TIMEOUT` and `STOPPED`. A failed worker rejects outstanding
+barriers with its original worker error retained as the cause. No failure
+implies rollback or authorizes replay under a new delivery identity.
+
+Graceful `stop()` still joins only its active bounded run. A barrier requiring
+an unstarted follow-up run rejects after shutdown settles; it does not silently
+change stop into an unbounded drain. A qualifying successful empty result from
+an already-admitted run is retained. Await `flush()` **before** `stop()` when
+the application needs a drain-to-empty boundary, and stop source producers
+first when using that boundary as part of application shutdown.
 
 ## Shutdown and failure
 
@@ -84,11 +126,12 @@ they are not a durable outbox cursor or an exactly-once claim.
 ## Verification
 
 ```sh
-node --experimental-transform-types --test packages/sdk/tests/changeset-worker.test.mjs
+node --experimental-transform-types --test packages/sdk/tests/changeset-worker*.test.mjs
 ```
 
 The tests execute the production supervisor with explicit pump drivers to cover
 single-flight ownership, wakeups, per-run budgets, task fairness, late commit
-outcomes, shutdown joins, malformed results and failure fencing. They do not
+outcomes, shutdown joins, malformed results, fresh-empty barriers, waiter
+admission/cancellation/deadlines and failure fencing. They do not
 substitute a pump driver for certification of SQLite, WASM, browser persistence,
 HTTP authentication, or the source/receiver confirmation barriers.

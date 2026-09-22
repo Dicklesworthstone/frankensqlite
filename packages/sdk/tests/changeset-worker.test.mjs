@@ -50,7 +50,7 @@ test("drains bounded pages sequentially and stops only after an empty read", asy
     assert.equal(options.signal.aborted, false);
   }
   assert.deepEqual(worker.stats, {
-    state: "stopped", active: false, attempts: 3, successfulRuns: 3,
+    state: "stopped", active: false, attempts: 3, successfulRuns: 3, pendingFlushes: 0,
     deliveries: 2, bytes: 64, applied: 2, omitted: 0, replays: 1, alreadyAcknowledged: 0,
   });
   assert.equal(Object.isFrozen(worker.stats), true);
@@ -60,7 +60,7 @@ test("drains bounded pages sequentially and stops only after an empty read", asy
 test("captures option getters and the pump method once", async () => {
   const reads = new Map();
   const values = { pollIntervalMs: 10, maxDeliveriesPerRun: 1, maxBytesPerRun: 50,
-    runTimeoutMs: 100, stopWhenIdle: true, signal: undefined };
+    runTimeoutMs: 100, maxPendingFlushes: 7, stopWhenIdle: true, signal: undefined };
   const options = Object.fromEntries([]);
   for (const [key, value] of Object.entries(values)) {
     Object.defineProperty(options, key, { get() {
@@ -76,7 +76,7 @@ test("captures option getters and the pump method once", async () => {
   const worker = ChangesetDeliveryWorker.start(pump, options);
   await worker.done;
   assert.equal(methodReads, 1);
-  assert.deepEqual([...reads.values()], [1, 1, 1, 1, 1, 1]);
+  assert.deepEqual([...reads.values()], [1, 1, 1, 1, 1, 1, 1]);
 });
 
 test("notifications during an active empty read coalesce into one follow-up", async () => {
@@ -277,6 +277,7 @@ test("invalid options fail before reading the pump or admitting any work", () =>
     { maxDeliveriesPerRun: 10_001 }, { maxDeliveriesPerRun: 0.5 },
     { maxBytesPerRun: 0 }, { maxBytesPerRun: 1_073_741_825 },
     { runTimeoutMs: 0 }, { runTimeoutMs: NaN },
+    { maxPendingFlushes: 0 }, { maxPendingFlushes: 65_537 },
     { stopWhenIdle: "true" }, { signal: {} },
   ]) assert.throws(() => ChangesetDeliveryWorker.start(pump, options));
   assert.throws(() => ChangesetDeliveryWorker.start(null), TypeError);
