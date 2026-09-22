@@ -383,14 +383,35 @@ impl Vfs for MemoryVfs {
         let resolved_path = if let Some(p) = path {
             p.to_path_buf()
         } else {
-            // Generate a unique temporary filename.
-            let id = inner.next_temp_id;
-            inner.next_temp_id += 1;
-            PathBuf::from(format!("__temp_{id}__"))
+            // Named callers share this namespace and can occupy a generated
+            // name. Never borrow their storage for a delete-on-close handle.
+            // Selection and insertion stay under the same namespace mutex.
+            loop {
+                checkpoint_or_abort(cx)?;
+                let id = inner.next_temp_id;
+                inner.next_temp_id = id.checked_add(1).ok_or_else(|| FrankenError::OutOfRange {
+                    what: "memory VFS temporary file sequence".to_owned(),
+                    value: id.to_string(),
+                })?;
+                let candidate = PathBuf::from(format!("__temp_{id}__"));
+                if !inner.files.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
         };
 
-        let is_create = flags.contains(VfsOpenFlags::CREATE);
+        let is_create = is_anonymous_temp || flags.contains(VfsOpenFlags::CREATE);
+        // Access belongs to this open, not to the shared storage's creator.
+        // CREATE (including anonymous scratch) requires a writable handle.
+        let read_only = !is_create && !flags.contains(VfsOpenFlags::READWRITE);
         let storage = if let Some(existing) = inner.files.get(&resolved_path) {
+            // EXCLUSIVE is a create-new condition, not a writer lock. Refuse
+            // before constructing a handle or installing cleanup obligations.
+            if is_create && flags.contains(VfsOpenFlags::EXCLUSIVE) {
+                return Err(FrankenError::CannotOpen {
+                    path: resolved_path,
+                });
+            }
             Arc::clone(existing)
         } else if is_create {
             let initial_reserve_bytes = if flags.contains(VfsOpenFlags::MAIN_DB)
@@ -430,6 +451,7 @@ impl Vfs for MemoryVfs {
         let file = MemoryFile {
             path: resolved_path,
             storage,
+            read_only,
             lock_level: LockLevel::None,
             external_shared_snapshot_prior_level: None,
             external_wal_append_prior_level: None,
@@ -443,9 +465,12 @@ impl Vfs for MemoryVfs {
         };
 
         let mut out_flags = flags;
-        if is_create {
-            out_flags |= VfsOpenFlags::READWRITE;
-        }
+        out_flags.remove(VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE);
+        out_flags.insert(if read_only {
+            VfsOpenFlags::READONLY
+        } else {
+            VfsOpenFlags::READWRITE
+        });
 
         Ok((file, out_flags))
     }
@@ -561,6 +586,7 @@ impl MemoryExternalMaintenanceAttempt {
 pub struct MemoryFile {
     path: PathBuf,
     storage: Arc<Mutex<FileStorage>>,
+    read_only: bool,
     lock_level: LockLevel,
     external_shared_snapshot_prior_level: Option<LockLevel>,
     external_wal_append_prior_level: Option<LockLevel>,
@@ -573,6 +599,14 @@ pub struct MemoryFile {
 }
 
 impl MemoryFile {
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(FrankenError::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
+
     fn write_into_storage(
         inner: &mut MemoryVfsInner,
         storage: &mut FileStorage,
@@ -766,10 +800,13 @@ impl MemoryFile {
             return Ok(());
         }
 
-        *slot_state
+        let holder_count = slot_state
             .shared_holders
             .entry(self.shm_owner_id)
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *holder_count = holder_count.checked_add(1).ok_or_else(|| FrankenError::LockFailed {
+            detail: format!("shared SHM lock reference count exhausted for slot {slot}"),
+        })?;
         Ok(())
     }
 
@@ -989,6 +1026,7 @@ impl VfsFile for MemoryFile {
     #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
     async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        self.ensure_writable()?;
         let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
         Self::write_into_storage(&mut inner, &mut storage, buf, offset)
@@ -1005,6 +1043,8 @@ impl VfsFile for MemoryFile {
     ) -> Result<()> {
         let result = (|| {
             checkpoint_or_abort(cx)?;
+            // Refusal must still terminate the completion token below.
+            self.ensure_writable()?;
             let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
             let mut storage = self.storage.lock().map_err(|_| lock_err())?;
             Self::write_into_storage(&mut inner, &mut storage, buf, offset)
@@ -1021,6 +1061,7 @@ impl VfsFile for MemoryFile {
     #[allow(clippy::unused_async_trait_impl)] // lazy future required by the trait; body is synchronous
     async fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        self.ensure_writable()?;
         if writes.is_empty() {
             return Ok(());
         }
@@ -1093,6 +1134,7 @@ impl VfsFile for MemoryFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        self.ensure_writable()?;
         let size = u64_to_usize(size, "truncate size")?;
         let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
@@ -1413,13 +1455,21 @@ impl VfsFile for MemoryFile {
         if lock_requested {
             let mut acquired = Vec::new();
             for slot in offset..offset + n {
+                // Both helpers are no-ops under an exclusive lock already
+                // owned by this handle. Only this request's actual additions
+                // belong to its undo list. The same mutex guards both steps.
+                let already_exclusive = info
+                    .slots
+                    .get(slot as usize)
+                    .is_some_and(|state| state.exclusive_owner == Some(self.shm_owner_id));
                 let result = if exclusive_mode {
                     self.acquire_shm_exclusive_slot(&mut info, slot)
                 } else {
                     self.acquire_shm_shared_slot(&mut info, slot)
                 };
                 match result {
-                    Ok(()) => acquired.push(slot),
+                    Ok(()) if !already_exclusive => acquired.push(slot),
+                    Ok(()) => {}
                     Err(err) => {
                         for acquired_slot in acquired.into_iter().rev() {
                             if exclusive_mode {
@@ -1481,6 +1531,418 @@ mod tests {
 
     fn make_vfs() -> MemoryVfs {
         MemoryVfs::new()
+    }
+
+    #[test]
+    fn readonly_handle_refuses_every_file_mutation_before_side_effects() {
+        use crate::traits::VfsWriteCompletionState;
+
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("readonly.db");
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (writer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        writer.write(&cx, b"original", 0).unwrap();
+        let (mut reader, actual) = vfs
+            .open(&cx, Some(path), VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB)
+            .unwrap();
+        assert!(actual.contains(VfsOpenFlags::READONLY));
+        assert!(!actual.contains(VfsOpenFlags::READWRITE));
+        assert_eq!(reader.file_identity().unwrap(), writer.file_identity().unwrap());
+        let before = vfs.usage_snapshot().unwrap();
+        assert!(matches!(reader.write(&cx, b"bad", 0), Err(FrankenError::ReadOnly)));
+        assert!(matches!(reader.write(&cx, b"grow", 100_000), Err(FrankenError::ReadOnly)));
+        assert!(matches!(reader.write(&cx, b"", 0), Err(FrankenError::ReadOnly)));
+        assert!(matches!(reader.write_page_batch(&cx, &[]), Err(FrankenError::ReadOnly)));
+        assert!(matches!(
+            reader.write_page_batch(&cx, &[(0, b"bad")]),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(matches!(
+            reader.write_page_batch(&cx, &[(0, b"bad"), (100_000, b"grow")]),
+            Err(FrankenError::ReadOnly)
+        ));
+        for size in [0, 4, 100_000] {
+            assert!(matches!(reader.truncate(&cx, size), Err(FrankenError::ReadOnly)));
+        }
+
+        let completion = VfsWriteCompletion::new();
+        let write = VfsFile::write_tracked(&reader, &cx, b"bad", 0, completion.clone());
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        assert!(matches!(crate::block_on_test_io(&cx, write), Err(FrankenError::ReadOnly)));
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+        assert!(!completion.complete_success(), "refusal cannot later become success");
+        assert_eq!(vfs.usage_snapshot().unwrap(), before);
+        let mut contents = [0; 8];
+        assert_eq!(reader.read(&cx, &mut contents, 0).unwrap(), 8);
+        assert_eq!(&contents, b"original");
+
+        writer.write(&cx, b"updated!", 0).unwrap();
+        reader.read(&cx, &mut contents, 0).unwrap();
+        assert_eq!(&contents, b"updated!");
+        reader.close(&cx).unwrap();
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
+    }
+
+    #[test]
+    fn memory_open_reports_one_actual_access_mode() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("modes.db");
+        let (seed, _) = vfs.open(&cx, Some(path), VfsOpenFlags::CREATE).unwrap();
+        for (flags, expected) in [
+            (VfsOpenFlags::READONLY, VfsOpenFlags::READONLY),
+            (VfsOpenFlags::empty(), VfsOpenFlags::READONLY),
+            (VfsOpenFlags::READWRITE, VfsOpenFlags::READWRITE),
+            (VfsOpenFlags::CREATE, VfsOpenFlags::READWRITE),
+            (VfsOpenFlags::CREATE | VfsOpenFlags::READONLY, VfsOpenFlags::READWRITE),
+            (VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE, VfsOpenFlags::READWRITE),
+        ] {
+            let (file, actual) = vfs
+                .open(&cx, Some(path), flags | VfsOpenFlags::MAIN_DB)
+                .unwrap();
+            assert_eq!(actual & (VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE), expected);
+            assert!(actual.contains(VfsOpenFlags::MAIN_DB));
+            assert_eq!(file.file_identity().unwrap(), seed.file_identity().unwrap());
+            let result = file.write(&cx, b"x", 0);
+            if expected == VfsOpenFlags::READONLY {
+                assert!(matches!(result, Err(FrankenError::ReadOnly)));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_identity_reopen_cannot_create_or_gain_write_access() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let before = vfs.usage_snapshot().unwrap();
+        assert!(matches!(
+            vfs.open(&cx, Some(Path::new("missing.db")), VfsOpenFlags::READONLY),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(vfs.usage_snapshot().unwrap(), before);
+        let path = Path::new("identity.db");
+        let (owner, _) = vfs.open(&cx, Some(path), VfsOpenFlags::CREATE).unwrap();
+        owner.write(&cx, b"keep", 0).unwrap();
+        let identity = owner.file_identity().unwrap().unwrap();
+        let (reader, actual) = vfs.open_with_expected_identity(
+            &cx,
+            path,
+            VfsOpenFlags::READONLY | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE,
+            identity,
+        ).unwrap();
+        assert!(actual.contains(VfsOpenFlags::READONLY));
+        assert!(!actual.intersects(
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE
+        ));
+        assert!(matches!(reader.write(&cx, b"bad!", 0), Err(FrankenError::ReadOnly)));
+        let mut contents = [0; 4];
+        owner.read(&cx, &mut contents, 0).unwrap();
+        assert_eq!(&contents, b"keep");
+    }
+
+    #[test]
+    fn anonymous_scratch_open_reports_writable_access_and_cleans_up() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let (file, actual) = vfs.open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::READONLY)
+            .unwrap();
+        assert!(actual.contains(VfsOpenFlags::READWRITE));
+        assert!(!actual.contains(VfsOpenFlags::READONLY));
+        file.write(&cx, b"scratch", 0).unwrap();
+        let path = file.path.clone();
+        drop(file);
+        assert!(!vfs.access(&cx, &path, AccessFlags::EXISTS).unwrap());
+        assert_eq!(vfs.usage_snapshot().unwrap().file_bytes, 0);
+    }
+
+    #[test]
+    fn exclusive_create_refuses_existing_file_without_side_effects() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new_with_config(MemoryVfsConfig {
+            initial_reserve_bytes: 64,
+            growth_chunk_bytes: 1,
+            max_bytes: Some(64),
+        });
+        let path = Path::new("exclusive.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (owner, _) = vfs.open(&cx, Some(path), flags | VfsOpenFlags::EXCLUSIVE).unwrap();
+        owner.write(&cx, b"owned", 0).unwrap();
+        let identity = owner.file_identity().unwrap();
+        let before = vfs.usage_snapshot().unwrap();
+        let refused = vfs.open(
+            &cx,
+            Some(path),
+            flags | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE,
+        );
+        assert!(matches!(refused, Err(FrankenError::CannotOpen { path: failed }) if failed == path));
+        assert_eq!(vfs.usage_snapshot().unwrap(), before);
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
+        let mut contents = [0; 5];
+        assert_eq!(owner.read(&cx, &mut contents, 0).unwrap(), 5);
+        assert_eq!(&contents, b"owned");
+        assert_eq!(owner.file_identity().unwrap(), identity);
+        for reopen_flags in [flags, VfsOpenFlags::READWRITE | VfsOpenFlags::EXCLUSIVE] {
+            let (peer, _) = vfs.open(&cx, Some(path), reopen_flags).unwrap();
+            assert_eq!(peer.file_identity().unwrap(), identity);
+            peer.write(&cx, b"peer!", 0).unwrap();
+        }
+        owner.read(&cx, &mut contents, 0).unwrap();
+        assert_eq!(&contents, b"peer!");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn competing_exclusive_creators_have_exactly_one_winner() {
+        const CREATORS: usize = 8;
+        let vfs = make_vfs();
+        let barrier = Arc::new(std::sync::Barrier::new(CREATORS));
+        let handles: Vec<_> = (0..CREATORS)
+            .map(|_| {
+                let vfs = vfs.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let cx = Cx::new();
+                    let flags = VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE
+                        | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                    barrier.wait();
+                    match vfs.open(&cx, Some(Path::new("contended.db")), flags) {
+                        Ok((_file, _)) => 1,
+                        Err(FrankenError::CannotOpen { .. }) => 0,
+                        Err(error) => panic!("unexpected exclusive-create failure: {error}"),
+                    }
+                })
+            })
+            .collect();
+        let winners: usize = handles.into_iter().map(|handle| handle.join().unwrap()).sum();
+        assert_eq!(winners, 1);
+        assert_eq!(vfs.usage_snapshot().unwrap().file_count, 1);
+    }
+
+    #[test]
+    fn anonymous_files_skip_named_collisions_and_never_delete_their_owners() {
+        for explicit_close in [false, true] {
+            let cx = Cx::new();
+            let vfs = make_vfs();
+            let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let mut owners = Vec::new();
+            for name in ["__temp_0__", "__temp_1__"] {
+                let (file, _) = vfs.open(&cx, Some(Path::new(name)), flags).unwrap();
+                file.write(&cx, b"keep", 0).unwrap();
+                owners.push(file);
+            }
+            let before = vfs.usage_snapshot().unwrap();
+            let (mut first, actual) = vfs
+                .open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::READWRITE)
+                .unwrap();
+            let (second, _) = vfs
+                .open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE)
+                .unwrap();
+            assert!(actual.contains(VfsOpenFlags::READWRITE));
+            assert_ne!(first.file_identity().unwrap(), second.file_identity().unwrap());
+            for owner in &owners {
+                assert_ne!(first.file_identity().unwrap(), owner.file_identity().unwrap());
+                assert_ne!(second.file_identity().unwrap(), owner.file_identity().unwrap());
+            }
+            let first_path = first.path.clone();
+            let second_path = second.path.clone();
+            first.write(&cx, b"scratch", 0).unwrap();
+            second.write(&cx, b"other", 0).unwrap();
+            if explicit_close {
+                first.close(&cx).unwrap();
+            }
+            drop(first);
+            drop(second);
+            assert!(!vfs.access(&cx, &first_path, AccessFlags::EXISTS).unwrap());
+            assert!(!vfs.access(&cx, &second_path, AccessFlags::EXISTS).unwrap());
+            let after = vfs.usage_snapshot().unwrap();
+            assert_eq!(after.file_count, before.file_count);
+            assert_eq!(after.file_bytes, before.file_bytes);
+            assert_eq!(after.file_reserved_bytes, before.file_reserved_bytes);
+            for owner in owners {
+                assert!(vfs.access(&cx, &owner.path, AccessFlags::EXISTS).unwrap());
+                let mut contents = [0; 4];
+                assert_eq!(owner.read(&cx, &mut contents, 0).unwrap(), 4);
+                assert_eq!(&contents, b"keep");
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_temporary_sequence_fails_without_wrapping_or_poisoning() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (owner, _) = vfs.open(&cx, Some(Path::new("__temp_0__")), flags).unwrap();
+        owner.write(&cx, b"keep", 0).unwrap();
+        vfs.inner.lock().unwrap().next_temp_id = u64::MAX;
+        let before = vfs.usage_snapshot().unwrap();
+        assert!(matches!(
+            vfs.open(&cx, None, flags | VfsOpenFlags::TEMP_DB),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert_eq!(vfs.inner.lock().unwrap().next_temp_id, u64::MAX);
+        assert_eq!(vfs.usage_snapshot().unwrap(), before);
+        let (peer, _) = vfs.open(&cx, Some(Path::new("__temp_0__")), flags).unwrap();
+        assert_eq!(peer.file_identity().unwrap(), owner.file_identity().unwrap());
+        let mut contents = [0; 4];
+        peer.read(&cx, &mut contents, 0).unwrap();
+        assert_eq!(&contents, b"keep");
+    }
+
+    #[test]
+    fn failed_exclusive_shm_range_retains_locks_owned_before_the_call() {
+        for first in 0..WAL_TOTAL_LOCKS - 2 {
+            for owned_offset in [0, 1] {
+                let cx = Cx::new();
+                let vfs = make_vfs();
+                let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+                let path = Path::new("exclusive_range.db");
+                let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                let (mut blocker, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                let (mut observer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+                let lock = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
+                let unlock = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
+                let owned = first + owned_offset;
+                let fresh = first + (1 - owned_offset);
+                let blocked = first + 2;
+                owner.shm_lock(&cx, owned, 1, lock).unwrap();
+                blocker.shm_lock(&cx, blocked, 1, lock).unwrap();
+                assert!(matches!(owner.shm_lock(&cx, first, 3, lock), Err(FrankenError::Busy)));
+                for mode in [SQLITE_SHM_SHARED, SQLITE_SHM_EXCLUSIVE] {
+                    assert!(matches!(
+                        observer.shm_lock(&cx, owned, 1, SQLITE_SHM_LOCK | mode),
+                        Err(FrankenError::Busy)
+                    ), "pre-existing slot {owned} must remain excluded");
+                }
+                observer.shm_lock(&cx, fresh, 1, lock).unwrap();
+                observer.shm_lock(&cx, fresh, 1, unlock).unwrap();
+                assert!(matches!(observer.shm_lock(&cx, blocked, 1, lock), Err(FrankenError::Busy)));
+                owner.shm_lock(&cx, owned, 1, unlock).unwrap();
+                observer.shm_lock(&cx, owned, 1, lock).unwrap();
+                observer.shm_lock(&cx, owned, 1, unlock).unwrap();
+                blocker.shm_lock(&cx, blocked, 1, unlock).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_shared_shm_range_preserves_refs_borrowed_under_exclusive_lock() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("shared_range.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut blocker, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut observer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let shared = SQLITE_SHM_LOCK | SQLITE_SHM_SHARED;
+        let exclusive = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
+        let unshare = SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED;
+        let unexclude = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
+        owner.shm_lock(&cx, 0, 1, shared).unwrap();
+        owner.shm_lock(&cx, 0, 1, shared).unwrap();
+        owner.shm_lock(&cx, 0, 1, exclusive).unwrap();
+        blocker.shm_lock(&cx, 2, 1, exclusive).unwrap();
+        assert!(matches!(owner.shm_lock(&cx, 0, 3, shared), Err(FrankenError::Busy)));
+        observer.shm_lock(&cx, 1, 1, exclusive).unwrap();
+        observer.shm_lock(&cx, 1, 1, unexclude).unwrap();
+        owner.shm_lock(&cx, 0, 1, unexclude).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(observer.shm_lock(&cx, 0, 1, exclusive), Err(FrankenError::Busy)));
+            owner.shm_lock(&cx, 0, 1, unshare).unwrap();
+        }
+        observer.shm_lock(&cx, 0, 1, exclusive).unwrap();
+        observer.shm_lock(&cx, 0, 1, unexclude).unwrap();
+        blocker.shm_lock(&cx, 2, 1, unexclude).unwrap();
+    }
+
+    #[test]
+    fn failed_shm_upgrade_restores_shared_refs_and_keeps_preexisting_exclusive() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("upgrade_range.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut blocker, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut observer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let shared = SQLITE_SHM_LOCK | SQLITE_SHM_SHARED;
+        let exclusive = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
+        let unshare = SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED;
+        let unexclude = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
+        owner.shm_lock(&cx, 0, 1, shared).unwrap();
+        owner.shm_lock(&cx, 0, 1, shared).unwrap();
+        owner.shm_lock(&cx, 1, 1, exclusive).unwrap();
+        blocker.shm_lock(&cx, 2, 1, shared).unwrap();
+        assert!(matches!(owner.shm_lock(&cx, 0, 3, exclusive), Err(FrankenError::Busy)));
+        observer.shm_lock(&cx, 0, 1, shared).unwrap();
+        observer.shm_lock(&cx, 0, 1, unshare).unwrap();
+        assert!(matches!(observer.shm_lock(&cx, 0, 1, exclusive), Err(FrankenError::Busy)));
+        assert!(matches!(observer.shm_lock(&cx, 1, 1, shared), Err(FrankenError::Busy)));
+        for _ in 0..2 {
+            owner.shm_lock(&cx, 0, 1, unshare).unwrap();
+        }
+        observer.shm_lock(&cx, 0, 1, exclusive).unwrap();
+        observer.shm_lock(&cx, 0, 1, unexclude).unwrap();
+        owner.shm_lock(&cx, 1, 1, unexclude).unwrap();
+        blocker.shm_lock(&cx, 2, 1, unshare).unwrap();
+    }
+
+    #[test]
+    fn shm_range_retry_after_contention_retains_one_exclusive_ownership() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("retry_range.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut blocker, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut observer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let lock = SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE;
+        let unlock = SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE;
+        owner.shm_lock(&cx, 0, 1, lock).unwrap();
+        blocker.shm_lock(&cx, 2, 1, lock).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(owner.shm_lock(&cx, 0, 3, lock), Err(FrankenError::Busy)));
+            assert!(matches!(observer.shm_lock(&cx, 0, 1, lock), Err(FrankenError::Busy)));
+        }
+        blocker.shm_lock(&cx, 2, 1, unlock).unwrap();
+        owner.shm_lock(&cx, 0, 3, lock).unwrap();
+        for slot in 0..3 {
+            assert!(matches!(observer.shm_lock(&cx, slot, 1, lock), Err(FrankenError::Busy)));
+        }
+        owner.shm_lock(&cx, 0, 3, unlock).unwrap();
+        observer.shm_lock(&cx, 0, 3, lock).unwrap();
+        observer.shm_lock(&cx, 0, 3, unlock).unwrap();
+    }
+
+    #[test]
+    fn shared_shm_reference_exhaustion_rolls_back_only_this_range_attempt() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("refcount_range.db");
+        let (mut owner, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut observer, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let shared = SQLITE_SHM_LOCK | SQLITE_SHM_SHARED;
+        owner.shm_lock(&cx, 0, 1, shared).unwrap();
+        owner.shm_lock(&cx, 2, 1, shared).unwrap();
+        {
+            let mut info = owner.shm_info.as_ref().unwrap().lock().unwrap();
+            info.slots[2].shared_holders.insert(owner.shm_owner_id, u32::MAX);
+        }
+        assert!(matches!(owner.shm_lock(&cx, 0, 3, shared), Err(FrankenError::LockFailed { .. })));
+        {
+            let info = owner.shm_info.as_ref().unwrap().lock().unwrap();
+            assert_eq!(info.slots[0].shared_holders.get(&owner.shm_owner_id), Some(&1));
+            assert!(!info.slots[1].shared_holders.contains_key(&owner.shm_owner_id));
+            assert_eq!(info.slots[2].shared_holders.get(&owner.shm_owner_id), Some(&u32::MAX));
+        }
+        observer.shm_lock(&cx, 1, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
+        observer.shm_lock(&cx, 1, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
+        drop(owner);
+        observer.shm_lock(&cx, 0, 3, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
+        observer.shm_lock(&cx, 0, 3, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
     }
 
     #[test]
