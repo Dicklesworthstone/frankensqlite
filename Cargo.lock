@@ -1125,6 +1125,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-parser",
  "fsqlite-types",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",

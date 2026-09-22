@@ -11,6 +11,7 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use asupersync::channel::oneshot;
 use asupersync::{Cx as NativeCx, types::Time};
 use fsqlite_error::FrankenError;
 
@@ -222,17 +223,24 @@ impl RetryRun<'_> {
         }
         let delay = delay.min(self.policy.timeout.saturating_sub(self.elapsed()));
         let mut sleep = pin!(asupersync::time::sleep(self.native.now(), delay));
-        let mut native_cancel = pin!(self.native.cancelled());
+        // asupersync's `Cx` has no awaitable cancellation future. A oneshot
+        // receiver whose sender is never used resolves exactly when the native
+        // context is cancelled (`RecvError::Cancelled`); the sender is kept
+        // alive until the race is over so it cannot resolve with `Closed`.
+        let (native_cancel_tx, mut native_cancel_rx) = oneshot::channel::<()>();
+        let mut native_cancel = pin!(native_cancel_rx.recv(&self.native));
         let local_cx = self.conn.root_cx();
         let mut local_cancel = pin!(local_cx.wait_for_local_cancel_request());
-        poll_fn(|cx| {
+        let waited = poll_fn(|cx| {
             if native_cancel.as_mut().poll(cx).is_ready()
                 || local_cancel.as_mut().poll(cx).is_ready()
             {
                 return Poll::Ready(Err(RetryStopReason::Cancelled));
             }
             sleep.as_mut().poll(cx).map(|()| Ok(()))
-        }).await?;
+        }).await;
+        drop(native_cancel_tx);
+        waited?;
         self.stop_reason().map_or(Ok(()), Err)
     }
 

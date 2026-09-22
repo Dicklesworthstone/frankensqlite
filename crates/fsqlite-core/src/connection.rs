@@ -1984,7 +1984,15 @@ static FSQLITE_BACKGROUND_COMPILE_INTERFERENCE_COUNT: AtomicU64 = AtomicU64::new
 // Time (ns) spent waiting for background compile.
 static FSQLITE_BACKGROUND_COMPILE_INTERFERENCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
-const RECURSIVE_CTE_MAX_RECURSION: usize = 1000;
+/// GH#419: recursive CTE iteration is unbounded, as in stock SQLite. There used
+/// to be a silent 1000-round cap here; a recursion that needed more rounds
+/// returned a truncated result with no error (`... WHERE x < 5000` yielded
+/// 1001 rows). Termination now comes only from the fixpoint (no new rows),
+/// the CTE's own `LIMIT`, a consuming query's plain `LIMIT`/`OFFSET`, or
+/// cooperative cancellation, which every round checks.
+/// Cancellation is polled at this stride inside the tight integer-series sum
+/// loop so an enormous bound stays interruptible without a per-step check.
+const RECURSIVE_CTE_CANCEL_CHECK_STRIDE: u64 = 1 << 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -3481,48 +3489,47 @@ impl RuntimeContext {
     /// bd-fo6xw: a gateway-carrying native `Cx` whose spawner outlives every
     /// operation on every connection using this context.
     ///
-    /// `block_on`'s ambient request `Cx` carries no spawn gateway, so it can
-    /// never start the shared io_uring driver (the refuted 2026-07-26 fix
-    /// failed on exactly that, deterministically). The only public mint for
-    /// a gateway-carrying `Cx` is `RuntimeHandle::try_spawn_with_cx`, whose
-    /// task `Cx` lives in the runtime's ROOT REGION.
+    /// A shared io_uring driver needs a spawner rooted in a long-lived region,
+    /// not the short-lived per-`block_on` request context. The `Cx` minted
+    /// here comes straight from the retained `RuntimeHandle` and lives in the
+    /// runtime's ROOT REGION, so it stays a valid spawner across separate
+    /// `block_on` calls for the whole runtime lifetime (runtime drop completes
+    /// in nanoseconds; a saved clone pins the runtime inner alive — plain
+    /// `Arc` extension, released when the last `Connection` drops).
     ///
-    /// MINT-AND-EXIT: the spawned task hands out a clone of its `Cx` and
-    /// returns immediately — no parked task exists afterwards (the
-    /// structured-lifecycle requirement from the bd-bjm5d/bd-fo6xw contract
-    /// review, agent-mail 4363, is satisfied by construction). The clone
-    /// remains a valid spawner because the gateway and pending-spawn
-    /// counter are `Arc`s into the runtime's root region, which stays open
-    /// for the runtime's lifetime; probe-verified originally against
-    /// asupersync 0.3.9 and still valid on 0.4.x. (Note: 0.3.10+ closed the
-    /// historical "block_on ambient request `Cx` has no spawn gateway" gap
-    /// upstream, so the surviving rationale for MINT-AND-EXIT is the
-    /// LIFETIME argument here — a shared driver needs a spawner rooted in a
-    /// long-lived region, not the short-lived per-`block_on` context.
-    /// Upstream exposure of `request_cx_with_budget` on `RuntimeHandle`
-    /// (asupersync-0fya65) would let this dance be replaced wholesale.)
-    /// (spawn works across separate `block_on` calls after the minting
-    /// task exited; runtime drop completes in nanoseconds; a saved clone
-    /// pins the runtime inner alive — plain `Arc` extension, released when
-    /// the last `Connection` drops).
+    /// History: before asupersync exposed `request_cx_with_budget` on
+    /// `RuntimeHandle` (asupersync-0fya65), the only public mint for a
+    /// gateway-carrying `Cx` was `RuntimeHandle::try_spawn_with_cx`, so this
+    /// used a MINT-AND-EXIT helper task whose `Cx` clone was handed back over
+    /// a channel (structured-lifecycle review: bd-bjm5d/bd-fo6xw, agent-mail
+    /// 4363). That handoff is what GH#424 was about; see `io_native_cx`.
     ///
     /// Lifetime proof: `Connection` pins `Arc<RuntimeContext>` (attach_env
     /// + SharedMvccState), which pins the strong `RuntimeHandle`, which
     /// pins `Arc<RuntimeInner>` — so the root region and gateway outlive
     /// the connection. Returns `None` when this context has no runtime
     /// handle (the process-global default), keeping that path unchanged.
+    ///
+    /// GH#424: the mint must never block the executor. The captured handle is
+    /// usually the runtime that is polling this very open (the CLI builds a
+    /// `current_thread` runtime, constructs the context inside `block_on`, and
+    /// opens on that thread), so the earlier spawn-a-task-then-`recv_timeout`
+    /// handoff could never observe its task run: every open burned the full
+    /// 5 s timeout on every platform and then silently fell back to the
+    /// detached path. asupersync 0.5.0 exposes
+    /// `RuntimeHandle::try_request_cx_with_budget`, which mints a runtime-rooted,
+    /// gateway-carrying `Cx` synchronously with no helper task, so the
+    /// MINT-AND-EXIT dance above is no longer needed. `Budget::INFINITE`
+    /// mirrors what `block_on` grants its own request context: the shared
+    /// driver spawner must never be quota- or deadline-limited.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn io_native_cx(&self) -> Option<asupersync::Cx> {
         self.io_native_cx
             .get_or_init(|| {
                 let handle = self.native_runtime_handle.as_ref()?;
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 handle
-                    .try_spawn_with_cx(move |cx: asupersync::Cx| async move {
-                        let _ = tx.send(cx.clone());
-                    })
-                    .ok()?;
-                rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+                    .try_request_cx_with_budget(asupersync::types::Budget::INFINITE)
+                    .ok()
             })
             .clone()
     }
@@ -89186,10 +89193,22 @@ impl Connection {
         // (test_select_structure_follows_sqlite_depth_first_precedence).
         let pruned_with = prune_unreferenced_ctes(select);
         let with_for_materialize = pruned_with.as_ref().or(select.with.as_ref());
+        // GH#419: `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c)
+        // SELECT x FROM c LIMIT 10` is a stock idiom; the recursion is infinite
+        // and only the consumer's LIMIT ends it. Stock sqlite3 streams rows and
+        // stops when the LIMIT is satisfied. This engine materializes the CTE
+        // first, so hand the plain-scan consumer's row budget to the
+        // materializer and let it stop at the same point.
+        let consumer_row_budget = self.recursive_cte_consumer_row_budget(select);
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         let result = async {
-            self.materialize_with_clause(with_for_materialize, params, &mut temp_tables.tables)
-                .await?;
+            self.materialize_with_clause(
+                with_for_materialize,
+                params,
+                &mut temp_tables.tables,
+                consumer_row_budget.as_ref(),
+            )
+            .await?;
             // CTE temp tables have dynamically allocated root pages. Do not
             // reuse compiled bytecode keyed only by stripped SQL text, but also
             // do not flush unrelated global caches on every execution.
@@ -89850,7 +89869,8 @@ impl Connection {
         plan: &RecursiveCteDirectSumConsumerPlan,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<SqliteValue>> {
-        if let Some(sum) = Self::execute_recursive_cte_integer_series_sum(plan, params)? {
+        let cx = self.op_cx_after_background_status();
+        if let Some(sum) = Self::execute_recursive_cte_integer_series_sum(plan, params, &cx)? {
             return Ok(Some(sum));
         }
 
@@ -89939,10 +89959,12 @@ impl Connection {
         let mut state = func.initial_state();
 
         Self::step_recursive_cte_direct_sum_rows(&*func, &mut state, &working_set, plan)?;
-        for _ in 0..RECURSIVE_CTE_MAX_RECURSION {
+        loop {
             if working_set.is_empty() {
                 break;
             }
+            // GH#419: no round cap; an unbounded recursion must stay interruptible.
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
             for (op, execution_plan) in &recursive_arms {
                 let arm_rows = self
@@ -89976,6 +89998,7 @@ impl Connection {
     fn execute_recursive_cte_integer_series_sum(
         plan: &RecursiveCteDirectSumConsumerPlan,
         params: Option<&[SqliteValue]>,
+        cx: &Cx,
     ) -> Result<Option<SqliteValue>> {
         let Some(series) = Self::recursive_cte_integer_series_sum_plan(plan) else {
             return Ok(None);
@@ -89998,8 +90021,8 @@ impl Connection {
 
         let mut current = start;
         let mut sum = current;
-        let mut remaining = RECURSIVE_CTE_MAX_RECURSION;
-        while remaining > 0 && current < bound {
+        let mut steps: u64 = 0;
+        while current < bound {
             let Some(next) = current.checked_add(step) else {
                 return Ok(None);
             };
@@ -90007,7 +90030,10 @@ impl Connection {
             sum = sum
                 .checked_add(current)
                 .ok_or(FrankenError::IntegerOverflow)?;
-            remaining -= 1;
+            steps = steps.wrapping_add(1);
+            if steps % RECURSIVE_CTE_CANCEL_CHECK_STRIDE == 0 {
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            }
         }
         FSQLITE_RECURSIVE_CTE_INTEGER_SERIES_SUM_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(Some(SqliteValue::Integer(sum)))
@@ -90645,7 +90671,7 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables.tables)
+        self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
         let mut stripped = delete.clone();
         stripped.with = None;
@@ -90725,7 +90751,7 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables.tables)
+        self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
         let mut stripped = update.clone();
         stripped.with = None;
@@ -90794,7 +90820,7 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables)
+        self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
         let mut stripped = insert.clone();
         stripped.with = None;
@@ -90838,6 +90864,7 @@ impl Connection {
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
         temp_tables: &mut Vec<(String, i32)>,
+        consumer_row_budget: Option<&RecursiveCteConsumerRowBudget>,
     ) -> Result<()> {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
@@ -90889,7 +90916,10 @@ impl Connection {
                     .any(|(_, core)| select_core_references_table(core, cte_name));
 
             if has_self_ref {
-                self.materialize_recursive_cte(cte, params, &mut *temp_tables)
+                let row_budget = consumer_row_budget
+                    .filter(|budget| budget.cte_name.eq_ignore_ascii_case(cte_name))
+                    .map(|budget| budget.rows);
+                self.materialize_recursive_cte(cte, params, &mut *temp_tables, row_budget)
                     .await?;
             } else {
                 let cte_rows = self
@@ -90966,7 +90996,7 @@ impl Connection {
             "with_clause_materialization",
         )?;
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
-        self.materialize_with_clause(with, params, &mut temp_tables.tables)
+        self.materialize_with_clause(with, params, &mut temp_tables.tables, None)
             .await?;
         self.snapshot_materialized_temp_tables(&temp_tables.tables)
     }
@@ -91125,11 +91155,99 @@ impl Connection {
 
     /// Materialize a recursive CTE by iterating until no new rows are produced.
     #[allow(clippy::cast_possible_wrap, clippy::too_many_lines)]
+    /// GH#419: when the consuming query is a plain scan of one recursive CTE
+    /// with a literal `LIMIT` (and optional literal `OFFSET`), it reads at most
+    /// `LIMIT + OFFSET` rows of the materialized table in rowid order, so the
+    /// materializer may stop producing rows at that point. That is what lets
+    /// an unbounded recursion such as
+    /// `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c LIMIT 10`
+    /// terminate, exactly as stock sqlite3's streaming evaluation does.
+    ///
+    /// The shape is deliberately narrow: no compound, `ORDER BY`, `DISTINCT`,
+    /// `WHERE`, `GROUP BY`/`HAVING`, window, join, or aggregate, and no
+    /// subquery anywhere in the result columns (a scalar subquery could read
+    /// the CTE and would need the complete table). Anything else returns
+    /// `None` and the CTE materializes in full.
+    fn recursive_cte_consumer_row_budget(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<RecursiveCteConsumerRowBudget> {
+        let with = select.with.as_ref()?;
+        if !with.recursive || !select.body.compounds.is_empty() || !select.order_by.is_empty() {
+            return None;
+        }
+        let limit_clause = select.limit.as_ref()?;
+        let literal_rows = |expr: &Expr| match expr {
+            Expr::Literal(fsqlite_ast::Literal::Integer(n), _) if *n >= 0 => {
+                usize::try_from(*n).ok()
+            }
+            _ => None,
+        };
+        let limit = literal_rows(&limit_clause.limit)?;
+        let offset = match limit_clause.offset.as_ref() {
+            Some(offset) => literal_rows(offset)?,
+            None => 0,
+        };
+        let rows = limit.checked_add(offset)?;
+        let SelectCore::Select {
+            distinct: Distinctness::All,
+            columns,
+            from: Some(from),
+            where_clause: None,
+            group_by,
+            having: None,
+            windows,
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if !group_by.is_empty() || !windows.is_empty() || !from.joins.is_empty() {
+            return None;
+        }
+        let TableOrSubquery::Table {
+            name: source, ..
+        } = &from.source
+        else {
+            return None;
+        };
+        if source.schema.is_some() {
+            return None;
+        }
+        // The scanned relation must be a recursive CTE of this WITH clause.
+        let is_recursive_cte = with.ctes.iter().any(|cte| {
+            cte.name.eq_ignore_ascii_case(&source.name)
+                && cte
+                    .query
+                    .body
+                    .compounds
+                    .iter()
+                    .any(|(_, core)| select_core_references_table(core, &cte.name))
+        });
+        if !is_recursive_cte {
+            return None;
+        }
+        if has_window_functions(select) || self.has_implicit_aggregation_with_registry(select) {
+            return None;
+        }
+        let has_subquery = columns.iter().any(|column| match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            ResultColumn::Expr { expr, .. } => expr_contains_subquery_match(expr, &mut |_| true),
+        });
+        if has_subquery {
+            return None;
+        }
+        Some(RecursiveCteConsumerRowBudget {
+            cte_name: source.name.clone(),
+            rows,
+        })
+    }
+
     async fn materialize_recursive_cte(
         &self,
         cte: &fsqlite_ast::Cte,
         params: Option<&[SqliteValue]>,
         temp_tables: &mut Vec<(String, i32)>,
+        consumer_row_budget: Option<usize>,
     ) -> Result<()> {
         let cte_name = &cte.name;
         let col_names = self.recursive_cte_output_column_names(cte);
@@ -91186,8 +91304,8 @@ impl Connection {
         // GH #152: a literal LIMIT inside the recursive CTE caps the total rows
         // it produces (stock sqlite3 stops the recursion once the LIMIT is
         // reached). A LIMIT with OFFSET or a non-literal expression is not capped
-        // here — the sum fast paths bail on any CTE limit, and other shapes keep
-        // the 1000-row recursion bound.
+        // here — the sum fast paths bail on any CTE limit, and other shapes run
+        // to the fixpoint (GH#419: there is no round cap any more).
         let recursive_cte_row_cap: Option<usize> =
             cte.query
                 .limit
@@ -91277,12 +91395,23 @@ impl Connection {
             BTreeSet::new()
         };
 
-        // Iterate: feed working set to recursive arm, collect new rows.
-        for _ in 0..RECURSIVE_CTE_MAX_RECURSION {
+        // GH#419: the consumer only ever reads its first `LIMIT + OFFSET` rows
+        // (see `recursive_cte_consumer_row_budget`), so rows past that point
+        // need not be produced. Combined with the CTE's own LIMIT this is the
+        // earliest safe stopping point.
+        let stop_row_cap = match (recursive_cte_row_cap, consumer_row_budget) {
+            (Some(cap), Some(budget)) => Some(cap.min(budget)),
+            (cap, budget) => cap.or(budget),
+        };
+        let cx = self.op_cx_after_background_status();
+        // Iterate: feed working set to recursive arm, collect new rows, until
+        // the fixpoint, a row cap, or cancellation. No round cap (GH#419).
+        loop {
             let frontier_end = all_rows.len();
             if frontier_start >= frontier_end {
                 break;
             }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             if recursive_arms_require_temp_table {
                 // Put only the working set (current frontier slice) in the temp
                 // table for recursive arms that still read through the ordinary
@@ -91344,8 +91473,9 @@ impl Connection {
             // frontier window to the just-appended tail.
             frontier_start = all_rows.len();
             all_rows.append(&mut new_rows);
-            // GH #152: stop once the CTE LIMIT has been reached.
-            if let Some(cap) = recursive_cte_row_cap
+            // GH #152 / GH#419: stop once the CTE LIMIT or the consumer's row
+            // budget has been reached.
+            if let Some(cap) = stop_row_cap
                 && all_rows.len() >= cap
             {
                 all_rows.truncate(cap);
@@ -91354,8 +91484,9 @@ impl Connection {
         }
 
         // GH #152: cap the materialized rows to the CTE LIMIT — also covers the
-        // case where the base case alone already produced enough rows.
-        if let Some(cap) = recursive_cte_row_cap {
+        // case where the base case alone already produced enough rows. The
+        // consumer budget is likewise safe to apply: those rows are never read.
+        if let Some(cap) = stop_row_cap {
             all_rows.truncate(cap);
         }
 
@@ -106941,6 +107072,14 @@ fn skip_block_sql_comment_chars(chars: &mut std::iter::Peekable<std::str::Chars<
 }
 
 /// Check whether a `SelectCore` references a named table/CTE in any FROM source.
+/// GH#419: how many leading rows of a recursive CTE its consuming query can
+/// observe. See `Connection::recursive_cte_consumer_row_budget`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecursiveCteConsumerRowBudget {
+    cte_name: String,
+    rows: usize,
+}
+
 fn select_core_references_table(core: &SelectCore, table_name: &str) -> bool {
     match core {
         SelectCore::Select {
