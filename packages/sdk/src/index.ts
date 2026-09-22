@@ -3,6 +3,7 @@ export type {
   ChangesetRebaseJournalOptions,
   RebaseJournalApplyOptions,
   RebaseJournalApplyResult,
+  RebaseJournalBookmark,
   RebaseJournalEntry,
   RebaseJournalHead,
   RebaseJournalOperationOptions,

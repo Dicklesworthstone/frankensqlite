@@ -130,6 +130,58 @@ anything, change an already-identified outbox payload, or implement a complete
 bidirectional synchronization protocol. Patchsets are rejected because they
 lack the before-images required for this contract.
 
+## History-bound bookmarks
+
+Use `await history.bookmark()` to capture the current prefix as a frozen,
+JSON-serializable `RebaseJournalBookmark`. Store it with the original local
+changeset under the same transaction ownership. Numeric positions alone cannot
+detect a restored backup that has reused positions on a different history.
+
+Both range endpoints accept a bookmark instead of a number:
+
+```ts
+// originalBasis was captured with the ORIGINAL local changes, before these
+// remote decisions. Persist both, not just originalBasis.position.
+const result = await history.rebase(originalLocalChangeset, {
+  after: originalBasis,
+  through: savedRemoteTip, // Optional bookmark; omit to use this SQL snapshot's tip.
+});
+console.log(result.afterBookmark, result.throughBookmark);
+```
+
+The returned bookmarks belong to the same SQL snapshot as the rebasing; they
+are not obtained from a separate later head read. `afterBookmark` identifies
+the excluded basis, and `throughBookmark` identifies the included prefix.
+Persist the original basis for future rebasing of the original bytes. A returned
+tip is not permission to feed already-rebased output through history again.
+
+Each bookmark contains `format: 'fsqlite-rebase-bookmark-v1'`, `journalId`,
+`position`, and a lowercase SHA-256 digest. The digest chains the entire prefix,
+not just the last delivery: it binds the previous hash, position, delivery ID,
+message digest/length, and verified decision digest/length. Empty decisions
+also advance the chain. A matching final entry cannot conceal an earlier fork.
+The chain uses UTF-8 JSON arrays with the versioned format as its domain; its
+genesis binds that domain and the journal identity. No schema migration or
+stored hash column is needed, so existing journal rows can be bookmarked.
+
+A present position with the wrong prefix (or another journal identity) fails
+with `ERR_FSQLITE_REBASE_JOURNAL_HISTORY`. An unavailable range still fails with
+`ERR_FSQLITE_REBASE_JOURNAL_MISSING`. Neither path changes rows, repairs history,
+replays remote SQL, or silently selects another basis. Exact copied/restored
+prefixes remain valid; the bookmark is a logical history identity, not a unique
+physical-database ID. Empty journals with the same ID share the same genesis.
+Hashes are not authentication, proof of unchanged application tables, a rollback
+oracle without a saved bookmark, or protection if a writer replaces the saved
+bookmark too. Checkpoint/outer-commit requirements remain unchanged.
+
+Bookmarking and rebasing verify entries from position one through the selected
+tip, including entries excluded by `after`; corruption in that prefix is not
+ignored. Bodies are verified against their checksums and inbox receipts one at
+a time, with existing entry/byte limits and cancellation/deadline checks.
+Work is linear in the prefix length; no constant-time or RSS guarantee is made.
+Numeric endpoints remain an explicit position-only selection and cannot detect
+a coherent alternative history without a saved bookmark.
+
 ## Bounds and integrity
 
 `maxEntries` defaults to 10,000 and has a hard maximum of 100,000.
@@ -160,7 +212,8 @@ who can coherently rewrite both journal and inbox. Authenticate remote input.
 
 ```sh
 node --experimental-loader=./packages/sdk/tests/helpers/source-loader.mjs \
-  --test packages/sdk/tests/changeset-rebase.test.mjs
+  --test packages/sdk/tests/changeset-rebase.test.mjs \
+  packages/sdk/tests/changeset-rebase-bookmark.test.mjs
 ```
 
 The tests execute production TypeScript journal SQL against Node SQLite and
@@ -176,3 +229,10 @@ unjournaled default, backpressure, corrupt/missing history, ordered native-oracl
 rebasing, and cancellation before or after committed history.
 They are not certification of the FrankenSQLite Rust/WASM engine, browser
 storage, native ECS, or power-loss behavior.
+
+The bookmark suite uses actual Node SQLite files to fork a backup, reuse
+positions with an identical final entry, and reject the saved conflicting
+prefix without modifying storage. It also checks exact reopen, empty decisions,
+message/policy identity, all valid small ranges, excluded-prefix corruption,
+untrusted bookmark fields, input ownership, cancellation, deadlines, provisional
+outer rollback, and same-snapshot result identities.

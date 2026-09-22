@@ -46,17 +46,27 @@ export interface RebaseJournalEntry {
 export interface RebaseJournalApplyResult extends ApplyChangesetResult {
   readonly entry: RebaseJournalEntry;
 }
+/** Content identity of an entire ordered history prefix, not authentication. */
+export interface RebaseJournalBookmark {
+  readonly format: "fsqlite-rebase-bookmark-v1";
+  readonly journalId: string;
+  readonly position: number;
+  readonly sha256: string;
+}
 export interface RebaseJournalRangeOptions extends RebaseJournalOperationOptions {
-  /** Exclude decisions at/before this local history position. Default zero. */
-  after?: number;
-  /** Inclusive upper bound. Defaults to the transaction's committed journal tip. */
-  through?: number;
+  /** Exclusive basis. A bookmark also verifies the excluded prefix. Default zero. */
+  after?: number | RebaseJournalBookmark;
+  /** Inclusive bound; a bookmark pins its history. Defaults to this snapshot's tip. */
+  through?: number | RebaseJournalBookmark;
 }
 export interface RebaseJournalResult {
   readonly journalId: string;
   readonly after: number;
   readonly through: number;
   readonly changeset: Uint8Array;
+  /** Both identities were verified in the same SQL snapshot as the rebasing. */
+  readonly afterBookmark: RebaseJournalBookmark;
+  readonly throughBookmark: RebaseJournalBookmark;
 }
 export class RebaseJournalError extends Error {
   constructor(
@@ -66,6 +76,7 @@ export class RebaseJournalError extends Error {
       | "ERR_FSQLITE_REBASE_JOURNAL_CORRUPT"
       | "ERR_FSQLITE_REBASE_JOURNAL_LIMIT"
       | "ERR_FSQLITE_REBASE_JOURNAL_MISSING"
+      | "ERR_FSQLITE_REBASE_JOURNAL_HISTORY"
       | "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED"
       | "ERR_FSQLITE_REBASE_JOURNAL_TIMEOUT",
     message: string,
@@ -77,7 +88,7 @@ export class RebaseJournalError extends Error {
 const HEADS = `main."${REBASE_JOURNAL_HEADS_TABLE}"`;
 const ENTRIES = `main."${REBASE_JOURNAL_ENTRIES_TABLE}"`;
 const MAX_WIRE = 64 * 1024 * 1024;
-function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "CANCELLED" | "TIMEOUT", message: string): never {
+function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "HISTORY" | "CANCELLED" | "TIMEOUT", message: string): never {
   throw new RebaseJournalError(`ERR_FSQLITE_REBASE_JOURNAL_${kind}`, message);
 }
 function identity(value: unknown): string {
@@ -103,6 +114,33 @@ function position(value: unknown): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 100_000)
     fail("INPUT", "Journal positions must be integers in 0..100000");
   return value;
+}
+interface HistoryBoundary {
+  readonly position: number;
+  readonly sha256: string | null;
+}
+const BOOKMARK_FORMAT = "fsqlite-rebase-bookmark-v1";
+/** Capture before admission; accessors cannot substitute a different bookmark. */
+function boundary(value: unknown, journalId: string): HistoryBoundary {
+  if (typeof value === "number") return { position: position(value), sha256: null };
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    fail("INPUT", "Expected a journal position or history bookmark");
+  const field = (key: string): unknown => {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property || !Object.hasOwn(property, "value"))
+      fail("INPUT", "Bookmark fields must be own data properties");
+    return property.value;
+  };
+  const format = field("format"), id = identity(field("journalId"));
+  const at = position(field("position")), sha256 = field("sha256");
+  if (format !== BOOKMARK_FORMAT || typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256))
+    fail("INPUT", "Invalid journal bookmark format or digest");
+  if (id !== journalId) fail("HISTORY", "Bookmark belongs to a different journal");
+  return { position: at, sha256 };
+}
+function verifyBoundary(expected: HistoryBoundary, actual: RebaseJournalBookmark): void {
+  if (expected.sha256 !== null && expected.sha256 !== actual.sha256)
+    fail("HISTORY", "Journal history differs from its saved bookmark; reconcile the restored or replaced history");
 }
 function digest(value: unknown): string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) fail("CORRUPT", "Invalid journal digest");
@@ -322,27 +360,69 @@ export class ChangesetRebaseJournal {
       return this.#entry(tx, op, "delivery_id", id);
     }, op.transactionOptions);
   }
+  /** Read-only identity of the current prefix, including empty decisions. */
+  async bookmark(options?: RebaseJournalOperationOptions): Promise<RebaseJournalBookmark> {
+    const op = operation(options);
+    return this.#target.transaction(async (tx) => {
+      const present = await ensure(tx, op, false);
+      const head = present ? await this.#head(tx, op, false) : { position: 0 };
+      const result = await this.#history(tx, op, { position: 0, sha256: null }, { position: head.position, sha256: null });
+      return result.throughBookmark;
+    }, op.transactionOptions);
+  }
+
+  /** One verified entry at a time: no copy of the whole retained wire history. */
+  async #history(tx: ChangesetExecutor, op: Operation, after: HistoryBoundary, through: HistoryBoundary, rebaser?: ChangesetRebaser) {
+    const encoder = new TextEncoder();
+    op.checkpoint();
+    // JSON arrays make bounded UTF-8 identities unambiguous. The versioned
+    // domain binds the journal; each next digest binds the COMPLETE prefix.
+    let current: RebaseJournalBookmark = Object.freeze({
+      format: BOOKMARK_FORMAT, journalId: this.#id, position: 0,
+      sha256: await hash(encoder.encode(JSON.stringify([BOOKMARK_FORMAT, this.#id]))),
+    });
+    op.checkpoint();
+    let afterBookmark = current;
+    if (after.position === 0) verifyBoundary(after, current);
+    for (let i = 1; i <= through.position; i++) {
+      const entry = await this.#entry(tx, op, "position", i);
+      if (entry === null) fail("MISSING", "A rebase decision is missing from the requested history");
+      if (entry.position !== i) fail("CORRUPT", "Journal returned the wrong history position");
+      const sha256 = await hash(encoder.encode(JSON.stringify([
+        BOOKMARK_FORMAT, current.sha256, i, entry.deliveryId, entry.messageSha256,
+        entry.messageBytes, entry.sha256, entry.rebaseInfo.length,
+      ])));
+      op.checkpoint();
+      current = Object.freeze({ format: BOOKMARK_FORMAT, journalId: this.#id, position: i, sha256 });
+      if (i === after.position) {
+        verifyBoundary(after, current);
+        afterBookmark = current;
+      }
+      if (i > after.position) rebaser?.configure(entry.rebaseInfo);
+    }
+    verifyBoundary(through, current);
+    op.checkpoint();
+    return { afterBookmark, throughBookmark: current };
+  }
+
   /** Rebase ORIGINAL local bytes over a complete range in one SQL snapshot. */
   async rebase(local: Uint8Array, options: RebaseJournalRangeOptions = {}): Promise<RebaseJournalResult> {
-    const after = position(options.after ?? 0), end = options.through;
-    const through = end === undefined ? undefined : position(end), op = operation(options);
+    const start = options.after, end = options.through;
+    const after = boundary(start === undefined ? 0 : start, this.#id);
+    const through = end === undefined ? undefined : boundary(end, this.#id), op = operation(options);
     const wire = owned(local, this.#policy.maxBytes);
     decodeChangeset(wire, this.#policy);
     return this.#target.transaction(async (tx) => {
       const present = await ensure(tx, op, false);
       const head = present ? await this.#head(tx, op, false) : { position: 0 };
-      const tip = through ?? head.position;
-      if (after > tip || tip > head.position) fail("MISSING", "Requested journal range is not available");
+      const tip = through ?? { position: head.position, sha256: null };
+      if (after.position > tip.position || tip.position > head.position) fail("MISSING", "Requested journal range is not available");
       const rebaser = new ChangesetRebaser(this.#policy);
-      for (let i = after + 1; i <= tip; i++) {
-        const entry = await this.#entry(tx, op, "position", i);
-        if (entry === null) fail("MISSING", "A rebase decision is missing from the requested range");
-        rebaser.configure(entry.rebaseInfo);
-      }
+      const bookmarks = await this.#history(tx, op, after, tip, rebaser);
       op.checkpoint();
       const changeset = rebaser.rebase(wire);
       op.checkpoint();
-      return Object.freeze({ journalId: this.#id, after, through: tip, changeset });
+      return Object.freeze({ journalId: this.#id, after: after.position, through: tip.position, changeset, ...bookmarks });
     }, op.transactionOptions);
   }
 }
