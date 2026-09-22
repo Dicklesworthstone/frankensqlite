@@ -50,10 +50,15 @@ export function validateManagedSql(sql: string, script = false): void {
  * Share the managed scanner so quotes, comments and opaque Tcl bind suffixes
  * cannot forge parentheses or statement boundaries. The prefix state machine
  * retains no token array and uses no recursion, including for nested CTEs.
+ * allowExplain also permits EXPLAIN [QUERY PLAN] of these SELECT statements;
+ * it never permits EXPLAIN PRAGMA or EXPLAIN of a writable CTE.
  */
-export function isSelectStatement(sql: string): boolean {
+export function isSelectStatement(sql: string, allowExplain = false): boolean {
   type State =
     | "start"
+    | "explain"
+    | "plan"
+    | "statement"
     | "with"
     | "name"
     | "after-name"
@@ -70,6 +75,13 @@ export function isSelectStatement(sql: string): boolean {
   let state: State = "start";
   let depth = 0;
   let selected = false;
+  const statement = (word: string): void => {
+    if (word === "WITH") state = "with";
+    else {
+      selected = word === "SELECT";
+      state = "done";
+    }
+  };
   const visit = (word: string, char: string): void => {
     const name = word !== "" || char === "'" || char === '"' || char === "`" || char === "[";
     switch (state) {
@@ -77,12 +89,18 @@ export function isSelectStatement(sql: string): boolean {
         return;
       case "start":
         if (char === ";") return;
-        if (word === "WITH") {
-          state = "with";
-          return;
-        }
-        selected = word === "SELECT";
-        state = "done";
+        if (allowExplain && word === "EXPLAIN") state = "explain";
+        else statement(word);
+        return;
+      case "explain":
+        if (word === "QUERY") state = "plan";
+        else statement(word);
+        return;
+      case "plan":
+        state = word === "PLAN" ? "statement" : "done";
+        return;
+      case "statement":
+        statement(word);
         return;
       case "with":
         if (word === "RECURSIVE") {

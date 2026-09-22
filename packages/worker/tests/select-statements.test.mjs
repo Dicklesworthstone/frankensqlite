@@ -147,3 +147,36 @@ test("shared scanner preserves managed trigger bodies, scripts and full prefligh
     db.close();
   }
 });
+
+for (const prefix of ["EXPLAIN ", "EXPLAIN /*a*/ QUERY /*b*/ PLAN "]) {
+  for (const [name, sql] of reads) {
+    test(`opt-in plan admission: ${prefix}${name}`, () => {
+      // Keep replay APIs SELECT-only unless their caller explicitly opts in.
+      assert.equal(isSelectStatement(prefix + sql.replace(/^\uFEFF;; /, "")), false);
+      assert.equal(isSelectStatement(prefix + sql.replace(/^\uFEFF;; /, ""), true), true);
+      const db = new DatabaseSync(":memory:");
+      try {
+        assert.ok(db.prepare(prefix + sql.replace(/^\uFEFF;; /, "")).all().length > 0);
+      } finally {
+        db.close();
+      }
+    });
+  }
+  for (const sql of [
+    "PRAGMA query_only=OFF", "UPDATE data SET n=1", "DELETE FROM data",
+    "WITH x AS (SELECT 1) DELETE FROM data", "WITH x AS (VALUES(1)) UPDATE data SET n=1",
+  ]) {
+    test(`never admit mutating EXPLAIN shape: ${prefix}${sql}`, () => {
+      assert.equal(isSelectStatement(prefix + sql, true), false);
+    });
+  }
+}
+for (const sql of [
+  "EXPLAIN", "EXPLAIN QUERY", "EXPLAIN QUERY PLAN", "EXPLAIN EXPLAIN SELECT 1",
+  "EXPLAIN QUERY SELECT 1", "EXPLAIN QUERY PLAN PRAGMA user_version=1",
+  "EXPLAIN QUERY PLAN EXPLAIN SELECT 1",
+]) {
+  test(`malformed plan prefix is not admitted: ${sql}`, () => {
+    assert.equal(isSelectStatement(sql, true), false);
+  });
+}

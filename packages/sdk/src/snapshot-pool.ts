@@ -1,9 +1,9 @@
 import type { QueryRequest } from "@frankensqlite/worker";
 import {
   createFrankenSqliteWorker,
+  isSelectStatement,
   RequestBudget,
   resolveResultEncoding,
-  validateManagedSql,
   validateSnapshotBytes,
 } from "@frankensqlite/worker";
 import { FrankenDB, observeDatabaseFailure } from "./database";
@@ -636,44 +636,13 @@ function timedOut(): FrankenPoolError {
 }
 
 function readOnlySql(sql: string): void {
-  validateManagedSql(sql);
-  let offset = 0;
-  const word = (): string => {
-    while (offset < sql.length) {
-      if (/[\s;\uFEFF]/.test(sql[offset]!)) {
-        offset++;
-        continue;
-      }
-      if (sql.startsWith("--", offset)) {
-        const end = sql.indexOf("\n", offset + 2);
-        offset = end < 0 ? sql.length : end + 1;
-        continue;
-      }
-      if (sql.startsWith("/*", offset)) {
-        const end = sql.indexOf("*/", offset + 2);
-        offset = end < 0 ? sql.length : end + 2;
-        continue;
-      }
-      break;
-    }
-    const token = /^[A-Za-z]+/.exec(sql.slice(offset))?.[0] ?? "";
-    offset += token.length;
-    return token.toUpperCase();
-  };
-  let first = word();
-  if (first === "EXPLAIN") {
-    first = word();
-    if (first === "QUERY") {
-      first = word() === "PLAN" ? word() : "";
-    }
-  }
   // PRAGMA may take effect during preparation even under EXPLAIN. Never admit
-  // it, ATTACH, maintenance, scripts or transaction controls. WITH may contain
-  // DML, so the verified engine query_only guard remains authoritative as well.
-  if (first !== "SELECT" && first !== "WITH") {
+  // it or CTE-backed writes to a replica. Keep verified engine query_only as
+  // defense in depth; lexical classification is not an SQL sandbox.
+  if (!isSelectStatement(sql, true)) {
     throw new FrankenPoolError(
       "ERR_FSQLITE_POOL_READ_ONLY",
-      "Snapshot pools accept SELECT, WITH, and their EXPLAIN forms only",
+      "Snapshot pools are readonly: use SELECT (optionally with CTEs) or its EXPLAIN forms",
     );
   }
 }

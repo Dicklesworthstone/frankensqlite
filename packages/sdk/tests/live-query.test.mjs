@@ -353,7 +353,11 @@ test(
     const before = f.worker.requests.length;
     for (const sql of [
       "INSERT INTO items VALUES(1,'write') RETURNING id",
-      "WITH x AS (SELECT 1) SELECT * FROM x",
+      "WITH x AS (SELECT 1) INSERT INTO items VALUES(1,'write') RETURNING id",
+      "WITH x AS (SELECT 1) UPDATE items SET value='write' RETURNING id",
+      "WITH x AS (SELECT 1) DELETE FROM items RETURNING id",
+      "WITH x AS (SELECT 1) SELECT * FROM x; DELETE FROM items",
+      "EXPLAIN SELECT * FROM items",
       "PRAGMA user_version=42",
       "DELETE FROM items",
       "SELECT 1; DELETE FROM items",
@@ -486,3 +490,51 @@ test(
     assert.equal(f.reads(), 2);
   },
 );
+
+test("recursive CTE watches capture bindings and requery base-table changes", options, async (t) => {
+  const f = await fixture(t);
+  await f.queue.transaction((tx) => tx.executeBatch(
+    "INSERT INTO items VALUES(1,'first'),(2,'second'),(3,'third');",
+  ));
+  const sql = `WITH RECURSIVE ids(n) AS (
+    SELECT :low UNION ALL SELECT n+1 FROM ids WHERE n<:high
+  ), picked AS MATERIALIZED (
+    SELECT items.id, items.value FROM items JOIN ids ON items.id=ids.n
+  ) SELECT id,value FROM picked ORDER BY id`;
+  const params = { low: 1, high: 2 };
+  const opening = f.watch(sql, { params });
+  params.high = 1;
+  const live = await opening;
+  assert.deepEqual(live.tables, ["items"]);
+  assert.equal(f.reads(sql), 0);
+  assert.deepEqual(rows(await live.next()), [[1, "first"], [2, "second"]]);
+  const next = live.next();
+  await f.queue.transaction((tx) => tx.execute("UPDATE items SET value='changed' WHERE id=2"));
+  assert.deepEqual(rows(await next), [[1, "first"], [2, "changed"]]);
+  assert.equal(f.reads(sql), 2);
+  await live.return();
+  await live.done;
+  assert.equal(f.queue.stats.subscriptions, 0);
+});
+
+test("nested CTE aggregates observe explicit dependencies without replaying rollbacks", options, async (t) => {
+  const f = await fixture(t);
+  const sql = `WITH totals AS NOT MATERIALIZED (
+    WITH counts(n) AS (SELECT count(*) FROM items UNION ALL SELECT count(*) FROM other)
+    SELECT sum(n) AS n FROM counts
+  ) SELECT n FROM totals`;
+  const live = await f.watch(sql, { tables: ["items", "other"] });
+  assert.deepEqual(rows(await live.next()), [[0]]);
+  const next = observe(live.next());
+  await assert.rejects(f.queue.transaction(async (tx) => {
+    await tx.execute("INSERT INTO other VALUES(1)");
+    throw Error("rollback CTE dependency");
+  }), /rollback CTE dependency/);
+  await delay(10);
+  assert.equal(next.outcome.status, "pending");
+  assert.equal(f.reads(sql), 1);
+  await f.queue.transaction((tx) => tx.execute("INSERT INTO other VALUES(2)"));
+  await next.settled;
+  assert.deepEqual(rows(next.outcome.value), [[1]]);
+  assert.equal(f.reads(sql), 2);
+});

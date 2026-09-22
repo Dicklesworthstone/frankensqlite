@@ -1,12 +1,12 @@
 import type { QueryRequest } from "@frankensqlite/worker";
-import { RequestBudget, validateManagedSql } from "@frankensqlite/worker";
+import { isSelectStatement, RequestBudget } from "@frankensqlite/worker";
 import { FrankenSQLiteError } from "./errors";
 import type { FrankenDBQueue, QueuedJobOptions } from "./queue";
 import type { TableSubscription } from "./subscriptions";
 import type { QueryResult, SqlBindings } from "./types";
 
 export interface LiveQueryOptions extends QueuedJobOptions {
-  /** Explicit ordinary main-table dependencies, including tables behind views. */
+  /** Explicit main-table dependencies, including tables behind views and CTEs. */
   tables: readonly string[];
   params?: SqlBindings;
   /** Captured SQL/parameter accounting, 256 bytes..64 MiB; default 1 MiB. */
@@ -36,24 +36,9 @@ function invalid(message: string): FrankenSQLiteError {
 }
 
 function selectOnly(sql: string): void {
-  validateManagedSql(sql);
-  let offset = 0;
-  while (offset < sql.length) {
-    if (/[\t\n\v\f\r \uFEFF;]/.test(sql[offset]!)) {
-      offset++;
-      continue;
-    }
-    if (sql.startsWith("--", offset)) {
-      const end = sql.indexOf("\n", offset + 2);
-      offset = end < 0 ? sql.length : end + 1;
-    } else if (sql.startsWith("/*", offset)) {
-      const end = sql.indexOf("*/", offset + 2);
-      offset = end < 0 ? sql.length : end + 2;
-    } else break;
-  }
-  if (!/^SELECT(?:$|[^A-Za-z0-9_$\u0080-\uFFFF])/i.test(sql.slice(offset))) {
+  if (!isSelectStatement(sql)) {
     throw invalid(
-      "Live queries require one SELECT; scripts, WITH, PRAGMA and writes are not replayed",
+      "Live queries require one SELECT, optionally with CTEs; scripts, PRAGMA and writes are not replayed",
     );
   }
 }
