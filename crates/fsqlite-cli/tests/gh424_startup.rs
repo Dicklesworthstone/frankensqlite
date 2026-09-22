@@ -5,6 +5,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,20 +30,34 @@ impl Drop for ReapOnDrop {
 
 fn assert_prompt_piped_select(file_backed: bool) {
     let dir = tempfile::tempdir().expect("create isolated shell working directory");
-    let stdout_path = dir.path().join("stdout.txt");
-    let stderr_path = dir.path().join("stderr.txt");
+    let db = file_backed.then_some("startup.db");
+    assert_prompt_piped_run(dir.path(), db, b"select 1 a\n", "1\n", STARTUP_BUDGET);
+}
+
+/// Pipe `input` into the real shell (optionally opening `db` inside `dir`)
+/// and require it to print `expected` and exit within `budget`.
+fn assert_prompt_piped_run(
+    dir: &Path,
+    db: Option<&str>,
+    input: &[u8],
+    expected: &str,
+    budget: Duration,
+) {
+    let file_backed = db.is_some();
+    let stdout_path = dir.join("stdout.txt");
+    let stderr_path = dir.join("stderr.txt");
     let stdout = File::create(&stdout_path).expect("create stdout capture");
     let stderr = File::create(&stderr_path).expect("create stderr capture");
     let mut command = Command::new(env!("CARGO_BIN_EXE_fsqlite"));
     command
-        .current_dir(dir.path())
+        .current_dir(dir)
         .stdin(Stdio::piped())
         // Files cannot fill a pipe buffer and deadlock the child while the
         // parent polls its status. Keep stdout/stderr for timeout diagnostics.
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    if file_backed {
-        command.arg("startup.db");
+    if let Some(db) = db {
+        command.arg(db);
     }
     // Exercise ordinary defaults, not the invoking developer's opt-in
     // instrumentation, fault injection, or metrics-listener configuration.
@@ -63,7 +78,7 @@ fn assert_prompt_piped_select(file_backed: bool) {
     let mut child = ReapOnDrop(command.spawn().expect("spawn the real fsqlite binary"));
     {
         let mut stdin = child.0.stdin.take().expect("child stdin is piped");
-        stdin.write_all(b"select 1 a\n").expect("pipe SELECT");
+        stdin.write_all(input).expect("pipe SQL");
         // Dropping this sole writer delivers EOF on Windows as well as Unix.
     }
 
@@ -73,12 +88,12 @@ fn assert_prompt_piped_select(file_backed: bool) {
             break (status, started.elapsed());
         }
         let elapsed = started.elapsed();
-        if elapsed >= STARTUP_BUDGET {
+        if elapsed >= budget {
             timed_out = true;
             child.0.kill().expect("terminate a stalled shell");
             break (child.0.wait().expect("reap a stalled shell"), elapsed);
         }
-        thread::sleep(POLL_INTERVAL.min(STARTUP_BUDGET.saturating_sub(elapsed)));
+        thread::sleep(POLL_INTERVAL.min(budget.saturating_sub(elapsed)));
     };
     // Release the Command's inherited capture handles before reading/removing
     // the captures, including on Windows.
@@ -87,13 +102,16 @@ fn assert_prompt_piped_select(file_backed: bool) {
     let stderr = fs::read_to_string(&stderr_path).expect("read shell stderr");
 
     assert!(
-        !timed_out && elapsed < STARTUP_BUDGET,
-        "GH#424: piped SELECT exceeded {STARTUP_BUDGET:?}; \
+        !timed_out && elapsed < budget,
+        "GH#424: piped SQL exceeded {budget:?}; \
          file_backed={file_backed}, elapsed={elapsed:?}, status={status}, \
          stdout={stdout:?}, stderr={stderr:?}"
     );
-    assert!(status.success(), "shell failed: {status}; stderr={stderr:?}");
-    assert_eq!(stdout.replace("\r\n", "\n"), "1\n");
+    assert!(
+        status.success(),
+        "shell failed: {status}; stderr={stderr:?}"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
     assert!(stderr.is_empty(), "unexpected shell stderr: {stderr:?}");
 }
 
@@ -105,4 +123,29 @@ fn gh424_memory_piped_select_exits_promptly() {
 #[test]
 fn gh424_file_piped_select_exits_promptly() {
     assert_prompt_piped_select(true);
+}
+
+/// A file that already holds a table starts the per-database WriteCoordinator;
+/// closing the last connection then drained its region with a synchronous
+/// spin on the CLI's single runtime thread, the only thread able to let the
+/// coordinator exit. Every such invocation hung at exit (v0.4.4, bd-viyz2).
+/// The budget is generous because the defect is an unbounded hang.
+#[test]
+fn file_backed_write_then_read_exits_promptly() {
+    const EXIT_BUDGET: Duration = Duration::from_secs(20);
+    let dir = tempfile::tempdir().expect("create isolated shell working directory");
+    assert_prompt_piped_run(
+        dir.path(),
+        Some("existing.db"),
+        b"create table t(x);\ninsert into t values(41);\n",
+        "",
+        EXIT_BUDGET,
+    );
+    assert_prompt_piped_run(
+        dir.path(),
+        Some("existing.db"),
+        b"select x + 1 from t\n",
+        "42\n",
+        EXIT_BUDGET,
+    );
 }

@@ -299,22 +299,33 @@ impl ScalarFunction for TanhFunc {
 
 // ── Rounding ──────────────────────────────────────────────────────────────
 //
-// ceil/floor/trunc preserve INTEGER type for INTEGER input.
+// ceil/floor/trunc preserve INTEGER type after SQLite numeric conversion.
+
+/// Parse integer text before floating-point conversion so rounding preserves
+/// exact i64 values. Decimal/exponent text keeps the existing REAL path.
+fn rounding_math(value: &SqliteValue, round: fn(f64) -> f64) -> Result<SqliteValue> {
+    let integer = match value {
+        SqliteValue::Integer(integer) => Some(*integer),
+        SqliteValue::Text(text) => text
+            .trim_matches(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}'))
+            .parse::<i64>()
+            .ok(),
+        _ => None,
+    };
+    if let Some(integer) = integer {
+        return Ok(SqliteValue::Integer(integer));
+    }
+    let Some(value) = to_f64(value) else {
+        return Ok(SqliteValue::Null);
+    };
+    Ok(wrap(round(value)))
+}
 
 pub struct CeilFunc;
 
 impl ScalarFunction for CeilFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        match &args[0] {
-            SqliteValue::Null => Ok(SqliteValue::Null),
-            SqliteValue::Integer(i) => Ok(SqliteValue::Integer(*i)),
-            other => {
-                let Some(x) = to_f64(other) else {
-                    return Ok(SqliteValue::Null);
-                };
-                Ok(wrap(x.ceil()))
-            }
-        }
+        rounding_math(&args[0], f64::ceil)
     }
 
     fn num_args(&self) -> i32 {
@@ -330,16 +341,7 @@ pub struct FloorFunc;
 
 impl ScalarFunction for FloorFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        match &args[0] {
-            SqliteValue::Null => Ok(SqliteValue::Null),
-            SqliteValue::Integer(i) => Ok(SqliteValue::Integer(*i)),
-            other => {
-                let Some(x) = to_f64(other) else {
-                    return Ok(SqliteValue::Null);
-                };
-                Ok(wrap(x.floor()))
-            }
-        }
+        rounding_math(&args[0], f64::floor)
     }
 
     fn num_args(&self) -> i32 {
@@ -355,16 +357,7 @@ pub struct TruncFunc;
 
 impl ScalarFunction for TruncFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        match &args[0] {
-            SqliteValue::Null => Ok(SqliteValue::Null),
-            SqliteValue::Integer(i) => Ok(SqliteValue::Integer(*i)),
-            other => {
-                let Some(x) = to_f64(other) else {
-                    return Ok(SqliteValue::Null);
-                };
-                Ok(wrap(x.trunc()))
-            }
-        }
+        rounding_math(&args[0], f64::trunc)
     }
 
     fn num_args(&self) -> i32 {
@@ -841,6 +834,127 @@ mod tests {
     }
 
     // ── Rounding ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rounding_integer_text_preserves_exact_i64() {
+        let functions: [&dyn ScalarFunction; 3] = [&CeilFunc, &FloorFunc, &TruncFunc];
+        let cases = [
+            ("0", 0),
+            ("-0", 0),
+            ("+0", 0),
+            ("42", 42),
+            ("+00042", 42),
+            ("-00042", -42),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("+9007199254740993", 9_007_199_254_740_993),
+            ("-9007199254740993", -9_007_199_254_740_993),
+            ("9223372036854775807", i64::MAX),
+            ("+9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+        ];
+        for function in functions {
+            for expected in [i64::MIN, i64::MAX] {
+                let value = SqliteValue::Integer(expected);
+                let result = function.invoke(std::slice::from_ref(&value)).unwrap();
+                assert!(matches!(&result, SqliteValue::Integer(_)));
+                assert_eq!(result, value, "{}({expected})", function.name());
+            }
+            for (input, expected) in cases {
+                let value = SqliteValue::Text(input.into());
+                let result = function.invoke(&[value]).unwrap();
+                assert!(matches!(&result, SqliteValue::Integer(_)));
+                assert_eq!(
+                    result,
+                    SqliteValue::Integer(expected),
+                    "{}({input:?})",
+                    function.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rounding_integer_text_accepts_sqlite_ascii_whitespace() {
+        let functions: [&dyn ScalarFunction; 3] = [&CeilFunc, &FloorFunc, &TruncFunc];
+        for function in functions {
+            for space in [' ', '\t', '\n', '\r', '\u{000b}', '\u{000c}'] {
+                let input = format!("{space}+9007199254740993{space}");
+                let value = SqliteValue::Text(input.into());
+                let result = function.invoke(&[value]).unwrap();
+                assert!(matches!(&result, SqliteValue::Integer(_)));
+                assert_eq!(
+                    result,
+                    SqliteValue::Integer(9_007_199_254_740_993),
+                    "{} with whitespace {space:?}",
+                    function.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rounding_integer_text_shortcut_preserves_fallback_types() {
+        let functions: [&dyn ScalarFunction; 3] = [&CeilFunc, &FloorFunc, &TruncFunc];
+        let real_cases = [
+            (SqliteValue::Float(42.0), 42.0),
+            (SqliteValue::Text("42.0".into()), 42.0),
+            (SqliteValue::Text("+42.0".into()), 42.0),
+            (SqliteValue::Text("42e0".into()), 42.0),
+            (
+                SqliteValue::Text("9223372036854775808".into()),
+                9_223_372_036_854_775_808.0,
+            ),
+            (
+                SqliteValue::Text("-9223372036854775809".into()),
+                -9_223_372_036_854_775_808.0,
+            ),
+        ];
+        let null_cases = [
+            SqliteValue::Null,
+            SqliteValue::Text("".into()),
+            SqliteValue::Text("42tail".into()),
+            SqliteValue::Text("+ 42".into()),
+            SqliteValue::Blob(vec![b'4', b'2'].into()),
+            SqliteValue::Float(f64::NAN),
+        ];
+        for function in functions {
+            for (input, expected) in &real_cases {
+                let result = function.invoke(std::slice::from_ref(input)).unwrap();
+                assert!(matches!(&result, SqliteValue::Float(_)));
+                assert_eq!(
+                    result,
+                    SqliteValue::Float(*expected),
+                    "{}({input:?})",
+                    function.name()
+                );
+            }
+            for input in &null_cases {
+                assert_eq!(
+                    function.invoke(std::slice::from_ref(input)).unwrap(),
+                    SqliteValue::Null,
+                    "{}({input:?})",
+                    function.name()
+                );
+            }
+            for input in [
+                SqliteValue::Float(-0.0),
+                SqliteValue::Text("-0.0".into()),
+                SqliteValue::Text("-0e0".into()),
+            ] {
+                let SqliteValue::Float(value) =
+                    function.invoke(std::slice::from_ref(&input)).unwrap()
+                else {
+                    panic!("{}({input:?}) must remain REAL", function.name());
+                };
+                assert_eq!(
+                    value.to_bits(),
+                    (-0.0_f64).to_bits(),
+                    "{}({input:?})",
+                    function.name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_ceil_real() {

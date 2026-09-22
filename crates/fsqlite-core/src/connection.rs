@@ -341,6 +341,39 @@ struct BeginBusyRetryHandoff {
     next_attempt: u32,
 }
 
+/// GH#423: one `busy_timeout` budget per statement, shared by the autocommit
+/// statement retry and the BEGIN admission loop nested inside it.
+///
+/// Each loop used to start its own clock, so a contended `BEGIN IMMEDIATE`
+/// spent the whole budget in admission and was then re-run by the statement
+/// retry for a second full budget (2.00x at every timeout, since 2cce5f3d8).
+/// The budget starts at the statement's FIRST wait, not at statement start,
+/// so a long statement that meets a transient late still gets a full budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BusyBudgetScope {
+    /// No statement retry is armed; every wait loop owns its own budget.
+    #[default]
+    Inactive,
+    /// A statement retry is armed and nothing has waited yet.
+    Armed,
+    /// The statement's first wait began here; later waits count from it.
+    Started(Instant),
+}
+
+/// Disarms the statement's shared busy budget when the arming scope ends.
+struct BusyBudgetScopeGuard<'a> {
+    scope: &'a Cell<BusyBudgetScope>,
+    owner: bool,
+}
+
+impl Drop for BusyBudgetScopeGuard<'_> {
+    fn drop(&mut self) {
+        if self.owner {
+            self.scope.set(BusyBudgetScope::Inactive);
+        }
+    }
+}
+
 impl BeginBusyRetryHandoff {
     fn next_wait(&mut self, started: Instant, deadline: Duration) -> Option<BeginBusyRetryWait> {
         if deadline.is_zero() || started.elapsed() >= deadline {
@@ -13409,6 +13442,8 @@ pub struct Connection {
     /// (`PRAGMA fsqlite.retry_slo_ms = <n>` to opt in). See
     /// `connection/conformal_retry.rs` for the coverage proof sketch.
     conformal_retry_budget: ConformalRetryBudgetCell,
+    /// GH#423: the current statement's shared `busy_timeout` budget.
+    busy_budget_scope: Cell<BusyBudgetScope>,
     // ── AAC-P6: Regenerative-renewal statement micro-batcher ────────────────
     /// PRAGMA fsqlite.stmt_microbatch — enable/disable the renewal-amortization
     /// ceremony coalescer for consecutive identical prepared-statement
@@ -14813,6 +14848,7 @@ impl Connection {
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
+            busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
             // 16-row burst budget, 200 µs staleness deadline.
             stmt_microbatch_enabled: Cell::new(true),
@@ -15366,6 +15402,7 @@ impl Connection {
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
+            busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
             // 16-row burst budget, 200 µs staleness deadline.
             stmt_microbatch_enabled: Cell::new(true),
@@ -24920,7 +24957,7 @@ impl Connection {
 
         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
         let deadline = Duration::from_millis(busy_timeout_ms);
-        let started = Instant::now();
+        let started = self.busy_budget_start();
         let mut handoff = BeginBusyRetryHandoff::default();
 
         while let Some(wait) = handoff.next_wait(started, deadline) {
@@ -24951,6 +24988,33 @@ impl Connection {
             "transaction lock admission remained busy through busy_timeout",
             last_was_recovery,
         ))
+    }
+
+    /// Arm the shared busy budget for one statement (GH#423). A nested arming
+    /// inside an already-armed statement leaves the outer scope in charge.
+    fn arm_busy_budget_scope(&self) -> BusyBudgetScopeGuard<'_> {
+        let owner = self.busy_budget_scope.get() == BusyBudgetScope::Inactive;
+        if owner {
+            self.busy_budget_scope.set(BusyBudgetScope::Armed);
+        }
+        BusyBudgetScopeGuard {
+            scope: &self.busy_budget_scope,
+            owner,
+        }
+    }
+
+    /// Start of the `busy_timeout` budget for a wait loop that begins now:
+    /// the armed statement's first wait if there is one, otherwise now.
+    fn busy_budget_start(&self) -> Instant {
+        match self.busy_budget_scope.get() {
+            BusyBudgetScope::Inactive => Instant::now(),
+            BusyBudgetScope::Armed => {
+                let now = Instant::now();
+                self.busy_budget_scope.set(BusyBudgetScope::Started(now));
+                now
+            }
+            BusyBudgetScope::Started(started) => started,
+        }
     }
 
     fn strict_multi_process_busy_refusal(
@@ -25438,6 +25502,9 @@ impl Connection {
             }
         }
 
+        self._shared_mvcc_state
+            .stop_write_coordinator_before_last_release()
+            .await;
         if best_effort {
             let _ = self
                 ._shared_mvcc_state
@@ -37035,6 +37102,9 @@ impl Connection {
                     | Statement::Drop(_)
                     | Statement::AlterTable(_)
             ) && self.autocommit_conflict_retry_boundary();
+            // GH#423: BEGIN admission inside this statement and the retry
+            // below draw on one busy_timeout budget.
+            let _busy_budget_scope = autocommit_retry_entry.then(|| self.arm_busy_budget_scope());
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
                 .await;
@@ -37061,7 +37131,7 @@ impl Connection {
             // without a second attempt.
             let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
             let deadline = Duration::from_millis(busy_timeout_ms);
-            let started = Instant::now();
+            let started = self.busy_budget_start();
             let mut handoff = BeginBusyRetryHandoff::default();
             while let Some(wait) = handoff.next_wait(started, deadline) {
                 if !self
@@ -74111,7 +74181,14 @@ impl Connection {
                 )?;
 
                 let page = txn.get_page(cx, trunk_page).await?;
-                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(
+                // Parse only the usable prefix: a trunk whose leaf list runs
+                // into the reserved trailer is corrupt to stock SQLite
+                // ("freelist leaf count too big"), so it must be here too.
+                let usable = usize::try_from(page_size.usable(reserved_per_page))
+                    .unwrap_or(usize::MAX)
+                    .min(page.as_ref().len());
+                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(&page.as_ref()[..usable])
+                    .map_err(
                     |err| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "freelist trunk page {} is malformed: {err}",
@@ -113197,6 +113274,37 @@ impl SharedMvccState {
                     lock_unpoisoned(state_map).remove(&state.key);
                 }
             }
+        }
+    }
+
+    /// Stop the database's WriteCoordinator before the last connection's
+    /// synchronous region drain, waiting for it cooperatively.
+    ///
+    /// `release_connection` drains the root region by spinning until its task
+    /// count reaches zero. The coordinator only exits once it is polled after
+    /// its shutdown sender drops, and on a current-thread runtime the only
+    /// thread that can poll it is the one closing the connection, so that spin
+    /// never ended: every file-backed `fsqlite` CLI invocation hung at exit
+    /// (bd-viyz2). Yielding here lets the caller's executor run the coordinator
+    /// to completion first, and the drain then finds its region already empty.
+    /// Quiescence is still awaited in full; nothing is abandoned or timed out.
+    async fn stop_write_coordinator_before_last_release(&self) {
+        let region = {
+            let mut state = lock_unpoisoned(&self.runtime_state);
+            if state.open_connections != 1 || state.write_coordinator_shutdown.is_none() {
+                return;
+            }
+            state.write_coordinator_service_starting = false;
+            state.write_coordinator_service_running = false;
+            let _ = state.write_coordinator_shutdown.take();
+            state.write_coordinator_region
+        };
+        while lock_unpoisoned(&self.runtime_state)
+            .regions
+            .active_tasks(region)
+            > 0
+        {
+            asupersync::runtime::yield_now().await;
         }
     }
 

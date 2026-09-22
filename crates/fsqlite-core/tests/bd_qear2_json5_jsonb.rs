@@ -6,7 +6,7 @@
 //! Tested via round-trip through json()/json_extract (JSONB bytes are opaque, so
 //! we compare the re-textified result vs rusqlite). If frank routes jsonb via
 //! the (already-lenient) json_arg_value choke point, JSON5 works for free.
-//! Non-finite (+Infinity/-Infinity/NaN) remains a documented follow-up.
+//! Non-finite Infinity/-Infinity values and NaN are included in these round-trips.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -53,6 +53,18 @@ fn json5_jsonb_functions_bd_qear2() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
 
         let exprs = [
+            // Non-finite values must survive the JSON5 -> value -> JSONB path.
+            "SELECT json(jsonb('Infinity'))",
+            "SELECT json(jsonb('-Infinity'))",
+            "SELECT json(jsonb('NaN'))",
+            "SELECT json(jsonb('{a:[Infinity,{b:-Infinity},NaN]}'))",
+            "SELECT json_extract(jsonb('{a:Infinity}'),'$.a')",
+            "SELECT json_extract(jsonb('{a:-Infinity}'),'$.a')",
+            "SELECT json_type(jsonb('{a:Infinity}'),'$.a')",
+            "SELECT json_type(jsonb('{a:NaN}'),'$.a')",
+            "SELECT json(jsonb_set(jsonb('{keep:Infinity}'),'$.added',1))",
+            "SELECT json(jsonb_remove(jsonb('{keep:-Infinity,other:0}'),'$.other'))",
+            "SELECT json(jsonb('{\"Infinity\":\"Infinity\",\"NaN\":\"NaN\",v:Infinity}'))",
             // jsonb(JSON5) round-tripped back to text via json()
             "SELECT json(jsonb('{a:1, b:2}'))",
             "SELECT json(jsonb('[1, 2, 3,]'))",

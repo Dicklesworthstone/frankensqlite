@@ -6,8 +6,8 @@
 //! standard JSON, matching stock SQLite 3.42+. Covers the common JSON5 features
 //! (unquoted keys, single-quoted strings, trailing commas, // and /* */
 //! comments, hex integers, leading/trailing decimal points) plus standard-JSON
-//! regression guards. Non-finite (+Infinity/-Infinity/NaN) is a documented
-//! follow-up and NOT asserted here. Oracle = rusqlite (bundled SQLite).
+//! regression guards, including lexical Infinity/NaN translation.
+//! Oracle = rusqlite (bundled SQLite).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -42,6 +42,13 @@ fn json_func_accepts_json5_bd_qear2() {
             "SELECT json('{\"a\": 1, \"b\": [2, 3]}')",
             "SELECT json('  [ 1 , 2.50 , \"x\" ] ')",
             "SELECT json('{\"e\": 1e3}')",
+            // The text-only path keeps its lexical non-finite translation.
+            "SELECT json('Infinity')",
+            "SELECT json('+Infinity')",
+            "SELECT json('-Infinity')",
+            "SELECT json('NaN')",
+            "SELECT json('{p:Infinity,n:-Infinity,a:NaN}')",
+            "SELECT json('{x:\"Infinity\",y:\"NaN\"}')",
             // JSON5: unquoted keys + trailing comma
             "SELECT json('{a:1, b:2}')",
             "SELECT json('{a:1, b:2,}')",

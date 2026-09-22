@@ -6,7 +6,7 @@
 //! json_type, json_each, json_tree — accept JSON5 input (unquoted keys, single
 //! quotes, trailing commas, comments, hex) and behave as if it were the
 //! canonicalized standard JSON, matching stock SQLite 3.42+. Non-finite
-//! (+Infinity/-Infinity/NaN) is a documented follow-up and not asserted here.
+//! Infinity/-Infinity values retain their numeric type; NaN becomes NULL.
 //! Oracle = rusqlite.
 
 use fsqlite_core::connection::{Connection, Row};
@@ -66,6 +66,30 @@ fn json5_read_functions_bd_qear2() {
         let r = rusqlite::Connection::open_in_memory().unwrap();
 
         let queries = [
+            // Non-finite JSON5 numbers must survive value deserialization.
+            "SELECT json_extract('Infinity','$')",
+            "SELECT json_extract('+Infinity','$')",
+            "SELECT json_extract('-Infinity','$')",
+            "SELECT json_extract('NaN','$')",
+            "SELECT json_type('[Infinity,-Infinity,NaN]','$[0]'), json_type('[Infinity,-Infinity,NaN]','$[1]'), json_type('[Infinity,-Infinity,NaN]','$[2]')",
+            "SELECT json_extract('{a:[Infinity,{b:-Infinity},NaN]}','$.a[0]','$.a[1].b','$.a[2]')",
+            "SELECT key,value,type,atom FROM json_each('[Infinity,-Infinity,NaN,\"Infinity\"]')",
+            "SELECT fullkey,value,type,atom FROM json_tree('{a:[Infinity,-Infinity,NaN]}') WHERE type NOT IN ('object','array')",
+            "SELECT json_set('{keep:Infinity,nan:NaN}','$.added',1)",
+            "SELECT json_insert('{keep:-Infinity}','$.added',2)",
+            "SELECT json_replace('{keep:Infinity,other:0}','$.other',3)",
+            "SELECT json_remove('{keep:Infinity,other:0}','$.other')",
+            "SELECT json_patch('{keep:Infinity,removed:1}','{removed:NaN}')",
+            "SELECT json_pretty('{keep:Infinity,nan:NaN}') = json_pretty('{\"keep\":9e999,\"nan\":null}')",
+            // Identifier keys and quoted/escaped strings remain ordinary text.
+            "SELECT json_extract('{\"Infinity\":7,\"NaN\":\"kept\",v:Infinity}','$.Infinity','$.NaN'), json_type('{\"Infinity\":7,\"NaN\":\"kept\",v:Infinity}','$.v')",
+            r#"SELECT json_extract('{a:"Infinity",b:"-Infinity",c:"NaN",d:"Infini\u0074y"}','$.a','$.b','$.c','$.d')"#,
+            "SELECT json_extract('{v:/* Infinity */-Infinity,s:''NaN''}','$.v'), json_extract('{v:/* Infinity */-Infinity,s:''NaN''}','$.s')",
+            // The custom value visitor must preserve ordinary numeric variants.
+            "SELECT json_type('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.u'), json_type('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.i'), json_type('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.z')",
+            "SELECT json_extract('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.u'), json_extract('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.i'), json_extract('{u:18446744073709551615,i:-9223372036854775808,z:-0.0}','$.z')",
+            "SELECT json_valid('Infinity'), json_valid('Infinity',2), json_valid('NaN',2)",
+            "SELECT json_extract('[Infinity,,NaN]','$')",
             // json_extract on JSON5
             "SELECT json_extract('{a:1}','$.a')",
             "SELECT json_extract('{a:{b:2}}','$.a.b')",

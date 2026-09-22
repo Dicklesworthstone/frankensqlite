@@ -7829,6 +7829,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     /// Page size for this database.
     page_size: PageSize,
+    /// Bytes reserved at the end of every page (database header byte 20).
+    /// Freelist trunk capacity derives from the usable size, not the page
+    /// size, or trunks overflow into the reserved trailer.
+    reserved_per_page: u8,
     /// Current database size in pages.
     db_size: u32,
     /// Next page to allocate (1-based).
@@ -9851,13 +9855,17 @@ impl<F: VfsFile> PagerInner<F> {
             // names them so the next commit republishes a clean chain.
             let dropped = u32::try_from(freelist.len())
                 .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
-            Ok((db_size, freelist, dropped))
+            Ok((db_size, freelist, dropped, header.reserved_per_page))
         })
         .await;
-        let (db_size, freelist, freelist_entries_dropped) = match full_refresh_result {
-            Ok(refreshed) => refreshed,
-            Err(err) => return Err(err),
-        };
+        let (db_size, freelist, freelist_entries_dropped, reserved_per_page) =
+            match full_refresh_result {
+                Ok(refreshed) => refreshed,
+                Err(err) => return Err(err),
+            };
+        // The committed page 1 is authoritative for the reserved-byte count;
+        // an open that bootstrapped from a stale main-file stub learns it here.
+        self.reserved_per_page = reserved_per_page;
         if freelist_entries_dropped > 0 && !self.access_mode.is_readonly() {
             self.freelist_repair_pending = true;
             self.freelist_repair_dropped = freelist_entries_dropped;
@@ -10537,6 +10545,17 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     Ok(normalize_freelist(&out, db_size, inner.page_size))
 }
 
+/// Leaf entries one freelist trunk page may hold when this pager writes it:
+/// `usable_size / 4 - 2`, the bound stock SQLite enforces in
+/// `allocateBtreePage` and `PRAGMA integrity_check` ("freelist leaf count too
+/// big"). The commit-time serializer and the predicted commit surface must
+/// both use it, or they disagree on which pages become trunks.
+fn freelist_trunk_leaf_capacity(page_size: PageSize, reserved_per_page: u8) -> usize {
+    (page_size.usable(reserved_per_page) as usize / 4)
+        .saturating_sub(2)
+        .max(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
@@ -10589,13 +10608,12 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         .filter(|page| page.get() <= committed_db_size)
         .collect();
 
-    let ps = inner.page_size.as_usize();
+    let max_leaf_entries = freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
     let total_free = durable_freelist.len() as u32;
 
     let (first_trunk, trunk_pages) = if durable_freelist.is_empty() {
         (0u32, Vec::<u32>::new())
     } else {
-        let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
         let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
         let trunks: Vec<u32> = durable_freelist
             .iter()
@@ -10607,7 +10625,6 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
 
     if !trunk_pages.is_empty() {
         let mut leaf_index = trunk_pages.len();
-        let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
 
         for (idx, trunk_pg) in trunk_pages.iter().enumerate() {
             let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
@@ -18720,6 +18737,7 @@ where
         };
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        let reserved_per_page = header.reserved_per_page;
         let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
         let freelist_count = freelist.len();
         let open_freelist_entries_dropped = u32::try_from(freelist_count)
@@ -18747,6 +18765,7 @@ where
                 #[cfg(all(feature = "native", any(unix, windows)))]
                 namespace_binding: inner_namespace_binding,
                 page_size,
+                reserved_per_page,
                 db_size,
                 next_page,
                 writer_active: false,
@@ -19155,6 +19174,9 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(
             header.as_ref().map_or(0, |header| header.change_counter),
         ));
+        // Raw header byte 20 also covers the stale-stub bootstrap (no parsed
+        // header); the first committed-state refresh replaces it regardless.
+        let reserved_per_page = header_bytes[20];
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -19178,6 +19200,7 @@ where
                 #[cfg(all(feature = "native", any(unix, windows)))]
                 namespace_binding: inner_namespace_binding,
                 page_size,
+                reserved_per_page,
                 db_size,
                 next_page,
                 writer_active: false,
@@ -21574,7 +21597,8 @@ where
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
 
         if freelist_dirty && !durable_freelist.is_empty() {
-            let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
+            let max_leaf_entries =
+                freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
             let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
             pages.extend(durable_freelist.into_iter().take(trunk_count));
 
