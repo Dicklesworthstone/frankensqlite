@@ -44,7 +44,7 @@ pub use cracking::{
 };
 pub use cursor::{
     BtCursor, CursorPositionStamp, MemPageStore, PageReader, PageWriter, TableAppendHint,
-    TransactionPageIo,
+    TeardownTask, TransactionPageIo,
 };
 pub use instrumentation::{
     BtreeCopyProfileSnapshot, BtreeLeafReuseSnapshot, BtreeMetricsSnapshot, BtreeOpType,
