@@ -90031,7 +90031,7 @@ impl Connection {
                 .checked_add(current)
                 .ok_or(FrankenError::IntegerOverflow)?;
             steps = steps.wrapping_add(1);
-            if steps % RECURSIVE_CTE_CANCEL_CHECK_STRIDE == 0 {
+            if steps.is_multiple_of(RECURSIVE_CTE_CANCEL_CHECK_STRIDE) {
                 cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             }
         }

@@ -1013,9 +1013,8 @@ impl StatementTimer {
 fn process_cpu_seconds() -> Option<(f64, f64)> {
     use nix::sys::resource::{UsageWho, getrusage};
     let usage = getrusage(UsageWho::RUSAGE_SELF).ok()?;
-    let seconds = |tv: nix::sys::time::TimeVal| {
-        tv.tv_sec() as f64 + tv.tv_usec() as f64 / 1_000_000.0
-    };
+    let seconds =
+        |tv: nix::sys::time::TimeVal| tv.tv_sec() as f64 + tv.tv_usec() as f64 / 1_000_000.0;
     Some((seconds(usage.user_time()), seconds(usage.system_time())))
 }
 
@@ -3149,9 +3148,15 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                     ShellOptions::batch(),
                 )
                 .await;
-                assert_eq!(exit_code, 1, "batch mode fails on a bad dot command: {script:?}");
+                assert_eq!(
+                    exit_code, 1,
+                    "batch mode fails on a bad dot command: {script:?}"
+                );
                 let err = String::from_utf8_lossy(&err);
-                assert!(err.starts_with("error: .timer "), "script {script:?}: {err:?}");
+                assert!(
+                    err.starts_with("error: .timer "),
+                    "script {script:?}: {err:?}"
+                );
                 assert!(out.is_empty(), "script {script:?}: {out:?}");
             }
         });
