@@ -6,6 +6,7 @@ export type {
   ChangesetConflict,
   ChangesetConflictKind,
   ChangesetExecutor,
+  ChangesetRebaseHook,
   ChangesetTarget,
   PatchsetConflict,
 } from "./changeset-apply";

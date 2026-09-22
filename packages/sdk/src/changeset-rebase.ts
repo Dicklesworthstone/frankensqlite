@@ -178,6 +178,9 @@ function rebaseRow(
   if (local.operation === "insert") {
     if (remote.operation === "delete") return local;
     if (remote.replace) return null;
+    // Both sides already contain this key, and there is no non-key value to
+    // reconcile. Do not emit an UPDATE with an empty assignment list.
+    if (pk.every((column) => column !== 0)) return null;
     // Normalize SQLite's redundant new.* PK values to the strict session
     // UPDATE representation used by this SDK. Do not invent missing evidence.
     return {

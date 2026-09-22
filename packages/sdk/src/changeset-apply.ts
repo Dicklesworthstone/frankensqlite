@@ -1,11 +1,17 @@
 import type {
   ChangesetChange,
   ChangesetLimits,
+  ChangesetRebaseTable,
   ChangesetValue,
   PatchsetChange,
   PatchsetTable,
 } from "./changeset-codec";
-import { decodeChangeset, decodePatchset } from "./changeset-codec";
+import {
+  decodeChangeset,
+  decodePatchset,
+  encodeRebaseInfo,
+  resolveChangesetLimits,
+} from "./changeset-codec";
 
 /** The ordinary SQL surface used inside one owned transaction/savepoint. */
 export interface ChangesetExecutor {
@@ -43,6 +49,12 @@ export interface ChangesetConflict<Change extends PatchsetChange = ChangesetChan
 /** Patchset callbacks never receive DATA conflicts: there is no non-key old data. */
 export type PatchsetConflict = ChangesetConflict<PatchsetChange>;
 
+/** Save native rebase decisions using the SAME transaction as the applied rows. */
+export type ChangesetRebaseHook = (
+  tx: ChangesetExecutor,
+  rebaseInfo: Uint8Array,
+) => void | Promise<void>;
+
 export interface ApplyChangesetOptions<Change extends PatchsetChange = ChangesetChange> {
   /** Explicit allowlist of direct target tables in main; NOT a SQL sandbox. */
   tables: readonly string[];
@@ -55,13 +67,20 @@ export interface ApplyChangesetOptions<Change extends PatchsetChange = Changeset
   onConflict?: (
     conflict: ChangesetConflict<Change>,
   ) => "abort" | "omit" | "replace" | Promise<"abort" | "omit" | "replace">;
+  /**
+   * Fresh full changesets only, after row application but BEFORE commit. Save
+   * these owned bytes with tx, never publish them externally from this hook.
+   * Replay skips the hook: recover prior decisions from the journal you saved.
+   * Throws/cancellation/commit failure roll back journal, rows and receipt.
+   */
+  onRebase?: ChangesetRebaseHook;
   limits?: ChangesetLimits;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
 
 /** Explicitly choose the format without before-image conflict detection. */
-export type ApplyPatchsetOptions = ApplyChangesetOptions<PatchsetChange>;
+export type ApplyPatchsetOptions = Omit<ApplyChangesetOptions<PatchsetChange>, "onRebase">;
 
 export interface ApplyChangesetResult {
   /** Direct row changes, excluding trigger and foreign-key side effects. */
@@ -125,7 +144,8 @@ function integer(value: unknown): number {
 function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<Change>) {
   const source = options?.tables,
     onConflict = options?.onConflict,
-    limits = options?.limits;
+    limits = Object.freeze(resolveChangesetLimits(options?.limits));
+  const onRebase = options?.onRebase;
   const signal = options?.signal,
     timeoutMs = options?.timeoutMs;
   const deliveryId = options?.deliveryId;
@@ -143,6 +163,8 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
   }
   if (onConflict !== undefined && typeof onConflict !== "function")
     invalid("onConflict must be a function");
+  if (onRebase !== undefined && typeof onRebase !== "function")
+    invalid("onRebase must be a function");
   if (deliveryId !== undefined) {
     if (
       typeof deliveryId !== "string" ||
@@ -193,7 +215,12 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
       );
     }
   }
-  return { names, onConflict, limits, deliveryId, transactionOptions, checkpoint };
+  const rebase = onRebase === undefined ? null : new Map<string, {
+    name: string;
+    primaryKey: readonly number[];
+    changes: ChangesetRebaseTable["changes"][number][];
+  }>();
+  return { names, onConflict, onRebase, rebase, limits, deliveryId, transactionOptions, checkpoint };
 }
 
 type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
@@ -514,7 +541,10 @@ async function applyRow<Change extends PatchsetChange>(
     const action =
       settings.onConflict === undefined ? "abort" : await settings.onConflict(conflict);
     settings.checkpoint();
-    if (action === "omit") return false;
+    if (action === "omit") {
+      recordRebase(settings, plan, change, false);
+      return false;
+    }
     if (action === "abort") {
       throw new ChangesetApplyError(
         "ERR_FSQLITE_CHANGESET_CONFLICT",
@@ -524,6 +554,7 @@ async function applyRow<Change extends PatchsetChange>(
     }
     if (action !== "replace") invalid("onConflict must return abort, omit or replace");
     if (kind === "not-found") invalid("replace requires an existing conflicting row");
+    recordRebase(settings, plan, change, true);
     replace = true;
   }
   if (replace && change.operation === "insert") {
@@ -576,12 +607,37 @@ async function applyRow<Change extends PatchsetChange>(
   return true;
 }
 
+function recordRebase<Change extends PatchsetChange>(
+  settings: Settings<Change>,
+  plan: TablePlan<Change>,
+  change: Change,
+  replace: boolean,
+): void {
+  if (settings.rebase === null) return;
+  const wire = plan.wire;
+  let table = settings.rebase.get(wire.name);
+  if (table === undefined) {
+    table = { name: wire.name, primaryKey: wire.primaryKey, changes: [] };
+    settings.rebase.set(wire.name, table);
+  }
+  // Decoder-owned values are isolated from both caller input and onConflict's
+  // copies. UPDATE becomes a partial INSERT-shaped native rebase record.
+  table.changes.push({
+    operation: change.operation === "delete" ? "delete" : "insert",
+    replace,
+    values: change.operation === "insert" ? change.new
+      : change.operation === "delete" ? change.old
+      : change.new.map((value, i) => wire.primaryKey[i] !== 0 ? change.old[i] : value),
+  });
+}
+
 /**
  * Apply bounded SQLite session wire changes through real owned SQL. Schema and
  * explicit before-image conflicts fail closed by default. This is NOT the full
  * native sqlite3changeset_apply API: triggers/constraints retain ordinary SQL
- * behavior, and constraint omission, rebasing and FK deferral are not
- * synthesized. Explicit data/primary-key replacement stays inside the owned
+ * behavior; constraint omission and FK deferral are not synthesized. onRebase
+ * records actual full-changeset decisions inside the owned transaction.
+ * Explicit data/primary-key replacement stays inside the owned
  * scope. No manual BEGIN or global writer serialization is introduced.
  */
 export function applyChangeset(
@@ -613,6 +669,8 @@ async function applySession<Change extends PatchsetChange>(
   decode: (bytes: Uint8Array, limits?: ChangesetLimits) => readonly TablePlan<Change>["wire"][],
 ): Promise<ApplyChangesetResult> {
   const settings = capture(options);
+  if (settings.onRebase !== undefined && decode !== decodeChangeset)
+    invalid("Patchsets do not provide changeset rebase evidence");
   settings.checkpoint();
   // Decode before the first await: caller mutation cannot change admitted work.
   const tables = decode(bytes, settings.limits);
@@ -645,6 +703,13 @@ async function applySession<Change extends PatchsetChange>(
         if (await applyRow(tx, settings, plan, change, index++)) applied++;
         else omitted++;
       }
+    }
+    if (settings.onRebase !== undefined && settings.rebase !== null) {
+      settings.checkpoint();
+      const info = encodeRebaseInfo([...settings.rebase.values()], settings.limits);
+      settings.checkpoint();
+      await settings.onRebase(tx, info);
+      settings.checkpoint();
     }
     if (delivery !== null) {
       // Application callbacks/triggers may have changed schema; verify again
