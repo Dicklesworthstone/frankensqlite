@@ -4085,11 +4085,14 @@ where
         // bd-1nq3j), so this is tolerance for a configuration stock itself
         // documents as unsupported, not cover for an interop defect.
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
+            // bd-7zs8a follow-up: do NOT create here. The native path's contract
+            // is that it never creates a companion to satisfy a binding --
+            // test_native_orphan_preflight_never_creates_or_rebinds_invalid_wal_paths
+            // constructs a backend with create_missing = true and still asserts
+            // "native append never creates a missing path". 2fc898296 created
+            // here and broke exactly that.
             if self.inner.has_pending_publication() {
                 return Err(FrankenError::Busy);
-            }
-            if self.create_missing {
-                return self.replace_with_created_wal(cx).await;
             }
             return Ok(());
         }
@@ -4126,9 +4129,8 @@ where
         // bd-7zs8a: same missing-companion tolerance as the statement-path
         // validator above. VACUUM reaches retirement with the -wal already gone.
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
-            if self.create_missing {
-                return self.replace_with_created_wal(cx).await;
-            }
+            // bd-7zs8a follow-up: same contract as the statement-path validator
+            // above -- the native path does not create to satisfy a binding.
             return Ok(());
         }
         let (mut file, _) = self.vfs.open(
