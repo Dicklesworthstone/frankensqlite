@@ -1,7 +1,8 @@
 import type { ApplyChangesetResult, ChangesetTarget } from "./changeset-apply";
 import type {
-  ChangesetDeliveryOptions, ChangesetDeliveryReceipt, ChangesetEnvelope,
+  ChangesetDeliveryOptions, ChangesetDeliveryReceipt, ChangesetEnvelope, ChangesetTransport,
 } from "./changeset-delivery";
+import type { OutboxReadResult } from "./changeset-outbox";
 import { ChangesetOrder } from "./changeset-order";
 
 export const CHANGESET_ORDER_PROTOCOL = "fsqlite-ordered-changeset-v1";
@@ -19,6 +20,17 @@ export interface OrderedChangesetEnvelope extends ChangesetEnvelope {
 }
 export interface OrderedChangesetReceipt extends ChangesetDeliveryReceipt {
   readonly order: Readonly<ChangesetWireOrder>;
+}
+export interface OrderedChangesetSource {
+  readonly receiverId?: string;
+  read(deliveryId: string): Promise<OutboxReadResult | null>;
+}
+export interface OrderedChangesetTransportOptions {
+  receiverId: string;
+  streamId: string;
+  /** Authenticate the peer and preserve the order envelope and receipt intact. */
+  deliver(message: OrderedChangesetEnvelope, options: ChangesetDeliveryOptions): Promise<unknown>;
+  maxMessageBytes?: number;
 }
 /** Apply with the supplied target; never confirm durability inside this callback. */
 export type OrderedDeliveryApply = (
@@ -197,4 +209,56 @@ export async function createOrderedChangesetReceiver(
       } finally { active = false; }
     },
   });
+}
+
+function baseReceipt(value: unknown, message: ChangesetEnvelope, byteLength: number): ChangesetDeliveryReceipt {
+  if (own(value, "protocol") !== BASE_PROTOCOL || own(value, "receiverId") !== message.receiverId ||
+      own(value, "deliveryId") !== message.deliveryId || own(value, "sha256") !== message.sha256 ||
+      own(value, "byteLength") !== byteLength || own(value, "confirmed") !== true)
+    mismatch("Receiver did not confirm this exact ordered payload");
+  return Object.freeze({ protocol: BASE_PROTOCOL, receiverId: message.receiverId, deliveryId: message.deliveryId,
+    sha256: message.sha256, byteLength, ...decisions(value), confirmed: true });
+}
+
+/**
+ * Pump-compatible transport whose successful return proves matching source order.
+ * Read authoritative outbox metadata before transport; never renumber retries.
+ * Legacy/stripped order receipts cannot release source payloads through this API.
+ * No source SQL transaction is held across transport; the pump still owns ACK
+ * persistence, its source-confirmation barrier and explicit omission policy.
+ */
+export function createOrderedChangesetTransport(
+  source: OrderedChangesetSource, options: OrderedChangesetTransportOptions,
+): ChangesetTransport {
+  const receiverId = identity(options?.receiverId, 256), streamId = identity(options?.streamId, 256);
+  const deliver = options?.deliver, read = source?.read, binding = source?.receiverId;
+  const maximum = bounded(options?.maxMessageBytes ?? 8 * 1024 * 1024, HARD_BYTES, 1);
+  if (typeof deliver !== "function" || typeof read !== "function" || (binding !== undefined && binding !== receiverId))
+    input("Use a matching receiver-bound source and an ordered transport");
+  let active = false;
+  return async (value, options = {}) => {
+    if (active) throw new OrderedChangesetDeliveryError("ERR_FSQLITE_ORDERED_BUSY", "This ordered transport is already active");
+    active = true;
+    try {
+      const time = budget(options), message = captureMessage(value, receiverId, maximum);
+      const byteLength = message.changeset.byteLength;
+      await verifyHash(message); time.check();
+      const record = await read.call(source, message.deliveryId); time.check();
+      if (record === null) mismatch("Ordered delivery has no retained source identity");
+      const entry = own(record, "delivery"), sequence = own(entry, "sequence");
+      if (typeof sequence !== "bigint" || sequence < 1n || sequence >= 1n << 63n ||
+          own(entry, "deliveryId") !== message.deliveryId || own(entry, "sha256") !== message.sha256 ||
+          own(entry, "byteLength") !== byteLength || typeof own(entry, "acknowledged") !== "boolean")
+        mismatch("Source metadata does not identify this ordered delivery");
+      const changes = bounded(own(entry, "changes"), 100_000);
+      const order = Object.freeze({ protocol: CHANGESET_ORDER_PROTOCOL, streamId, sequence: sequence.toString() });
+      const response = await deliver(Object.freeze({ ...message, order }), time.remaining());
+      time.check();
+      const proof = captureOrder(own(response, "order"));
+      if (proof.streamId !== streamId || proof.sequence !== order.sequence) mismatch("Receiver did not confirm the exact source sequence");
+      const receipt = baseReceipt(response, message, byteLength);
+      if (receipt.applied + receipt.omitted !== changes) mismatch("Ordered receipt decisions disagree with source change count");
+      return Object.freeze({ ...receipt, order });
+    } finally { active = false; }
+  };
 }

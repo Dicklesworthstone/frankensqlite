@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { ChangesetOrder, CHANGESET_ORDER_TABLE } from "../src/changeset-order.ts";
-import { CHANGESET_ORDER_PROTOCOL, createOrderedChangesetReceiver } from "../src/changeset-ordered-delivery.ts";
+import { CHANGESET_ORDER_PROTOCOL, createOrderedChangesetReceiver, createOrderedChangesetTransport } from "../src/changeset-ordered-delivery.ts";
 
 const ID = { receiverId: "east", sourceId: "source:incarnation-1" };
 const HASH = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -216,4 +216,128 @@ test("receiver captures application and confirmation configuration before openin
   const pending = createOrderedChangesetReceiver(f.order, opts);
   opts.apply = () => { throw new Error("changed"); }; opts.confirmCommit = opts.apply;
   const receiver = await pending; await receiver.receive(message()); assert.equal(f.state.confirmations, 1);
+});
+
+function sourceFor(msg, overrides = {}) {
+  return { receiverId: ID.receiverId, reads: 0,
+    async read(id) {
+      this.reads++; assert.equal(id, msg.deliveryId);
+      return { delivery: { sequence: BigInt(msg.order.sequence), deliveryId: msg.deliveryId,
+        sha256: msg.sha256, byteLength: msg.changeset.length, changes: 1, acknowledged: false, ...overrides },
+        changeset: new Uint8Array(msg.changeset) };
+    },
+  };
+}
+const transportOptions = deliver => ({ receiverId: ID.receiverId, streamId: ID.sourceId, deliver });
+const fakeAck = msg => ({ protocol: msg.protocol, receiverId: msg.receiverId, deliveryId: msg.deliveryId,
+  sha256: msg.sha256, byteLength: msg.changeset.length, applied: 1, omitted: 0,
+  replayed: false, confirmed: true, order: { ...msg.order } });
+
+test("source-bound transport reaches actual ledger and returns matching confirmed order", async t => {
+  const f = await setup(t), msg = message(), source = sourceFor(msg);
+  const transport = createOrderedChangesetTransport(source, transportOptions((m, opts) => {
+    assert.equal(f.state.active, false); return f.receiver.receive(m, opts);
+  }));
+  // Ignore a caller-supplied sequence: the retained source metadata is authoritative.
+  const ack = await transport({ ...msg, order: { ...msg.order, sequence: "999" } }, {});
+  assert.equal(ack.order.sequence, "1"); assert.equal(source.reads, 1);
+  assert.deepEqual(f.rows(), [[1, "body-1"]]);
+  assert.equal((await transport(msg, {})).replayed, true); assert.equal(f.state.applications, 1);
+});
+test("lost transport ACK reuses exact source sequence after receiver commit", async t => {
+  const f = await setup(t), msg = message(); let lost = true;
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async (m, opts) => {
+    const ack = await f.receiver.receive(m, opts);
+    if (lost) { lost = false; throw new Error("lost wire response"); } return ack;
+  }));
+  await assert.rejects(transport(msg, {}), /lost wire response/);
+  assert.equal((await transport(msg, {})).replayed, true);
+  assert.equal(f.state.applications, 1); assert.equal(f.state.confirmations, 2);
+});
+for (const sequence of [9007199254740993n, (1n << 63n) - 1n])
+  test(`source int64 ${sequence} survives JSON receipt roundtrip without precision loss`, async () => {
+    const msg = message();
+    const transport = createOrderedChangesetTransport(sourceFor(msg, { sequence }), transportOptions(async m => {
+      assert.equal(m.order.sequence, sequence.toString()); return JSON.parse(JSON.stringify(fakeAck(m)));
+    }));
+    assert.equal((await transport(msg, {})).order.sequence, sequence.toString());
+  });
+for (const [name, alter] of [
+  ["missing order", a => { delete a.order; }], ["legacy order", a => { a.order.protocol = "v0"; }],
+  ["wrong stream", a => { a.order.streamId = "other"; }], ["wrong sequence", a => { a.order.sequence = "2"; }],
+  ["wrong receiver", a => { a.receiverId = "west"; }], ["wrong delivery", a => { a.deliveryId = "other"; }],
+  ["wrong digest", a => { a.sha256 = "0".repeat(64); }], ["wrong length", a => { a.byteLength++; }],
+  ["unconfirmed", a => { a.confirmed = false; }], ["wrong total", a => { a.applied = 2; }],
+  ["negative count", a => { a.omitted = -1; }], ["nonboolean replay", a => { a.replayed = 1; }],
+]) test(`source never accepts ${name} ACK`, async () => {
+  const msg = message();
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => {
+    const ack = fakeAck(m); alter(ack); return ack;
+  }));
+  await assert.rejects(transport(msg, {}));
+});
+for (const override of [{ sequence: 0n }, { sequence: 1 }, { sequence: 1n << 63n },
+  { deliveryId: "other" }, { sha256: "0".repeat(64) }, { byteLength: 0 }, { acknowledged: 0 }, { changes: -1 }])
+  test(`invalid retained metadata ${Object.keys(override)[0]}=${String(Object.values(override)[0])} refuses transport`, async () => {
+    const msg = message(); let sent = 0;
+    const transport = createOrderedChangesetTransport(sourceFor(msg, override), transportOptions(async m => { sent++; return fakeAck(m); }));
+    await assert.rejects(transport(msg, {})); assert.equal(sent, 0);
+  });
+test("missing source identity refuses delivery", async () => {
+  let sent = 0; const msg = message();
+  const transport = createOrderedChangesetTransport({ read: async () => null }, transportOptions(async m => { sent++; return fakeAck(m); }));
+  await assert.rejects(transport(msg, {}), code("RECEIPT")); assert.equal(sent, 0);
+});
+test("receiver-bound source cannot be configured for another replica", () => {
+  assert.throws(() => createOrderedChangesetTransport(sourceFor(message()), {
+    ...transportOptions(async m => fakeAck(m)), receiverId: "west",
+  }), code("INPUT"));
+});
+test("source configuration and buffers are captured before asynchronous transport", async () => {
+  const msg = message(), source = sourceFor(message()), opts = transportOptions(async m => fakeAck(m));
+  const transport = createOrderedChangesetTransport(source, opts);
+  opts.deliver = async () => { throw new Error("replacement"); }; source.read = opts.deliver;
+  const pending = transport(msg, {}); msg.changeset.fill(0);
+  const ack = await pending; assert.equal(ack.sha256, message().sha256);
+});
+test("transport cancellation waits for active delivery to settle", async () => {
+  const p = pause(), started = pause(), c = new AbortController(), msg = message();
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => {
+    started.resolve(); await p.promise; return fakeAck(m);
+  }));
+  const pending = transport(msg, { signal: c.signal }); await started.promise; c.abort();
+  let settled = false; void pending.catch(() => { settled = true; });
+  await assert.rejects(transport(msg, {}), code("BUSY"));
+  await new Promise(r => setImmediate(r)); assert.equal(settled, false);
+  p.resolve(); await assert.rejects(pending, code("CANCELLED"));
+});
+test("transport timeout withholds late ACK without abandoning active delivery", async () => {
+  const p = pause(), started = pause(), msg = message();
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => {
+    started.resolve(); await p.promise; return fakeAck(m);
+  }));
+  const pending = transport(msg, { timeoutMs: 100 }); await started.promise;
+  let settled = false; void pending.catch(() => { settled = true; });
+  await new Promise(r => setTimeout(r, 120)); assert.equal(settled, false);
+  p.resolve(); await assert.rejects(pending, code("TIMEOUT"));
+});
+test("ordered omission counts remain explicit and unchanged for pump policy", async () => {
+  const msg = message();
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => ({ ...fakeAck(m), applied: 0, omitted: 1 })));
+  const ack = await transport(msg, {}); assert.equal(ack.applied, 0); assert.equal(ack.omitted, 1);
+});
+test("forged receipt accessors are rejected without invoking them", async () => {
+  const msg = message(); let calls = 0;
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => {
+    const ack = fakeAck(m); Object.defineProperty(ack, "order", { get() { calls++; throw new Error("getter"); } }); return ack;
+  }));
+  await assert.rejects(transport(msg, {})); assert.equal(calls, 0);
+});
+test("recovery allows a fresh call after invalid acknowledgement", async () => {
+  const msg = message(); let valid = false;
+  const transport = createOrderedChangesetTransport(sourceFor(msg), transportOptions(async m => {
+    const ack = fakeAck(m); if (!valid) delete ack.order; return ack;
+  }));
+  await assert.rejects(transport(msg, {})); valid = true;
+  assert.equal((await transport(msg, {})).confirmed, true);
 });

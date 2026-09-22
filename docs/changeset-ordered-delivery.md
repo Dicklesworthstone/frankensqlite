@@ -83,3 +83,43 @@ transactions and native session changesets, including file reopen and deferred
 COMMIT failure. Its SQL application callback is a reference adapter, not the
 existing production SDK `applyChangeset`, receiver or pump. It does not certify
 the Rust/WASM engine, browser storage, full SDK build or power-loss behavior.
+
+## Source transport and fanout
+
+```ts
+import { ChangesetDeliveryPump, createOrderedChangesetTransport } from '@frankensqlite/sdk';
+
+const source = fanout.forReplica('east'); // Or the single-recipient outbox.
+const deliver = createOrderedChangesetTransport(source, {
+  receiverId: 'east', streamId: 'source:incarnation-1',
+  deliver: authenticatedOrderedTransport,
+});
+const pump = new ChangesetDeliveryPump(source, {
+  receiverId: 'east', deliver, confirmSource: confirmSourceDatabase,
+});
+await pump.run();
+```
+
+The transport reads the retained source identity to obtain its original sequence;
+it does not trust a caller-supplied order field or number deliveries per run.
+Digest, identity, length, sequence and count admission complete before sending.
+Only an ACK matching that exact receiver, stream, sequence, delivery ID, digest,
+length and original decision total can return successfully to the existing pump.
+Absent/stripped order evidence is an error, never a legacy fallback. The pump
+still owns source acknowledgement persistence, source confirmation, and its
+explicit omission policy. The adapter itself never acknowledges or reclaims.
+
+Use the same receiver-bound source for the transport and pump. Authenticate
+peers and carry the complete envelope/receipt through the network. The existing
+legacy changeset HTTP helpers are NOT extended by this module: a transport that
+strips order metadata is incompatible. Do not send ordered work through an
+unordered receiver and then infer ordering from its ordinary success receipt.
+
+Transport options are captured once. Active transport and confirmation are
+awaited on cancellation/deadline expiration, not abandoned in a Promise race.
+Timeouts are cooperative checkpoints, not interrupts of a stalled network call.
+The tests include both production adapters together with the existing ledger,
+exact lost-response replay, rejection of forged/legacy receipts, source metadata
+admission and JSON roundtrips of sequences above JavaScript's safe integer range.
+Source metadata and pumping are reference fixtures; no claim of a production
+HTTP/pump/fanout end-to-end run is made.

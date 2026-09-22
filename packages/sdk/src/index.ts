@@ -264,5 +264,7 @@ export type {
   OrderedDeliveryApply,
   OrderedChangesetReceiverOptions,
   OrderedChangesetReceiver,
+  OrderedChangesetSource,
+  OrderedChangesetTransportOptions,
 } from "./changeset-ordered-delivery";
-export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver } from "./changeset-ordered-delivery";
+export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver, createOrderedChangesetTransport } from "./changeset-ordered-delivery";
