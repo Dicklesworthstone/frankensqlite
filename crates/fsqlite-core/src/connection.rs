@@ -74111,7 +74111,14 @@ impl Connection {
                 )?;
 
                 let page = txn.get_page(cx, trunk_page).await?;
-                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(
+                // Parse only the usable prefix: a trunk whose leaf list runs
+                // into the reserved trailer is corrupt to stock SQLite
+                // ("freelist leaf count too big"), so it must be here too.
+                let usable = usize::try_from(page_size.usable(reserved_per_page))
+                    .unwrap_or(usize::MAX)
+                    .min(page.as_ref().len());
+                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(&page.as_ref()[..usable])
+                    .map_err(
                     |err| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "freelist trunk page {} is malformed: {err}",
