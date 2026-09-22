@@ -1510,8 +1510,113 @@ fn parse_json_text(input: &str) -> Result<Value> {
     }
 }
 
+/// Deserialize JSON5 without letting serde_json turn infinite floats into null.
+struct Json5Value(Value);
+
+impl<'de> serde::Deserialize<'de> for Json5Value {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Json5ValueVisitor)
+    }
+}
+
+struct Json5ValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
+    type Value = Json5Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON5 value")
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::Null))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::from(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::from(value)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let value = if value.is_nan() {
+            Value::Null
+        } else if value.is_infinite() {
+            nonfinite_value(if value.is_sign_negative() {
+                "-9e999"
+            } else {
+                "9e999"
+            })
+        } else {
+            Value::from(value)
+        };
+        Ok(Json5Value(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Json5Value(Value::String(value)))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<Json5Value>()? {
+            values.push(value.0);
+        }
+        Ok(Json5Value(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some((key, value)) = object.next_entry::<String, Json5Value>()? {
+            values.insert(key, value.0);
+        }
+        Ok(Json5Value(Value::Object(values)))
+    }
+}
+
 fn parse_json5_text(input: &str) -> Result<Value> {
-    json5::from_str::<Value>(input)
+    json5::from_str::<Json5Value>(input)
+        .map(|value| value.0)
         .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))
 }
 
@@ -1521,9 +1626,8 @@ fn parse_json5_text(input: &str) -> Result<Value> {
 /// value-consuming json functions (json_extract, json_type, json_each,
 /// json_tree, …) re-serialize/extract from the parsed tree, so JSON5 input is
 /// transparently canonicalized — matching stock SQLite 3.42+ (bd-qear2). Strict
-/// JSON is unaffected (the strict parse is tried first). Non-finite
-/// +Infinity/-Infinity/NaN still error here (serde_json::Value cannot carry
-/// them) — a documented follow-up on bd-qear2.
+/// JSON is unaffected (the strict parse is tried first). JSON5 infinities use
+/// the existing non-finite numeric carriers, while NaN becomes JSON null.
 fn parse_json_value_lenient(input: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(input) {
         Ok(value) => Ok(value),
@@ -4318,6 +4422,76 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
+
+    #[test]
+    fn json5_nonfinite_scalars_preserve_sign_and_jsonb_round_trip() {
+        for (input, negative) in [("Infinity", false), ("+Infinity", false), ("-Infinity", true)] {
+            let value = parse_json5_text(input).expect("JSON5 infinity parses");
+            assert_eq!(
+                value,
+                nonfinite_value(if negative { "-9e999" } else { "9e999" })
+            );
+            let SqliteValue::Float(number) = json_to_sqlite_scalar(&value) else {
+                panic!("{input} must extract as a REAL");
+            };
+            assert!(number.is_infinite());
+            assert_eq!(number.is_sign_negative(), negative);
+            let encoded = encode_jsonb_root(&value).expect("infinity encodes as JSONB");
+            assert_eq!(
+                decode_jsonb_root(&encoded).expect("infinity JSONB decodes"),
+                value
+            );
+        }
+        for input in ["NaN", "+NaN", "-NaN"] {
+            assert_eq!(parse_json5_text(input).unwrap(), Value::Null);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_nonfinite_values_survive_nested_containers() {
+        let value = parse_json5_text("{a:[Infinity,{b:-Infinity,c:NaN}],s:'Infinity'}")
+            .expect("nested JSON5 non-finite values parse");
+        assert_eq!(value["a"][0], nonfinite_value("9e999"));
+        assert_eq!(value["a"][1]["b"], nonfinite_value("-9e999"));
+        assert_eq!(value["a"][1]["c"], Value::Null);
+        assert_eq!(value["s"], Value::String("Infinity".to_owned()));
+        assert_eq!(
+            encode_json_text("nested JSON5", &value).unwrap(),
+            r#"{"a":[9e999,{"b":-9e999,"c":null}],"s":"Infinity"}"#
+        );
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_nonfinite_visitor_preserves_keys_strings_and_finite_types() {
+        let value = parse_json5_text(
+            r#"{
+                Infinity:1, NaN:'NaN',
+                u:18446744073709551615, i:-9223372036854775808,
+                z:-0.0, v:'\v', s:'\\Infinity', b:true, n:null, a:[]
+            }"#,
+        )
+        .expect("ordinary JSON5 values keep their representation");
+        assert_eq!(value["Infinity"].as_u64(), Some(1));
+        assert_eq!(value["NaN"].as_str(), Some("NaN"));
+        assert_eq!(value["u"].as_u64(), Some(u64::MAX));
+        assert_eq!(value["i"].as_i64(), Some(i64::MIN));
+        assert_eq!(value["z"].as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(value["v"].as_str(), Some("\u{000B}"));
+        assert_eq!(value["s"].as_str(), Some("\\Infinity"));
+        assert_eq!(value["b"], Value::Bool(true));
+        assert_eq!(value["n"], Value::Null);
+        assert_eq!(value["a"], Value::Array(Vec::new()));
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn json5_nonfinite_values_do_not_accept_malformed_input() {
+        for input in ["Infinityx", "[Infinity,,NaN]", "{a:Infinity b:1}", "[-Infinity"] {
+            assert!(parse_json5_text(input).is_err(), "accepted {input:?}");
+        }
+    }
 
     #[test]
     // The JSON5 literals ('{a:...}') look like format args to clippy.
