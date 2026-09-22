@@ -305,24 +305,46 @@ fn recheck_names(vfs: &NativeVfs, cx: &Cx, source: &Path, captured: &CapturedSou
     Ok(())
 }
 
-fn backup_original(vfs: &NativeVfs, cx: &Cx, path: &Path, original: &[u8]) -> Result<()> {
+/// Return the verified backup owner, not merely a successful pathname write.
+/// Its descriptor stays alive until source settlement and fence restoration end.
+fn backup_original(
+    vfs: &NativeVfs,
+    cx: &Cx,
+    path: &Path,
+    original: &[u8],
+    mut sync: impl FnMut(&mut std::fs::File) -> io::Result<()>,
+) -> Result<(std::fs::File, FileIdentity)> {
     checkpoint(cx)?;
     refuse_destination_artifacts(vfs, cx, path)?;
     let mut backup = host_fs::reserve_new_file(path)?;
-    let result = (|| {
-        refuse_destination_artifacts(vfs, cx, path)?;
+    let result: Result<FileIdentity> = (|| {
+        let identity = FileIdentity::from_file(&backup)?.ok_or(FrankenError::Unsupported)?;
+        let validate_destination = || {
+            host_fs::validate_reserved_file_identity(path, identity)?;
+            refuse_destination_artifacts(vfs, cx, path)
+        };
+        validate_destination()?;
         for chunk in original.chunks(IO_CHUNK) {
             checkpoint(cx)?;
             backup.write_all(chunk)?;
         }
-        backup.sync_all()?;
+        sync(&mut backup)?;
         verify_image(&mut backup, cx, original)?;
-        vfs.sync_parent_directory(cx, path)
+        validate_destination()?;
+        vfs.sync_parent_directory(cx, path)?;
+        validate_destination()?;
+        Ok(identity)
     })();
-    if result.is_err() {
-        eprintln!("Incomplete backup retained at {}; source WAL has not been modified", path.display());
+    match result {
+        Ok(identity) => Ok((backup, identity)),
+        Err(error) => {
+            eprintln!(
+                "Backup is NOT certified for {}; source WAL has not been modified and no output or replacement was removed",
+                path.display()
+            );
+            Err(error)
+        }
     }
-    result
 }
 
 fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> Result<RepairHandoff> {
@@ -347,9 +369,14 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
         plan.index_header.i_change = previous.i_change.wrapping_add(1);
         plan.index_header.update_checksum()?;
     }
-    backup_original(&vfs, cx, &options.destination, &captured.snapshot.wal)?;
+    let (backup, backup_identity) = backup_original(
+        &vfs, cx, &options.destination, &captured.snapshot.wal, |file| file.sync_all(),
+    )?;
     recheck_names(&vfs, cx, &options.source, &captured)?;
     verify_image(&mut wal, cx, &captured.snapshot.wal)?;
+    // Do not authorize destructive repair from a stale backup pathname.
+    host_fs::validate_reserved_file_identity(&options.destination, backup_identity)?;
+    refuse_destination_artifacts(&vfs, cx, &options.destination)?;
     checkpoint(cx)?;
 
     // Once source mutation can begin, cancellation must not interrupt its
@@ -370,6 +397,10 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
         if read_shared_wal_index_header(&regions[0])? != Some(plan.index_header) {
             return Err(corruption("repaired WAL index failed publication readback"));
         }
+        // Preserve the backup's ownership evidence through the receipt boundary,
+        // including failures after the WAL bytes have already been repaired.
+        host_fs::validate_reserved_file_identity(&options.destination, backup_identity)?;
+        refuse_destination_artifacts(&vfs, cx, &options.destination)?;
         publication.complete = true;
         Ok::<_, FrankenError>(digest)
     })();
@@ -377,7 +408,7 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
     drop(regions);
     drop(wal);
     if result.is_err() {
-        eprintln!("WAL repair is NOT certified; original backup retained at {}", options.destination.display());
+        eprintln!("WAL repair is NOT certified; verify the original backup at {}", options.destination.display());
     }
     let digest = result?;
     // Stop blocking native readers/writers before invoking an SQL constructor,
@@ -389,6 +420,7 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
         captured.main.file.restore_external_maintenance_attempt(&captured.main.cleanup_cx)?;
         captured.main.maintenance = false;
     }
+    drop(backup);
     let report = ExportReport {
         destination: options.destination.clone(), pages: plan.pages,
         wal_frames: plan.index_header.mx_frame, repaired_frames: plan.changed.len(),
@@ -452,6 +484,102 @@ mod tests {
         let cx = Cx::new();
         cx.set_native_cx(asupersync::Cx::current().unwrap());
         cx
+    }
+
+    #[test]
+    fn backup_retains_the_verified_descriptor_identity() {
+        with_runtime(async {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("original.wal");
+            let original = vec![0x37; IO_CHUNK + 513];
+            let cx = attached_context();
+            let (mut backup, identity) = backup_original(
+                &NativeVfs::new(), &cx, &path, &original, |file| file.sync_all(),
+            ).unwrap();
+            assert_eq!(FileIdentity::from_file(&backup).unwrap(), Some(identity));
+            host_fs::validate_reserved_file_identity(&path, identity).unwrap();
+            assert_eq!(verify_image(&mut backup, &cx, &original).unwrap(), blake3::hash(&original));
+            assert_eq!(host_fs::read(&path).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn backup_refuses_missing_or_replaced_path_during_sync() {
+        with_runtime(async {
+            for install_replacement in [false, true] {
+                let directory = tempfile::tempdir().unwrap().keep();
+                let path = directory.join("original.wal");
+                let retained = directory.join("retained.wal");
+                let original = vec![0x37; IO_CHUNK + 513];
+                let cx = attached_context();
+                let result = backup_original(&NativeVfs::new(), &cx, &path, &original, |file| {
+                    file.sync_all()?;
+                    host_fs::rename(&path, &retained).unwrap();
+                    if install_replacement {
+                        host_fs::write(&path, &original).unwrap();
+                    }
+                    Ok(())
+                });
+                if install_replacement {
+                    assert!(matches!(result, Err(FrankenError::BusyRecovery)));
+                    assert_eq!(host_fs::read(&path).unwrap(), original);
+                } else {
+                    assert!(matches!(result, Err(FrankenError::Io(error))
+                        if error.kind() == io::ErrorKind::NotFound));
+                    assert!(!path.exists());
+                }
+                assert_eq!(host_fs::read(&retained).unwrap(), original);
+            }
+        });
+    }
+
+    #[test]
+    fn backup_refuses_recovery_companions_created_during_sync() {
+        with_runtime(async {
+            for suffix in crate::native_recovery::RECOVERY_COMPANION_SUFFIXES {
+                let directory = tempfile::tempdir().unwrap().keep();
+                let path = directory.join("original.wal");
+                let artifact = companion(&path, suffix);
+                let original = vec![0x37; IO_CHUNK + 513];
+                let cx = attached_context();
+                let result = backup_original(&NativeVfs::new(), &cx, &path, &original, |file| {
+                    file.sync_all()?;
+                    host_fs::write(&artifact, b"unowned companion").unwrap();
+                    Ok(())
+                });
+                assert!(matches!(result, Err(FrankenError::CannotOpen { path })
+                    if path == artifact));
+                assert_eq!(host_fs::read(&path).unwrap(), original);
+                assert_eq!(host_fs::read(&artifact).unwrap(), b"unowned companion");
+            }
+        });
+    }
+
+    #[test]
+    fn backup_sync_and_readback_failures_never_return_a_verified_owner() {
+        with_runtime(async {
+            for corrupt_readback in [false, true] {
+                let directory = tempfile::tempdir().unwrap().keep();
+                let path = directory.join("original.wal");
+                let original = vec![0x37; IO_CHUNK + 513];
+                let cx = attached_context();
+                let result = backup_original(&NativeVfs::new(), &cx, &path, &original, |file| {
+                    if !corrupt_readback {
+                        return Err(io::Error::other("injected backup sync failure"));
+                    }
+                    file.seek(SeekFrom::Start(0))?;
+                    file.write_all(&[0xff])?;
+                    file.sync_all()
+                });
+                if corrupt_readback {
+                    assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+                    assert_eq!(host_fs::read(&path).unwrap()[0], 0xff);
+                } else {
+                    assert!(matches!(result, Err(FrankenError::Io(_))));
+                    assert_eq!(host_fs::read(&path).unwrap(), original);
+                }
+            }
+        });
     }
 
     /// Three versions of an empty sqlite_schema page in one FEC-covered
