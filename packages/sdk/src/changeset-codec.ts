@@ -237,9 +237,13 @@ export function encodeRebaseInfo(
   return encodeSession(tables.map((table) => ({
     name: table.name,
     primaryKey: table.primaryKey,
-    changes: table.changes.map((change): SessionChange => change.operation === "insert"
-      ? { operation: "insert", indirect: change.replace, new: change.values }
-      : { operation: "delete", indirect: change.replace, old: change.values }),
+    changes: table.changes.map((change): SessionChange => {
+      if (change.operation !== "insert" && change.operation !== "delete")
+        format("Invalid rebase record operation");
+      return change.operation === "insert"
+        ? { operation: "insert", indirect: change.replace, new: change.values }
+        : { operation: "delete", indirect: change.replace, old: change.values };
+    }),
   })), options, false, true);
 }
 

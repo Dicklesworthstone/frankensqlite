@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { decodeChangeset, decodeRebaseInfo, encodeChangeset, encodePatchset, encodeRebaseInfo } from "../src/changeset-codec.ts";
+import { decodeChangeset, decodePatchset, decodeRebaseInfo, encodeChangeset, encodePatchset, encodeRebaseInfo } from "../src/changeset-codec.ts";
 import { ChangesetRebaser, createChangesetRebaseInfo, rebaseChangeset } from "../src/changeset-rebase.ts";
+import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
 
 const oraclePath = fileURLToPath(new URL("./helpers/rebase-oracle.py", import.meta.url));
 function oracle(input) {
@@ -219,6 +224,9 @@ test("rebase buffers cannot masquerade as patchsets or contain UPDATE records", 
     { operation: "update", indirect: false, old: [1n, "a", undefined], new: [undefined, "b", undefined] },
   ] }]);
   assert.throws(() => rb.configure(update));
+  assert.throws(() => encodeRebaseInfo([{ name: "t", primaryKey: [1, 0, 0], changes: [
+    { operation: "update", replace: false, values: [1n, "a", "b"] },
+  ] }]));
 });
 test("missing full-row evidence refuses a synthesized INSERT instead of inventing values", () => {
   const incompleteDelete = encodeRebaseInfo([{ name: "t", primaryKey: [1, 0, 0], changes: [
@@ -236,3 +244,273 @@ for (const [left, right] of [[1n, 1], ["1", 1n], ["A", "a"], [new Uint8Array([0,
     assert.deepEqual(rb.rebase(input), input);
   });
 }
+
+// Execute shipped SQL, receipts and rebase hooks on Node's actual SQLite.
+// This adapter supplies transaction ownership, not an emulated SQL engine.
+function sqlTarget(db) {
+  let depth = 0, serial = 0;
+  const host = {
+    loseAcknowledgement: false,
+    admissions: 0,
+    async transaction(work) {
+      const id = `test_rebase_${++serial}`, outer = depth === 0;
+      db.exec(outer ? "BEGIN" : `SAVEPOINT ${id}`);
+      depth++;
+      host.admissions++;
+      let active = true, result;
+      const tx = {
+        async execute(sql, params = []) {
+          assert.ok(active, "transaction executor cannot escape its owner");
+          return Number(db.prepare(sql).run(...params).changes);
+        },
+        async query(sql, params = []) {
+          assert.ok(active, "transaction executor cannot escape its owner");
+          const stmt = db.prepare(sql); stmt.setReadBigInts(true);
+          return { rowArrays: stmt.all(...params).map((row) => Object.values(row)) };
+        },
+      };
+      try {
+        result = await work(tx);
+        db.exec(outer ? "COMMIT" : `RELEASE SAVEPOINT ${id}`);
+      } catch (error) {
+        try {
+          db.exec(outer ? "ROLLBACK" : `ROLLBACK TO SAVEPOINT ${id}; RELEASE SAVEPOINT ${id}`);
+        } catch (cleanup) { throw new AggregateError([error, cleanup], "SQLite test transaction cleanup failed"); }
+        throw error;
+      } finally { active = false; depth--; }
+      if (host.loseAcknowledgement) {
+        host.loseAcknowledgement = false;
+        throw new Error("injected lost commit acknowledgement");
+      }
+      return result;
+    },
+  };
+  return host;
+}
+function opened(c = first, path = ":memory:") {
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA foreign_keys=ON;" + c.schema + (c.seed ?? "") + c.local);
+  db.exec("CREATE TABLE rebase_journal(id TEXT PRIMARY KEY, info BLOB NOT NULL);");
+  return { db, host: sqlTarget(db) };
+}
+const stored = (db, id) => db.prepare("SELECT info FROM rebase_journal WHERE id=?").get(id)?.info;
+const rowCount = (db, table) => Number(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n);
+function inboxCount(db) {
+  const found = db.prepare("SELECT name FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'").get();
+  return found ? rowCount(db, "__fsqlite_changeset_receipts") : 0;
+}
+
+for (const c of generated.cases) {
+  test(`transactional native rebase capture: ${c.name}`, async () => {
+    const { db, host } = opened(c);
+    const rebaser = new ChangesetRebaser();
+    try {
+      for (let i = 0; i < c.remoteWires.length; i++) {
+        const id = `remote:${i}`, wire = bytes(c.remoteWires[i]);
+        let hooks = 0;
+        const result = await applyChangeset(host, wire, {
+          tables: decodeChangeset(wire).map((t) => t.name), deliveryId: id,
+          onConflict: () => c.remote[i].policy ?? "omit",
+          async onRebase(tx, info) {
+            hooks++;
+            // No success notification yet: save proof inside the same owner.
+            // Node 22's binding of a sliced zero-length buffer may become
+            // NULL; explicitly persist a zero-length BLOB for an empty proof.
+            if (info.length === 0)
+              await tx.execute("INSERT INTO rebase_journal VALUES (?, zeroblob(0))", [id]);
+            else await tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", [id, info]);
+          },
+        });
+        assert.equal(result.replayed, false); assert.equal(hooks, 1);
+        assert.deepEqual(decodeRebaseInfo(stored(db, id)), decodeRebaseInfo(bytes(c.rebaseBuffers[i])));
+        const duplicate = await applyChangeset(host, wire, {
+          tables: decodeChangeset(wire).map((t) => t.name), deliveryId: id,
+          onConflict: () => assert.fail("replay cannot resolve a conflict again"),
+          onRebase: () => assert.fail("replay cannot invent a new decision journal"),
+        });
+        assert.deepEqual(duplicate, { ...result, replayed: true });
+        assert.equal(rowCount(db, "rebase_journal"), i + 1);
+        rebaser.configure(stored(db, id));
+      }
+      assert.deepEqual(records(rebaser.rebase(bytes(c.localWire))), c.expectedRecords);
+    } finally { db.close(); }
+  });
+}
+
+test("journal failure rolls back replacement rows and receipt", async () => {
+  const { db, host } = opened();
+  try {
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "failed-journal", onConflict: () => "replace",
+      async onRebase(tx, info) {
+        await tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["failed-journal", info]);
+        throw new Error("journal failure");
+      },
+    }), /journal failure/);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "rebase_journal"), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+test("cancellation after the journal write rolls back every effect", async () => {
+  const { db, host } = opened(), controller = new AbortController();
+  try {
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "cancelled", signal: controller.signal, onConflict: () => "replace",
+      async onRebase(tx, info) {
+        await tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["cancelled", info]);
+        controller.abort("during journal persistence");
+      },
+    }), { code: "ERR_FSQLITE_CHANGESET_CANCELLED" });
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "rebase_journal"), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+test("deferred COMMIT failure cannot leave a durable journal or receipt", async () => {
+  const { db, host } = opened();
+  db.exec("CREATE TABLE parent(id PRIMARY KEY); CREATE TABLE deferred_child(id REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);");
+  try {
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "deferred", onConflict: () => "replace",
+      async onRebase(tx, info) {
+        await tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["deferred", info]);
+        await tx.execute("INSERT INTO deferred_child VALUES (?)", [123n]);
+      },
+    }), /FOREIGN KEY/);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "rebase_journal"), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+test("an outer rollback undoes a successful child application and its journal", async () => {
+  const { db, host } = opened();
+  try {
+    await assert.rejects(host.transaction(async () => {
+      await applyChangeset(host, bytes(first.remoteWires[0]), {
+        tables: ["t"], deliveryId: "child", onConflict: () => "replace",
+        onRebase: (tx, info) => tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["child", info]),
+      });
+      assert.equal(rowCount(db, "rebase_journal"), 1);
+      throw new Error("outer failed");
+    }), /outer failed/);
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "rebase_journal"), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+test("lost acknowledgement plus file reopen recovers the original proof without rerunning SQL", async () => {
+  // Retain the temporary database as an inspectable test artifact; no deletion.
+  const filename = join(mkdtempSync(join(tmpdir(), "fsqlite-rebase-")), "source.db");
+  let { db, host } = opened(first, filename);
+  try {
+    host.loseAcknowledgement = true;
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "lost-ack", onConflict: () => "omit",
+      onRebase: (tx, info) => tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["lost-ack", info]),
+    }), /lost commit acknowledgement/);
+    db.close(); db = new DatabaseSync(filename); host = sqlTarget(db);
+    const replay = await applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "lost-ack",
+      onConflict: () => assert.fail("cannot replay policy"),
+      onRebase: () => assert.fail("cannot replay persistence"),
+    });
+    assert.equal(replay.replayed, true);
+    assert.equal(rowCount(db, "rebase_journal"), 1); assert.equal(inboxCount(db), 1);
+    assert.deepEqual(records(rebaseChangeset(local(), [stored(db, "lost-ack")])), first.expectedRecords);
+    assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  } finally { db.close(); }
+});
+test("callback cannot corrupt the reserved inbox schema unnoticed", async () => {
+  const { db, host } = opened();
+  try {
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "schema", onConflict: () => "replace",
+      async onRebase(tx, info) {
+        await tx.execute("INSERT INTO rebase_journal VALUES (?, ?)", ["schema", info]);
+        await tx.execute("CREATE TRIGGER bad_receipt AFTER INSERT ON __fsqlite_changeset_receipts BEGIN SELECT 1; END");
+      },
+    }), { code: "ERR_FSQLITE_CHANGESET_RECEIPT" });
+    assert.equal(db.prepare("SELECT v FROM t").get().v, "local");
+    assert.equal(rowCount(db, "rebase_journal"), 0); assert.equal(inboxCount(db), 0);
+  } finally { db.close(); }
+});
+test("admission captures limits and hook once before awaiting callbacks", async () => {
+  const { db, host } = opened(), input = bytes(first.remoteWires[0]);
+  let reads = 0, hooks = 0;
+  const options = { tables: ["t"], limits: { get maxBytes() { reads++; return 1000; } },
+    async onConflict() { input.fill(0); await Promise.resolve(); return "omit"; },
+    onRebase(_tx, info) { hooks++; assert.deepEqual(decodeRebaseInfo(info), decodeRebaseInfo(rbInfo())); },
+  };
+  try {
+    const pending = applyChangeset(host, input, options);
+    options.onRebase = () => assert.fail("must not read hook again after admission");
+    await pending; assert.equal(reads, 1); assert.equal(hooks, 1);
+  } finally { db.close(); }
+});
+test("patchsets and invalid hooks fail before any transaction admission", async () => {
+  const { db, host } = opened();
+  try {
+    const wire = encodePatchset(decodeChangeset(bytes(first.remoteWires[0])));
+    await assert.rejects(applyPatchset(host, wire, { tables: ["t"], onRebase() {} }), { code: "ERR_FSQLITE_CHANGESET_INPUT" });
+    await assert.rejects(applyChangeset(host, bytes(first.remoteWires[0]), { tables: ["t"], onRebase: 123 }), { code: "ERR_FSQLITE_CHANGESET_INPUT" });
+    assert.equal(host.admissions, 0);
+  } finally { db.close(); }
+});
+test("existing receipts without a decision journal do not fabricate rebase evidence", async () => {
+  const { db, host } = opened();
+  try {
+    await applyChangeset(host, bytes(first.remoteWires[0]), { tables: ["t"], deliveryId: "old", onConflict: () => "omit" });
+    const result = await applyChangeset(host, bytes(first.remoteWires[0]), {
+      tables: ["t"], deliveryId: "old", onRebase: () => assert.fail("no historical evidence exists"),
+    });
+    assert.equal(result.replayed, true); assert.equal(rowCount(db, "rebase_journal"), 0);
+  } finally { db.close(); }
+});
+
+test("key-only duplicate insert needs no impossible empty UPDATE", async () => {
+  const db = new DatabaseSync(":memory:"), host = sqlTarget(db);
+  db.exec("CREATE TABLE key_only(k PRIMARY KEY); INSERT INTO key_only VALUES(1);");
+  const wire = encodeChangeset([{ name: "key_only", primaryKey: [1], changes: [
+    { operation: "insert", indirect: false, new: [1n] },
+  ] }]);
+  let captured;
+  try {
+    await applyChangeset(host, wire, {
+      tables: ["key_only"], onConflict: () => "omit", onRebase(_tx, info) { captured = info; },
+    });
+    assert.equal(rebaseChangeset(wire, [captured]).length, 0);
+    assert.equal(rowCount(db, "key_only"), 1);
+  } finally { db.close(); }
+});
+test("an empty fresh delivery saves an explicit empty decision buffer once", async () => {
+  const { db, host } = opened();
+  let calls = 0;
+  const options = { tables: [], deliveryId: "empty",
+    async onRebase(tx, info) {
+      calls++; assert.equal(info.length, 0);
+      await tx.execute("INSERT INTO rebase_journal VALUES ('empty', zeroblob(0))");
+    },
+  };
+  try {
+    assert.deepEqual(await applyChangeset(host, new Uint8Array(), options), { applied: 0, omitted: 0, replayed: false });
+    assert.deepEqual(await applyChangeset(host, new Uint8Array(), options), { applied: 0, omitted: 0, replayed: true });
+    assert.equal(calls, 1); assert.equal(stored(db, "empty").length, 0);
+  } finally { db.close(); }
+});
+test("shared codec preserves 64 native changeset/patchset roundtrips and default patchset application", async () => {
+  const initial = "CREATE TABLE c(k PRIMARY KEY,v,w); INSERT INTO c VALUES(1,'a','b'),(2,'c','d');";
+  const rows = (db) => {
+    const statement = db.prepare("SELECT k,v,w,typeof(v) FROM c ORDER BY k");
+    statement.setReadBigInts(true); return statement.all();
+  };
+  for (let n = 0; n < 64; n++) {
+    const source = new DatabaseSync(":memory:"), replica = new DatabaseSync(":memory:");
+    source.exec(initial); replica.exec(initial);
+    const session = source.createSession();
+    try {
+      source.exec(`UPDATE c SET v=CAST(${n} AS REAL),w=x'00ff'; DELETE FROM c WHERE k=2; INSERT INTO c VALUES(3,'λ'||char(0)||'😀',NULL);`);
+      const full = session.changeset(), patch = session.patchset();
+      assert.deepEqual(encodeChangeset(decodeChangeset(full)), Uint8Array.from(full));
+      assert.deepEqual(encodePatchset(decodePatchset(patch)), Uint8Array.from(patch));
+      const result = await applyPatchset(sqlTarget(replica), patch, { tables: ["c"] });
+      assert.equal(result.applied, 3); assert.deepEqual(rows(replica), rows(source));
+    } finally { session.close(); source.close(); replica.close(); }
+  }
+});
