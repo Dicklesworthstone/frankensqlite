@@ -324,7 +324,7 @@ test("throwing and invalid conflict callbacks do not leave partial application",
     (error) => error === failure,
   );
   await assert.rejects(
-    applyChangeset(actual, bytes, { ...options, onConflict: () => "replace" }),
+    applyChangeset(actual, bytes, { ...options, onConflict: () => "overwrite" }),
     code("ERR_FSQLITE_CHANGESET_INPUT"),
   );
   assert.deepEqual(actual.rows(), [{ id: 2n, v: "local" }]);
@@ -942,4 +942,181 @@ test("two overlapping file connections do not apply a delivery twice", async (t)
   assert.equal((await applyChangeset(right, bytes, deliveryOptions)).replayed, true);
   assert.equal(left.db.prepare("SELECT count(*) AS n FROM audit").get().n, 1);
   assert.equal(inboxCount(left), 2);
+});
+
+// Session REPLACE is not SQL INSERT OR REPLACE: only a primary-key conflict
+// permits removing the matching row, never an unrelated UNIQUE-index victim.
+for (const operation of ["insert", "update", "delete"]) {
+  for (const composite of [false, true]) {
+    test(`replace agrees with native session: ${operation}, composite=${composite}`, async (t) => {
+      const definition = composite
+        ? "CREATE TABLE t(b TEXT COLLATE NOCASE,a INTEGER,v,local TEXT DEFAULT 'default',PRIMARY KEY(a,b)) WITHOUT ROWID;"
+        : "CREATE TABLE t(a INTEGER PRIMARY KEY,b TEXT,v,local TEXT DEFAULT 'default');";
+      const original = composite ? "('key',1,'old','source')" : "(1,'key','old','source')";
+      const diverged = composite ? "('KEY',1,'local','keep')" : "(1,'key','local','keep')";
+      const author = target(t, definition + (operation === "insert" ? "" : `INSERT INTO t VALUES${original};`));
+      const actual = target(t, definition + `INSERT INTO t VALUES${diverged};`);
+      const oracle = target(t, definition + `INSERT INTO t VALUES${diverged};`);
+      const session = author.db.createSession();
+      author.db.exec(operation === "insert"
+        ? `INSERT INTO t VALUES${original};`
+        : operation === "delete" ? "DELETE FROM t" : "UPDATE t SET v='remote'");
+      const bytes = session.changeset();
+      const nativeConflicts = [], sdkConflicts = [];
+      assert.equal(oracle.db.applyChangeset(bytes, {
+        onConflict(kind) { nativeConflicts.push(kind); return constants.SQLITE_CHANGESET_REPLACE; },
+      }), true);
+      const applied = await applyChangeset(actual, bytes, {
+        ...options,
+        onConflict(conflict) { sdkConflicts.push(conflict.kind); return "replace"; },
+      });
+      assert.deepEqual(nativeConflicts, [operation === "insert"
+        ? constants.SQLITE_CHANGESET_CONFLICT : constants.SQLITE_CHANGESET_DATA]);
+      assert.deepEqual(sdkConflicts, [operation === "insert" ? "conflict" : "data"]);
+      assert.deepEqual(applied, { applied: 1, omitted: 0, replayed: false });
+      assert.deepEqual(actual.rows("SELECT * FROM t ORDER BY a,b"), oracle.rows("SELECT * FROM t ORDER BY a,b"));
+      if (operation === "update") assert.equal(actual.rows("SELECT local FROM t")[0].local, "keep");
+      assert.ok(!actual.log.some((sql) => /(?:INSERT|UPDATE) OR REPLACE/.test(sql)));
+      session.close();
+    });
+  }
+}
+
+for (const value of [null, -(1n << 63n), (1n << 63n) - 1n, 1, Infinity, "text\0tail", Uint8Array.of(0, 255)]) {
+  test(`replace preserves new storage class and bytes: ${String(value)}`, async (t) => {
+    const actual = target(t, "CREATE TABLE t(id INTEGER PRIMARY KEY,v); INSERT INTO t VALUES(1,'local');");
+    const oracle = target(t, "CREATE TABLE t(id INTEGER PRIMARY KEY,v); INSERT INTO t VALUES(1,'local');");
+    const bytes = wire([update([1n, "old"], [undefined, value])]);
+    assert.equal(oracle.db.applyChangeset(bytes, { onConflict: () => constants.SQLITE_CHANGESET_REPLACE }), true);
+    await applyChangeset(actual, bytes, { ...options, onConflict: () => "replace" });
+    const sql = "SELECT id, typeof(v) AS type, CAST(v AS BLOB) AS bytes FROM t";
+    assert.deepEqual(actual.rows(sql), oracle.rows(sql));
+  });
+}
+
+test("primary-key replacement resets trailing defaults, while DATA updates preserve them", async (t) => {
+  const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v,extra DEFAULT 'default'); INSERT INTO t VALUES(1,'local','receiver');");
+  await applyChangeset(actual, wire([update([1n, "old"], [undefined, "remote"])]), {
+    ...options, onConflict: () => "replace",
+  });
+  assert.equal(actual.rows()[0].extra, "receiver");
+  await applyChangeset(actual, wire([insert(1n, "replacement")]), {
+    ...options, onConflict: () => "replace",
+  });
+  assert.deepEqual(actual.rows(), [{ id: 1n, v: "replacement", extra: "default" }]);
+});
+
+for (const change of [insert(1n, "occupied"), update([1n, "old"], [undefined, "occupied"])]) {
+  test(`replace never removes an unrelated UNIQUE victim: ${change.operation}`, async (t) => {
+    const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v UNIQUE ON CONFLICT REPLACE); INSERT INTO t VALUES(1,'local'),(2,'occupied'); CREATE TABLE audit(x); CREATE TRIGGER deleted AFTER DELETE ON t BEGIN INSERT INTO audit VALUES(old.id); END;");
+    let callbacks = 0;
+    await assert.rejects(applyChangeset(actual, wire([insert(3n, "prefix"), change]), {
+      ...deliveryOptions, onConflict() { callbacks++; return "replace"; },
+    }), /UNIQUE constraint failed/);
+    assert.equal(callbacks, 1);
+    assert.deepEqual(actual.rows(), [{ id: 1n, v: "local" }, { id: 2n, v: "occupied" }]);
+    assert.deepEqual(actual.rows("SELECT * FROM audit"), []);
+    assert.equal(actual.db.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name=?").get(CHANGESET_RECEIPTS_TABLE).n, 0);
+  });
+}
+
+for (const change of [remove(9n, "missing"), update([9n, "missing"], [undefined, "new"])]) {
+  test(`replace refuses missing ${change.operation} rather than inventing an upsert`, async (t) => {
+    const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v);");
+    await assert.rejects(applyChangeset(actual, wire([insert(1n, "prefix"), change]), {
+      ...deliveryOptions, onConflict: () => "replace",
+    }), code("ERR_FSQLITE_CHANGESET_INPUT"));
+    assert.deepEqual(actual.rows(), []);
+  });
+}
+
+for (const phase of ["DELETE", "INSERT"]) {
+  test(`ignored replacement ${phase} rolls back the original and all effects`, async (t) => {
+    const actual = target(t, `CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,'local'); CREATE TABLE audit(x); CREATE TRIGGER deleted AFTER DELETE ON t BEGIN INSERT INTO audit VALUES(old.id); END; CREATE TRIGGER ignored BEFORE ${phase} ON t WHEN ${phase === "DELETE" ? "OLD" : "NEW"}.id=1 BEGIN SELECT RAISE(IGNORE); END;`);
+    await assert.rejects(applyChangeset(actual, wire([insert(2n, "prefix"), insert(1n, "new")]), {
+      ...deliveryOptions, onConflict: () => "replace",
+    }), code("ERR_FSQLITE_CHANGESET_RESULT"));
+    assert.deepEqual(actual.rows(), [{ id: 1n, v: "local" }]);
+    assert.deepEqual(actual.rows("SELECT * FROM audit"), []);
+  });
+}
+
+test("cancellation between replacement DELETE and INSERT restores the original row", async (t) => {
+  const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,'local');");
+  const abort = new AbortController();
+  actual.afterExecute = (sql) => { if (sql.startsWith("DELETE")) abort.abort("after delete"); };
+  await assert.rejects(applyChangeset(actual, wire([insert(1n, "new")]), {
+    ...deliveryOptions, signal: abort.signal, onConflict: () => "replace",
+  }), code("ERR_FSQLITE_CHANGESET_CANCELLED"));
+  assert.deepEqual(actual.rows(), [{ id: 1n, v: "local" }]);
+  assert.ok(!actual.log.some((sql) => sql.startsWith('INSERT OR ABORT INTO main."t"')));
+});
+
+test("async replace decision drains before cancellation settles; no replacement starts", async (t) => {
+  const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,'local');");
+  const abort = new AbortController();
+  let enter, release;
+  const entered = new Promise((r) => { enter = r; });
+  const gate = new Promise((r) => { release = r; });
+  const pending = applyChangeset(actual, wire([insert(2n, "prefix"), insert(1n, "new")]), {
+    ...deliveryOptions, signal: abort.signal,
+    async onConflict() { enter(); await gate; return "replace"; },
+  });
+  let settled = false;
+  const checked = assert.rejects(pending, code("ERR_FSQLITE_CHANGESET_CANCELLED")).then(() => { settled = true; });
+  await entered;
+  abort.abort();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, false);
+  release();
+  await checked;
+  assert.deepEqual(actual.rows(), [{ id: 1n, v: "local" }]);
+  assert.ok(!actual.log.some((sql) => sql.startsWith("DELETE")));
+});
+
+test("mutating conflict image blobs cannot replace with callback-modified bytes", async (t) => {
+  const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,x'01');");
+  await applyChangeset(actual, wire([insert(1n, Uint8Array.of(2, 3))]), {
+    ...options, onConflict(conflict) { conflict.change.new[1].fill(99); return "replace"; },
+  });
+  assert.deepEqual(actual.rows()[0].v, Uint8Array.of(2, 3));
+});
+
+test("callback deletion cannot manufacture a successful replacement", async (t) => {
+  const actual = target(t, "CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,'local');");
+  await assert.rejects(applyChangeset(actual, wire([insert(1n, "new")]), {
+    ...options, async onConflict() { await actual.execute("DELETE FROM t"); return "replace"; },
+  }), code("ERR_FSQLITE_CHANGESET_RESULT"));
+  assert.deepEqual(actual.rows(), [{ id: 1n, v: "local" }]);
+});
+
+test("a replacement's deferred FK failure also rolls back its receipt", async (t) => {
+  const actual = target(t, "PRAGMA foreign_keys=ON; CREATE TABLE parent(id PRIMARY KEY); INSERT INTO parent VALUES(1); CREATE TABLE t(id PRIMARY KEY,v REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO t VALUES(1,1);");
+  const bytes = wire([insert(1n, 2n)]);
+  await assert.rejects(applyChangeset(actual, bytes, {
+    ...deliveryOptions, onConflict: () => "replace",
+  }), /FOREIGN KEY constraint failed/);
+  assert.deepEqual(actual.rows(), [{ id: 1n, v: 1n }]);
+  actual.db.exec("INSERT INTO parent VALUES(2)");
+  assert.equal((await applyChangeset(actual, bytes, { ...deliveryOptions, onConflict: () => "replace" })).replayed, false);
+});
+
+test("replacement and trigger effects are recorded once across lost ACK and file reopen", async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "fsqlite-replacement-")), "receiver.db");
+  const actual = new SqlTarget("CREATE TABLE t(id PRIMARY KEY,v); INSERT INTO t VALUES(1,'local'); CREATE TABLE audit(op); CREATE TRIGGER d AFTER DELETE ON t BEGIN INSERT INTO audit VALUES('d'); END; CREATE TRIGGER i AFTER INSERT ON t BEGIN INSERT INTO audit VALUES('i'); END;", path);
+  const bytes = wire([insert(1n, "new")]);
+  try {
+    await assert.rejects(applyChangeset({
+      async transaction(work, opts) { await actual.transaction(work, opts); throw Error("lost ACK"); },
+    }, bytes, { ...deliveryOptions, onConflict: () => "replace" }), /lost ACK/);
+  } finally { actual.db.close(); }
+  const reopened = new SqlTarget("", path);
+  try {
+    assert.deepEqual(await applyChangeset(reopened, bytes, {
+      ...deliveryOptions, onConflict() { assert.fail("replay must retain original replace decision"); },
+    }), { applied: 1, omitted: 0, replayed: true });
+    assert.deepEqual(reopened.rows(), [{ id: 1n, v: "new" }]);
+    assert.deepEqual(reopened.rows("SELECT op FROM audit ORDER BY rowid"), [{ op: "d" }, { op: "i" }]);
+    assert.equal(reopened.db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  } finally { reopened.db.close(); }
 });

@@ -45,8 +45,13 @@ export interface ApplyChangesetOptions {
   tables: readonly string[];
   /** Stable source-qualified delivery identity; atomically recorded with the rows. */
   deliveryId?: string;
-  /** Default: abort. SQL/constraint errors always abort, never become omissions. */
-  onConflict?: (conflict: ChangesetConflict) => "abort" | "omit" | Promise<"abort" | "omit">;
+  /**
+   * Default: abort. replace is valid only for data/primary-key conflicts, never
+   * missing rows. SQL/constraint errors still abort the entire owned scope.
+   */
+  onConflict?: (
+    conflict: ChangesetConflict,
+  ) => "abort" | "omit" | "replace" | Promise<"abort" | "omit" | "replace">;
   limits?: ChangesetLimits;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -489,6 +494,7 @@ async function applyRow(
         : integer(probe[0]![0]) === 0
           ? "data"
           : undefined;
+  let replace = false;
   if (kind !== undefined) {
     const conflict = Object.freeze({
       kind,
@@ -501,13 +507,37 @@ async function applyRow(
       settings.onConflict === undefined ? "abort" : await settings.onConflict(conflict);
     settings.checkpoint();
     if (action === "omit") return false;
-    if (action !== "abort") invalid("onConflict must return abort or omit");
-    throw new ChangesetApplyError(
-      "ERR_FSQLITE_CHANGESET_CONFLICT",
-      `Changeset ${kind} conflict in ${plan.name} at change ${changeIndex}`,
-      conflict,
-    );
+    if (action === "abort") {
+      throw new ChangesetApplyError(
+        "ERR_FSQLITE_CHANGESET_CONFLICT",
+        `Changeset ${kind} conflict in ${plan.name} at change ${changeIndex}`,
+        conflict,
+      );
+    }
+    if (action !== "replace") invalid("onConflict must return abort, omit or replace");
+    if (kind === "not-found") invalid("replace requires an existing conflicting row");
+    replace = true;
   }
+  if (replace && change.operation === "insert") {
+    // Session REPLACE removes ONLY the row with the conflicting primary key,
+    // then retries the ordinary INSERT. INSERT OR REPLACE could also delete
+    // unrelated rows that collide on another UNIQUE index. Never do that.
+    // This deletion, its trigger/FK effects, the insert and the inbox receipt
+    // share the enclosing owned transaction: every later error rolls them back.
+    settings.checkpoint();
+    const removed = await tx.execute(
+      `DELETE FROM ${plan.sqlName} WHERE ${where.key}`,
+      where.keyParams,
+    );
+    settings.checkpoint();
+    if (removed !== 1) badResult();
+  }
+  // DATA replacement overrides only the expected before-image, not the key,
+  // unchanged UPDATE columns, constraint enforcement, or affected-row checks.
+  const condition = replace ? where.key : `${where.key} AND ${where.before}`;
+  const conditionParams = replace
+    ? where.keyParams
+    : [...where.keyParams, ...where.beforeParams];
   const params: ChangesetValue[] = [];
   let sql: string;
   if (change.operation === "insert") {
@@ -516,8 +546,8 @@ async function applyRow(
       change.new.map((value) => parameter(value, params)).join(", ") +
       ")";
   } else if (change.operation === "delete") {
-    sql = `DELETE FROM ${plan.sqlName} WHERE ${where.key} AND ${where.before}`;
-    params.push(...where.keyParams, ...where.beforeParams);
+    sql = `DELETE FROM ${plan.sqlName} WHERE ${condition}`;
+    params.push(...conditionParams);
   } else {
     const assignments: string[] = [];
     for (let i = 0; i < change.new.length; i++) {
@@ -525,8 +555,8 @@ async function applyRow(
       if (value !== undefined)
         assignments.push(`${quote(plan.columns[i]!)} = ${parameter(value, params)}`);
     }
-    sql = `UPDATE OR ABORT ${plan.sqlName} SET ${assignments.join(", ")} WHERE ${where.key} AND ${where.before}`;
-    params.push(...where.keyParams, ...where.beforeParams);
+    sql = `UPDATE OR ABORT ${plan.sqlName} SET ${assignments.join(", ")} WHERE ${condition}`;
+    params.push(...conditionParams);
   }
   settings.checkpoint();
   const changed = await tx.execute(sql, params);
@@ -542,8 +572,9 @@ async function applyRow(
  * Apply bounded SQLite session wire changes through real owned SQL. Schema and
  * explicit before-image conflicts fail closed by default. This is NOT the full
  * native sqlite3changeset_apply API: triggers/constraints retain ordinary SQL
- * behavior, and constraint omission, REPLACE, rebasing and FK deferral are not
- * synthesized. No manual BEGIN or global writer serialization is introduced.
+ * behavior, and constraint omission, rebasing and FK deferral are not
+ * synthesized. Explicit data/primary-key replacement stays inside the owned
+ * scope. No manual BEGIN or global writer serialization is introduced.
  */
 export async function applyChangeset(
   target: ChangesetTarget,

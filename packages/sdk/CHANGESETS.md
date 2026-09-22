@@ -79,17 +79,34 @@ SQL identifiers are quoted; values are bound, not interpolated.
 By default, a missing row, changed before-image or duplicate primary key aborts
 the complete application. An optional awaited `onConflict` callback receives
 `kind` (`data`, `not-found`, or `conflict`), table, zero-based global change index,
-column names and owned change images. It may return `omit` for that entry or
-`abort`. Thrown errors, invalid callback results, cancellation and SQL errors
+column names and owned change images. It may return `omit`, `abort`, or `replace`.
+Replacement is allowed only for `data` and `conflict`, never `not-found`.
+Thrown errors, invalid callback results, cancellation and SQL errors
 roll back the owned scope. SQL/constraint errors are never silently converted
 to omissions. INSERT/UPDATE use OR ABORT to override schema IGNORE/REPLACE rules;
 an ignored write cannot be counted as applied. Counts exclude trigger/FK effects.
+
+`replace` on a DATA conflict applies the incoming UPDATE or DELETE despite the
+different before-image. An UPDATE still changes only its supplied columns; it
+does not replace the entire row. On an INSERT primary-key conflict, it deletes
+only the row with that key and retries INSERT OR ABORT. It never uses SQL INSERT
+OR REPLACE, which could remove an unrelated row via a different UNIQUE index.
+Trailing target columns get their defaults on a replacement INSERT. The delete,
+insert, ordinary trigger/FK effects and receipt share one transaction: any later
+constraint, cancellation, ignored write or commit failure rolls everything back.
+One successfully replaced entry counts as one applied change, not two SQL writes.
+
+The same callback type is accepted by `ChangesetReceiver`; returning `replace`
+there does not bypass its confirmation barrier. A retained receipt replays the
+original outcome without executing replacement SQL or resolving the conflict
+again. Replacement is an explicit application policy, never an automatic retry
+or a claim that one replica's values are inherently authoritative.
 
 This is deliberately not the entire native `sqlite3changeset_apply` API. Local
 triggers and foreign-key actions retain ordinary SQL behavior, so the allowlist
 is not a security sandbox or a promise that triggers cannot modify other tables.
 Authenticate changesets and trust the target schema. The helper does not disable
-constraints, synthesize FK deferral, implement REPLACE/constraint omission or
+constraints, synthesize FK deferral, implement constraint omission or
 rebasing, automatically capture changes, or provide a replication transport.
 For snapshot persistence, SQL commit still requires an explicit checkpoint to
 publish durable browser storage; applying a changeset does not checkpoint.
