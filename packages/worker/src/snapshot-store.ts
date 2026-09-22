@@ -298,6 +298,19 @@ export function validateSnapshotBytes(bytes: Uint8Array): void {
   ) {
     throw corrupt("Snapshot has an invalid page size or a truncated page");
   }
+  // Page alignment alone misses truncation by one or more complete pages.
+  // SQLite trusts a nonzero header page count only when the change counter
+  // matches version-valid-for; legacy writers otherwise use actual file size.
+  // https://www.sqlite.org/fileformat.html#in_header_database_size
+  const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const pages = header.getUint32(28);
+  if (
+    pages !== 0 &&
+    header.getUint32(24) === header.getUint32(92) &&
+    pages > bytes.byteLength / pageSize
+  ) {
+    throw corrupt("Snapshot is missing pages declared by its SQLite header");
+  }
 }
 
 function validateRecord(value: unknown, name: string): SnapshotRecord {

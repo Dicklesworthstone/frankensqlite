@@ -3,7 +3,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_SNAPSHOT_BYTES, IndexedDbSnapshotStore as Store } from "../src/snapshot-store.ts";
+import {
+  MAX_SNAPSHOT_BYTES,
+  IndexedDbSnapshotStore as Store,
+  validateSnapshotBytes,
+} from "../src/snapshot-store.ts";
 import {
   snapshotImage as image,
   installIndexedDbModel,
@@ -329,4 +333,114 @@ test("model: unsupported stored schema rejects open without deleting it", async 
   state(name).stores.clear();
   await assert.rejects(Store.open(name), code("ERR_FSQLITE_SNAPSHOT_CORRUPT"));
   assert.equal(state(name).stores.size, 0);
+});
+
+// Header fixtures, not complete B-trees. Exercise the shared image validator
+// used by both persistence backends without claiming SQL integrity checking.
+function countedImage(pageSize, pages = 3) {
+  const bytes = new Uint8Array(pageSize * pages);
+  bytes.set(image(17, pageSize));
+  const header = new DataView(bytes.buffer);
+  header.setUint32(24, 0x12345678);
+  header.setUint32(28, pages);
+  header.setUint32(92, 0x12345678);
+  return bytes;
+}
+
+for (const pageSize of [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]) {
+  test(`model: ${pageSize}-byte pages cannot publish a whole-page-truncated image`, async () => {
+    const { store } = await fixture();
+    try {
+      const bytes = countedImage(pageSize);
+      // The backing buffer still contains the last page; this view does not.
+      const truncated = bytes.subarray(0, bytes.byteLength - pageSize);
+      await assert.rejects(store.save(truncated, null), code("ERR_FSQLITE_SNAPSHOT_CORRUPT"));
+      assert.equal(await store.load(), null);
+      const saved = await store.save(bytes, null);
+      await assert.rejects(
+        store.save(truncated, saved.revision),
+        code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+      );
+      const retained = await store.load();
+      assert.equal(retained.revision, saved.revision);
+      assert.deepEqual(retained.bytes, bytes);
+    } finally {
+      store.close();
+    }
+  });
+
+  test(`model: ${pageSize}-byte pages retain SQLite's legacy size fallback`, async () => {
+    const { store } = await fixture();
+    try {
+      const bytes = countedImage(pageSize);
+      const header = new DataView(bytes.buffer);
+      let revision = null;
+      // An unavailable/stale count falls back to the actual file size. A
+      // smaller authoritative count may ignore trailing complete pages.
+      for (const [pages, validFor] of [
+        [0, 0x12345678],
+        [0xffffffff, 0x12345679],
+        [1, 0x12345678],
+        [3, 0x12345678],
+      ]) {
+        header.setUint32(28, pages);
+        header.setUint32(92, validFor);
+        const saved = await store.save(bytes, revision);
+        revision = saved.revision;
+        assert.deepEqual((await store.load()).bytes, bytes);
+      }
+    } finally {
+      store.close();
+    }
+  });
+}
+
+test("image validation reads the view's header and length, not its backing buffer", () => {
+  const backing = new Uint8Array(512 * 3 + 256).fill(255);
+  const bytes = backing.subarray(128, 128 + 512 * 3);
+  bytes.set(countedImage(512));
+  assert.doesNotThrow(() => validateSnapshotBytes(bytes));
+  assert.throws(
+    () => validateSnapshotBytes(bytes.subarray(0, 1024)),
+    code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+  );
+});
+
+test("image page counts remain unsigned and equal zero change counters are authoritative", () => {
+  const bytes = countedImage(512);
+  const header = new DataView(bytes.buffer);
+  header.setUint32(24, 0);
+  header.setUint32(92, 0);
+  assert.doesNotThrow(() => validateSnapshotBytes(bytes));
+  for (const pages of [4, 0x80000000, 0xffffffff]) {
+    header.setUint32(28, pages);
+    assert.throws(() => validateSnapshotBytes(bytes), code("ERR_FSQLITE_SNAPSHOT_CORRUPT"));
+  }
+});
+
+test("model: matching envelope checksum cannot confirm or replace a truncated database", async () => {
+  const { name, store } = await fixture();
+  try {
+    const bytes = countedImage(512);
+    const saved = await store.save(bytes, null);
+    const truncated = bytes.slice(0, 1024);
+    const record = state(name).values.get("head");
+    record.bytes = truncated.buffer;
+    record.byteLength = truncated.byteLength;
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", truncated));
+    record.sha256 = [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const damaged = structuredClone(record);
+    await assert.rejects(store.load(), code("ERR_FSQLITE_SNAPSHOT_CORRUPT"));
+    await assert.rejects(
+      store.confirmPublication(saved.revision, saved.parentRevision),
+      code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+    );
+    await assert.rejects(
+      store.save(bytes, saved.revision),
+      code("ERR_FSQLITE_SNAPSHOT_CORRUPT"),
+    );
+    assert.deepEqual(state(name).values.get("head"), damaged);
+  } finally {
+    store.close();
+  }
 });
