@@ -12422,8 +12422,8 @@ impl Drop for OperationCxGuard<'_> {
 /// # Lifecycle & quiescence contract (bd-1is5z)
 ///
 /// An **awaited** `close()` (or a `close_*` variant) is the only path that
-/// guarantees strict *quiescence*. It drains this connection's region tree via
-/// `RegionTree::close_and_drain`, which spin-waits until every region-registered
+/// guarantees strict *quiescence*. It drains this connection's region tree,
+/// awaiting (and yielding to the caller's executor) until every region-registered
 /// background task (spawned through `try_spawn_in_region`) has exited and — on the
 /// last connection to a path — the shared write-coordinator service task under the
 /// database-root region has joined. After an awaited close, no task spawned by this
@@ -12431,10 +12431,11 @@ impl Drop for OperationCxGuard<'_> {
 ///
 /// **`Drop` is cancel-only, by design.** Shutdown I/O is async and `Drop` cannot
 /// await; this crate never builds its own runtime (`Cx` flows down from the
-/// consumer, per AGENTS.md), and `close_and_drain`'s spin-wait would deadlock if
-/// run on a runtime thread inside `Drop`. So dropping a `Connection` without
-/// awaiting `close()` *cancels* every region `Cx` (tasks exit at their next
-/// `checkpoint()`) but does not wait for them: at `Drop` return the write-
+/// consumer, per AGENTS.md), and waiting for region quiescence inside `Drop`
+/// would block a runtime thread on tasks only that thread can run. So dropping
+/// a `Connection` without awaiting `close()` *cancels* every region `Cx`
+/// (tasks exit at their next `checkpoint()`) but does not wait for them: at
+/// `Drop` return the write-
 /// coordinator task may still be live and a quiescence oracle would not yet settle.
 /// A `drop_close` warning is emitted for this case, and open transactions are left
 /// unrolled-back with no checkpoint (committed bytes stay durable in the WAL and the
@@ -14595,7 +14596,9 @@ impl Connection {
         env.apply_blocking_io_inline_safety(&root_cx);
         pager.bind_shared_connection_count(shared_mvcc_state.shared_open_connection_count());
         if let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started() {
-            let _ = shared_mvcc_state.release_connection(runtime_region, true);
+            let _ = shared_mvcc_state
+                .release_connection(runtime_region, true)
+                .await;
             return Err(err);
         }
         let eprocess_oracle = Arc::new(EProcessOracle::new(
@@ -15128,7 +15131,9 @@ impl Connection {
         if !pager_is_memory
             && let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started()
         {
-            let _ = shared_mvcc_state.release_connection(runtime_region, true);
+            let _ = shared_mvcc_state
+                .release_connection(runtime_region, true)
+                .await;
             return Err(err);
         }
         let eprocess_oracle = Arc::new(EProcessOracle::new(
@@ -25452,9 +25457,8 @@ impl Connection {
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(mut pipeline) = self.wal_fec_pipeline.get_mut().take() {
-            // Await before close_and_drain's synchronous region wait. In
-            // particular, current-thread runtimes must get a chance to poll
-            // the worker and release its region TaskHandle.
+            // Flush and stop the worker explicitly before the region drain, so
+            // pending FEC work completes rather than being cancelled by it.
             if !pipeline.flush(&cx, Duration::from_secs(30)).await {
                 pipeline.cancel();
             }
@@ -25507,16 +25511,15 @@ impl Connection {
             }
         }
 
-        self._shared_mvcc_state
-            .stop_write_coordinator_before_last_release()
-            .await;
         if best_effort {
             let _ = self
                 ._shared_mvcc_state
-                .release_connection(self.runtime_region, true);
+                .release_connection(self.runtime_region, true)
+                .await;
         } else {
             self._shared_mvcc_state
-                .release_connection(self.runtime_region, false)?;
+                .release_connection(self.runtime_region, false)
+                .await?;
         }
         if let Some(metrics) = self.pool_metrics.take() {
             self._shared_mvcc_state
@@ -113126,7 +113129,7 @@ impl SharedMvccState {
     /// [`TaskHandle`] plus a child [`Cx`] of that region.
     ///
     /// The handle keeps the region's `active_tasks` count non-zero until it is
-    /// dropped, so [`RegionTree::close_and_drain`] accounts for the task; the
+    /// dropped, so [`RegionTree::try_finish_close`] accounts for the task; the
     /// child `Cx` makes the work cancel-correct (the region's `begin_close`
     /// cancels it). This is the low-level half of [`Self::try_spawn_in_region`].
     #[cfg_attr(not(test), allow(dead_code))]
@@ -113154,14 +113157,14 @@ impl SharedMvccState {
     ///
     /// The region [`TaskHandle`] is moved into the spawned future so the region's
     /// quiescence drain accounts for the task's whole lifetime, and the task runs
-    /// under a child [`Cx`] of `region` so `begin_close`/`close_and_drain` cancel
+    /// under a child [`Cx`] of `region` so `begin_close` cancels
     /// it. Returns `Ok(false)` when no native asupersync runtime is active
     /// (wasm / non-`native` builds).
     ///
     /// INVARIANT (bd-54ulg / bd-1is5z): per-Connection background work MUST go
     /// through this helper — never a raw `RuntimeHandle::try_spawn`,
     /// `std::thread::spawn`, or `spawn_blocking` outside `#[cfg(test)]`. A task
-    /// that does not hold a region `TaskHandle` is invisible to `close_and_drain`
+    /// that does not hold a region `TaskHandle` is invisible to the close drain
     /// and silently breaks quiescence-on-Connection-close.
     fn try_spawn_in_region<F, Fut>(&self, region: Region, task: F) -> Result<bool>
     where
@@ -113229,8 +113232,8 @@ impl SharedMvccState {
     ///
     /// `RegionTree::begin_close` cancels a region's `Cx` and propagates to
     /// descendant regions, but explicitly does not wait for quiescence.
-    /// `release_connection` (which calls `close_and_drain`) spin-waits and
-    /// therefore must not run on the drop path.
+    /// `release_connection` awaits quiescence, which `Drop` cannot do, so it
+    /// does not run on the drop path.
     ///
     /// Without this, a `Connection` dropped without an awaited `close()` leaks
     /// every task spawned into its region: nothing ever cancels their `Cx`, so
@@ -113293,75 +113296,93 @@ impl SharedMvccState {
         }
     }
 
-    /// Stop the database's WriteCoordinator before the last connection's
-    /// synchronous region drain, waiting for it cooperatively.
+    /// Drive `region`'s close to completion without blocking the executor.
     ///
-    /// `release_connection` drains the root region by spinning until its task
-    /// count reaches zero. The coordinator only exits once it is polled after
-    /// its shutdown sender drops, and on a current-thread runtime the only
-    /// thread that can poll it is the one closing the connection, so that spin
-    /// never ended: every file-backed `fsqlite` CLI invocation hung at exit
-    /// (bd-viyz2). Yielding here lets the caller's executor run the coordinator
-    /// to completion first, and the drain then finds its region already empty.
-    /// Quiescence is still awaited in full; nothing is abandoned or timed out.
-    async fn stop_write_coordinator_before_last_release(&self) {
-        let region = {
-            let mut state = lock_unpoisoned(&self.runtime_state);
-            if state.open_connections != 1 || state.write_coordinator_shutdown.is_none() {
-                return;
+    /// The tasks being drained, such as the WriteCoordinator after its shutdown
+    /// sender drops, finish only when polled, and on a current-thread runtime
+    /// the thread able to poll them is the one closing the connection. So the
+    /// runtime-state lock is held only for each non-blocking step, and the
+    /// caller's executor gets a turn between steps. A synchronous spin here once
+    /// made every file-backed `fsqlite` CLI invocation hang at exit (bd-viyz2,
+    /// bd-1eqrr). Quiescence is still awaited in full; nothing is abandoned or
+    /// timed out. Most drains finish within a few executor turns; a task that
+    /// runs long (blocking-pool work, say) is then waited on with a bounded
+    /// sleep rather than by spinning the closing thread.
+    async fn finish_region_close(&self, region: Region) -> Result<()> {
+        const YIELDS_BEFORE_SLEEP: u32 = 64;
+        let mut attempt = 0_u32;
+        loop {
+            if lock_unpoisoned(&self.runtime_state)
+                .regions
+                .try_finish_close(region)?
+            {
+                return Ok(());
             }
-            state.write_coordinator_service_starting = false;
-            state.write_coordinator_service_running = false;
-            let _ = state.write_coordinator_shutdown.take();
-            state.write_coordinator_region
-        };
-        while lock_unpoisoned(&self.runtime_state)
-            .regions
-            .active_tasks(region)
-            > 0
-        {
-            asupersync::runtime::yield_now().await;
+            attempt = attempt.saturating_add(1);
+            if attempt <= YIELDS_BEFORE_SLEEP {
+                asupersync::runtime::yield_now().await;
+            } else {
+                // 50us doubling to a 6.4ms ceiling.
+                let micros = 50_u64 << (attempt - YIELDS_BEFORE_SLEEP).min(7);
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_micros(micros),
+                )
+                .await;
+            }
         }
     }
 
-    fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
-        let mut state = lock_unpoisoned(&self.runtime_state);
-
+    async fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
         let connection_close_started = Instant::now();
-        tracing::info!(
-            target: "fsqlite::runtime",
-            event = "region_closing",
-            db_path = %state.key.path_key,
-            region_id = connection_region.get(),
-            active_tasks = state.regions.active_tasks(connection_region)
-        );
-        if let Err(err) = state.regions.close_and_drain(connection_region) {
-            tracing::warn!(
+        let begin_connection_close = {
+            let mut state = lock_unpoisoned(&self.runtime_state);
+            tracing::info!(
                 target: "fsqlite::runtime",
-                event = "region_close_failed",
+                event = "region_closing",
                 db_path = %state.key.path_key,
                 region_id = connection_region.get(),
-                error = %err
+                active_tasks = state.regions.active_tasks(connection_region)
             );
-            if !best_effort {
-                return Err(err);
-            }
-        }
-        if state.open_connections > 0 {
-            state.open_connections -= 1;
-            self.open_connection_count
-                .fetch_sub(1, AtomicOrdering::Release);
-        }
-        tracing::info!(
-            target: "fsqlite::runtime",
-            event = "region_closed",
-            db_path = %state.key.path_key,
-            region_id = connection_region.get(),
-            elapsed_ms = u64::try_from(connection_close_started.elapsed().as_millis())
-                .unwrap_or(u64::MAX)
-        );
+            state.regions.begin_close(connection_region)
+        };
+        let connection_close = match begin_connection_close {
+            Ok(()) => self.finish_region_close(connection_region).await,
+            Err(err) => Err(err),
+        };
 
-        if state.open_connections == 0 {
+        // The runtime-state guard must not live across the root drain's awaits.
+        let (db_root_region, begin_root_close, path_key, root_close_started) = {
+            let mut state = lock_unpoisoned(&self.runtime_state);
+            if let Err(err) = connection_close {
+                tracing::warn!(
+                    target: "fsqlite::runtime",
+                    event = "region_close_failed",
+                    db_path = %state.key.path_key,
+                    region_id = connection_region.get(),
+                    error = %err
+                );
+                if !best_effort {
+                    return Err(err);
+                }
+            }
+            if state.open_connections > 0 {
+                state.open_connections -= 1;
+                self.open_connection_count
+                    .fetch_sub(1, AtomicOrdering::Release);
+            }
+            tracing::info!(
+                target: "fsqlite::runtime",
+                event = "region_closed",
+                db_path = %state.key.path_key,
+                region_id = connection_region.get(),
+                elapsed_ms = u64::try_from(connection_close_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+            );
+
+            if state.open_connections != 0 {
+                return Ok(());
+            }
             state.write_coordinator_service_starting = false;
             state.write_coordinator_service_running = false;
             let _ = state.write_coordinator_shutdown.take();
@@ -113374,34 +113395,47 @@ impl SharedMvccState {
                 region_id = db_root_region.get(),
                 active_tasks = state.regions.active_tasks(db_root_region)
             );
-            if let Err(err) = state.regions.close_and_drain(db_root_region) {
-                tracing::warn!(
-                    target: "fsqlite::runtime",
-                    event = "region_close_failed",
-                    db_path = %state.key.path_key,
-                    region_id = db_root_region.get(),
-                    error = %err
-                );
-                if !best_effort {
-                    return Err(err);
-                }
-            }
-            tracing::info!(
-                target: "fsqlite::runtime",
-                event = "region_closed",
-                db_path = %state.key.path_key,
-                region_id = db_root_region.get(),
-                elapsed_ms = u64::try_from(root_close_started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX)
-            );
-
+            // Detach before draining, so an open racing this close builds a
+            // fresh shared state instead of registering under a root that is
+            // closing.
             if state.key.path_key != ":memory:"
                 && let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get()
             {
                 lock_unpoisoned(state_map).remove(&state.key);
             }
-        }
+            let begin_root_close = state.regions.begin_close(db_root_region);
+            (
+                db_root_region,
+                begin_root_close,
+                state.key.path_key.clone(),
+                root_close_started,
+            )
+        };
 
+        let root_close = match begin_root_close {
+            Ok(()) => self.finish_region_close(db_root_region).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = root_close {
+            tracing::warn!(
+                target: "fsqlite::runtime",
+                event = "region_close_failed",
+                db_path = %path_key,
+                region_id = db_root_region.get(),
+                error = %err
+            );
+            if !best_effort {
+                return Err(err);
+            }
+        }
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_closed",
+            db_path = %path_key,
+            region_id = db_root_region.get(),
+            elapsed_ms = u64::try_from(root_close_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+        );
         Ok(())
     }
 
