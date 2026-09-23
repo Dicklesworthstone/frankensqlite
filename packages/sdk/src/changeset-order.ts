@@ -230,6 +230,154 @@ function fingerprint(row: Stored): string {
   return JSON.stringify({ ...row, sequence: row.sequence.toString() });
 }
 
+/**
+ * @internal Publish/verify the prefix installed by ChangesetBootstrapReceiver.
+ * The caller owns ONE transaction containing the validated baseline, this ledger
+ * and the installed marker. Metadata must come from that same verified staging
+ * snapshot, never from an untrusted remote receipt. This is not an enrollment API.
+ *
+ * Keep one metadata record at a time and advance the head once, avoiding a full
+ * ledger population scan for every seed chunk. On installed replay, never create
+ * missing storage or move the head backwards over later incremental deliveries.
+ */
+export async function bootstrapOrderPrefix(
+  tx: ChangesetExecutor,
+  options: {
+    readonly receiverId: string;
+    readonly sourceId: string;
+    readonly deliveryId: string;
+    readonly chunks: number;
+    readonly replayed: boolean;
+  },
+  readChunk: (index: number) => Promise<{
+    readonly sha256: string;
+    readonly byteLength: number;
+    readonly changes: number;
+  }>,
+  checkpoint: () => void,
+): Promise<ChangesetOrderHead> {
+  const receiverId = identity(options.receiverId, 256);
+  const sourceId = identity(options.sourceId, 256);
+  const root = identity(options.deliveryId, 480);
+  const chunks = bound(options.chunks, 1, 100_000);
+  const replayed = options.replayed;
+  if (typeof replayed !== "boolean" || typeof readChunk !== "function" || typeof checkpoint !== "function")
+    fail("ERR_FSQLITE_ORDER_INPUT", "Invalid verified-bootstrap prefix operation");
+  const inside: ChangesetTarget = { transaction: async work => work(tx) };
+  const order = new ChangesetOrder(inside, { receiverId, sourceId });
+  checkpoint();
+  // In particular, replay MUST NOT call initialize(): both missing tables can
+  // mean lost history, not a new stream. Fresh installation permits only genesis.
+  const before = replayed ? await order.head() : await order.initialize();
+  checkpoint();
+  if (replayed ? before.sequence < BigInt(chunks) : before.sequence !== 0n)
+    fail("ERR_FSQLITE_ORDER_REUSE", "Bootstrap does not match the retained order frontier");
+  let last: Stored | null = null;
+  for (let index = 0; index < chunks; index++) {
+    checkpoint();
+    const meta = await readChunk(index);
+    checkpoint();
+    const sequence = BigInt(index + 1);
+    const next = metadata([
+      sequence.toString(), receiverId, sourceId,
+      index === 0 ? root : `${root}/chunk/${index}`,
+      meta.sha256, meta.byteLength, meta.changes, 0,
+    ]);
+    if (!replayed) {
+      const changed = await tx.execute(
+        `INSERT OR ABORT INTO ${TABLE} VALUES (?,?,?,?,?,?,?,?)`,
+        [sequence, receiverId, sourceId, next.deliveryId, next.sha256,
+          BigInt(next.byteLength), BigInt(next.applied), 0n],
+      );
+      checkpoint();
+      if (changed !== 1)
+        fail("ERR_FSQLITE_ORDER_CORRUPT", "Bootstrap order entry was not stored exactly once");
+    }
+    const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
+    checkpoint();
+    if (rows.length !== 1 || fingerprint(metadata(rows[0]!)) !== fingerprint(next))
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Bootstrap order prefix disagrees with verified staging");
+    last = next;
+  }
+  if (last === null) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing bootstrap order prefix");
+  if (!replayed) {
+    const initial = metadata(["0", receiverId, sourceId, "", ZERO_HASH, 0, 0, 0]);
+    const changed = await tx.execute(
+      `UPDATE OR ABORT ${HEAD} SET receipt=? WHERE slot=1 AND receipt=? COLLATE BINARY`,
+      [fingerprint(last), fingerprint(initial)],
+    );
+    checkpoint();
+    if (changed !== 1)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Bootstrap order head did not advance atomically");
+  }
+  const after = await order.head();
+  checkpoint();
+  // head() returns the same Stored object, including its original decisions.
+  const expected = replayed ? before : last;
+  if (JSON.stringify(after, (_, value) => typeof value === "bigint" ? value.toString() : value) !==
+      JSON.stringify(expected, (_, value) => typeof value === "bigint" ? value.toString() : value))
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Bootstrap changed an unexpected order frontier");
+  return last;
+}
+
+/** A staged ordered baseline owns its prefix until the whole install commits. */
+async function requireInstalledBootstrap(tx: ChangesetExecutor, head: Stored): Promise<string | null> {
+  // These names are the bootstrap storage protocol. Avoid a runtime import cycle:
+  // bootstrap's publisher already imports this module, and both paths are covered
+  // together by changeset-bootstrap-order.test.mjs.
+  const stateName = "__fsqlite_bootstrap_state";
+  const chunksName = "__fsqlite_bootstrap_chunks";
+  const objects = await query(tx,
+    "SELECT name, type FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (?,?)",
+    [stateName, chunksName]);
+  if (objects.length === 0) return null;
+  if (objects.length !== 2 || objects.some(row => row[1] !== "table"))
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Partial or invalid bootstrap storage cannot authorize ordered writes");
+  const rows = await query(tx,
+    `SELECT id, CASE WHEN length(CAST(manifest AS BLOB))<=131072 THEN manifest END, ` +
+    `installed, received, bytes, changes, CASE WHEN length(chain)=64 THEN chain END ` +
+    `FROM main."${stateName}" LIMIT 2`);
+  if (rows.length !== 1 || rows[0]!.length !== 7 || count(rows[0]![0]) !== 1 || typeof rows[0]![1] !== "string")
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing or invalid bootstrap authority");
+  const row = rows[0]!;
+  let value: unknown;
+  try { value = JSON.parse(row[1] as string); }
+  catch { fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid bootstrap authority JSON"); }
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid bootstrap authority record");
+  if (!Object.hasOwn(value, "orderedSourceId")) return null; // Explicit legacy, unordered policy.
+  const m = value as Record<string, unknown>;
+  if (m.protocol !== "fsqlite-bootstrap-v1" || typeof m.receiverId !== "string" ||
+      typeof m.orderedSourceId !== "string" || typeof m.deliveryId !== "string" ||
+      !m.deliveryId.length || m.deliveryId.length > 480 || m.deliveryId.includes("\0") ||
+      typeof m.chunks !== "number" || !Number.isSafeInteger(m.chunks) || m.chunks < 1 || m.chunks > 100_000 ||
+      typeof m.byteLength !== "number" || !Number.isSafeInteger(m.byteLength) || m.byteLength < 0 || m.byteLength > 1024 * 1024 * 1024 ||
+      typeof m.changes !== "number" || !Number.isSafeInteger(m.changes) || m.changes < 0 || m.changes > 10_000_000 ||
+      typeof m.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.sha256))
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid ordered bootstrap authority fields");
+  if (m.receiverId !== head.receiverId || m.orderedSourceId !== head.sourceId)
+    fail("ERR_FSQLITE_ORDER_BINDING", "Ordered writes do not own this bootstrap's source/receiver binding");
+  const installed = count(row[2]);
+  if (installed === 0)
+    fail("ERR_FSQLITE_ORDER_GAP", "Finish atomic bootstrap installation before delivering its ordered stream");
+  if (installed !== 1 || count(row[3]) !== m.chunks || count(row[4]) !== m.byteLength ||
+      count(row[5]) !== m.changes || row[6] !== m.sha256 || head.sequence < BigInt(m.chunks))
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Installed bootstrap and ordered history disagree; do not reinitialize");
+  const prefix = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [BigInt(m.chunks)]);
+  const chunk = await query(tx,
+    `SELECT CASE WHEN length(sha256)=64 THEN sha256 END, byte_length, change_count, typeof(payload), length(payload) ` +
+    `FROM main."${chunksName}" WHERE idx=?`, [BigInt(m.chunks - 1)]);
+  if (prefix.length !== 1 || chunk.length !== 1 || chunk[0]!.length !== 5)
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Installed bootstrap lost its terminal order receipt");
+  const saved = metadata(prefix[0]!), end = chunk[0]!;
+  if (saved.receiverId !== head.receiverId || saved.sourceId !== head.sourceId ||
+      saved.deliveryId !== (m.chunks === 1 ? m.deliveryId : `${m.deliveryId}/chunk/${m.chunks - 1}`) ||
+      saved.sha256 !== end[0] || saved.byteLength !== count(end[1]) || saved.applied !== count(end[2]) ||
+      saved.omitted !== 0 || end[3] !== "blob" || count(end[4]) !== 0)
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Installed bootstrap terminal receipt was changed or not reclaimed");
+  return row[1] as string;
+}
+
 /** Drain admitted child scopes/SQL even when the application forgets to await. */
 async function applyScoped(
   tx: ChangesetExecutor,
@@ -387,6 +535,8 @@ export class ChangesetOrder {
       return await this.#target.transaction(async tx => {
         b.checkpoint();
         const before = await this.#head(tx);
+        const bootstrap = await requireInstalledBootstrap(tx, before);
+        b.checkpoint();
         if (sequence > before.sequence + 1n) fail("ERR_FSQLITE_ORDER_GAP", "A source predecessor is missing; no rows were applied");
         if (sequence <= before.sequence) {
           const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
@@ -413,6 +563,9 @@ export class ChangesetOrder {
           fail("ERR_FSQLITE_ORDER_REUSE", "Fresh ordered work must not reuse an unordered receipt");
         if (fingerprint(await this.#head(tx)) !== fingerprint(before))
           fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed the order ledger");
+        if (await requireInstalledBootstrap(tx, before) !== bootstrap)
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed its bootstrap authority");
+        b.checkpoint();
         const changed = await tx.execute(`INSERT OR ABORT INTO ${TABLE} VALUES (?,?,?,?,?,?,?,?)`,
           [sequence, this.#receiver, this.#source, deliveryId, sha256, BigInt(byteLength), BigInt(applied), BigInt(omitted)]);
         if (changed !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Sequence marker was not written exactly once");

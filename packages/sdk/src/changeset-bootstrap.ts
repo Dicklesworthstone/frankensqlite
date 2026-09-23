@@ -2,6 +2,7 @@ import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { applyChangeset } from "./changeset-apply";
 import type { ChangesetValue } from "./changeset-codec";
 import { decodeChangeset } from "./changeset-codec";
+import { bootstrapOrderPrefix } from "./changeset-order";
 
 /** Separate from ordinary per-message delivery: staging is NOT an application ACK. */
 export const CHANGESET_BOOTSTRAP_PROTOCOL = "fsqlite-bootstrap-v1";
@@ -42,6 +43,13 @@ export interface BootstrapInstallReceipt {
   readonly installed: true;
   readonly confirmed: true;
   readonly replayed: boolean;
+  /** Present only when the seed and its ordered prefix committed together. */
+  readonly order?: Readonly<{
+    protocol: "fsqlite-ordered-changeset-v1";
+    streamId: string;
+    /** Last seed sequence, not the current incremental tip. */
+    sequence: string;
+  }>;
 }
 export interface BootstrapReceiverOptions {
   receiverId: string;
@@ -49,6 +57,12 @@ export interface BootstrapReceiverOptions {
   tables: readonly string[];
   /** SAME top-level database; called after installation and every installed replay. */
   confirmCommit: () => Promise<unknown>;
+  /**
+   * Trusted source incarnation for an outbox seed occupying sequences 1..N.
+   * Bind before the FIRST stage and preserve on reopen. Never inferred from
+   * incoming data. Installation publishes the prefix in the SAME transaction.
+   */
+  orderedSourceId?: string;
   maxChunkBytes?: number;
   maxBytes?: number;
   maxChunks?: number;
@@ -415,6 +429,11 @@ async function noTriggers(tx: ChangesetExecutor, b: Budget, table: string): Prom
 interface Stored extends BootstrapProgress {
   chain: string;
 }
+function storedManifest(m: BootstrapManifest, orderedSourceId: string | undefined): string {
+  // Local policy is separate from the portable bootstrap wire hash. Persist it
+  // with the manifest so restart cannot silently downgrade an ordered install.
+  return JSON.stringify(orderedSourceId === undefined ? m : { ...m, orderedSourceId });
+}
 function progress(s: Stored): BootstrapProgress {
   return Object.freeze({
     receivedChunks: s.receivedChunks,
@@ -427,6 +446,7 @@ async function state(
   tx: ChangesetExecutor,
   b: Budget,
   m: BootstrapManifest,
+  orderedSourceId: string | undefined,
 ): Promise<Stored | null> {
   const rows = await query(
     tx,
@@ -442,7 +462,7 @@ async function state(
   if (rows.length !== 1 || rows[0]!.length !== 7 || sqlNumber(rows[0]![0], 1) !== 1)
     fail("CORRUPT", "Invalid bootstrap state row");
   const r = rows[0]!;
-  if (r[1] !== JSON.stringify(m))
+  if (r[1] !== storedManifest(m, orderedSourceId))
     fail("STATE", "Receiver is bound to a different bootstrap manifest; do not reseed");
   const s = {
     receivedChunks: sqlNumber(r[2], m.chunks),
@@ -513,6 +533,7 @@ export class ChangesetBootstrapReceiver {
   readonly #bytes: number;
   readonly #chunks: number;
   readonly #changes: number;
+  readonly #orderedSourceId: string | undefined;
   #active = false;
   constructor(target: ChangesetTarget, options: BootstrapReceiverOptions) {
     this.#target = target;
@@ -522,6 +543,8 @@ export class ChangesetBootstrapReceiver {
     if (typeof confirm !== "function")
       fail("INPUT", "Bootstrap requires same-target storage confirmation");
     this.#confirm = confirm;
+    const orderedSourceId = options.orderedSourceId;
+    this.#orderedSourceId = orderedSourceId === undefined ? undefined : text(orderedSourceId, 256);
     this.#chunkBytes = number(options.maxChunkBytes ?? 8 * 1024 * 1024, HARD_CHUNK, 1);
     this.#bytes = number(options.maxBytes ?? 256 * 1024 * 1024, HARD_BYTES, 1);
     this.#chunks = number(options.maxChunks ?? 10_000, 100_000, 1);
@@ -562,7 +585,7 @@ export class ChangesetBootstrapReceiver {
     return this.#run(options, (b) =>
       this.#target.transaction(async (tx) => {
         if (!(await ensure(tx, b, false))) return null;
-        const s = await state(tx, b, m);
+        const s = await state(tx, b, m, this.#orderedSourceId);
         return s === null ? null : progress(s);
       }, b.options()),
     );
@@ -585,7 +608,7 @@ export class ChangesetBootstrapReceiver {
       b.check();
       return this.#target.transaction(async (tx) => {
         await ensure(tx, b, true);
-        let s = await state(tx, b, m);
+        let s = await state(tx, b, m, this.#orderedSourceId);
         if (s === null) {
           if (index !== 0) fail("STATE", "Start bootstrap at chunk zero");
           s = {
@@ -599,7 +622,7 @@ export class ChangesetBootstrapReceiver {
             tx,
             b,
             `INSERT OR ABORT INTO ${STATE} VALUES (1,?,0,0,0,?,0)`,
-            [JSON.stringify(m), s.chain],
+            [storedManifest(m, this.#orderedSourceId), s.chain],
             1,
           );
         }
@@ -666,10 +689,13 @@ export class ChangesetBootstrapReceiver {
     return this.#run(options, async (b) => {
       const replayed = await this.#target.transaction(async (tx) => {
         if (!(await ensure(tx, b, false))) fail("STATE", "No staged bootstrap");
-        const s = await state(tx, b, m);
+        const s = await state(tx, b, m, this.#orderedSourceId);
         if (s === null || s.receivedChunks !== m.chunks)
           fail("STATE", "The complete bootstrap must be staged before installation");
-        if (s.installed) return true;
+        if (s.installed) {
+          await this.#orderPrefix(tx, b, m, true);
+          return true;
+        }
         await emptyTargets(tx, b, m);
         const count = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
         if (
@@ -715,6 +741,7 @@ export class ChangesetBootstrapReceiver {
         }
         if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
           fail("CORRUPT", "Staged bootstrap digest/totals mismatch");
+        await this.#orderPrefix(tx, b, m, false);
         await write(tx, b, `UPDATE OR ABORT ${CHUNKS} SET payload=X''`, [], m.chunks);
         await write(
           tx,
@@ -748,7 +775,44 @@ export class ChangesetBootstrapReceiver {
         installed: true,
         confirmed: true,
         replayed,
+        ...(this.#orderedSourceId === undefined ? {} : {
+          order: Object.freeze({
+            protocol: "fsqlite-ordered-changeset-v1" as const,
+            streamId: this.#orderedSourceId,
+            sequence: String(m.chunks),
+          }),
+        }),
       });
     });
+  }
+
+  /** Verify retained chunk metadata even after bodies have been reclaimed. */
+  async #orderPrefix(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest, replayed: boolean): Promise<void> {
+    if (this.#orderedSourceId === undefined) return;
+    const population = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
+    if (population.length !== 1 || population[0]!.length !== 1 ||
+        sqlNumber(population[0]![0], m.chunks) !== m.chunks)
+      fail("CORRUPT", "Bootstrap order prefix has missing or extra chunks");
+    let chain = await seed(m), bytes = 0, changes = 0;
+    await bootstrapOrderPrefix(tx, {
+      receiverId: this.#id,
+      sourceId: this.#orderedSourceId,
+      deliveryId: m.deliveryId,
+      chunks: m.chunks,
+      replayed,
+    }, async index => {
+      const meta = await chunkMeta(tx, b, index);
+      if (meta.storedBytes !== (replayed ? 0 : meta.byteLength) || meta.byteLength > this.#chunkBytes)
+        fail("CORRUPT", "Bootstrap order prefix has invalid payload metadata");
+      chain = await link(chain, index, meta.sha256, meta.byteLength, meta.changes);
+      bytes += meta.byteLength;
+      changes += meta.changes;
+      if (bytes > m.byteLength || changes > m.changes)
+        fail("CORRUPT", "Bootstrap order prefix exceeds manifest totals");
+      return meta;
+    }, () => b.check());
+    b.check();
+    if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
+      fail("CORRUPT", "Bootstrap order prefix failed manifest verification");
   }
 }

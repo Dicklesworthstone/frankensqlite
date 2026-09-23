@@ -98,6 +98,103 @@ callback must refer to the same TOP-LEVEL database. Durable SQL targets can expl
 supply an async no-op only when their own commit contract already supplies durability.
 A no-op on an in-memory database does not make it persistent.
 
+## Atomic handoff to ordered incremental replication
+
+For a seed created as the first `ChangesetOutbox.bootstrapChunks` operation,
+configure `orderedSourceId` **before staging chunk zero**. Use the same trusted
+source incarnation as the incremental ordered transport. The manifest's root
+delivery identity and exact chunk bytes must be those retained by that source
+outbox, not a newly generated snapshot of later data.
+
+```ts
+import {
+  ChangesetBootstrapReceiver, ChangesetOrder,
+  createOrderedChangesetReceiver, applyChangeset,
+} from '@frankensqlite/sdk';
+
+const seedReceiver = new ChangesetBootstrapReceiver(destination, {
+  receiverId: 'replica-42', tables: ['notes'],
+  orderedSourceId: 'source-42:incarnation-1',
+  confirmCommit: confirmDestinationCommit,
+});
+// Stage the immutable manifest/chunks as above, then:
+const installed = await seedReceiver.install(manifest);
+console.log(installed.order?.sequence); // N seed chunks occupy sequences 1..N.
+
+const order = new ChangesetOrder(destination, {
+  receiverId: 'replica-42', sourceId: 'source-42:incarnation-1',
+});
+// No separate initialize/reset is needed after installation.
+const incremental = await createOrderedChangesetReceiver(order, {
+  apply: (inside, message, controls) => applyChangeset(inside, message.changeset, {
+    tables: ['notes'], deliveryId: message.deliveryId, ...controls,
+  }),
+  confirmCommit: confirmDestinationCommit,
+});
+// The next source outbox message must have its original sequence N+1.
+```
+
+All baseline rows, the existing order ledger's per-chunk receipts and head,
+staging-body reclamation, and the installed marker commit in **one** transaction.
+There is no interval between committed baseline installation and order enrollment.
+Staging alone does not initialize an order ledger. A matching, empty genesis may
+already exist; a nonempty or differently bound ledger refuses installation and
+rolls back all its row writes. Nothing is renumbered or silently rebased.
+
+Once an ordered manifest is staged, `ChangesetOrder.apply` refuses its stream
+until installation commits, even when an incremental endpoint was already open
+on an initialized genesis. A pump therefore cannot publish the seed one chunk at
+a time through the incremental API. Application callbacks cannot remove or
+change the bootstrap authority while advancing the order ledger. Each ordinary
+delivery checks the installed binding and terminal prefix receipt; full retained
+seed-prefix verification remains part of bootstrap replay, not every increment.
+
+Seed sequence `i+1` retains the original root ID at `i=0`, otherwise
+`root/chunk/i`, together with its verified byte digest, length and applied-row
+count. These are replay records, not separately committed chunk applications.
+Historical ordered seed retries return their original decisions without inserting
+rows again. An empty seed still occupies its original source sequence.
+
+The installed receipt adds a frozen, JSON-serializable `order` field containing
+`protocol: 'fsqlite-ordered-changeset-v1'`, `streamId`, and the canonical decimal
+`sequence`. It identifies the **seed's** final sequence, not a later incremental
+tip. It is still a bootstrap receipt, not a per-delivery ACK. Authenticate the
+transport and verify the exact manifest/receiver before source reclamation; this
+option does not acknowledge source entries or change fanout membership.
+
+Reopen with the same `orderedSourceId`. It is stored as local policy alongside the
+manifest, independently of the portable wire hash. Changing it, omitting it, or
+adding it to an existing unordered bootstrap is refused. Installed replay checks
+the retained chunk metadata against the manifest hash and every seed ledger
+receipt, without needing reclaimed payloads or rerunning application SQL. It
+never recreates missing order tables/receipts or rewinds newer increments. A failed
+check prevents confirmation. Whole-database restoration can still restore older
+history; hashes are not authentication or an external rollback detector.
+
+The prefix writer retains one metadata entry at a time and updates the order head
+once. The existing 100,000-entry order limit includes seed chunks; a seed that
+uses the entire limit leaves no room for incremental entries. Reserve headroom.
+Foreign-key rules remain unchanged; explicitly deferred constraints or a suitable
+whole-install transaction policy are required for cross-chunk cyclic dependencies.
+
+The cross-component regression suite runs the production bootstrap, codec,
+`applyChangeset`, and order ledger together on reference SQLite, including native
+Session-generated seeds followed by actual SDK incremental application:
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/fanout-source-loader.mjs \
+  --test packages/sdk/tests/changeset-bootstrap-order.test.mjs
+```
+
+Process-death coverage kills a separate Node process at row application, prefix
+insertion, head publication, body reclamation, before/after COMMIT and confirmation,
+under both WAL and DELETE journals. Fresh SQLite connections verify all-or-none
+baseline/order publication and retry the same retained manifest.
+
+This is not validation of the FrankenSQLite Rust/WASM engine, the complete HTTP
+and source-pump path, browser snapshot persistence, or physical power loss.
+
 ## Resource and cancellation contract
 
 Default limits are 8 MiB per chunk, 256 MiB total wire bytes, 10,000 chunks and
