@@ -573,6 +573,12 @@ pub struct ReusableTableExecutionState {
     pub version_store: Option<Arc<VersionStore>>,
     pub collect_result_rows: bool,
     pub max_collected_result_rows: Option<usize>,
+    /// The database's TEXT encoding. Set before execution because a program
+    /// may encode TEXT (MakeRecord for an index seek key) before its first
+    /// OpenRead, which is where the engine otherwise adopts the page-1 header
+    /// encoding; a fresh engine would build a UTF-8 key against UTF-16 index
+    /// entries and match nothing.
+    pub text_encoding: TextEncoding,
 }
 
 // ── In-Memory Table Store ──────────────────────────────────────────────────
@@ -6554,6 +6560,13 @@ pub struct VdbeEngine {
     /// the page-1 header; TEXT record columns decode through it. Defaults to
     /// UTF-8 and is preserved across `reset_for_reuse` (same connection/DB).
     text_encoding: TextEncoding,
+    /// Set when the connection supplied `text_encoding` for this execution
+    /// (`apply_reusable_table_execution_state`). The connection's value then
+    /// governs the whole program: storage-cursor open does not re-adopt a
+    /// page-1 header, because the TEMP store's header does not carry main's
+    /// encoding and ATTACH already rejects a mismatched one. Cleared on reset,
+    /// so engines run without connection state keep adopting at cursor open.
+    text_encoding_authoritative: bool,
     /// Whether opcode-level tracing is enabled, latched when the engine is constructed.
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
@@ -7190,6 +7203,7 @@ impl VdbeEngine {
             execution_cx: execution_cx.clone(),
             page_size,
             text_encoding: TextEncoding::Utf8,
+            text_encoding_authoritative: false,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
             results: Vec::with_capacity(64),
@@ -7404,6 +7418,7 @@ impl VdbeEngine {
         self.bindings.clear();
         self.execution_cx = execution_cx.clone();
         self.page_size = page_size;
+        self.text_encoding_authoritative = false;
         // Opcode tracing is engine configuration; reuse preserves the construction-time setting.
         self.collect_vdbe_metrics = false;
         self.results.clear();
@@ -7587,7 +7602,10 @@ impl VdbeEngine {
             version_store,
             collect_result_rows,
             max_collected_result_rows,
+            text_encoding,
         } = state;
+        self.text_encoding = text_encoding;
+        self.text_encoding_authoritative = true;
 
         let mut outcome = ReusableTableExecutionStateOutcome::default();
         let mut note_rebind = |changed: bool| {
@@ -11394,10 +11412,15 @@ impl VdbeEngine {
                         } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page)
                         {
                             // MemDatabase fallback (Phase 4 in-memory cursors).
+                            // MakeRecord encoded TEXT in `self.text_encoding`;
+                            // decode in the same encoding so a UTF-16 database's
+                            // TEMP rows are not mojibaked (as bd-o3rz4 did for
+                            // FusedAppendInsert).
                             let values = if let Some(record) = preformatted_record {
-                                let values = parse_record(record).ok_or_else(|| {
-                                    FrankenError::internal("malformed SQLite record blob")
-                                })?;
+                                let values = parse_record_with_encoding(record, self.text_encoding)
+                                    .ok_or_else(|| {
+                                        FrankenError::internal("malformed SQLite record blob")
+                                    })?;
                                 if self.collect_vdbe_metrics {
                                     FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
                                         .fetch_add(1, AtomicOrdering::Relaxed);
@@ -11407,9 +11430,11 @@ impl VdbeEngine {
                                 }
                                 values
                             } else if sideband_active {
-                                let values = parse_record(&sideband_buf).ok_or_else(|| {
-                                    FrankenError::internal("malformed SQLite record blob")
-                                })?;
+                                let values =
+                                    parse_record_with_encoding(&sideband_buf, self.text_encoding)
+                                        .ok_or_else(|| {
+                                            FrankenError::internal("malformed SQLite record blob")
+                                        })?;
                                 if self.collect_vdbe_metrics {
                                     FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
                                         .fetch_add(1, AtomicOrdering::Relaxed);
@@ -17432,7 +17457,11 @@ impl VdbeEngine {
                 // field directly (not via `set_text_encoding`) because
                 // `self.txn_page_io` is mutably borrowed as `page_io` across
                 // this block, and a `&mut self` method call would overlap it.
-                self.text_encoding = page_layout.text_encoding;
+                // A connection-supplied encoding stays in force for the whole
+                // program (see `text_encoding_authoritative`).
+                if !self.text_encoding_authoritative {
+                    self.text_encoding = page_layout.text_encoding;
+                }
 
                 if is_valid_btree {
                     // Real B-tree backed by pager: infer table-vs-index from the
@@ -23353,6 +23382,7 @@ mod tests {
             version_store: None,
             collect_result_rows: false,
             max_collected_result_rows: Some(1),
+            text_encoding: TextEncoding::Utf8,
         };
 
         let first_outcome = engine.apply_reusable_table_execution_state(state.clone());
@@ -23403,6 +23433,7 @@ mod tests {
             version_store: None,
             collect_result_rows: true,
             max_collected_result_rows: None,
+            text_encoding: TextEncoding::Utf8,
         };
 
         // First apply: fresh engine, caches will be cleared (func_registry was None)
@@ -23455,6 +23486,7 @@ mod tests {
                 version_store: None,
                 collect_result_rows: true,
                 max_collected_result_rows: None,
+                text_encoding: TextEncoding::Utf8,
             });
         assert!(
             fourth_outcome.function_cache_cleared,

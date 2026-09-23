@@ -9207,6 +9207,7 @@ impl PreparedStatement<'_> {
             self.conn.memdb_storage_count_shortcuts_safe.get(),
             self.conn.version_store_for_program(self.program.as_ref()),
             page_size,
+            self.conn.db_text_encoding.get(),
             false,
             None,
             None,
@@ -9387,6 +9388,7 @@ impl PreparedStatement<'_> {
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
                 self.conn.version_store_for_program(self.program.as_ref()),
                 page_size,
+                self.conn.db_text_encoding.get(),
                 max_collected_result_rows,
                 true,
                 cached,
@@ -9440,6 +9442,7 @@ impl PreparedStatement<'_> {
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
                 self.conn.version_store_for_program(self.program.as_ref()),
                 page_size,
+                self.conn.db_text_encoding.get(),
                 max_collected_result_rows,
                 true,
                 cached,
@@ -9574,6 +9577,7 @@ impl PreparedStatement<'_> {
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
                 self.conn.version_store_for_program(self.program.as_ref()),
                 page_size,
+                self.conn.db_text_encoding.get(),
                 collect_rows,
                 max_collected_result_rows,
                 row_handler,
@@ -9630,6 +9634,7 @@ impl PreparedStatement<'_> {
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
                 self.conn.version_store_for_program(self.program.as_ref()),
                 page_size,
+                self.conn.db_text_encoding.get(),
                 collect_rows,
                 max_collected_result_rows,
                 row_handler,
@@ -94881,6 +94886,7 @@ impl Connection {
             self.memdb_storage_count_shortcuts_safe.get(),
             self.version_store_for_program(program),
             page_size,
+            self.db_text_encoding.get(),
             true,
             None,
             None,
@@ -130708,6 +130714,7 @@ async fn execute_table_program_with_db(
     storage_cursor_memdb_count_shortcuts_safe: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
+    text_encoding: TextEncoding,
     collect_rows: bool,
     max_collected_result_rows: Option<usize>,
     mut row_handler: Option<&mut QueryRowHandler<'_>>,
@@ -130799,6 +130806,7 @@ async fn execute_table_program_with_db(
         version_store,
         collect_result_rows: collect_rows,
         max_collected_result_rows,
+        text_encoding,
     });
 
     // bd-v6pjf: hand the engine the declared->physical permutation so the
@@ -131001,6 +131009,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     storage_cursor_memdb_count_shortcuts_safe: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
+    text_encoding: TextEncoding,
     max_collected_result_rows: usize,
     prepared_engine_reuse_profile: bool,
     cached_engine: Option<VdbeEngine>,
@@ -131079,6 +131088,7 @@ async fn execute_table_program_exactly_one_row_with_db(
         version_store,
         collect_result_rows: true,
         max_collected_result_rows: Some(max_collected_result_rows),
+        text_encoding,
     });
 
     // bd-v6pjf: see execute_table_program_with_db — remap non-leading-PK
