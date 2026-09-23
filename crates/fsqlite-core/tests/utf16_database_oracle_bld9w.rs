@@ -34,6 +34,10 @@
 //!   * `utf16_fixture_really_is_utf16_*` — proves the rusqlite fixtures actually
 //!     produce UTF-16 databases (header text-encoding byte + `PRAGMA encoding`).
 
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
