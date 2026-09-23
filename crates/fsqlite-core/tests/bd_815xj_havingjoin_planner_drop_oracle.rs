@@ -11,6 +11,10 @@
 //!
 //! Differential against rusqlite: frank must AGREE with stock (error-ness + rows).
 
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
