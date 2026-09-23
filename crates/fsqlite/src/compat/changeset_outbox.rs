@@ -34,6 +34,10 @@
 //! // transport. Only acknowledge() after validating the receiver's COMMIT.
 //! ```
 
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[path = "changeset_delivery.rs"]
+pub mod delivery;
+
 use fsqlite_types::ecs::PayloadHash;
 
 use super::{
@@ -44,6 +48,8 @@ use super::{
 
 const QUEUE: &str = "__fsqlite_changeset_outbox";
 const STATE: &str = "__fsqlite_changeset_outbox_state";
+// Keep the bypass guard active even in builds without the native delivery API.
+const DELIVERY_ROUTE: &str = "__fsqlite_changeset_delivery_route";
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const STATE_DDL: &str = "CREATE TABLE \"__fsqlite_changeset_outbox_state\" (slot INTEGER PRIMARY KEY CHECK(slot=1), incarnation BLOB NOT NULL, last_sequence INTEGER NOT NULL, pending_messages INTEGER NOT NULL, pending_bytes INTEGER NOT NULL, receipts INTEGER NOT NULL)";
 const QUEUE_DDL: &str = "CREATE TABLE \"__fsqlite_changeset_outbox\" (sequence INTEGER PRIMARY KEY, message_id BLOB NOT NULL UNIQUE, payload_hash BLOB NOT NULL, payload_bytes INTEGER NOT NULL, change_count INTEGER NOT NULL, touched_rows INTEGER NOT NULL, payload BLOB)";
@@ -336,6 +342,9 @@ impl ChangesetOutbox {
     /// source receipt must match, including incarnation, request ID, sequence,
     /// digest and counts. Duplicate acknowledgements are idempotent. Retained
     /// identity tombstones prevent request-ID reuse even after payload removal.
+    /// Once an ordered delivery route exists, use that route's acknowledgement
+    /// API instead: reclaiming bytes without advancing its predecessor would
+    /// make the remaining messages undeliverable.
     pub async fn acknowledge(
         &self, connection: &mut Connection, cx: &Cx, receipt: &OutboxReceipt,
     ) -> CaptureResult<AcknowledgeOutcome> {
@@ -345,31 +354,49 @@ impl ChangesetOutbox {
         checkpoint(cx)?;
         let transaction = connection.transaction().await?;
         let result = async {
-            Self::validate_schema(&transaction, cx).await?;
-            let state = self.read_state(&transaction).await?;
-            let status = self.lookup_in(&transaction, receipt.message_id).await?
-                .ok_or(CaptureError::Input("acknowledgement names an unknown request"))?;
-            if &status.receipt != receipt {
-                return Err(CaptureError::Input("acknowledgement does not match the committed source receipt"));
+            let routes = transaction.query_with_params(
+                "SELECT name FROM main.sqlite_schema WHERE CAST(name AS BLOB)=?1 LIMIT 1",
+                &[blob(DELIVERY_ROUTE.as_bytes())],
+            ).await?;
+            if !routes.is_empty() {
+                return Err(CaptureError::Input("ordered delivery requires a route-bound acknowledgement"));
             }
-            if status.acknowledged { return Ok(AcknowledgeOutcome::AlreadyAcknowledged); }
-            let messages = state.pending_messages.checked_sub(1)
-                .ok_or(CaptureError::Schema("outbox pending message count underflow"))?;
-            let bytes = state.pending_bytes.checked_sub(receipt.payload_bytes)
-                .ok_or(CaptureError::Schema("outbox pending byte count underflow"))?;
-            if messages == 0 && bytes != 0 { return Err(CaptureError::Schema("outbox final acknowledgement leaves inconsistent byte accounting")); }
-            checkpoint(cx)?;
-            let changed = transaction.execute_with_params(&format!(
-                "UPDATE main.{} SET payload=NULL WHERE sequence=?1 AND payload IS NOT NULL", quote(QUEUE),
-            ), &[SqliteValue::Integer(receipt.sequence)]).await?;
-            if changed != 1 { return Err(CaptureError::Schema("outbox acknowledgement lost its record")); }
-            let changed = transaction.execute_with_params(&format!(
-                "UPDATE main.{} SET pending_messages=?1,pending_bytes=?2 WHERE slot=1", quote(STATE),
-            ), &[number(messages)?, number(bytes)?]).await?;
-            if changed != 1 { return Err(CaptureError::Schema("outbox acknowledgement lost its accounting row")); }
-            Ok(AcknowledgeOutcome::Acknowledged)
+            self.acknowledge_in(&transaction, cx, receipt).await
         }.await;
         settle(transaction, cx, result).await
+    }
+
+    // The route owner reuses this mutation inside its OWN transaction so
+    // payload reclamation, accounting and predecessor publication are atomic.
+    async fn acknowledge_in(
+        &self, transaction: &Transaction<'_>, cx: &Cx, receipt: &OutboxReceipt,
+    ) -> CaptureResult<AcknowledgeOutcome> {
+        if receipt.incarnation != self.incarnation {
+            return Err(CaptureError::Input("acknowledgement belongs to a different outbox incarnation"));
+        }
+        Self::validate_schema(transaction, cx).await?;
+        let state = self.read_state(transaction).await?;
+        let status = self.lookup_in(transaction, receipt.message_id).await?
+            .ok_or(CaptureError::Input("acknowledgement names an unknown request"))?;
+        if &status.receipt != receipt {
+            return Err(CaptureError::Input("acknowledgement does not match the committed source receipt"));
+        }
+        if status.acknowledged { return Ok(AcknowledgeOutcome::AlreadyAcknowledged); }
+        let messages = state.pending_messages.checked_sub(1)
+            .ok_or(CaptureError::Schema("outbox pending message count underflow"))?;
+        let bytes = state.pending_bytes.checked_sub(receipt.payload_bytes)
+            .ok_or(CaptureError::Schema("outbox pending byte count underflow"))?;
+        if messages == 0 && bytes != 0 { return Err(CaptureError::Schema("outbox final acknowledgement leaves inconsistent byte accounting")); }
+        checkpoint(cx)?;
+        let changed = transaction.execute_with_params(&format!(
+            "UPDATE main.{} SET payload=NULL WHERE sequence=?1 AND payload IS NOT NULL", quote(QUEUE),
+        ), &[SqliteValue::Integer(receipt.sequence)]).await?;
+        if changed != 1 { return Err(CaptureError::Schema("outbox acknowledgement lost its record")); }
+        let changed = transaction.execute_with_params(&format!(
+            "UPDATE main.{} SET pending_messages=?1,pending_bytes=?2 WHERE slot=1", quote(STATE),
+        ), &[number(messages)?, number(bytes)?]).await?;
+        if changed != 1 { return Err(CaptureError::Schema("outbox acknowledgement lost its accounting row")); }
+        Ok(AcknowledgeOutcome::Acknowledged)
     }
 
     async fn enqueue(
