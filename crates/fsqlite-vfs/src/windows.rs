@@ -79,8 +79,9 @@ const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const ERROR_NOT_LOCKED: i32 = 158;
 
-// Dedicated database workers may perform bounded I/O without another thread
-// hop. Match the Unix backend's limit; ordinary async callers still offload.
+// Bounded positional I/O runs inline, as `sync` does; only larger transfers
+// take the blocking pool. Matches the Unix backend (see its
+// `INLINE_IO_MAX_BYTES`).
 const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
 
 fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::Result<u64> {
@@ -2472,7 +2473,7 @@ impl VfsFile for WindowsFile {
         checkpoint_or_abort(cx)?;
         let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
         let requested = buf.len();
-        if cx.blocking_io_inline_safe() && requested <= INLINE_IO_MAX_BYTES {
+        if requested <= INLINE_IO_MAX_BYTES {
             let (data, total) = read_owned_at(&file, requested, offset)?;
             checkpoint_or_abort(cx)?;
             buf.copy_from_slice(&data);
@@ -2489,7 +2490,7 @@ impl VfsFile for WindowsFile {
     async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
             write_owned_at(&file, buf, offset)?;
             return checkpoint_or_abort(cx);
         }
@@ -2518,7 +2519,7 @@ impl VfsFile for WindowsFile {
             }
         };
         let source_completion = VfsWriteCompletionSource::new(completion.clone());
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
             write_owned_at_tracked(&file, buf, offset, source_completion)?;
             return checkpoint_or_abort(cx);
         }

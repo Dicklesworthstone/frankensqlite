@@ -492,8 +492,9 @@ struct CxInner {
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
     // bd-bjm5d: set only on the root Cx of a dedicated engine OS thread
     // that owns its Connection exclusively and is not a shared scheduler
-    // worker. Grants VFS backends permission to issue bounded EINTR-safe
-    // positional I/O inline instead of hopping to the blocking pool.
+    // worker. It used to gate inline bounded positional I/O in the VFS
+    // backends; they now issue page-sized I/O inline for every context, so
+    // the marker only records the thread-ownership property.
     // Deliberately NOT feature-gated: this is an OS-thread-ownership
     // property, not an asupersync property.
     blocking_io_inline_safe: AtomicBool,
@@ -1520,8 +1521,8 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         drop(retired);
     }
 
-    /// Mark this context as running on a dedicated engine OS thread where
-    /// bounded blocking I/O may be issued inline (bd-bjm5d). Irreversible
+    /// Mark this context as running on a dedicated engine OS thread
+    /// (bd-bjm5d). Irreversible
     /// for the lifetime of this context; shared through [`Cx::clone`] and
     /// propagated to children by [`Cx::create_child`].
     pub fn mark_blocking_io_inline_safe(&self) {
@@ -1530,8 +1531,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .store(true, Ordering::Release);
     }
 
-    /// Whether bounded, page-sized positional I/O may be issued inline on
-    /// the calling thread instead of via the blocking pool (bd-bjm5d).
+    /// Whether this context runs on a dedicated engine OS thread (bd-bjm5d).
+    ///
+    /// The VFS backends no longer consult it: page-sized positional I/O runs
+    /// inline for every context.
     #[must_use]
     pub fn blocking_io_inline_safe(&self) -> bool {
         self.inner.blocking_io_inline_safe.load(Ordering::Acquire)

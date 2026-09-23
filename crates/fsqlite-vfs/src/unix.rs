@@ -162,11 +162,15 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result
     })
 }
 
-/// Upper bound for inline positional I/O under the bd-bjm5d marker.
+/// Upper bound for inline positional I/O.
 ///
-/// Matches `IO_URING_MAX_RW_CHUNK_BYTES` (64 KiB = the maximum page size);
-/// WAL group-commit consolidated writes can be arbitrarily large and
-/// therefore always take the blocking pool regardless of the marker.
+/// Page-sized reads and writes (up to 64 KiB, the maximum page size, matching
+/// `IO_URING_MAX_RW_CHUNK_BYTES`) run inline on the calling thread, exactly as
+/// `sync` always has: a pread/pwrite of one page costs about as much as the
+/// handoff to a blocking-pool thread (~14 us round trip, several per
+/// statement), and with no asupersync runtime polling, `spawn_blocking_io`
+/// starts a fresh OS thread per call. Larger transfers — WAL group-commit
+/// consolidated writes can be arbitrarily large — still take the pool.
 const INLINE_IO_MAX_BYTES: usize = 64 * 1024;
 
 #[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
@@ -1620,6 +1624,15 @@ impl Vfs for UnixVfs {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(FrankenError::Io(error)),
         }
+    }
+
+    fn path_file_identity(&self, _cx: &Cx, path: &Path) -> Result<Option<FileIdentity>> {
+        use std::os::unix::fs::MetadataExt;
+        // `stat` follows symlinks exactly as `open` does, and opens no
+        // descriptor, so it cannot disturb this process's fcntl locks.
+        Ok(fs::metadata(path)
+            .ok()
+            .map(|meta| FileIdentity::from_unix_parts(meta.dev(), meta.ino())))
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -3410,13 +3423,11 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        // bd-bjm5d: on a dedicated engine OS thread (marker set), a bounded
-        // pread directly into the caller's buffer costs ~1.5us where the
-        // blocking-pool round-trip costs ~14us — and the driver thread
-        // would only park while waiting. Semantics preserved exactly:
-        // EINTR retried in place, zero-filled tail on short read, actual
-        // total returned.
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+        // A bounded pread directly into the caller's buffer costs ~1.5us
+        // where the blocking-pool round-trip costs ~14us. Semantics preserved
+        // exactly: EINTR retried in place, zero-filled tail on short read,
+        // actual total returned.
+        if buf.len() <= INLINE_IO_MAX_BYTES {
             let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
             buf[total..].fill(0);
             checkpoint_or_abort(cx)?;
@@ -3439,7 +3450,7 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
             write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
             return checkpoint_or_abort(cx);
         }
@@ -3475,7 +3486,7 @@ impl VfsFile for UnixFile {
         // The completion token resolves at the syscall site, which the
         // inline arm satisfies trivially (same thread, same frame); the
         // pre-flight error path above already completed the token.
-        if cx.blocking_io_inline_safe() && buf.len() <= INLINE_IO_MAX_BYTES {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
             match write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write") {
                 Ok(()) => {
                     completion.complete_success();
@@ -3513,12 +3524,11 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        // bd-bjm5d: on a dedicated engine thread the whole batch can be
-        // pwritten inline — no hop AND no staging copies at all.
-        if cx.blocking_io_inline_safe()
-            && writes
-                .iter()
-                .all(|(_, data)| data.len() <= INLINE_IO_MAX_BYTES)
+        // A batch of bounded writes is pwritten inline — no hop AND no
+        // staging copies at all.
+        if writes
+            .iter()
+            .all(|(_, data)| data.len() <= INLINE_IO_MAX_BYTES)
         {
             for (offset, data) in writes {
                 checked_io_range(*offset, data.len(), "write")?;
@@ -10163,10 +10173,9 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_cx_never_takes_the_inline_path() {
-        // Without the marker the behavior must be byte-identical to the
-        // pooled path (which the rest of this suite pins); this test just
-        // pins the gate itself via the roundtrip still working.
+    fn unmarked_cx_page_io_roundtrips_inline() {
+        // Bounded I/O no longer depends on the marker: an unmarked context
+        // takes the same inline path.
         let cx = Cx::new();
         assert!(!cx.blocking_io_inline_safe());
         let vfs = UnixVfs::new();

@@ -1181,6 +1181,10 @@ impl Vfs for IoUringVfs {
         self.unix.path_entry_exists(cx, path)
     }
 
+    fn path_file_identity(&self, cx: &Cx, path: &Path) -> Result<Option<FileIdentity>> {
+        self.unix.path_file_identity(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.unix.full_pathname(cx, path)
     }

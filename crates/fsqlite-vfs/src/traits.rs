@@ -752,6 +752,16 @@ pub trait Vfs: Send + Sync {
         self.access(cx, path, AccessFlags::EXISTS)
     }
 
+    /// Identity of the file `path` names now, without opening it, in the
+    /// domain of [`VfsFile::file_identity`]: equal identities mean the path
+    /// and an open handle name the same file.
+    ///
+    /// `Ok(None)` means "not known cheaply" (no such entry, or a VFS without
+    /// stable identities); callers must then take their open-and-inspect path.
+    fn path_file_identity(&self, _cx: &Cx, _path: &Path) -> Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+
     /// Resolve a potentially relative path into an absolute path.
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;
 

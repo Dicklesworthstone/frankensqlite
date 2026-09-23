@@ -1121,6 +1121,7 @@ version = "0.4.4"
 dependencies = [
  "asupersync",
  "fsqlite",
+ "fsqlite-ast",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-parser",

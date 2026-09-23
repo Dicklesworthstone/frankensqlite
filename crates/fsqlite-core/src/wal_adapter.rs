@@ -3707,6 +3707,27 @@ where
         Ok(wal)
     }
 
+    /// Cheap form of opening `wal_path` and comparing its header with this
+    /// handle's generation: when a `stat` of the path shows the file this
+    /// handle already has open, the path's header *is* the handle's header, so
+    /// it is read through the handle — no descriptor is opened or closed.
+    /// `None` when either identity is unknown or they differ; callers then take
+    /// their open-and-inspect path, which also handles missing and replaced
+    /// companions.
+    async fn current_handle_names_wal_path(&self, cx: &Cx) -> Result<Option<bool>> {
+        let current = self.inner.wal.file();
+        let (Some(path_identity), Some(current_identity)) = (
+            self.vfs.path_file_identity(cx, &self.wal_path)?,
+            current.file_identity()?,
+        ) else {
+            return Ok(None);
+        };
+        if path_identity != current_identity {
+            return Ok(None);
+        }
+        self.path_header_matches_current_handle(cx, current).await.map(Some)
+    }
+
     async fn path_header_matches_current_handle(
         &self,
         cx: &Cx,
@@ -3989,6 +4010,9 @@ where
             binding.validate_path_identity()?;
         }
         self.ensure_db_file_identity_captured(cx).await;
+        if self.current_handle_names_wal_path(cx).await? == Some(true) {
+            return Ok(WalNativeReadOutcome::Ready);
+        }
         let opened = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL);
         let opened = match opened {
             Err(_) if !self.create_missing => {
@@ -4084,6 +4108,11 @@ where
         // Cross-process stock DOES see it and leaves them alone (measured on
         // bd-1nq3j), so this is tolerance for a configuration stock itself
         // documents as unsupported, not cover for an interop defect.
+        match self.current_handle_names_wal_path(cx).await? {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(FrankenError::BusyRecovery),
+            None => {}
+        }
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
             // bd-7zs8a follow-up: do NOT create here. The native path's contract
             // is that it never creates a companion to satisfy a binding --

@@ -33,6 +33,7 @@ misc = ["fsqlite/misc"]
 # the gap via feature unification; the dsr release build (`-p fsqlite-cli`)
 # does not.
 fsqlite = { workspace = true, features = ["linux-asupersync-uring"] }
+fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-core = { workspace = true }
 fsqlite-parser = { workspace = true }
