@@ -1410,6 +1410,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let region = source.map_region(cx, 0, false).await?;
         let header = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
         self.wal.refresh(cx).await?;
+        // An index still describing a retired WAL generation (for example
+        // after leaving and re-entering WAL mode, which creates a new
+        // generation with fresh salts) is stale, not corrupt: request the
+        // same index rebuild read admission performs for this mismatch.
+        let wal_header = self.wal.header();
+        if header.page_size().ok() != Some(wal_header.page_size)
+            || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+            || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+        {
+            self.native_recovery_requested = Some(WalNativeRecoveryReason::WalGenerationMismatch);
+            return Err(FrankenError::BusyRecovery);
+        }
         if usize::try_from(header.mx_frame).ok() != Some(self.wal.frame_count()) {
             return Err(FrankenError::BusyRecovery);
         }
@@ -4085,7 +4097,14 @@ where
 
     /// Validate an attached native descriptor without creating or replacing it.
     /// Existing-path rebinding belongs to fresh read/recovery admission only.
-    async fn validate_current_native_wal_path(&mut self, cx: &Cx) -> Result<()> {
+    ///
+    /// `for_append`: frames written through a handle whose path no longer
+    /// names a file land in an unlinked inode — acknowledged, then lost
+    /// (bd-7zs8a: an in-process stock connection, blind to our fcntl locks,
+    /// checkpoints and unlinks the companions it believes it owns). Reads may
+    /// continue on the pinned snapshot; an append refuses with `BusySnapshot`,
+    /// and the retry's fresh read admission recreates the companion.
+    async fn validate_current_native_wal_path(&mut self, cx: &Cx, for_append: bool) -> Result<()> {
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
         self.ensure_db_file_identity_captured(cx).await;
@@ -4122,6 +4141,11 @@ where
             // here and broke exactly that.
             if self.inner.has_pending_publication() {
                 return Err(FrankenError::Busy);
+            }
+            if for_append {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: "WAL companion removed".to_owned(),
+                });
             }
             return Ok(());
         }
@@ -4234,9 +4258,19 @@ where
         }
     }
 
+    /// [`Self::ensure_current_wal_path`] for a caller about to append frames:
+    /// a native handle whose path vanished refuses instead of writing into an
+    /// unlinked inode (see [`Self::validate_current_native_wal_path`]).
+    async fn ensure_current_wal_path_for_append(&mut self, cx: &Cx) -> Result<()> {
+        if self.inner.native_reader_required() {
+            return self.validate_current_native_wal_path(cx, true).await;
+        }
+        self.ensure_current_wal_path(cx).await
+    }
+
     async fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
         if self.inner.native_reader_required() {
-            return self.validate_current_native_wal_path(cx).await;
+            return self.validate_current_native_wal_path(cx, false).await;
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding {
@@ -5467,7 +5501,7 @@ where
             if self.inner.has_pending_publication() || self.inner.native_recovery_requested.is_some() {
                 return Err(FrankenError::BusyRecovery);
             }
-            self.validate_current_native_wal_path(cx).await?;
+            self.validate_current_native_wal_path(cx, true).await?;
             self.inner.preflight_native_append(cx).await
         })
     }
@@ -5652,7 +5686,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner
                 .append_frame(cx, page_number, page_data, db_size_if_commit)
                 .await
@@ -5666,7 +5700,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner.append_frames(cx, frames).await
         })
     }
@@ -5680,7 +5714,7 @@ where
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             preflight.hand_off();
             drop(preflight);
             self.inner
@@ -5711,7 +5745,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner.append_prepared_frames(cx, prepared).await
         })
     }
@@ -5725,7 +5759,7 @@ where
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             preflight.hand_off();
             drop(preflight);
             self.inner

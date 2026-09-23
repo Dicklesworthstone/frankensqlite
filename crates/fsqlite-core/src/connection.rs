@@ -204306,10 +204306,17 @@ mod tests {
                         panic!("mode={mode}: expected integer for total_frames, got {other:?}")
                     }
                 };
-                assert!(
-                    total_frames > 0,
-                    "mode={mode}: expected frames > 0, got {total_frames}"
-                );
+                // Stock reports the post-checkpoint log size: TRUNCATE empties
+                // the WAL, so it returns 0|0|0 (sqlite3 3.46: PASSIVE, FULL and
+                // RESTART give 0|4|4 for this script, TRUNCATE 0|0|0).
+                if mode == "TRUNCATE" {
+                    assert_eq!(total_frames, 0, "mode={mode}: stock reports an emptied log");
+                } else {
+                    assert!(
+                        total_frames > 0,
+                        "mode={mode}: expected frames > 0, got {total_frames}"
+                    );
+                }
 
                 // Data still accessible after checkpoint.
                 let data = conn.query("SELECT COUNT(*) FROM t_ckpt;").await.unwrap();
@@ -212561,7 +212568,23 @@ mod autocommit_txn_tests {
                 );
             }
 
-            conn.execute("COMMIT;").await.unwrap();
+            match conn.execute("COMMIT;").await {
+                Ok(_) => {}
+                // The in-process stock connections above cannot see our fcntl
+                // locks, so their close checkpointed and unlinked the WAL
+                // companions mid-transaction. The commit refuses rather than
+                // land in an unlinked inode and vanish (bd-7zs8a); as with
+                // SQLITE_BUSY_SNAPSHOT, the caller rolls back and redoes it.
+                Err(FrankenError::BusySnapshot { .. }) => {
+                    conn.execute("ROLLBACK;").await.unwrap();
+                    conn.execute("BEGIN;").await.unwrap();
+                    conn.execute("INSERT INTO begin_flush VALUES (2, 'explicit');")
+                        .await
+                        .unwrap();
+                    conn.execute("COMMIT;").await.unwrap();
+                }
+                Err(error) => panic!("COMMIT failed: {error:?}"),
+            }
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 .await
                 .unwrap();
@@ -234312,13 +234335,15 @@ mod pager_routing_tests {
                 .query("SELECT id, name, score FROM explicit_stmt_skip_opt_in ORDER BY id")
                 .await
                 .unwrap();
-            // bd-q2bju/bd-01qa9 (8cd725668): the skip fast path is only sound
-            // for a single-row direct insert, so a multi-row INSERT takes the
-            // statement savepoint even under the skip API — the failed
-            // statement leaves no partial rows in either mode.
+            // hfdt-gbou9l (c5a3f443d): the explicit opt-in API makes the
+            // caller own rollback — "if execution fails inside an explicit
+            // transaction, callers must roll back that transaction to discard
+            // any partial effects" — so a failed multi-row INSERT may leave
+            // its first row until the ROLLBACK below discards it. Automatic
+            // elision (without the opt-in) stays single-row only.
             assert!(
-                rows.is_empty(),
-                "multi-row INSERT stays statement-atomic even under the skip API (bd-q2bju)"
+                rows.is_empty() || rows.len() == 1,
+                "at most the first row of the failed statement remains before the caller's ROLLBACK"
             );
             conn.execute("ROLLBACK").await.unwrap();
             let rows = conn

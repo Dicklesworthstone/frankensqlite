@@ -29040,12 +29040,16 @@ where
         };
         if inspect_native_index {
             let backend = wal_backend_handle(&self.wal_backend)?;
-            let native = async_rwlock_read(&backend, cx, "checkpoint native admission")
-                .await?
-                .native_reader_required();
+            let (native, recovery_requested) = {
+                let wal = async_rwlock_read(&backend, cx, "checkpoint native admission").await?;
+                (wal.native_reader_required(), wal.native_recovery_required().is_some())
+            };
             if native {
                 let source = self.wal_index_shm_source()?;
-                let needs_recovery = match source.map_region(cx, 0, false).await {
+                // A backend that found the shared index describing another WAL
+                // generation (e.g. after leaving and re-entering WAL mode) has
+                // requested a rebuild; only read admission performs it.
+                let needs_recovery = recovery_requested || match source.map_region(cx, 0, false).await {
                     Ok(region) => {
                         fsqlite_wal::wal_index::read_shared_wal_index_header(&region)?.is_none()
                     }
