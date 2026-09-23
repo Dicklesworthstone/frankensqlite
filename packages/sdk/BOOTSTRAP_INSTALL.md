@@ -195,6 +195,76 @@ baseline/order publication and retry the same retained manifest.
 This is not validation of the FrankenSQLite Rust/WASM engine, the complete HTTP
 and source-pump path, browser snapshot persistence, or physical power loss.
 
+## Acknowledging the complete seed at the source
+
+For a single-recipient `ChangesetOutbox.bootstrapChunks` source, use
+`acknowledgeBootstrapInstall` after receiving an authenticated, confirmed install
+receipt. This avoids retransmitting every installed seed chunk just to obtain
+individual replay acknowledgements before incremental delivery can start.
+
+```ts
+import { acknowledgeBootstrapInstall } from '@frankensqlite/sdk';
+
+// originalManifest is the exact manifest sent to this trusted receiver.
+// Do not construct it from fields of the incoming receipt.
+const newlyAcknowledged = await acknowledgeBootstrapInstall(
+  source, originalManifest, installedReceipt, {
+    receiverId: 'replica-42',
+    orderedSourceId: 'source-42:incarnation-1',
+    signal: cancellationSignal,
+  },
+);
+await confirmSourceCommit(); // Required for a snapshot-backed source, even on replay.
+// The ordinary source pump can now select the original increment at N+1.
+```
+
+The helper verifies the receiver, root identity, complete manifest hash, totals,
+and confirmed installation decision before entering source SQL. Ordered receipts
+also require the configured source incarnation and exact seed frontier. Configure
+`receiverId` and `orderedSourceId` from trusted routing state, never incoming ACK
+fields. An unordered install omits `orderedSourceId`; an ordered receipt cannot
+be silently accepted through that policy. Stage/status results are not install
+receipts and cannot authorize reclamation. Hash matching is not authentication.
+
+Within one source transaction, the helper validates the outbox schema, full
+contiguous seed scope and metadata, every still-pending payload, and the complete
+receiver-specific manifest hash chain. Only then does one UPDATE acknowledge all
+remaining seed entries and clear their payloads. Later incremental entries,
+original identity tombstones, and the AUTOINCREMENT sequence remain unchanged.
+Metadata is paged and bodies are verified one at a time, not collected into a
+whole-baseline array; this is not an RSS or SQL-engine allocation bound.
+
+The return value is the number of newly acknowledged chunks. A partial ordinary
+acknowledgement prefix is completed safely; an exact retained replay returns zero
+without requiring already reclaimed bodies. A missing/forgotten seed is an error,
+not an empty successful acknowledgement. After a lost source COMMIT response,
+reopen/reconcile and retry the same manifest and receipt. No source DML or receiver
+application is repeated. Failure before source COMMIT rolls back all reclamation;
+a response lost after COMMIT cannot be interpreted as rollback.
+
+This helper does not contact the receiver, checkpoint either database, authenticate
+the peer, forget tombstones, or update fanout progress. It rejects a source with
+fanout membership (including a partial/corrupt membership schema): one receiver
+cannot authorize deleting data still needed by another. Such sources continue to
+use their receiver-bound acknowledgement path. A source transaction nested in an
+outer transaction remains provisional until that outer transaction commits.
+
+The source regression suite executes the real SDK capture, outbox, manifest,
+bootstrap installer, row application, order ledger, and source acknowledgement
+against reference SQLite transaction owners. It includes forged/missing ACKs,
+source corruption, partial acknowledgements, preserved incremental bytes,
+cancellation, deferred-COMMIT failures, reopen, and six process-kill/reopen cases
+around reclamation and COMMIT under WAL and DELETE journals:
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/fanout-source-loader.mjs \
+  --test packages/sdk/tests/changeset-bootstrap-ack.test.mjs
+```
+
+These are not executions of the FrankenSQLite Rust/WASM engine, browser snapshot
+storage, the complete HTTP/pump chain, or physical power-loss tests.
+
 ## Resource and cancellation contract
 
 Default limits are 8 MiB per chunk, 256 MiB total wire bytes, 10,000 chunks and

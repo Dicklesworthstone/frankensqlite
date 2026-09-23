@@ -37,6 +37,7 @@ export {
   ChangesetApplyError,
 } from "./changeset-apply";
 export type {
+  BootstrapAcknowledgeOptions,
   BootstrapInstallReceipt,
   BootstrapManifest,
   BootstrapManifestInput,
@@ -50,6 +51,7 @@ export {
   CHANGESET_BOOTSTRAP_STATE_TABLE,
   ChangesetBootstrapError,
   ChangesetBootstrapReceiver,
+  acknowledgeBootstrapInstall,
   createBootstrapManifest,
 } from "./changeset-bootstrap";
 export type {
