@@ -8,6 +8,10 @@
 //! write-encode sweep produces byte-correct UTF-16 images, not just self-consistent
 //! ones.
 
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
@@ -506,6 +510,111 @@ fn bd_bld9w_utf16_write_oracle_fsqlite_writes_rusqlite_validates() {
                 assert_eq!(&got_name, name, "{encoding}: stock name {id}");
                 assert_eq!(&got_city, city, "{encoding}: stock city {id}");
             }
+        }
+    });
+}
+
+/// System-table maintenance on a UTF-16 database: DROP, ALTER (add column,
+/// rename), AUTOINCREMENT's `sqlite_sequence` upkeep and ANALYZE's
+/// `sqlite_stat1` rewrite all find existing rows by their TEXT name. The
+/// helpers already encoded new rows in the DB encoding (bd-bld9w.7) but decoded
+/// the rows they searched with the UTF-8-hardcoded `parse_record`, so on
+/// UTF-16 nothing ever matched: DROP and ALTER failed with "sqlite_master entry
+/// not found" (after ALTER ADD COLUMN had already widened the in-memory schema),
+/// every AUTOINCREMENT insert appended another `sqlite_sequence` row for the
+/// same table, and ANALYZE duplicated its stat rows. Stock SQLite is the oracle.
+#[test]
+fn utf16_system_table_maintenance_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for &(encoding, expected_header) in UTF16_VARIANTS {
+            let db_path = dir.path().join(format!("maint_{encoding}.db"));
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            for sql in [
+                format!("PRAGMA encoding = '{encoding}';"),
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT);".to_owned(),
+                "INSERT INTO p VALUES (1, 'Élise'), (2, '名前'), (3, 'plain');".to_owned(),
+                "CREATE TABLE s(x INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);".to_owned(),
+                "INSERT INTO s(v) VALUES ('a'), ('b');".to_owned(),
+                "INSERT INTO s(v) VALUES ('c');".to_owned(),
+                "DELETE FROM s WHERE x = 3;".to_owned(),
+                "INSERT INTO s(v) VALUES ('d');".to_owned(),
+                "ALTER TABLE p ADD COLUMN z TEXT DEFAULT 'zü';".to_owned(),
+                "UPDATE p SET z = 'set' WHERE id = 2;".to_owned(),
+                "CREATE TABLE u AS SELECT * FROM p;".to_owned(),
+                "DROP TABLE u;".to_owned(),
+                "CREATE INDEX p_name ON p(name);".to_owned(),
+                "ANALYZE;".to_owned(),
+                "ANALYZE;".to_owned(),
+                "ALTER TABLE s RENAME TO s2;".to_owned(),
+                "INSERT INTO s2(v) VALUES ('e');".to_owned(),
+            ] {
+                conn.execute(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{encoding}: `{sql}` failed: {e:?}"));
+            }
+            let x = conn
+                .query("SELECT max(x) FROM s2;")
+                .await
+                .unwrap();
+            assert_eq!(
+                x[0].values()[0],
+                SqliteValue::Integer(5),
+                "{encoding}: AUTOINCREMENT must not reuse the deleted rowid 3 or 4"
+            );
+            conn.close().await.unwrap();
+
+            assert_stock_image_ok(&db_path, expected_header, encoding);
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let seq: Vec<(String, i64)> = stock
+                .prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name;")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                seq,
+                vec![("s2".to_owned(), 5)],
+                "{encoding}: exactly one renamed sqlite_sequence row"
+            );
+            let tables: Vec<String> = stock
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                tables,
+                ["p", "s2", "sqlite_sequence", "sqlite_stat1"],
+                "{encoding}: u dropped, s renamed"
+            );
+            let z: Vec<(i64, String)> = stock
+                .prepare("SELECT id, z FROM p ORDER BY id;")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                z,
+                vec![(1, "zü".to_owned()), (2, "set".to_owned()), (3, "zü".to_owned())],
+                "{encoding}: stock sees the added column and its values"
+            );
+            let (stat_rows, distinct_rows): (i64, i64) = stock
+                .query_row(
+                    "SELECT count(*), count(DISTINCT tbl || '/' || coalesce(idx, '')) \
+                     FROM sqlite_stat1;",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                stat_rows, distinct_rows,
+                "{encoding}: ANALYZE must rewrite, not duplicate, sqlite_stat1 rows"
+            );
         }
     });
 }

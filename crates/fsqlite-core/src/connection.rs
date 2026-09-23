@@ -60062,7 +60062,7 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx).await?;
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
+                        let values = parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "sqlite_master row {rowid} payload is not a valid SQLite record"
@@ -60126,7 +60126,7 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx).await?;
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
+                        let values = parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "sqlite_master row {rowid} payload is not a valid SQLite record"
@@ -60348,7 +60348,7 @@ impl Connection {
                     let rowid = cursor.rowid(cx).await?;
                     let payload = cursor.payload(cx).await?;
                     let values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "sqlite_master row {rowid} payload is not a valid SQLite record"
                             ),
@@ -60444,7 +60444,7 @@ impl Connection {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
@@ -60504,7 +60504,7 @@ impl Connection {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
@@ -60570,7 +60570,7 @@ impl Connection {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
@@ -60873,6 +60873,7 @@ impl Connection {
         cx: &Cx,
         txn: &mut TransactionKind,
         index: &IndexSchema,
+        text_encoding: TextEncoding,
     ) -> Result<Option<String>> {
         let Some(root) = PageNumber::new(u32::try_from(index.root_page).unwrap_or(0)) else {
             return Ok(None);
@@ -60887,7 +60888,7 @@ impl Connection {
             loop {
                 let payload = cursor.payload(cx).await?;
                 let fields =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, text_encoding).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "index {} payload is not a valid SQLite record",
                             index.name
@@ -60970,7 +60971,7 @@ impl Connection {
                 max_rowid = max_rowid.max(rowid);
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_stat1 row {rowid} payload is not a valid SQLite record"
                         ),
@@ -61055,7 +61056,7 @@ impl Connection {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_sequence row {rowid} payload is not a valid SQLite record"
                         ),
@@ -61125,7 +61126,7 @@ impl Connection {
                 max_rowid = max_rowid.max(rowid);
                 let payload = cursor.payload(cx).await?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_sequence row {rowid} payload is not a valid SQLite record"
                         ),
@@ -61177,7 +61178,7 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx).await?;
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
+                        let values = parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "sqlite_sequence row {rowid} payload is not a valid SQLite record"
@@ -61261,7 +61262,7 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx).await?;
                         let payload = cursor.payload(cx).await?;
-                        let values = parse_record(&payload).ok_or_else(|| {
+                        let values = parse_record_with_encoding(&payload, self.db_text_encoding.get()).ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "sqlite_sequence row {rowid} payload is not a valid SQLite record"
@@ -66230,7 +66231,13 @@ impl Connection {
 
                 for index in &target.indexes {
                     if let Some(stat) =
-                        Self::compute_index_stat_string_in_txn(cx, txn, index).await?
+                        Self::compute_index_stat_string_in_txn(
+                            cx,
+                            txn,
+                            index,
+                            self.db_text_encoding.get(),
+                        )
+                        .await?
                     {
                         replacement_rows.push(Stat1Row {
                             table_name: target.table.name.clone(),
