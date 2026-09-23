@@ -236,6 +236,9 @@ mod linux {
     }
 
     #[cfg(test)]
+    // Birth tokens are tag bits OR'd with decimal fake PIDs; the PIDs read
+    // better in decimal.
+    #[allow(clippy::decimal_bitwise_operands)]
     mod tests {
         use std::cell::Cell;
 

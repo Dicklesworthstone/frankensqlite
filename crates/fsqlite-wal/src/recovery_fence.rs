@@ -901,7 +901,7 @@ mod tests {
                 let file = open_db_file(&vfs, &cx);
                 let page = PageNumber::ONE;
                 let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
-                file.write(&cx, &[0x54], u64::from(damaged_offset)).unwrap();
+                file.write(&cx, &[0x54], u64::from(damaged_offset)).wait().unwrap();
                 let mut read_back = vec![0; usize::try_from(page_size).unwrap()];
                 assert_eq!(file.read(&cx, &mut read_back, 0).wait().unwrap(), read_back.len());
                 assert_eq!(crate::checksum::read_page_checksum(&read_back).unwrap(), checksum);
@@ -931,7 +931,7 @@ mod tests {
         let checksum = write_page_with_checksum(&cx, &file, 4096, page, 0xAB);
         let expected = [ExpectedPageChecksum { page, checksum }];
         // The body is intact but its stored checksum was damaged.
-        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).unwrap();
+        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
@@ -962,8 +962,8 @@ mod tests {
         let checksum = crate::checksum::write_page_checksum(&mut third).unwrap();
         let third_page = PageNumber::new(3).unwrap();
         expected.push(ExpectedPageChecksum { page: third_page, checksum });
-        file.write(&cx, &third[..256], 1024).unwrap();
-        file.write(&cx, &[0x54], 612).unwrap();
+        file.write(&cx, &third[..256], 1024).wait().unwrap();
+        file.write(&cx, &[0x54], 612).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: PageNumber::new(2).unwrap() }
@@ -973,7 +973,7 @@ mod tests {
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: third_page }
         );
-        file.write(&cx, &third, 1024).unwrap();
+        file.write(&cx, &third, 1024).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Match

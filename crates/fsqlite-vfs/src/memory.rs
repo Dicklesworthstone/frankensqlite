@@ -1695,6 +1695,9 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    // Collecting the handles spawns every creator before any join; joining
+    // lazily would run them one at a time and remove the contention.
+    #[allow(clippy::needless_collect)]
     fn competing_exclusive_creators_have_exactly_one_winner() {
         const CREATORS: usize = 8;
         let vfs = make_vfs();
