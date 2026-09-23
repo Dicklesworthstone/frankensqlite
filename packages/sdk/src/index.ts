@@ -52,6 +52,7 @@ export {
   ChangesetBootstrapError,
   ChangesetBootstrapReceiver,
   acknowledgeBootstrapInstall,
+  acknowledgeFanoutBootstrapInstall,
   createBootstrapManifest,
 } from "./changeset-bootstrap";
 export type {

@@ -3,7 +3,7 @@ import { applyChangeset } from "./changeset-apply";
 import type { ChangesetValue } from "./changeset-codec";
 import { decodeChangeset } from "./changeset-codec";
 import { bootstrapOrderPrefix } from "./changeset-order";
-import { assertSingleRecipient } from "./changeset-fanout";
+import { acknowledgeFanoutBootstrapPrefix, assertSingleRecipient } from "./changeset-fanout";
 import {
   TABLE as OUTBOX,
   chunkId,
@@ -849,6 +849,37 @@ export async function acknowledgeBootstrapInstall(
   receipt: BootstrapInstallReceipt,
   options: BootstrapAcknowledgeOptions,
 ): Promise<number> {
+  return acknowledgeInstall(source, manifest, receipt, options, false);
+}
+
+/**
+ * Accept one required replica's complete install ACK on a fanout source. The
+ * original receiver-bound manifest and trusted route are mandatory, just as for
+ * acknowledgeBootstrapInstall(). Only that replica advances, without rewinding
+ * newer incremental progress. Payload reclamation follows the minimum required
+ * replica cursor, not this receiver's installation frontier.
+ *
+ * Return seed sequences newly acknowledged by THIS replica, not reclaimed rows
+ * or bytes. Cursor advancement and any reclamation commit together. A retained
+ * replay returns zero; missing history is an error. Confirm the same source's
+ * storage before treating this SQL result as durable. No network runs here.
+ */
+export async function acknowledgeFanoutBootstrapInstall(
+  source: ChangesetTarget,
+  manifest: BootstrapManifest,
+  receipt: BootstrapInstallReceipt,
+  options: BootstrapAcknowledgeOptions,
+): Promise<number> {
+  return acknowledgeInstall(source, manifest, receipt, options, true);
+}
+
+async function acknowledgeInstall(
+  source: ChangesetTarget,
+  manifest: BootstrapManifest,
+  receipt: BootstrapInstallReceipt,
+  options: BootstrapAcknowledgeOptions,
+  fanout: boolean,
+): Promise<number> {
   const m = captureManifest(manifest);
   const receiverId = text(options?.receiverId, 256);
   const requestedSource = options.orderedSourceId;
@@ -892,7 +923,7 @@ export async function acknowledgeBootstrapInstall(
           return rows;
         },
       };
-      await assertSingleRecipient(tx);
+      if (!fanout) await assertSingleRecipient(tx);
       if (!(await ensureOutbox(tx, false))) fail("STATE", "No retained source bootstrap");
       const root = await findOutboxEntry(tx, m.deliveryId);
       if (root === null || root.stream?.index !== 0 || root.stream.summary === null)
@@ -918,6 +949,11 @@ export async function acknowledgeBootstrapInstall(
       }
       b.check();
       if (chain !== m.sha256) fail("CORRUPT", "Install manifest does not match the complete source prefix");
+      if (fanout) {
+        const advanced = await acknowledgeFanoutBootstrapPrefix(tx, receiverId, root, () => b.check());
+        b.check();
+        return advanced;
+      }
       const changed = m.chunks - before.acknowledgedChunks;
       if (changed === 0) return 0;
       await write(tx, b,

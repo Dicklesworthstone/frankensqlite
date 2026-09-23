@@ -1,7 +1,7 @@
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
-import type { OutboxDelivery, OutboxPageOptions, OutboxReadResult } from "./changeset-outbox-store";
+import type { OutboxDelivery, OutboxPageOptions, OutboxReadResult, Stored } from "./changeset-outbox-store";
 import {
-  TABLE, CHANGESET_OUTBOX_TABLE, acknowledgeDelivery, bound, digest, ensure, find,
+  TABLE, CHANGESET_OUTBOX_TABLE, acknowledgeDelivery, bound, chunkId, digest, ensure, find,
   forgetBootstrap, forgetDelivery, identity, inspectStream, integer, load,
   pendingDeliveries, query,
 } from "./changeset-outbox-store";
@@ -207,6 +207,69 @@ export async function captureFanoutGuard(tx: ChangesetExecutor): Promise<string 
 /** @internal Never let the legacy single-recipient API bypass a required replica. */
 export async function assertSingleRecipient(tx: ChangesetExecutor): Promise<void> {
   if (await present(tx)) fail("STATE", "Use the receiver-bound fanout source for acknowledgements and fanout cleanup");
+}
+
+/**
+ * @internal Called only AFTER the bootstrap module verifies the entire original
+ * receiver-bound manifest, confirmed receipt and pending source payloads in this
+ * SAME transaction. Never call this with an unverified incoming frontier.
+ */
+export async function acknowledgeFanoutBootstrapPrefix(
+  tx: ChangesetExecutor,
+  receiverId: string,
+  root: Stored,
+  checkpoint: () => void,
+): Promise<number> {
+  checkpoint();
+  const current = await state(tx);
+  const cursor = current.replicas.find((r) => r.receiverId === receiverId);
+  if (cursor === undefined) fail("ACK", "Bootstrap receiver is not a required fanout member");
+  const stream = root.stream, summary = stream?.summary;
+  if (stream === null || summary === null || summary === undefined || stream.index !== 0)
+    fail("CORRUPT", "Fanout bootstrap acknowledgement requires a complete retained seed");
+  const end = BigInt(summary.chunks);
+  const last = await find(tx, chunkId(stream.id, summary.chunks - 1));
+  if (last === null || last.delivery.sequence !== end || last.stream?.id !== stream.id ||
+      last.stream.index !== summary.chunks - 1 || last.stream.base !== stream.base || end > current.high)
+    fail("CORRUPT", "Fanout bootstrap frontier has no matching retained source identity");
+  checkpoint();
+  // Manifest/payload verification has already run, even for historical ACKs.
+  // Never move a newer cursor back to its seed or clear incremental payloads.
+  if (cursor.sequence >= end) return 0;
+
+  if (await tx.execute(
+    `UPDATE OR ABORT ${PROGRESS} SET sequence=?,delivery_id=?,sha256=? WHERE replica_id=? AND sequence=? AND delivery_id=? AND sha256=?`,
+    [end, last.delivery.deliveryId, last.delivery.sha256, receiverId,
+      cursor.sequence, cursor.deliveryId ?? "", cursor.sha256 ?? ""],
+  ) !== 1) fail("CORRUPT", "Bootstrap replica cursor did not advance exactly once");
+  checkpoint();
+  const replicas = current.replicas.map((r) => r.receiverId === receiverId
+    ? { receiverId, sequence: end, deliveryId: last.delivery.deliveryId, sha256: last.delivery.sha256 } : r);
+  const minimum = replicas.reduce((n, r) => r.sequence < n ? r.sequence : n, current.high);
+  if (minimum < current.minimum || minimum > end)
+    fail("CORRUPT", "Bootstrap acknowledgement has an invalid reclamation frontier");
+  const reclaimed = Number(minimum - current.minimum);
+  if (reclaimed > 0) {
+    // The minimum may stop INSIDE the seed if another member has only a partial
+    // prefix. It can never advance beyond this seed. Keep all later bytes and
+    // every identity tombstone, including cursors needed for source-state checks.
+    if (await tx.execute(
+      `UPDATE OR ABORT ${TABLE} SET acknowledged=1,payload=X'' WHERE seq>? AND seq<=? AND acknowledged=0`,
+      [current.minimum, minimum],
+    ) !== reclaimed) fail("CORRUPT", "Bootstrap reclamation did not match the required-replica frontier");
+    checkpoint();
+  }
+  const after = await inspectStream(tx, root, checkpoint, false);
+  if (after.acknowledgedChunks !== Number(minimum) || after.chunks !== summary.chunks ||
+      after.changes !== summary.changes || after.byteLength !== summary.byteLength ||
+      after.sha256 !== root.delivery.sha256)
+    fail("CORRUPT", "Bootstrap payload reclamation was not retained with replica progress");
+  const next = await state(tx);
+  if (fingerprint(next) !== fingerprint({ ...current, replicas, minimum }) ||
+      next.minimum !== minimum || next.high !== current.high)
+    fail("CORRUPT", "Bootstrap acknowledgement changed unrelated fanout state");
+  checkpoint();
+  return Number(end - cursor.sequence);
 }
 
 /**

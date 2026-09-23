@@ -245,8 +245,9 @@ a response lost after COMMIT cannot be interpreted as rollback.
 This helper does not contact the receiver, checkpoint either database, authenticate
 the peer, forget tombstones, or update fanout progress. It rejects a source with
 fanout membership (including a partial/corrupt membership schema): one receiver
-cannot authorize deleting data still needed by another. Such sources continue to
-use their receiver-bound acknowledgement path. A source transaction nested in an
+cannot authorize deleting data still needed by another. Such sources use
+`acknowledgeFanoutBootstrapInstall` below or their receiver-bound per-message
+acknowledgement path. A source transaction nested in an
 outer transaction remains provisional until that outer transaction commits.
 
 The source regression suite executes the real SDK capture, outbox, manifest,
@@ -264,6 +265,82 @@ node --experimental-transform-types \
 
 These are not executions of the FrankenSQLite Rust/WASM engine, browser snapshot
 storage, the complete HTTP/pump chain, or physical power-loss tests.
+
+## Complete installation acknowledgements for a fanout source
+
+`acknowledgeFanoutBootstrapInstall(source, originalManifest, receipt, options)`
+accepts one member's confirmed installation without acknowledging or retransmitting
+every seed chunk separately. Initialize the immutable `ChangesetFanout` roster
+before creating the source outbox's first seed, as usual. Build and retain each
+receiver's own outbound manifest: its hash is recipient-specific even though all
+members share the same source chunk bytes.
+
+```ts
+import { acknowledgeFanoutBootstrapInstall } from '@frankensqlite/sdk';
+
+// eastManifest is the ORIGINAL manifest sent to this trusted receiver route.
+// eastReceipt comes from its authenticated, completed install operation.
+const advanced = await acknowledgeFanoutBootstrapInstall(
+  source, eastManifest, eastReceipt,
+  { receiverId: 'east', orderedSourceId: 'device-42:incarnation-7' },
+);
+await confirmSourceCommit(); // The SAME source; also required after an ACK replay.
+
+// A fast member can now consume N+1 while other members still need seed chunks.
+console.log(advanced, await fanout.progress());
+await eastPump.run();
+```
+
+This uses the same strict receipt, route, full-source-manifest and pending-payload
+verification as the single-recipient helper. The stored fanout roster and every
+member cursor are validated in that same transaction. A receipt for a nonmember,
+a missing cursor, a damaged roster, or source sequence holes reject. Neither API
+falls back to the other when its required source state is absent or corrupt.
+Use trusted routing configuration for `receiverId` and `orderedSourceId`; the
+receipt is not permission to choose a different member or stream incarnation.
+
+Only the named member advances to the seed's final original sequence N, with the
+last seed chunk's retained identity and digest. Other member cursors and later
+incremental entries remain unchanged. Payload reclamation advances only to the
+minimum of ALL required member cursors, which may stop partway through the seed.
+The cursor update and any newly permitted range reclamation commit together.
+An offline member therefore continues to retain its required source payloads;
+this is all-member retention, not a quorum, expiry, eviction or membership change.
+
+The return value counts seed sequences newly acknowledged by THAT member. It is
+not the number of globally reclaimed rows or bytes: the first member may return
+N while reclaiming nothing. Already acknowledged per-message prefixes are handled
+without replaying SQL. Exact install-ACK retries return zero, including after that
+member has consumed newer increments, and never rewind its cursor. Retries still
+verify the complete retained seed metadata and all globally pending seed bodies.
+Forgetting a complete seed explicitly ends this replay guarantee; the helper
+rejects missing history rather than silently reconstructing it.
+
+No transport, source checkpoint, transaction retry loop or global writer mutex is
+introduced. Concurrent connections use the source engine's ordinary transaction
+conflict rules; reconcile and retry the same manifest and receipt on conflict or
+a lost commit response. Cancellation drains started SQL before rejecting, and a
+failed transaction rolls back both cursor advancement and reclamation. An outer
+transaction still owns the final commit of a nested invocation. A response lost
+after commit is not proof of rollback.
+
+The fanout regression suite executes production capture, outbox, bootstrap,
+`applyChangeset`, order and fanout code with reference SQLite transaction owners.
+It checks fast/slow replicas through N+1, all 27 three-member combinations of
+0/1/2 seed acknowledgements, multi-page seeds, empty seeds, historical retries,
+receipt forgery, corrupt progress/payloads, cancellation, false affected-row
+results, deferred commit failure, two overlapping file-backed source owners and
+eight SIGKILL/reopen boundaries under WAL
+and DELETE journals. Its row oracle also applies the same changesets through
+native SQLite Session APIs. These tests do not qualify the FrankenSQLite
+Rust/WASM engine, browser durability, the full HTTP/pump chain or physical power
+loss.
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/fanout-source-loader.mjs \
+  --test packages/sdk/tests/changeset-fanout-bootstrap.test.mjs
+```
 
 ## Resource and cancellation contract
 
