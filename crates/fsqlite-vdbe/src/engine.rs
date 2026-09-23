@@ -6516,6 +6516,7 @@ fn build_compiled_record_write_plan<'a>(
     ))
 }
 
+#[allow(clippy::disallowed_methods)] // UTF-8 branch only
 fn serialize_compiled_record_into_vec(
     values: &[SqliteValue],
     record_builder: &CompiledRecordBuilder,
@@ -8091,6 +8092,8 @@ impl VdbeEngine {
         loop {
             key_buf.clear();
             sc.cursor.payload_into(&sc.cx, &mut key_buf).await?;
+            // Only the trailing integer rowid is read.
+            #[allow(clippy::disallowed_methods)]
             let values = parse_record(&key_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "REPLACE cleanup encountered a malformed secondary-index record".to_owned(),
             })?;
@@ -10158,6 +10161,7 @@ impl VdbeEngine {
                             cursor.set_index_collation_context(
                                 autoindex_collations,
                                 Arc::clone(&self.collation_registry),
+                                self.text_encoding,
                             );
                         }
                         self.cursor_root_pages
@@ -11444,7 +11448,11 @@ impl VdbeEngine {
                                 }
                                 values
                             } else {
-                                decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?
+                                decode_record_with_metrics(
+                                    &record_val,
+                                    self.text_encoding,
+                                    self.collect_vdbe_metrics,
+                                )?
                             };
                             // Exact rows implicitly deleted by REPLACE below;
                             // pushed into `replace_victims` after the &mut db
@@ -12159,6 +12167,7 @@ impl VdbeEngine {
                         // UTF-8 hot path keeps the lazy prefix decode (only the first
                         // `key_columns` values); UTF-16 databases are rare, so they
                         // decode the full record and retain the sort-key prefix.
+                        #[allow(clippy::disallowed_methods)] // UTF-8 branch only
                         let key_values = if matches!(sorter.text_encoding, TextEncoding::Utf8) {
                             fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
                         } else {
@@ -12325,6 +12334,7 @@ impl VdbeEngine {
                                 .then(|| {
                                     decode_record_bytes_with_metrics(
                                         &probe_buf,
+                                        self.text_encoding,
                                         self.collect_vdbe_metrics,
                                     )
                                 })
@@ -12334,6 +12344,7 @@ impl VdbeEngine {
                         } else if preflight_needs_compare {
                             Some(decode_record_with_metrics(
                                 self.get_reg(op.p3),
+                                self.text_encoding,
                                 self.collect_vdbe_metrics,
                             )?)
                         } else {
@@ -12356,11 +12367,13 @@ impl VdbeEngine {
                             // observe the packed record in P3.
                             Some(decode_record_bytes_with_metrics(
                                 self.make_record_lookaside.as_slice(),
+                                self.text_encoding,
                                 self.collect_vdbe_metrics,
                             )?)
                         } else {
                             Some(decode_record_with_metrics(
                                 self.get_reg(op.p3),
+                                self.text_encoding,
                                 self.collect_vdbe_metrics,
                             )?)
                         }
@@ -13013,7 +13026,11 @@ impl VdbeEngine {
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         // MemCursor fallback (Phase 4).
                         let probe_fields =
-                            decode_record_with_metrics(&probe_val, self.collect_vdbe_metrics)?;
+                            decode_record_with_metrics(
+                                &probe_val,
+                                self.text_encoding,
+                                self.collect_vdbe_metrics,
+                            )?;
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
                             && let Some(table) = db.get_table(cursor.root_page)
@@ -15819,6 +15836,8 @@ impl VdbeEngine {
     }
 
     #[inline(always)]
+    // UTF-8 fast paths only: non-UTF-8 returns early through the encoded helper.
+    #[allow(clippy::disallowed_methods)]
     fn serialize_record_from_register_range(
         &self,
         first_reg: i32,
@@ -16096,6 +16115,7 @@ impl VdbeEngine {
             new_cursor.set_index_collation_context(
                 self.index_collations_for_root(root_page),
                 Arc::clone(&self.collation_registry),
+                self.text_encoding,
             );
         }
         configure_btree_cursor_page_size(&mut new_cursor, page_layout);
@@ -16312,7 +16332,13 @@ impl VdbeEngine {
 
         observe_execution_cancellation(step.execution_cx)?;
         if should_step {
-            if let Some(collation) = step.agg_collation
+            // Implicit BINARY MIN/MAX on a UTF-16 database must order in the
+            // storage encoding like stock; the registry's min/max compares
+            // canonical UTF-8, so route it through the collated step.
+            let min_max_collation = step.agg_collation.or_else(|| {
+                (!matches!(step.text_encoding, TextEncoding::Utf8)).then_some("BINARY")
+            });
+            if let Some(collation) = min_max_collation
                 && (step.func_name.eq_ignore_ascii_case("min")
                     || step.func_name.eq_ignore_ascii_case("max"))
                 && !step.args.is_empty()
@@ -17128,8 +17154,11 @@ impl VdbeEngine {
                             );
                         }
                         note_decode_cache_miss(collect_vdbe_metrics);
-                        if let Ok(values) = decode_record_with_metrics(&blob, collect_vdbe_metrics)
-                        {
+                        if let Ok(values) = decode_record_with_metrics(
+                            &blob,
+                            self.text_encoding,
+                            collect_vdbe_metrics,
+                        ) {
                             if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                                 cursor.cached_pseudo_row = Some((blob, values));
                             }
@@ -17504,6 +17533,7 @@ impl VdbeEngine {
                         cursor.set_index_collation_context(
                             self.index_collations_for_root(root_page),
                             Arc::clone(&self.collation_registry),
+                            self.text_encoding,
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
@@ -17665,6 +17695,7 @@ impl VdbeEngine {
                         cursor.set_index_collation_context(
                             self.index_collations_for_root(root_page),
                             Arc::clone(&self.collation_registry),
+                            self.text_encoding,
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
@@ -17848,6 +17879,7 @@ impl VdbeEngine {
             cursor.set_index_collation_context(
                 self.index_collations_for_root(root_page),
                 Arc::clone(&self.collation_registry),
+                self.text_encoding,
             );
         }
         // Populate cursor from MemDatabase if available.
@@ -18133,36 +18165,9 @@ fn compare_text_with_collation(
 /// For UTF-8 databases this is a plain `memcmp` — byte-for-byte the previous
 /// behavior, so the common hot path pays nothing.
 fn binary_compare_bytes(left: &[u8], right: &[u8], enc: TextEncoding) -> Ordering {
-    match enc {
-        TextEncoding::Utf8 => left.cmp(right),
-        TextEncoding::Utf16le | TextEncoding::Utf16be => {
-            let big_endian = matches!(enc, TextEncoding::Utf16be);
-            // Canonical TEXT is valid UTF-8; transcode both sides to the DB
-            // encoding and memcmp. Raw (byte-preserved non-UTF-8) TEXT is the
-            // bd-6y0jd concern — fall back to comparing its stored bytes.
-            match (std::str::from_utf8(left), std::str::from_utf8(right)) {
-                (Ok(ls), Ok(rs)) => {
-                    encode_utf16_sortkey(ls, big_endian).cmp(&encode_utf16_sortkey(rs, big_endian))
-                }
-                _ => left.cmp(right),
-            }
-        }
-    }
-}
-
-/// Encode `s` to its UTF-16 (LE or BE) byte sequence — the exact bytes stock
-/// SQLite `memcmp`s for BINARY collation on a UTF-16 database.
-fn encode_utf16_sortkey(s: &str, big_endian: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len() * 2);
-    for unit in s.encode_utf16() {
-        let bytes = if big_endian {
-            unit.to_be_bytes()
-        } else {
-            unit.to_le_bytes()
-        };
-        out.extend_from_slice(&bytes);
-    }
-    out
+    // Raw (byte-preserved non-UTF-8) TEXT is the bd-6y0jd concern — it
+    // compares as stored.
+    fsqlite_types::value::binary_text_cmp(left, right, enc)
 }
 
 fn builtin_collation_compare_text(
@@ -19266,7 +19271,12 @@ async fn find_conflicting_rowid_in_index_collated(
     collations: &[Option<String>],
     collation_registry: &CollationRegistry,
 ) -> Result<Option<i64>> {
-    let target_values = parse_record(key_bytes).ok_or_else(|| {
+    // Both keys are DB-encoded; decode them to canonical text so NOCASE/RTRIM
+    // see characters rather than UTF-16 code-unit bytes (RTRIM must strip a
+    // trailing `20 00`, and NOCASE must not fold one byte of a non-ASCII unit,
+    // e.g. `Ł` = `41 01` vs `š` = `61 01`). BINARY then compares in
+    // `sc.text_encoding`, matching stock.
+    let target_values = parse_record_with_encoding(key_bytes, sc.text_encoding).ok_or_else(|| {
         FrankenError::internal("find_conflicting_rowid_in_index_collated: malformed new index key")
     })?;
     if target_values.len() < n_idx_cols
@@ -19278,56 +19288,85 @@ async fn find_conflicting_rowid_in_index_collated(
         return Ok(None);
     }
 
-    if !sc.cursor.first(&sc.cx).await? {
-        return Ok(None);
-    }
-
-    // bd-1dp9.6.7.11.2: reuse one buffer across the loop instead of a fresh `Vec`
-    // per iteration; `existing_values` are owned (parse_record copies out).
+    // The cursor orders entries by their collated key prefix, then rowid, so
+    // under the UNIQUE invariant the one entry whose prefix equals the new
+    // key's sits next to where the new key sorts: at the seek position or just
+    // before it. (A full index scan here made bulk loads into UNIQUE ...
+    // COLLATE tables quadratic.)
+    sc.cursor.index_move_to(&sc.cx, key_bytes).await?;
     let mut existing_key = Vec::new();
-    loop {
-        existing_key.clear();
-        sc.cursor.payload_into(&sc.cx, &mut existing_key).await?;
-        let existing_values = parse_record(&existing_key).ok_or_else(|| {
+    if !sc.cursor.eof()
+        && let Some(rowid) = collated_prefix_conflict_at_cursor(
+            sc,
+            &mut existing_key,
+            &target_values,
+            n_idx_cols,
+            desc_flags,
+            collations,
+            collation_registry,
+        )
+        .await?
+    {
+        return Ok(Some(rowid));
+    }
+    if sc.cursor.prev(&sc.cx).await? {
+        return collated_prefix_conflict_at_cursor(
+            sc,
+            &mut existing_key,
+            &target_values,
+            n_idx_cols,
+            desc_flags,
+            collations,
+            collation_registry,
+        )
+        .await;
+    }
+    Ok(None)
+}
+
+/// The rowid of the entry under `sc`'s cursor when its key prefix equals
+/// `target_values` under the index collations.
+async fn collated_prefix_conflict_at_cursor(
+    sc: &StorageCursor,
+    existing_key: &mut Vec<u8>,
+    target_values: &[SqliteValue],
+    n_idx_cols: usize,
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &CollationRegistry,
+) -> Result<Option<i64>> {
+    existing_key.clear();
+    sc.cursor.payload_into(&sc.cx, existing_key).await?;
+    let existing_values = parse_record_with_encoding(existing_key, sc.text_encoding)
+        .ok_or_else(|| {
             FrankenError::internal(
                 "find_conflicting_rowid_in_index_collated: malformed index entry record",
             )
         })?;
-        if existing_values.len() >= n_idx_cols
-            && existing_values
-                .iter()
-                .take(n_idx_cols)
-                .all(|value| !value.is_null())
-            && compare_index_prefix_keys(
-                &existing_values,
-                &target_values,
-                n_idx_cols,
-                desc_flags,
-                collations,
-                collation_registry,
-                // bd-gmruy: BOTH operands are raw `parse_record` decodes (DB-encoded
-                // bytes reinterpreted as UTF-8), so compare them byte-wise under
-                // `Utf8` — exactly as bd-nmd19 fixed the sibling blind-append guard.
-                // Passing `sc.text_encoding` here would transcode the already-raw
-                // bytes a second time; it is equality-preserving for valid injective
-                // input (hence symptom-free today) but inconsistent, and SQLite's
-                // ASCII-only NOCASE still folds correctly on the raw bytes.
-                TextEncoding::Utf8,
-            ) == Ordering::Equal
-        {
-            let rowid = index_entry_rowid_at(
-                &existing_values,
-                n_idx_cols,
-                "find_conflicting_rowid_in_index_collated: index entry must end with exactly one integer rowid suffix",
-            )?;
-            return Ok(Some(rowid));
-        }
-
-        if !sc.cursor.next(&sc.cx).await? {
-            break;
-        }
+    if existing_values.len() >= n_idx_cols
+        && existing_values
+            .iter()
+            .take(n_idx_cols)
+            .all(|value| !value.is_null())
+        && compare_index_prefix_keys(
+            &existing_values,
+            target_values,
+            n_idx_cols,
+            desc_flags,
+            collations,
+            collation_registry,
+            // bd-gmruy: both operands are canonical decodes, so the storage
+            // encoding is the consistent compare encoding.
+            sc.text_encoding,
+        ) == Ordering::Equal
+    {
+        return index_entry_rowid_at(
+            &existing_values,
+            n_idx_cols,
+            "find_conflicting_rowid_in_index_collated: index entry must end with exactly one integer rowid suffix",
+        )
+        .map(Some);
     }
-
     Ok(None)
 }
 
@@ -19354,6 +19393,7 @@ fn index_entry_rowid_at(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     fsqlite_types::record::serialize_record(values)
 }
@@ -19681,7 +19721,7 @@ fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
     );
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::disallowed_methods)]
 fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
     fsqlite_types::record::serialize_record_refs(values)
 }
@@ -19694,22 +19734,29 @@ fn record_blob_bytes(val: &SqliteValue) -> &[u8] {
     }
 }
 
+/// Decode an engine-built record (MakeRecord output held in a register, a
+/// sorter row, a pseudo-cursor row, an ephemeral-table row). Every engine
+/// encoder writes TEXT in the DB storage encoding, so the decode must use the
+/// same `encoding`; a UTF-8 decode of a UTF-16 record surfaces the raw code
+/// units as mojibake and mis-compares against encoding-aware sort keys.
 fn decode_record_with_metrics(
     val: &SqliteValue,
+    encoding: TextEncoding,
     collect_vdbe_metrics: bool,
 ) -> Result<Vec<SqliteValue>> {
     let SqliteValue::Blob(bytes) = val else {
         return Ok(Vec::new());
     };
-    decode_record_bytes_with_metrics(bytes, collect_vdbe_metrics)
+    decode_record_bytes_with_metrics(bytes, encoding, collect_vdbe_metrics)
 }
 
 fn decode_record_bytes_with_metrics(
     bytes: &[u8],
+    encoding: TextEncoding,
     collect_vdbe_metrics: bool,
 ) -> Result<Vec<SqliteValue>> {
     let _profile_stage = enter_vdbe_decode_profile_stage();
-    let values = parse_record(bytes)
+    let values = parse_record_with_encoding(bytes, encoding)
         .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
     if collect_vdbe_metrics {
         FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
@@ -19722,7 +19769,7 @@ fn decode_record_bytes_with_metrics(
 
 #[cfg(test)]
 fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
-    decode_record_with_metrics(val, vdbe_metrics_enabled())
+    decode_record_with_metrics(val, TextEncoding::Utf8, vdbe_metrics_enabled())
 }
 
 fn sorter_keys_equal(
@@ -19767,6 +19814,8 @@ fn compare_sorter_keys(
     Ordering::Equal
 }
 
+// Feeds the blind-append guard, which compares physical (stored-byte) order.
+#[allow(clippy::disallowed_methods)]
 fn parse_non_null_index_prefix(key_bytes: &[u8], key_columns: usize) -> Option<Vec<SqliteValue>> {
     let fields = parse_record(key_bytes)?;
     if fields.len() < key_columns || fields.iter().take(key_columns).any(SqliteValue::is_null) {
@@ -20276,6 +20325,7 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::Arc;
     use std::time::Instant;
@@ -20986,6 +21036,53 @@ mod tests {
             FrankenError::DatabaseCorrupt { detail }
                 if detail.contains("integer rowid suffix")
         ));
+    }
+
+    /// The probe seeks instead of scanning, so a conflict anywhere in a large
+    /// collated index must still be found, and a miss must stay a miss.
+    #[test]
+    fn test_collated_conflicting_rowid_seeks_through_large_nocase_index() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_collations_by_root_page(HashMap::from([(
+            index_root,
+            vec![Some("NOCASE".to_owned())],
+        )]));
+        assert!(run_async(engine.open_storage_cursor(0, index_root, true)).unwrap());
+        let sc = engine.storage_cursors.get_mut(&0).unwrap();
+        for rowid in 1..=600_i64 {
+            let key = encode_record(&[
+                SqliteValue::Text(format!("key{rowid:04}").into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            run_async(sc.cursor.index_insert(&sc.cx, &key)).unwrap();
+        }
+        let probe = |text: &str, rowid: i64| {
+            encode_record(&[SqliteValue::Text(text.into()), SqliteValue::Integer(rowid)])
+        };
+        for (text, new_rowid, expected) in [
+            ("KEY0001", 9_001, Some(1)),
+            ("Key0317", 9_002, Some(317)),
+            ("kEy0600", 9_003, Some(600)),
+            ("KEY0317", 5, Some(317)),
+            ("key0601", 9_004, None),
+            ("KEY0000", 9_005, None),
+        ] {
+            let found = run_async(find_conflicting_rowid_in_index_collated(
+                sc,
+                &probe(text, new_rowid),
+                1,
+                &[false],
+                &[Some("NOCASE".to_owned())],
+                &BUILTIN_COLLATION_REGISTRY,
+            ))
+            .unwrap();
+            assert_eq!(found, expected, "probe {text:?} (rowid {new_rowid})");
+        }
     }
 
     #[test]
@@ -34084,7 +34181,8 @@ mod tests {
 
         let before = vdbe_metrics_snapshot();
         let decoded_without_metrics =
-            decode_record_with_metrics(&record, false).expect("record should decode");
+            decode_record_with_metrics(&record, TextEncoding::Utf8, false)
+                .expect("record should decode");
         let after_without_metrics = vdbe_metrics_snapshot();
         assert_eq!(
             decoded_without_metrics,
@@ -34100,7 +34198,8 @@ mod tests {
         );
 
         let decoded_with_metrics =
-            decode_record_with_metrics(&record, true).expect("record should decode");
+            decode_record_with_metrics(&record, TextEncoding::Utf8, true)
+                .expect("record should decode");
         let after_with_metrics = vdbe_metrics_snapshot();
         assert_eq!(decoded_with_metrics, decoded_without_metrics);
         assert_eq!(

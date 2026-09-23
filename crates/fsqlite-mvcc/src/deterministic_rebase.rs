@@ -342,6 +342,9 @@ pub struct ReplayResult {
 /// 5. Produce updated record
 /// 6. Enforce NOT NULL / CHECK constraints
 /// 7. Regenerate index ops
+// UTF-8 databases only: not yet wired into execution; it must take the
+// database encoding before it is.
+#[allow(clippy::disallowed_methods)]
 pub fn replay_update_expression(
     table: TableId,
     key: RowId,
@@ -631,6 +634,7 @@ pub fn can_emit_update_expression(candidate: &UpdateExpressionCandidate) -> bool
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

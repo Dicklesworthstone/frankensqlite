@@ -1,4 +1,6 @@
 #![no_main]
+// Fuzzes the UTF-8 record codecs directly.
+#![allow(clippy::disallowed_methods)]
 
 //! Fuzz the record format serialization/deserialization.
 //!

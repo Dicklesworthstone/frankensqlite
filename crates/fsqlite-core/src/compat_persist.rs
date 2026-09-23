@@ -42,7 +42,8 @@ use fsqlite_types::StrictColumnType;
 use fsqlite_types::cx::Cx;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::record::{
-    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record_with_encoding,
+    RecordProfileScope, enter_record_profile_scope, parse_record_with_encoding,
+    serialize_record_with_encoding,
 };
 use fsqlite_types::value::SqliteValue;
 
@@ -93,9 +94,18 @@ fn resolve_index_collations(
     let guard = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Built-in BINARY stays unresolved: like the cursor, it orders in the
+    // database encoding rather than through the UTF-8 byte comparator.
     collations
         .iter()
-        .map(|coll| coll.as_deref().and_then(|name| guard.find(name)))
+        .map(|coll| {
+            coll.as_deref()
+                .filter(|name| {
+                    !(name.eq_ignore_ascii_case("BINARY")
+                        && guard.uses_builtin_implementation("BINARY"))
+                })
+                .and_then(|name| guard.find(name))
+        })
         .collect()
 }
 
@@ -119,6 +129,7 @@ fn compare_rebuilt_index_key(
     rhs: &[SqliteValue],
     desc_flags: &[bool],
     collations: &[Option<Arc<dyn CollationFunction>>],
+    text_encoding: fsqlite_types::TextEncoding,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let shared = lhs.len().min(rhs.len());
@@ -129,9 +140,9 @@ fn compare_rebuilt_index_key(
             &rhs[idx],
         ) {
             (Some(coll), SqliteValue::Text(left), SqliteValue::Text(right)) => {
-                coll.compare(left.as_bytes(), right.as_bytes())
+                coll.compare(left.as_bytes_direct(), right.as_bytes_direct())
             }
-            _ => lhs[idx].cmp(&rhs[idx]),
+            _ => lhs[idx].cmp_binary_in(&rhs[idx], text_encoding),
         };
         if desc_flags.get(idx).copied().unwrap_or(false) {
             ord = ord.reverse();
@@ -1284,7 +1295,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     }
                 }
             }
-            cursor.set_index_collation_context(pk.collations.clone(), collation_registry);
+            cursor.set_index_collation_context(
+                pk.collations.clone(),
+                collation_registry,
+                header_template.text_encoding,
+            );
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
 
             // GH#347: sort the primary-key records into ascending b-tree order
@@ -1318,7 +1333,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 })
                 .collect();
             pk_rows.sort_by(|a, b| {
-                compare_rebuilt_index_key(a, b, &pk.desc_flags, &pk_sort_collations)
+                compare_rebuilt_index_key(
+                    a,
+                    b,
+                    &pk.desc_flags,
+                    &pk_sort_collations,
+                    header_template.text_encoding,
+                )
             });
             for values in &pk_rows {
                 // Rows are already physical PK-leading (reordered above), so the
@@ -1544,7 +1565,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 // before `index_collations` is moved into the cursor.
                 let sort_collations =
                     resolve_index_collations(&index_collations, &collation_registry);
-                idx_cursor.set_index_collation_context(index_collations, collation_registry);
+                idx_cursor.set_index_collation_context(
+                    index_collations,
+                    collation_registry,
+                    header_template.text_encoding,
+                );
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     // GH#347: collect every index key, then sort into ascending
@@ -1607,7 +1632,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         index_keys.push(key_values);
                     }
                     index_keys.sort_by(|a, b| {
-                        compare_rebuilt_index_key(a, b, &sort_desc_flags, &sort_collations)
+                        compare_rebuilt_index_key(
+                            a,
+                            b,
+                            &sort_desc_flags,
+                            &sort_collations,
+                            header_template.text_encoding,
+                        )
                     });
                     for key_values in &index_keys {
                         idx_cursor
@@ -1821,8 +1852,8 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 // sqlite_master rows in the database.
                 payload_buf.clear();
                 let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
-                let values =
-                    parse_record(&payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                let values = parse_record_with_encoding(&payload_buf, header.text_encoding)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
@@ -2012,7 +2043,11 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     loop {
                         payload_buf.clear();
                         cursor.payload_into(cx, &mut payload_buf).await?;
-                        let mut values = parse_record(&payload_buf).ok_or_else(|| {
+                        let mut values = parse_record_with_encoding(
+                            &payload_buf,
+                            header.text_encoding,
+                        )
+                        .ok_or_else(|| {
                             FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "WITHOUT ROWID table `{table_name_for_err}` payload is not a valid SQLite record"
@@ -2041,7 +2076,11 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                     // hot path used by file-backed schema hydration.
                     payload_buf.clear();
                     let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf).await?;
-                    let mut values = parse_record(&payload_buf).ok_or_else(|| {
+                    let mut values = parse_record_with_encoding(
+                        &payload_buf,
+                        header.text_encoding,
+                    )
+                    .ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "table `{table_name_for_err}` rowid {rowid} payload is not a valid SQLite record"

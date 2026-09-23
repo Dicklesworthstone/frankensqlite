@@ -21945,6 +21945,8 @@ fn precomputed_serial_type_kind(column: &ColumnInfo) -> Option<PrecomputedSerial
 ///   placeholders for INTEGER PRIMARY KEY aliases just like `MakeRecord`
 /// - CURRENT_* literals stay on the runtime path so the value registers and
 ///   record blob cannot drift from separate timestamp materializations
+// Bakes UTF-8 TEXT: the only caller gates on a UTF-8 database (bd-bld9w.7).
+#[allow(clippy::disallowed_methods)]
 fn try_build_preformatted_insert_record(
     row_values: &[Expr],
     table: &TableSchema,
@@ -39156,6 +39158,7 @@ pub fn emit_backfill_column_read(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

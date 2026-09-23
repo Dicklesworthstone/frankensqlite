@@ -560,6 +560,9 @@ fn sqlite_value_compare(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering 
 ///
 /// Applies SQLite affinity coercion per the index column's declared affinity,
 /// then serializes the result using the SQLite record format.
+// UTF-8 databases only: not yet wired into execution; it must take the
+// database encoding before it is.
+#[allow(clippy::disallowed_methods)]
 pub fn compute_index_key(
     index_def: &IndexDef,
     row: &[SqliteValue],
@@ -718,7 +721,9 @@ pub fn discard_stale_index_ops(
 /// - For each index, checks participation and key changes
 /// - Emits the minimal set of `IndexInsert`/`IndexDelete` ops
 /// - Enforces UNIQUE constraints via the provided checker
-#[allow(clippy::too_many_lines)]
+// UTF-8 databases only: not yet wired into execution; it must take the
+// database encoding before it is.
+#[allow(clippy::too_many_lines, clippy::disallowed_methods)]
 pub fn regenerate_index_ops(
     base_record: &[u8],
     column_updates: &[(ColumnIdx, RebaseExpr)],
@@ -833,6 +838,7 @@ pub fn regenerate_index_ops(
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::collections::BTreeMap;
 

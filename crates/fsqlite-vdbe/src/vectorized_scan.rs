@@ -247,7 +247,9 @@ where
     ///
     /// Returns an error when cursor I/O fails, row payloads cannot be decoded,
     /// or batch construction fails.
-    #[allow(clippy::too_many_lines)]
+    // UTF-8 databases only: this operator is not wired into SQL execution, and
+    // it must take the database encoding before it is (bd-fug5d).
+    #[allow(clippy::too_many_lines, clippy::disallowed_methods)]
     pub async fn next_batch(&mut self) -> ScanResult<Option<ScanBatch>> {
         let _record_profile_scope =
             enter_record_profile_scope(RecordProfileScope::VdbeVectorizedScan);
@@ -502,6 +504,7 @@ fn checked_offset_span(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;

@@ -197,7 +197,8 @@ use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::set_record_profile_enabled;
 use fsqlite_types::record::{
     ColumnOffset, NumericColumnValue, PrecomputedRecordHeader, RecordHotPathProfileSnapshot,
-    RecordProfileScope, decode_column_from_offset, decode_numeric_column_from_offset, encode_batch,
+    RecordProfileScope, decode_column_from_offset, decode_column_from_offset_with_encoding,
+    decode_numeric_column_from_offset, encode_batch,
     enter_record_profile_scope, parse_record, parse_record_header_into,
     parse_record_into_with_encoding, parse_record_projected_column_offsets,
     parse_record_with_encoding, record_profile_enabled, record_profile_snapshot,
@@ -211,8 +212,8 @@ use fsqlite_types::serial_type::{
 };
 use fsqlite_types::sync_primitives::{Instant, SystemTime};
 use fsqlite_types::value::{
-    SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue, classify_sql_like_fast_path,
-    format_sqlite_float, sql_like_cased,
+    SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue, binary_text_cmp,
+    classify_sql_like_fast_path, format_sqlite_float, sql_like_cased,
 };
 use fsqlite_types::{
     BTreePageHeader, ComparisonAffinity, DatabaseHeader, EProcessConfig, EProcessOracle,
@@ -16207,12 +16208,13 @@ impl Connection {
             Self::bounded_next_table_row(cx, txn, root_page, page_size, reserved_per_page, after)
                 .await?
         {
-            let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                    table.name
-                ),
-            })?;
+            let values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                        table.name
+                    ),
+                })?;
             if values.len() > table.columns.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -16327,12 +16329,13 @@ impl Connection {
                         BOUNDED_VALIDATION_MAX_RECORD_BYTES
                     )));
                 }
-                let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
-                        table.name
-                    ),
-                })?;
+                let values = parse_record_with_encoding(&payload, self.db_text_encoding.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "WITHOUT ROWID table `{}` row {position} payload is not a valid SQLite record",
+                            table.name
+                        ),
+                    })?;
                 if values.len() > table.columns.len() {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -16746,6 +16749,7 @@ impl Connection {
                     descending.clone(),
                     collations.clone(),
                     Arc::clone(&self.collation_registry),
+                    self.db_text_encoding.get(),
                 );
                 let found = cursor.index_move_to(cx, &expected).await?;
                 counters.index_point_probes = counters
@@ -16783,6 +16787,7 @@ impl Connection {
             descending,
             collations,
             Arc::clone(&self.collation_registry),
+            self.db_text_encoding.get(),
         );
         let mut previous_payload: Option<Vec<u8>> = None;
         let mut previous_values: Option<Vec<SqliteValue>> = None;
@@ -16969,6 +16974,7 @@ impl Connection {
                 descending.clone(),
                 collations.clone(),
                 Arc::clone(&self.collation_registry),
+                self.db_text_encoding.get(),
             );
             let found = cursor.index_move_to(cx, expected).await?;
             counters.index_point_probes = counters
@@ -17008,6 +17014,7 @@ impl Connection {
             descending,
             collations,
             Arc::clone(&self.collation_registry),
+            self.db_text_encoding.get(),
         );
         let mut previous_payload: Option<Vec<u8>> = None;
         let mut previous_values: Option<Vec<SqliteValue>> = None;
@@ -17261,6 +17268,7 @@ impl Connection {
                     descending,
                     collations,
                     Arc::clone(&self.collation_registry),
+                    self.db_text_encoding.get(),
                 );
                 bounded_increment_validation_counter(&mut counters.foreign_key_parent_probes)?;
                 let _seek_result = cursor.index_move_to(cx, &probe).await?;
@@ -17370,6 +17378,7 @@ impl Connection {
                     descending,
                     collations.clone(),
                     Arc::clone(&self.collation_registry),
+                    self.db_text_encoding.get(),
                 );
                 bounded_increment_validation_counter(&mut counters.foreign_key_parent_probes)?;
                 // A LowerBound index seek treats a PK-only probe as a strict
@@ -19262,6 +19271,7 @@ impl Connection {
         index_desc_flags: Vec<bool>,
         index_collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
+        text_encoding: TextEncoding,
     ) -> fsqlite_btree::BtCursor<TransactionPageIo<'_, T>> {
         let (usable_size, full_page_size) =
             Self::btree_cursor_sizes_from_header(page_size, reserved_per_page);
@@ -19272,7 +19282,7 @@ impl Connection {
             false,
             index_desc_flags,
         );
-        cursor.set_index_collation_context(index_collations, collation_registry);
+        cursor.set_index_collation_context(index_collations, collation_registry, text_encoding);
         Self::configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
         cursor
     }
@@ -22124,6 +22134,7 @@ impl Connection {
             resolve("_idx")?,
             resolve("_docsize")?,
             resolve("_content")?,
+            self.db_text_encoding.get(),
             registry,
         );
         match reader.read_data_block(FTS5_AVERAGES_ROWID).await? {
@@ -22165,6 +22176,7 @@ impl Connection {
             None,
             None,
             None,
+            self.db_text_encoding.get(),
             registry,
         );
         let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID).await? else {
@@ -22219,6 +22231,7 @@ impl Connection {
                     None,
                     None,
                     None,
+                    self.db_text_encoding.get(),
                     registry,
                 );
                 let averages = reader.read_data_block(FTS5_AVERAGES_ROWID).await?;
@@ -22355,6 +22368,7 @@ impl Connection {
                 idx_root,
                 docsize_root,
                 content_root,
+                self.db_text_encoding.get(),
                 Arc::clone(&registry),
             );
             return f(&mut reader).await;
@@ -22377,6 +22391,7 @@ impl Connection {
             idx_root,
             docsize_root,
             content_root,
+            self.db_text_encoding.get(),
             registry,
         );
         let result = f(&mut reader).await;
@@ -28946,12 +28961,14 @@ impl Connection {
             )));
         }
 
-        let values = parse_record(payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "table `{}` rowid {rowid} payload is not a valid SQLite record",
-                table.name
-            ),
-        })?;
+        let values = parse_record_with_encoding(payload, self.db_text_encoding.get()).ok_or_else(
+            || FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} payload is not a valid SQLite record",
+                    table.name
+                ),
+            },
+        )?;
         self.inflate_table_row_values_for_storage_reload(
             table,
             rowid,
@@ -29018,6 +29035,7 @@ impl Connection {
                         table.name
                     ),
                 })?;
+                #[allow(clippy::disallowed_methods)] // INTEGER PRIMARY KEY alias
                 let alias_value =
                     decode_column_from_offset(payload, alias_offset, record_profile_enabled())
                         .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -29144,6 +29162,7 @@ impl Connection {
                                 table.name
                             ),
                         })?;
+                #[allow(clippy::disallowed_methods)] // INTEGER PRIMARY KEY alias
                 let alias_value =
                     decode_column_from_offset(payload, alias_offset, record_profile_enabled())
                         .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -29199,13 +29218,18 @@ impl Connection {
         }
 
         if let Some(column_offset) = column_offsets.get(column_index) {
-            return decode_column_from_offset(payload, column_offset, record_profile_enabled())
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} column {column_index} is not a valid SQLite record value",
-                        table.name
-                    ),
-                });
+            return decode_column_from_offset_with_encoding(
+                payload,
+                column_offset,
+                self.db_text_encoding.get(),
+                record_profile_enabled(),
+            )
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table `{}` rowid {rowid} column {column_index} is not a valid SQLite record value",
+                    table.name
+                ),
+            });
         }
 
         let default_value = match table
@@ -30932,7 +30956,7 @@ impl Connection {
                         push_memdb_value_as_text(&mut entry.1, &value);
                         entry.0 = true;
                     }
-                    groups
+                    let mut rows: Vec<Row> = groups
                         .into_iter()
                         .map(|(group_key, (saw_value, concat))| Row {
                             values: vec![
@@ -30944,7 +30968,15 @@ impl Connection {
                                 },
                             ],
                         })
-                        .collect()
+                        .collect();
+                    // The map groups by value equality (encoding-independent)
+                    // but iterates in canonical UTF-8 order; stock emits groups
+                    // in BINARY order of the stored encoding.
+                    let encoding = statement_text_encoding();
+                    if !matches!(encoding, TextEncoding::Utf8) {
+                        rows.sort_by(|a, b| a.values[0].cmp_binary_in(&b.values[0], encoding));
+                    }
+                    rows
                 };
                 Ok(Some(rows))
             }
@@ -52824,6 +52856,7 @@ impl Connection {
         Ok(false)
     }
 
+    #[allow(clippy::disallowed_methods)] // `encode_batch` lane is gated on UTF-8
     async fn persist_materialized_live_vtab_rows(
         &self,
         table_name: &str,
@@ -52857,8 +52890,11 @@ impl Connection {
         // whole blob of records with a single resize-and-fill.  The output
         // is byte-identical to the per-row `serialize_record` path, so this
         // fast lane is enabled by default and gated off via
-        // `PRAGMA fsqlite.vectorized_makerecord = OFF`.
-        let use_vectorized = self.vectorized_makerecord_enabled.get();
+        // `PRAGMA fsqlite.vectorized_makerecord = OFF`. `encode_batch` emits
+        // UTF-8 TEXT, so a UTF-16 database takes the encoding-aware lane.
+        let text_encoding = self.db_text_encoding.get();
+        let use_vectorized = self.vectorized_makerecord_enabled.get()
+            && matches!(text_encoding, TextEncoding::Utf8);
 
         self.with_pager_write_txn(async |cx, txn| {
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
@@ -52901,10 +52937,7 @@ impl Connection {
                     if cursor.table_move_to(cx, rowid).await?.is_found() {
                         cursor.delete(cx).await?;
                     }
-                    let record = serialize_record_with_encoding(
-                        &persisted_values,
-                        self.db_text_encoding.get(),
-                    );
+                    let record = serialize_record_with_encoding(&persisted_values, text_encoding);
                     cursor.table_insert(cx, rowid, &record).await?;
                 }
             }
@@ -54234,6 +54267,7 @@ impl Connection {
     /// segid would alias the seek space when its segid is later reallocated.
     /// No-op when `%_idx` is absent or legacy rowid-shaped.
     #[cfg(feature = "ext-fts5")]
+    #[allow(clippy::disallowed_methods)] // `%_idx` keys: integer segid, BLOB term
     async fn delete_fts5_idx_rows_for_segids(
         &self,
         idx_name: &str,
@@ -73753,18 +73787,45 @@ impl Connection {
         // compare code points, silently regressing BINARY ordering on UTF-16. A
         // rusqlite differential keeper pins this:
         // `tests/bd_npl2p_utf16_index_key_order.rs`.
+        //
+        // A declared collation other than the built-in BINARY sees canonical
+        // text, as in the cursor comparator (`cmp_index_values_collated`): stock
+        // applies NOCASE/RTRIM to UTF-8, so on a UTF-16 database the stored
+        // bytes are decoded before the collation runs. Text is always read as
+        // its exact bytes, never the lossy `&str` view.
+        fn canonical_bytes(
+            text: &fsqlite_types::SmallText,
+            encoding: TextEncoding,
+        ) -> std::borrow::Cow<'_, [u8]> {
+            match encoding {
+                TextEncoding::Utf8 => std::borrow::Cow::Borrowed(text.as_bytes_direct()),
+                encoding => std::borrow::Cow::Owned(
+                    fsqlite_types::SmallText::from_record_text_bytes(
+                        text.as_bytes_direct(),
+                        encoding,
+                    )
+                    .as_bytes_direct()
+                    .to_vec(),
+                ),
+            }
+        }
         let registry = self
             .collation_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let text_encoding = self.db_text_encoding.get();
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
             let mut ord = match (index.key_term_collation(idx), &lhs[idx], &rhs[idx]) {
-                (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) => {
-                    let (left, right) = (left.as_bytes(), right.as_bytes());
+                (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right))
+                    if !(coll_name.eq_ignore_ascii_case("BINARY")
+                        && registry.uses_builtin_implementation("BINARY")) =>
+                {
+                    let left = canonical_bytes(left, text_encoding);
+                    let right = canonical_bytes(right, text_encoding);
                     match registry.find(coll_name) {
-                        Some(collation) => collation.compare(left, right),
-                        None => left.cmp(right),
+                        Some(collation) => collation.compare(&left, &right),
+                        None => binary_text_cmp(&left, &right, text_encoding),
                     }
                 }
                 _ => lhs[idx].partial_cmp(&rhs[idx])?,
@@ -74400,7 +74461,9 @@ impl Connection {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Index-order checks compare the stored key bytes (see
+    // `compare_index_key_values_for_integrity`), so keys decode byte-preserving.
+    #[allow(clippy::too_many_arguments, clippy::disallowed_methods)]
     async fn validate_schema_btrees_in_txn(
         &self,
         cx: &Cx,
@@ -74908,6 +74971,7 @@ impl Connection {
                             .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
                             .collect(),
                         Arc::clone(&self.collation_registry),
+                        self.db_text_encoding.get(),
                     );
                     let mut prev_payload: Option<Vec<u8>> = None;
                     if cursor.first(cx).await? {
@@ -75072,6 +75136,7 @@ impl Connection {
                         .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
                         .collect(),
                     Arc::clone(&self.collation_registry),
+                    self.db_text_encoding.get(),
                 );
                 let mut prev_payload: Option<Vec<u8>> = None;
                 if cursor.first(cx).await? {
@@ -86497,7 +86562,11 @@ impl Connection {
             if cursor.first(cx).await? {
                 loop {
                     let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-                    let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
+                    let payload_values = parse_record_with_encoding(
+                        payload.as_ref(),
+                        self.db_text_encoding.get(),
+                    )
+                    .ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "join pager scan: table `{}` rowid {rowid} has invalid record",
@@ -86905,7 +86974,11 @@ impl Connection {
         let mut valid = !cursor.eof();
         while valid {
             let (rowid, payload) = cursor.rowid_and_payload_cow(cx).await?;
-            let payload_values = parse_record(payload.as_ref()).ok_or_else(|| {
+            let payload_values = parse_record_with_encoding(
+                payload.as_ref(),
+                self.db_text_encoding.get(),
+            )
+            .ok_or_else(|| {
                 FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "keyset join stream scan: table `{outer_name}` rowid {rowid} has an \
@@ -95652,6 +95725,7 @@ impl Connection {
         let ipk_col_idx = rowid_alias_columns
             .get(&table.name.to_ascii_lowercase())
             .copied();
+        let text_encoding = self.db_text_encoding.get();
         let mut rows = Vec::new();
 
         if cursor.first(cx).await? {
@@ -95659,13 +95733,14 @@ impl Connection {
                 let mut synthetic_rowid = 1_i64;
                 loop {
                     let payload = cursor.payload(cx).await?;
-                    let values =
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    let values = parse_record_with_encoding(&payload, text_encoding).ok_or_else(
+                        || FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "WITHOUT ROWID table `{}` payload is not a valid SQLite record",
                                 table.name
                             ),
-                        })?;
+                        },
+                    )?;
                     let values = self
                         .inflate_table_row_values_for_storage_reload(
                             table,
@@ -95685,13 +95760,14 @@ impl Connection {
             loop {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
-                let mut values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                let mut values = parse_record_with_encoding(&payload, text_encoding).ok_or_else(
+                    || FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "table `{}` rowid {rowid} payload is not a valid SQLite record",
                             table.name
                         ),
-                    })?;
+                    },
+                )?;
                 values = self
                     .inflate_table_row_values_for_storage_reload(table, rowid, &values, ipk_col_idx)
                     .await?;
@@ -119487,9 +119563,24 @@ where
         );
     }
 
+    // The map groups by value equality (encoding-independent) but iterates in
+    // canonical UTF-8 order; stock emits groups in BINARY order of the stored
+    // encoding.
+    let encoding = statement_text_encoding();
+    let mut groups: Vec<(Vec<SqliteValue>, SimpleStreamingGroupByState)> =
+        groups.into_iter().collect();
+    if !matches!(encoding, TextEncoding::Utf8) {
+        groups.sort_by(|(a, _), (b, _)| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| a.cmp_binary_in(b, encoding))
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or_else(|| a.len().cmp(&b.len()))
+        });
+    }
     groups
-        .into_values()
-        .map(|state| {
+        .into_iter()
+        .map(|(_, state)| {
             Ok(Row {
                 values: finalize_simple_streaming_group_by_row(&state, outputs, col_map)?,
             })
@@ -128119,7 +128210,9 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         }
         (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
         (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
-        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
+        (SqliteValue::Text(at), SqliteValue::Text(bt)) => {
+            binary_text_cmp(at.as_bytes_direct(), bt.as_bytes_direct(), statement_text_encoding())
+        }
         (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
         _ => unreachable!("same rank guarantees same type class"),
     }
@@ -128161,7 +128254,9 @@ fn cmp_values_no_affinity(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Orderin
         }
         (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
         (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
-        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
+        (SqliteValue::Text(at), SqliteValue::Text(bt)) => {
+            binary_text_cmp(at.as_bytes_direct(), bt.as_bytes_direct(), statement_text_encoding())
+        }
         (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
         _ => unreachable!("same rank guarantees same type class"),
     }
@@ -128511,10 +128606,31 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         }
         (SqliteValue::Integer(a), SqliteValue::Float(b)) => int_float_cmp(*a, *b),
         (SqliteValue::Float(a), SqliteValue::Integer(b)) => int_float_cmp(*b, *a).reverse(),
-        (SqliteValue::Text(a), SqliteValue::Text(b)) => a.cmp(b),
+        (SqliteValue::Text(a), SqliteValue::Text(b)) => {
+            binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), statement_text_encoding())
+        }
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) => a.cmp(b),
         _ => unreachable!("unreachable given rank check above"),
     }
+}
+
+/// BINARY-or-registry TEXT compare on canonical values: the built-in BINARY
+/// (and an unregistered name, which SQLite resolves to BINARY) orders in the
+/// statement's database encoding like stock; any other collation, including
+/// an application override of BINARY, decides through the registry.
+fn compare_text_bytes_with_registry(
+    left: &[u8],
+    right: &[u8],
+    collation: &str,
+    registry: &CollationRegistry,
+) -> std::cmp::Ordering {
+    if collation.eq_ignore_ascii_case("BINARY") && registry.uses_builtin_implementation("BINARY") {
+        return binary_text_cmp(left, right, statement_text_encoding());
+    }
+    registry
+        .find(collation)
+        .map(|coll_fn| coll_fn.compare(left, right))
+        .unwrap_or_else(|| binary_text_cmp(left, right, statement_text_encoding()))
 }
 
 /// Compare text bytes using a pre-snapshotted collation registry.
@@ -128526,13 +128642,12 @@ fn compare_text_bytes_collated(
     collation: &str,
     collation_registry: &Mutex<CollationRegistry>,
 ) -> std::cmp::Ordering {
-    let compare_with = |registry: &CollationRegistry| {
-        registry
-            .find(collation)
-            .map(|collation| collation.compare(left, right))
-    };
-
-    compare_with(&lock_unpoisoned(collation_registry)).unwrap_or_else(|| left.cmp(right))
+    compare_text_bytes_with_registry(
+        left,
+        right,
+        collation,
+        &lock_unpoisoned(collation_registry),
+    )
 }
 
 /// Compare text bytes using a pre-snapshotted collation registry.
@@ -128543,10 +128658,7 @@ fn compare_text_bytes_collated_snapshot(
     collation: &str,
     registry: &CollationRegistry,
 ) -> std::cmp::Ordering {
-    registry
-        .find(collation)
-        .map(|coll_fn| coll_fn.compare(left, right))
-        .unwrap_or_else(|| left.cmp(right))
+    compare_text_bytes_with_registry(left, right, collation, registry)
 }
 
 /// Lock-free variant using a pre-snapshotted registry.
@@ -140629,7 +140741,7 @@ fn compare_order_values(
         };
     }
 
-    let mut ordering = left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal);
+    let mut ordering = left.cmp_binary_in(right, statement_text_encoding());
     if term.descending {
         ordering = ordering.reverse();
     }
@@ -142006,6 +142118,8 @@ struct Fts5LiveShadowReader<'a> {
     idx_root: Option<PageNumber>,
     docsize_root: Option<PageNumber>,
     content_root: Option<PageNumber>,
+    /// Database text encoding: `_content` columns are TEXT stored in it.
+    text_encoding: TextEncoding,
     collation_registry: Arc<Mutex<CollationRegistry>>,
 }
 
@@ -142023,6 +142137,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
         reserved_per_page: u8,
         schema: &[TableSchema],
         table_name: &str,
+        text_encoding: TextEncoding,
         collation_registry: Arc<Mutex<CollationRegistry>>,
     ) -> Result<Self> {
         let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
@@ -142051,6 +142166,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
             resolve("_idx")?,
             resolve("_docsize")?,
             resolve("_content")?,
+            text_encoding,
             collation_registry,
         ))
     }
@@ -142067,6 +142183,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
         idx_root: Option<PageNumber>,
         docsize_root: Option<PageNumber>,
         content_root: Option<PageNumber>,
+        text_encoding: TextEncoding,
         collation_registry: Arc<Mutex<CollationRegistry>>,
     ) -> Self {
         Self {
@@ -142079,6 +142196,7 @@ impl<'a> Fts5LiveShadowReader<'a> {
             idx_root,
             docsize_root,
             content_root,
+            text_encoding,
             collation_registry,
         }
     }
@@ -142100,8 +142218,10 @@ impl<'a> Fts5LiveShadowReader<'a> {
             return Ok(None);
         }
         let payload = cursor.payload(self.cx).await?;
-        let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!("fts5 shadow row {rowid} payload is not a valid SQLite record"),
+        let values = parse_record_with_encoding(&payload, self.text_encoding).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("fts5 shadow row {rowid} payload is not a valid SQLite record"),
+            }
         })?;
         Ok(Some(values))
     }
@@ -142193,6 +142313,7 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
         ))
     }
 
+    #[allow(clippy::disallowed_methods)] // `%_idx` keys: integer segid, BLOB term
     async fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
         let Some(root) = self.idx_root else {
             return Ok(None);
@@ -142212,6 +142333,7 @@ impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
             vec![false, false],
             vec![None, None],
             Arc::clone(&self.collation_registry),
+            self.text_encoding,
         );
         cursor.index_move_to(self.cx, &probe).await?;
         // index_move_to lands at the smallest stored key >= probe (or EOF).
@@ -151367,6 +151489,7 @@ pub(crate) fn fsqlite_core_test_serializer() -> std::sync::MutexGuard<'static, (
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         BoundPagerPublication, CanonicalHashJoinKey, CommitSeq, ConcurrentRegistry, Connection,
@@ -208200,6 +208323,7 @@ mod transaction_lifecycle_tests {
 // 5A.2 – sqlite_master row insert / delete tests (bd-1b5e)
 // =========================================================================
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod sqlite_master_btree_tests {
     use super::*;
     use fsqlite_btree::BtreeCursorOps;
@@ -208998,6 +209122,7 @@ mod sqlite_master_btree_tests {
 // 5A.3 – real root page allocation tests (bd-3ez5)
 // =========================================================================
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod root_page_allocation_tests {
     use super::*;
     use fsqlite_btree::BtreeCursorOps;
@@ -213311,6 +213436,7 @@ mod schema_cookie_tests {
 
 // ── Schema loading from sqlite_master tests (bd-1soh) ───────────────────
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod schema_loading_tests {
     use super::*;
     use fsqlite_btree::BtreeCursorOps;
@@ -221697,6 +221823,7 @@ fts5(title, body, content=docs, content_rowid=id)'
 // ── bd-2ttd8.1: Pager routing integration tests ──────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod pager_routing_tests {
     use super::tests::{
         ReentrantVtabConnectionGuard, ValuesDonorProbe, ValuesRegistryChangingFactory,

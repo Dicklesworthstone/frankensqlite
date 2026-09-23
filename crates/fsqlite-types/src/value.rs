@@ -1984,6 +1984,50 @@ impl PartialOrd for SqliteValue {
     }
 }
 
+/// Stock SQLite's BINARY order for canonical TEXT of an `encoding` database.
+///
+/// Stock memcmps the *stored* bytes. UTF-8 is a plain byte compare. UTF-16
+/// orders by the code units' stored bytes, which diverges from UTF-8 order for
+/// non-ASCII text (UTF-16LE puts `Ā` U+0100 = `00 01` before `é` U+00E9 =
+/// `E9 00`; UTF-16BE puts U+E000..U+FFFF after supplementary characters).
+/// Bytes that are not valid UTF-8 (byte-preserved raw TEXT) compare as stored.
+///
+/// Only for canonical values: a record decoded with the byte-preserving UTF-8
+/// decoder already holds the stored UTF-16 bytes and must compare them as-is.
+#[must_use]
+pub fn binary_text_cmp(left: &[u8], right: &[u8], encoding: TextEncoding) -> Ordering {
+    let little_endian = match encoding {
+        TextEncoding::Utf8 => return left.cmp(right),
+        TextEncoding::Utf16le => true,
+        TextEncoding::Utf16be => false,
+    };
+    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+        (Ok(left), Ok(right)) => {
+            // memcmp over little-endian unit bytes `[lo, hi]` is numeric order
+            // of the byte-swapped unit.
+            let stored = |unit: u16| if little_endian { unit.swap_bytes() } else { unit };
+            left.encode_utf16()
+                .map(stored)
+                .cmp(right.encode_utf16().map(stored))
+        }
+        _ => left.cmp(right),
+    }
+}
+
+impl SqliteValue {
+    /// [`Ord::cmp`] with TEXT under BINARY collation in the database
+    /// `encoding` (see [`binary_text_cmp`]); identical to `cmp` for UTF-8.
+    #[must_use]
+    pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) if !matches!(encoding, TextEncoding::Utf8) => {
+                binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), encoding)
+            }
+            _ => self.cmp(other),
+        }
+    }
+}
+
 impl Ord for SqliteValue {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -2861,6 +2905,43 @@ mod tests {
                         da.cmp(&SmallText::new(a)),
                         std::cmp::Ordering::Equal,
                         "bd-bld9w.4 {enc:?}: decoded {a:?} must equal its UTF-8 form"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_text_cmp_is_memcmp_of_the_stored_encoding() {
+        // Stock BINARY on a UTF-16 database memcmps the stored UTF-16 bytes;
+        // `binary_text_cmp` must reproduce that from the canonical UTF-8 form
+        // without transcoding, for every pair and both byte orders.
+        let samples = [
+            "", "A", "a", "é", "Ā", "ÿ", "Đ", "名", "東", "杲", "\u{e000}", "\u{ffff}",
+            "😀", "😀grin", "én12", "Ān15", "a\0", "ab",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    binary_text_cmp(a.as_bytes(), b.as_bytes(), TextEncoding::Utf8),
+                    a.as_bytes().cmp(b.as_bytes()),
+                    "UTF-8 is a plain memcmp: {a:?} vs {b:?}"
+                );
+                for (enc, le) in [
+                    (TextEncoding::Utf16le, true),
+                    (TextEncoding::Utf16be, false),
+                ] {
+                    let stored = utf16_record_bytes(a, le).cmp(&utf16_record_bytes(b, le));
+                    assert_eq!(
+                        binary_text_cmp(a.as_bytes(), b.as_bytes(), enc),
+                        stored,
+                        "{enc:?}: {a:?} vs {b:?} must order as the stored bytes"
+                    );
+                    assert_eq!(
+                        SqliteValue::Text(SmallText::new(a))
+                            .cmp_binary_in(&SqliteValue::Text(SmallText::new(b)), enc),
+                        stored,
+                        "{enc:?}: cmp_binary_in {a:?} vs {b:?}"
                     );
                 }
             }

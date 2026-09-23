@@ -1,0 +1,23 @@
+# TEXT in a database file is stored in the header's text encoding (UTF-8,
+# UTF-16le or UTF-16be). These record codecs hardcode UTF-8: decoding a UTF-16
+# record with them yields code-unit mojibake, and encoding with them writes
+# UTF-8 bytes into a UTF-16 file. Use the `*_with_encoding` sibling with the
+# database encoding; where UTF-8 is correct by construction (byte-order key
+# compares, rowid/integer-only reads, a branch already gated on UTF-8, tests),
+# add a scoped `#[allow(clippy::disallowed_methods)]` that says why.
+disallowed-methods = [
+    { path = "fsqlite_types::record::parse_record", reason = "UTF-8-only decode; use parse_record_with_encoding" },
+    { path = "fsqlite_types::record::parse_record_into", reason = "UTF-8-only decode; use parse_record_into_with_encoding" },
+    { path = "fsqlite_types::record::parse_record_column", reason = "UTF-8-only decode; decode with the database encoding" },
+    { path = "fsqlite_types::record::parse_record_prefix", reason = "UTF-8-only decode; use parse_record_prefix_with_encoding" },
+    { path = "fsqlite_types::record::decode_column_from_offset", reason = "UTF-8-only decode; use decode_column_from_offset_with_encoding" },
+    { path = "fsqlite_types::record::decode_column_from_offset_reuse", reason = "UTF-8-only decode; use decode_column_from_offset_reuse_with_encoding" },
+    { path = "fsqlite_types::record::decode_value", reason = "UTF-8-only decode; use decode_value_with_encoding" },
+    { path = "fsqlite_types::record::serialize_record", reason = "UTF-8-only encode; use serialize_record_with_encoding" },
+    { path = "fsqlite_types::record::serialize_record_refs", reason = "UTF-8-only encode; use serialize_record_with_encoding" },
+    { path = "fsqlite_types::record::serialize_record_iter", reason = "UTF-8-only encode; use serialize_record_iter_into_with_encoding" },
+    { path = "fsqlite_types::record::serialize_record_iter_into", reason = "UTF-8-only encode; use serialize_record_iter_into_with_encoding" },
+    { path = "fsqlite_types::record::encode_batch", reason = "UTF-8-only encode; gate on a UTF-8 database or serialize with the encoding" },
+    { path = "fsqlite_types::record::encode_batch_auto", reason = "UTF-8-only encode; gate on a UTF-8 database or serialize with the encoding" },
+    { path = "fsqlite_types::record::encode_batch_homogeneous", reason = "UTF-8-only encode; gate on a UTF-8 database or serialize with the encoding" },
+]
