@@ -229,7 +229,9 @@ fn sidecar_writer_contention_does_not_leak_source_recovery_locks() {
         let (options, _) = fixture(8, &[1]);
         let cx = request_context().unwrap();
         let guard = host_fs::open_existing_regular_file_no_follow(&companion(&options.source, "-wal-fec.lock")).unwrap();
-        guard.try_lock().unwrap();
+        // Blocking: a sibling test's fork can briefly share the fixture's
+        // released lock until its child execs.
+        guard.lock().unwrap();
         assert!(matches!(export_database(&cx, &options).await, Err(FrankenError::Busy)));
         assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
         drop(guard);

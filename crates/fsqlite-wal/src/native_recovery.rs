@@ -260,6 +260,28 @@ fn read_exact_snapshot(reader: &mut impl Read, cx: &Cx, len: usize) -> Result<Ve
     }
 }
 
+/// Sidecar mutations hold their exclusive lock only across one metadata or
+/// symbol write, so a snapshot reader waits out that window rather than
+/// refusing. The flock also stays held while any process forked in that window
+/// has not yet exec'd, since the child shares the open file description.
+/// A lock held past the budget is a live writer, reported as `Busy`.
+const SIDECAR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn lock_sidecar_shared(guard: &std::fs::File, cx: &Cx) -> Result<()> {
+    let deadline = std::time::Instant::now() + SIDECAR_LOCK_WAIT;
+    loop {
+        match guard.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                checkpoint(cx)?;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(FrankenError::Busy),
+            Err(std::fs::TryLockError::Error(error)) => return Err(FrankenError::Io(error)),
+        }
+    }
+}
+
 fn read_sidecar(path: &Path, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
     let lock_path = companion(path, ".lock");
     // Stable companion shared with FEC append/migration; never unlink it.
@@ -276,11 +298,7 @@ fn read_sidecar(path: &Path, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
         }
         Err(error) => return Err(error),
     };
-    guard.try_lock_shared().map_err(|error| {
-        let error = io::Error::from(error);
-        if error.kind() == io::ErrorKind::WouldBlock { FrankenError::Busy }
-        else { FrankenError::Io(error) }
-    })?;
+    lock_sidecar_shared(&guard, cx)?;
     let mut file = match host_fs::open_existing_regular_file_no_follow(path) {
         Ok(file) => file,
         Err(FrankenError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
