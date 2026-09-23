@@ -83391,6 +83391,168 @@ impl Connection {
         Some(Ok(SqliteValue::Integer(i64::from(truth))))
     }
 
+    /// GH#419: direct MemDatabase scan for a correlated `EXISTS` whose outer
+    /// references have already been substituted as bound values, when the
+    /// probe is a plain single-table filter over a small or unindexed table.
+    ///
+    /// The Sudoku recursive CTE re-runs `NOT EXISTS (SELECT 1 FROM digits AS lp
+    /// WHERE z.z = substr(s, ...) OR ...)` once per candidate row — ~42k probes
+    /// of a 9-row table. `try_direct_exists_probe` admits only one correlated
+    /// equality, so every probe fell through to a nested statement that was
+    /// validated and compiled from scratch (bound outer values make each
+    /// program unique, so it is never cached): ~100x stock's runtime. This
+    /// scans the table once per probe instead, evaluates the WHERE with the
+    /// same synchronous evaluator and column-affinity/collation context that
+    /// `execute_join_select` uses for a fully pushed-down single-table filter,
+    /// and stops at the first qualifying row as stock's EXISTS does.
+    ///
+    /// Statement-level validation (unknown columns/functions, arity) has
+    /// already run on the enclosing statement. Only a literal or `*` result
+    /// list is admitted, so no result expression (aggregate, subquery, erroring
+    /// function) is skipped; DISTINCT, LIMIT and ORDER BY decline. Tables that
+    /// need namespace routing (TEMP, shadowed), virtual tables, schema-qualified
+    /// names, generated columns, WITHOUT ROWID storage, or a WHERE the
+    /// evaluator cannot resolve against this table alone also decline. A large
+    /// *indexed* table declines too: the nested statement can seek it, while
+    /// this path is a linear scan.
+    fn try_scan_correlated_exists_probe(&self, subquery: &SelectStatement) -> Option<Result<bool>> {
+        if !self.join_mem_scan_safe() || self.scalar_function_overridden.get() {
+            return None;
+        }
+        if subquery.with.is_some()
+            || !subquery.body.compounds.is_empty()
+            || subquery.limit.is_some()
+            || !subquery.order_by.is_empty()
+            || select_contains_any_placeholder(subquery)
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause: Some(where_expr),
+            group_by,
+            having,
+            windows,
+            distinct,
+            ..
+        } = &subquery.body.select
+        else {
+            return None;
+        };
+        if !from.joins.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || !matches!(distinct, fsqlite_ast::Distinctness::All)
+            || !columns.iter().all(|column| {
+                matches!(
+                    column,
+                    ResultColumn::Star
+                        | ResultColumn::Expr {
+                            expr: Expr::Literal(..),
+                            ..
+                        }
+                )
+            })
+        {
+            return None;
+        }
+        let TableOrSubquery::Table {
+            name,
+            alias,
+            index_hint,
+            time_travel,
+        } = &from.source
+        else {
+            return None;
+        };
+        if name.schema.is_some() || index_hint.is_some() || time_travel.is_some() {
+            return None;
+        }
+        let table_key = name.name.to_ascii_lowercase();
+        if self.temp_table_names.borrow().contains(&table_key)
+            || self.shadowed_main_tables.borrow().contains_key(&table_key)
+            || self.table_name_is_virtual(&name.name)
+        {
+            return None;
+        }
+        let (root_page, col_map, column_collations, column_affinities) = {
+            let schema = self.schema.borrow();
+            let mut matches = schema
+                .iter()
+                .filter(|table| table.name.eq_ignore_ascii_case(&name.name));
+            let table = matches.next()?;
+            if matches.next().is_some()
+                || table.without_rowid
+                || table
+                    .columns
+                    .iter()
+                    .any(|column| column.generated_expr.is_some())
+            {
+                return None;
+            }
+            let label = alias.as_deref().unwrap_or(&name.name);
+            let col_map: Vec<(String, String, bool)> = table
+                .columns
+                .iter()
+                .map(|column| (label.to_owned(), column.name.clone(), false))
+                .collect();
+            if !expr_references_only_col_map(where_expr, &col_map) {
+                return None;
+            }
+            let collations: Vec<Option<String>> = table
+                .columns
+                .iter()
+                .map(|column| normalize_column_collation(column.collation.as_deref()))
+                .collect();
+            let affinities: Vec<TypeAffinity> = table
+                .columns
+                .iter()
+                .map(|column| affinity_char_to_type(column.affinity))
+                .collect();
+            if !table.indexes.is_empty() {
+                let db = self.db.borrow();
+                if db.get_table(table.root_page)?.row_count()
+                    > Self::EXISTS_DIRECT_PROBE_MAX_LINEAR_ROWS
+                {
+                    return None;
+                }
+            }
+            (table.root_page, col_map, collations, affinities)
+        };
+        let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&table_key).copied();
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
+                column_collations,
+                column_affinities,
+                using_column_projections: HashMap::new(),
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
+        let db = self.db.borrow();
+        let table = db.get_table(root_page)?;
+        let mut row: Vec<SqliteValue> = Vec::with_capacity(col_map.len());
+        for (rowid, values) in table.iter_rows() {
+            row.clear();
+            row.extend_from_slice(values);
+            // Short physical records (pre-ALTER ADD COLUMN) read as NULL,
+            // exactly as the join scan pads them.
+            row.resize(col_map.len(), SqliteValue::Null);
+            if let Some(alias_index) = rowid_alias_column_index
+                && let Some(alias_value) = row.get_mut(alias_index)
+            {
+                *alias_value = SqliteValue::Integer(rowid);
+            }
+            match eval_join_predicate(where_expr, &row, &col_map) {
+                Ok(true) => return Some(Ok(true)),
+                Ok(false) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Some(Ok(false))
+    }
+
     /// bd-nd2ju (#377, L3): after outer-ref substitution, relax each correlated
     /// equality `inner_col = <BoundOuterValue>` in a single-table EXISTS
     /// subquery to `inner_col = <literal>` when the comparison contract is
@@ -83689,6 +83851,13 @@ impl Connection {
                         col_map,
                         None,
                     );
+                    // GH#419: a plain single-table filter scans MemDB directly
+                    // instead of compiling a fresh nested statement per row.
+                    if let Some(scanned) = self.try_scan_correlated_exists_probe(&sub_clone) {
+                        let exists = scanned?;
+                        let truth = if *not { !exists } else { exists };
+                        return Ok(SqliteValue::Integer(i64::from(truth)));
+                    }
                     // bd-nd2ju (#377, L3): relax collation/affinity-safe correlated
                     // equalities (`inner_col = <bound outer value>`) to plain literals
                     // so the nested statement compiles to an index / PRIMARY KEY seek

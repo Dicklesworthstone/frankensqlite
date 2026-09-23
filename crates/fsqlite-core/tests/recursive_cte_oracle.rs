@@ -150,6 +150,96 @@ SELECT s FROM x WHERE ind=0;
     });
 }
 
+/// GH#419: correlated `EXISTS` probes whose predicate is not a single
+/// correlated equality (OR chains, expression operands) scan the probe table
+/// directly instead of compiling a nested statement per outer row. Pin the
+/// comparison semantics that path must preserve — column affinity on either
+/// side, declared NOCASE vs explicit BINARY collation, INTEGER PRIMARY KEY
+/// aliases, NULL outer values, `SELECT *` probes — plus a large indexed table
+/// that must keep the seekable nested-statement path, both in plain SELECTs and
+/// inside recursive CTE arms.
+#[test]
+fn gh419_correlated_exists_scan_probe_matches_sqlite() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE k(t TEXT, i INTEGER, r REAL, b)",
+        "INSERT INTO k VALUES ('1', 1, 1.0, '1'), ('02', 2, 2.5, 2), ('abc', NULL, NULL, x'61'), (NULL, 4, 4.0, NULL)",
+        "CREATE TABLE kc(name TEXT COLLATE NOCASE, tag TEXT)",
+        "INSERT INTO kc VALUES ('Alpha', 'x'), ('beta ', 'y'), ('GAMMA', NULL)",
+        "CREATE TABLE kp(id INTEGER PRIMARY KEY, v TEXT)",
+        "INSERT INTO kp VALUES (3, 'c'), (7, 'g'), (10, 'j')",
+        "CREATE TABLE big(a INTEGER, s TEXT)",
+        "CREATE INDEX big_a ON big(a)",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x < 200) INSERT INTO big SELECT x, 'v' || x FROM n",
+        "CREATE TABLE o1(x, y TEXT, z INTEGER)",
+        "INSERT INTO o1 VALUES (1,'1',1),(2,'2','2'),(3,'abc',3),(4,NULL,4),('1',1,'1'),(2.5,'2.5',2.5),(NULL,NULL,NULL),(x'61','a',97)",
+        "CREATE TABLE o2(w TEXT, u)",
+        "INSERT INTO o2 VALUES ('alpha','alpha'),('BETA','BETA'),('beta ','beta '),('gamma','x'),('delta',NULL),('A','A'),('b','b')",
+    ];
+    const CASES: &[(&str, &str)] = &[
+        (
+            "SELECT x, y, z FROM o1 WHERE NOT EXISTS (SELECT 1 FROM k WHERE k.t = o1.x OR k.i = o1.y) ORDER BY rowid",
+            "NOT EXISTS, TEXT/INTEGER inner columns vs untyped/TEXT outer",
+        ),
+        (
+            "SELECT x, y, z FROM o1 WHERE EXISTS (SELECT 1 FROM k WHERE k.r = o1.x OR k.b = o1.z) ORDER BY rowid",
+            "EXISTS, REAL and untyped inner columns",
+        ),
+        (
+            "SELECT x, y, z FROM o1 WHERE EXISTS (SELECT 1 FROM k WHERE o1.y = k.i OR o1.z = k.t OR o1.x = k.b) ORDER BY rowid",
+            "outer operand on the left of each comparison",
+        ),
+        (
+            "SELECT w FROM o2 WHERE EXISTS (SELECT 1 FROM kc WHERE kc.name = o2.w OR kc.tag = o2.w) ORDER BY rowid",
+            "declared NOCASE inner column on the left",
+        ),
+        (
+            "SELECT w FROM o2 WHERE NOT EXISTS (SELECT 1 FROM kc WHERE o2.w = kc.name OR o2.u = kc.tag) ORDER BY rowid",
+            "outer BINARY column on the left of a NOCASE column",
+        ),
+        (
+            "SELECT u FROM o2 WHERE EXISTS (SELECT 1 FROM kc WHERE o2.u = kc.name OR o2.u || '' = kc.name) ORDER BY rowid",
+            "untyped outer column and expression vs NOCASE column",
+        ),
+        (
+            "SELECT w FROM o2 WHERE EXISTS (SELECT 1 FROM kc WHERE kc.name = o2.w COLLATE BINARY OR substr(kc.name, 1, 1) = o2.w) ORDER BY rowid",
+            "explicit COLLATE BINARY overrides the declared NOCASE",
+        ),
+        (
+            "SELECT w FROM o2 WHERE EXISTS (SELECT 1 FROM kc AS q WHERE q.name = o2.w AND q.tag IS NOT NULL OR q.name LIKE o2.u) ORDER BY rowid",
+            "aliased probe table, AND inside OR, LIKE",
+        ),
+        (
+            "SELECT x, z FROM o1 WHERE EXISTS (SELECT 1 FROM kp WHERE kp.id = o1.z OR v = char(o1.z + 96)) ORDER BY rowid",
+            "INTEGER PRIMARY KEY alias read from the rowid",
+        ),
+        (
+            "SELECT x FROM o1 WHERE NOT EXISTS (SELECT * FROM k WHERE k.i = o1.x OR (k.i IS o1.x AND k.t IS NULL)) ORDER BY rowid",
+            "SELECT * probe and NULL outer values",
+        ),
+        (
+            "SELECT x, z FROM o1 WHERE EXISTS (SELECT 1 FROM big WHERE big.a = o1.z OR big.s = 'v' || (o1.z + 100)) ORDER BY rowid",
+            "large indexed probe table keeps the nested-statement path",
+        ),
+        (
+            "WITH RECURSIVE c(n, path) AS (SELECT 1, '1' UNION ALL SELECT n+1, path || ',' || (n+1) FROM c WHERE n < 12 AND NOT EXISTS (SELECT 1 FROM kp WHERE kp.id = c.n + 1 OR kp.v = substr('abcdefghijkl', c.n + 1, 1))) SELECT n, path FROM c ORDER BY n",
+            "recursive arm stops when the probe first matches",
+        ),
+        (
+            "WITH RECURSIVE c(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM c, kc WHERE n < 3 AND EXISTS (SELECT 1 FROM kc AS z WHERE z.name = kc.tag OR z.tag = kc.tag)) SELECT n, count(*) FROM c GROUP BY n ORDER BY n",
+            "recursive arm joined with the probed table under an alias",
+        ),
+        (
+            "WITH RECURSIVE c(n, s) AS (SELECT 1, 'x' UNION ALL SELECT n+1, s || n FROM c, o2 WHERE n < 3 AND NOT EXISTS (SELECT 1 FROM kc WHERE kc.name = o2.w OR kc.tag = substr(c.s, n, 1))) SELECT n, s, count(*) FROM c GROUP BY n, s ORDER BY n, s",
+            "probe correlated with both the working table and a joined table",
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for (sql, msg) in CASES {
+            agree(SETUP, sql, msg).await;
+        }
+    });
+}
+
 #[test]
 fn counters_and_accumulation() {
     asupersync::test_utils::run_test(|| async {
