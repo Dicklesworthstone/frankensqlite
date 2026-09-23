@@ -786,7 +786,7 @@ fn find_recovery_group(
                 .map_err(|_| Stop::UnusableSidecar)?
                 .ok_or(Stop::UnusableSidecar)?;
             if matches {
-                match fsqlite_types::SymbolRecord::from_bytes(payload) {
+                match super::parse_wal_fec_repair_symbol(payload) {
                     Ok(symbol) => repair_symbols.push(symbol),
                     Err(_) => corruption_observations += 1,
                 }
