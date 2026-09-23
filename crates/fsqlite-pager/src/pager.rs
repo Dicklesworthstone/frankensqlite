@@ -10556,6 +10556,21 @@ fn freelist_trunk_leaf_capacity(page_size: PageSize, reserved_per_page: u8) -> u
         .max(1)
 }
 
+/// Reserved bytes per page that a commit makes durable. A transaction that
+/// stages page 1 carries the header this commit publishes: a fresh image
+/// stamped from a header template (VACUUM's rebuild, compat persistence)
+/// starts from a bootstrap header with no reserved bytes and only then writes
+/// the template's, so the pager's committed value is stale until the commit.
+fn commit_reserved_per_page<S: std::hash::BuildHasher>(
+    write_set: &HashMap<PageNumber, StagedPage, S>,
+    committed: u8,
+) -> u8 {
+    write_set
+        .get(&PageNumber::ONE)
+        .and_then(|page_one| page_one.as_page_bytes().get(20).copied())
+        .unwrap_or(committed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
@@ -10608,7 +10623,10 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         .filter(|page| page.get() <= committed_db_size)
         .collect();
 
-    let max_leaf_entries = freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
+    let max_leaf_entries = freelist_trunk_leaf_capacity(
+        inner.page_size,
+        commit_reserved_per_page(write_set, inner.reserved_per_page),
+    );
     let total_free = durable_freelist.len() as u32;
 
     let (first_trunk, trunk_pages) = if durable_freelist.is_empty() {
@@ -21597,8 +21615,10 @@ where
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
 
         if freelist_dirty && !durable_freelist.is_empty() {
-            let max_leaf_entries =
-                freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
+            let max_leaf_entries = freelist_trunk_leaf_capacity(
+                inner.page_size,
+                commit_reserved_per_page(&self.write_set, inner.reserved_per_page),
+            );
             let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
             pages.extend(durable_freelist.into_iter().take(trunk_count));
 

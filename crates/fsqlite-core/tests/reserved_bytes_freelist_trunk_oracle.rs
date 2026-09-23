@@ -39,14 +39,14 @@ fn stock_integrity(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-/// Build, through stock SQLite, a 4096-byte-page database with 32 reserved
-/// bytes per page and one ~page-sized row per page in `t`.
+/// Build, through stock SQLite, an empty 4096-byte-page database with 32
+/// reserved bytes per page.
 ///
 /// The rusqlite API cannot set `SQLITE_FCNTL_RESERVE_BYTES`, so the empty
 /// one-page image is patched exactly as stock `zeroPage` lays it out for a
 /// reserved-bytes database: header byte 20 and page 1's cell-content start at
 /// the usable size. Stock then fills it, honoring the reserved trailer.
-fn build_stock_reserved_db(path: &std::path::Path) {
+fn build_stock_reserved_empty(path: &std::path::Path) {
     {
         let conn = rusqlite::Connection::open(path).expect("stock create");
         conn.execute_batch(
@@ -67,6 +67,11 @@ fn build_stock_reserved_db(path: &std::path::Path) {
         vec!["ok".to_owned()],
         "patched empty reserved-bytes image must be valid to stock SQLite"
     );
+}
+
+/// [`build_stock_reserved_empty`] plus one ~page-sized row per page in `t`.
+fn build_stock_reserved_db(path: &std::path::Path) {
+    build_stock_reserved_empty(path);
     let conn = rusqlite::Connection::open(path).expect("stock reopen");
     conn.execute_batch(&format!(
         "CREATE TABLE t(x); \
@@ -217,5 +222,74 @@ fn integrity_check_rejects_trunk_leaves_in_the_reserved_trailer() {
                 "fsqlite must fail on the freelist defect, got {err}"
             ),
         }
+    });
+}
+
+/// Content digest, read through stock SQLite.
+fn stock_digest(path: &std::path::Path) -> (i64, i64, i64) {
+    let conn = rusqlite::Connection::open(path).expect("stock open");
+    conn.query_row(
+        "SELECT count(*), sum(length(a)), sum(length(b)) FROM t",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .expect("stock digest")
+}
+
+/// VACUUM rebuilds the image through a pager opened on a fresh file, whose
+/// bootstrap header has no reserved bytes; the source header (with them) is
+/// stamped into page 1 only inside the rebuild transaction. The rebuild's
+/// freelist trunks must still be sized for the published usable size, or
+/// the pre-publication integrity gate rejects the image (and, before that
+/// gate parsed the usable prefix, stock-corrupt images were published).
+#[test]
+fn vacuum_on_reserved_bytes_db_keeps_trunks_within_usable_capacity() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("reserved_vacuum.db");
+        build_stock_reserved_empty(&path);
+        {
+            // Overflow chains, index churn and deletes leave the source with
+            // free pages and the rebuild with more than one trunk's worth.
+            let conn = rusqlite::Connection::open(&path).expect("stock reopen");
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c REAL); \
+                 CREATE INDEX ti ON t(a); \
+                 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 600) \
+                 INSERT INTO t SELECT i, printf('text-%05d-%.*c', i, (i * 37) % 300, 'x'), \
+                   zeroblob((i * 131) % 9000) || x'0102', i * 0.25 FROM s; \
+                 UPDATE t SET b = zeroblob((id * 53) % 20000) || x'ff' WHERE id % 3 = 0; \
+                 DELETE FROM t WHERE id % 5 = 0; \
+                 WITH RECURSIVE s(i) AS (SELECT 601 UNION ALL SELECT i + 1 FROM s WHERE i < 900) \
+                 INSERT INTO t SELECT i, printf('late-%05d', i), zeroblob(i * 17) || x'0a', \
+                   i * 1.5 FROM s; \
+                 DELETE FROM t WHERE id BETWEEN 100 AND 400;",
+            )
+            .expect("stock workload");
+        }
+        let before = stock_digest(&path);
+        let db = path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db).await.expect("fsqlite open");
+        conn.execute("PRAGMA journal_mode=DELETE;")
+            .await
+            .expect("journal_mode");
+        conn.execute("VACUUM;").await.expect("fsqlite VACUUM");
+        conn.close().await.expect("fsqlite close");
+
+        let bytes = std::fs::read(&path).expect("read vacuumed image");
+        assert_eq!(bytes[20], RESERVED, "VACUUM must keep the reserved bytes");
+        for (trunk, leaves) in trunk_chain(&bytes) {
+            assert!(
+                leaves <= TRUNK_CAPACITY,
+                "trunk page {trunk} holds {leaves} leaves; usable capacity is {TRUNK_CAPACITY}"
+            );
+        }
+        assert_eq!(
+            stock_integrity(&path),
+            vec!["ok".to_owned()],
+            "stock SQLite must accept fsqlite's VACUUMed image"
+        );
+        assert_eq!(stock_digest(&path), before, "VACUUM must not change content");
     });
 }
