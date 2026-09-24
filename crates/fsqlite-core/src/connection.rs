@@ -11878,6 +11878,15 @@ struct PlannerDirectiveCacheEntry {
     directive: Option<SelectPlannerDirective>,
 }
 
+/// Planner inputs from `sqlite_stat1`, keyed by lowercased name.
+#[derive(Debug, Default)]
+struct Stat1Hints {
+    /// Table row count (the first `stat` integer).
+    table_rows: HashMap<String, u64>,
+    /// Per index: average rows matching an equality on each leading prefix.
+    index_rows_per_key: HashMap<String, Vec<u64>>,
+}
+
 /// Schema-scoped execution metadata reused by table-backed VDBE runs.
 ///
 /// This caches only structural data derived from the schema graph. Values that
@@ -13399,6 +13408,9 @@ pub struct Connection {
     /// and feature flags. This only caches the connection seam that has no
     /// cracking/runtime hints so planner post-processing remains valid on hits.
     planner_directive_cache: RefCell<LruCache<u64, Arc<PlannerDirectiveCacheEntry>>>,
+    /// `sqlite_stat1` as loaded at a mirror commit sequence. Cleared with the
+    /// planner-directive cache, so both see the same ANALYZE.
+    stat1_hints_cache: RefCell<Option<(CommitSeq, Rc<Stat1Hints>)>>,
     /// Version-scoped prepared equality caches for safe in-memory secondary-index
     /// lookup fast paths.
     prepared_indexed_equality_cache:
@@ -14886,6 +14898,7 @@ impl Connection {
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
             ),
+            stat1_hints_cache: RefCell::new(None),
             prepared_indexed_equality_cache: RefCell::new(HashMap::new()),
             prepared_indexed_equality_last_result: RefCell::new(None),
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
@@ -15442,6 +15455,7 @@ impl Connection {
             planner_directive_cache: RefCell::new(
                 LruCache::new(default_statement_cache_capacity()),
             ),
+            stat1_hints_cache: RefCell::new(None),
             prepared_indexed_equality_cache: RefCell::new(HashMap::new()),
             prepared_indexed_equality_last_result: RefCell::new(None),
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
@@ -35959,6 +35973,7 @@ impl Connection {
         self.compiled_cache.borrow_mut().clear();
         self.prepared_cache.borrow_mut().clear();
         self.planner_directive_cache.borrow_mut().clear();
+        self.stat1_hints_cache.borrow_mut().take();
         self.storage_count_cache.borrow_mut().clear();
         self.clear_prepared_indexed_equality_caches();
         *self.group_by_bucket_fast_memo.borrow_mut() = None;
@@ -35999,6 +36014,7 @@ impl Connection {
         self.compiled_cache.borrow_mut().clear();
         self.prune_prepared_cache_after_write_commit();
         self.planner_directive_cache.borrow_mut().clear();
+        self.stat1_hints_cache.borrow_mut().take();
         self.storage_count_cache.borrow_mut().clear();
         self.clear_prepared_indexed_equality_caches();
         // bd-z22mq: the bucket memo caches only schema-derived products, but a
@@ -43963,7 +43979,8 @@ impl Connection {
         // try_extract_equi_join_indices; infeasible permutations bail out.
         let mut join_order_permutation: Option<Vec<usize>> = None;
         if all_inner_joins && table_sources.len() >= 2 {
-            let row_hints = self.sqlite_stat1_row_counts().await;
+            let stat1_hints = self.sqlite_stat1_hints().await;
+            let row_hints = &stat1_hints.table_rows;
             let refs: Vec<fsqlite_planner::TableRefWithStats> = table_sources
                 .iter()
                 .map(|source| {
@@ -60840,27 +60857,38 @@ impl Connection {
         self.schema.borrow().get(idx).map(|t| t.root_page)
     }
 
-    /// Build a `table-name -> n_rows` map by scanning all of `sqlite_stat1`.
+    /// Planner hints from all of `sqlite_stat1`: table row counts and each
+    /// index's rows-per-key.
     ///
     /// Keys are lowercased for case-insensitive lookup by the planner glue.
-    /// Returns an empty map when `sqlite_stat1` does not exist or cannot be
-    /// read; callers should treat missing entries as "no ANALYZE data" and
-    /// fall back to heuristics.
+    /// Empty when `sqlite_stat1` does not exist or cannot be read; callers
+    /// treat missing entries as "no ANALYZE data" and fall back to heuristics.
+    ///
+    /// Outside an explicit transaction the result is reused while the mirror
+    /// stays at one commit sequence; ANALYZE and write commits clear it along
+    /// with the planner-directive cache. Inside one, the transaction's own
+    /// `sqlite_stat1` writes are visible only to a fresh read.
     ///
     /// A thread-local re-entrance guard short-circuits recursive calls.
     /// Without the guard, running `query()` on `sqlite_stat1` would itself
     /// compile through `planner_select_directive_with_cache`, which calls
     /// back into this function and overflows the stack.
-    async fn sqlite_stat1_row_counts(&self) -> HashMap<String, u64> {
+    async fn sqlite_stat1_hints(&self) -> Rc<Stat1Hints> {
         thread_local! {
             static STAT1_LOAD_IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        let mut out: HashMap<String, u64> = HashMap::new();
-        if self.sqlite_stat1_root_page().is_none() {
-            return out;
+        if self.sqlite_stat1_root_page().is_none()
+            || STAT1_LOAD_IN_PROGRESS.with(std::cell::Cell::get)
+        {
+            return Rc::default();
         }
-        if STAT1_LOAD_IN_PROGRESS.with(std::cell::Cell::get) {
-            return out;
+        let visible_seq = *self.memdb_visible_commit_seq.borrow();
+        let cacheable = !self.in_transaction.get();
+        if cacheable
+            && let Some((seq, hints)) = self.stat1_hints_cache.borrow().as_ref()
+            && *seq == visible_seq
+        {
+            return Rc::clone(hints);
         }
         STAT1_LOAD_IN_PROGRESS.with(|c| c.set(true));
         // RAII guard so we clear the flag even if `query` panics (unlikely,
@@ -60875,8 +60903,9 @@ impl Connection {
 
         let sql = "SELECT tbl, idx, stat FROM sqlite_stat1";
         let Ok(rows) = self.query(sql).await else {
-            return out;
+            return Rc::default();
         };
+        let mut out = Stat1Hints::default();
         for row in &rows {
             let values = row.values();
             let Some(SqliteValue::Text(table)) = values.first() else {
@@ -60891,17 +60920,30 @@ impl Connection {
             let Some(parsed) = fsqlite_planner::stats::parse_stat1(stat_text) else {
                 continue;
             };
-            let is_table_row = matches!(values.get(1), Some(SqliteValue::Null) | None);
             let key = table.to_ascii_lowercase();
-            if is_table_row {
+            match values.get(1) {
                 // Table-level row is authoritative; always overwrite.
-                out.insert(key, parsed.n_rows);
-            } else {
-                // Index-level row: use as fallback if no table-level entry.
-                out.entry(key).or_insert(parsed.n_rows);
+                Some(SqliteValue::Null) | None => {
+                    out.table_rows.insert(key, parsed.n_rows);
+                }
+                // Index-level row: its row count is a fallback when the table
+                // has no table-level entry.
+                Some(index) => {
+                    out.table_rows.entry(key).or_insert(parsed.n_rows);
+                    if let SqliteValue::Text(index) = index {
+                        out.index_rows_per_key
+                            .insert(index.to_ascii_lowercase(), parsed.per_column_distinct);
+                    }
+                }
             }
         }
-        out
+        let hints = Rc::new(out);
+        if cacheable {
+            // The read may have refreshed the mirror; key by what it read.
+            let seq = *self.memdb_visible_commit_seq.borrow();
+            *self.stat1_hints_cache.borrow_mut() = Some((seq, Rc::clone(&hints)));
+        }
+        hints
     }
 
     fn is_autoincrement_table(&self, table_name: &str) -> bool {
@@ -79199,13 +79241,13 @@ impl Connection {
         Self::planner_select_directive_with_stats(select, schema, None)
     }
 
-    /// Same as [`Self::planner_select_directive`] but optionally takes a
-    /// `tbl-name-lowercased -> n_rows` map derived from `sqlite_stat1`
+    /// Same as [`Self::planner_select_directive`] but optionally takes the
+    /// table row counts and index rows-per-key from `sqlite_stat1`
     /// (PLANNER-1). Pass `None` to use the heuristic defaults.
     fn planner_select_directive_with_stats(
         select: &SelectStatement,
         schema: &[TableSchema],
-        stat1_row_counts: Option<&HashMap<String, u64>>,
+        stat1: Option<&Stat1Hints>,
     ) -> Option<SelectPlannerDirective> {
         const PLANNER_SURFACE: &str = "single_table_access_path_v1";
         const PLAN_GENERATION: u64 = 1;
@@ -79269,8 +79311,8 @@ impl Connection {
         let needed_columns = planner_needed_columns(columns, &table.name, table_alias);
         // PLANNER-1: prefer ANALYZE-derived row count from sqlite_stat1 when
         // available; fall back to the heuristic default.
-        let (n_rows, stats_source) = stat1_row_counts
-            .and_then(|m| m.get(&table.name.to_ascii_lowercase()).copied())
+        let (n_rows, stats_source) = stat1
+            .and_then(|hints| hints.table_rows.get(&table.name.to_ascii_lowercase()).copied())
             .map_or(
                 (HEURISTIC_TABLE_ROWS, PlannerStatsSource::Heuristic),
                 |rows| (rows, PlannerStatsSource::Analyze),
@@ -79314,6 +79356,14 @@ impl Connection {
                     Some(sql) => Some(fsqlite_parser::expr::parse_expr(sql).ok()?),
                     None => None,
                 };
+                let rows_per_key = stat1
+                    .and_then(|hints| {
+                        hints
+                            .index_rows_per_key
+                            .get(&index.name.to_ascii_lowercase())
+                            .cloned()
+                    })
+                    .unwrap_or_default();
                 Some(PlannerIndexInfo {
                     name: index.name.clone(),
                     table: planner_relation_name.clone(),
@@ -79323,6 +79373,7 @@ impl Connection {
                     source: PlannerStatsSource::Heuristic,
                     partial_where,
                     expression_columns,
+                    rows_per_key,
                 })
             })
             .collect::<Vec<_>>();
@@ -79584,15 +79635,8 @@ impl Connection {
             FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
         // PLANNER-1: consult sqlite_stat1 if ANALYZE has populated it.
-        // Building the full map on each cache miss is acceptable: directive
-        // caching still absorbs the hot path, and sqlite_stat1 is typically
-        // tiny (one row per (table, index)).
-        let stat1_row_counts = self.sqlite_stat1_row_counts().await;
-        let stat1_arg = if stat1_row_counts.is_empty() {
-            None
-        } else {
-            Some(&stat1_row_counts)
-        };
+        let stat1_hints = self.sqlite_stat1_hints().await;
+        let stat1_arg = (!stat1_hints.table_rows.is_empty()).then_some(&*stat1_hints);
         let pc = hot_path_profile_enabled().then(Instant::now);
         let directive = Self::planner_select_directive_with_stats(select, schema, stat1_arg);
         record_hot_path_duration(&FSQLITE_PLAN_COMPUTE_NS, pc);
@@ -79918,7 +79962,7 @@ impl Connection {
         // bd-5310l: the whole schema is deep-cloned per compile ONLY as a defensive snapshot,
         // because the planner may consult `sqlite_stat1` through a reentrant `self.query()` that can
         // mutate `self.schema` while we hold a reference to it. That reentrancy happens iff
-        // `sqlite_stat1` actually exists (ANALYZE was run); `sqlite_stat1_row_counts()` early-returns
+        // `sqlite_stat1` actually exists (ANALYZE was run); `sqlite_stat1_hints()` early-returns
         // without any `self.query()` otherwise. And the per-statement shadowed-main substitution
         // needs an owned, mutable schema. So when neither applies — the common case (no ANALYZE, no
         // TEMP shadowing) — borrow `self.schema` directly and skip the O(total-schema) deep clone.
@@ -79985,8 +80029,8 @@ impl Connection {
             // heuristics remain available for unrelated predicates.
             None
         } else if bypass_planner_cache {
-            let stat1_row_counts = self.sqlite_stat1_row_counts().await;
-            let stat1_arg = (!stat1_row_counts.is_empty()).then_some(&stat1_row_counts);
+            let stat1_hints = self.sqlite_stat1_hints().await;
+            let stat1_arg = (!stat1_hints.table_rows.is_empty()).then_some(&*stat1_hints);
             let pc = prof.then(Instant::now);
             let directive =
                 Self::planner_select_directive_with_stats(canonical_select, schema, stat1_arg);
@@ -245278,7 +245322,7 @@ mod pager_routing_tests {
             // One directive entry: the user query. This is a DIRECT `compile_table_select` call (not
             // fronted by the compiled-program cache), so it uses the planner-directive cache. The
             // internal `SELECT tbl, idx, stat FROM sqlite_stat1` query the planner runs (via
-            // `sqlite_stat1_row_counts`) goes through `query()` -> `compile_with_cache`, so it IS
+            // `sqlite_stat1_hints`) goes through `query()` -> `compile_with_cache`, so it IS
             // program-cache-fronted and bypasses the directive cache (bd-5310l) — its plan is reused via
             // the compiled-program cache instead, not a separate directive entry.
             assert_eq!(conn.planner_directive_cache_len(), 1);
@@ -245286,6 +245330,55 @@ mod pager_routing_tests {
             conn.execute("ANALYZE plan_analyze;").await.unwrap();
             // ANALYZE must invalidate every cached directive (the user query directive).
             assert_eq!(conn.planner_directive_cache_len(), 0);
+        });
+    }
+
+    #[test]
+    fn test_analyze_rows_per_key_steers_equality_index_choice() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE sel_stats (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);")
+                .await
+                .unwrap();
+            // Declared first, and far less selective: two distinct values.
+            conn.execute("CREATE INDEX idx_sel_stats_a ON sel_stats(a);")
+                .await
+                .unwrap();
+            conn.execute("CREATE INDEX idx_sel_stats_b ON sel_stats(b);")
+                .await
+                .unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            for i in 0..200 {
+                conn.execute(&format!("INSERT INTO sel_stats VALUES ({i}, {}, {i}, 'x');", i % 2))
+                    .await
+                    .unwrap();
+            }
+            conn.execute("COMMIT;").await.unwrap();
+            let select = parse_select_statement("SELECT c FROM sel_stats WHERE a = 1 AND b = 7");
+
+            let directive = |hints: Option<&Stat1Hints>| {
+                Connection::planner_select_directive_with_stats(
+                    &select,
+                    &conn.schema.borrow(),
+                    hints,
+                )
+                .and_then(|directive| directive.index_name)
+            };
+            assert_eq!(directive(None).as_deref(), Some("idx_sel_stats_a"));
+
+            conn.execute("ANALYZE;").await.unwrap();
+            let hints = conn.sqlite_stat1_hints().await;
+            assert_eq!(
+                hints.index_rows_per_key.get("idx_sel_stats_a").map(Vec::as_slice),
+                Some(&[100][..])
+            );
+            assert_eq!(directive(Some(&hints)).as_deref(), Some("idx_sel_stats_b"));
+
+            let rows = conn
+                .query("SELECT c FROM sel_stats WHERE a = 1 AND b = 7;")
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
         });
     }
 

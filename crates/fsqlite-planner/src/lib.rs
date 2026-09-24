@@ -464,6 +464,10 @@ pub struct IndexInfo {
     /// When present, the planner matches query expressions structurally against these.
     /// `columns` should contain synthetic names; the real matching uses these exprs.
     pub expression_columns: Vec<Expr>,
+    /// From `sqlite_stat1` (ANALYZE): at position `k`, the average number of
+    /// rows an equality on the leading `k + 1` columns matches. Empty when the
+    /// index has not been analyzed.
+    pub rows_per_key: Vec<u64>,
 }
 
 /// Schema hint that a visible table column is an alias for SQLite's hidden
@@ -1677,6 +1681,14 @@ pub fn best_access_path_with_hints(
     best
 }
 
+/// Rows one equality probe on the leading `width` columns of `index` matches,
+/// as ANALYZE recorded it in `sqlite_stat1`.
+#[allow(clippy::cast_precision_loss)]
+fn analyzed_rows_per_probe(index: &IndexInfo, width: usize) -> Option<f64> {
+    let rows = *index.rows_per_key.get(width.checked_sub(1)?)?;
+    Some((rows as f64).max(1.0))
+}
+
 /// Build the cheapest [`AccessPath`] with optional explicit and adaptive hints.
 #[must_use]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1896,10 +1908,15 @@ fn best_access_path_internal(
         });
 
         let mut cost_multiplier: f64 = 1.0;
+        // Rows one equality probe matches, when ANALYZE measured it.
+        let mut analyzed_probe_rows = None;
         let (kind, mut est_rows) = match usability {
             IndexUsability::Equality => {
                 let rows = if idx.unique {
                     1.0
+                } else if let Some(rows) = analyzed_rows_per_probe(idx, 1) {
+                    analyzed_probe_rows = Some(rows);
+                    rows
                 } else {
                     (table.n_rows as f64 / 10.0).max(1.0)
                 };
@@ -1934,6 +1951,9 @@ fn best_access_path_internal(
                             | MultiColumnTrailingConstraint::LikePrefix
                     ) {
                     1.0
+                } else if let Some(rows) = analyzed_rows_per_probe(idx, equality_width) {
+                    analyzed_probe_rows = Some(rows);
+                    rows
                 } else {
                     let divisor = 10.0_f64.powi(i32::try_from(equality_width).unwrap_or(i32::MAX));
                     (table.n_rows as f64 / divisor).max(1.0)
@@ -1990,6 +2010,9 @@ fn best_access_path_internal(
                 // and rows are scaled by the number of probes.
                 let per_probe_rows: f64 = if idx.unique {
                     1.0
+                } else if let Some(rows) = analyzed_rows_per_probe(idx, 1) {
+                    analyzed_probe_rows = Some(rows);
+                    rows
                 } else {
                     (table.n_rows as f64 / 10.0).max(1.0)
                 };
@@ -2016,8 +2039,16 @@ fn best_access_path_internal(
             est_rows = (est_rows * probe_multiplier).min(table.n_rows.max(1) as f64);
         }
 
-        let mut cost =
-            estimate_cost_ext(&kind, table.n_pages, idx.n_pages, table.n_rows) * cost_multiplier;
+        let mut cost = estimate_cost_ext(&kind, table.n_pages, idx.n_pages, table.n_rows);
+        // An equality probe is charged one matching row above. With ANALYZE
+        // data its real fan-out is known: charge every further row a table
+        // visit, so a selective index beats one that merely comes first.
+        if matches!(kind, AccessPathKind::IndexScanEquality)
+            && let Some(rows) = analyzed_probe_rows
+        {
+            cost = (rows - 1.0).max(0.0).mul_add(ROW_ACCESS_COST, cost);
+        }
+        cost *= cost_multiplier;
 
         if let Some(hinted_name) = explicit_indexed_by {
             if idx.name.eq_ignore_ascii_case(hinted_name) {
@@ -3757,11 +3788,10 @@ fn normalize_expression_index_columns(expr: &mut Expr, index_table: &str) -> boo
     }
 }
 
-/// Default selectivity for range constraints when no ANALYZE data is available.
-/// 0.33 means "a range predicate eliminates ~67% of rows." This is a
-/// conservative estimate matching C SQLite's heuristic for tables without
-/// `sqlite_stat1` data. When ANALYZE has been run, the planner uses the
-/// actual statistics from sqlite_stat1 instead.
+/// Selectivity for range constraints. 0.33 means "a range predicate
+/// eliminates ~67% of rows," matching C SQLite's heuristic without
+/// `sqlite_stat4` samples; `sqlite_stat1` records only equality fan-out
+/// (see [`IndexInfo::rows_per_key`]), which leading equality columns use.
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
 /// Selectivity heuristic for a constant LIKE/GLOB prefix range.
 const LIKE_PREFIX_SELECTIVITY: f64 = 0.10;
@@ -7052,6 +7082,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }
     }
 
@@ -9352,6 +9383,38 @@ mod tests {
     }
 
     #[test]
+    fn test_best_access_path_analyzed_rows_per_key_picks_selective_equality_index() {
+        let mut table = table_stats("t1", 1_000, 100_000);
+        table.source = StatsSource::Analyze;
+        let terms = [eq_term("a"), eq_term("b")];
+
+        // Without ANALYZE data both single-column equality probes cost the
+        // same, so the first index wins.
+        let unanalyzed = [
+            index_info("idx_a", "t1", &["a"], false, 80),
+            index_info("idx_b", "t1", &["b"], false, 80),
+        ];
+        let ap = best_access_path(&table, &unanalyzed, &terms, None);
+        assert_eq!(ap.index.as_deref(), Some("idx_a"));
+
+        // sqlite_stat1 says `a` matches 50,000 rows per value and `b` two.
+        let mut idx_a = index_info("idx_a", "t1", &["a"], false, 80);
+        idx_a.rows_per_key = vec![50_000];
+        let mut idx_b = index_info("idx_b", "t1", &["b"], false, 80);
+        idx_b.rows_per_key = vec![2];
+        let ap = best_access_path(&table, &[idx_a, idx_b], &terms, None);
+        assert_eq!(ap.index.as_deref(), Some("idx_b"));
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanEquality));
+        assert!((ap.estimated_rows - 2.0).abs() < f64::EPSILON);
+
+        // A two-column index uses its two-column fan-out.
+        let mut idx_ab = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        idx_ab.rows_per_key = vec![50_000, 1];
+        let ap = best_access_path(&table, &[idx_ab], &terms, None);
+        assert!((ap.estimated_rows - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_best_access_path_multicolumn_trailing_in_refines_row_estimate() {
         let table = table_stats("t1", 1_000, 1_000_000);
         let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
@@ -9614,6 +9677,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![key_expr],
+            rows_per_key: Vec::new(),
         };
 
         let terms = [classify_where_term(where_expr)];
@@ -9678,6 +9742,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![key_expr],
+            rows_per_key: Vec::new(),
         };
 
         let terms = [classify_where_term(where_expr)];
@@ -9740,6 +9805,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![key_expr],
+            rows_per_key: Vec::new(),
         };
 
         let terms = [classify_where_term(upper_name_eq)];
@@ -9835,6 +9901,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![key_expr],
+            rows_per_key: Vec::new(),
         };
         // Leak the parsed WHERE expression so the WhereTerm can hold a
         // reference with `'static` lifetime, matching the other tests.
@@ -9892,6 +9959,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: Some(partial_predicate()),
             expression_columns: vec![lower_name()],
+            rows_per_key: Vec::new(),
         };
         let table = table_stats("users", 1_000, 100_000);
 
@@ -9918,6 +9986,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
         let terms = [eq_term("a")];
         assert!(matches!(
@@ -11819,6 +11888,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
         let terms = [eq_term("a")];
         let ap = best_access_path(&table, &[idx], &terms, None);
@@ -11952,6 +12022,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
@@ -11983,6 +12054,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let ap = best_access_path(&table, &[idx], &[eq_term("region_code")], None);
@@ -12014,6 +12086,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
@@ -12041,6 +12114,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let candidate =
@@ -12069,6 +12143,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let candidate =
@@ -12100,6 +12175,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: Vec::new(),
+            rows_per_key: Vec::new(),
         };
 
         let candidate =
@@ -12132,6 +12208,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
 
         let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
@@ -12767,6 +12844,7 @@ mod tests {
                 over: None,
                 span: Span::ZERO,
             }],
+            rows_per_key: Vec::new(),
         };
         let qualified_expression_path = join_access_path(
             &table_stats("t1", 100, 1_000),
@@ -12987,6 +13065,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![key_expr],
+            rows_per_key: Vec::new(),
         };
 
         let path = best_access_path(&table, &[index], &[classify_where_term(where_expr)], None);
@@ -13595,6 +13674,7 @@ mod tests {
                     source: StatsSource::Heuristic,
                     partial_where: None,
                     expression_columns: vec![],
+                    rows_per_key: Vec::new(),
                 })
                 .boxed()
         }
@@ -13799,6 +13879,7 @@ mod tests {
                     source: StatsSource::Heuristic,
                     partial_where: None,
                     expression_columns: vec![],
+                    rows_per_key: Vec::new(),
                 };
 
                 let with_index_path = best_access_path(
@@ -14211,6 +14292,7 @@ mod tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let join_expr = Expr::BinaryOp {
             left: Box::new(Expr::Column(
@@ -15141,6 +15223,7 @@ mod tests {
                 source: StatsSource::Heuristic,
                 partial_where: None,
                 expression_columns: vec![],
+                rows_per_key: Vec::new(),
             },
             IndexInfo {
                 name: "idx_b".to_owned(),
@@ -15151,6 +15234,7 @@ mod tests {
                 source: StatsSource::Heuristic,
                 partial_where: None,
                 expression_columns: vec![],
+                rows_per_key: Vec::new(),
             },
         ];
         let terms = [eq_term("a")];
@@ -15326,6 +15410,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -15387,6 +15472,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -15445,6 +15531,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -15506,6 +15593,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -15556,6 +15644,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),
@@ -15631,6 +15720,7 @@ mod probe_tests {
             source: StatsSource::Heuristic,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }];
         let ap = AccessPath {
             table: "t".to_owned(),

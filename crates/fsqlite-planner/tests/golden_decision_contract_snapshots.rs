@@ -45,6 +45,7 @@ fn index(name: &str, table: &str, columns: &[&str], unique: bool, n_pages: u64) 
         source: StatsSource::Analyze,
         partial_where: None,
         expression_columns: Vec::new(),
+        rows_per_key: Vec::new(),
     }
 }
 

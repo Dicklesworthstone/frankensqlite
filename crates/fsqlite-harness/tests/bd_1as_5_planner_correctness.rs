@@ -136,6 +136,7 @@ fn tpch_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_lineitem_orderkey".to_owned(),
@@ -146,6 +147,7 @@ fn tpch_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_customer_nationkey".to_owned(),
@@ -156,6 +158,7 @@ fn tpch_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_supplier_nationkey".to_owned(),
@@ -166,6 +169,7 @@ fn tpch_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
     ]
 }
@@ -210,6 +214,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_order_items_order_id".to_owned(),
@@ -220,6 +225,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_order_items_item_id".to_owned(),
@@ -230,6 +236,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
     ]
 }
@@ -327,6 +334,7 @@ fn test_access_path_selection() {
         source: StatsSource::Analyze,
         partial_where: None,
         expression_columns: vec![],
+        rows_per_key: Vec::new(),
     };
 
     // No WHERE -> full table scan
@@ -479,6 +487,7 @@ fn test_index_usability() {
         source: StatsSource::Analyze,
         partial_where: None,
         expression_columns: vec![],
+        rows_per_key: Vec::new(),
     };
 
     // Equality on indexed column -> usable
@@ -509,6 +518,7 @@ fn test_index_usability() {
         source: StatsSource::Analyze,
         partial_where: None,
         expression_columns: vec![],
+        rows_per_key: Vec::new(),
     };
 
     // Equality on first column of composite -> usable
@@ -633,6 +643,7 @@ fn test_conformance_summary() {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         };
         let t_a_eq = cmp_expr("t", "a", BinaryOp::Eq);
         let eq = eq_term("t", "a", &t_a_eq);
