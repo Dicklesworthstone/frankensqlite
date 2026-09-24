@@ -7825,6 +7825,22 @@ impl PagerCommittedSnapshot {
 }
 
 /// The inner mutable pager state protected by a mutex.
+/// What a complete standalone WAL refresh observed. While this process holds
+/// the main-file SHARED lock that lives with its WAL shared-memory attachment,
+/// no other process can take EXCLUSIVE — so none can leave WAL mode, write in
+/// rollback mode, leave a hot journal, or unlink the WAL. Every other change a
+/// refresh looks for (a commit from any connection or process, a checkpoint
+/// reset, a recovery) rewrites the WAL-index header. An identical header, the
+/// same file at the `-wal` path (an in-process stock SQLite, which cannot see
+/// our locks, may still unlink it) and no local commit since therefore mean
+/// the refresh would find exactly what it found last time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalRefreshSignature {
+    shm_header: fsqlite_wal::wal_index::WalIndexHdr,
+    wal_identity: FileIdentity,
+    commit_seq: CommitSeq,
+}
+
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
@@ -7959,6 +7975,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// generation changes, the main DB header must be read again before the
     /// cached base counter can be trusted.
     committed_wal_generation: Option<WalGenerationIdentity>,
+    /// State observed by the last complete standalone WAL refresh, so an
+    /// unchanged one can be recognized without repeating it (see
+    /// [`WalRefreshSignature`]).
+    wal_refresh_signature: Option<WalRefreshSignature>,
     /// Visible WAL commit count paired with the cached base counter. External
     /// checkpoints can move commits from WAL into the main database while the
     /// summed visible commit sequence stays the same; this keeps that physical
@@ -16891,14 +16911,76 @@ where
         self.published.snapshot()
     }
 
+    /// The WAL-index header and `-wal` file as they stand now, when this
+    /// connection can vouch for them (see [`WalRefreshSignature`]).
+    async fn current_wal_refresh_signature(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<Option<WalRefreshSignature>> {
+        if inner.journal_mode != JournalMode::Wal || self.vfs.is_memory() {
+            return Ok(None);
+        }
+        {
+            let backend = wal_backend_handle(&self.wal_backend)?;
+            let wal = async_rwlock_read(&backend, cx, "refresh signature").await?;
+            if !wal.native_reader_required() || wal.native_recovery_required().is_some() {
+                return Ok(None);
+            }
+        }
+        let shm_header = {
+            let mut file = shared_db_file_write(&inner.db_file, cx).await?;
+            if !file.holds_main_wal_lifetime_read_lock() {
+                return Ok(None);
+            }
+            let Ok(region) = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) else {
+                return Ok(None);
+            };
+            let Some(header) = fsqlite_wal::wal_index::read_shared_wal_index_header(&region)? else {
+                return Ok(None);
+            };
+            header
+        };
+        let mut wal_path = self.db_path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let Some(wal_identity) = self.vfs.path_file_identity(cx, Path::new(&wal_path))? else {
+            return Ok(None);
+        };
+        Ok(Some(WalRefreshSignature {
+            shm_header,
+            wal_identity,
+            commit_seq: inner.commit_seq,
+        }))
+    }
+
+    /// Whether a standalone refresh now would observe exactly what the last
+    /// complete one did.
+    async fn standalone_refresh_is_unchanged(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<bool> {
+        let Some(previous) = inner.wal_refresh_signature else {
+            return Ok(false);
+        };
+        if inner.active_transactions > 0
+            || inner.checkpoint_active
+            || inner.rollback_journal_recovery_state.is_pending()
+            || inner.commit_seq != previous.commit_seq
+        {
+            return Ok(false);
+        }
+        Ok(self.current_wal_refresh_signature(cx, inner).await? == Some(previous))
+    }
+
     /// Refresh the publication plane from the latest committed pager state.
     ///
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
-    // bd-h9o9r: a sync mutex guard is held across an await in this
-    // function's body; reachable-deadlock audit and lock-scope repair
-    // belong to the Phase-C pager reconstruction.
+    // bd-h9o9r: the pager's sync mutex guard is held across awaits here, as
+    // the full refresh below already did; the reachable-deadlock audit and
+    // lock-scope repair belong to the Phase-C pager reconstruction.
     #[allow(clippy::await_holding_lock)]
     pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
@@ -16921,7 +17003,18 @@ where
             // exact existing recovery-owner admission check.
             self.validate_namespace_binding_locked(&mut inner)?;
             inner.adopt_orphaned_rollback_journal_recovery()?;
+            if self.standalone_refresh_is_unchanged(cx, &inner).await? {
+                return Ok(self.published.snapshot());
+            }
         }
+        // Observed before refreshing: a commit that lands while the refresh
+        // runs changes the header, so the next boundary still refreshes.
+        let pre_refresh_signature = if returning_open {
+            None
+        } else {
+            self.current_wal_refresh_signature(cx, &inner).await?
+        };
+        inner.wal_refresh_signature = None;
         let expected_recovery_owner = if inner.active_transactions == 0
             && inner
                 .rollback_journal_recovery_state
@@ -16986,6 +17079,12 @@ where
         let Some((refresh, journal_visibility_invalidation)) = refresh else {
             return Ok(self.published.snapshot());
         };
+        // The header stays the pre-refresh one; the commit sequence is the
+        // refreshed one, which later local commits must differ from.
+        inner.wal_refresh_signature = pre_refresh_signature.map(|signature| WalRefreshSignature {
+            commit_seq: inner.commit_seq,
+            ..signature
+        });
 
         let clear_published_pages = had_recovery_pending
             || journal_visibility_invalidation
@@ -17036,6 +17135,18 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.page_size
+    }
+
+    /// Reserved bytes per page of the committed image this pager last bound.
+    /// Commits stamp page 1 with this value, so callers outside a transaction
+    /// can use it instead of beginning one to parse page 1.
+    #[must_use]
+    pub fn committed_reserved_per_page(&self) -> u8 {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.reserved_per_page
     }
 
     /// Read the committed-state snapshot without taking the PagerInner Mutex.
@@ -18897,6 +19008,7 @@ where
                 committed_db_file_size_bytes: file_size,
                 committed_db_change_counter: u64::from(header.change_counter),
                 committed_wal_generation: None,
+                wal_refresh_signature: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -19336,6 +19448,7 @@ where
                     .as_ref()
                     .map_or(0, |header| u64::from(header.change_counter)),
                 committed_wal_generation: None,
+                wal_refresh_signature: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -25849,7 +25962,8 @@ where
                     .await?;
                 return Ok(());
             }
-            self.validate_namespace_binding()?;
+            // A reader's commit publishes nothing, so only a writer re-proves
+            // the pathname here; the next begin validates it for a reader.
             if !self.is_writer {
                 let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
                     &self.group_commit_queue,
@@ -25901,6 +26015,7 @@ where
                 self.scratch_arena.reset();
                 return Ok(());
             }
+            self.validate_namespace_binding()?;
             if self.vfs.is_memory()
                 && self.memory_db_bump_alloc
                 && !self.retained_memory_overlay_dirty_pages.is_empty()

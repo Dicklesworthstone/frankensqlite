@@ -1347,6 +1347,16 @@ pub trait VfsFile: Send + Sync {
         false
     }
 
+    /// Whether this handle holds the main-file SHARED read lock it keeps for
+    /// the whole life of its WAL shared-memory attachment. While held, no other
+    /// process can take EXCLUSIVE: it cannot leave WAL mode, write in rollback
+    /// mode, leave a hot journal, or unlink the WAL beneath this process —
+    /// which is what lets a WAL reader trust an unchanged WAL-index header.
+    /// Conservatively `false` for backends that do not track it.
+    fn holds_main_wal_lifetime_read_lock(&self) -> bool {
+        false
+    }
+
     /// Return the sector size for this file.
     ///
     /// The sector size is the minimum write granularity for the underlying

@@ -3645,7 +3645,11 @@ impl VfsFile for UnixFile {
                     FrankenError::internal("Unix inode SHARED count overflow"),
                 );
             };
-            if info.n_shared == 0 {
+            // A WAL-lifetime owner already holds the kernel SHARED lock for this
+            // process (release keeps it while `n_wal_lifetime > 0`), and no other
+            // process can reach EXCLUSIVE past it, so the PENDING pass-through
+            // and the SHARED re-lock would only repeat locks already held.
+            if info.n_shared == 0 && info.n_wal_lifetime == 0 {
                 // Readers must pass through the PENDING byte so a waiting
                 // writer can block new SHARED acquisitions while upgrading.
                 if !self.transient_shared_pending_gate {
@@ -4216,6 +4220,10 @@ impl VfsFile for UnixFile {
         #[allow(clippy::cast_possible_truncation)]
         let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
         Ok(flock.l_type != unlocked)
+    }
+
+    fn holds_main_wal_lifetime_read_lock(&self) -> bool {
+        self.wal_lifetime_claim == WalLifetimeClaim::Held
     }
 
     fn locking_downgraded_to_whole_file_flock(&self) -> bool {

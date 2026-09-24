@@ -4472,6 +4472,20 @@ impl PagerBackend {
         }
     }
 
+    /// Reserved bytes per page of the committed image the pager last bound.
+    #[must_use]
+    pub fn committed_reserved_per_page(&self) -> u8 {
+        match self {
+            Self::Memory(p) => p.committed_reserved_per_page(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.committed_reserved_per_page(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.committed_reserved_per_page(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.committed_reserved_per_page(),
+        }
+    }
+
     /// Open a pager for the given path.
     ///
     /// Uses [`MemoryVfs`] for `:memory:`.
@@ -24915,8 +24929,16 @@ impl Connection {
         // bd-ztgst: a CTE-only WITH statement treats an unloaded row image as
         // current; hydrating it would only re-inflate rows it never reads.
         let hydration_suppressed = self.memdb_row_hydration_suppressed.get() > 0;
+        // A clean mirror needs nothing from this refresh unless rows are to be
+        // hydrated eagerly. File connections keep rows unloaded by design
+        // (row reads go through pager cursors), and treating "unloaded" as
+        // "dirty" reloaded the whole image from the pager — a full snapshot
+        // refresh — on every unprepared statement. Peer commits are still
+        // picked up by the staleness refresh at each statement boundary.
         if !self.memdb_requires_active_txn_reload.get()
-            && (self.memdb_rows_loaded.get() || hydration_suppressed)
+            && (self.memdb_rows_loaded.get()
+                || hydration_suppressed
+                || !self.should_eagerly_hydrate_memdb_rows())
         {
             return Ok(());
         }
@@ -24928,6 +24950,25 @@ impl Connection {
                 // the writer handle is gone, repair the committed execution
                 // image from pager instead of silently clearing the dirty flag.
                 if self.pager.is_memory() {
+                    self.memdb_requires_active_txn_reload.set(false);
+                    return Ok(());
+                }
+                // No rows are mirrored, and the committed schema cookie every
+                // in-process commit publishes still matches ours: the reload
+                // would take its cookie-match fast path, whose only effect on an
+                // unloaded mirror is clearing this flag — after first beginning
+                // a whole read transaction to read page 1. Only while nothing
+                // was published past the mirror: a commit (a concurrent-mode
+                // local one leaves the sequence behind too) still needs the
+                // reload to refresh sequence-scoped state and advance it.
+                if !self.memdb_rows_loaded.get()
+                    && !self.should_eagerly_hydrate_memdb_rows()
+                    && self.pending_memdb_direct_upserts.borrow().is_empty()
+                    && self.pending_local_live_vtab_preservation.borrow().is_none()
+                    && self.committed_schema_cookie() == self.schema_cookie()
+                    && self.pager.published_snapshot().visible_commit_seq
+                        <= *self.memdb_visible_commit_seq.borrow()
+                {
                     self.memdb_requires_active_txn_reload.set(false);
                     return Ok(());
                 }
@@ -26377,11 +26418,12 @@ impl Connection {
                     // hydrating rows, which would make a stale row image look current
                     // to file-backed direct row lookup preparation.
                     self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
-                    if !self.memdb_rows_loaded.get() {
-                        self.reload_memdb_from_pager(&op_cx).await?;
-                    } else {
-                        self.refresh_memdb_if_stale(&op_cx).await?;
-                    }
+                    // Reloads when the published sequence moved past the
+                    // mirror, or when rows are hydrated eagerly but unloaded.
+                    // File connections keep rows unloaded by design, so an
+                    // unconditional reload here began a whole read
+                    // transaction on every prepare.
+                    self.refresh_memdb_if_stale(&op_cx).await?;
                 }
                 let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
                 Ok(())
@@ -45510,11 +45552,17 @@ impl Connection {
             );
         let lane =
             Self::classify_prepared_direct_simple_insert_lane(compiled_row_values.as_deref());
-        let (cursor_page_size, cursor_reserved_per_page) = self
-            .pragma_database_header()
-            .await?
-            .map(|header| (header.page_size, header.reserved_per_page))
-            .unwrap_or((PageSize::DEFAULT, 0));
+        // Outside a transaction, the geometry the pager last bound is the
+        // committed one; parsing page 1 would begin a whole read transaction
+        // on every uncached INSERT prepare.
+        let (cursor_page_size, cursor_reserved_per_page) = if self.active_txn.borrow().is_some() {
+            self.pragma_database_header()
+                .await?
+                .map(|header| (header.page_size, header.reserved_per_page))
+                .unwrap_or((PageSize::DEFAULT, 0))
+        } else {
+            (self.pager.page_size(), self.pager.committed_reserved_per_page())
+        };
         Ok(Some(PreparedDirectSimpleInsert {
             root_page: table.root_page,
             rowid_alias_col_idx,
@@ -80266,8 +80314,24 @@ impl Connection {
         // the exact SQL key and generation check: a temporary binding can shadow
         // the persistent table named by original_ddl_sql. Cold/non-table entries
         // retain the compatibility parser's existing fallback behavior.
-        self.cached_without_rowid_table_sql(sql)
-            .unwrap_or_else(|| is_without_rowid_table_sql(sql))
+        if let Some(without_rowid) = self.cached_without_rowid_table_sql(sql) {
+            return without_rowid;
+        }
+        // A miss used to re-parse the whole CREATE TABLE on every call, which
+        // join and scan planning make per table per statement. Remember the
+        // parse under the same schema-cookie generation the reload uses.
+        let Ok(statement @ Statement::CreateTable(_)) = parse_single_statement(sql) else {
+            return is_without_rowid_table_sql(sql);
+        };
+        let without_rowid = matches!(&statement, Statement::CreateTable(create) if create.without_rowid);
+        let schema_cookie = *self.schema_cookie.borrow();
+        let mut cache = self.schema_reload_parse_cache.borrow_mut();
+        if cache.0 != schema_cookie {
+            cache.0 = schema_cookie;
+            cache.1.clear();
+        }
+        cache.1.insert(sql.to_owned(), statement);
+        without_rowid
     }
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
@@ -192880,8 +192944,9 @@ mod tests {
                 .unwrap();
             assert_eq!(conn.cached_without_rowid_table_sql(rowid), Some(false));
             // Same table name is not the same definition. A name-keyed cache
-            // would incorrectly reuse the rowid flag here.
-            assert_eq!(conn.cached_without_rowid_table_sql(without), None);
+            // would incorrectly reuse the rowid flag here; the exact-SQL entry
+            // the earlier miss recorded keeps its own flag.
+            assert_eq!(conn.cached_without_rowid_table_sql(without), Some(true));
             assert!(conn.table_sql_declares_without_rowid(without));
             conn.parse_stored_schema_statement_cached(without, cookie)
                 .unwrap();

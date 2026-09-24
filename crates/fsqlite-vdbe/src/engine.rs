@@ -303,6 +303,19 @@ fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+/// Per-row boundary around a function call: observe a cancellation already
+/// requested (including one the call itself requested) with one atomic load.
+/// A full checkpoint also consults the deadline/budget plane, which reads the
+/// clock; the main loop's interval checkpoint covers that plane.
+#[inline]
+fn observe_requested_execution_cancellation(cx: &Cx) -> Result<()> {
+    if cx.is_cancel_requested() {
+        observe_execution_cancellation(cx)
+    } else {
+        Ok(())
+    }
+}
+
 const MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES: usize = 9;
 const MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MIN: usize = 64;
 const MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MAX: usize = 512;
@@ -13583,7 +13596,7 @@ impl VdbeEngine {
                                 args,
                             )?;
                         }
-                        observe_execution_cancellation(&self.execution_cx)?;
+                        observe_requested_execution_cancellation(&self.execution_cx)?;
                         if function_consumes_argument_collation {
                             func.invoke_with_collation(args, function_collation.as_deref())?
                         } else if any_arg_subtype {
@@ -13601,7 +13614,7 @@ impl VdbeEngine {
                                 &args,
                             )?;
                         }
-                        observe_execution_cancellation(&self.execution_cx)?;
+                        observe_requested_execution_cancellation(&self.execution_cx)?;
                         if function_consumes_argument_collation {
                             func.invoke_with_collation(&args, function_collation.as_deref())?
                         } else if any_arg_subtype {
@@ -13610,7 +13623,7 @@ impl VdbeEngine {
                             func.invoke(&args)?
                         }
                     };
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
 
                     // Propagate this function's result subtype (e.g. JSON) to the
                     // destination register so a nested `json(...)` keeps its tag.
@@ -14089,12 +14102,12 @@ impl VdbeEngine {
                         if state.null_row || state.cursor.eof() {
                             SqliteValue::Null
                         } else {
-                            observe_execution_cancellation(&self.execution_cx)?;
+                            observe_requested_execution_cancellation(&self.execution_cx)?;
                             let mut ctx = ColumnContext::new();
                             if let Err(e) = state.cursor.column(&mut ctx, col) {
                                 break vtab_exec_outcome("VColumn", e)?;
                             }
-                            observe_execution_cancellation(&self.execution_cx)?;
+                            observe_requested_execution_cancellation(&self.execution_cx)?;
                             ctx.take_value().unwrap_or(SqliteValue::Null)
                         }
                     } else {
@@ -16353,7 +16366,7 @@ impl VdbeEngine {
             true
         };
 
-        observe_execution_cancellation(step.execution_cx)?;
+        observe_requested_execution_cancellation(step.execution_cx)?;
         if should_step {
             // Implicit BINARY MIN/MAX on a UTF-16 database must order in the
             // storage encoding like stock; the registry's min/max compares
@@ -16379,7 +16392,7 @@ impl VdbeEngine {
                     .step_with_arg_subtypes(&mut ctx.state, step.args, step.arg_subtypes)?;
             }
         }
-        observe_execution_cancellation(step.execution_cx)
+        observe_requested_execution_cancellation(step.execution_cx)
     }
 
     #[allow(dead_code)]

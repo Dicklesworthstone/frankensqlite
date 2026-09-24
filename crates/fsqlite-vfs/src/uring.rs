@@ -1324,6 +1324,10 @@ impl VfsFile for IoUringFile {
         self.inner.shm_map(cx, region, size, extend)
     }
 
+    fn holds_main_wal_lifetime_read_lock(&self) -> bool {
+        self.inner.holds_main_wal_lifetime_read_lock()
+    }
+
     fn mvcc_shm_map(&mut self, cx: &Cx, payload_bytes: u64, create: bool) -> Result<ShmRegion> {
         self.inner.mvcc_shm_map(cx, payload_bytes, create)
     }
