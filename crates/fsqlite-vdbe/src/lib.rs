@@ -580,6 +580,9 @@ pub struct ProgramBuilder {
     /// bd-5bq6u: true when this statement is `OR FAIL`, whose semantics keep the
     /// rows already written when a later row violates a constraint.
     preserves_rows_on_constraint: bool,
+    /// bd-01uq7: MemDatabase-backed (TEMP) table roots whose written rows carry
+    /// computed VIRTUAL generated values instead of the NULL record placeholder.
+    materialized_virtual_generated_roots: Vec<i32>,
 }
 
 impl ProgramBuilder {
@@ -595,6 +598,7 @@ impl ProgramBuilder {
             schema_evaluation_context: None,
             generated_column_emission: None,
             preserves_rows_on_constraint: false,
+            materialized_virtual_generated_roots: Vec::new(),
         }
     }
 
@@ -602,6 +606,19 @@ impl ProgramBuilder {
     /// failure (`OR FAIL`). Consulted by the MemDatabase statement boundary.
     pub fn set_preserves_rows_on_constraint(&mut self, preserves: bool) {
         self.preserves_rows_on_constraint = preserves;
+    }
+
+    /// bd-01uq7: a `MemTable` enforces UNIQUE over its stored cells and has no
+    /// index B-tree to hold a computed key, so rows written to these roots keep
+    /// the computed value of each VIRTUAL generated column in its placeholder.
+    /// Reads still recompute the column; the on-disk record format of every
+    /// other table is unchanged.
+    pub fn set_materialized_virtual_generated_roots(&mut self, roots: impl IntoIterator<Item = i32>) {
+        self.materialized_virtual_generated_roots = roots.into_iter().collect();
+    }
+
+    fn materializes_virtual_generated(&self, root_page: i32) -> bool {
+        self.materialized_virtual_generated_roots.contains(&root_page)
     }
 
     /// Reserve a contiguous range of auxiliary cursor identifiers.

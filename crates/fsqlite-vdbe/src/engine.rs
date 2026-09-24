@@ -1057,6 +1057,24 @@ impl MemTable {
         self.rebuild_unique_indexes();
     }
 
+    /// bd-01uq7: store computed VIRTUAL generated values in `column`, keyed by
+    /// rowid, for rows written before their placeholder was materialized (rows
+    /// padded by ALTER TABLE ADD COLUMN).
+    pub fn materialize_column_values(
+        &mut self,
+        column: usize,
+        values: impl IntoIterator<Item = (i64, SqliteValue)>,
+    ) {
+        for (rowid, value) in values {
+            if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid)
+                && let Some(cell) = self.rows[idx].values.get_mut(column)
+            {
+                *cell = value;
+            }
+        }
+        self.rebuild_unique_indexes();
+    }
+
     /// Remove one declared column from every materialized row.
     ///
     /// TEMP tables use `MemTable` as their authoritative storage.  Keep the
@@ -8654,6 +8672,19 @@ impl VdbeEngine {
         self.concurrent_rowid_session_id = session_id;
     }
 
+    /// Allocate a rowid on a MemDatabase (TEMP) table. bd-nb49a: an ordinary
+    /// rowid table takes `max(rowid) + 1` as stock does, so a row discarded by
+    /// OR IGNORE burns nothing and a deleted maximum is reused; AUTOINCREMENT
+    /// keeps the table's monotonic counter, which never reuses a value.
+    fn alloc_mem_rowid(&mut self, root_page: i32, concurrent_mode: bool) -> i64 {
+        let autoincrement = self.autoincrement_seq_by_root_page.contains_key(&root_page);
+        match self.db.as_mut() {
+            Some(db) if autoincrement && !concurrent_mode => db.alloc_rowid(root_page),
+            Some(db) => db.alloc_rowid_concurrent(root_page),
+            None => 1,
+        }
+    }
+
     fn storage_cursor_runtime_meta(&self, root_page: i32) -> (RowIdMode, i64) {
         match self.autoincrement_seq_by_root_page.get(&root_page).copied() {
             Some(high_water) => (RowIdMode::AutoIncrement, high_water),
@@ -11155,15 +11186,7 @@ impl VdbeEngine {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let root = self.cursors.get(&cursor_id).map(|c| c.root_page);
                         if let Some(root) = root {
-                            if let Some(db) = self.db.as_mut() {
-                                if concurrent_mode {
-                                    db.alloc_rowid_concurrent(root)
-                                } else {
-                                    db.alloc_rowid(root)
-                                }
-                            } else {
-                                1
-                            }
+                            self.alloc_mem_rowid(root, concurrent_mode)
                         } else {
                             1
                         }
@@ -14989,7 +15012,7 @@ impl VdbeEngine {
                     // TEMP tables deliberately use the direct MemDatabase
                     // cursor backend. Preserve the fused opcode's semantics
                     // there instead of requiring a pager-backed cursor.
-                    let rowid = self.db.as_mut().map_or(1, |db| db.alloc_rowid(root_page));
+                    let rowid = self.alloc_mem_rowid(root_page, false);
                     let mut rec_buf = self.make_record_lookaside.take_buf();
                     self.serialize_record_from_register_range(
                         first_reg,

@@ -27928,6 +27928,25 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         }
     }
+    // bd-01uq7: a MemDatabase row is also its own UNIQUE index, so fill its
+    // VIRTUAL placeholders with the computed values. Register-context reads of
+    // a VIRTUAL column always re-expand its expression, so the order of these
+    // writes cannot change any value computed above or below.
+    if b.materializes_virtual_generated(table.root_page) {
+        let gen_ctx = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if let Some(expr) = virtual_generated_column_expr(col) {
+                emit_virtual_generated_column(b, col_idx, &expr, val_regs + col_idx as i32, &gen_ctx);
+            }
+        }
+    }
 }
 
 /// bd-r3303: if `col` is a VIRTUAL generated column, parse and return its

@@ -11241,6 +11241,7 @@ struct DbSnapshot {
     rowid_alias_columns: HashMap<String, usize>,
     autoincrement_tables: HashSet<String>,
     sqlite_sequence_cache: HashMap<String, i64>,
+    temp_sqlite_sequence: HashMap<String, i64>,
     original_ddl_sql: HashMap<String, String>,
     next_master_rowid: i64,
     schema_cookie: u32,
@@ -12926,6 +12927,10 @@ pub struct Connection {
     autoincrement_tables: RefCell<HashSet<String>>,
     /// Cached sqlite_sequence high-water values keyed by lowercased table name.
     sqlite_sequence_cache: RefCell<HashMap<String, i64>>,
+    /// AUTOINCREMENT high-water values of TEMP tables, keyed by lowercased
+    /// name. Stock keeps these in the temp schema's own sqlite_sequence; they
+    /// never belong in the main database's durable one.
+    temp_sqlite_sequence: RefCell<HashMap<String, i64>>,
     /// Next rowid to use when inserting into the sqlite_master B-tree on
     /// page 1.  Starts at 1 for a fresh database; 5A.4 (schema loading)
     /// will advance this past any existing entries.
@@ -13119,6 +13124,9 @@ pub struct Connection {
     /// Whether the connection-local `MemDatabase` currently contains full row
     /// payloads for file-backed tables, not just schema-shaped placeholders.
     memdb_rows_loaded: Cell<bool>,
+    /// bd-ztgst: nonzero while a WITH statement that reads only its own CTEs
+    /// runs; such a statement needs no persistent row image in `MemDatabase`.
+    memdb_row_hydration_suppressed: Cell<u32>,
     /// True when pager-backed writes have advanced beyond the current MemDatabase
     /// mirror inside an explicit transaction, so the next query/fallback path
     /// must rebuild MemDatabase from the live transaction view.
@@ -14144,6 +14152,25 @@ impl Drop for MemDatabaseRestoreGuard<'_> {
     }
 }
 
+/// The statement that consumes a WITH clause's materialized CTEs.
+#[derive(Clone, Copy)]
+enum CteConsumer<'a> {
+    Select(&'a SelectStatement),
+    Insert(&'a fsqlite_ast::InsertStatement),
+}
+
+/// bd-ztgst: scope in which `MemDatabase` refreshes skip row hydration.
+struct MemdbRowHydrationSuppression<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for MemdbRowHydrationSuppression<'_> {
+    fn drop(&mut self) {
+        let depth = &self.conn.memdb_row_hydration_suppressed;
+        depth.set(depth.get() - 1);
+    }
+}
+
 struct MaterializedTablesCleanupGuard<'a> {
     conn: &'a Connection,
     tables: Vec<(String, i32)>,
@@ -14725,6 +14752,7 @@ impl Connection {
             pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
+            temp_sqlite_sequence: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
@@ -14768,6 +14796,7 @@ impl Connection {
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
             memdb_rows_loaded: Cell::new(false),
+            memdb_row_hydration_suppressed: Cell::new(0),
             memdb_requires_active_txn_reload: Cell::new(false),
             schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
             schema_reload_parse_count: Cell::new(0),
@@ -15261,6 +15290,7 @@ impl Connection {
             pending_ddl_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
+            temp_sqlite_sequence: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
@@ -15306,6 +15336,7 @@ impl Connection {
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
+            memdb_row_hydration_suppressed: Cell::new(0),
             memdb_requires_active_txn_reload: Cell::new(false),
             schema_reload_parse_cache: RefCell::new((0, HashMap::new())),
             schema_reload_parse_count: Cell::new(0),
@@ -24422,8 +24453,88 @@ impl Connection {
     }
 
     #[inline]
+    /// bd-ztgst: materializing a WITH clause turns off the mem-fallback
+    /// rejection, which made every refresh inside it re-inflate every row of
+    /// every table — O(database) per statement, quadratic over a CTE-sourced
+    /// workload. A statement whose relations are all its own top-level CTEs
+    /// reads no persistent row from `MemDatabase`, so it runs with hydration
+    /// suppressed. Anything else keeps the complete image: a view, a
+    /// qualified or nested-WITH name, a table-valued function named after a
+    /// schema relation (FTS5's `ft('query')`), UPSERT or RETURNING, or an
+    /// INSERT target with triggers.
+    fn cte_statement_reads_only_own_ctes(&self, consumer: CteConsumer<'_>) -> bool {
+        let with = match consumer {
+            CteConsumer::Select(select) => select.with.as_ref(),
+            CteConsumer::Insert(insert) => insert.with.as_ref(),
+        };
+        let Some(with) = with else {
+            return false;
+        };
+        let mut only_own_ctes = true;
+        let mut check = |name: &QualifiedName| {
+            only_own_ctes &= name.schema.is_none()
+                && with
+                    .ctes
+                    .iter()
+                    .any(|cte| cte.name.eq_ignore_ascii_case(&name.name));
+            Ok(())
+        };
+        let visited = match consumer {
+            CteConsumer::Select(select) => visit_select_qualified_names(select, &mut check),
+            CteConsumer::Insert(insert) => {
+                let InsertSource::Select(source) = &insert.source else {
+                    return false;
+                };
+                if !insert.upsert.is_empty()
+                    || !insert.returning.is_empty()
+                    || self
+                        .triggers
+                        .borrow()
+                        .iter()
+                        .any(|trigger| trigger.table_name.eq_ignore_ascii_case(&insert.table.name))
+                {
+                    return false;
+                }
+                with.ctes
+                    .iter()
+                    .try_for_each(|cte| visit_select_qualified_names(&cte.query, &mut check))
+                    .and_then(|()| visit_select_qualified_names(source, &mut check))
+            }
+        };
+        if visited.is_err() || !only_own_ctes {
+            return false;
+        }
+        let mut names_schema_relation = |name: &str, _: &FunctionArgs| {
+            self.schema
+                .borrow()
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(name))
+                || self
+                    .views
+                    .borrow()
+                    .iter()
+                    .any(|view| view.name.eq_ignore_ascii_case(name))
+        };
+        !match consumer {
+            CteConsumer::Select(select) => {
+                any_function_call_in_select(select, &mut names_schema_relation)
+            }
+            CteConsumer::Insert(insert) => {
+                any_function_call_in_insert(insert, &mut names_schema_relation)
+            }
+        }
+    }
+
+    fn suppress_memdb_row_hydration(&self) -> MemdbRowHydrationSuppression<'_> {
+        self.memdb_row_hydration_suppressed
+            .set(self.memdb_row_hydration_suppressed.get() + 1);
+        MemdbRowHydrationSuppression { conn: self }
+    }
+
     fn should_eagerly_hydrate_memdb_rows(&self) -> bool {
-        self.path == ":memory:" || !*self.reject_mem_fallback.borrow()
+        self.path == ":memory:"
+            || (!*self.reject_mem_fallback.borrow()
+                && self.memdb_row_hydration_suppressed.get() == 0)
     }
 
     /// PR#401 invariant (GH#402 companion): connections opened through the
@@ -24801,7 +24912,12 @@ impl Connection {
             self.flush_pending_memdb_direct_upserts();
         }
 
-        if !self.memdb_requires_active_txn_reload.get() && self.memdb_rows_loaded.get() {
+        // bd-ztgst: a CTE-only WITH statement treats an unloaded row image as
+        // current; hydrating it would only re-inflate rows it never reads.
+        let hydration_suppressed = self.memdb_row_hydration_suppressed.get() > 0;
+        if !self.memdb_requires_active_txn_reload.get()
+            && (self.memdb_rows_loaded.get() || hydration_suppressed)
+        {
             return Ok(());
         }
 
@@ -24836,7 +24952,7 @@ impl Connection {
         // (reject_mem_fallback == false) must the mirror stay eagerly hydrated.
         // (`should_eagerly_hydrate_memdb_rows() && !reject_mem_fallback`
         // simplifies to `!reject_mem_fallback` by absorption.)
-        let hydrate_rows = !*self.reject_mem_fallback.borrow();
+        let hydrate_rows = !*self.reject_mem_fallback.borrow() && !hydration_suppressed;
         let bound_visible_commit_seq = self
             .active_txn
             .borrow()
@@ -37145,6 +37261,14 @@ impl Connection {
             // GH#423: BEGIN admission inside this statement and the retry
             // below draw on one busy_timeout budget.
             let _busy_budget_scope = autocommit_retry_entry.then(|| self.arm_busy_budget_scope());
+            // bd-pa8e5: the CREATE handler consumes the verbatim source that
+            // `execute_impl` staged once per call; each retry must persist the
+            // same sqlite_master text the first attempt would have.
+            let pending_ddl_source = if autocommit_retry_entry {
+                self.pending_ddl_source.borrow().clone()
+            } else {
+                None
+            };
             let mut result = self
                 .execute_statement_once_after_background_status(statement, params)
                 .await;
@@ -37185,6 +37309,9 @@ impl Connection {
                 if !self.autocommit_conflict_retry_boundary() {
                     break;
                 }
+                self.pending_ddl_source
+                    .borrow_mut()
+                    .clone_from(&pending_ddl_source);
                 result = self
                     .execute_statement_once_after_background_status(statement, params)
                     .await;
@@ -61444,6 +61571,43 @@ impl Connection {
         Ok(true)
     }
 
+    /// A TEMP AUTOINCREMENT table's rows live in MemDatabase, not in pager
+    /// pages, and its high-water belongs to the connection-local temp
+    /// sequence. Reading its root through the pager raised BusySnapshot (a
+    /// TEMP root is past any main-file extent), and the statement retry then
+    /// re-ran an INSERT whose rows had already landed; writing the value into
+    /// main's durable sqlite_sequence leaked a TEMP name into the database.
+    fn refresh_temp_autoincrement_sequence(&self, table_key: String, last_insert_rowid: Option<i64>) {
+        let Some(root_page) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&table_key))
+            .map(|table| table.root_page)
+        else {
+            return;
+        };
+        let max_rowid = self
+            .db
+            .borrow()
+            .get_table(root_page)
+            .and_then(fsqlite_vdbe::engine::MemTable::max_visible_rowid)
+            .unwrap_or(0);
+        // GH #186: a rowid burned by OR IGNORE still advances the sequence.
+        let allocated_hw = self
+            .cached_vdbe_engine
+            .borrow()
+            .as_ref()
+            .and_then(|engine| engine.autoinc_alloc_high_water().get(&root_page).copied())
+            .unwrap_or(0);
+        let high_water = max_rowid
+            .max(allocated_hw)
+            .max(last_insert_rowid.unwrap_or(0));
+        let mut sequences = self.temp_sqlite_sequence.borrow_mut();
+        let sequence = sequences.entry(table_key).or_insert(0);
+        *sequence = (*sequence).max(high_water);
+    }
+
     async fn refresh_autoincrement_sequence_after_insert(
         &self,
         table_name: &str,
@@ -61451,6 +61615,11 @@ impl Connection {
         last_insert_rowid: Option<i64>,
     ) -> Result<()> {
         if !self.is_autoincrement_table(table_name) {
+            return Ok(());
+        }
+        let table_key = table_name.to_ascii_lowercase();
+        if self.temp_table_names.borrow().contains(&table_key) {
+            self.refresh_temp_autoincrement_sequence(table_key, last_insert_rowid);
             return Ok(());
         }
         if self
@@ -61520,16 +61689,23 @@ impl Connection {
     fn autoincrement_sequence_by_root_page(&self) -> HashMap<i32, i64> {
         let metadata = self.table_execution_metadata();
         let autoincrement_tables = self.autoincrement_tables.borrow();
-        let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
         metadata
             .autoincrement_table_name_by_root_page
             .iter()
             .filter(|(_, table_name)| autoincrement_tables.contains(*table_name))
-            .map(|(root_page, table_name)| {
-                let seq = sqlite_sequence_cache.get(table_name).copied().unwrap_or(0);
-                (*root_page, seq)
-            })
+            .map(|(root_page, table_name)| (*root_page, self.autoincrement_sequence(table_name)))
             .collect()
+    }
+
+    /// The AUTOINCREMENT high-water of `table_key` (lowercased): a TEMP
+    /// table's lives in the connection-local temp sequence, never in main's.
+    fn autoincrement_sequence(&self, table_key: &str) -> i64 {
+        let sequence = if self.temp_table_names.borrow().contains(table_key) {
+            self.temp_sqlite_sequence.borrow().get(table_key).copied()
+        } else {
+            self.sqlite_sequence_cache.borrow().get(table_key).copied()
+        };
+        sequence.unwrap_or(0)
     }
 
     fn rowid_alias_column_by_root_page(&self) -> HashMap<i32, usize> {
@@ -61558,13 +61734,7 @@ impl Connection {
                     .autoincrement_table_name_by_root_page
                     .get(&root_page)
                 {
-                    let seq = self
-                        .sqlite_sequence_cache
-                        .borrow()
-                        .get(table_name)
-                        .copied()
-                        .unwrap_or(0);
-                    map.insert(root_page, seq);
+                    map.insert(root_page, self.autoincrement_sequence(table_name));
                 }
                 map
             } else {
@@ -62616,15 +62786,22 @@ impl Connection {
                     }
                 }
                 if is_autoincrement {
-                    self.ensure_sqlite_sequence_table_exists().await?;
                     let table_key = tbl_name.to_ascii_lowercase();
                     self.autoincrement_tables
                         .borrow_mut()
                         .insert(table_key.clone());
-                    self.sqlite_sequence_cache
-                        .borrow_mut()
-                        .entry(table_key)
-                        .or_insert(0);
+                    if target_is_temp {
+                        // A TEMP table's sequence is connection-local; stock
+                        // keeps it in the temp schema's sqlite_sequence, never
+                        // the main database's.
+                        self.temp_sqlite_sequence.borrow_mut().insert(table_key, 0);
+                    } else {
+                        self.ensure_sqlite_sequence_table_exists().await?;
+                        self.sqlite_sequence_cache
+                            .borrow_mut()
+                            .entry(table_key)
+                            .or_insert(0);
+                    }
                 }
             }
             CreateTableBody::AsSelect(select_stmt) => {
@@ -63045,6 +63222,7 @@ impl Connection {
                 }
                 self.temp_table_names.borrow_mut().remove(&drop_name_lc);
                 self.rowid_alias_columns.borrow_mut().remove(&drop_name_lc);
+                self.temp_sqlite_sequence.borrow_mut().remove(&drop_name_lc);
                 // Restore the shadowed main table (if any) as the visible entry.
                 if let Some(main_table) =
                     self.shadowed_main_tables.borrow_mut().remove(&drop_name_lc)
@@ -64569,8 +64747,18 @@ impl Connection {
                 self.autoincrement_tables
                     .borrow_mut()
                     .insert(new_key.clone());
-                self.rename_sqlite_sequence_entry(&old_name, new_name)
-                    .await?;
+                let temp_names = self.temp_table_names.borrow();
+                let renamed_temp = temp_names.contains(&old_key) || temp_names.contains(&new_key);
+                drop(temp_names);
+                if renamed_temp {
+                    let mut sequences = self.temp_sqlite_sequence.borrow_mut();
+                    if let Some(sequence) = sequences.remove(&old_key) {
+                        sequences.insert(new_key.clone(), sequence);
+                    }
+                } else {
+                    self.rename_sqlite_sequence_entry(&old_name, new_name)
+                        .await?;
+                }
             }
         }
 
@@ -66459,6 +66647,8 @@ impl Connection {
                         "failed to resolve TEMP index columns for `{index_name}`"
                     ))
                 })?;
+            self.materialize_temp_virtual_key_cells(&table_schema, &columns)
+                .await?;
             let db = self.db.borrow();
             let table = db.get_table(table_schema.root_page).ok_or_else(|| {
                 FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
@@ -70495,6 +70685,7 @@ impl Connection {
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
             autoincrement_tables: self.autoincrement_tables.borrow().clone(),
             sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
+            temp_sqlite_sequence: self.temp_sqlite_sequence.borrow().clone(),
             original_ddl_sql: self.original_ddl_sql.borrow().clone(),
             next_master_rowid: *self.next_master_rowid.borrow(),
             schema_cookie: *self.schema_cookie.borrow(),
@@ -70570,6 +70761,7 @@ impl Connection {
         (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
         (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
         (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
+        (*self.temp_sqlite_sequence.borrow_mut()).clone_from(&snap.temp_sqlite_sequence);
         (*self.original_ddl_sql.borrow_mut()).clone_from(&snap.original_ddl_sql);
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
@@ -79563,6 +79755,68 @@ impl Connection {
     /// lives exclusively in `MemDatabase`. Finalized VDBE programs use this
     /// set to annotate those roots with SQLite database number 1 so execution
     /// never consults or mutates the main pager for them.
+    /// bd-01uq7: a TEMP UNIQUE index is enforced by `MemTable` over the stored
+    /// cells of its key columns. Writes fill a VIRTUAL generated column's cell
+    /// with its computed value, but rows padded by ALTER TABLE ADD COLUMN still
+    /// hold the NULL placeholder, so compute those cells before the index is
+    /// validated and registered.
+    async fn materialize_temp_virtual_key_cells(
+        &self,
+        table: &TableSchema,
+        columns: &[usize],
+    ) -> Result<()> {
+        let virtual_columns: Vec<usize> = columns
+            .iter()
+            .copied()
+            .filter(|&column| table.columns[column].generated_stored == Some(false))
+            .collect();
+        if virtual_columns.is_empty() {
+            return Ok(());
+        }
+        let rowid_name = ["rowid", "_rowid_", "oid"]
+            .into_iter()
+            .find(|alias| {
+                table
+                    .column_index(alias)
+                    .is_none_or(|column| table.columns[column].is_ipk)
+            })
+            .ok_or_else(|| {
+                FrankenError::NotImplemented(format!(
+                    "UNIQUE index over a VIRTUAL column of TEMP table `{}` whose columns shadow every rowid alias",
+                    table.name
+                ))
+            })?;
+        let select_list = virtual_columns
+            .iter()
+            .map(|&column| quote_identifier(&table.columns[column].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {rowid_name}, {select_list} FROM temp.{}",
+            quote_identifier(&table.name)
+        );
+        // The nested read must not consume the verbatim CREATE text this
+        // statement persists after validation.
+        let pending_ddl_source = self.pending_ddl_source.borrow_mut().take();
+        let rows = self.query(&sql).await;
+        *self.pending_ddl_source.borrow_mut() = pending_ddl_source;
+        let rows = rows?;
+        let mut db = self.db.borrow_mut();
+        let Some(mem_table) = db.get_table_mut(table.root_page) else {
+            return Ok(());
+        };
+        for (position, &column) in virtual_columns.iter().enumerate() {
+            mem_table.materialize_column_values(
+                column,
+                rows.iter().filter_map(|row| {
+                    let values = row.values();
+                    Some((values.first()?.as_integer()?, values.get(position + 1)?.clone()))
+                }),
+            );
+        }
+        Ok(())
+    }
+
     fn temp_storage_roots(&self) -> HashSet<i32> {
         let temp_names = self.temp_table_names.borrow();
         if temp_names.is_empty() {
@@ -89505,6 +89759,9 @@ impl Connection {
             "select",
             "with_clause_materialization",
         )?;
+        let _hydration_suppression = self
+            .cte_statement_reads_only_own_ctes(CteConsumer::Select(select))
+            .then(|| self.suppress_memdb_row_hydration());
         match self
             .execute_recursive_cte_direct_sum_consumer(select, params)
             .await
@@ -91157,6 +91414,9 @@ impl Connection {
             "insert",
             "with_clause_materialization",
         )?;
+        let _hydration_suppression = self
+            .cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
+            .then(|| self.suppress_memdb_row_hydration());
         let mut temp_tables = MaterializedTablesCleanupGuard::new(self);
         self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables.tables, None)
             .await?;
@@ -94482,6 +94742,7 @@ impl Connection {
                 let mut schema = self.schema.borrow().clone();
                 self.apply_shadowed_main_target_substitution(&mut schema, &insert.table);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             }
@@ -94612,6 +94873,7 @@ impl Connection {
                 let mut schema = self.schema.borrow().clone();
                 self.apply_shadowed_main_target_substitution(&mut schema, &update.table.name);
                 Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
                 codegen_update(&mut builder, update, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             }
@@ -104815,7 +105077,12 @@ fn any_function_call_in_table_or_subquery(
     match source {
         TableOrSubquery::Table { .. } => false,
         TableOrSubquery::Subquery { query, .. } => any_function_call_in_select(query, pred),
-        TableOrSubquery::TableFunction { args, .. } => {
+        TableOrSubquery::TableFunction { name, args, .. } => {
+            // A table-valued function is a call too; bd-ztgst needs its name to
+            // tell a pure generator from a table read (FTS5's `ft('query')`).
+            if pred(name, &FunctionArgs::List(args.clone())) {
+                return true;
+            }
             for expr in args {
                 if any_function_call_in_expr(expr, pred) {
                     return true;
@@ -263085,6 +263352,217 @@ mod pager_routing_tests {
                 vec![1, 1_000_000],
                 "the sparse TEMP-IPK repair driver must find every requested FTS shadow row"
             );
+        });
+    }
+
+    /// bd-ztgst: a WITH statement reading only its own CTEs skips the
+    /// persistent row image, and every statement that reads a persistent
+    /// relation still sees each committed and in-transaction row.
+    #[test]
+    fn test_cte_only_with_statements_skip_row_hydration_without_changing_results() {
+        asupersync::test_utils::run_test(|| async {
+            let temp = tempfile::NamedTempFile::new().unwrap();
+            let path = temp.path().to_string_lossy().into_owned();
+            let conn = Connection::open(&path).await.unwrap();
+            let scalar = async |sql: &str| -> i64 {
+                conn.query(sql).await.unwrap()[0].values()[0].to_integer()
+            };
+            let gate = |sql: &str| {
+                let parsed = parse_single_statement(sql).unwrap();
+                match &parsed {
+                    Statement::Select(select) => {
+                        conn.cte_statement_reads_only_own_ctes(CteConsumer::Select(select))
+                    }
+                    Statement::Insert(insert) => {
+                        conn.cte_statement_reads_only_own_ctes(CteConsumer::Insert(insert))
+                    }
+                    other => panic!("unexpected statement {other:?}"),
+                }
+            };
+            const CTE_INSERT: &str = "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL \
+                 SELECT i+1 FROM s WHERE i<50) INSERT INTO t(v) SELECT i FROM s";
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("CREATE VIEW tv AS SELECT v FROM t;").await.unwrap();
+
+            assert!(gate(CTE_INSERT));
+            assert!(gate(
+                "WITH a(x) AS (VALUES(1),(2)) SELECT sum(value) FROM a, generate_series(1, x)"
+            ));
+            assert!(!gate("WITH c(k) AS (SELECT 1) SELECT count(*) FROM t, c"));
+            assert!(!gate("WITH c(k) AS (SELECT 1) SELECT count(*) FROM tv, c"));
+            assert!(!gate("WITH c(k) AS (SELECT 1) SELECT (SELECT max(v) FROM t) FROM c"));
+            assert!(!gate("WITH c(k) AS (SELECT 1) SELECT * FROM c, t(1)"));
+            assert!(!gate("WITH c(k) AS (SELECT 1) SELECT * FROM main.c"));
+            assert!(!gate(
+                "WITH s(i) AS (SELECT 1) INSERT INTO t(v) SELECT i FROM s RETURNING id"
+            ));
+
+            for _ in 0..3 {
+                conn.execute(CTE_INSERT).await.unwrap();
+            }
+            assert_eq!(
+                scalar("WITH a(x) AS (VALUES(1),(2)), b(y) AS (SELECT x*10 FROM a) \
+                        SELECT sum(y) FROM a JOIN b ON y = x*10")
+                .await,
+                30
+            );
+            assert_eq!(
+                scalar("WITH c(k) AS (SELECT 1) SELECT count(*) FROM t JOIN c").await,
+                150
+            );
+
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute(CTE_INSERT).await.unwrap();
+            assert_eq!(
+                scalar("WITH c(k) AS (SELECT 2) SELECT count(*) * max(k) FROM t, c").await,
+                400
+            );
+            assert_eq!(
+                scalar("WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s \
+                        WHERE i<10) SELECT sum(i) FROM s")
+                .await,
+                55
+            );
+            conn.execute("COMMIT;").await.unwrap();
+
+            conn.execute(CTE_INSERT).await.unwrap();
+            assert_eq!(
+                scalar("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL \
+                        SELECT n+1 FROM r, t WHERE t.id = r.n AND n < 5) SELECT count(*) FROM r")
+                .await,
+                5
+            );
+            assert_eq!(scalar("SELECT count(*) FROM t").await, 250);
+            assert_eq!(scalar("SELECT sum(v) FROM tv").await, 5 * 1275);
+            assert_eq!(conn.memdb_row_hydration_suppressed.get(), 0);
+        });
+    }
+
+    /// bd-01uq7: a TEMP UNIQUE index over a VIRTUAL generated column was never
+    /// enforced — MemTable compared the NULL record placeholder, not the value.
+    #[test]
+    fn test_temp_unique_index_over_virtual_generated_column_is_enforced() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let unique_failure = |result: Result<usize>, label: &str| {
+                let err = result.expect_err(label).to_string();
+                assert!(err.contains("UNIQUE constraint failed"), "{label}: {err}");
+            };
+            conn.execute(
+                "CREATE TEMP TABLE g(id INTEGER PRIMARY KEY, v INTEGER DEFAULT 3,
+                 n INTEGER GENERATED ALWAYS AS (NULLIF(v,0)+1) VIRTUAL NOT NULL CHECK(n>0));",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE UNIQUE INDEX g_n ON g(n);").await.unwrap();
+            conn.execute("INSERT INTO g(v) VALUES(7);").await.unwrap();
+            unique_failure(
+                conn.execute("INSERT INTO g(v) VALUES(7);").await,
+                "duplicate computed key",
+            );
+            assert_eq!(
+                conn.execute("INSERT OR IGNORE INTO g(v) VALUES(7),(1);")
+                    .await
+                    .unwrap(),
+                1
+            );
+            unique_failure(
+                conn.execute("UPDATE g SET v = 7 WHERE n = 2;").await,
+                "UPDATE onto an existing computed key",
+            );
+            conn.execute("UPDATE g SET v = 4 WHERE n = 2;").await.unwrap();
+            let rows = conn.query("SELECT v, n FROM g ORDER BY n;").await.unwrap();
+            let rows: Vec<Vec<i64>> = rows
+                .iter()
+                .map(|row| row.values().iter().map(SqliteValue::to_integer).collect())
+                .collect();
+            assert_eq!(rows, vec![vec![4, 5], vec![7, 8]]);
+
+            // Rows padded by ADD COLUMN predate materialization; the index
+            // must still see their computed keys.
+            conn.execute("CREATE TEMP TABLE h(id INTEGER PRIMARY KEY, v INTEGER);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO h(v) VALUES(5),(5);").await.unwrap();
+            conn.execute("ALTER TABLE h ADD COLUMN w INTEGER GENERATED ALWAYS AS (v*2) VIRTUAL;")
+                .await
+                .unwrap();
+            unique_failure(
+                conn.execute("CREATE UNIQUE INDEX h_w ON h(w);").await,
+                "index over duplicate pre-ALTER rows",
+            );
+            conn.execute("UPDATE h SET v = 6 WHERE id = 2;").await.unwrap();
+            conn.execute("CREATE UNIQUE INDEX h_w ON h(  w  );").await.unwrap();
+            unique_failure(
+                conn.execute("INSERT INTO h(v) VALUES(5);").await,
+                "duplicate of a pre-ALTER row",
+            );
+        });
+    }
+
+    /// bd-nb49a: TEMP rowid allocation matches stock — a row discarded by
+    /// OR IGNORE burns no rowid and a deleted maximum is reused, while
+    /// AUTOINCREMENT still never reuses a value.
+    #[test]
+    fn test_temp_rowid_allocation_matches_stock_for_ignore_delete_and_autoincrement() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let rowids = async |sql: &str| -> Vec<Vec<i64>> {
+                conn.query(sql)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(SqliteValue::to_integer).collect())
+                    .collect()
+            };
+            conn.execute("CREATE TEMP TABLE g(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO g(v) VALUES(5);").await.unwrap();
+            conn.execute("INSERT OR IGNORE INTO g(v) VALUES(19),(NULL),(21);")
+                .await
+                .unwrap();
+            assert_eq!(
+                rowids("SELECT id, v FROM g ORDER BY id;").await,
+                vec![vec![1, 5], vec![2, 19], vec![3, 21]]
+            );
+            conn.execute("DELETE FROM g WHERE id = 3;").await.unwrap();
+            conn.execute("INSERT INTO g(v) VALUES(22);").await.unwrap();
+            assert_eq!(rowids("SELECT max(id) FROM g;").await, vec![vec![3]]);
+
+            conn.execute(
+                "CREATE TEMP TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO a(v) VALUES(1),(2),(3);").await.unwrap();
+            conn.execute("DELETE FROM a WHERE id = 3;").await.unwrap();
+            conn.execute("INSERT INTO a(v) VALUES(4);").await.unwrap();
+            conn.execute("INSERT OR IGNORE INTO a(v) VALUES(NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO a(v) VALUES(6);").await.unwrap();
+            assert_eq!(
+                rowids("SELECT id FROM a ORDER BY id;").await,
+                vec![vec![1], vec![2], vec![4], vec![6]]
+            );
+            // A TEMP table's sequence stays connection-local: main never
+            // grows a sqlite_sequence for it.
+            assert_eq!(
+                rowids("SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence';")
+                    .await,
+                vec![vec![0]]
+            );
+            conn.execute("DROP TABLE a;").await.unwrap();
+            conn.execute(
+                "CREATE TEMP TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER NOT NULL);",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO a(v) VALUES(1);").await.unwrap();
+            assert_eq!(rowids("SELECT id FROM a;").await, vec![vec![1]]);
         });
     }
 
