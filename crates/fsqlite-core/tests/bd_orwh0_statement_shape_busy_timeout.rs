@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-orwh0 — every autocommit statement shape must honour `busy_timeout`, not
 //! just the three that happened to get reported.
 //!
@@ -234,6 +236,126 @@ fn every_autocommit_shape_spends_busy_timeout_before_refusing() {
             refusals.len()
         );
     }
+}
+
+/// bd-pa8e5: a CREATE INDEX that the autocommit loop retried must leave exactly
+/// what one clean attempt leaves — the verbatim CREATE text in sqlite_master, no
+/// residue that makes the next CREATE say "already exists", and a sound image.
+#[test]
+fn retried_create_index_persists_verbatim_sql_and_leaves_no_residue() {
+    const CREATE: &str = "CREATE INDEX probe_verbatim ON t(  v  , id )";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pa8e5.db");
+    let path = path.to_str().expect("utf-8 path").to_owned();
+    seed(&path);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let checkpointer = {
+        let p = path.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(&p).await.expect("open checkpointer");
+                conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
+                    .await
+                    .expect("busy_timeout");
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await;
+                    let _ = conn.execute("INSERT INTO t(v) VALUES('c')").await;
+                }
+                conn.close().await.expect("close checkpointer");
+            });
+        })
+    };
+    let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let p = path.clone();
+        let failures = Arc::clone(&failures);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&p).await.expect("open prober");
+            conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
+                .await
+                .expect("busy_timeout");
+            // A refusal after the whole busy_timeout is legal against a
+            // checkpointer that never pauses, so a transient error just means
+            // "again". Anything else — "already exists" from a residue of a
+            // failed attempt, or rewritten sqlite_master text — is the defect.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            // Stop retrying at this point. A DDL writer can starve against a
+            // checkpointer that commits without pause (first committer wins
+            // on page 1; the page-1/freelist contention track), which is not
+            // what this keeper judges: the image it leaves is still checked.
+            let hard_stop = deadline + Duration::from_secs(60);
+            let starved = |what: &str, created: u32| {
+                println!("{what} #{created}: still refused after the retry budget (starved)");
+            };
+            let (mut created, mut refused) = (0u32, 0u32);
+            'probe: while Instant::now() < deadline {
+                match conn.execute(CREATE).await {
+                    Ok(_) => created += 1,
+                    Err(error) if error.is_transient() => {
+                        refused += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.lock().unwrap().push(format!("create #{created}: {error}"));
+                        break;
+                    }
+                }
+                let sql = loop {
+                    match conn
+                        .query("SELECT sql FROM sqlite_master WHERE name = 'probe_verbatim'")
+                        .await
+                    {
+                        Ok(rows) => break rows.first().map(|row| format!("{:?}", row.values()[0])),
+                        Err(error) if error.is_transient() => {
+                            if Instant::now() > hard_stop {
+                                starved("read", created);
+                                break 'probe;
+                            }
+                        }
+                        Err(error) => {
+                            failures.lock().unwrap().push(format!("read #{created}: {error}"));
+                            break 'probe;
+                        }
+                    }
+                };
+                if sql.as_deref() != Some(&format!("Text({CREATE:?})")) {
+                    failures.lock().unwrap().push(format!("create #{created}: sql {sql:?}"));
+                    break;
+                }
+                loop {
+                    match conn.execute("DROP INDEX probe_verbatim").await {
+                        Ok(_) => break,
+                        Err(error) if error.is_transient() => {
+                            refused += 1;
+                            if Instant::now() > hard_stop {
+                                starved("drop", created);
+                                break 'probe;
+                            }
+                        }
+                        Err(error) => {
+                            failures.lock().unwrap().push(format!("drop #{created}: {error}"));
+                            break 'probe;
+                        }
+                    }
+                }
+            }
+            println!("created and dropped {created} times, {refused} busy refusals retried");
+            conn.close().await.expect("close prober");
+        });
+    }
+    stop.store(true, Ordering::Relaxed);
+    checkpointer.join().expect("checkpointer thread");
+    let failures = failures.lock().unwrap().clone();
+    assert!(failures.is_empty(), "{failures:?}");
+
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(&path).await.expect("reopen");
+        let rows = conn.query("PRAGMA integrity_check").await.expect("integrity_check");
+        assert_eq!(format!("{:?}", rows[0].values()[0]), "Text(\"ok\")");
+        conn.close().await.expect("close");
+    });
 }
 
 #[test]
