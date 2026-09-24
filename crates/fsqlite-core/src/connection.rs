@@ -83184,11 +83184,15 @@ impl Connection {
         else {
             return None;
         };
-        // Gate: no GROUP BY, HAVING, windows, DISTINCT.
+        // Gate: no GROUP BY, HAVING, windows, DISTINCT, or aggregate result
+        // list. An aggregate without GROUP BY (`SELECT count(*) ...`) always
+        // yields exactly one row, so EXISTS is true even when no source row
+        // matches; this probe only answers "does a matching row exist".
         if !group_by.is_empty()
             || having.is_some()
             || !windows.is_empty()
             || matches!(distinct, fsqlite_ast::Distinctness::Distinct)
+            || select_core_is_aggregate(&subquery.body.select)
         {
             return None;
         }

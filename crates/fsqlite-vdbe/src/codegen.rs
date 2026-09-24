@@ -29567,7 +29567,12 @@ fn resolve_sort_key(
     columns: &[ResultColumn],
 ) -> SortKeySource {
     if let Some(output_expr) = resolve_order_by_output_expr(expr, columns) {
-        return resolve_sort_key(output_expr, table, table_alias, columns);
+        // SQLite resolves an ORDER BY term against the result list once. The
+        // selected expression is an ordinary expression, not another output
+        // reference: re-resolving it against `columns` would loop forever for
+        // `SELECT 1 ... ORDER BY 1` (the literal re-reads as ordinal 1) and for
+        // swapped aliases such as `SELECT a AS b, b AS a ... ORDER BY a`.
+        return resolve_sort_key(output_expr, table, table_alias, &[]);
     }
 
     if let Expr::Column(col_ref, _) = expr {
