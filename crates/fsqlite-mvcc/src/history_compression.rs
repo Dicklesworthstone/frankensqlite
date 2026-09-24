@@ -1465,7 +1465,8 @@ fn canonical_sqlite_value_bytes(buf: &mut Vec<u8>, val: &SqliteValue) {
             #[allow(clippy::cast_possible_truncation)]
             let len = s.len() as u32;
             buf.extend_from_slice(&len.to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
+            // Bind stored bytes, not SmallText's lossy str view of raw TEXT.
+            buf.extend_from_slice(s.as_bytes_direct());
         }
         SqliteValue::Blob(b) => {
             buf.push(4);
