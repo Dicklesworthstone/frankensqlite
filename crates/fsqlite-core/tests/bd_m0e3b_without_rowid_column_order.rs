@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-m0e3b / GH#340: WITHOUT ROWID VACUUM INTO column-order coverage + the
 //! supported-PK-shape boundary.
 //!

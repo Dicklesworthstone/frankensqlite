@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-76x57 (file-backed GROUP BY residual): json_group_array /
 // json_group_object must preserve the JSON subtype of their arguments through a
 // FILE-BACKED GROUP BY query, so a nested json()/json_object()/json_array()

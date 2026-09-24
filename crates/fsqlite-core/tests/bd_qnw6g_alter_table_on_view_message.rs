@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-alter-table-on-view-wrong-message-qnw6g: ALTER TABLE targeting a VIEW must
 //! report the stock VIEW-specific SQLITE_ERROR message (the object exists, it just
 //! isn't alterable), not "no such table" from the tables-only schema lookup.

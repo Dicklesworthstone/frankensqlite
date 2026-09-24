@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-nd2ju / GH#377 (L2): WITHOUT ROWID PRIMARY KEY point seeks for
 // the two shapes the single-column bare-`pk = const` L1 hoist leaves as scans —
 //   * a COMPOSITE full-key equality (`WHERE a = ? AND b = ?` on `PRIMARY KEY

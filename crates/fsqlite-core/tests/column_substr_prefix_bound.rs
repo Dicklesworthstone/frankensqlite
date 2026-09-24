@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#400: a bounded prefix projection `substr(col, 1, N)` over a large,
 //! overflow-backed value must (a) return exactly what stock SQLite returns —
 //! including for non-ASCII TEXT — and (b) read only a bounded slice of the

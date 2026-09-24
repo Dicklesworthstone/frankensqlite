@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-76x57: json_group_array / json_group_object must preserve the
 // JSON subtype of their arguments so a nested json()/json_object()/json_array()
 // result is EMBEDDED as JSON, not quoted as a string. A plain (non-JSON) text

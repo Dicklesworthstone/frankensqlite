@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-977wx: an INTEGER PRIMARY KEY (rowid alias) collision must be
 // reported as SQLite's `UNIQUE constraint failed: <table>.<ipk>` — never the
 // bare `PRIMARY KEY constraint failed`, and never wrapped as a FrankenError

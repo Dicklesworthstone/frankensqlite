@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Diagnostic integration test for frankensqlite#377 (WITHOUT ROWID half).
 //
 // Captures the connection's own planner-directive outcome telemetry

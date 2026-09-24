@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-alter-rename-sqlite-sequence-gx6ds (GH #150): ALTER TABLE RENAME must
 //! rewrite the on-disk sqlite_sequence row, not leave a stale entry.
 //!

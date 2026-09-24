@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Reproduce the explicit-main correlated lookup used by foreign_key_check.
 //! Ordinary SQL rows only; this is not financial-data or live-provider proof.
 

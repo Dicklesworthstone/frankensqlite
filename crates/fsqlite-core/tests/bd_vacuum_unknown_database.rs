@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): VACUUM of an unknown database name reports
 // stock's "unknown database <name>", not frank's old "not implemented: VACUUM
 // on attached schemas". VACUUM of main / a live attached schema / no-arg all

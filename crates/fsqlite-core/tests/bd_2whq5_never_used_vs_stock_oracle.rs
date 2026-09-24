@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-2whq5 (P1): fsqlite `integrity_check` reports "page N is never used" on a
 //! (reconstruct/churn) database that stock sqlite3 accepts as `ok`.
 //!

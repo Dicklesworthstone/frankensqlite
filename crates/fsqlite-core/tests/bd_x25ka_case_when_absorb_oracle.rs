@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-x25ka(c) (REVIEW3-P3) CASE-WHEN absorb: inside a `CASE WHEN <test> ...`,
 //! a LITERAL `X AND 0` compile-folds to FALSE and DROPS X's name/aggregate
 //! resolution — exactly like every other context (stock: `WHERE nosuchcol AND 0`

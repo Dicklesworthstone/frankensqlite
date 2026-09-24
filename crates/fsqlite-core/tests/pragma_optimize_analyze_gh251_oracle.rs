@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #251 (bd-gh-pragma-optimize-analyze): `PRAGMA optimize` was unimplemented
 //! — it fell through to the unknown-pragma no-op, so it never ran ANALYZE and
 //! `sqlite_stat1` was never created, making a follow-up `SELECT * FROM

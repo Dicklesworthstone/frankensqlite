@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-sw2k5 AC#1 — rollback-journal cleanup durability per `PRAGMA journal_mode`.
 //!
 //! The post-commit cleanup differs by mode: `delete` unlinks the journal file,

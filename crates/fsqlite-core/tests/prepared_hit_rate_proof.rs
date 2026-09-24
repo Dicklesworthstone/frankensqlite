@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-db300.4.5.1: Prove actual prepared-artifact hit rates and fast-lane usage
 //! on c1 micro-workloads.
 //!

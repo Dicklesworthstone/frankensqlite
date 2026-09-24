@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Regression test for the UNION+VIEW root-page collision bug.
 //!
 //! Symptom on main pre-fix: a UNION query whose arms reference a VIEW caused

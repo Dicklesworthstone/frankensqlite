@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-76k72 / bd-rwaxp: an FTS5 virtual table used as a JOIN input must expose
 //! its non-MATCH columns correctly, so a join on one of them matches stock.
 //!

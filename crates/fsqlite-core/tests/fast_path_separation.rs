@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-6eyrg.1: Fast-path vs slow-path execution separation tests.
 //!
 //! Proves:

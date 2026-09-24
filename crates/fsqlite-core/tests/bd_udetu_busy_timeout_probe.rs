@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-udetu — is `PRAGMA busy_timeout` honoured on the `BEGIN CONCURRENT` path?
 //!
 //! The ioq6x livelock shows four writers, each with `busy_timeout=10000`, taking

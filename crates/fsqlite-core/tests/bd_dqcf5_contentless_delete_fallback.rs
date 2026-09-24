@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-dqcf5: a contentless_delete FTS5 table, reopened lazily, that takes the
 //! origin-NULL DELETE fallback (`_docsize.origin` is NULL, so the incremental
 //! tombstone delete returns None and the connection promotes + full-re-encodes)

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #208 (bd-gh-live-vtab-update-routing): an UPDATE on a live R*Tree virtual
 //! table must be visible on the same connection.
 //!

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-76k72 pin: does fsqlite apply comparison numeric affinity to a PLAIN
 //! (non-FTS5) `TEXT = INTEGER PRIMARY KEY` comparison, in WHERE and in JOIN
 //! ON-conditions? Stock sqlite3 3.46.1 matches all three (verified):

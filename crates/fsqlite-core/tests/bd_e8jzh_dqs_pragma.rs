@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-e8jzh — `PRAGMA fsqlite.dqs` opt-out knob for the DQS-ON engine (bd-jcjkf).
 //!
 //! Stock SQLite exposes DQS ("double-quoted string") control as the dbconfig

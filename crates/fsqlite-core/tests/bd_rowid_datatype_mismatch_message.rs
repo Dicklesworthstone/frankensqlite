@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper: inserting a non-integral value into an INTEGER PRIMARY KEY (rowid)
 // reports stock SQLite's bare "datatype mismatch" (SQLITE_MISMATCH), not a
 // verbose "type mismatch: expected INTEGER PRIMARY KEY rowid, got text".

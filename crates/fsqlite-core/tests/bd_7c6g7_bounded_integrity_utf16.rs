@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-7c6g7 #6: the BOUNDED integrity check (`validate_database_integrity_bounded`)
 //! is frank's own image-publication gate. It recomputed every expected index key
 //! by decoding the row payload and serializing the key with the UTF-8-hardcoded

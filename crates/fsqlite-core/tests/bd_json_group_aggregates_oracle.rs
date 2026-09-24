@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-json-group-aggregates-pdvx5: JSON1 aggregate functions `json_group_array`
 //! and `json_group_object` were declared in the extension's doc comment as
 //! provided but never actually registered (`register_json_scalars` wired only

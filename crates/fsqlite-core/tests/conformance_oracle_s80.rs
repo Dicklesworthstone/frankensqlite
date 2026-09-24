@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 80 (cc4 UPDATE/DELETE ceremony + edge cases)
 //!
 //! Targeted probes: UPDATE with complex SET expressions, DELETE with

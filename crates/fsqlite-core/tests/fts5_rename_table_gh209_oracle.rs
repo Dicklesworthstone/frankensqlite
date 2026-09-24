@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #209 (bd-c6jre): `ALTER TABLE <fts5> RENAME TO <new>` must rename the
 //! FTS5 virtual table together with all five of its shadow tables
 //! (`_config`, `_content`, `_data`, `_docsize`, `_idx`) and keep the table

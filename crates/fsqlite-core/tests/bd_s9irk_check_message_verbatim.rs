@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-s9irk (part): an UNNAMED CHECK constraint violation reports the
 // VERBATIM check expression source (`a>0`, `a > 0`) rather than an AST re-render
 // (`a > 0` for a `a>0` source). Oracle: sqlite3 3.46.1.

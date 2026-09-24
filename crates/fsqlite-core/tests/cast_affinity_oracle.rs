@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: CAST semantics + type-affinity coercion in comparisons
 //! vs rusqlite (bundled SQLite 3.53). A probe sweep found this surface
 //! stock-correct across 21 cases; this keeper locks it in.

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #137 (bd-gh-indexed-by-hard-contract-qd1cs): `INDEXED BY <name>` is a hard
 //! planning contract — the named index must be usable, or prepare must fail with
 //! `no query solution`. The bead's evidence predates the bd-wlo29 / bd-0fz9d

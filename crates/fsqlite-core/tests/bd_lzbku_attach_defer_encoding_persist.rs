@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lzbku: ATTACH of a brand-new/empty file to a UTF-16 main adopts main's
 //! encoding IN MEMORY but must DEFER the on-disk page-1 header write to the aux's
 //! first real write (like stock, which leaves an untouched aux at 0 bytes).

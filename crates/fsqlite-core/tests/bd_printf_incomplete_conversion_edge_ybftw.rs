@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-printf-incomplete-conversion-edge-ybftw: printf()/format() incomplete
 //! conversions must match stock SQLite. Differential vs rusqlite (SQLite 3.53).
 //!

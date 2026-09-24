@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper: GLOB char-class range `[lo-hi]` matches its lower-bound char `lo` as a
 // LITERAL set member even when the range is reversed/empty (hi < lo), matching
 // C SQLite's patternCompare (which tests `c2==c` for the range start before

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-33sht: a read-free `INSERT ... VALUES` streak must not pay a full O(rows)
 //! MemDatabase reload per statement (which made bulk ingest O(rows x statements)).
 //! The mirror stays stale through the streak and is rebuilt once at the next

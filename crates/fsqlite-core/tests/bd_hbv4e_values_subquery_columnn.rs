@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-hbv4e: a scalar subquery whose FROM is an inline `(VALUES ...)` (or any
 //! unaliased derived table) referencing the auto-generated `columnN` names was
 //! wrongly rejected with "no such column in result expression". The FROM-less

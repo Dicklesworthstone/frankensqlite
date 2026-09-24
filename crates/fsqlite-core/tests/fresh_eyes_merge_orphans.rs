@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Fresh-eyes probe: lazy segment MERGE over STOCK-written segments must not
 //! orphan the inputs' %_idx rows / dlidx %_data rows (the strict
 //! integrity_report then rejects the shadow on the next promote).

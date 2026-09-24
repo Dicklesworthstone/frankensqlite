@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2): a user CREATE TABLE with a name beginning
 // "sqlite_" (case-insensitive) is rejected with stock's "object name reserved
 // for internal use: <name>" (name as-written), even under IF NOT EXISTS.

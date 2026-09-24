@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-x25ka(b) (REVIEW3-P3): a HAVING clause must name/aggregate-resolve its
 //! column references at prepare, exactly like WHERE / JOIN-ON — a bare
 //! `HAVING nosuchcol` (and `HAVING NULL AND nosuchcol`) raises `no such column`

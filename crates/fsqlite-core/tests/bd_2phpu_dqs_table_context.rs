@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-2phpu: the DQS ("double-quoted string") fallback must also fire for
 //! double-quoted tokens that fail column resolution in a FROM-table / WHERE /
 //! concat context — not only in the fromless projection contexts of bd-jcjkf.

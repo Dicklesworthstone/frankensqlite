@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-errmsg-parity-batch4-deqcb (cast-incomplete): an EMPTY CAST type name
 //! `CAST(x AS)` is legal SQL and has NUMERIC affinity — the `sqlite3AffinityType`
 //! default — so it behaves identically to `CAST(x AS NUMERIC)`. Frank previously

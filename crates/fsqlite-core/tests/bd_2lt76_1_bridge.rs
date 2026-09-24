@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::{Connection, ConnectionEnv, IoPollStrategy, RuntimeConfig};
 use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch4): CREATE TABLE with an unknown COLLATE name is
 // rejected with stock's "no such collation sequence: <name>"; builtin collations
 // (BINARY/NOCASE/RTRIM, case-insensitive) are accepted. Oracle: sqlite3 3.46.1 +

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-scbx6 (GH#353, P0): WITHOUT ROWID + composite UNIQUE auto-index maintenance.
 //!
 //! DML on a WITHOUT ROWID table must maintain the auto-indexes backing composite

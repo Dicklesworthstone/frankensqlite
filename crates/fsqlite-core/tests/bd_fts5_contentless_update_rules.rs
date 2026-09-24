@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Match stock's contentless FTS5 UPDATE admission rules (found by the GH#358
 //! lazy-default blast-radius audit):
 //! - `contentless_delete`: an UPDATE must assign EVERY column (a full-row replace);

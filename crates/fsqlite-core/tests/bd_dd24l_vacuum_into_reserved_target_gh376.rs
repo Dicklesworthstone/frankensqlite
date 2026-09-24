@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-dd24l / GH#376: `VACUUM INTO` must produce an output file.
 //!
 //! Regression: on Windows, fsqlite 0.3.4 → 0.3.7 broke `VACUUM INTO` — it

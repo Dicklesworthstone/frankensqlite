@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 #[test]
 fn rp() {

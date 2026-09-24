@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! frankensqlite#86 — superseded property-based differential scaffold.
 //!
 //! This integration target is intentionally inert. The independent, typed,

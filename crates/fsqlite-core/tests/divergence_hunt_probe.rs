@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Broad differential RESULT-parity divergence hunt vs C SQLite (rusqlite,
 //! bundled fixed version). Complements `scalar_result_diff_probe.rs` (scalar/
 //! math/date/dtoa/aggregate/window) and `core_sql_rusqlite_conformance.rs`

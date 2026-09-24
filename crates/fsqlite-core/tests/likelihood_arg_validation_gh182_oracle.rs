@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #182 (bd-gh-likelihood-arg-validation-bynz9): `likelihood(X, Y)` must
 //! reject a second argument that is not a floating-point literal in the closed
 //! range `[0.0, 1.0]`.

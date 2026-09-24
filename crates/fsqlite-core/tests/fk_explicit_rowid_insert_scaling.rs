@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Issue #111 perf repro: FK-on INSERTs with an explicit `INTEGER PRIMARY KEY`
 //! child rowid must not scale super-linearly.
 //!

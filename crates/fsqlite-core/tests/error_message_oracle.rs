@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Error-message parity keeper: frank's error text must match stock SQLite
 //! (3.53) VERBATIM for the common error conditions below. A differential probe
 //! (frank vs rusqlite) confirmed these match; asserted here against the exact

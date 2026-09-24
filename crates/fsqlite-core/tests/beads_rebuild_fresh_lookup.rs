@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;

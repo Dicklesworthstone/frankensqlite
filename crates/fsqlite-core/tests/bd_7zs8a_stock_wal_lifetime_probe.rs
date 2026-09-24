@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-7zs8a — does a stock SQLite connection delete our WAL out from under us?
 //!
 //! Nine `retained_autocommit_*_flushes_prior_batch` unit tests fail on main with

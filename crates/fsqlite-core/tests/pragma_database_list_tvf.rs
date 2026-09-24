@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-pragma-tvf-surface-0ryxd (GH #213): `pragma_database_list()` must be
 //! usable as a table-valued function, not error "table-valued function
 //! pragma_database_list is not supported". Its rows mirror `PRAGMA

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #214 (bd-gh-vtab-insert-or-replace-m7npk): `INSERT OR REPLACE` into a live
 //! virtual table (R*Tree) errored with "UPSERT and conflict clauses are not
 //! supported for live virtual-table INSERT" instead of performing SQLite's

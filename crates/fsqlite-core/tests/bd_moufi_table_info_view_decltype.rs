@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-pragma-table-info-view-decltype-moufi: PRAGMA table_info(<view>)
 // must report one row per view OUTPUT column, with each column's DECLARED type
 // resolved like SQLite's sqlite3ColumnType — a direct column reference reports

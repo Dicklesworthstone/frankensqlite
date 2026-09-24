@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): a non-integer LIMIT on a table scan (VDBE
 // MustBeInt path) reports stock's bare "datatype mismatch", not the verbose
 // "type mismatch: expected integer, got text". Oracle: sqlite3 3.46.1 +

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-eapu1: ALTER TABLE RENAME COLUMN/TABLE must store the affected index's
 //! `sqlite_master.sql` in SQLite's minimal form (quote only when needed, no
 //! implicit ASC), not a canonical always-quoted re-render. Oracle: sqlite3.

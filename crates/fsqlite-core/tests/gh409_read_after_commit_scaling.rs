@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #409 keeper — the first read after a committed write must cost what the
 //! read touches, not a pass over the whole database image.
 //!

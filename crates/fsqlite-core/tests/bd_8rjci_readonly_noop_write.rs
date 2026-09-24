@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-8rjci (parity): a read-only handle must refuse a write-class statement
 //! at the execute() boundary regardless of whether it would change any rows.
 //!

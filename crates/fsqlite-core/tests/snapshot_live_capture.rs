@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Public Connection -> frozen source -> real repair symbols -> durable spool
 //! -> SQLite image. Native acceptance tests; no mock snapshot-authority path.
 #![cfg(all(feature = "native", unix, not(target_arch = "wasm32")))]

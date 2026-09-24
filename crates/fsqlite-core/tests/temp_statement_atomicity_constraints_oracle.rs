@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-c36qv — widen TEMP statement atomicity beyond NOT NULL.
 //!
 //! bd-5bq6u proved and fixed statement atomicity on the MemDatabase lane, but

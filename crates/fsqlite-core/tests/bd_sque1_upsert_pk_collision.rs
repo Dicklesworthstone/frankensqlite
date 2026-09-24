@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-sque1: an UPSERT `DO UPDATE SET` that rewrites the PRIMARY KEY / UNIQUE
 //! key onto a DIFFERENT existing row must raise a constraint error and leave the
 //! table unchanged — never silently clobber (REPLACE) and lose the other row.

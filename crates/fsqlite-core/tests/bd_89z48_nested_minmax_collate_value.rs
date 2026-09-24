@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-89z48 (regression/incompleteness of 15d34d33d / bd-3radn M5; overlaps
 //! bd-9vtbh).
 //!

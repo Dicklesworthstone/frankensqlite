@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-t7oeo: the interpreted evaluator (`eval_join_expr`, the FROM-less / CTE
 //! routed lane) had no `Expr::RowValue` arm, so a row-value comparison whose
 //! operands are subqueries (which arrive pre-evaluated as

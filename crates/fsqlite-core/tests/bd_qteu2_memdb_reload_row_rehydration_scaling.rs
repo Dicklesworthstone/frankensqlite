@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-qteu2 / GH#345 residual: an ingestion loop must not re-hydrate the rows of
 //! tables it never touches.
 //!

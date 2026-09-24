@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Generic SQL regression for indexed text-key FK probes; not provider evidence.
 use fsqlite_core::connection::{
     Connection, hot_path_profile_snapshot, set_hot_path_profile_enabled,

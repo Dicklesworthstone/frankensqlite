@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Regression: `optimize` (and any other promote path) on a lazy `contentless_delete`
 //! FTS5 table must hydrate the in-memory index from the persisted `_data` segments,
 //! NOT rebuild from the (empty) `_content` shadow.

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-3radn H2: SQLite sources every bare output from the `min()`/`max()`
 //! extremum row when that is the query's only aggregate — INCLUDING a scalar
 //! subquery in the output that correlates to the outer row (e.g. `(SELECT name)`

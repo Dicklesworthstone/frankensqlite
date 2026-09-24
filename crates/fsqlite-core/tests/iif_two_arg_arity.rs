@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-iif-two-arg-arity-a8tm9 (GH #183): two-argument `iif(X,Y)` (shorthand
 //! for `iif(X,Y,NULL)`, SQLite 3.48+). A truthy X returns Y; a falsy/NULL X
 //! returns NULL. Covers both the constant const-fold path and the runtime

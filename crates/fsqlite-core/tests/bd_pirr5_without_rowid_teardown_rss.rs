@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pirr5 (GH#371): WITHOUT-ROWID teardown must be RSS-bounded.
 //!
 //! Dropping / tearing down a large WITHOUT-ROWID table (rows live in the PK

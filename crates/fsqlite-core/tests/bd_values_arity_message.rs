@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2): ragged VALUES rows report stock's verbatim
 // "all VALUES must have the same number of terms" under SQLITE_ERROR, not
 // frank's old "SQL error at offset N: ..." (mis-classified ParseError) prefix.

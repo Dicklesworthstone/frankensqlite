@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Original correlated JSON-key anti-join, without rewriting caller SQL.
 //! Ordinary SQL values; these tests do not certify a provider or migration.
 use fsqlite_core::connection::{

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle — `MAX(rowid)` / `MIN(rowid)` leaf-seek fast path.
 //!
 //! Verifies the planner/codegen special-case that lowers

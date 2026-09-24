@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use std::collections::BTreeSet;
 
 use fsqlite_core::connection::{Connection, Row};

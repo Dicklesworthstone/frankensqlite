@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-prepare-time-validation-bypass slice 3): a bad column in a window
 // function's inline OVER (PARTITION BY / ORDER BY <col>) is rejected at prepare
 // with "no such column: <c>", matching stock — previously frank resolved window

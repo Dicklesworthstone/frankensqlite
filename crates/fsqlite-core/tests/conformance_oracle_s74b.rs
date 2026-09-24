@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 74b
 //!
 //! GROUP BY + window function coverage (leveraging the execute_group_by_window_select fix),

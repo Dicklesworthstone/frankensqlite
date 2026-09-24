@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-1v1pl acceptance keeper: opening a **stock UTF-16** database must NOT
 //! trigger a spurious first-open migration/repair pass.
 //!

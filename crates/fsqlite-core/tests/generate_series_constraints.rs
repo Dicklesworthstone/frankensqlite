@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! SQL guards for the built-in series cursor and its xBestIndex/xFilter plan.
 //! Large-domain seek bounds are tested directly in fsqlite-ext-misc so that
 //! a broken planner cannot make this SQL target scan an unbounded sequence.

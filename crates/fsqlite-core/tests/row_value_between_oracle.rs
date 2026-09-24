@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-row-value-comparisons-s2wd8 (GH #171): row-value BETWEEN.
 //!
 //! `(a,b) BETWEEN (x,y) AND (z,w)` must expand to lexicographic

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Stock-oracle keeper for `INSERT ... ON CONFLICT(<rowid alias>) DO UPDATE`
 //! on a TEMP table.
 //!

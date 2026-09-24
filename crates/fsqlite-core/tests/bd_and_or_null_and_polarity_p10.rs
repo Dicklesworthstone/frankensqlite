@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-and-or-short-circuit-value-jump-gaps-dkswh, residual P10/P12 — the
 //! polarity-dependent `NULL AND E` truth-context rule vs stock sqlite3.
 //!

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch #7): an INSERT ... SELECT column/value count
 // mismatch reports stock's verbatim SQLITE_ERROR text (same two forms as the
 // VALUES path), NOT frank's old Internal "INSERT ... SELECT column count

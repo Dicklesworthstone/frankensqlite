@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #406 keepers — a content-backed FTS5 INSERT persists O(rows in the
 //! statement), not O(rows in the table).
 //!

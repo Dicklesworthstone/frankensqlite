@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Public sender regression for the bd-3mgq5.1 / MTDT build dependency seam.
 //! This proves wire-symbol encoding and restart, not snapshot loss recovery.
 

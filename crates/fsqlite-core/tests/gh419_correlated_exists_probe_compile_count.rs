@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#419: the SQLite documentation's Sudoku solver (a recursive CTE whose
 //! recursive arm filters candidates with a correlated `NOT EXISTS` over a
 //! 9-row CTE) ran ~100x slower than stock sqlite3.

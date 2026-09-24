@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: date/time functions vs rusqlite (bundled SQLite 3.53).
 //! A probe sweep found this surface stock-correct across 22 cases; this keeper
 //! locks it in. Fixed timestamps only — no now()/wall-clock — so the comparison

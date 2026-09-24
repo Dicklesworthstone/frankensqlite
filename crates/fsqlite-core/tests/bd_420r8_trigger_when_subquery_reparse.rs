@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-420r8 / GH#345: an ordinary ingestion loop must not re-parse the whole
 //! schema on every write.
 //!

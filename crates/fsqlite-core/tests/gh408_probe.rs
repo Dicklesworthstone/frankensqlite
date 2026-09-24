@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Scratch measurement probe for GH#408 (not a keeper).
 
 use fsqlite_core::connection::{

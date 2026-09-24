@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #411 keeper — a committed transaction must not be destroyed when a
 //! FOREIGN (stock-SQLite, separate process) connection closes its handle on
 //! the same WAL-mode database.

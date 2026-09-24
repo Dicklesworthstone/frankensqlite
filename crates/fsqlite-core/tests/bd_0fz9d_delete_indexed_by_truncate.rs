@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-0fz9d (regression of 350af08c3 / bd-wlo29 L10).
 //!
 //! `validate_dml_target_partial_index` demanded that a forced `INDEXED BY`

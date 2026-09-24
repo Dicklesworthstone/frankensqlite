@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: collation (BINARY / NOCASE / RTRIM) vs rusqlite
 //! (bundled SQLite 3.53). A probe sweep found this surface stock-correct across
 //! 15 cases; this keeper locks it in.

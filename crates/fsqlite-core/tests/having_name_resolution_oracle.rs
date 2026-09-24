@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-having-name-resolution-v912w (GH #174): HAVING must resolve an
 //! unqualified name to a base (input) column before a SELECT output alias that
 //! shadows it, matching C SQLite.

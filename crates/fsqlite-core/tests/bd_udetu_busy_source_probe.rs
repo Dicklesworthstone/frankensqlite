@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-udetu — WHICH layer raises the instant `database is busy`?
 //!
 //! The checkpoint probe established the trigger: while a `wal_checkpoint(TRUNCATE)`

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch4): an ON CONFLICT conflict-target is validated
 // for both DO NOTHING and DO UPDATE: a non-existent target column reports
 // "no such column: <c>"; a target that matches no PRIMARY KEY / UNIQUE

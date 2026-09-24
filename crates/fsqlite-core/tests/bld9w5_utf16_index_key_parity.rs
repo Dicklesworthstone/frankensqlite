@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-bld9w.5 acceptance keeper: TEXT index-key encode/decode/compare must be
 //! consistent with the DB text encoding, so an **index-routed** query returns
 //! the SAME rows in the SAME order as the equivalent **full-table-scan** AND

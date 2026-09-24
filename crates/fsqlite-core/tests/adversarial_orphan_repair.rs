@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-zywqc.14 adversarial corpus — orphaned-page corruption healed by the
 //! first-open repair pass (bd-zywqc.5).
 //!

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-txn-savepoint-errors-internal-vs-error-vaiu7: user-facing
 // transaction- and savepoint-control errors must match SQLite's messages
 // VERBATIM under SQLITE_ERROR — never wrapped as an Internal error (which would

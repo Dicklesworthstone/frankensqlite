@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential RESULT parity gate: assert that the actual *values* returned by
 //! FrankenSQLite match C SQLite (rusqlite, bundled = fixed version) for scalar /
 //! numeric / CAST / string / math / date-time edge cases, plus a harder batch

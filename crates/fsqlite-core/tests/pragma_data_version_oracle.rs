@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pragma-data-version-approximation-b3dpn: `PRAGMA data_version` oracle parity.
 //!
 //! Stock semantics (sqlite pragma docs): `data_version` is a per-connection

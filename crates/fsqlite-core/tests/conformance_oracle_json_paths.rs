@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! SQL-level JSON1 path and mutator conformance against C SQLite.
 //!
 //! This complements the JSON extension unit tests by executing the registered

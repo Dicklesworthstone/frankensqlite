@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-o499g: fsqlite `PRAGMA integrity_check` must agree with stock sqlite3 on a
 //! valid, actively-written multi-column index.
 //!

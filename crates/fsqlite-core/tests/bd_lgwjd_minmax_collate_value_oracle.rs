@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lgwjd (REVIEW3-P2): `min()/max()` must compute the extremum VALUE under a
 //! column's DECLARED collation (`name TEXT COLLATE NOCASE`), not BINARY, in the
 //! multi-aggregate and explicit-GROUP BY lanes — and `max` must break

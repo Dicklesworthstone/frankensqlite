@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Fresh-eyes probe: `SELECT count(*) FROM <fts5vocab>` must not short-circuit
 //! through the generic live-vtab cursor (whose fts5vocab stub is always EOF).
 

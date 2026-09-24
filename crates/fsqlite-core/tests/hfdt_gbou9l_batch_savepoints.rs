@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Migration-copy regression: explicit caller-owned rollback must not clone
 //! the complete catalog per constrained INSERT. Generic SQL, not provider proof.
 use fsqlite_core::connection::{

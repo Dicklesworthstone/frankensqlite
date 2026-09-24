@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Integration tests for PLANNER-3: the `try_prepare_simple_join_rows` wire
 //! that routes multi-table FROM clauses through
 //! `order_join_inputs_with_hints`.

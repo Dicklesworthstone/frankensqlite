@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-1m280: a WHERE-less `DELETE FROM p INDEXED BY <idx>` on a table that is an
 //! FK *parent* must still take stock's truncate optimization when
 //! `PRAGMA foreign_keys` is OFF (the default) — stock's `sqlite3FkRequired` is

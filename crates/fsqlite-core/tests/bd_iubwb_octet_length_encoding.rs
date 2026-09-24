@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-iubwb acceptance oracle: `octet_length(X)` must report the byte length of
 //! X's TEXT representation IN THE DATABASE'S text encoding.
 //!

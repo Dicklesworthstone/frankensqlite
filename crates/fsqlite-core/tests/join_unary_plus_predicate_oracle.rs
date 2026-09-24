@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-g54oq regression guard: unary plus (`+expr`) in a JOIN predicate.
 //!
 //! `eval_join_expr` (the fallback join executor) once handled UnaryOp

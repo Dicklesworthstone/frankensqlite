@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-fts5-lazy-shadow-reads-itcc4.3 Stage 1 (v2 origin-targeted lazy DELETE) —
 //! `_docsize.origin` persistence oracle.
 //!

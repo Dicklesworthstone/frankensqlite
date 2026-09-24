@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-fts5-lazy-shadow-reads-itcc4.3 special commands: `'delete-all'`.
 //!
 //! `INSERT INTO t(t) VALUES('delete-all')` on a lazy `contentless_delete` FTS5

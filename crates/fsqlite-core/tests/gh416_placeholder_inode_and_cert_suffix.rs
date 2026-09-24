@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#416: filesystems that number a file by its first data cluster (macOS
 //! `msdosfs` / FAT32) give a zero-length file a placeholder `st_ino` that
 //! changes on the first write. A database CREATED on such a volume captured

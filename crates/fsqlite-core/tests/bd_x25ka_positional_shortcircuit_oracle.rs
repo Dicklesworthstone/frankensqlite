@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-x25ka(a) (REVIEW3-P3) positional short-circuit: `(subquery) AND <never-true>`
 //! — the subquery on the LEFT — must be evaluated (and may raise its error) in a
 //! FROM-less WHERE / HAVING / JOIN-ON, exactly like stock's left-to-right

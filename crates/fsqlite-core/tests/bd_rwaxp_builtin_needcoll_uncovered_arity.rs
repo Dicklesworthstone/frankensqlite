@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-rwaxp: a builtin scalar's NEEDCOLL (collation-consuming) requirement must
 //! survive when a custom scalar registration shadows only SOME arities.
 //!

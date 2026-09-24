@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #173 (bd-qfgsa): `SELECT ... INDEXED BY <idx>` where `<idx>` is a PARTIAL
 //! index must be REJECTED at prepare with "no query solution" UNLESS the query's
 //! WHERE (or a join ON clause) *syntactically* covers every conjunct of the

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #215: SQLite forbids `ALTER TABLE <fts5> RENAME COLUMN` — stock errors
 //! "cannot rename columns of virtual table". FrankenSQLite previously ACCEPTED
 //! it, silently rewriting the connection's shadow column list. This asserts the

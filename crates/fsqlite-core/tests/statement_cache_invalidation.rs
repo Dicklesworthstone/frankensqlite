@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-db300.4.2.3: Statement cache invalidation correctness verification.
 //!
 //! Proves:

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-7c6g7.6 acceptance keeper: `PRAGMA integrity_check` on a **stock UTF-16**
 //! database with an **expression index** must agree with stock sqlite3 ("ok"),
 //! with no spurious first-open migration.

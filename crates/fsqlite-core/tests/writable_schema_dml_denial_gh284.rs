@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #284 part 2 (bd-gh-pragma-writable-schema): direct DML on `sqlite_master`
 //! with `writable_schema` OFF must be rejected with the correct SQLITE_ERROR
 //! ("table sqlite_master may not be modified"), like stock SQLite — not the

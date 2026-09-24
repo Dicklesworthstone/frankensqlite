@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-a0oa9: `IN (subquery)` with a TEXT-affinity LHS must apply NUMERIC
 //! comparison affinity, so text-numeric rows ('02','2.0') match an integer
 //! subquery result — matching stock SQLite.

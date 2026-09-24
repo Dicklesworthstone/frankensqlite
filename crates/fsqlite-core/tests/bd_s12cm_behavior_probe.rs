@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Throwaway diagnostic (bd-s12cm / bd-pqauo, lane cc_5 2026-08-22): capture
 //! frank's ACTUAL behavior at HEAD for the attached cross-DB write repros and
 //! the unqualified-attached-name read, since the bead's root-cause hypothesis

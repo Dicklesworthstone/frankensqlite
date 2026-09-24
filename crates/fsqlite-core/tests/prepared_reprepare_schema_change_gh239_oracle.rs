@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-prepared-stmt-reprepare-yuq2p (GH #239): a prepared statement must
 //! transparently re-prepare after a SAME-connection schema change, matching
 //! stock SQLite (via the rusqlite oracle), instead of failing permanently with

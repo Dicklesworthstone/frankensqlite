@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-yoa57 / bd-2rsuf: `PRAGMA journal_size_limit` must be RECOGNIZED and
 //! ENFORCED, not silently ignored (which made the downstream WAL-size cap an
 //! illusion).

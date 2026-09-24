@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-wwqen.2 (B2): Regression tests for IN subquery HashSet probe and
 //! EXISTS LIMIT 1 injection.
 //!

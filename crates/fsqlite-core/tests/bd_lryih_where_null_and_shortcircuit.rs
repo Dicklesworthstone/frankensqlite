@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lryih (P10 residual) — a WHERE clause of the shape `NULL AND E`
 //! (E = an erroring uncorrelated, non-VDBE-lowerable subquery such as
 //! `(SELECT count(*) FROM json_each('bare'))`) must match stock sqlite3 3.46.1:

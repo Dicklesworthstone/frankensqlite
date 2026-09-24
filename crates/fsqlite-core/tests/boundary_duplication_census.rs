@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-db300.5.2.2.1: Boundary-duplication census for prepared DML.
 //!
 //! Instruments and attributes the common prepared-DML path to expose how many

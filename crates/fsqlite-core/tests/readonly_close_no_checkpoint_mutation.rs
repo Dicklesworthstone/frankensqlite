@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lcuoc: a connection that performed NO durable writes must not mutate the
 //! main-DB bytes at close. The close-time passive checkpoint is opportunistic WAL
 //! hygiene (a WAL-preserving close is fully correct), so a read-only consumer's

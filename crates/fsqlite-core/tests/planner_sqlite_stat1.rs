@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Integration tests for PLANNER-1: sqlite_stat1 round-trip through the
 //! planner's row-count stats load path.
 //!

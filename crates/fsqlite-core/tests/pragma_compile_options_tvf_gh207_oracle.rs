@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #207 (bd-gh-pragma-tvf-ktwap): the table-valued form of compile-options
 //! introspection was missing — `SELECT * FROM pragma_compile_options()` failed
 //! with `no such table: pragma_compile_options`, even though the statement form
