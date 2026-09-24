@@ -26,6 +26,11 @@ use crate::{FunctionRegistry, ScalarFunction};
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+fn trim_numeric_whitespace(text: &str) -> &str {
+    // sqlite3Isspace accepts these six ASCII characters, not Unicode spaces.
+    text.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}'))
+}
+
 /// Coerce a `SqliteValue` to `f64`. Returns `None` for `Null`, `Blob`, and for
 /// non-numeric text (SQLite math functions return NULL for these cases,
 /// per `sqlite3_value_numeric_type()` semantics in C SQLite).
@@ -33,13 +38,21 @@ fn to_f64(v: &SqliteValue) -> Option<f64> {
     match v {
         SqliteValue::Null => None,
         SqliteValue::Integer(i) => Some(*i as f64),
-        SqliteValue::Float(f) => Some(*f),
+        // SQLite normalizes NaN inputs to NULL before calling the function.
+        // Waiting until wrap() is too late for pow(NaN, 0) and pow(1, NaN).
+        SqliteValue::Float(f) => (!f.is_nan()).then_some(*f),
         // SQLite trims leading/trailing whitespace via sqlite3AtoF before
         // numeric conversion.  Non-numeric text produces NULL (not 0.0).
         SqliteValue::Text(s) => {
-            let trimmed = s.trim();
-            // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-            trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
+            let trimmed = trim_numeric_whitespace(s);
+            // Rust also parses "inf" and "NaN", which are not SQLite numeric
+            // literals. Require a decimal digit, then let parse validate the
+            // entire spelling. Do not reject infinity produced by overflow:
+            // e.g. sqlite3AtoF accepts "1e999" as a numeric REAL infinity.
+            if !trimmed.bytes().any(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            trimmed.parse::<f64>().ok()
         }
         SqliteValue::Blob(_) => None,
     }
@@ -235,9 +248,9 @@ pub struct AtanhFunc;
 
 impl ScalarFunction for AtanhFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        // Domain: (-1, 1) — open interval, atanh(1) and atanh(-1) are ±Inf
-        // but C sqlite returns NULL for these edge cases.
-        unary_domain(args, |x| x > -1.0 && x < 1.0, f64::atanh)
+        // Like SQLite's math1Func, preserve the infinities at +/-1 and
+        // normalize only the NaN results outside [-1, 1] to NULL.
+        unary_math(args, f64::atanh)
     }
 
     fn num_args(&self) -> i32 {
@@ -306,10 +319,7 @@ impl ScalarFunction for TanhFunc {
 fn rounding_math(value: &SqliteValue, round: fn(f64) -> f64) -> Result<SqliteValue> {
     let integer = match value {
         SqliteValue::Integer(integer) => Some(*integer),
-        SqliteValue::Text(text) => text
-            .trim_matches(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}'))
-            .parse::<i64>()
-            .ok(),
+        SqliteValue::Text(text) => trim_numeric_whitespace(text).parse::<i64>().ok(),
         _ => None,
     };
     if let Some(integer) = integer {
@@ -792,9 +802,26 @@ mod tests {
 
     #[test]
     fn test_atanh_domain_error() {
-        // atanh(1.0) is outside the open interval (-1, 1)
-        assert_null(&AtanhFunc.invoke(&[float(1.0)]).unwrap());
-        assert_null(&AtanhFunc.invoke(&[float(-1.0)]).unwrap());
+        for input in [2.0, -2.0, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_null(&AtanhFunc.invoke(&[float(input)]).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_atanh_endpoints_preserve_infinity() {
+        // SQLite oracle: SELECT atanh(1), atanh(-1) -> +Inf, -Inf.
+        for (input, numeric, expected) in [
+            (1, 1.0, f64::INFINITY),
+            (-1, -1.0, f64::NEG_INFINITY),
+        ] {
+            for value in [
+                int(input),
+                float(numeric),
+                SqliteValue::Text(input.to_string().into()),
+            ] {
+                assert_eq!(AtanhFunc.invoke(&[value]).unwrap(), float(expected));
+            }
+        }
     }
 
     #[test]
@@ -1228,6 +1255,120 @@ mod tests {
         assert_null(&PowFunc.invoke(&[float(2.0), blob.clone()]).unwrap());
         assert_null(&LogFunc.invoke(&[blob.clone()]).unwrap());
         assert_null(&ModFunc.invoke(&[float(4.0), blob]).unwrap());
+    }
+
+    #[test]
+    fn test_math_numeric_text_uses_sqlite_whitespace() {
+        for space in [' ', '\t', '\n', '\r', '\u{000b}', '\u{000c}'] {
+            let value = SqliteValue::Text(format!("{space}+4.0{space}").into());
+            assert_eq!(to_f64(&value), Some(4.0), "ASCII space {space:?}");
+            assert_eq!(SqrtFunc.invoke(&[value]).unwrap(), float(2.0));
+        }
+        for space in [
+            '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2007}', '\u{2028}', '\u{2029}',
+            '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            for input in [format!("{space}4"), format!("4{space}")] {
+                let value = SqliteValue::Text(input.into());
+                assert_eq!(to_f64(&value), None, "{value:?}");
+                assert_null(&SqrtFunc.invoke(std::slice::from_ref(&value)).unwrap());
+                assert_null(&CeilFunc.invoke(&[value]).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn test_math_numeric_text_rejects_non_sqlite_spellings() {
+        for input in [
+            "", " ", ".", "+", "-", "NaN", "-NaN", "inf", "+Inf", "infinity",
+            "-Infinity", "0x4", "4tail", "4e", "4e+", "1_0", "4\0", "4\0tail", "1 2",
+        ] {
+            let value = SqliteValue::Text(input.into());
+            assert_eq!(to_f64(&value), None, "{input:?}");
+        }
+        for (input, expected) in [
+            (".5", 0.5),
+            ("4.", 4.0),
+            ("+4e-1", 0.4),
+            ("-4E+1", -40.0),
+        ] {
+            assert_eq!(to_f64(&SqliteValue::Text(input.into())), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_math_numeric_text_accepts_overflow_and_signed_underflow() {
+        for (input, expected) in [
+            ("1e999", f64::INFINITY),
+            ("+1e+999", f64::INFINITY),
+            (".9e999", f64::INFINITY),
+            ("-1e999", f64::NEG_INFINITY),
+            ("1e-999", 0.0),
+            ("-1e-999", -0.0),
+            ("0e999", 0.0),
+            ("-0e999", -0.0),
+        ] {
+            let result = to_f64(&SqliteValue::Text(input.into())).unwrap();
+            assert_eq!(result.to_bits(), expected.to_bits(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_registry_math_numeric_text_matches_real_inputs() {
+        let mut registry = FunctionRegistry::new();
+        register_math_builtins(&mut registry);
+        let cases = [
+            ("1e999", f64::INFINITY),
+            ("-1e999", f64::NEG_INFINITY),
+            (" \t1.0\u{000b}\n", 1.0),
+        ];
+        for name in [
+            "acos", "asin", "atan", "cos", "sin", "tan", "acosh", "asinh", "atanh",
+            "cosh", "sinh", "tanh", "ceil", "ceiling", "floor", "trunc", "ln", "log",
+            "log10", "log2", "exp", "sqrt", "degrees", "radians",
+        ] {
+            let function = registry.find_scalar(name, 1).unwrap();
+            for (input, numeric) in cases {
+                let value = SqliteValue::Text(input.into());
+                assert_eq!(
+                    function.invoke(&[value]).unwrap(),
+                    function.invoke(&[float(numeric)]).unwrap(),
+                    "{name}({input:?})"
+                );
+            }
+            let nonnumeric = SqliteValue::Text("\u{00a0}1\u{00a0}".into());
+            assert_null(&function.invoke(&[nonnumeric]).unwrap());
+        }
+        for name in ["atan2", "log", "pow", "power", "mod"] {
+            let function = registry.find_scalar(name, 2).unwrap();
+            for position in 0..2 {
+                for (input, numeric) in cases {
+                    let mut text_args = [float(2.0), float(2.0)];
+                    let mut real_args = text_args.clone();
+                    text_args[position] = SqliteValue::Text(input.into());
+                    real_args[position] = float(numeric);
+                    assert_eq!(
+                        function.invoke(&text_args).unwrap(),
+                        function.invoke(&real_args).unwrap(),
+                        "{name} argument {position}: {input:?}"
+                    );
+                }
+                let mut args = [float(2.0), float(2.0)];
+                args[position] = SqliteValue::Text("1\u{00a0}".into());
+                assert_null(&function.invoke(&args).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn test_nan_input_stays_null_before_power_identities() {
+        let mut registry = FunctionRegistry::new();
+        register_math_builtins(&mut registry);
+        for name in ["pow", "power"] {
+            let function = registry.find_scalar(name, 2).unwrap();
+            assert_null(&function.invoke(&[float(f64::NAN), float(0.0)]).unwrap());
+            assert_null(&function.invoke(&[float(1.0), float(f64::NAN)]).unwrap());
+        }
     }
 
     #[test]
