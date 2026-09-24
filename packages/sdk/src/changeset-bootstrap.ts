@@ -30,6 +30,10 @@ export interface BootstrapManifest extends BootstrapManifestInput {
   /** Ordered SHA-256 chain binding the complete scope, chunk digests and totals. */
   readonly sha256: string;
 }
+/** Receiver route and table order chosen before the original seed transfer. */
+export type BootstrapSourceManifestInput = Pick<
+  BootstrapManifestInput, "receiverId" | "deliveryId" | "tables"
+>;
 export interface BootstrapOperationOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -333,6 +337,37 @@ export async function createBootstrapManifest(
     return Object.freeze({ protocol: CHANGESET_BOOTSTRAP_PROTOCOL, ...m, sha256: chain });
   } finally {
     budget.finish();
+  }
+}
+/**
+ * Build or recover the SAME receiver-specific manifest from a retained source
+ * bootstrap, never by snapshotting current application rows. Pending bodies are
+ * verified one at a time; acknowledged chunks use their retained identities.
+ * Reads one source transaction, creates no storage, changes no cursors and
+ * proves neither receiver installation nor source commit durability.
+ */
+export async function readBootstrapManifest(
+  source: ChangesetTarget,
+  input: BootstrapSourceManifestInput,
+  options?: BootstrapOperationOptions,
+): Promise<BootstrapManifest> {
+  const route = Object.freeze({
+    receiverId: text(data(input, "receiverId"), 256),
+    deliveryId: text(data(input, "deliveryId"), 480),
+    tables: tableNames(data(input, "tables")),
+  });
+  if (typeof source?.transaction !== "function") fail("INPUT", "A source transaction owner is required");
+  const b = new Budget(options);
+  try {
+    b.check();
+    const result = await source.transaction(async executor => {
+      const retained = await inspectSourceBootstrap(sourceExecutor(executor, b), b, route);
+      return retained.manifest;
+    }, b.options());
+    b.check();
+    return result;
+  } finally {
+    b.finish();
   }
 }
 async function query(
@@ -832,6 +867,63 @@ export class ChangesetBootstrapReceiver {
   }
 }
 
+/** Check cancellation at every source-storage SQL boundary without racing it. */
+function sourceExecutor(executor: ChangesetExecutor, b: Budget): ChangesetExecutor {
+  return {
+    execute: async (sql, params) => {
+      b.check();
+      const changed = await executor.execute(sql, params);
+      b.check();
+      return changed;
+    },
+    query: async (sql, params) => {
+      b.check();
+      const rows = await executor.query(sql, params);
+      b.check();
+      return rows;
+    },
+  };
+}
+
+/** Shared retained-source proof for manifest recovery and install ACK admission. */
+async function inspectSourceBootstrap(
+  tx: ChangesetExecutor,
+  b: Budget,
+  route: BootstrapSourceManifestInput,
+  expected?: BootstrapManifest,
+) {
+  if (!(await ensureOutbox(tx, false))) fail("STATE", "No retained source bootstrap");
+  const root = await findOutboxEntry(tx, route.deliveryId);
+  if (root === null || root.stream?.index !== 0 || root.stream.summary === null)
+    fail("STATE", "The original source bootstrap manifest is no longer retained");
+  const scope = JSON.parse(root.scope) as { tables: string[] };
+  if (JSON.stringify(scope.tables) !== JSON.stringify([...route.tables].sort()))
+    fail("STATE", "Bootstrap manifest has a different source table scope");
+  const before = await inspectStream(tx, root, () => b.check(), false);
+  if (expected !== undefined && (before.chunks !== expected.chunks ||
+      before.changes !== expected.changes || before.byteLength !== expected.byteLength))
+    fail("STATE", "Install acknowledgement has different retained source totals");
+  const input = captureInput({ ...route, chunks: before.chunks, changes: before.changes, byteLength: before.byteLength });
+  let chain = await seed(input);
+  for (let i = 0; i < input.chunks; i++) {
+    b.check();
+    const entry = await findOutboxEntry(tx, chunkId(input.deliveryId, i));
+    if (entry === null || entry.stream?.id !== input.deliveryId || entry.stream.index !== i ||
+        entry.stream.base !== root.stream.base)
+      fail("CORRUPT", "Source bootstrap contains missing or foreign prefix entries");
+    // Already acknowledged bodies are gone; their retained hashes still bind
+    // replay. A pending body must pass the existing size/hash/codec checks.
+    await loadOutboxPayload(tx, entry);
+    const d = entry.delivery;
+    chain = await link(chain, i, d.sha256, d.byteLength, d.changes);
+  }
+  b.check();
+  if (expected !== undefined && chain !== expected.sha256)
+    fail("CORRUPT", "Install manifest does not match the complete source prefix");
+  const manifest: BootstrapManifest = Object.freeze({ protocol: CHANGESET_BOOTSTRAP_PROTOCOL, ...input, sha256: chain });
+  return { root, before, manifest };
+}
+
 /**
  * Reclaim a single-recipient source seed after its complete, authenticated install
  * ACK. Pass the ORIGINAL outbound manifest and trusted route, not a manifest
@@ -907,48 +999,9 @@ async function acknowledgeInstall(
   try {
     b.check();
     return await source.transaction(async executor => {
-      // Storage helpers share cancellation/deadline checks at EVERY SQL boundary.
-      // Started SQL is awaited; cancellation never races an abandoned mutation.
-      const tx: ChangesetExecutor = {
-        execute: async (sql, params) => {
-          b.check();
-          const changed = await executor.execute(sql, params);
-          b.check();
-          return changed;
-        },
-        query: async (sql, params) => {
-          b.check();
-          const rows = await executor.query(sql, params);
-          b.check();
-          return rows;
-        },
-      };
+      const tx = sourceExecutor(executor, b);
       if (!fanout) await assertSingleRecipient(tx);
-      if (!(await ensureOutbox(tx, false))) fail("STATE", "No retained source bootstrap");
-      const root = await findOutboxEntry(tx, m.deliveryId);
-      if (root === null || root.stream?.index !== 0 || root.stream.summary === null)
-        fail("STATE", "The original source bootstrap manifest is no longer retained");
-      const scope = JSON.parse(root.scope) as { tables: string[] };
-      if (JSON.stringify(scope.tables) !== JSON.stringify([...m.tables].sort()))
-        fail("STATE", "Install acknowledgement has a different source table scope");
-      const before = await inspectStream(tx, root, () => b.check(), false);
-      if (before.chunks !== m.chunks || before.changes !== m.changes || before.byteLength !== m.byteLength)
-        fail("STATE", "Install acknowledgement has different retained source totals");
-      let chain = await seed(m);
-      for (let i = 0; i < m.chunks; i++) {
-        b.check();
-        const entry = await findOutboxEntry(tx, chunkId(m.deliveryId, i));
-        if (entry === null || entry.stream?.id !== m.deliveryId || entry.stream.index !== i ||
-            entry.stream.base !== root.stream.base)
-          fail("CORRUPT", "Source bootstrap contains missing or foreign prefix entries");
-        // Already acknowledged bodies are gone; their retained hashes still bind
-        // replay. A pending body must pass the existing size/hash/codec checks.
-        await loadOutboxPayload(tx, entry);
-        const d = entry.delivery;
-        chain = await link(chain, i, d.sha256, d.byteLength, d.changes);
-      }
-      b.check();
-      if (chain !== m.sha256) fail("CORRUPT", "Install manifest does not match the complete source prefix");
+      const { root, before } = await inspectSourceBootstrap(tx, b, m, m);
       if (fanout) {
         const advanced = await acknowledgeFanoutBootstrapPrefix(tx, receiverId, root, () => b.check());
         b.check();

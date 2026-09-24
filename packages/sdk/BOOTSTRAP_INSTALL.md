@@ -342,6 +342,79 @@ node --experimental-transform-types \
   --test packages/sdk/tests/changeset-fanout-bootstrap.test.mjs
 ```
 
+## Rebuilding manifests from the retained source
+
+Use `readBootstrapManifest(source, route, options?)` to build the initial
+receiver-specific manifest directly from an already captured outbox seed, or
+to reconstruct it on restart. It reads the original retained chunk identities
+and totals in one source transaction; it does **not** snapshot today's rows or
+require the application to keep a separate copy of every chunk.
+
+```ts
+import { readBootstrapManifest, acknowledgeFanoutBootstrapInstall } from '@frankensqlite/sdk';
+
+// This route and table ORDER are trusted local configuration, chosen before
+// the first transfer. The deliveryId names the retained bootstrap root.
+const route = {
+  receiverId: 'east', deliveryId: 'source:seed/1', tables: ['parents', 'children'],
+};
+const originalManifest = await readBootstrapManifest(sourceDatabase, route);
+// Transfer retained chunks, then receive the authenticated install receipt.
+await acknowledgeFanoutBootstrapInstall(sourceDatabase, originalManifest, receipt, {
+  receiverId: route.receiverId,
+  orderedSourceId: 'source:incarnation/1',
+});
+await confirmSourceCommit();
+```
+
+Use the existing `acknowledgeBootstrapInstall` for a single-recipient source.
+The distinct acknowledgement APIs keep their existing route checks; manifest
+recovery does not select between them or change fanout membership.
+
+The same route yields byte-for-byte equivalent canonical manifest JSON before
+and after partial or complete source reclamation. Pending payloads pass the
+existing size, digest and changeset checks; acknowledged payloads have already
+been cleared, so their retained metadata reconstructs the same hash chain.
+The returned manifest is frozen, including its table array. Receiver identity
+and table order are significant: another receiver or a different original
+table order intentionally produces another manifest hash.
+
+This API does not recover cleared payload bytes, establish a new database
+snapshot, prove receiver installation, select a source incarnation, checkpoint
+storage, advance replica cursors, or reclaim anything. Do not derive the route
+from an incoming ACK: that would let the ACK choose its own authority. Preserve
+the trusted route (including table order) for the lifetime of the source seed.
+If the original manifest is already available, pass that directly to the
+acknowledgement API; its shared source verification still runs.
+
+An unknown/forgotten seed, missing chunk, mismatched scope/totals, malformed
+metadata or corrupt pending payload fails without creating state. The helper
+cannot reconstruct history after `forgetBootstrapChunks`, and does not treat
+missing history as an empty seed. An empty retained seed is one real empty
+chunk with its own manifest and sequence. Later schema/row changes do not
+change the retained seed identity. This relies on trusted local metadata and
+does not authenticate a database writer who coherently rewrites the entire
+history. Reading a nested transaction remains provisional until its owner
+commits; cancellation and deadlines are checked at each SQL boundary.
+
+The recovery suite also checks replay through both existing acknowledgement
+APIs, all 27 small three-replica cursor combinations, source-row/schema changes,
+corrupt/missing retained data, configuration capture, and eight source
+SIGKILL/reopen boundaries under WAL and DELETE journals. It executes production
+bootstrap, application, ordering, fanout and storage modules on reference SQLite;
+source capture planning and transaction ownership are fixtures. Run it with the
+existing receiver handoff suite:
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/fanout-source-loader.mjs \
+  --test packages/sdk/tests/changeset-bootstrap-fanout.test.mjs \
+  packages/sdk/tests/changeset-bootstrap-order.test.mjs
+```
+
+These are not full SDK worker/HTTP/pump, FrankenSQLite Rust/WASM/MVCC, browser
+persistence, or physical power-loss qualification.
+
 ## Resource and cancellation contract
 
 Default limits are 8 MiB per chunk, 256 MiB total wire bytes, 10,000 chunks and

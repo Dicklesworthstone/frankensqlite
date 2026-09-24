@@ -44,6 +44,7 @@ export type {
   BootstrapOperationOptions,
   BootstrapProgress,
   BootstrapReceiverOptions,
+  BootstrapSourceManifestInput,
 } from "./changeset-bootstrap";
 export {
   CHANGESET_BOOTSTRAP_CHUNKS_TABLE,
@@ -54,6 +55,7 @@ export {
   acknowledgeBootstrapInstall,
   acknowledgeFanoutBootstrapInstall,
   createBootstrapManifest,
+  readBootstrapManifest,
 } from "./changeset-bootstrap";
 export type {
   CaptureChangesetOptions,
