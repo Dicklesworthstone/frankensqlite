@@ -10990,6 +10990,41 @@ fn attach_group_commit_conflict_metadata(
     batch
 }
 
+/// Tells a WAL backend, for as long as this lives, that the cross-process
+/// append gate and the backend's write guard are held (see
+/// [`WalBackend::note_append_gate_held`]). Dropping it, on every exit path
+/// including an early error return or cancellation, withdraws that.
+struct HeldAppendGate<'a> {
+    wal: &'a mut dyn WalBackend,
+}
+
+impl<'a> HeldAppendGate<'a> {
+    fn enter(wal: &'a mut dyn WalBackend) -> Self {
+        wal.note_append_gate_held(true);
+        Self { wal }
+    }
+}
+
+impl<'a> std::ops::Deref for HeldAppendGate<'a> {
+    type Target = dyn WalBackend + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.wal
+    }
+}
+
+impl std::ops::DerefMut for HeldAppendGate<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.wal
+    }
+}
+
+impl Drop for HeldAppendGate<'_> {
+    fn drop(&mut self) {
+        self.wal.note_append_gate_held(false);
+    }
+}
+
 async fn conflicting_pages_since_batch_snapshots(
     cx: &Cx,
     wal: &mut dyn WalBackend,
@@ -23704,7 +23739,10 @@ where
                             record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendWrite);
                             let mut wal_guard =
                                 async_rwlock_write(&backend, cx, "WAL backend").await?;
-                            let wal = wal_guard.as_mut();
+                            // The append gate was acquired above and is held
+                            // until after this guard drops.
+                            let mut append_gate = HeldAppendGate::enter(wal_guard.as_mut());
+                            let wal = &mut *append_gate;
                                 // A connection-local WAL backend can lag a
                                 // commit published through a peer backend.
                                 // Refresh it while the cross-process append
@@ -24109,6 +24147,7 @@ where
                                     wal.publish_authorized_deferred_commit(&durability_cx)
                                         .await?;
                                 }
+                                drop(append_gate);
                                 drop(wal_guard);
                                 recovery.complete_authorized(&durability_cx)?;
                                 #[cfg(any(test, feature = "fault-injection"))]

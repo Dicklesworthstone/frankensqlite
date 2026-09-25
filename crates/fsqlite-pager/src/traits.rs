@@ -289,6 +289,15 @@ pub trait WalBackend: Send + Sync {
         None
     }
 
+    /// The pager enters (`true`) or leaves (`false`) a section during which
+    /// this process continuously holds the cross-process append gate (WAL
+    /// write lock and main RESERVED) and this backend's write guard.
+    ///
+    /// No other writer can change the WAL inside such a section, so a backend
+    /// may prove its path and append baseline once there instead of on every
+    /// call. Leaving must discard anything proven inside.
+    fn note_append_gate_held(&mut self, _held: bool) {}
+
     /// Refresh the conflict horizon inside the already acquired append window.
     ///
     /// Native adapters prove their current shared baseline before conflicts

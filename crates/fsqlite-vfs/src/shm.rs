@@ -574,6 +574,69 @@ impl ShmRegion {
         }
     }
 
+    /// Zero every nonzero native-endian `u32` word among the `count` words
+    /// starting at `offset`, holding the local backing mutex once.
+    ///
+    /// Each word is read with a `Relaxed` fixed-width load and, only when
+    /// nonzero, stored as zero with `ordering`. Words already zero are not
+    /// written, so the caller must be the only writer of the range (as the
+    /// WAL write-lock owner is for WAL-index slots).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] before any store if the offset is
+    /// not 4-byte aligned or the range exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Nonempty mmap ranges panic for `Acquire` or `AcqRel` ordering.
+    pub fn atomic_clear_nonzero_u32_ne(
+        &self,
+        offset: usize,
+        count: usize,
+        ordering: Ordering,
+    ) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        if !offset.is_multiple_of(4) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u32 clear".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        let width = count.checked_mul(4).ok_or_else(|| FrankenError::OutOfRange {
+            what: "SHM atomic u32 clear".to_owned(),
+            value: format!("count={count}"),
+        })?;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_range(offset, width, guard.len(), "SHM atomic u32 clear")?;
+                guard[range].fill(0);
+                Ok(())
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_range(offset, width, m.len, "SHM atomic u32 clear")?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for index in 0..count {
+                    // SAFETY: The complete aligned range was checked; the
+                    // mapping and backing mutex span every access.
+                    let word = unsafe { atomic_u32_at(m, offset + index * 4) };
+                    if word.load(Ordering::Relaxed) != 0 {
+                        word.store(0, ordering);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Atomically load a native-endian `u16` at the given byte offset.
     ///
     /// Heap-backed regions emulate the atomic through the region mutex.
@@ -1318,9 +1381,37 @@ mod tests {
         );
     }
 
+    fn assert_atomic_clear_nonzero_words(region: &ShmRegion) {
+        let words = [7_u32, 0, u32::MAX, 0x1234_5678];
+        for (index, value) in words.into_iter().enumerate() {
+            region
+                .atomic_store_u32_ne(index * 4, value, Ordering::Release)
+                .unwrap();
+        }
+        // Clear words 1..=2 only: the zero stays zero, the nonzero goes.
+        region
+            .atomic_clear_nonzero_u32_ne(4, 2, Ordering::Release)
+            .unwrap();
+        let read = |index: usize| region.atomic_load_u32_ne(index * 4, Ordering::Acquire).unwrap();
+        assert_eq!([read(0), read(1), read(2), read(3)], [7, 0, 0, 0x1234_5678]);
+
+        // Unaligned or out-of-range requests store nothing.
+        for (offset, count) in [(2, 1), (region.len() - 4, 2), (0, usize::MAX)] {
+            assert!(matches!(
+                region.atomic_clear_nonzero_u32_ne(offset, count, Ordering::Release),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+        }
+        assert_eq!(read(0), 7, "a rejected clear must not store");
+        region
+            .atomic_clear_nonzero_u32_ne(region.len(), 0, Ordering::Release)
+            .unwrap();
+    }
+
     #[test]
     fn test_shm_region_atomic_copy_words_and_bounds() {
         assert_atomic_copy_words_and_bounds(&ShmRegion::new(16));
+        assert_atomic_clear_nonzero_words(&ShmRegion::new(16));
         let empty = ShmRegion::new(0);
         empty
             .atomic_copy_u32_ne(0, &mut [], Ordering::Acquire)
@@ -1440,6 +1531,7 @@ mod tests {
         let region = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
         assert!(region.is_mmap_backed());
         assert_atomic_copy_words_and_bounds(&region);
+        assert_atomic_clear_nonzero_words(&region);
         let shared = region.share();
         let cloned = region.clone();
         let end = region.len();

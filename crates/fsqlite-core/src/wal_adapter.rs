@@ -3495,6 +3495,16 @@ fn combine_sidecar_io_results<const N: usize>(
 /// performs a path probe before mutable WAL operations and swaps in a freshly
 /// opened/created `WalFile` when the path-visible sidecar no longer matches the
 /// open handle.
+/// Facts proven once inside one held append gate.
+#[derive(Debug, Clone, Copy, Default)]
+struct AppendGateProof {
+    /// The WAL (and database) pathnames still name the attached files.
+    path: bool,
+    /// The append baseline was refreshed since the gate was entered and no
+    /// append has happened since.
+    baseline: bool,
+}
+
 pub struct PathRefreshingWalBackend<V: Vfs>
 where
     V::File: Send + Sync + 'static,
@@ -3550,6 +3560,12 @@ where
     /// each read statement (which made a read O(frames in the last commit)).
     authorized_certificate_record:
         std::sync::Mutex<Option<ParallelWalDurableCertificateRecord>>,
+    /// What this backend already proved inside the pager's current held
+    /// append gate (see [`WalBackend::note_append_gate_held`]); `None` outside
+    /// one. A commit validated the WAL path and refreshed its append baseline
+    /// on every backend call — about seven times under one gate, where no
+    /// other writer can change either.
+    append_gate_proof: Option<AppendGateProof>,
     /// Creation-stable identity of the main database file (page-1 header bytes
     /// 76..92), captured once from the already-held verification descriptor the
     /// first time a WAL operation runs against this adapter (bd-85x9y / GH#364).
@@ -3607,6 +3623,7 @@ where
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
             authorized_certificate_record: std::sync::Mutex::new(None),
+            append_gate_proof: None,
             db_file_identity: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             pending_fec_reclamation: Vec::new(),
@@ -4161,6 +4178,30 @@ where
     /// continue on the pinned snapshot; an append refuses with `BusySnapshot`,
     /// and the retry's fresh read admission recreates the companion.
     async fn validate_current_native_wal_path(&mut self, cx: &Cx, for_append: bool) -> Result<()> {
+        if self.append_gate_proof.is_some_and(|proof| proof.path) {
+            return Ok(());
+        }
+        self.validate_current_native_wal_path_uncached(cx, for_append).await?;
+        // Only an append validation proves the companion exists; a read
+        // validation also accepts a missing one.
+        if for_append && let Some(proof) = &mut self.append_gate_proof {
+            proof.path = true;
+        }
+        Ok(())
+    }
+
+    /// An append moves the WAL tail, so the next preflight re-derives it.
+    fn forget_append_gate_baseline(&mut self) {
+        if let Some(proof) = &mut self.append_gate_proof {
+            proof.baseline = false;
+        }
+    }
+
+    async fn validate_current_native_wal_path_uncached(
+        &mut self,
+        cx: &Cx,
+        for_append: bool,
+    ) -> Result<()> {
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
         self.ensure_db_file_identity_captured(cx).await;
@@ -5571,9 +5612,20 @@ where
             if self.inner.has_pending_publication() || self.inner.native_recovery_requested.is_some() {
                 return Err(FrankenError::BusyRecovery);
             }
+            if self.append_gate_proof.is_some_and(|proof| proof.baseline) {
+                return Ok(());
+            }
             self.validate_current_native_wal_path(cx, true).await?;
-            self.inner.preflight_native_append(cx).await
+            self.inner.preflight_native_append(cx).await?;
+            if let Some(proof) = &mut self.append_gate_proof {
+                proof.baseline = true;
+            }
+            Ok(())
         })
+    }
+
+    fn note_append_gate_held(&mut self, held: bool) {
+        self.append_gate_proof = held.then(AppendGateProof::default);
     }
 
     fn native_reader_required(&self) -> bool {
@@ -5757,6 +5809,7 @@ where
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path_for_append(cx).await?;
+            self.forget_append_gate_baseline();
             self.inner
                 .append_frame(cx, page_number, page_data, db_size_if_commit)
                 .await
@@ -5771,6 +5824,7 @@ where
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path_for_append(cx).await?;
+            self.forget_append_gate_baseline();
             self.inner.append_frames(cx, frames).await
         })
     }
@@ -5785,6 +5839,7 @@ where
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path_for_append(cx).await?;
+            self.forget_append_gate_baseline();
             preflight.hand_off();
             drop(preflight);
             self.inner
@@ -5816,6 +5871,7 @@ where
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path_for_append(cx).await?;
+            self.forget_append_gate_baseline();
             self.inner.append_prepared_frames(cx, prepared).await
         })
     }
@@ -5830,6 +5886,7 @@ where
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
             self.ensure_current_wal_path_for_append(cx).await?;
+            self.forget_append_gate_baseline();
             preflight.hand_off();
             drop(preflight);
             self.inner

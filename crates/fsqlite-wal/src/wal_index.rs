@@ -851,9 +851,13 @@ pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u
             segment.atomic_store_u16_ne(hash_offset, 0, Ordering::Release)?;
         }
     }
-    for entry in retained..capacity {
-        segment.atomic_store_u32_ne(offset + entry * 4, 0, Ordering::Release)?;
-    }
+    // One pass under one lock, writing only leftover entries: a clean tail
+    // (the common case) no longer costs a locked store per capacity slot.
+    segment.atomic_clear_nonzero_u32_ne(
+        offset + retained * 4,
+        capacity - retained,
+        Ordering::Release,
+    )?;
     Ok(())
 }
 

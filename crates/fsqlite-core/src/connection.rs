@@ -59912,7 +59912,24 @@ impl Connection {
             commit_handle_finalize_start,
         );
         if committed_write && !self.pager.is_memory() {
-            self.sync_filebacked_post_commit_visibility_floor();
+            let committed_seq = self.sync_filebacked_post_commit_visibility_floor();
+            // When no other commit landed between this transaction's snapshot
+            // and its own, the mirror's schema and header metadata are what
+            // this connection just wrote; only the sequence lags (concurrent
+            // mode leaves it behind). Advance it so the next statement does
+            // not begin a read transaction to re-derive unchanged metadata.
+            // Mirrored rows, AUTOINCREMENT counters and live virtual tables
+            // are refreshed by that reload, so their presence keeps it.
+            let mirror_seq = *self.memdb_visible_commit_seq.borrow();
+            if !schema_change_boundary
+                && !self.memdb_rows_loaded.get()
+                && self.autoincrement_tables.borrow().is_empty()
+                && self.vtab_instances.borrow().is_empty()
+                && txn_begin_visible_commit_seq
+                    .is_some_and(|begin| begin == mirror_seq && begin.next() == committed_seq)
+            {
+                *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
+            }
             // bd-nsktt (Track H): attribute this file-backed autocommit write commit
             // when it ran in FORCED single-writer mode (the benchmark comparison
             // workload), and whether the pager was shared by peer connections
