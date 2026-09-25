@@ -808,34 +808,37 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
     i
 }
 
-/// Parse the longest numeric prefix of `b` as an integer.
-#[allow(clippy::cast_possible_truncation)]
+/// Parse the longest signed decimal integer prefix, saturating at `i64` bounds.
+///
+/// INTEGER conversion stops before a decimal point or exponent. Accumulating
+/// directly in integers also preserves digits beyond `f64`'s exact range.
 fn parse_integer_prefix_bytes(b: &[u8]) -> i64 {
     let mut start = 0;
-    while start < b.len() && b[start].is_ascii_whitespace() {
+    while start < b.len() && matches!(b[start], b' ' | b'\t'..=b'\r') {
         start += 1;
     }
-    let trimmed = &b[start..];
-    let end = scan_numeric_prefix(trimmed);
-    if end == 0 {
-        return 0;
+    let negative = b.get(start) == Some(&b'-');
+    if matches!(b.get(start), Some(b'+' | b'-')) {
+        start += 1;
     }
-    // SAFETY: scan_numeric_prefix only advances over ASCII bytes (digits, +, -, ., e, E),
-    // so the slice is always valid UTF-8.
-    let s = std::str::from_utf8(&trimmed[..end]).unwrap_or("");
-    let f = s.parse::<f64>().unwrap_or(0.0);
-    #[allow(clippy::manual_clamp)]
-    if f >= i64::MAX as f64 {
-        i64::MAX
-    } else if f <= i64::MIN as f64 {
-        i64::MIN
+
+    // Accumulate negatively so i64::MIN is representable without an unsigned
+    // cast or a special-case final digit. Overflow remains saturated.
+    let mut value = 0_i64;
+    for &byte in &b[start..] {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value.saturating_mul(10).saturating_sub(i64::from(byte - b'0'));
+    }
+    if negative {
+        value
     } else {
-        f as i64
+        value.saturating_neg()
     }
 }
 
-/// Parse the longest numeric prefix of `s` as an integer.
-#[allow(clippy::cast_possible_truncation)]
+/// Parse the longest signed decimal integer prefix of `s`.
 fn parse_integer_prefix(s: &str) -> i64 {
     parse_integer_prefix_bytes(s.as_bytes())
 }
@@ -843,7 +846,7 @@ fn parse_integer_prefix(s: &str) -> i64 {
 /// Parse the longest numeric prefix of `b` as a float.
 fn parse_float_prefix_bytes(b: &[u8]) -> f64 {
     let mut start = 0;
-    while start < b.len() && b[start].is_ascii_whitespace() {
+    while start < b.len() && matches!(b[start], b' ' | b'\t'..=b'\r') {
         start += 1;
     }
     let trimmed = &b[start..];
@@ -863,7 +866,24 @@ fn parse_float_prefix(s: &str) -> f64 {
 }
 
 fn trim_sqlite_ascii_whitespace(s: &str) -> &str {
-    s.trim_matches(|ch: char| ch.is_ascii_whitespace())
+    // SQLite accepts vertical tab too; Rust's ASCII whitespace predicate does not.
+    s.trim_matches(|ch: char| matches!(ch, ' ' | '\t'..='\r'))
+}
+
+/// SQLite integer affinity excludes both endpoint integers when starting
+/// from REAL (`sqlite3VdbeIntegerAffinity`, ticket #3922). In particular, casting
+/// `i64::MAX` to `f64` rounds up, so a round-trip check alone is insufficient.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::float_cmp
+)]
+fn float_to_affinity_integer(value: f64) -> Option<i64> {
+    if value <= -9_223_372_036_854_775_808.0 || value >= 9_223_372_036_854_775_808.0 {
+        return None;
+    }
+    let integer = value as i64;
+    (integer as f64 == value).then_some(integer)
 }
 
 fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
@@ -884,8 +904,11 @@ fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
     }
 
     if let Ok(value) = prefix.parse::<f64>() {
+        // CAST AS NUMERIC uses SQLite's conservative signed 51-bit
+        // round-trip range for REAL syntax, not the wider affinity range.
+        // Integer syntax above still retains the complete signed i64 range.
         if value.is_finite()
-            && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+            && (-2_251_799_813_685_248.0..2_251_799_813_685_248.0).contains(&value)
         {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             let truncated = value as i64;
@@ -975,15 +998,7 @@ impl SqliteValue {
             },
             TypeAffinity::Numeric | TypeAffinity::Integer => match &self {
                 Self::Text(s) => try_coerce_text_to_numeric(s.as_str()).unwrap_or(self),
-                Self::Float(f) => {
-                    if *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0 {
-                        let i = *f as i64;
-                        if (i as f64) == *f {
-                            return Self::Integer(i);
-                        }
-                    }
-                    self
-                }
+                Self::Float(f) => float_to_affinity_integer(*f).map_or(self, Self::Integer),
                 _ => self,
             },
             TypeAffinity::Real => match &self {
@@ -1018,19 +1033,12 @@ impl SqliteValue {
                 // INTEGER in a STRICT INTEGER column (3.0 -> 3); a fractional or
                 // out-of-range REAL stays a type error. The round-trip through
                 // i64 is the lossless test SQLite applies.
-                Self::Float(fl) => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let as_int = fl as i64;
-                    #[allow(clippy::float_cmp)]
-                    if as_int as f64 == fl {
-                        Ok(Self::Integer(as_int))
-                    } else {
-                        Err(StrictTypeError {
-                            expected: col_type,
-                            actual: StorageClass::Real,
-                        })
-                    }
-                }
+                Self::Float(fl) => float_to_affinity_integer(fl)
+                    .map(Self::Integer)
+                    .ok_or(StrictTypeError {
+                        expected: col_type,
+                        actual: StorageClass::Real,
+                    }),
                 // GH #163: STRICT accepts a TEXT value that losslessly converts
                 // to the column's declared type (stock sqlite3 STRICT). For an
                 // INTEGER column only text parsing to an integer qualifies —
@@ -1313,12 +1321,9 @@ impl SqliteValue {
     #[inline]
     pub fn is_integer_numeric_type(&self) -> bool {
         fn text_is_integer_numeric_type(s: &str) -> bool {
-            let trimmed = s.trim_start();
+            let trimmed = trim_sqlite_ascii_whitespace(s);
             let end = scan_numeric_prefix(trimmed.as_bytes());
-            end > 0
-                && !trimmed.as_bytes()[..end]
-                    .iter()
-                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+            end > 0 && trimmed[..end].parse::<i64>().is_ok()
         }
 
         match self {
@@ -1329,19 +1334,16 @@ impl SqliteValue {
         }
     }
 
-    /// Returns true if this value should be treated as a float for arithmetic.
-    /// A value is "float numeric type" only if it has a numeric prefix
-    /// containing '.', 'e', or 'E'. Non-numeric text/blob is NOT float
-    /// (it coerces to integer 0 in C SQLite's OP_Add/Sub/Mul).
+    /// Returns true for REAL syntax or a numeric prefix outside the `i64` range.
+    /// Non-numeric text/blob is NOT float: it coerces to integer 0 in
+    /// SQLite's OP_Add/Sub/Mul. Arithmetic must promote overflowing integer
+    /// text to REAL instead of using the saturating INTEGER conversion.
     #[inline]
     fn is_float_numeric_type(&self) -> bool {
         fn text_is_float(s: &str) -> bool {
-            let trimmed = s.trim_start();
+            let trimmed = trim_sqlite_ascii_whitespace(s);
             let end = scan_numeric_prefix(trimmed.as_bytes());
-            end > 0
-                && trimmed.as_bytes()[..end]
-                    .iter()
-                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+            end > 0 && trimmed[..end].parse::<i64>().is_err()
         }
         match self {
             Self::Float(_) => true,
@@ -1984,6 +1986,50 @@ impl PartialOrd for SqliteValue {
     }
 }
 
+/// Stock SQLite's BINARY order for canonical TEXT of an `encoding` database.
+///
+/// Stock memcmps the *stored* bytes. UTF-8 is a plain byte compare. UTF-16
+/// orders by the code units' stored bytes, which diverges from UTF-8 order for
+/// non-ASCII text (UTF-16LE puts `Ā` U+0100 = `00 01` before `é` U+00E9 =
+/// `E9 00`; UTF-16BE puts U+E000..U+FFFF after supplementary characters).
+/// Bytes that are not valid UTF-8 (byte-preserved raw TEXT) compare as stored.
+///
+/// Only for canonical values: a record decoded with the byte-preserving UTF-8
+/// decoder already holds the stored UTF-16 bytes and must compare them as-is.
+#[must_use]
+pub fn binary_text_cmp(left: &[u8], right: &[u8], encoding: TextEncoding) -> Ordering {
+    let little_endian = match encoding {
+        TextEncoding::Utf8 => return left.cmp(right),
+        TextEncoding::Utf16le => true,
+        TextEncoding::Utf16be => false,
+    };
+    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
+        (Ok(left), Ok(right)) => {
+            // memcmp over little-endian unit bytes `[lo, hi]` is numeric order
+            // of the byte-swapped unit.
+            let stored = |unit: u16| if little_endian { unit.swap_bytes() } else { unit };
+            left.encode_utf16()
+                .map(stored)
+                .cmp(right.encode_utf16().map(stored))
+        }
+        _ => left.cmp(right),
+    }
+}
+
+impl SqliteValue {
+    /// [`Ord::cmp`] with TEXT under BINARY collation in the database
+    /// `encoding` (see [`binary_text_cmp`]); identical to `cmp` for UTF-8.
+    #[must_use]
+    pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) if !matches!(encoding, TextEncoding::Utf8) => {
+                binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), encoding)
+            }
+            _ => self.cmp(other),
+        }
+    }
+}
+
 impl Ord for SqliteValue {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -2102,15 +2148,8 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
                 return None;
             }
         }
-        // If the float is an exact integer value within bounds, store as integer.
-        // Checking bounds prevents incorrect saturation for values >= 2^63.
-        if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
-            #[allow(clippy::cast_possible_truncation)]
-            let i = f as i64;
-            #[allow(clippy::cast_precision_loss)]
-            if (i as f64) == f {
-                return Some(SqliteValue::Integer(i));
-            }
+        if let Some(integer) = float_to_affinity_integer(f) {
+            return Some(SqliteValue::Integer(integer));
         }
         return Some(SqliteValue::Float(f));
     }
@@ -2861,6 +2900,43 @@ mod tests {
                         da.cmp(&SmallText::new(a)),
                         std::cmp::Ordering::Equal,
                         "bd-bld9w.4 {enc:?}: decoded {a:?} must equal its UTF-8 form"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_text_cmp_is_memcmp_of_the_stored_encoding() {
+        // Stock BINARY on a UTF-16 database memcmps the stored UTF-16 bytes;
+        // `binary_text_cmp` must reproduce that from the canonical UTF-8 form
+        // without transcoding, for every pair and both byte orders.
+        let samples = [
+            "", "A", "a", "é", "Ā", "ÿ", "Đ", "名", "東", "杲", "\u{e000}", "\u{ffff}",
+            "😀", "😀grin", "én12", "Ān15", "a\0", "ab",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    binary_text_cmp(a.as_bytes(), b.as_bytes(), TextEncoding::Utf8),
+                    a.as_bytes().cmp(b.as_bytes()),
+                    "UTF-8 is a plain memcmp: {a:?} vs {b:?}"
+                );
+                for (enc, le) in [
+                    (TextEncoding::Utf16le, true),
+                    (TextEncoding::Utf16be, false),
+                ] {
+                    let stored = utf16_record_bytes(a, le).cmp(&utf16_record_bytes(b, le));
+                    assert_eq!(
+                        binary_text_cmp(a.as_bytes(), b.as_bytes(), enc),
+                        stored,
+                        "{enc:?}: {a:?} vs {b:?} must order as the stored bytes"
+                    );
+                    assert_eq!(
+                        SqliteValue::Text(SmallText::new(a))
+                            .cmp_binary_in(&SqliteValue::Text(SmallText::new(b)), enc),
+                        stored,
+                        "{enc:?}: cmp_binary_in {a:?} vs {b:?}"
                     );
                 }
             }
@@ -4551,5 +4627,209 @@ mod tests {
         assert_eq!(scan_numeric_prefix(b"abc"), 0);
         assert_eq!(scan_numeric_prefix(b"+"), 0);
         assert_eq!(scan_numeric_prefix(b"-"), 0);
+    }
+
+    #[test]
+    fn integer_conversion_preserves_digits_and_ignores_real_suffixes() {
+        let cases = [
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("9223372036854775806", i64::MAX - 1),
+            ("-9223372036854775807", i64::MIN + 1),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+            ("9223372036854775808", i64::MAX),
+            ("-9223372036854775809", i64::MIN),
+            ("123e+5", 123),
+            ("123e-5", 123),
+            ("-123.9e+5", -123),
+            (".9e2", 0),
+            ("+", 0),
+            ("-", 0),
+            ("", 0),
+            (" \t\n\x0b\x0c\r+42tail", 42),
+            ("\u{00a0}42", 0),
+            ("12\0 34", 12),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(SqliteValue::from(input).to_integer(), expected, "{input:?}");
+            assert_eq!(
+                SqliteValue::Blob(Arc::from(input.as_bytes())).to_integer(),
+                expected,
+                "blob {input:?}",
+            );
+        }
+        let raw = b"9007199254740993\xff";
+        assert_eq!(parse_integer_prefix_bytes(raw), 9_007_199_254_740_993);
+        assert_eq!(
+            SqliteValue::Text(SmallText::from_bytes(raw)).to_integer(),
+            9_007_199_254_740_993,
+        );
+        for (sign, expected) in [("", i64::MAX), ("-", i64::MIN)] {
+            let input = format!("{sign}{}", "9".repeat(4096));
+            assert_eq!(SqliteValue::from(input).to_integer(), expected);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn integer_conversion_roundtrips_all_i64_values(
+            value in proptest::prelude::any::<i64>(),
+        ) {
+            let text = value.to_string();
+            proptest::prop_assert_eq!(parse_integer_prefix(&text), value);
+            proptest::prop_assert_eq!(
+                SqliteValue::Blob(Arc::from(text.as_bytes())).to_integer(),
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn real_integer_affinity_and_strict_reject_endpoint_rounding() {
+        for value in [
+            -9_223_372_036_854_775_808.0,
+            9_223_372_036_854_775_808.0,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            3.5,
+        ] {
+            for affinity in [TypeAffinity::Integer, TypeAffinity::Numeric] {
+                let coerced = SqliteValue::Float(value).apply_affinity(affinity);
+                assert_eq!(coerced.as_float(), Some(value), "{affinity:?}: {value}");
+                assert!(coerced.validate_strict(StrictColumnType::Integer).is_err());
+            }
+            let error = SqliteValue::Float(value)
+                .validate_strict(StrictColumnType::Integer)
+                .expect_err("REAL must not saturate into a STRICT INTEGER");
+            assert_eq!(error.actual, StorageClass::Real);
+        }
+        assert!(
+            SqliteValue::Float(f64::NAN)
+                .validate_strict(StrictColumnType::Integer)
+                .is_err()
+        );
+        for (value, expected) in [
+            (-9_223_372_036_854_774_784.0, -9_223_372_036_854_774_784_i64),
+            (9_223_372_036_854_774_784.0, 9_223_372_036_854_774_784_i64),
+            (3.0, 3),
+            (-0.0, 0),
+        ] {
+            assert_eq!(
+                SqliteValue::Float(value)
+                    .validate_strict(StrictColumnType::Integer)
+                    .unwrap()
+                    .as_integer(),
+                Some(expected),
+            );
+        }
+        for value in [i64::MIN, i64::MAX] {
+            for input in [
+                SqliteValue::Integer(value),
+                SqliteValue::from(value.to_string()),
+            ] {
+                assert_eq!(
+                    input
+                        .validate_strict(StrictColumnType::Integer)
+                        .unwrap()
+                        .as_integer(),
+                    Some(value),
+                );
+            }
+        }
+        for text in ["-9223372036854775808.0", "9223372036854775807.0"] {
+            let value = SqliteValue::from(text).apply_affinity(TypeAffinity::Integer);
+            assert!(value.as_float().is_some());
+            assert!(value.validate_strict(StrictColumnType::Integer).is_err());
+        }
+    }
+
+    #[test]
+    fn numeric_cast_keeps_real_syntax_outside_the_signed_51_bit_range() {
+        for (text, expected_type) in [
+            ("2251799813685247.0", "integer"),
+            ("2251799813685248.0", "real"),
+            ("-2251799813685248.0", "integer"),
+            ("-2251799813685249.0", "real"),
+            ("9007199254740992.0", "real"),
+            ("2251799813685248", "integer"),
+            ("9223372036854775807", "integer"),
+            ("-9223372036854775808", "integer"),
+        ] {
+            for value in [
+                SqliteValue::from(text),
+                SqliteValue::Blob(Arc::from(text.as_bytes())),
+            ] {
+                assert_eq!(value.cast_to_numeric().typeof_str(), expected_type, "{text}");
+            }
+        }
+        // Affinity and CAST deliberately differ here.
+        assert_eq!(
+            SqliteValue::from("2251799813685248.0")
+                .apply_affinity(TypeAffinity::Numeric)
+                .as_integer(),
+            Some(2_251_799_813_685_248),
+        );
+    }
+
+    #[test]
+    fn arithmetic_promotes_out_of_range_integer_prefixes_to_real() {
+        for (text, expected) in [
+            ("9223372036854775808", 9_223_372_036_854_775_808.0),
+            ("-9223372036854775809", -9_223_372_036_854_775_808.0),
+            ("9223372036854775808tail", 9_223_372_036_854_775_808.0),
+        ] {
+            for value in [
+                SqliteValue::from(text),
+                SqliteValue::Blob(Arc::from(text.as_bytes())),
+            ] {
+                assert!(!value.is_integer_numeric_type(), "{text}");
+                assert_eq!(
+                    value.sql_add(&SqliteValue::Integer(0)).as_float(),
+                    Some(expected),
+                );
+                assert_eq!(
+                    value.sql_sub(&SqliteValue::Integer(0)).as_float(),
+                    Some(expected),
+                );
+                assert_eq!(
+                    value.sql_mul(&SqliteValue::Integer(1)).as_float(),
+                    Some(expected),
+                );
+            }
+        }
+        assert_eq!(
+            SqliteValue::from("9007199254740993")
+                .sql_add(&SqliteValue::Integer(0))
+                .as_integer(),
+            Some(9_007_199_254_740_993),
+        );
+        assert_eq!(
+            SqliteValue::from("123e-5")
+                .sql_add(&SqliteValue::Integer(0))
+                .as_float(),
+            Some(0.00123),
+        );
+    }
+
+    #[test]
+    fn numeric_whitespace_matches_sqlite_not_unicode_whitespace() {
+        let vertical_tab = SqliteValue::from("\x0b42\x0b");
+        assert_eq!(vertical_tab.to_integer(), 42);
+        assert_eq!(vertical_tab.to_float(), 42.0);
+        assert_eq!(vertical_tab.to_sum_numeric_value().as_integer(), Some(42));
+        assert_eq!(
+            vertical_tab
+                .clone()
+                .apply_affinity(TypeAffinity::Numeric)
+                .as_integer(),
+            Some(42),
+        );
+        assert!(vertical_tab.is_integer_numeric_type());
+        for prefix in ["\u{00a0}", "\u{2003}"] {
+            let value = SqliteValue::from(format!("{prefix}1.5"));
+            assert!(!value.is_integer_numeric_type());
+            assert_eq!(value.sql_add(&SqliteValue::Integer(0)).as_integer(), Some(0));
+            assert_eq!(value.to_float(), 0.0);
+        }
     }
 }

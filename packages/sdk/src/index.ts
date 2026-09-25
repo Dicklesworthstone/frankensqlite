@@ -37,12 +37,14 @@ export {
   ChangesetApplyError,
 } from "./changeset-apply";
 export type {
+  BootstrapAcknowledgeOptions,
   BootstrapInstallReceipt,
   BootstrapManifest,
   BootstrapManifestInput,
   BootstrapOperationOptions,
   BootstrapProgress,
   BootstrapReceiverOptions,
+  BootstrapSourceManifestInput,
 } from "./changeset-bootstrap";
 export {
   CHANGESET_BOOTSTRAP_CHUNKS_TABLE,
@@ -50,7 +52,10 @@ export {
   CHANGESET_BOOTSTRAP_STATE_TABLE,
   ChangesetBootstrapError,
   ChangesetBootstrapReceiver,
+  acknowledgeBootstrapInstall,
+  acknowledgeFanoutBootstrapInstall,
   createBootstrapManifest,
+  readBootstrapManifest,
 } from "./changeset-bootstrap";
 export type {
   CaptureChangesetOptions,

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! frankensqlite#81 — strict multi-process refusal mode.
 //!
 //! These tests cover the infrastructure for the strict-multi-process

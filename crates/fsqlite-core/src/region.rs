@@ -457,31 +457,33 @@ impl RegionTree {
         Ok(())
     }
 
-    /// Close a region and spin-wait until quiescent, then finalize.
+    /// One non-blocking step of the drain half of the close protocol: finalize,
+    /// bottom-up, every region in `id`'s subtree that has become quiescent.
+    /// Returns `true` once `id` itself is [`RegionState::Closed`].
     ///
-    /// This is the full close protocol: cancel → drain → finalize.
-    /// Blocks the caller until INV-REGION-QUIESCENCE is satisfied.
-    /// Children are drained bottom-up before the parent.
-    pub fn close_and_drain(&mut self, id: Region) -> Result<()> {
-        self.begin_close(id)?;
-        self.drain_subtree(id)
-    }
-
-    /// Recursively drain a subtree bottom-up: wait for each region's tasks
-    /// and obligations to complete, then run finalizers and mark closed.
-    fn drain_subtree(&mut self, id: Region) -> Result<()> {
+    /// Call [`begin_close`](Self::begin_close) first, then drive this until it
+    /// returns `true`, yielding between attempts so the tasks being waited for
+    /// can run. The drain deliberately never blocks: a synchronous spin here,
+    /// on the one thread able to poll the task it waited for, livelocked every
+    /// close on a current-thread runtime (bd-viyz2, bd-1eqrr).
+    pub fn try_finish_close(&mut self, id: Region) -> Result<bool> {
         let children = self
             .nodes
             .get(&id)
             .map(|n| n.children.clone())
             .unwrap_or_default();
+        let mut children_closed = true;
         for child in children {
-            self.drain_subtree(child)?;
+            children_closed &= self.try_finish_close(child)?;
         }
-        while self.active_tasks(id) > 0 || self.active_obligations(id) > 0 {
-            std::hint::spin_loop();
+        if self.state(id) == Some(RegionState::Closed) {
+            return Ok(true);
         }
-        self.complete_close(id)
+        if !children_closed || self.active_tasks(id) > 0 || self.active_obligations(id) > 0 {
+            return Ok(false);
+        }
+        self.complete_close(id)?;
+        Ok(true)
     }
 
     fn alloc_id(&mut self) -> Region {
@@ -1010,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_close_and_drain_threaded() {
+    fn test_try_finish_close_threaded() {
         use std::sync::Mutex;
         use std::thread;
         use std::time::Duration;
@@ -1051,11 +1053,26 @@ mod tests {
             drop(task2);
         });
 
-        // close_and_drain blocks until all tasks complete.
+        // Each drain step returns immediately; it reports "not yet" while a
+        // task is still held and finalizes once both have dropped.
+        tree.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_close(root)
+            .expect("begin_close");
+        let mut pending_steps = 0_u32;
+        while !tree
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_finish_close(root)
+            .expect("try_finish_close")
         {
-            let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
-            t.close_and_drain(root).expect("close_and_drain");
+            pending_steps += 1;
+            thread::yield_now();
         }
+        assert!(
+            pending_steps > 0,
+            "bead_id={BEAD_ID} case=drain_step_does_not_block_on_held_tasks"
+        );
         flag.store(true, Ordering::Release);
 
         t1.join().expect("t1 join");

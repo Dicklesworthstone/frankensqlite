@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-wwqen.4: Proof tests for SimpleIndexedEqualityLookup query_row fast path.
 //!
 //! Tests use `query_row_with_params` (prepared statement) where the fast path

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pgqsk L5 + M7: `PRAGMA encoding` setter fidelity and cross-encoding
 //! ATTACH of an empty file.
 //!

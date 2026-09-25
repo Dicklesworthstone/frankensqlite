@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-yaomh.6 — format-version rollback-safety handshake.
 //!
 //! A future release may change the on-disk `.fsqlite` format (e.g. add a

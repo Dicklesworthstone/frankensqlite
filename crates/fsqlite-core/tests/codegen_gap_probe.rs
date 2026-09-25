@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential probe: classify `CodegenError::Unsupported` sites in
 //! fsqlite-vdbe/src/codegen.rs as GENUINE feature gaps vs. legit errors vs.
 //! constructs that fall back to the interpreter and work.

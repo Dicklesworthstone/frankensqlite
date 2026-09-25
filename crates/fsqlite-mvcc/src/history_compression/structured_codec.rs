@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_history_encoder_refuses_lossy_intent_digest_payloads() {
+    fn checked_history_encoder_roundtrips_nonempty_intents() {
         let original = history(CompressedVersionData::IntentLogPatch(vec![IntentOp {
             schema_epoch: 1,
             footprint: IntentFootprint::empty(),
@@ -352,7 +352,8 @@ mod tests {
                 key: RowId::new(1),
             },
         }]));
-        assert!(original.try_to_bytes().is_err());
+        let bytes = original.try_to_bytes().unwrap();
+        assert_eq!(CompressedPageHistory::from_bytes(&bytes).unwrap(), original);
         let empty = history(CompressedVersionData::IntentLogPatch(Vec::new()));
         assert_eq!(
             CompressedPageHistory::from_bytes(&empty.try_to_bytes().unwrap()).unwrap(),

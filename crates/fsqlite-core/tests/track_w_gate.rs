@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-aaiwu: W-TEST — Truth-matrix, mixed-OLTP, and regression gate for Track W.
 //!
 //! Covers:

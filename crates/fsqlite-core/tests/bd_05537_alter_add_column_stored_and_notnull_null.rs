@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-alter-add-column-stored-empty-and-notnull-defaul-05537: two behavioral
 //! ALTER TABLE ADD COLUMN divergences, both row-gated exactly like stock
 //! sqlite3 3.46.1:

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2 (a)): a bare aggregate in ORDER BY of a
 // non-aggregate SELECT reports stock's "misuse of aggregate: <name>()" naming
 // the rightmost bare aggregate, not the old nameless stub "misuse of aggregate: ".

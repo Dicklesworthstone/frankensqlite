@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — ALTER TABLE variants (cc_3)
 //!
 //! Schema mutation is one of the trickiest paths in any SQLite implementation:

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-c36qv — does an explicit `ROLLBACK` (and `ROLLBACK TO SAVEPOINT`) undo
 //! mutations to a **TEMP** table?
 //!

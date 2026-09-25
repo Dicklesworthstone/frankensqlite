@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 83 (cc4 multi-table JOIN permutations + aggregate edge cases)
 //!
 //! Probes for PLANNER-3 join-order reshaping correctness (commit eecba647):

@@ -51,6 +51,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_orders_product_id".to_owned(),
@@ -61,6 +62,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
         IndexInfo {
             name: "idx_users_email".to_owned(),
@@ -71,6 +73,7 @@ fn oltp_indexes() -> Vec<IndexInfo> {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         },
     ]
 }
@@ -394,6 +397,7 @@ fn access_path_selection_logged_in_contract() {
         source: StatsSource::Analyze,
         partial_where: None,
         expression_columns: vec![],
+        rows_per_key: Vec::new(),
     }];
 
     // Without WHERE → full table scan.

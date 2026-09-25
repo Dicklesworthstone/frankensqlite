@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 79 (cc4 COLLATE + aggregate probes)
 //!
 //! Targeted probes after fixing COLLATE NOCASE MIN/MAX (bd-ox2mg):

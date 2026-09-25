@@ -8,6 +8,10 @@
 //! write-encode sweep produces byte-correct UTF-16 images, not just self-consistent
 //! ones.
 
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
@@ -506,6 +510,261 @@ fn bd_bld9w_utf16_write_oracle_fsqlite_writes_rusqlite_validates() {
                 assert_eq!(&got_name, name, "{encoding}: stock name {id}");
                 assert_eq!(&got_city, city, "{encoding}: stock city {id}");
             }
+        }
+    });
+}
+
+/// System-table maintenance on a UTF-16 database: DROP, ALTER (add column,
+/// rename), AUTOINCREMENT's `sqlite_sequence` upkeep and ANALYZE's
+/// `sqlite_stat1` rewrite all find existing rows by their TEXT name. The
+/// helpers already encoded new rows in the DB encoding (bd-bld9w.7) but decoded
+/// the rows they searched with the UTF-8-hardcoded `parse_record`, so on
+/// UTF-16 nothing ever matched: DROP and ALTER failed with "sqlite_master entry
+/// not found" (after ALTER ADD COLUMN had already widened the in-memory schema),
+/// every AUTOINCREMENT insert appended another `sqlite_sequence` row for the
+/// same table, and ANALYZE duplicated its stat rows. Stock SQLite is the oracle.
+/// A collated UNIQUE probe compares characters, not UTF-16 code-unit bytes:
+/// RTRIM must ignore a trailing `20 00`, and NOCASE must not fold one byte of a
+/// non-ASCII unit (`Ł` = `41 01` and `š` = `61 01` differ only in the byte an
+/// ASCII fold would equate).
+#[test]
+fn utf16_collated_unique_conflicts_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for &(encoding, expected_header) in UTF16_VARIANTS {
+            let db_path = dir.path().join(format!("coll_unique_{encoding}.db"));
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            for sql in [
+                format!("PRAGMA encoding = '{encoding}';"),
+                "CREATE TABLE u(id INTEGER PRIMARY KEY, r TEXT COLLATE RTRIM UNIQUE, \
+                 n TEXT COLLATE NOCASE UNIQUE);"
+                    .to_owned(),
+                "INSERT INTO u VALUES (1, 'a', 'Ł');".to_owned(),
+            ] {
+                conn.execute(&sql).await.unwrap();
+            }
+            let rtrim_dup = conn.execute("INSERT INTO u VALUES (2, 'a  ', 'x');").await;
+            assert!(
+                rtrim_dup.is_err(),
+                "{encoding}: 'a  ' must collide with 'a' under RTRIM UNIQUE"
+            );
+            conn.execute("INSERT INTO u VALUES (3, 'b', 'š');")
+                .await
+                .unwrap_or_else(|e| panic!("{encoding}: 'š' is not NOCASE-equal to 'Ł': {e:?}"));
+            let nocase_dup = conn.execute("INSERT INTO u VALUES (4, 'c', 'Š');").await;
+            assert!(
+                nocase_dup.is_ok(),
+                "{encoding}: NOCASE folds ASCII only, so 'Š' is distinct from 'š'"
+            );
+            let ascii_dup = conn.execute("INSERT INTO u VALUES (5, 'd', 'X'), (6, 'e', 'x');").await;
+            assert!(
+                ascii_dup.is_err(),
+                "{encoding}: 'x' must collide with 'X' under NOCASE UNIQUE"
+            );
+            conn.close().await.unwrap();
+
+            assert_stock_image_ok(&db_path, expected_header, encoding);
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let rows: Vec<(i64, String, String)> = stock
+                .prepare("SELECT id, r, n FROM u ORDER BY id;")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (1, "a".to_owned(), "Ł".to_owned()),
+                    (3, "b".to_owned(), "š".to_owned()),
+                    (4, "c".to_owned(), "Š".to_owned()),
+                ],
+                "{encoding}: stock sees exactly the rows stock would have accepted"
+            );
+        }
+    });
+}
+
+/// Collated index keys on a UTF-16 database. The b-tree comparator read TEXT
+/// through its lossy `&str` view, so stored UTF-16 keys that are not valid
+/// UTF-8 (any Latin-1/CJK unit) collapsed to equal replacement strings: every
+/// index with a declared collation was misordered ("row N missing from index"
+/// under stock `integrity_check`), and a plain `SELECT DISTINCT` deduplicated
+/// distinct values through its BINARY autoindex (5 of 65 rows).
+#[test]
+fn utf16_collated_indexes_and_distinct_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for &(encoding, expected_header) in UTF16_VARIANTS {
+            let db_path = dir.path().join(format!("coll_index_{encoding}.db"));
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            for sql in [
+                format!("PRAGMA encoding = '{encoding}';"),
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, b TEXT COLLATE BINARY, \
+                 n TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, u TEXT COLLATE NOCASE UNIQUE, \
+                 city TEXT);"
+                    .to_owned(),
+                "CREATE INDEX items_b ON items(b);".to_owned(),
+                "CREATE INDEX items_n ON items(n);".to_owned(),
+                "CREATE INDEX items_r ON items(r);".to_owned(),
+                "CREATE INDEX items_city_nocase ON items(city COLLATE NOCASE, b);".to_owned(),
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300) \
+                 INSERT INTO items \
+                 SELECT x, char(192 + (x * 7) % 40) || char(26481 + x % 5) || (x % 97), \
+                 char(192 + x % 40) || 'n' || x, char(26481 + x % 3) || ' ' || x, \
+                 'u' || char(192 + x % 40) || x, char(26481 + x % 5) || char(192 + x % 13) \
+                 FROM c;"
+                    .to_owned(),
+            ] {
+                conn.execute(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{encoding}: `{sql}` failed: {e:?}"));
+            }
+            let queries = [
+                "SELECT count(*) FROM (SELECT DISTINCT city FROM items)",
+                "SELECT b FROM items ORDER BY b LIMIT 5",
+                "SELECT n FROM items ORDER BY n LIMIT 5",
+                "SELECT count(*) FROM items WHERE b >= 'Ā'",
+                "SELECT id FROM items WHERE u = 'U' || char(192 + 7 % 40) || 7",
+            ];
+            let mut frank = Vec::new();
+            for sql in queries {
+                let rows = conn.query(sql).await.unwrap();
+                frank.push(
+                    rows.iter()
+                        .map(|r| format!("{:?}", r.values()))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                );
+            }
+            conn.close().await.unwrap();
+
+            assert_stock_image_ok(&db_path, expected_header, encoding);
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            for (sql, frank) in queries.iter().zip(frank) {
+                let mut stmt = stock.prepare(sql).unwrap();
+                let width = stmt.column_count();
+                let want = stmt
+                    .query_map([], |r| {
+                        (0..width)
+                            .map(|i| {
+                                Ok(match r.get::<_, rusqlite::types::Value>(i)? {
+                                    rusqlite::types::Value::Integer(v) => {
+                                        format!("{:?}", SqliteValue::Integer(v))
+                                    }
+                                    rusqlite::types::Value::Text(v) => {
+                                        format!("{:?}", SqliteValue::Text(v.as_str().into()))
+                                    }
+                                    other => format!("{other:?}"),
+                                })
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map(|cols| format!("[{}]", cols.join(", ")))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+                    .join("|");
+                assert_eq!(frank, want, "{encoding}: `{sql}` must match stock");
+            }
+        }
+    });
+}
+
+#[test]
+fn utf16_system_table_maintenance_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for &(encoding, expected_header) in UTF16_VARIANTS {
+            let db_path = dir.path().join(format!("maint_{encoding}.db"));
+            let db_str = db_path.to_string_lossy().into_owned();
+            let conn = Connection::open(&db_str).await.unwrap();
+            for sql in [
+                format!("PRAGMA encoding = '{encoding}';"),
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT);".to_owned(),
+                "INSERT INTO p VALUES (1, 'Élise'), (2, '名前'), (3, 'plain');".to_owned(),
+                "CREATE TABLE s(x INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);".to_owned(),
+                "INSERT INTO s(v) VALUES ('a'), ('b');".to_owned(),
+                "INSERT INTO s(v) VALUES ('c');".to_owned(),
+                "DELETE FROM s WHERE x = 3;".to_owned(),
+                "INSERT INTO s(v) VALUES ('d');".to_owned(),
+                "ALTER TABLE p ADD COLUMN z TEXT DEFAULT 'zü';".to_owned(),
+                "UPDATE p SET z = 'set' WHERE id = 2;".to_owned(),
+                "CREATE TABLE u AS SELECT * FROM p;".to_owned(),
+                "DROP TABLE u;".to_owned(),
+                "CREATE INDEX p_name ON p(name);".to_owned(),
+                "ANALYZE;".to_owned(),
+                "ANALYZE;".to_owned(),
+                "ALTER TABLE s RENAME TO s2;".to_owned(),
+                "INSERT INTO s2(v) VALUES ('e');".to_owned(),
+            ] {
+                conn.execute(&sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{encoding}: `{sql}` failed: {e:?}"));
+            }
+            let x = conn
+                .query("SELECT max(x) FROM s2;")
+                .await
+                .unwrap();
+            assert_eq!(
+                x[0].values()[0],
+                SqliteValue::Integer(5),
+                "{encoding}: AUTOINCREMENT must not reuse the deleted rowid 3 or 4"
+            );
+            conn.close().await.unwrap();
+
+            assert_stock_image_ok(&db_path, expected_header, encoding);
+            let stock = rusqlite::Connection::open(&db_path).unwrap();
+            let seq: Vec<(String, i64)> = stock
+                .prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name;")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                seq,
+                vec![("s2".to_owned(), 5)],
+                "{encoding}: exactly one renamed sqlite_sequence row"
+            );
+            let tables: Vec<String> = stock
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                tables,
+                ["p", "s2", "sqlite_sequence", "sqlite_stat1"],
+                "{encoding}: u dropped, s renamed"
+            );
+            let z: Vec<(i64, String)> = stock
+                .prepare("SELECT id, z FROM p ORDER BY id;")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                z,
+                vec![(1, "zü".to_owned()), (2, "set".to_owned()), (3, "zü".to_owned())],
+                "{encoding}: stock sees the added column and its values"
+            );
+            let (stat_rows, distinct_rows): (i64, i64) = stock
+                .query_row(
+                    "SELECT count(*), count(DISTINCT tbl || '/' || coalesce(idx, '')) \
+                     FROM sqlite_stat1;",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                stat_rows, distinct_rows,
+                "{encoding}: ANALYZE must rewrite, not duplicate, sqlite_stat1 rows"
+            );
         }
     });
 }

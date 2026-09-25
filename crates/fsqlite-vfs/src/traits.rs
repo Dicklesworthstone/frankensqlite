@@ -752,6 +752,16 @@ pub trait Vfs: Send + Sync {
         self.access(cx, path, AccessFlags::EXISTS)
     }
 
+    /// Identity of the file `path` names now, without opening it, in the
+    /// domain of [`VfsFile::file_identity`]: equal identities mean the path
+    /// and an open handle name the same file.
+    ///
+    /// `Ok(None)` means "not known cheaply" (no such entry, or a VFS without
+    /// stable identities); callers must then take their open-and-inspect path.
+    fn path_file_identity(&self, _cx: &Cx, _path: &Path) -> Result<Option<FileIdentity>> {
+        Ok(None)
+    }
+
     /// Resolve a potentially relative path into an absolute path.
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;
 
@@ -1334,6 +1344,16 @@ pub trait VfsFile: Send + Sync {
     /// byte-range locks, and in-memory / other custom backends do not use
     /// `flock`. Only the Unix backend overrides this (GH #343 / bd-qll76).
     fn locking_downgraded_to_whole_file_flock(&self) -> bool {
+        false
+    }
+
+    /// Whether this handle holds the main-file SHARED read lock it keeps for
+    /// the whole life of its WAL shared-memory attachment. While held, no other
+    /// process can take EXCLUSIVE: it cannot leave WAL mode, write in rollback
+    /// mode, leave a hot journal, or unlink the WAL beneath this process —
+    /// which is what lets a WAL reader trust an unchanged WAL-index header.
+    /// Conservatively `false` for backends that do not track it.
+    fn holds_main_wal_lifetime_read_lock(&self) -> bool {
         false
     }
 

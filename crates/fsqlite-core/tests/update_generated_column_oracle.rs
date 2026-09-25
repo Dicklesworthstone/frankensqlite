@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-generated-column-update-target-4r7kw (GH #165): UPDATE that assigns to
 //! a generated (STORED or VIRTUAL) column must be rejected ("cannot UPDATE
 //! generated column"), like C SQLite — on both the interpreted (:memory:) and

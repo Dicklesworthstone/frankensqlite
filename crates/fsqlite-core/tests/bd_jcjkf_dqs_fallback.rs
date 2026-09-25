@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-jcjkf — DQS ("double-quoted string") compat, shapes 1+2 (DQS-ON by default).
 //!
 //! SQLite's legacy default (SQLITE_DQS=3): a double-quoted identifier that does

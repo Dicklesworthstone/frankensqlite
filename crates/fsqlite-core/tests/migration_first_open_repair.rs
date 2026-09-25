@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-zywqc.5: first-open-after-upgrade one-time idempotent repair pass.
 //!
 //! A database created by a version predating this migration logic has no

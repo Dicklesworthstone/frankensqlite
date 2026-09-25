@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-alter-create-nonconstant-default-internal-vs-err-it66z: ALTER
 // TABLE ADD COLUMN / column-DEFAULT rejections must match SQLite's messages
 // VERBATIM under SQLITE_ERROR — never wrapped as an Internal error (which would

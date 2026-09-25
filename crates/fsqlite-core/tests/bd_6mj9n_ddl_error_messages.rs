@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-audit-internal-wrapped-stock-messages-6mj9n: DDL create/drop
 // conflict errors must match SQLite's messages VERBATIM under SQLITE_ERROR —
 // never wrapped as an Internal error ("internal error:" prefix / SQLITE_INTERNAL).

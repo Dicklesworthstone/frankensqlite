@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-insert-select-returning-param-77yt5: a bind parameter in the
 // RETURNING clause of `INSERT ... SELECT` must resolve to its bound value, not
 // bind out of range during the per-row replay. Oracle: sqlite3 3.46.1 returns

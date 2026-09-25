@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Some SQL literals here ('{x:...}') look like format args to clippy.
 #![allow(clippy::literal_string_with_formatting_args)]
 //! bd-f3s2l: `CAST(blob AS TEXT/INTEGER/REAL)` must relabel/decode the blob's

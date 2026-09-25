@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-9hp58 ASK#2 — pool-drop / close must be lsof-clean: a connection's
 //! namespace-binding advisory-lock sidecar fds (`-fsqlite-ns-use` /
 //! `-fsqlite-ns-gate`) must not survive the connection's teardown, even on an

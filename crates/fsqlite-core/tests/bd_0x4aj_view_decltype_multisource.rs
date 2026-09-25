@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pragma-table-info-view-decltype-multisource-0x4aj: PRAGMA table_info(view)
 //! must resolve source declared types across joins, subqueries, and nested views
 //! (not just a single bare base table). Types match stock sqlite3 verbatim.

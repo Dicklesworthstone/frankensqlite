@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-prepare-time-validation-bypass): an aggregate misused in WHERE now
 // raises the prepare-time "misuse of aggregate…" error via execute() too, not
 // only via query() — the prepared/VDBE fast lane previously skipped it, so

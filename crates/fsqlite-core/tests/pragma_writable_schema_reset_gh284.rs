@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #284 (bd-gh-pragma-writable-schema): `PRAGMA writable_schema = RESET`
 //! must be accepted like stock SQLite, not rejected as a bad boolean.
 //!

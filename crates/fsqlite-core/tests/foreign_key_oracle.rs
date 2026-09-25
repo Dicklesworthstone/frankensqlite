@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: foreign-key enforcement + referential actions vs
 //! rusqlite (bundled SQLite 3.53), with `PRAGMA foreign_keys=ON`. A probe sweep
 //! found this surface stock-correct across 10 cases; this keeper locks it in.

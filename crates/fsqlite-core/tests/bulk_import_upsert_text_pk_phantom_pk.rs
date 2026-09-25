@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-fcof5: beads_rust JSONL auto-import fails with a PHANTOM
 //! "PRIMARY KEY constraint failed" during a bulk upsert of ~3200 rows into a
 //! TEXT-PRIMARY-KEY table carrying several partial (and one UNIQUE partial)

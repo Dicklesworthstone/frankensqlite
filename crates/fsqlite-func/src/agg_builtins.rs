@@ -22,9 +22,12 @@
     clippy::suboptimal_flops
 )]
 
+use std::cmp::Ordering;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 
+use crate::builtins::statement_text_encoding;
 use crate::{AggregateFunction, FunctionRegistry};
 
 // ─── Kahan compensated summation ──────────────────────────────────────────
@@ -286,7 +289,9 @@ impl AggregateFunction for AggMaxFunc {
         match state {
             None => *state = Some(candidate.clone()),
             Some(current) => {
-                if candidate > current {
+                if candidate.cmp_binary_in(current, statement_text_encoding())
+                    == Ordering::Greater
+                {
                     *state = Some(candidate.clone());
                 }
             }
@@ -328,7 +333,7 @@ impl AggregateFunction for AggMinFunc {
         match state {
             None => *state = Some(candidate.clone()),
             Some(current) => {
-                if candidate < current {
+                if candidate.cmp_binary_in(current, statement_text_encoding()) == Ordering::Less {
                     *state = Some(candidate.clone());
                 }
             }

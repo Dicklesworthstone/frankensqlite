@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): STRICT-table type-declaration errors and
 // REINDEX-of-unknown-object report stock's verbatim SQLITE_ERROR text, not
 // frank's old "internal error: ..." (SQLITE_INTERNAL). Oracle: sqlite3 3.46.1 +

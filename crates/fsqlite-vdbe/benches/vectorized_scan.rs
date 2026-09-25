@@ -1,3 +1,6 @@
+// Benchmarks measure the UTF-8 record codecs directly.
+#![allow(clippy::disallowed_methods)]
+
 use std::cell::Cell;
 use std::future::Future;
 use std::hint::black_box;

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-eqmqv (DQS shape 5): a double-quoted column DEFAULT is a string literal
 //! under DQS-ON, not a (non-constant) column reference.
 //!

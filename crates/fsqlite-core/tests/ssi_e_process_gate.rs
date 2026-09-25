@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Integration tests for the anytime-valid e-process SSI skip gate.
 //!
 //! The gate is controlled by `PRAGMA fsqlite.write_merge = LAB_UNSAFE`

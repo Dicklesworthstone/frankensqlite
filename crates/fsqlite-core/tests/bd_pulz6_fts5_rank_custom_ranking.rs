@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pulz6: the FTS5 `rank MATCH '<rankfn>'` (and `rank = '<rankfn>'`) idiom
 //! binds a custom ranking function for the query — it is NOT a row filter.
 //!

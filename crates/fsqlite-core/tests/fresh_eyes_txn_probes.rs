@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Fresh-eyes probes: (1) ROLLBACK of a lazy tombstone DELETE must restore the
 //! in-memory row count; (2) frank's monotonically growing segids must stay
 //! readable by stock (stock caps segids at FTS5_MAX_SEGMENT=2000 and reuses).

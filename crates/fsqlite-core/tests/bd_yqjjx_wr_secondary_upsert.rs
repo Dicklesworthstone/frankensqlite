@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-yqjjx — ON CONFLICT (<secondary-unique>) DO UPDATE on WITHOUT ROWID tables.
 //!
 //! Previously the WITHOUT ROWID upsert codegen refused an EXPLICIT secondary-

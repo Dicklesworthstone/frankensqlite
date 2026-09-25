@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-row-value-is-distinct-8glg9 (GH #243): row-value IS DISTINCT FROM / IS
 //! NOT DISTINCT FROM with NULL components.
 //!

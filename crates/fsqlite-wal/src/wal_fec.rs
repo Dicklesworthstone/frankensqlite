@@ -9,7 +9,7 @@
 #[path = "wal_fec_replay.rs"]
 pub mod replay;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2478,7 +2478,15 @@ fn process_committed_wal_range(
     }
     // Admission is nonblocking and precedes encoding. Busy retries release the
     // caller's blocking-pool thread and wait in the async worker instead.
-    let sidecar_guard = try_lock_wal_fec_sidecar(&wal_fec_path_for_wal(&range.wal_path))?;
+    let _sidecar_guard = try_lock_wal_fec_sidecar(&wal_fec_path_for_wal(&range.wal_path))?;
+    // The guard MUST precede the generation check. A later reset cannot reclaim
+    // while we hold it; its pending cleanup will retire this range's groups. If
+    // cleanup already finished, this check refuses the late job before any
+    // sidecar I/O.
+    if !wal_fec_generation_matches(&range.wal_path, range.header)? {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    let mut sidecar = CommittedRangeSidecar::load(range)?;
     let page_size =
         usize::try_from(range.header.page_size).map_err(|_| FrankenError::DatabaseFull)?;
     let frame_size = crate::WAL_FRAME_HEADER_SIZE + page_size;
@@ -2550,22 +2558,31 @@ fn process_committed_wal_range(
             page_numbers: std::mem::take(&mut page_numbers),
             source_page_xxh3_128: hashes,
         })?;
-        let Some(symbols) = generate_wal_fec_repair_symbols_inner(
-            &meta,
-            &pages,
-            Some(cx),
-            Some(cancel_flag),
-            per_symbol_delay,
-        )?
-        else {
-            return Ok(WalFecWorkOutcome::Canceled);
-        };
-        let group = WalFecGroupRecord::new(meta, symbols)?;
-        if !append_committed_wal_fec_group(range, &group, cx, cancel_flag, &sidecar_guard)? {
-            return Ok(WalFecWorkOutcome::Canceled);
+        if sidecar.contains(&meta)? {
+            // Restart catch-up over groups that are already durable.
+            diagnostics.record_group(&sidecar.path, &meta);
+        } else {
+            let Some(symbols) = generate_wal_fec_repair_symbols_inner(
+                &meta,
+                &pages,
+                Some(cx),
+                Some(cancel_flag),
+                per_symbol_delay,
+            )?
+            else {
+                return Ok(WalFecWorkOutcome::Canceled);
+            };
+            let group = WalFecGroupRecord::new(meta, symbols)?;
+            if !wal_fec_generation_matches(&range.wal_path, range.header)?
+                || cancel_flag.load(Ordering::Acquire)
+                || cx.checkpoint().is_err()
+            {
+                return Ok(WalFecWorkOutcome::Canceled);
+            }
+            sidecar.append(&group)?;
+            crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
+            diagnostics.record_group(&sidecar.path, &group.meta);
         }
-        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
-        diagnostics.record_group(&wal_fec_path_for_wal(&range.wal_path), &group.meta);
         pages.clear();
         group_start = frame_no.saturating_add(1);
     }
@@ -2574,6 +2591,7 @@ fn process_committed_wal_range(
             detail: "durable WAL-FEC interval ends before a commit marker".to_owned(),
         });
     }
+    sidecar.sync()?;
     Ok(WalFecWorkOutcome::Completed)
 }
 
@@ -2624,89 +2642,118 @@ fn reclaim_retired_fec_on_open(
     Ok(WalFecWorkOutcome::Completed)
 }
 
-fn append_committed_wal_fec_group(
-    range: &WalFecCommittedRange,
-    group: &WalFecGroupRecord,
-    cx: &Cx,
-    cancel_flag: &AtomicBool,
-    _sidecar_guard: &fs::File,
-) -> Result<bool> {
-    let sidecar = wal_fec_path_for_wal(&range.wal_path);
-    let record = encode_wal_fec_group(group)?;
-    // The guard MUST precede the generation check. A later reset cannot reclaim
-    // while we append; its pending cleanup will retire this group. If cleanup
-    // already finished, this check refuses the late job before any sidecar I/O.
-    if !wal_fec_generation_matches(&range.wal_path, range.header)?
-        || cancel_flag.load(Ordering::Acquire)
-        || cx.checkpoint().is_err()
-    {
-        return Ok(false);
+/// One committed range's view of the sidecar, taken under the sidecar guard.
+///
+/// The sidecar is read and validated once per range. Catch-up used to re-read,
+/// re-parse and re-validate the whole sidecar for every commit group —
+/// quadratic at open (a 1500-commit WAL took ~30 s to reopen) and on every
+/// commit of a long session — and encoded repair symbols for groups it then
+/// found already present.
+struct CommittedRangeSidecar {
+    path: PathBuf,
+    /// Metadata of the durable groups of the current WAL generation.
+    present: HashMap<WalFecGroupId, WalFecGroupMeta>,
+    /// Whether the sidecar did not exist or was empty (the first sync also
+    /// syncs the parent directory).
+    created: bool,
+    /// Append handle holding records not yet synced; [`Self::sync`] makes the
+    /// whole range durable with one `fdatasync`. An unsynced tail lost to a
+    /// crash is a truncated suffix, which the next catch-up replaces.
+    output: Option<fs::File>,
+}
+
+impl CommittedRangeSidecar {
+    /// Caller holds the sidecar guard and has checked the WAL generation. An
+    /// unusable suffix or retired generations are replaced atomically now,
+    /// preserving the configuration header and every complete validated group,
+    /// so later groups only append.
+    fn load(range: &WalFecCommittedRange) -> Result<Self> {
+        let path = wal_fec_path_for_wal(&range.wal_path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let mut scan = scan_wal_fec_bytes(&path, &bytes)?;
+        let before = scan.groups.len();
+        scan.groups.retain(|existing| {
+            (existing.meta.wal_salt1, existing.meta.wal_salt2)
+                == (range.header.salts.salt1, range.header.salts.salt2)
+        });
+        if scan.truncated_tail || scan.groups.len() != before {
+            let header_len = scan_offset_after_optional_pragma_header(&bytes)?;
+            let permissions = fs::metadata(&path)?.permissions();
+            replace_wal_fec_sidecar(&path, permissions, |output| {
+                output.write_all(&bytes[..header_len])?;
+                for existing in &scan.groups {
+                    output.write_all(&encode_wal_fec_group(existing)?)?;
+                }
+                Ok(())
+            })?;
+            debug!(sidecar = %path.display(), truncated_tail = scan.truncated_tail,
+                retired_groups = before - scan.groups.len(),
+                "replaced unusable or retired WAL-FEC records using validated durable frames");
+        }
+        Ok(Self {
+            path,
+            present: scan
+                .groups
+                .into_iter()
+                .map(|group| (group.meta.group_id(), group.meta))
+                .collect(),
+            created: bytes.is_empty(),
+            output: None,
+        })
     }
-    let bytes = match fs::read(&sidecar) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(err.into()),
-    };
-    let mut scan = scan_wal_fec_bytes(&sidecar, &bytes)?;
-    let before = scan.groups.len();
-    scan.groups.retain(|existing| {
-        (existing.meta.wal_salt1, existing.meta.wal_salt2)
-            == (range.header.salts.salt1, range.header.salts.salt2)
-    });
-    let already_present = if let Some(existing) = scan
-        .groups
-        .iter()
-        .find(|existing| existing.meta.group_id() == group.meta.group_id())
-    {
-        if existing.meta.source_page_xxh3_128 != group.meta.source_page_xxh3_128
-            || existing.meta.page_numbers != group.meta.page_numbers
-            || existing.meta.start_frame_no != group.meta.start_frame_no
+
+    /// Whether an identical group is already durable. A group with the same
+    /// id but a different identity is corruption.
+    fn contains(&self, meta: &WalFecGroupMeta) -> Result<bool> {
+        let Some(existing) = self.present.get(&meta.group_id()) else {
+            return Ok(false);
+        };
+        if existing.source_page_xxh3_128 != meta.source_page_xxh3_128
+            || existing.page_numbers != meta.page_numbers
+            || existing.start_frame_no != meta.start_frame_no
         {
             return Err(FrankenError::WalCorrupt {
                 detail: "conflicting WAL-FEC commit group identity".to_owned(),
             });
         }
-        true
-    } else {
-        false
-    };
-    if already_present && !scan.truncated_tail && scan.groups.len() == before {
-        return Ok(true);
+        Ok(true)
     }
-    if scan.truncated_tail || scan.groups.len() != before {
-        // Restart catch-up replaces only an unusable suffix. Preserve the
-        // configuration header and every complete validated group atomically.
-        let header_len = scan_offset_after_optional_pragma_header(&bytes)?;
-        let permissions = fs::metadata(&sidecar)?.permissions();
-        replace_wal_fec_sidecar(&sidecar, permissions, |output| {
-            output.write_all(&bytes[..header_len])?;
-            for existing in &scan.groups {
-                output.write_all(&encode_wal_fec_group(existing)?)?;
+
+    fn append(&mut self, group: &WalFecGroupRecord) -> Result<()> {
+        let record = encode_wal_fec_group(group)?;
+        let output = match &mut self.output {
+            Some(output) => output,
+            output @ None => {
+                let mut options = fs::OpenOptions::new();
+                options.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                output.insert(options.open(&self.path)?)
             }
-            if !already_present {
-                output.write_all(&record)?;
-            }
-            Ok(())
-        })?;
-        debug!(sidecar = %sidecar.display(), truncated_tail = scan.truncated_tail,
-            retired_groups = before - scan.groups.len(),
-            "replaced unusable or retired WAL-FEC records using validated durable frames");
-    } else {
-        let mut options = fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut output = options.open(&sidecar)?;
+        };
         output.write_all(&record)?;
-        output.sync_data()?;
-        if bytes.is_empty() {
-            sync_wal_fec_parent(&sidecar)?;
-        }
+        self.present.insert(group.meta.group_id(), group.meta.clone());
+        Ok(())
     }
-    Ok(true)
+
+    /// Make every group appended for this range durable.
+    fn sync(&mut self) -> Result<()> {
+        if let Some(output) = self.output.take() {
+            output.sync_data()?;
+            if self.created {
+                sync_wal_fec_parent(&self.path)?;
+                self.created = false;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn generate_wal_fec_repair_symbols_inner(
@@ -3191,6 +3238,18 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
     Ok(())
 }
 
+/// Parse one sidecar repair symbol. WAL-FEC never authenticates its symbols
+/// (they are written with an all-zero `auth_tag`), and `frame_xxh3` does not
+/// cover the tag, so a nonzero tag is damage the hash cannot see: reject it
+/// like any other corrupt record.
+fn parse_wal_fec_repair_symbol(bytes: &[u8]) -> std::result::Result<SymbolRecord, String> {
+    let symbol = SymbolRecord::from_bytes(bytes).map_err(|err| err.to_string())?;
+    if symbol.auth_tag != [0; 16] {
+        return Err("nonzero auth tag on an unauthenticated WAL-FEC repair symbol".to_owned());
+    }
+    Ok(symbol)
+}
+
 fn encode_wal_fec_group(group: &WalFecGroupRecord) -> Result<Vec<u8>> {
     group.validate_layout()?;
     let mut record = Vec::new();
@@ -3325,7 +3384,7 @@ fn scan_wal_fec_bytes(sidecar_path: &Path, bytes: &[u8]) -> Result<WalFecScanRes
                 );
                 break;
             };
-            let symbol = match SymbolRecord::from_bytes(symbol_bytes) {
+            let symbol = match parse_wal_fec_repair_symbol(symbol_bytes) {
                 Ok(symbol) => symbol,
                 Err(err) => {
                     // bd-xv5cm M4: a corrupt repair symbol truncates the usable
@@ -4173,7 +4232,7 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
                 truncated_tail = true;
                 break;
             };
-            match SymbolRecord::from_bytes(symbol_bytes) {
+            match parse_wal_fec_repair_symbol(symbol_bytes) {
                 Ok(symbol) => repair_symbols.push(symbol),
                 Err(err) => {
                     warn!(

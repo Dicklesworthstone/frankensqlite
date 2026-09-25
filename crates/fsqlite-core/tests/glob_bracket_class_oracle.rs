@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-glob-charclass-tobn9 (GH #257): GLOB bracket character classes must
 //! match C SQLite on BOTH matcher paths.
 //!

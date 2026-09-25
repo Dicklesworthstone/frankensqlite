@@ -10,9 +10,11 @@ use std::sync::Arc;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, PageWriter};
 use fsqlite_error::FrankenError;
-use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record_into};
+use fsqlite_types::record::{
+    RecordProfileScope, enter_record_profile_scope, parse_record_into_with_encoding,
+};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{Cx, PageNumber};
+use fsqlite_types::{Cx, PageNumber, TextEncoding};
 
 use crate::vectorized::{Batch, BatchFormatError, Column, ColumnData, ColumnSpec, SelectionVector};
 
@@ -184,6 +186,8 @@ where
     batch_capacity: usize,
     predicate: Option<RowPredicate>,
     morsel: Option<PageMorsel>,
+    /// Database text encoding: TEXT cells decode from it (bd-fug5d).
+    text_encoding: TextEncoding,
     payload_buf: Vec<u8>,
     row_buffers: Vec<Vec<SqliteValue>>,
     started: bool,
@@ -217,6 +221,7 @@ where
             batch_capacity,
             predicate: None,
             morsel: None,
+            text_encoding: TextEncoding::Utf8,
             payload_buf: Vec::new(),
             row_buffers: Vec::with_capacity(batch_capacity),
             started: false,
@@ -229,6 +234,13 @@ where
     #[must_use]
     pub fn with_morsel(mut self, morsel: PageMorsel) -> Self {
         self.morsel = Some(morsel);
+        self
+    }
+
+    /// Decode TEXT cells from the database's text encoding (default UTF-8).
+    #[must_use]
+    pub fn with_text_encoding(mut self, encoding: TextEncoding) -> Self {
+        self.text_encoding = encoding;
         self
     }
 
@@ -320,10 +332,12 @@ where
                     .last_mut()
                     .expect("row buffer push must yield a buffer")
             };
-            parse_record_into(&self.payload_buf, row).ok_or(VectorizedScanError::RecordDecode {
-                rowid,
-                payload_len: self.payload_buf.len(),
-            })?;
+            parse_record_into_with_encoding(&self.payload_buf, row, self.text_encoding).ok_or(
+                VectorizedScanError::RecordDecode {
+                    rowid,
+                    payload_len: self.payload_buf.len(),
+                },
+            )?;
 
             let row_index = row_count;
             if predicate
@@ -502,6 +516,7 @@ fn checked_offset_span(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -860,6 +875,50 @@ mod tests {
                 scanned_pages.len() > 1,
                 "bead_id={BEAD_ID} expected multi-page scan to validate leaf traversal"
             );
+        });
+    }
+
+    /// bd-fug5d: a UTF-16 database's TEXT cells decode from UTF-16, not as
+    /// UTF-8 mojibake of their code units.
+    #[test]
+    fn scan_decodes_text_in_the_database_encoding() {
+        block_on_test(async {
+            for encoding in [TextEncoding::Utf16le, TextEncoding::Utf16be] {
+                let root_page = PageNumber::new(ROOT_PAGE).expect("root page should be non-zero");
+                let io = SharedTrackingPageIo::new(PAGE_SIZE, root_page);
+                let mut writer = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
+                let cx = Cx::new();
+                let rows: Vec<Vec<SqliteValue>> = (1..=300_i64)
+                    .map(|rowid| {
+                        vec![
+                            SqliteValue::Integer(rowid),
+                            SqliteValue::Float(0.5),
+                            SqliteValue::Text(format!("ключ-{rowid}-ü€𝄞").into()),
+                            SqliteValue::Blob(vec![1, 2].into()),
+                        ]
+                    })
+                    .collect();
+                for (rowid, row) in (1_i64..).zip(&rows) {
+                    let payload =
+                        fsqlite_types::record::serialize_record_with_encoding(row, encoding);
+                    writer
+                        .table_insert(&cx, rowid, &payload)
+                        .await
+                        .expect("table_insert should succeed");
+                }
+                let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
+                let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 128)
+                    .expect("scan should initialize")
+                    .with_text_encoding(encoding);
+                let mut actual_rows = Vec::new();
+                while let Some(output) = scan.next_batch().await.expect("batch should scan") {
+                    actual_rows.extend(
+                        materialize_selected_rows(&output.batch)
+                            .expect("selected rows should materialize"),
+                    );
+                }
+                assert_eq!(actual_rows, rows, "{encoding:?}");
+            }
         });
     }
 

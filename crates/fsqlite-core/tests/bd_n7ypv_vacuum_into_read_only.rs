@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-n7ypv / GH#342: VACUUM INTO must be permitted on a read-only source
 //! connection — it writes a NEW target file and only reads the source, so
 //! sqlite3 allows it (verified: `sqlite3 'file:src?mode=ro' "VACUUM INTO ..."`

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pgqsk M6: truth-context `AND` folds. In a FILTER position (WHERE / HAVING
 //! / JOIN-ON) a `<never-true-const> AND E` conjunction is never TRUE, so the row
 //! is filtered and E — even an erroring uncorrelated subquery — is never

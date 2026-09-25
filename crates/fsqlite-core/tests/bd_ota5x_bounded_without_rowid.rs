@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-ota5x / GH#341: `validate_database_integrity_bounded` must accept a
 //! WITHOUT ROWID table across its full structural family — the row walk, the
 //! secondary-index concordance, and (part-3) foreign keys — instead of refusing

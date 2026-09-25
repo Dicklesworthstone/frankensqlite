@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Keeper: the CASE-wrapped conditional-RAISE trigger idiom
 //! `SELECT CASE WHEN <cond> THEN RAISE(<action>, <msg>) END` — the canonical
 //! alternative to `SELECT RAISE(...) WHERE <cond>`. Previously frank rejected it

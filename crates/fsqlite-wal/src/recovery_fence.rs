@@ -135,8 +135,9 @@ impl RecoveryFence {
 
     /// Block with bounded backoff until the fence is free, then acquire it.
     ///
-    /// Waits up to [`RECOVERY_FENCE_MAX_RETRIES`] cycles of
-    /// [`RECOVERY_FENCE_BACKOFF`] each (default: 1 s total). If recovery is
+    /// Waits up to [`RECOVERY_FENCE_MAX_RETRIES`] × [`RECOVERY_FENCE_BACKOFF`]
+    /// (default: 1 s total), with sleeps growing from 1 ms to the backoff
+    /// period. If recovery is
     /// still in progress when the budget is exhausted,
     /// [`FrankenError::Busy`] is returned so the caller can fail fast rather
     /// than hang forever.
@@ -166,14 +167,22 @@ impl RecoveryFence {
             }
             std::hint::spin_loop();
         }
-        for attempt in 0..=max_retries {
+        // The budget is `max_retries` backoffs, but the sleeps grow from 1 ms
+        // up to `backoff`: a holder that was merely descheduled mid-probe
+        // costs a waiter about a millisecond, not a whole backoff period,
+        // while a genuine recovery still gets the full budget.
+        let deadline = std::time::Instant::now() + backoff.saturating_mul(max_retries);
+        let mut sleep = backoff.min(Duration::from_millis(1));
+        loop {
             if let Some(guard) = self.try_acquire_for_recovery() {
                 return Ok(guard);
             }
-            if attempt == max_retries {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 break;
             }
-            std::thread::sleep(backoff);
+            std::thread::sleep(sleep.min(deadline - now));
+            sleep = sleep.saturating_mul(2).min(backoff);
         }
         warn!(
             target: "fsqlite.wal.recovery_fence",
@@ -649,56 +658,60 @@ mod tests {
         // after the first CAS miss. After the spin-fast-path, almost
         // all contenders resolve inside the spin.
         //
-        // Gate: with backoff = 100 ms × 10 retries, 8 workers each
-        // holding the fence for ~1 µs must finish the full round-robin
-        // in well under `ceil(N/1) × backoff`. We set a generous
-        // ceiling of 50 ms so the test does not flake on loaded CI,
-        // and print the observed latency for the commit body.
+        // Gate: no single acquire may wait as long as one full backoff
+        // period. Each acquire is timed on its own, after the barrier, so
+        // thread spawn and scheduling on a loaded host are not counted; a
+        // holder descheduled mid-probe costs a waiter the 1 ms first
+        // backoff step, not the 100 ms period.
         use std::time::Instant;
         const THREADS: usize = 8;
         const ROUNDS_PER_THREAD: usize = 4;
         let fence = Arc::new(RecoveryFence::new());
         let barrier = Arc::new(std::sync::Barrier::new(THREADS));
 
-        let started = Instant::now();
         let handles: Vec<_> = (0..THREADS)
             .map(|_| {
                 let fence = Arc::clone(&fence);
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
+                    let mut slowest = Duration::ZERO;
                     for _ in 0..ROUNDS_PER_THREAD {
+                        let started = Instant::now();
                         let guard = fence
                             .acquire_for_recovery_with(
                                 RECOVERY_FENCE_MAX_RETRIES,
                                 RECOVERY_FENCE_BACKOFF,
                             )
                             .expect("fence acquire under storm");
+                        slowest = slowest.max(started.elapsed());
                         // Simulate a hot-journal probe on a warm DB —
                         // the fence is held for only a few hundred
                         // nanoseconds of real work.
                         std::hint::black_box(&guard);
                         drop(guard);
                     }
+                    slowest
                 })
             })
             .collect();
-        for h in handles {
-            h.join().expect("worker join");
-        }
-        let elapsed = started.elapsed();
+        let slowest = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker join"))
+            .max()
+            .unwrap_or_default();
 
         eprintln!(
             "recovery_fence concurrent-open storm: {THREADS} threads × \
-             {ROUNDS_PER_THREAD} rounds = {elapsed:?} \
+             {ROUNDS_PER_THREAD} rounds, slowest acquire {slowest:?} \
              (spin_attempts={RECOVERY_FENCE_SPIN_ATTEMPTS}, \
               backoff={RECOVERY_FENCE_BACKOFF:?}, \
               max_retries={RECOVERY_FENCE_MAX_RETRIES})"
         );
         assert!(
-            elapsed < Duration::from_millis(50),
-            "concurrent-open storm should resolve inside the spin-fast-path, \
-             not pay the 100ms sleep penalty (elapsed {elapsed:?})",
+            slowest < RECOVERY_FENCE_BACKOFF,
+            "a microsecond fence hold must not cost a waiter a full backoff \
+             period (slowest acquire {slowest:?})",
         );
     }
 
@@ -901,7 +914,7 @@ mod tests {
                 let file = open_db_file(&vfs, &cx);
                 let page = PageNumber::ONE;
                 let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
-                file.write(&cx, &[0x54], u64::from(damaged_offset)).unwrap();
+                file.write(&cx, &[0x54], u64::from(damaged_offset)).wait().unwrap();
                 let mut read_back = vec![0; usize::try_from(page_size).unwrap()];
                 assert_eq!(file.read(&cx, &mut read_back, 0).wait().unwrap(), read_back.len());
                 assert_eq!(crate::checksum::read_page_checksum(&read_back).unwrap(), checksum);
@@ -931,7 +944,7 @@ mod tests {
         let checksum = write_page_with_checksum(&cx, &file, 4096, page, 0xAB);
         let expected = [ExpectedPageChecksum { page, checksum }];
         // The body is intact but its stored checksum was damaged.
-        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).unwrap();
+        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
@@ -962,8 +975,8 @@ mod tests {
         let checksum = crate::checksum::write_page_checksum(&mut third).unwrap();
         let third_page = PageNumber::new(3).unwrap();
         expected.push(ExpectedPageChecksum { page: third_page, checksum });
-        file.write(&cx, &third[..256], 1024).unwrap();
-        file.write(&cx, &[0x54], 612).unwrap();
+        file.write(&cx, &third[..256], 1024).wait().unwrap();
+        file.write(&cx, &[0x54], 612).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: PageNumber::new(2).unwrap() }
@@ -973,7 +986,7 @@ mod tests {
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Mismatch { first_bad_page: third_page }
         );
-        file.write(&cx, &third, 1024).unwrap();
+        file.write(&cx, &third, 1024).wait().unwrap();
         assert_eq!(
             verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
             CheckpointChecksumVerdict::Match

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lryih (scalar residual) — FROM-less pure-scalar searched-CASE `WHEN`
 //! conditions must short-circuit AND/OR left-to-right, exactly like stock
 //! sqlite3 and like the FROM-bearing VDBE codegen path.

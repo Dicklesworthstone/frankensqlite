@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! itcc4.5 differential harness for lazy FTS5 **ranked** reads: fsqlite's
 //! `ORDER BY rank` / `bm25()` on a lazily-bound on-disk index must match stock
 //! SQLite exactly — both the row ORDER and the bm25 score VALUES.

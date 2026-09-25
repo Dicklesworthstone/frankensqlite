@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): a known SCALAR function used with an OVER
 // clause reports stock's "NAME() may not be used as a window function", not
 // "no such function: NAME". An unknown name still says "no such function"; an

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-kon3m residual: a legacy contentless FTS5 table (`content=''` WITHOUT
 //! `contentless_delete=1`) whose structure record was poisoned into origin
 //! tracking by a pre-fix automerge must NOT keep writing 3-column origin

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-printf-unsupported-spec-null-f46wo: printf()/format() must match stock
 //! SQLite's conversion-specifier partition exactly. Differential vs rusqlite
 //! (bundled SQLite 3.53, the authoritative oracle — the sqlite3 CLI 3.46.1 is a

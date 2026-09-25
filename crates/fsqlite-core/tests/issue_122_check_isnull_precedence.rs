@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Regression tests for issue #122: `CHECK ((a IS NULL) = (b IS NULL))`
 //! mis-evaluated because schema normalization stripped the parentheses and
 //! the re-parse regrouped the expression.

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-84rh4 (RELEASE-P0): large-scale churn leaves an in-range page reachable
 //! from neither a b-tree nor the durable freelist — `integrity_check` reports
 //! "Page N: never used" with freelist_count=0. The definitive diagnosis is a

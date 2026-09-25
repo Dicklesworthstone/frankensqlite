@@ -318,3 +318,108 @@ fn circuit_breaker_identity_binds_all_certificate_fields() {
         assert_ne!(digest(&changed), expected);
     }
 }
+
+fn text_literal_intent(bytes: &[u8]) -> IntentOp {
+    IntentOp {
+        schema_epoch: context().schema_epoch,
+        footprint: IntentFootprint::empty(),
+        op: IntentOpKind::UpdateExpression {
+            table: TableId::new(1),
+            key: RowId::new(1),
+            column_updates: vec![(
+                ColumnIdx::new(0),
+                RebaseExpr::Literal(SqliteValue::Text(
+                    fsqlite_types::value::SmallText::from_bytes(bytes),
+                )),
+            )],
+        },
+    }
+}
+
+#[test]
+fn canonical_text_fields_bind_exact_payload_bytes_and_lengths() {
+    let cases: &[&[u8]] = &[
+        b"",
+        b"a\0b",
+        b"\x80",
+        b"\x81",
+        b"\x80\0\x81",
+        b"\xEF\xBF\xBD",
+        "café".as_bytes(),
+    ];
+    for &bytes in cases {
+        let value = SqliteValue::Text(fsqlite_types::value::SmallText::from_bytes(bytes));
+        let mut actual = Vec::new();
+        canonical_sqlite_value_bytes(&mut actual, &value);
+        let mut expected = vec![3];
+        expected.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+        expected.extend_from_slice(bytes);
+        assert_eq!(actual, expected, "TEXT field must contain its exact bytes");
+    }
+}
+
+#[test]
+fn raw_text_intent_digests_distinguish_every_invalid_single_byte() {
+    let mut digests = BTreeSet::new();
+    for byte in 0x80_u8..=0xFF {
+        let raw = [byte];
+        let text = fsqlite_types::value::SmallText::from_bytes(&raw);
+        assert_eq!(text.as_str(), "\u{FFFD}");
+        assert_eq!(text.as_bytes_direct(), &raw);
+        assert!(
+            digests.insert(compute_op_digest(&text_literal_intent(&raw))),
+            "distinct invalid TEXT byte {byte:#04x} shared a proof identity"
+        );
+    }
+    assert_eq!(digests.len(), 128);
+    // A replacement character's valid UTF-8 is not any of the raw payloads.
+    assert!(!digests.contains(&compute_op_digest(&text_literal_intent(
+        "\u{FFFD}".as_bytes(),
+    ))));
+}
+
+#[test]
+fn decoded_history_cannot_substitute_raw_text_under_an_existing_certificate() {
+    let original = text_literal_intent(b"\x80");
+    let cert = generate_merge_certificate(
+        context().merge_kind,
+        context().base_commit_seq,
+        context().schema_epoch,
+        std::slice::from_ref(&original),
+        &pages(),
+        [0x42; 16],
+    )
+    .unwrap();
+    for (op, should_match) in [(original, true), (text_literal_intent(b"\x81"), false)] {
+        let history = CompressedPageHistory {
+            pgno: PageNumber::new(3).unwrap(),
+            versions: vec![
+                CompressedPageVersion {
+                    commit_seq: CommitSeq::new(41),
+                    data: CompressedVersionData::FullImage(vec![0xA5; 512]),
+                },
+                CompressedPageVersion {
+                    commit_seq: CommitSeq::new(40),
+                    data: CompressedVersionData::IntentLogPatch(vec![op]),
+                },
+            ],
+        };
+        let bytes = history.try_to_bytes().unwrap();
+        drop(history);
+        let restored = CompressedPageHistory::from_bytes(&bytes).unwrap();
+        let CompressedVersionData::IntentLogPatch(ops) = &restored.versions[1].data else {
+            panic!("expected persisted intent evidence");
+        };
+        // Context, footprints, routing, and independently supplied page hashes
+        // stay identical; the substituted raw literal alone must invalidate proof.
+        let result = cert.verify_in_context(context(), ops, &pages(), [0x42; 16]);
+        if should_match {
+            assert!(result.is_ok(), "unaltered persisted intent must verify");
+        } else {
+            assert!(matches!(
+                result,
+                Err(CertificateVerificationError::OpDigestMismatch { .. })
+            ));
+        }
+    }
+}

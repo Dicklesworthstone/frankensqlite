@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-s9irk #1: an INTEGER PRIMARY KEY (rowid) duplicate reports
 // SQLite's "UNIQUE constraint failed: <table>.<ipk_col>" — not "PRIMARY KEY
 // constraint failed". Oracle: sqlite3 3.46.1.

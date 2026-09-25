@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-xmpma: an OR-absorbing / AND-absorbing WHERE containing an ERRORING
 //! uncorrelated subquery must fold at compile time (stock semantics) so a bare
 //! aggregate (count(*)) returns a single correctly-aggregated row, not per-row

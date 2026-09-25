@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-j5sft: a multi-key ORDER BY must keep its secondary tie-breaker term
 //! even when the primary key carries an explicit `COLLATE` and the query
 //! projects an *expression* over a *derived table* (subquery source).

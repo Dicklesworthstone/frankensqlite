@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-udetu — where does the instant `database is busy` come from?
 //!
 //! The previous probe established two things: `busy_timeout` IS honoured (an

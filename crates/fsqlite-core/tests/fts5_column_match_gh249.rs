@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #249 (bd-gh-fts5-column-match): a column-restricted FTS5 `<col> MATCH <q>`
 //! must search only the named column, like stock SQLite.
 //!

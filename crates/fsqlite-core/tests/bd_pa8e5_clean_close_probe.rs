@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pa8e5 — is the "corruption" real, or an artifact of reading the database
 //! with stock SQLite while our own connections are still open?
 //!

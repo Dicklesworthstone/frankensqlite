@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Public SQL coverage for durable, caller-runtime-owned WAL-FEC generation.
 #![cfg(all(feature = "native", not(target_arch = "wasm32")))]
 

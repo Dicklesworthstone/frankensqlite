@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-sw2k5 — `PRAGMA journal_mode` round-trip for the rollback-journal modes.
 //!
 //! `journal_mode` accepts all of SQLite's modes; setting one returns the mode

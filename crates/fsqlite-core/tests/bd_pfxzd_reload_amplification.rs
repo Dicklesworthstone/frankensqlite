@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pfxzd (GH#368) regression guard: the per-write in-txn memdb refresh must
 //! take the schema-cookie fast path (bd-ixf69), so N single-row INSERTs inside
 //! ONE explicit transaction do NOT each trigger a full `sqlite_master` scan.

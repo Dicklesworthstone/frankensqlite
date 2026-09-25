@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pa8e5 — is it CREATE INDEX that corrupts the index, or ordinary writes to
 //! an indexed table while a checkpoint runs?
 //!

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2): CREATE INDEX / CREATE TRIGGER on a missing
 // target table schema-qualifies the "no such table" error (default "main."),
 // unlike SELECT/DROP/ALTER which stay unqualified. Oracle: sqlite3 3.46.1 +

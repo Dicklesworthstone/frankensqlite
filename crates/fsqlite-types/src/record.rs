@@ -7,6 +7,11 @@
 //!
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
+// This module defines the record codecs that the workspace `clippy.toml`
+// disallows elsewhere; the UTF-8 entry points are thin wrappers over the
+// encoding-aware ones, and the tests exercise both.
+#![allow(clippy::disallowed_methods)]
+
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;

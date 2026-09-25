@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-65oac: `INSERT ... ON CONFLICT(<pk>) DO UPDATE/NOTHING` on a WITHOUT
 //! ROWID table must accept the PRIMARY KEY as a valid conflict arbiter.
 //!

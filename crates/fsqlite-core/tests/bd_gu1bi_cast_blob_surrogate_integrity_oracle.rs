@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gu1bi (REVIEW3-P1) acceptance keeper: `PRAGMA integrity_check` on a **stock
 //! UTF-16** database must agree with stock sqlite3 ("ok") for the two index
 //! shapes whose recomputed key needs the DB-ENCODED bytes, not canonical text:

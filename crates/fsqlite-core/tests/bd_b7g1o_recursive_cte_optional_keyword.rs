@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-b7g1o: SQLite treats the `RECURSIVE` keyword as optional — a
 //! self-referencing CTE (`WITH cte AS (... FROM cte ...)`) is recursive whether
 //! or not `RECURSIVE` was written. Before the fix, frank required the keyword and

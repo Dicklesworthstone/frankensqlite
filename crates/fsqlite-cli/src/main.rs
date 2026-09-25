@@ -949,8 +949,8 @@ where
         // Connection::query returns only the final statement's rows. Execute
         // one parser-delimited statement at a time so every result is printed
         // and a later error cannot discard earlier output or side effects.
-        let tail_offset = match parser.parse_next_statement_with_tail() {
-            Ok(Some((_, tail_offset))) => tail_offset,
+        let (statement, tail_offset) = match parser.parse_next_statement_with_tail() {
+            Ok(Some(parsed)) => parsed,
             Ok(None) => return true,
             Err(error) => {
                 let error = Connection::parse_error_to_franken_error(sql, error);
@@ -959,7 +959,13 @@ where
             }
         };
         let statement_sql = sql[statement_start..tail_offset].trim_start();
-        let column_names = infer_result_column_names(connection, statement_sql).await;
+        // Preparing only to learn column names costs a full snapshot refresh;
+        // statements that cannot return rows have none to learn.
+        let column_names = if statement_may_return_rows(&statement) {
+            infer_result_column_names(connection, statement_sql).await
+        } else {
+            None
+        };
         let timer = output_options.timer.then(StatementTimer::start);
         match connection.query(statement_sql).await {
             Ok(rows) => {
@@ -1351,6 +1357,18 @@ fn render_csv_field(value: &[u8]) -> Vec<u8> {
         quoted
     } else {
         value.to_vec()
+    }
+}
+
+/// Whether `statement` can produce result rows (and so result column names).
+fn statement_may_return_rows(statement: &fsqlite_ast::Statement) -> bool {
+    use fsqlite_ast::Statement;
+    match statement {
+        Statement::Select(_) | Statement::Pragma(_) | Statement::Explain { .. } => true,
+        Statement::Insert(insert) => !insert.returning.is_empty(),
+        Statement::Update(update) => !update.returning.is_empty(),
+        Statement::Delete(delete) => !delete.returning.is_empty(),
+        _ => false,
     }
 }
 

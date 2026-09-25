@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Keeper for bd-p1h2r (parity): rowid-key collisions and `UPDATE ... SET
 //! rowid = <expr>` on rowid tables, checked against stock SQLite.
 //!

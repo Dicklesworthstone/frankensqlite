@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-yqjjx item (5) — WITHOUT ROWID, non-leading PRIMARY KEY, ALTER ADD COLUMN,
 //! reopened from disk.
 //!

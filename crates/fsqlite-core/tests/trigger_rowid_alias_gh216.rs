@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #216 / #205 (bd-gh-trigger-rowid-alias): `OLD.rowid` / `NEW.rowid`
 //! inside a trigger body must resolve to the affected row's rowid, even when
 //! the table has no explicit `INTEGER PRIMARY KEY` alias for the rowid.

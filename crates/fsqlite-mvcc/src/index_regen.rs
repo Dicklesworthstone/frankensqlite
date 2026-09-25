@@ -240,29 +240,20 @@ fn eval_case(
     }
 }
 
-/// Check if two `SqliteValue`s are equal using SQLite semantics (NULL != NULL).
-/// SQLite equality uses exact comparison for floats (no epsilon), and NULL != NULL.
-#[allow(clippy::float_cmp)]
+/// SQLite equality with NULL excluded, using the shared precision-preserving
+/// numeric comparison rather than rounding integers through `f64`.
 fn sqlite_values_equal(a: &SqliteValue, b: &SqliteValue) -> bool {
-    match (a, b) {
-        (SqliteValue::Integer(x), SqliteValue::Integer(y)) => x == y,
-        (SqliteValue::Float(x), SqliteValue::Float(y)) => x == y,
-        #[allow(clippy::cast_precision_loss)]
-        (SqliteValue::Integer(x), SqliteValue::Float(y))
-        | (SqliteValue::Float(y), SqliteValue::Integer(x)) => *x as f64 == *y,
-        (SqliteValue::Text(x), SqliteValue::Text(y)) => x == y,
-        (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x == y,
-        // NULL != anything (including NULL), and different type groups are not equal.
-        _ => false,
-    }
+    a.unique_eq(b)
 }
 
-/// SQLite truthiness: C SQLite uses integer truncation (`sqlite3VdbeIntValue`),
-/// so 0.5 is falsy (truncates to 0), 1.5 is truthy (truncates to 1).
+/// SQLite boolean conversion tests the numeric value against zero. It does
+/// not truncate fractional values (`sqlite3VdbeBooleanValue`).
+#[allow(clippy::float_cmp)]
 fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
     match v {
         SqliteValue::Null => false,
-        v => v.to_integer() != 0,
+        SqliteValue::Integer(value) => *value != 0,
+        value => value.to_float() != 0.0,
     }
 }
 
@@ -344,7 +335,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::BitwiseOr => integer_bitop(&left, &right, |a, b| a | b),
         #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftLeft => integer_bitop(&left, &right, |a, b| {
-            let shift = b.unsigned_abs() as u32;
+            let shift = b.unsigned_abs();
             if shift >= 64 {
                 if b < 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
@@ -355,7 +346,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         }),
         #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftRight => integer_bitop(&left, &right, |a, b| {
-            let shift = b.unsigned_abs() as u32;
+            let shift = b.unsigned_abs();
             if shift >= 64 {
                 if b >= 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
@@ -367,12 +358,16 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn numeric_div(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
     if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
         if *b == 0 {
             return SqliteValue::Null;
         }
-        SqliteValue::Integer(a.wrapping_div(*b))
+        match a.checked_div(*b) {
+            Some(result) => SqliteValue::Integer(result),
+            None => SqliteValue::from(*a as f64 / *b as f64),
+        }
     } else {
         let fb = r.to_float();
         if fb == 0.0 {
@@ -521,37 +516,9 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
     }
 }
 
-/// Compare two non-NULL `SqliteValue`s using SQLite ordering rules.
+/// Compare using the same SQLite ordering as ordinary value evaluation.
 fn sqlite_value_compare(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    // SQLite sort order: NULL < INTEGER/REAL < TEXT < BLOB
-    fn type_order(v: &SqliteValue) -> u8 {
-        match v {
-            SqliteValue::Null => 0,
-            SqliteValue::Integer(_) | SqliteValue::Float(_) => 1,
-            SqliteValue::Text(_) => 2,
-            SqliteValue::Blob(_) => 3,
-        }
-    }
-
-    let ta = type_order(a);
-    let tb = type_order(b);
-    if ta != tb {
-        return ta.cmp(&tb);
-    }
-
-    match (a, b) {
-        (SqliteValue::Integer(x), SqliteValue::Integer(y)) => x.cmp(y),
-        (SqliteValue::Float(x), SqliteValue::Float(y)) => x.total_cmp(y),
-        #[allow(clippy::cast_precision_loss)]
-        (SqliteValue::Integer(x), SqliteValue::Float(y)) => (*x as f64).total_cmp(y),
-        #[allow(clippy::cast_precision_loss)]
-        (SqliteValue::Float(x), SqliteValue::Integer(y)) => x.total_cmp(&(*y as f64)),
-        (SqliteValue::Text(x), SqliteValue::Text(y)) => x.cmp(y),
-        (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x.cmp(y),
-        _ => Ordering::Equal,
-    }
+    a.cmp(b)
 }
 
 // ── Index key encoding ───────────────────────────────────────────────────────
@@ -560,6 +527,9 @@ fn sqlite_value_compare(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering 
 ///
 /// Applies SQLite affinity coercion per the index column's declared affinity,
 /// then serializes the result using the SQLite record format.
+// UTF-8 databases only: not yet wired into execution; it must take the
+// database encoding before it is.
+#[allow(clippy::disallowed_methods)]
 pub fn compute_index_key(
     index_def: &IndexDef,
     row: &[SqliteValue],
@@ -718,7 +688,9 @@ pub fn discard_stale_index_ops(
 /// - For each index, checks participation and key changes
 /// - Emits the minimal set of `IndexInsert`/`IndexDelete` ops
 /// - Enforces UNIQUE constraints via the provided checker
-#[allow(clippy::too_many_lines)]
+// UTF-8 databases only: not yet wired into execution; it must take the
+// database encoding before it is.
+#[allow(clippy::too_many_lines, clippy::disallowed_methods)]
 pub fn regenerate_index_ops(
     base_record: &[u8],
     column_updates: &[(ColumnIdx, RebaseExpr)],
@@ -833,6 +805,7 @@ pub fn regenerate_index_ops(
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -1635,5 +1608,167 @@ mod tests {
             ),
             "bead_id={BEAD_ID} btreemap_unique"
         );
+    }
+
+    #[test]
+    fn rebase_fractional_predicates_preserve_partial_index_participation() {
+        let mut index = ordinary_index(
+            201,
+            1,
+            &[(0, TypeAffinity::Integer)],
+            false,
+            vec![TypeAffinity::Integer, TypeAffinity::Blob],
+        );
+        index.where_predicate = Some(RebaseExpr::ColumnRef(ColumnIdx::new(1)));
+        for fraction in [
+            SqliteValue::Float(0.5),
+            SqliteValue::Float(-0.5),
+            SqliteValue::from("0.5suffix"),
+            SqliteValue::Blob(b"1e-3".as_slice().into()),
+        ] {
+            let empty = record_bytes(&[SqliteValue::Integer(7), SqliteValue::Integer(0)]);
+            let insert = regenerate_index_ops(
+                &empty,
+                &[(ColumnIdx::new(1), RebaseExpr::Literal(fraction.clone()))],
+                std::slice::from_ref(&index),
+                RowId::new(7),
+                &NoOpUniqueChecker,
+            )
+            .unwrap();
+            assert!(matches!(
+                insert.ops.as_slice(),
+                [IntentOpKind::IndexInsert { .. }]
+            ));
+            let occupied = record_bytes(&[SqliteValue::Integer(7), fraction]);
+            let delete = regenerate_index_ops(
+                &occupied,
+                &[(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(0)))],
+                std::slice::from_ref(&index),
+                RowId::new(7),
+                &NoOpUniqueChecker,
+            )
+            .unwrap();
+            assert!(matches!(
+                delete.ops.as_slice(),
+                [IntentOpKind::IndexDelete { .. }]
+            ));
+        }
+        for value in [
+            SqliteValue::Null,
+            SqliteValue::Float(-0.0),
+            SqliteValue::from("abc"),
+        ] {
+            assert!(!row_participates(&index, &[SqliteValue::Integer(7), value]).unwrap());
+        }
+    }
+
+    #[test]
+    fn rebase_case_not_and_nullif_share_sqlite_value_semantics() {
+        let expression = RebaseExpr::Case {
+            operand: None,
+            when_clauses: vec![(
+                RebaseExpr::Literal(SqliteValue::Float(0.5)),
+                RebaseExpr::Literal(SqliteValue::Integer(7)),
+            )],
+            else_clause: Some(Box::new(RebaseExpr::Literal(SqliteValue::Integer(9)))),
+        };
+        assert_eq!(
+            eval_rebase_expr(&expression, &[]).unwrap().as_integer(),
+            Some(7),
+        );
+        assert_eq!(
+            eval_unary_op(RebaseUnaryOp::Not, SqliteValue::Float(0.5)).as_integer(),
+            Some(0),
+        );
+        assert!(eval_unary_op(RebaseUnaryOp::Not, SqliteValue::Null).is_null());
+        let expression = RebaseExpr::NullIf {
+            left: Box::new(RebaseExpr::Literal(SqliteValue::Integer(9_007_199_254_740_993))),
+            right: Box::new(RebaseExpr::Literal(SqliteValue::Float(9_007_199_254_740_992.0))),
+        };
+        assert_eq!(
+            eval_rebase_expr(&expression, &[]).unwrap().as_integer(),
+            Some(9_007_199_254_740_993),
+        );
+    }
+
+    #[test]
+    fn rebase_numeric_order_does_not_round_large_integers() {
+        let integer = SqliteValue::Integer(9_007_199_254_740_993);
+        let real = SqliteValue::Float(9_007_199_254_740_992.0);
+        assert_eq!(
+            sqlite_value_compare(&integer, &real),
+            std::cmp::Ordering::Greater,
+        );
+        assert_eq!(
+            sqlite_value_compare(&real, &integer),
+            std::cmp::Ordering::Less,
+        );
+        assert!(!sqlite_values_equal(&integer, &real));
+        assert!(!sqlite_values_equal(&SqliteValue::Null, &SqliteValue::Null));
+        assert_eq!(
+            eval_function("max", &[real.clone(), integer.clone()])
+                .unwrap()
+                .as_integer(),
+            Some(9_007_199_254_740_993),
+        );
+        assert_eq!(
+            eval_function("min", &[integer, real]).unwrap().as_float(),
+            Some(9_007_199_254_740_992.0),
+        );
+        assert_eq!(
+            sqlite_value_compare(&SqliteValue::Float(-0.0), &SqliteValue::Float(0.0)),
+            std::cmp::Ordering::Equal,
+        );
+    }
+
+    #[test]
+    fn rebase_integer_division_overflow_promotes_and_large_shifts_do_not_wrap() {
+        assert_eq!(
+            eval_binary_op(
+                RebaseBinaryOp::Divide,
+                SqliteValue::Integer(i64::MIN),
+                SqliteValue::Integer(-1),
+            )
+            .as_float(),
+            Some(9_223_372_036_854_775_808.0),
+        );
+        assert!(
+            eval_binary_op(
+                RebaseBinaryOp::Divide,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(0),
+            )
+            .is_null()
+        );
+        for (shift, left_positive, left_negative, right_positive, right_negative) in [
+            (4_294_967_296_i64, 0, 0, 0, -1),
+            (-4_294_967_296_i64, 0, -1, 0, 0),
+            (i64::MAX, 0, 0, 0, -1),
+            (i64::MIN, 0, -1, 0, 0),
+        ] {
+            for (value, expected_left, expected_right) in [
+                (1, left_positive, right_positive),
+                (-1, left_negative, right_negative),
+            ] {
+                assert_eq!(
+                    eval_binary_op(
+                        RebaseBinaryOp::ShiftLeft,
+                        SqliteValue::Integer(value),
+                        SqliteValue::Integer(shift),
+                    )
+                    .as_integer(),
+                    Some(expected_left),
+                );
+                assert_eq!(
+                    eval_binary_op(
+                        RebaseBinaryOp::ShiftRight,
+                        SqliteValue::Integer(value),
+                        SqliteValue::Integer(shift),
+                    )
+                    .as_integer(),
+                    Some(expected_right),
+                );
+            }
+        }
     }
 }

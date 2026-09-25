@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: LIKE / GLOB pattern matching vs rusqlite (bundled
 //! SQLite 3.53). A probe sweep found this surface stock-correct across 20 cases;
 //! this keeper locks it in.

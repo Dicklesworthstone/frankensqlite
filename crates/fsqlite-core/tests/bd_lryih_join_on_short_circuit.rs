@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-lryih (P9 residual) — a JOIN-ON constraint of the shape
 //! `ON (0 AND E) OR <eq>` must match stock sqlite3: the constant-false
 //! `0 AND E` conjunct folds to FALSE at prepare, so the erroring uncorrelated

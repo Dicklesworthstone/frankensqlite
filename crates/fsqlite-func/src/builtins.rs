@@ -1710,7 +1710,7 @@ impl ScalarFunction for ScalarMaxFunc {
                 (SqliteValue::Text(left), SqliteValue::Text(right), Some(collation)) => {
                     Some(collation.compare(left.as_bytes(), right.as_bytes()))
                 }
-                _ => arg.partial_cmp(max),
+                _ => Some(arg.cmp_binary_in(max, statement_text_encoding())),
             };
             if ordering == Some(std::cmp::Ordering::Greater) {
                 max = arg;
@@ -1760,7 +1760,7 @@ impl ScalarFunction for ScalarMinFunc {
                 (SqliteValue::Text(left), SqliteValue::Text(right), Some(collation)) => {
                     Some(collation.compare(left.as_bytes(), right.as_bytes()))
                 }
-                _ => arg.partial_cmp(min),
+                _ => Some(arg.cmp_binary_in(min, statement_text_encoding())),
             };
             // SQLite's scalar min() selects the later argument on a tie. This
             // is observable when equal numeric values use different storage

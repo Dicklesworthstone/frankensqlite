@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-printf-negative-zero-era4w (GH #258): printf/format must normalize
 //! signed zero for %f/%e/%g like C SQLite (`-0.0` renders as `0`, not `-0`),
 //! including sign flags (`%+g` -> `+0`, `% g` -> ` 0`), width, and

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! frankensim-lnbzs: parameters referenced inside subqueries under a
 //! WHERE clause attached to a FROM-less SELECT must bind. sqlite3
 //! returns rows for every shape below; fsqlite silently returned zero

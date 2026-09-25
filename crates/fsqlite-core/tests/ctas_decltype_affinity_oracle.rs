@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-ctas-decltype-affinity-nmexg (GH #179): CREATE TABLE AS SELECT must
 //! give each target column the affinity of the SELECT result-column decltype
 //! (from the AST), not the storage class of the first materialized value. A

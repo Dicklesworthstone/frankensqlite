@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Session 55 conformance oracle tests — FK cascades, multi-way JOINs, CTE aggregates,
 //! expression edges, complex UPDATEs, triggers, typeof, CAST, LIKE, BETWEEN, IN list edges.
 

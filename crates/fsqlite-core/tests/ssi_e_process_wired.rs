@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Integration tests for the SSI e-process gate wired into the real
 //! commit path. These tests cover the "does it actually skip?" behaviour
 //! (separate from the API-level contract covered in

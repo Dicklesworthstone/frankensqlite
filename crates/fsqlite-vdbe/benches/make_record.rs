@@ -1,3 +1,6 @@
+// Benchmarks measure the UTF-8 record codecs directly.
+#![allow(clippy::disallowed_methods)]
+
 use std::hint::black_box;
 use std::sync::Arc;
 

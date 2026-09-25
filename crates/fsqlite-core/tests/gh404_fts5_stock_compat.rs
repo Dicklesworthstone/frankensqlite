@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#404 / bd-jdq9v — FTS5 `%_data` stock-compatibility keeper.
 //!
 //! An fsqlite-written multi-leaf-page FTS5 index must be readable and

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#360 / bd-lmw9y end-to-end keeper: FrankenSQLite's lazy on-disk FTS5 reader
 //! must read a doclist that stock SQLite split across leaf pages.
 //!

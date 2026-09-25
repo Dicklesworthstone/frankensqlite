@@ -4,10 +4,10 @@
 //!
 //! 1. **`PageHistory` Objects (§5.10.6):** Compressed version chains where the
 //!    newest committed version is stored as a full page image. Older versions are
-//!    currently stored as full images too. Structured patches have a lossless
-//!    wire codec, but are not generated automatically: semantic replay alone
-//!    does not preserve every byte of a historical page. Encoded as ECS objects
-//!    for repair and remote fetching.
+//!    currently stored as full images too. Intent and structured patches have
+//!    lossless wire codecs, but are not generated automatically: semantic replay
+//!    alone does not preserve every byte of a historical page. Encoded as ECS
+//!    objects for repair and remote fetching.
 //!
 //! 2. **Intent Commutativity (§5.10.7):** Mazurkiewicz trace-monoid formalization
 //!    of when intent operations commute. Defines the independence relation
@@ -30,6 +30,7 @@ use fsqlite_types::{
 use crate::physical_merge::StructuredPagePatch;
 
 pub mod compact;
+mod intent_codec;
 mod structured_codec;
 #[cfg(test)]
 mod certificate_tests;
@@ -61,9 +62,9 @@ pub struct CompressedPageVersion {
 
 /// Compressed page history: newest version is always a full image.
 ///
-/// Older versions are full images in the current encoder. Patch variants are
-/// retained in the type so the ECS format can grow into intent/structured
-/// patches without changing the outer object shape.
+/// Older versions are full images in the current compressor. Caller-supplied
+/// intent and structured patches have lossless, versioned payload codecs;
+/// decoding a patch does not establish its replay eligibility.
 ///
 /// This is the ECS-integrated representation from §5.10.6. Hot pages encode
 /// their patch chains as these objects for bounded memory, repairability, and
@@ -172,17 +173,17 @@ impl CompressedPageHistory {
             .expect("page history must have a lossless wire representation")
     }
 
-    /// Encode without dropping unsupported mutation evidence or truncating lengths.
+    /// Encode without dropping mutation evidence or truncating lengths.
     /// Full-image and empty-placeholder wire bytes remain unchanged. Nonempty
-    /// structured patches use the versioned SPP1 payload; old readers reject it.
-    /// The intent digest encoding is not a reversible serialization of a full
-    /// `IntentOp`, so nonempty intent patches are refused, not written as history.
+    /// structured and intent patches use versioned SPP1 and ILP1 payloads,
+    /// respectively. Intent payloads preserve complete operations and footprints,
+    /// not the separate digest-only encoding used by merge certificates.
     ///
     /// # Errors
     ///
     /// Returns an error for an empty history, a non-full newest version,
-    /// unrepresentable lengths, oversized structured patches, or nonempty intent
-    /// patches whose lossless wire representation is not implemented.
+    /// unrepresentable lengths, oversized patches, unknown structural flags,
+    /// or intent expressions exceeding the depth/node limits.
     pub fn try_to_bytes(&self) -> Result<Vec<u8>, HistoryCompressionError> {
         let newest = self
             .versions
@@ -211,13 +212,8 @@ impl CompressedPageHistory {
                     buf.extend_from_slice(img);
                 }
                 CompressedVersionData::IntentLogPatch(ops) => {
-                    if !ops.is_empty() {
-                        return Err(HistoryCompressionError::DecodeError(
-                            "nonempty intent history cannot be serialized losslessly".to_owned(),
-                        ));
-                    }
                     buf.push(TAG_INTENT_LOG_PATCH);
-                    let payload = canonical_intent_ops_bytes(ops);
+                    let payload = intent_codec::encode(ops)?;
                     let len = wire_len(payload.len())?;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(&payload);
@@ -302,15 +298,7 @@ impl CompressedPageHistory {
             let version_data = match tag {
                 TAG_FULL_IMAGE => CompressedVersionData::FullImage(payload.to_vec()),
                 TAG_INTENT_LOG_PATCH => {
-                    // Intent patch decoding is intentionally limited until the
-                    // canonical wire parser is implemented. Accept only empty
-                    // placeholders; accepting non-empty bytes would silently
-                    // drop mutation ops and make historical reconstruction
-                    // wrong.
-                    if !(payload.is_empty() || payload == 0u32.to_le_bytes().as_slice()) {
-                        return Err(err("intent log patch payload decode not implemented"));
-                    }
-                    CompressedVersionData::IntentLogPatch(Vec::new())
+                    CompressedVersionData::IntentLogPatch(intent_codec::decode(payload)?)
                 }
                 TAG_STRUCTURED_PATCH => {
                     CompressedVersionData::StructuredPatch(structured_codec::decode(payload)?)
@@ -339,7 +327,8 @@ impl CompressedPageHistory {
     }
 }
 
-/// Serialize intent ops to canonical binary bytes (deterministic for ECS encoding).
+/// Legacy digest stream retained only to test that it is not decoded as history.
+#[cfg(test)]
 fn canonical_intent_ops_bytes(ops: &[IntentOp]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(ops.len() * 32);
     #[allow(clippy::cast_possible_truncation)]
@@ -1476,7 +1465,8 @@ fn canonical_sqlite_value_bytes(buf: &mut Vec<u8>, val: &SqliteValue) {
             #[allow(clippy::cast_possible_truncation)]
             let len = s.len() as u32;
             buf.extend_from_slice(&len.to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
+            // Bind stored bytes, not SmallText's lossy str view of raw TEXT.
+            buf.extend_from_slice(s.as_bytes_direct());
         }
         SqliteValue::Blob(b) => {
             buf.push(4);

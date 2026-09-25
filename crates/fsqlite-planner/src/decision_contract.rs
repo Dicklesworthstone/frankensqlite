@@ -701,6 +701,7 @@ mod tests {
             source: StatsSource::Analyze,
             partial_where: None,
             expression_columns: vec![],
+            rows_per_key: Vec::new(),
         }]
     }
 

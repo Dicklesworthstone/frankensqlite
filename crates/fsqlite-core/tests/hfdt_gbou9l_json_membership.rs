@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! SQL-engine regression for truth-tested JSON membership; no financial data.
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use fsqlite_core::connection::Connection;

@@ -1,5 +1,8 @@
 // Some SQL literals here ('{x:...}') look like format args to clippy.
 #![allow(clippy::literal_string_with_formatting_args)]
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
 //! bd-p9nhq (GH#180 residual) differential oracle — REFUTES the bead premise.
 //!
 //! GH#180's CORE bug (BLOB->TEXT->BLOB dropping raw bytes to U+FFFD) was fixed by

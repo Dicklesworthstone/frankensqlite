@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2-g8v6e leaf (b)): stock SQLite reserves object
 // names beginning with "sqlite_" (case-insensitive) for internal use. A user
 // CREATE of a table, index, view, or trigger with such a name fails with the

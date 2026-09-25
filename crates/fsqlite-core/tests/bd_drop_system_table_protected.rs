@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2): DROP of a system table reports stock's
 // "table <name> may not be dropped" (beats IF EXISTS; DROP VIEW on sqlite_master
 // gives the same). sqlite_master is always protected; sqlite_sequence is

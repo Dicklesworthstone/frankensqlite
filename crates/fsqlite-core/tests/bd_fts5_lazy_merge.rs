@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-fts5-lazy-shadow-reads-itcc4.3 merge policy — e2e keeper.
 //!
 //! FrankenSQLite inserts past `automerge` into a lazy `contentless_delete` FTS5

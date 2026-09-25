@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #338 (bd-qfag9): a single connection running ONE explicit transaction
 //! that copies rows out of a table and then drops that same source table must
 //! not fail `COMMIT` with a `BusySnapshot` self-conflict.

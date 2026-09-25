@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH#358 lazy-rebind readiness: a broad cross-engine conformance check for the
 //! lazy on-disk FTS5 read path.
 //!

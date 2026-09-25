@@ -233,9 +233,11 @@ impl CollationRegistry {
     /// applications may replace even `BINARY`, `NOCASE`, or `RTRIM`.
     #[must_use]
     pub fn uses_builtin_implementation(&self, name: &str) -> bool {
-        let canon = name.to_ascii_uppercase();
-        matches!(canon.as_str(), "BINARY" | "NOCASE" | "RTRIM")
-            && !self.custom_collations.contains_key(&canon)
+        // Allocation-free: comparators call this per key comparison.
+        ["BINARY", "NOCASE", "RTRIM"]
+            .into_iter()
+            .find(|builtin| name.eq_ignore_ascii_case(builtin))
+            .is_some_and(|builtin| !self.custom_collations.contains_key(builtin))
     }
 
     /// Whether any built-in collation name (`BINARY`, `NOCASE`, `RTRIM`) is

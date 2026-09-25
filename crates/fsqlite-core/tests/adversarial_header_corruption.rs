@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-zywqc.14 adversarial corpus — database-header corruption.
 //!
 //! Corrupt a critical field of the 100-byte SQLite header (the 16-byte magic

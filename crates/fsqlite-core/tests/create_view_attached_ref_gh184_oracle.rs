@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #184 (bd-qfgsa): a *persistent* (non-TEMP) `CREATE VIEW` whose body
 //! references an ATTACHED database must be rejected at prepare, matching stock
 //! SQLite. A `CREATE TEMP VIEW` may reference an attached database.

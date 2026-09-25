@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-parser-syntax-error-format-6w6kp, Part B: expression-position catch-all
 // unexpected tokens). An unexpected token in expression position now reports stock's
 // `near "<lexeme>": syntax error`; an unexpected end-of-input reports `incomplete

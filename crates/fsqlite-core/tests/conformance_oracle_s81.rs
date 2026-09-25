@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 81 (cc4 JOIN + planner + edge cases)
 //!
 //! Targeted probes after PLANNER-3 join-order permutation landed:

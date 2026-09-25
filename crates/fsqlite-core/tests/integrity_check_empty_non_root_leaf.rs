@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-y5urj: `PRAGMA integrity_check` must flag an empty non-root B-tree leaf
 //! that is still referenced by its parent — stock sqlite3 3.46.1 calls that
 //! shape malformed (it cannot even parse the page: `integrity_check`,

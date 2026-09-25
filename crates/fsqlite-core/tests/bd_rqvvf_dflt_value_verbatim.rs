@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-pragma-table-info-dflt-source-rqvvf: PRAGMA table_info's
 // dflt_value must report a parenthesized DEFAULT's VERBATIM inner source (outer
 // paren pair stripped, whitespace trimmed, exact text preserved) rather than an

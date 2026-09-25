@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-nd2ju / GH#377: WITHOUT ROWID single-column PRIMARY KEY
 // equality seeks the table b-tree (SEARCH ... USING PRIMARY KEY) instead of
 // full-scanning every row. Oracle: rusqlite bundled SQLite.

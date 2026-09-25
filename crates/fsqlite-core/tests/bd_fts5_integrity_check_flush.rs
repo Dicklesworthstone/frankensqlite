@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-fts5-lazy-shadow-reads-itcc4.3 special commands: `'integrity-check'` and
 //! `'flush'`.
 //!

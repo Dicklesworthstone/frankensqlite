@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Issue #111 — differential FK/conflict oracle for the direct-insert lane.
 //!
 //! The #111 fix lets explicit-rowid FK-checked INSERTs stay on the

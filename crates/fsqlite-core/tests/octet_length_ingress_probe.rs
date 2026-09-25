@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-rwaxp: `octet_length` over a large overflow payload must read only the
 //! record-header serial type — never materialize the overflow chain.
 //!

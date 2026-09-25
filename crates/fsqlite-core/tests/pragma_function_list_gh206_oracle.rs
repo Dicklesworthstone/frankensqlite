@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #206 (bd-gh-pragma-introspection-29g0a): `PRAGMA function_list` returned
 //! an empty result — function introspection reported no registered SQL
 //! functions. It must return a non-empty catalog of the built-in functions.

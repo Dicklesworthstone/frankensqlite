@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-pa8e5 — when a retried CREATE INDEX leaves a malformed index, WHICH side
 //! diverged: the durable database, or this connection's local schema?
 //!

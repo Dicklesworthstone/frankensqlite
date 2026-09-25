@@ -1181,6 +1181,10 @@ impl Vfs for IoUringVfs {
         self.unix.path_entry_exists(cx, path)
     }
 
+    fn path_file_identity(&self, cx: &Cx, path: &Path) -> Result<Option<FileIdentity>> {
+        self.unix.path_file_identity(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.unix.full_pathname(cx, path)
     }
@@ -1318,6 +1322,10 @@ impl VfsFile for IoUringFile {
 
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
         self.inner.shm_map(cx, region, size, extend)
+    }
+
+    fn holds_main_wal_lifetime_read_lock(&self) -> bool {
+        self.inner.holds_main_wal_lifetime_read_lock()
     }
 
     fn mvcc_shm_map(&mut self, cx: &Cx, payload_bytes: u64, create: bool) -> Result<ShmRegion> {

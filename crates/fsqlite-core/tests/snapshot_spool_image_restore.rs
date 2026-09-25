@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Native SQL -> authenticated packet journal -> reopened SQLite image.
 //!
 //! Local/RCH oracle keeper, not an Actions or power-loss certification claim.

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — type affinity & coercion corners (cc_3)
 //!
 //! SQLite's column affinity, comparison affinity, CAST semantics, and arithmetic

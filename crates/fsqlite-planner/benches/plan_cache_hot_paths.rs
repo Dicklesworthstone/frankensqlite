@@ -28,6 +28,7 @@ fn index_info(name: &str, table: &str, columns: &[&str], unique: bool, n_pages: 
         source: StatsSource::Heuristic,
         partial_where: None,
         expression_columns: vec![],
+        rows_per_key: Vec::new(),
     }
 }
 

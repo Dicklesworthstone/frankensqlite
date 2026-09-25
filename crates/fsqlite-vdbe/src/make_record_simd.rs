@@ -8,6 +8,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::try_serialize_integer_record_iter_into;
     use fsqlite_types::record::serialize_record;

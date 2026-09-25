@@ -32,13 +32,14 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, parse_record_prefix,
-    parse_record_projected_column_offsets,
+    parse_record_projected_column_offsets, parse_record_with_encoding,
 };
+use fsqlite_types::value::binary_text_cmp;
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
 use fsqlite_types::sync_primitives::Instant;
-use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
+use fsqlite_types::{PageData, PageNumber, SqliteValue, TextEncoding, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -2107,6 +2108,8 @@ pub struct BtCursor<P> {
     index_collations: Vec<Option<String>>,
     /// Shared collation registry used by text-key comparisons.
     collation_registry: Arc<Mutex<CollationRegistry>>,
+    /// Database text encoding of the stored keys, for collated comparisons.
+    index_text_encoding: TextEncoding,
     /// Page stack from root to current leaf.
     stack: CursorStack,
     /// Whether the cursor is at EOF (past the last entry).
@@ -2716,6 +2719,7 @@ impl<P: PageReader> BtCursor<P> {
             // that need custom collations still override via
             // `set_index_collation_context`.
             collation_registry: Arc::clone(default_collation_registry()),
+            index_text_encoding: TextEncoding::Utf8,
             // Most cursor lifetimes stay within root/interior/leaf depth, and
             // the prepared direct-insert append lane can complete without ever
             // pushing a stack entry. Keep shallow descents inline so both paths
@@ -2739,14 +2743,17 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    /// Attach per-index collation metadata and a shared registry.
+    /// Attach per-index collation metadata, a shared registry, and the
+    /// database text encoding the keys are stored in.
     pub fn set_index_collation_context(
         &mut self,
         index_collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
+        text_encoding: TextEncoding,
     ) {
         self.index_collations = index_collations;
         self.collation_registry = collation_registry;
+        self.index_text_encoding = text_encoding;
     }
 
     /// Returns the descending-key metadata for index cursors.
@@ -4738,7 +4745,7 @@ impl<P: PageReader> BtCursor<P> {
         // probe) without any real scratch regression.
         let parsed_target = {
             let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-            parse_record(target)
+            self.decode_index_key_for_compare(target)
         };
 
         while lo < hi {
@@ -4799,7 +4806,7 @@ impl<P: PageReader> BtCursor<P> {
         // probe) without any real scratch regression.
         let parsed_target = {
             let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-            parse_record(target)
+            self.decode_index_key_for_compare(target)
         };
 
         while lo < hi {
@@ -4843,6 +4850,30 @@ impl<P: PageReader> BtCursor<P> {
         )
     }
 
+    /// The encoding collated index keys are compared in: canonical text of the
+    /// database encoding when a UTF-16 index declares a collation (stock
+    /// applies NOCASE/RTRIM to UTF-8 and BINARY to the stored bytes), else the
+    /// stored bytes themselves (`Utf8` = memcmp).
+    fn index_key_compare_encoding(&self) -> TextEncoding {
+        if !matches!(self.index_text_encoding, TextEncoding::Utf8)
+            && self.index_collations.iter().any(Option::is_some)
+        {
+            self.index_text_encoding
+        } else {
+            TextEncoding::Utf8
+        }
+    }
+
+    /// Decode an index key consistently with [`Self::index_key_compare_encoding`].
+    // UTF-8 compare encoding means the stored bytes, decoded byte-preserving.
+    #[allow(clippy::disallowed_methods)]
+    fn decode_index_key_for_compare(&self, key: &[u8]) -> Option<Vec<SqliteValue>> {
+        match self.index_key_compare_encoding() {
+            TextEncoding::Utf8 => parse_record(key),
+            encoding => parse_record_with_encoding(key, encoding),
+        }
+    }
+
     fn compare_index_key_bytes_with_bias(
         &self,
         lhs_bytes: &[u8],
@@ -4851,7 +4882,7 @@ impl<P: PageReader> BtCursor<P> {
         bias: IndexSeekBias,
     ) -> std::cmp::Ordering {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-        match (parse_record(lhs_bytes), parsed_rhs) {
+        match (self.decode_index_key_for_compare(lhs_bytes), parsed_rhs) {
             (Some(lhs_vals), Some(rhs_vals)) => self
                 .compare_index_key_values(&lhs_vals, rhs_vals, bias)
                 .unwrap_or_else(|| bias.adjust_byte_order(lhs_bytes.cmp(rhs_bytes))),
@@ -4869,14 +4900,20 @@ impl<P: PageReader> BtCursor<P> {
             .collation_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let encoding = self.index_key_compare_encoding();
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
             let coll_name = self
                 .index_collations
                 .get(idx)
                 .and_then(|coll| coll.as_deref());
-            let mut ord =
-                Self::cmp_index_values_collated(&lhs[idx], &rhs[idx], coll_name, &registry_guard)?;
+            let mut ord = Self::cmp_index_values_collated(
+                &lhs[idx],
+                &rhs[idx],
+                coll_name,
+                &registry_guard,
+                encoding,
+            )?;
             if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
                 ord = ord.reverse();
             }
@@ -4891,35 +4928,34 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
+    /// Order two decoded key terms. TEXT compares its exact bytes (never the
+    /// lossy `&str` view, which made distinct non-UTF-8 keys — e.g. raw
+    /// UTF-16 — compare equal and misplaced index entries): built-in BINARY
+    /// (and a missing collation) in `encoding`, any other collation through
+    /// the registry.
     fn cmp_index_values_collated(
         lhs: &SqliteValue,
         rhs: &SqliteValue,
         coll_name: Option<&str>,
         registry: &CollationRegistry,
+        encoding: TextEncoding,
     ) -> Option<std::cmp::Ordering> {
-        if let (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) =
-            (coll_name, lhs, rhs)
-        {
-            return Some(Self::compare_text_with_collation(
-                left.as_bytes(),
-                right.as_bytes(),
-                coll_name,
-                registry,
-            ));
+        if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (lhs, rhs) {
+            let (left, right) = (left.as_bytes_direct(), right.as_bytes_direct());
+            return Some(match coll_name {
+                Some(coll_name)
+                    if !(coll_name.eq_ignore_ascii_case("BINARY")
+                        && registry.uses_builtin_implementation("BINARY")) =>
+                {
+                    registry.find(coll_name).map_or_else(
+                        || binary_text_cmp(left, right, encoding),
+                        |collation| collation.compare(left, right),
+                    )
+                }
+                _ => binary_text_cmp(left, right, encoding),
+            });
         }
         lhs.partial_cmp(rhs)
-    }
-
-    fn compare_text_with_collation(
-        left: &[u8],
-        right: &[u8],
-        coll_name: &str,
-        registry: &CollationRegistry,
-    ) -> std::cmp::Ordering {
-        registry
-            .find(coll_name)
-            .map(|collation| collation.compare(left, right))
-            .unwrap_or_else(|| left.cmp(right))
     }
 
     /// Advance to the next entry. Returns false if at EOF.
@@ -10873,6 +10909,8 @@ impl<P: PageWriter> BtCursor<P> {
     /// seed a same-statement monotonic append hint; correctness never depends
     /// on receiving `true`.
     #[doc(hidden)]
+    // BINARY uniqueness is exact equality of the stored key bytes.
+    #[allow(clippy::disallowed_methods)]
     pub async fn index_insert_unique_with_rightmost_report(
         &mut self,
         cx: &Cx,
@@ -11523,6 +11561,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         Ok(rowid)
     }
 
+    // Reads only the trailing integer rowid of an index key.
+    #[allow(clippy::disallowed_methods)]
     async fn rowid_and_payload_cow<'a>(&'a self, cx: &'a Cx) -> Result<(i64, Cow<'a, [u8]>)> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
@@ -11584,6 +11624,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .await
     }
 
+    // Reads only the trailing integer rowid of an index key.
+    #[allow(clippy::disallowed_methods)]
     async fn rowid(&self, cx: &Cx) -> Result<i64> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
@@ -11631,7 +11673,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::disallowed_methods)]
 mod tests {
     use asupersync::runtime::RuntimeBuilder;
 
@@ -15110,6 +15152,7 @@ mod tests {
             cursor.set_index_collation_context(
                 vec![Some("NOCASE".to_owned())],
                 Arc::new(Mutex::new(CollationRegistry::new())),
+                fsqlite_types::TextEncoding::Utf8,
             );
             for (text, rowid) in [("alpha", 1_i64), ("ALPHA", 2), ("beta", 3)] {
                 let key = serialize_record(&[
@@ -15142,6 +15185,7 @@ mod tests {
             cursor.set_index_collation_context(
                 vec![Some("NOCASE".to_owned())],
                 Arc::new(Mutex::new(CollationRegistry::new())),
+                fsqlite_types::TextEncoding::Utf8,
             );
 
             let alpha =
@@ -15172,6 +15216,7 @@ mod tests {
             cursor.set_index_collation_context(
                 vec![Some("NOCASE".to_owned())],
                 Arc::new(Mutex::new(CollationRegistry::new())),
+                fsqlite_types::TextEncoding::Utf8,
             );
 
             for key in [

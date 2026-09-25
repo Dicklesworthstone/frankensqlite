@@ -1434,6 +1434,13 @@ struct GroupCommitQueue {
     /// (not a `Vec`) so the fold-time re-share of still-abandoned pages is
     /// idempotent and the ledger cannot accumulate duplicates.
     disowned_pages: Arc<Mutex<HashSet<u32>>>,
+    /// The WAL generation the `disowned_pages` ledger is reconciled against:
+    /// the latest generation any connection to this file refreshed into, or
+    /// `None` once a checkpoint reset the WAL and nobody has observed the new
+    /// generation yet. A private abandonment pool parked in any other
+    /// generation is stale — the frames that proved its pages were holes went
+    /// with that generation — and must never be handed to the ledger.
+    disowned_pages_generation: Arc<Mutex<Option<WalGenerationIdentity>>>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -1914,6 +1921,7 @@ impl GroupCommitQueue {
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
             disowned_pages: Arc::new(Mutex::new(HashSet::new())),
+            disowned_pages_generation: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -7817,6 +7825,22 @@ impl PagerCommittedSnapshot {
 }
 
 /// The inner mutable pager state protected by a mutex.
+/// What a complete standalone WAL refresh observed. While this process holds
+/// the main-file SHARED lock that lives with its WAL shared-memory attachment,
+/// no other process can take EXCLUSIVE — so none can leave WAL mode, write in
+/// rollback mode, leave a hot journal, or unlink the WAL. Every other change a
+/// refresh looks for (a commit from any connection or process, a checkpoint
+/// reset, a recovery) rewrites the WAL-index header. An identical header, the
+/// same file at the `-wal` path (an in-process stock SQLite, which cannot see
+/// our locks, may still unlink it) and no local commit since therefore mean
+/// the refresh would find exactly what it found last time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalRefreshSignature {
+    shm_header: fsqlite_wal::wal_index::WalIndexHdr,
+    wal_identity: FileIdentity,
+    commit_seq: CommitSeq,
+}
+
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
@@ -7878,6 +7902,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// with no bound queue (which are single-connection shapes that never
     /// populate the pool), so the cross-connection sweep is simply inert there.
     disowned_page_ledger: Option<Arc<Mutex<HashSet<u32>>>>,
+    /// The ledger's shared reconciliation generation
+    /// (`GroupCommitQueue::disowned_pages_generation`).
+    disowned_page_ledger_generation: Option<Arc<Mutex<Option<WalGenerationIdentity>>>>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -7948,6 +7975,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// generation changes, the main DB header must be read again before the
     /// cached base counter can be trusted.
     committed_wal_generation: Option<WalGenerationIdentity>,
+    /// State observed by the last complete standalone WAL refresh, so an
+    /// unchanged one can be recognized without repeating it (see
+    /// [`WalRefreshSignature`]).
+    wal_refresh_signature: Option<WalRefreshSignature>,
     /// Visible WAL commit count paired with the cached base counter. External
     /// checkpoints can move commits from WAL into the main database while the
     /// summed visible commit sequence stays the same; this keeps that physical
@@ -7965,17 +7996,37 @@ impl<F: VfsFile> Drop for PagerInner<F> {
         // ledger so a surviving connection adopts and reconciles them at its
         // next fold. Sync-mutex only — safe in Drop; a no-op when the pool is
         // empty (the overwhelming common case) or no shared ledger is bound.
+        //
+        // Only a pool parked in the ledger's current WAL generation may be
+        // handed over. A connection that never refreshed across a peer's
+        // checkpoint still holds entries judged in the old generation; one of
+        // them may since have been re-granted from EOF, committed live and
+        // checkpointed away, and a fold would read its missing frame as a
+        // hole and free a live page (a page referenced twice). Discarding a
+        // stale pool can at worst leave an unreferenced hole, which the
+        // open-time orphan repair reclaims; handing it over can corrupt.
         if !ioq6x_ledger_disabled()
             && !self.abandoned_eof_reservations.is_empty()
             && let Some(ledger) = self.disowned_page_ledger.as_ref()
         {
+            let current_generation = self.disowned_page_ledger_generation.as_ref().map(|generation| {
+                *generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            let pool_is_current = self.committed_wal_generation.is_some()
+                && current_generation == Some(self.committed_wal_generation);
             if std::env::var_os("IOQ6X_TRACE").is_some() {
                 eprintln!(
-                    "IOQ6X DISOWN pool={} -> shared ledger",
+                    "IOQ6X DISOWN pool={} current={pool_is_current} -> shared ledger",
                     self.abandoned_eof_reservations.len(),
                 );
             }
-            disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+            if pool_is_current {
+                disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+            } else {
+                self.abandoned_eof_reservations.clear();
+            }
         }
         if let Some(owner) = self.rollback_journal_recovery_owner {
             // Never expose a clean identity atomic merely because this one
@@ -9766,19 +9817,34 @@ impl<F: VfsFile> PagerInner<F> {
         // Cross the boundary the way the checkpointing pager itself does:
         // above-extent entries stay in the shared ledger, in-range ones are
         // dropped, and this refresh must not re-park anything.
+        //
+        // "Above extent" must be judged against the NEW generation's committed
+        // extent. This pager's `db_size` is its view from before the boundary:
+        // a page it abandoned above that view may since have been committed
+        // live by a peer and checkpointed away with the old generation, so
+        // classifying against the stale extent would carry a live page into the
+        // shared ledger as provably free, and keep in-range ledger entries the
+        // boundary must drop. Each branch below crosses the boundary only once
+        // `db_size` covers the new generation's image.
         let wal_generation_changed = self.journal_mode == JournalMode::Wal
             && self.committed_wal_generation.is_some()
             && self.committed_wal_generation != probe.wal_generation;
-        if wal_generation_changed {
-            preserve_above_extent_at_generation_boundary(self);
-        }
         if mode == CommittedStateRefreshMode::Normal
             && probe.visible_commit_seq == self.commit_seq
             && probe.file_size == self.committed_db_file_size_bytes
             && !probe.durable_identity_changed
         {
+            // Nothing was committed since this pager's view, so its extent is
+            // the new generation's.
+            if wal_generation_changed {
+                preserve_above_extent_at_generation_boundary(self);
+            }
             self.committed_db_change_counter = probe.db_change_counter;
+            let generation_moved = self.committed_wal_generation != probe.wal_generation;
             self.committed_wal_generation = probe.wal_generation;
+            if generation_moved {
+                publish_disowned_ledger_generation(self);
+            }
             self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
             return Ok(CommittedStateRefresh {
                 wal_snapshot_initialized: probe.wal_snapshot_initialized,
@@ -9886,6 +9952,9 @@ impl<F: VfsFile> PagerInner<F> {
             self.db_size.max(db_size)
         };
         let effective_db_size = self.db_size;
+        if wal_generation_changed {
+            preserve_above_extent_at_generation_boundary(self);
+        }
         self.next_page = if effective_db_size >= 2 {
             effective_db_size.saturating_add(1)
         } else {
@@ -9962,7 +10031,11 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.committed_db_file_size_bytes = probe.file_size;
         self.committed_db_change_counter = probe.db_change_counter;
+        let generation_moved = self.committed_wal_generation != probe.wal_generation;
         self.committed_wal_generation = probe.wal_generation;
+        if generation_moved {
+            publish_disowned_ledger_generation(self);
+        }
         self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
 
         Ok(CommittedStateRefresh {
@@ -10270,6 +10343,34 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
     adopted_count
 }
 
+/// Record the WAL generation this connection just refreshed into as the
+/// ledger's reconciliation generation (see
+/// `GroupCommitQueue::disowned_pages_generation`). Called only when the
+/// connection's own generation moved, so steady-state refreshes never lock.
+fn publish_disowned_ledger_generation<F: VfsFile>(inner: &PagerInner<F>) {
+    let (Some(generation), Some(shared)) = (
+        inner.committed_wal_generation,
+        inner.disowned_page_ledger_generation.as_ref(),
+    ) else {
+        return;
+    };
+    let mut current = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *current != Some(generation) {
+        *current = Some(generation);
+    }
+}
+
+/// A checkpoint just reset the WAL: every pool parked before this point
+/// belongs to a dead generation until some connection observes the new one.
+fn invalidate_disowned_ledger_generation(queue: &GroupCommitQueue) {
+    *queue
+        .disowned_pages_generation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// bd-ioq6x Face-2: clear the shared disowned-page ledger at a WAL-generation
 /// boundary (checkpoint). The no-committed-frame guard that reconciles adopted
 /// pages is only sound WITHIN one WAL generation: after a checkpoint resets the
@@ -10556,6 +10657,21 @@ fn freelist_trunk_leaf_capacity(page_size: PageSize, reserved_per_page: u8) -> u
         .max(1)
 }
 
+/// Reserved bytes per page that a commit makes durable. A transaction that
+/// stages page 1 carries the header this commit publishes: a fresh image
+/// stamped from a header template (VACUUM's rebuild, compat persistence)
+/// starts from a bootstrap header with no reserved bytes and only then writes
+/// the template's, so the pager's committed value is stale until the commit.
+fn commit_reserved_per_page<S: std::hash::BuildHasher>(
+    write_set: &HashMap<PageNumber, StagedPage, S>,
+    committed: u8,
+) -> u8 {
+    write_set
+        .get(&PageNumber::ONE)
+        .and_then(|page_one| page_one.as_page_bytes().get(20).copied())
+        .unwrap_or(committed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
@@ -10608,7 +10724,10 @@ async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         .filter(|page| page.get() <= committed_db_size)
         .collect();
 
-    let max_leaf_entries = freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
+    let max_leaf_entries = freelist_trunk_leaf_capacity(
+        inner.page_size,
+        commit_reserved_per_page(write_set, inner.reserved_per_page),
+    );
     let total_free = durable_freelist.len() as u32;
 
     let (first_trunk, trunk_pages) = if durable_freelist.is_empty() {
@@ -16792,14 +16911,76 @@ where
         self.published.snapshot()
     }
 
+    /// The WAL-index header and `-wal` file as they stand now, when this
+    /// connection can vouch for them (see [`WalRefreshSignature`]).
+    async fn current_wal_refresh_signature(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<Option<WalRefreshSignature>> {
+        if inner.journal_mode != JournalMode::Wal || self.vfs.is_memory() {
+            return Ok(None);
+        }
+        {
+            let backend = wal_backend_handle(&self.wal_backend)?;
+            let wal = async_rwlock_read(&backend, cx, "refresh signature").await?;
+            if !wal.native_reader_required() || wal.native_recovery_required().is_some() {
+                return Ok(None);
+            }
+        }
+        let shm_header = {
+            let mut file = shared_db_file_write(&inner.db_file, cx).await?;
+            if !file.holds_main_wal_lifetime_read_lock() {
+                return Ok(None);
+            }
+            let Ok(region) = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) else {
+                return Ok(None);
+            };
+            let Some(header) = fsqlite_wal::wal_index::read_shared_wal_index_header(&region)? else {
+                return Ok(None);
+            };
+            header
+        };
+        let mut wal_path = self.db_path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let Some(wal_identity) = self.vfs.path_file_identity(cx, Path::new(&wal_path))? else {
+            return Ok(None);
+        };
+        Ok(Some(WalRefreshSignature {
+            shm_header,
+            wal_identity,
+            commit_seq: inner.commit_seq,
+        }))
+    }
+
+    /// Whether a standalone refresh now would observe exactly what the last
+    /// complete one did.
+    async fn standalone_refresh_is_unchanged(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<bool> {
+        let Some(previous) = inner.wal_refresh_signature else {
+            return Ok(false);
+        };
+        if inner.active_transactions > 0
+            || inner.checkpoint_active
+            || inner.rollback_journal_recovery_state.is_pending()
+            || inner.commit_seq != previous.commit_seq
+        {
+            return Ok(false);
+        }
+        Ok(self.current_wal_refresh_signature(cx, inner).await? == Some(previous))
+    }
+
     /// Refresh the publication plane from the latest committed pager state.
     ///
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
-    // bd-h9o9r: a sync mutex guard is held across an await in this
-    // function's body; reachable-deadlock audit and lock-scope repair
-    // belong to the Phase-C pager reconstruction.
+    // bd-h9o9r: the pager's sync mutex guard is held across awaits here, as
+    // the full refresh below already did; the reachable-deadlock audit and
+    // lock-scope repair belong to the Phase-C pager reconstruction.
     #[allow(clippy::await_holding_lock)]
     pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
@@ -16822,7 +17003,18 @@ where
             // exact existing recovery-owner admission check.
             self.validate_namespace_binding_locked(&mut inner)?;
             inner.adopt_orphaned_rollback_journal_recovery()?;
+            if self.standalone_refresh_is_unchanged(cx, &inner).await? {
+                return Ok(self.published.snapshot());
+            }
         }
+        // Observed before refreshing: a commit that lands while the refresh
+        // runs changes the header, so the next boundary still refreshes.
+        let pre_refresh_signature = if returning_open {
+            None
+        } else {
+            self.current_wal_refresh_signature(cx, &inner).await?
+        };
+        inner.wal_refresh_signature = None;
         let expected_recovery_owner = if inner.active_transactions == 0
             && inner
                 .rollback_journal_recovery_state
@@ -16887,6 +17079,12 @@ where
         let Some((refresh, journal_visibility_invalidation)) = refresh else {
             return Ok(self.published.snapshot());
         };
+        // The header stays the pre-refresh one; the commit sequence is the
+        // refreshed one, which later local commits must differ from.
+        inner.wal_refresh_signature = pre_refresh_signature.map(|signature| WalRefreshSignature {
+            commit_seq: inner.commit_seq,
+            ..signature
+        });
 
         let clear_published_pages = had_recovery_pending
             || journal_visibility_invalidation
@@ -16937,6 +17135,18 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.page_size
+    }
+
+    /// Reserved bytes per page of the committed image this pager last bound.
+    /// Commits stamp page 1 with this value, so callers outside a transaction
+    /// can use it instead of beginning one to parse page 1.
+    #[must_use]
+    pub fn committed_reserved_per_page(&self) -> u8 {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.reserved_per_page
     }
 
     /// Read the committed-state snapshot without taking the PagerInner Mutex.
@@ -18783,6 +18993,9 @@ where
                 freelist_repair_dropped: open_freelist_entries_dropped,
                 wal_reader: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
+                disowned_page_ledger_generation: Some(Arc::clone(
+                    &group_commit_queue.disowned_pages_generation,
+                )),
                 journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -18795,6 +19008,7 @@ where
                 committed_db_file_size_bytes: file_size,
                 committed_db_change_counter: u64::from(header.change_counter),
                 committed_wal_generation: None,
+                wal_refresh_signature: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -19216,6 +19430,9 @@ where
                 freelist_repair_dropped: 0,
                 wal_reader: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
+                disowned_page_ledger_generation: Some(Arc::clone(
+                    &group_commit_queue.disowned_pages_generation,
+                )),
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -19231,6 +19448,7 @@ where
                     .as_ref()
                     .map_or(0, |header| u64::from(header.change_counter)),
                 committed_wal_generation: None,
+                wal_refresh_signature: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -21597,8 +21815,10 @@ where
         let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
 
         if freelist_dirty && !durable_freelist.is_empty() {
-            let max_leaf_entries =
-                freelist_trunk_leaf_capacity(inner.page_size, inner.reserved_per_page);
+            let max_leaf_entries = freelist_trunk_leaf_capacity(
+                inner.page_size,
+                commit_reserved_per_page(&self.write_set, inner.reserved_per_page),
+            );
             let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
             pages.extend(durable_freelist.into_iter().take(trunk_count));
 
@@ -25742,7 +25962,8 @@ where
                     .await?;
                 return Ok(());
             }
-            self.validate_namespace_binding()?;
+            // A reader's commit publishes nothing, so only a writer re-proves
+            // the pathname here; the next begin validates it for a reader.
             if !self.is_writer {
                 let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
                     &self.group_commit_queue,
@@ -25794,6 +26015,7 @@ where
                 self.scratch_arena.reset();
                 return Ok(());
             }
+            self.validate_namespace_binding()?;
             if self.vfs.is_memory()
                 && self.memory_db_bump_alloc
                 && !self.retained_memory_overlay_dirty_pages.is_empty()
@@ -29020,12 +29242,16 @@ where
         };
         if inspect_native_index {
             let backend = wal_backend_handle(&self.wal_backend)?;
-            let native = async_rwlock_read(&backend, cx, "checkpoint native admission")
-                .await?
-                .native_reader_required();
+            let (native, recovery_requested) = {
+                let wal = async_rwlock_read(&backend, cx, "checkpoint native admission").await?;
+                (wal.native_reader_required(), wal.native_recovery_required().is_some())
+            };
             if native {
                 let source = self.wal_index_shm_source()?;
-                let needs_recovery = match source.map_region(cx, 0, false).await {
+                // A backend that found the shared index describing another WAL
+                // generation (e.g. after leaving and re-entering WAL mode) has
+                // requested a rebuild; only read admission performs it.
+                let needs_recovery = recovery_requested || match source.map_region(cx, 0, false).await {
                     Ok(region) => {
                         fsqlite_wal::wal_index::read_shared_wal_index_header(&region)?.is_none()
                     }
@@ -29367,6 +29593,9 @@ where
             wal_was_reset = result.wal_was_reset,
             "checkpoint completed without re-entering the foreground physical writer lane"
         );
+        if result.wal_was_reset {
+            invalidate_disowned_ledger_generation(&pager_group_commit_queue(self));
+        }
         guard
             .external_lock
             .as_mut()
@@ -46624,9 +46853,20 @@ mod tests {
         // per-file disowned-page ledger so a surviving connection can reconcile
         // them. Without this, a `drop_close` under churn orphaned the holes and
         // a later grow turned them into durable "page N is never used" leaks.
+        // Only a pool parked in the ledger's current WAL generation may be
+        // handed over; one from a generation a checkpoint has since retired is
+        // discarded, because its "no frame => hole" judgements died with it.
+        let generation = |checkpoint_seq| WalGenerationIdentity {
+            checkpoint_seq,
+            salts: fsqlite_wal::WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+        };
+        for pool_is_current in [true, false] {
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
-            let path = PathBuf::from("/ioq6x_face2_disown.db");
+            let path = PathBuf::from(format!("/ioq6x_face2_disown_{pool_is_current}.db"));
             let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
@@ -46640,6 +46880,13 @@ mod tests {
                 // connection WAL directly (no live backend needed — the drop
                 // handoff itself is mode-agnostic).
                 inner.journal_mode = JournalMode::Wal;
+                inner.committed_wal_generation = Some(generation(1));
+                *inner
+                    .disowned_page_ledger_generation
+                    .as_ref()
+                    .expect("an open pager binds the ledger generation")
+                    .lock()
+                    .unwrap() = Some(generation(if pool_is_current { 1 } else { 2 }));
                 let ledger = inner
                     .disowned_page_ledger
                     .clone()
@@ -46671,12 +46918,13 @@ mod tests {
                 .map(|page| page.get())
                 .collect();
             disowned.sort_unstable();
+            let expected = if pool_is_current { vec![57, 58] } else { Vec::new() };
             assert_eq!(
-                disowned,
-                vec![57, 58],
-                "a dropped connection disowns its still-parked pool to the shared ledger"
+                disowned, expected,
+                "a dropped connection disowns its still-parked pool only within its generation"
             );
         });
+        }
     }
 
     #[test]

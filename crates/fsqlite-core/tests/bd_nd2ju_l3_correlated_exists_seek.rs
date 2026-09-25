@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-nd2ju / GH#377 (L3): the trigger-WHEN correlated EXISTS
 // statement-fallback relaxes collation/affinity-safe `inner_col = <bound outer
 // value>` equalities to literals so the nested statement seeks instead of

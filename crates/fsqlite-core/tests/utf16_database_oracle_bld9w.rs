@@ -34,6 +34,10 @@
 //!   * `utf16_fixture_really_is_utf16_*` — proves the rusqlite fixtures actually
 //!     produce UTF-16 databases (header text-encoding byte + `PRAGMA encoding`).
 
+// Integration tests are their own crate root and do not inherit the lib's
+// `#![recursion_limit]`; match the 512 used by the other oracle suites.
+#![recursion_limit = "512"]
+
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
@@ -434,5 +438,111 @@ fn utf16le_text_index_seek_and_scan_parity_unicode() {
         build_stock_db(&path, Some("UTF-16le"), UNICODE_ROWS);
         assert_eq!(header_text_encoding(&path), 2);
         assert_custom_query_parity(&path, INDEX_QUERIES, "utf16le_index_unicode").await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Engine-internal records at scale. The four-row fixtures above never fill a
+// TopN sorter, never step a GROUP BY SorterCompare across a key change with a
+// MakeRecord probe, and never route through an ephemeral table, so they missed
+// every path that re-decodes a record the engine itself encoded in the DB
+// encoding: grouped/DISTINCT output came back as UTF-16 mojibake, UNION /
+// window / implicit-BINARY MIN/MAX ordered by canonical UTF-8 instead of the
+// UTF-16 storage bytes stock memcmps, and NOCASE TopN mis-ordered.
+// ---------------------------------------------------------------------------
+
+/// 600 rows of non-ASCII BMP names (unique) and CJK+Latin-1 cities (65
+/// distinct), so UTF-16LE byte order, UTF-16BE byte order and UTF-8 order all
+/// disagree somewhere.
+const SCALED_ROWS: &[&str] = &["WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 600) \
+     INSERT INTO items(id, name, city) \
+     SELECT x, char(233 + (x * 7) % 40) || 'n' || (x % 97), char(26481 + x % 5) || char(192 + x % 13) \
+     FROM c"];
+
+const SCALED_QUERIES: &[&str] = &[
+    "SELECT name FROM items ORDER BY name LIMIT 7",
+    "SELECT name, id FROM items ORDER BY name DESC, id LIMIT 9",
+    "SELECT name FROM items ORDER BY name COLLATE NOCASE, id LIMIT 7",
+    "SELECT city, count(*), sum(id % 11) FROM items GROUP BY city ORDER BY city",
+    "SELECT name, count(*) FROM items GROUP BY name ORDER BY 2 DESC, 1 LIMIT 10",
+    "SELECT DISTINCT city FROM items ORDER BY city",
+    "SELECT count(DISTINCT name) FROM items",
+    "SELECT name, row_number() OVER (PARTITION BY city ORDER BY name) FROM items ORDER BY id LIMIT 20",
+    "SELECT city FROM items WHERE id % 11 = 1 UNION SELECT name FROM items WHERE id % 11 = 2 ORDER BY 1 LIMIT 15",
+    "SELECT min(name), max(name), min(city), max(city) FROM items",
+    "SELECT a.id, b.id FROM items a JOIN items b ON a.city = b.city AND a.id < b.id ORDER BY a.id, b.id LIMIT 12",
+    "SELECT group_concat(name, ',') FROM (SELECT name FROM items WHERE id < 30 ORDER BY name)",
+];
+
+#[test]
+fn utf16_engine_record_paths_parity_at_scale() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (encoding, header) in [("UTF-16le", 2), ("UTF-16be", 3), ("UTF-8", 1)] {
+            let path = dir.path().join(format!("scaled_{encoding}.db"));
+            build_stock_db(&path, Some(encoding), SCALED_ROWS);
+            assert_eq!(header_text_encoding(&path), header);
+            assert_custom_query_parity(&path, SCALED_QUERIES, &format!("scaled_{encoding}")).await;
+        }
+    });
+}
+
+/// FTS5 on a UTF-16 database: `_content` rows are TEXT in the DB encoding, so
+/// the lazy shadow reader must decode them with it (content columns and
+/// `highlight()` came back as code-unit mojibake), and a FrankenSQLite
+/// `'rebuild'` must re-tokenize the decoded text (it indexed mojibake, so stock
+/// then found nothing).
+#[test]
+fn utf16_fts5_content_highlight_and_rebuild_parity() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let path = dir.path().join(format!("fts5_{encoding}.db"));
+            {
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                stock
+                    .execute_batch(&format!(
+                        "PRAGMA encoding = '{encoding}';
+                         CREATE VIRTUAL TABLE docs USING fts5(body);
+                         INSERT INTO docs VALUES ('Zürich lake shore'), ('Paris city lights'), ('東京 tower night');"
+                    ))
+                    .unwrap();
+            }
+            let label = format!("fts5_{encoding}");
+            assert_custom_query_parity(
+                &path,
+                &[
+                    "SELECT rowid, body FROM docs ORDER BY rowid",
+                    "SELECT body FROM docs WHERE docs MATCH 'lake'",
+                    "SELECT highlight(docs, 0, '[', ']') FROM docs WHERE docs MATCH 'tower'",
+                ],
+                &label,
+            )
+            .await;
+
+            let fconn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            fconn
+                .execute("INSERT INTO docs(docs) VALUES ('rebuild');")
+                .await
+                .unwrap_or_else(|e| panic!("[{label}] fsqlite rebuild: {e}"));
+            fconn.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch("INSERT INTO docs(docs) VALUES ('integrity-check');")
+                .unwrap_or_else(|e| panic!("[{label}] stock fts5 integrity-check after fsqlite rebuild: {e}"));
+            let hits: Vec<String> = stock
+                .prepare("SELECT body FROM docs WHERE docs MATCH 'lake' OR docs MATCH '東京'")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                hits,
+                ["Zürich lake shore", "東京 tower night"],
+                "[{label}] stock MATCH over the fsqlite-rebuilt index"
+            );
+        }
     });
 }

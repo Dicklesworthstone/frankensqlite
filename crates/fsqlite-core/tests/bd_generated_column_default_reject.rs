@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch #8): a column cannot have both a generated
 // (AS) expression and a DEFAULT. Stock SQLite's message is order-dependent:
 // DEFAULT after the AS expr -> "cannot use DEFAULT on a generated column";

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #271 / bd-c6jre: the `fts5vocab` virtual-table module.
 //!
 //! For each vocabulary type (`row`, `col`, `instance`) this creates and

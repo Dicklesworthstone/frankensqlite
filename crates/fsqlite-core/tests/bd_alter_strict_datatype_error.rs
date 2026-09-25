@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): ALTER TABLE ADD COLUMN on a STRICT table
 // with a missing/unknown datatype reports stock's "error in table <t> after add
 // column: <inner>" wrapper (inner = the CREATE-time datatype message), not

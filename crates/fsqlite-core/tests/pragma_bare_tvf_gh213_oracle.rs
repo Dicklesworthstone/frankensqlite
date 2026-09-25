@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-xl98m (GH #207/#213 family): the *parenless* eponymous no-arg pragma
 //! table-valued function form — `SELECT * FROM pragma_compile_options` (no
 //! parens) — used to error `no such table`, while the call form

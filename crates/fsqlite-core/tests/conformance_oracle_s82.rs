@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 82 (cc4 prepared-statement ceremony + rapid DML)
 //!
 //! Regression guards for bd-cg732 ceremony-gating optimizations:

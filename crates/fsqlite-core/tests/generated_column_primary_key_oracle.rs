@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-generated-column-pk-ddl-frvx8 (GH #181): a generated column may not be
 //! part of a PRIMARY KEY (column-level, table-level, or composite). C SQLite
 //! rejects "generated columns cannot be part of the PRIMARY KEY"; UNIQUE on a

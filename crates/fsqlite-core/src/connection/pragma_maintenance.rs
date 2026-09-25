@@ -11,6 +11,16 @@ impl Connection {
         let mut failures = Vec::new();
         if let Err(error) = self.validate_database_integrity(quick).await {
             failures.push(error.to_string());
+        } else {
+            // Rows are only readable once the B-trees they live in are sound.
+            let scope = integrity_check_table_scope(pragma.value.as_ref());
+            match self
+                .integrity_check_row_constraints(scope.as_deref(), max_errors)
+                .await
+            {
+                Ok(reports) => failures.extend(reports),
+                Err(error) => failures.push(error.to_string()),
+            }
         }
 
         // Qualified attached PRAGMAs already delegate to their child Connection.
@@ -78,6 +88,97 @@ impl Connection {
             });
         }
         rows
+    }
+
+    /// bd-fjieg.4: stock `integrity_check` and `quick_check` both verify every
+    /// stored row against its table's NOT NULL and CHECK constraints, reporting
+    /// `NULL value in T.C` per violated column and at most one
+    /// `CHECK constraint failed in T` per row. The scan asks each constrained
+    /// table for its violating rows only, reading short records through their
+    /// column defaults and evaluating CHECK exactly as a write does (a NULL
+    /// result passes); a table with no such constraint is not read at all.
+    async fn integrity_check_row_constraints(
+        &self,
+        only_table: Option<&str>,
+        budget: usize,
+    ) -> Result<Vec<String>> {
+        let tables = {
+            let temp_table_names = self.temp_table_names.borrow();
+            let mut tables: Vec<TableSchema> = self
+                .schema
+                .borrow()
+                .iter()
+                .filter(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()))
+                .cloned()
+                .collect();
+            tables.extend(self.shadowed_main_tables.borrow().values().cloned());
+            tables.retain(|table| {
+                table.root_page > 0
+                    && only_table.is_none_or(|name| table.name.eq_ignore_ascii_case(name))
+            });
+            tables
+        };
+        let mut reports = Vec::new();
+        for table in &tables {
+            if reports.len() >= budget {
+                break;
+            }
+            let primary_key = if table.without_rowid {
+                table.primary_key_constraints.first().cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let not_null: Vec<&str> = table
+                .columns
+                .iter()
+                .filter(|column| {
+                    !column.is_ipk
+                        && (column.notnull
+                            || primary_key
+                                .iter()
+                                .any(|key| key.eq_ignore_ascii_case(&column.name)))
+                })
+                .map(|column| column.name.as_str())
+                .collect();
+            if not_null.is_empty() && table.check_constraints.is_empty() {
+                continue;
+            }
+            let predicates: Vec<String> = not_null
+                .iter()
+                .map(|column| format!("{} IS NULL", quote_identifier(column)))
+                .chain(
+                    table
+                        .check_constraints
+                        .iter()
+                        .map(|check| format!("NOT ({})", check.expr)),
+                )
+                .collect();
+            let sql = format!(
+                "SELECT {} FROM main.{} WHERE {} LIMIT {}",
+                predicates.join(", "),
+                quote_identifier(&table.name),
+                predicates
+                    .iter()
+                    .map(|predicate| format!("({predicate})"))
+                    .collect::<Vec<_>>()
+                    .join(" OR "),
+                budget - reports.len()
+            );
+            let is_true = |value: &SqliteValue| matches!(value, SqliteValue::Integer(1));
+            for row in self.query(&sql).await? {
+                let (nulls, checks) = row.values().split_at(not_null.len());
+                for (column, value) in not_null.iter().zip(nulls) {
+                    if is_true(value) {
+                        reports.push(format!("NULL value in {}.{column}", table.name));
+                    }
+                }
+                if checks.iter().any(is_true) {
+                    reports.push(format!("CHECK constraint failed in {}", table.name));
+                }
+            }
+        }
+        reports.truncate(budget);
+        Ok(reports)
     }
 
     pub(super) async fn pragma_wal_checkpoint_rows(
@@ -231,6 +332,16 @@ fn integrity_check_error_limit(value: Option<&fsqlite_ast::PragmaValue>) -> usiz
             usize::try_from(limit.unsigned_abs()).unwrap_or(usize::MAX)
         }
         _ => 100,
+    }
+}
+
+/// `PRAGMA integrity_check(T)` / `('T')` limits the check to one table.
+fn integrity_check_table_scope(value: Option<&fsqlite_ast::PragmaValue>) -> Option<String> {
+    let (fsqlite_ast::PragmaValue::Assign(expr) | fsqlite_ast::PragmaValue::Call(expr)) = value?;
+    match expr {
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(col_ref.column.to_string()),
+        Expr::Literal(Literal::String(name), _) => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -459,6 +570,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// bd-fjieg.4: stored rows that violate NOT NULL or CHECK are reported
+    /// exactly as stock reports them, by both integrity_check and quick_check.
+    #[test]
+    fn integrity_checks_report_stored_not_null_and_check_violations_like_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("constraints.db");
+        {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INT, c INT DEFAULT 5);
+                     INSERT INTO t(id, a, b) VALUES(1,'x',1),(2,NULL,-2),(3,NULL,-3),(4,'w',4);
+                     CREATE TABLE u(p INT, q INT);
+                     INSERT INTO u VALUES(NULL, 1),(7, 'abc');
+                     CREATE TABLE w(k TEXT, v INT, PRIMARY KEY(k)) WITHOUT ROWID;
+                     INSERT INTO w VALUES('a', 1),('b', 20);
+                     CREATE TABLE clean(x INT NOT NULL CHECK(x > 0));
+                     INSERT INTO clean VALUES(1);
+                     PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET sql='CREATE TABLE t(id INTEGER PRIMARY KEY, \
+                         a TEXT NOT NULL, b INT CHECK(b>0), c INT DEFAULT 5 CHECK(c<5))'
+                         WHERE name='t';
+                     UPDATE sqlite_schema SET sql='CREATE TABLE u(p INT NOT NULL, q INT, \
+                         CONSTRAINT q_not_one CHECK(q<>1), CHECK(q>0))' WHERE name='u';
+                     UPDATE sqlite_schema SET sql='CREATE TABLE w(k TEXT, v INT CHECK(v<10), \
+                         PRIMARY KEY(k)) WITHOUT ROWID' WHERE name='w';",
+                )
+                .unwrap();
+        }
+        let stock_reports = |sql: &str| -> Vec<String> {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            let mut statement = stock.prepare(sql).unwrap();
+            let mut reports = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            reports.sort();
+            reports
+        };
+        let cases = [
+            "PRAGMA integrity_check;",
+            "PRAGMA quick_check;",
+            "PRAGMA integrity_check(t);",
+            "PRAGMA quick_check('w');",
+            "PRAGMA integrity_check(clean);",
+            "PRAGMA integrity_check(3);",
+        ];
+        let expected: Vec<Vec<String>> = cases.iter().map(|sql| stock_reports(sql)).collect();
+        assert_eq!(expected[0].len(), 9, "fixture: {:?}", expected[0]);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (sql, expected) in cases.iter().zip(&expected) {
+                let mut reports: Vec<String> = conn
+                    .query(sql)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| match &row.values()[0] {
+                        SqliteValue::Text(text) => text.to_string(),
+                        other => panic!("{sql}: non-text report {other:?}"),
+                    })
+                    .collect();
+                reports.sort();
+                if sql.contains("(3)") {
+                    // Stock visits tables in hash order; only the cap is shared.
+                    assert_eq!(reports.len(), expected.len(), "{sql}: {reports:?}");
+                } else {
+                    assert_eq!(&reports, expected, "{sql}");
+                }
+            }
+            conn.close().await.unwrap();
+        });
     }
 
     #[test]

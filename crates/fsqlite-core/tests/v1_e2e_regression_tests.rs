@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! V1 zero-copy page access regression tests.
 //!
 //! Verifies correctness after V1.1 (cell pointer Vec), V1.2 (page cache

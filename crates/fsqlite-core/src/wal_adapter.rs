@@ -384,9 +384,115 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// moves on every peer commit and a full rebuild per commit — held under
     /// the append gate — starved writers off their retry budget.
     appended_tail_index_folds: u64,
+    /// Page bytes of committed frames already read, keyed by frame index
+    /// within one WAL generation (see [`WalFramePageCache`]).
+    frame_page_cache: std::sync::Mutex<WalFramePageCache>,
+}
+
+/// Committed WAL frames never change within their generation: a frame index
+/// is reused only after a checkpoint resets the WAL, which changes the salts.
+/// Caching a committed frame's page bytes is therefore exact for every
+/// snapshot that resolves to it, and saves re-reading the WAL file for each
+/// page of each statement, as SQLite's page cache does across transactions
+/// while the WAL index is unchanged. Only frames at or below the reading
+/// snapshot's commit horizon are cached; a connection's own appended frames
+/// can be rolled back and their indexes reused.
+#[derive(Debug, Default)]
+struct WalFramePageCache {
+    generation: Option<WalGenerationIdentity>,
+    pages: HashMap<usize, (u32, Arc<[u8]>)>,
+    insertion_order: std::collections::VecDeque<usize>,
+}
+
+impl WalFramePageCache {
+    /// Frames kept per connection (4 MiB at 4 KiB pages).
+    const CAPACITY: usize = 1024;
+
+    fn get(&self, generation: WalGenerationIdentity, frame_index: usize, page_number: u32) -> Option<Vec<u8>> {
+        if self.generation != Some(generation) {
+            return None;
+        }
+        self.pages
+            .get(&frame_index)
+            .filter(|(cached_page, _)| *cached_page == page_number)
+            .map(|(_, bytes)| bytes.to_vec())
+    }
+
+    fn insert(&mut self, generation: WalGenerationIdentity, frame_index: usize, page_number: u32, bytes: &[u8]) {
+        if self.generation != Some(generation) {
+            self.pages.clear();
+            self.insertion_order.clear();
+            self.generation = Some(generation);
+        }
+        if self
+            .pages
+            .insert(frame_index, (page_number, Arc::from(bytes)))
+            .is_none()
+        {
+            self.insertion_order.push_back(frame_index);
+            if self.insertion_order.len() > Self::CAPACITY
+                && let Some(evicted) = self.insertion_order.pop_front()
+            {
+                self.pages.remove(&evicted);
+            }
+        }
+    }
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
+    /// Page bytes of the resolved frame `frame_index`, which must hold
+    /// `page_number`. A committed frame (at or below `snapshot`'s commit
+    /// horizon) is served from and recorded in [`WalFramePageCache`].
+    async fn read_resolved_frame_page(
+        &self,
+        cx: &Cx,
+        snapshot: &WalPublishedSnapshot,
+        frame_index: usize,
+        page_number: u32,
+    ) -> Result<Vec<u8>> {
+        let cacheable = snapshot
+            .last_commit_frame
+            .is_some_and(|last_commit_frame| frame_index <= last_commit_frame);
+        if cacheable
+            && let Some(page) = self
+                .frame_page_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(snapshot.generation, frame_index, page_number)
+        {
+            return Ok(page);
+        }
+        let mut frame_buf = vec![0u8; self.wal.frame_size()];
+        let header = self
+            .wal
+            .read_frame_into(cx, frame_index, &mut frame_buf)
+            .await?;
+        // Runtime integrity check: verify the frame actually contains our page.
+        // This guards against index corruption or stale entries.
+        if header.page_number != page_number {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL page index integrity failure: expected page {page_number} \
+                     at frame {frame_index}, found page {}",
+                    header.page_number
+                ),
+            });
+        }
+        // Strip the 24-byte frame header in place instead of allocating a
+        // second page-sized buffer (d9c410bb).
+        let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
+        let page_size = self.wal.page_size();
+        frame_buf.copy_within(header_size.., 0);
+        frame_buf.truncate(page_size);
+        if cacheable {
+            self.frame_page_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(snapshot.generation, frame_index, page_number, &frame_buf);
+        }
+        Ok(frame_buf)
+    }
+
     /// Wrap an existing [`WalFile`] in the adapter (FEC disabled).
     #[must_use]
     pub fn new(wal: WalFile<F>) -> Self {
@@ -417,6 +523,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             appended_tail_index: None,
             appended_tail_index_builds: 0,
             appended_tail_index_folds: 0,
+            frame_page_cache: std::sync::Mutex::new(WalFramePageCache::default()),
         }
     }
 
@@ -448,6 +555,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             appended_tail_index: None,
             appended_tail_index_builds: 0,
             appended_tail_index_folds: 0,
+            frame_page_cache: std::sync::Mutex::new(WalFramePageCache::default()),
         }
     }
 
@@ -1410,6 +1518,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let region = source.map_region(cx, 0, false).await?;
         let header = read_shared_wal_index_header(&region)?.ok_or(FrankenError::BusyRecovery)?;
         self.wal.refresh(cx).await?;
+        // An index still describing a retired WAL generation (for example
+        // after leaving and re-entering WAL mode, which creates a new
+        // generation with fresh salts) is stale, not corrupt: request the
+        // same index rebuild read admission performs for this mismatch.
+        let wal_header = self.wal.header();
+        if header.page_size().ok() != Some(wal_header.page_size)
+            || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+            || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+        {
+            self.native_recovery_requested = Some(WalNativeRecoveryReason::WalGenerationMismatch);
+            return Err(FrankenError::BusyRecovery);
+        }
         if usize::try_from(header.mx_frame).ok() != Some(self.wal.frame_count()) {
             return Err(FrankenError::BusyRecovery);
         }
@@ -2629,40 +2749,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 return Ok(None);
             };
 
-            // Read the frame data at the resolved position.
-            let mut frame_buf = vec![0u8; self.wal.frame_size()];
-            let header = self
-                .wal
-                .read_frame_into(cx, frame_index, &mut frame_buf)
+            let frame_buf = self
+                .read_resolved_frame_page(cx, &snapshot, frame_index, page_number)
                 .await?;
-
-            // Runtime integrity check: verify the frame actually contains our page.
-            // This guards against index corruption or stale entries.
-            if header.page_number != page_number {
-                return Err(FrankenError::WalCorrupt {
-                    detail: format!(
-                        "WAL page index integrity failure: expected page {page_number} \
-                         at frame {frame_index}, found page {}",
-                        header.page_number
-                    ),
-                });
-            }
-
-            // Strip the 24-byte frame header in place rather than
-            // allocating a second page-sized Vec. Mirrors the fix in
-            // `read_page_pinned` (`d9c410bb`): `frame_buf[HEADER..].to_vec()`
-            // allocates a fresh 4 KiB buffer, memcpys the page payload into
-            // it, then drops the original 4 KiB+24 B scratch — an alloc/free
-            // round-trip on the hot WAL read path. Using `copy_within` +
-            // `truncate` reuses the already-populated buffer: one memmove
-            // (over the same bytes `to_vec` would have copied) and no new
-            // allocation. `read_page` is the `&mut self` fallback path taken
-            // when the caller does not hold a pinned snapshot — still hot
-            // under mixed OLTP and write-path conflict resolution.
-            let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
-            let page_size = self.wal.page_size();
-            frame_buf.copy_within(header_size.., 0);
-            frame_buf.truncate(page_size);
             debug!(
                 page_number,
                 frame_index,
@@ -2752,39 +2841,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             let Some(frame_index) = resolution.frame_index() else {
                 return Ok(None);
             };
-
-            let mut frame_buf = vec![0u8; self.wal.frame_size()];
-            let header = self
-                .wal
-                .read_frame_into(cx, frame_index, &mut frame_buf)
-                .await?;
-
-            if header.page_number != page_number {
-                return Err(FrankenError::WalCorrupt {
-                    detail: format!(
-                        "WAL page index integrity failure: expected page {page_number} \
-                         at frame {frame_index}, found page {}",
-                        header.page_number
-                    ),
-                });
-            }
-
-            // Strip the 24-byte frame header in place instead of allocating
-            // a fresh page-sized Vec. The pre-existing pattern did
-            // `frame_buf[HEADER..].to_vec()` — on a 4 KiB page that
-            // allocated a second 4 KiB buffer plus a 4 KiB memcpy and then
-            // dropped the original 4 KiB+24 B frame_buf. On an MT pinned-
-            // read workload every page served from the WAL paid that per-
-            // read alloc/free round-trip; `_int_malloc` and `cfree` already
-            // showed up in recent 2-thread profiles. Here we keep the
-            // already-populated `frame_buf`, memmove the page bytes over
-            // the header, truncate to `page_size`, and return it — one
-            // allocation per read instead of two.
-            let header_size = fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE;
-            let page_size = self.wal.page_size();
-            frame_buf.copy_within(header_size.., 0);
-            frame_buf.truncate(page_size);
-            Ok(Some(frame_buf))
+            self.read_resolved_frame_page(cx, snapshot, frame_index, page_number)
+                .await
+                .map(Some)
         })
     }
 
@@ -3483,6 +3542,14 @@ where
     /// because the read path is `&self` (a `WalBackend` read-snapshot method);
     /// the lock is held only for the sync take/put-back, never across `.await`.
     cached_certificate_read: std::sync::Mutex<Option<V::File>>,
+    /// The newest sidecar record already proven to authorize its WAL boundary.
+    /// Its verdict depends only on the record itself, its WAL generation, the
+    /// commit marker and the payload digest of the committed frames it covers,
+    /// all immutable within that generation, so an identical record read again
+    /// is authorized without re-reading and re-hashing every covered frame on
+    /// each read statement (which made a read O(frames in the last commit)).
+    authorized_certificate_record:
+        std::sync::Mutex<Option<ParallelWalDurableCertificateRecord>>,
     /// Creation-stable identity of the main database file (page-1 header bytes
     /// 76..92), captured once from the already-held verification descriptor the
     /// first time a WAL operation runs against this adapter (bd-85x9y / GH#364).
@@ -3539,6 +3606,7 @@ where
             namespace_binding,
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
+            authorized_certificate_record: std::sync::Mutex::new(None),
             db_file_identity: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             pending_fec_reclamation: Vec::new(),
@@ -3705,6 +3773,27 @@ where
             });
         }
         Ok(wal)
+    }
+
+    /// Cheap form of opening `wal_path` and comparing its header with this
+    /// handle's generation: when a `stat` of the path shows the file this
+    /// handle already has open, the path's header *is* the handle's header, so
+    /// it is read through the handle — no descriptor is opened or closed.
+    /// `None` when either identity is unknown or they differ; callers then take
+    /// their open-and-inspect path, which also handles missing and replaced
+    /// companions.
+    async fn current_handle_names_wal_path(&self, cx: &Cx) -> Result<Option<bool>> {
+        let current = self.inner.wal.file();
+        let (Some(path_identity), Some(current_identity)) = (
+            self.vfs.path_file_identity(cx, &self.wal_path)?,
+            current.file_identity()?,
+        ) else {
+            return Ok(None);
+        };
+        if path_identity != current_identity {
+            return Ok(None);
+        }
+        self.path_header_matches_current_handle(cx, current).await.map(Some)
     }
 
     async fn path_header_matches_current_handle(
@@ -3989,6 +4078,9 @@ where
             binding.validate_path_identity()?;
         }
         self.ensure_db_file_identity_captured(cx).await;
+        if self.current_handle_names_wal_path(cx).await? == Some(true) {
+            return Ok(WalNativeReadOutcome::Ready);
+        }
         let opened = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL);
         let opened = match opened {
             Err(_) if !self.create_missing => {
@@ -4061,7 +4153,14 @@ where
 
     /// Validate an attached native descriptor without creating or replacing it.
     /// Existing-path rebinding belongs to fresh read/recovery admission only.
-    async fn validate_current_native_wal_path(&mut self, cx: &Cx) -> Result<()> {
+    ///
+    /// `for_append`: frames written through a handle whose path no longer
+    /// names a file land in an unlinked inode — acknowledged, then lost
+    /// (bd-7zs8a: an in-process stock connection, blind to our fcntl locks,
+    /// checkpoints and unlinks the companions it believes it owns). Reads may
+    /// continue on the pinned snapshot; an append refuses with `BusySnapshot`,
+    /// and the retry's fresh read admission recreates the companion.
+    async fn validate_current_native_wal_path(&mut self, cx: &Cx, for_append: bool) -> Result<()> {
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding { binding.validate_path_identity()?; }
         self.ensure_db_file_identity_captured(cx).await;
@@ -4084,6 +4183,11 @@ where
         // Cross-process stock DOES see it and leaves them alone (measured on
         // bd-1nq3j), so this is tolerance for a configuration stock itself
         // documents as unsupported, not cover for an interop defect.
+        match self.current_handle_names_wal_path(cx).await? {
+            Some(true) => return Ok(()),
+            Some(false) => return Err(FrankenError::BusyRecovery),
+            None => {}
+        }
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
             // bd-7zs8a follow-up: do NOT create here. The native path's contract
             // is that it never creates a companion to satisfy a binding --
@@ -4093,6 +4197,11 @@ where
             // here and broke exactly that.
             if self.inner.has_pending_publication() {
                 return Err(FrankenError::Busy);
+            }
+            if for_append {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: "WAL companion removed".to_owned(),
+                });
             }
             return Ok(());
         }
@@ -4205,9 +4314,19 @@ where
         }
     }
 
+    /// [`Self::ensure_current_wal_path`] for a caller about to append frames:
+    /// a native handle whose path vanished refuses instead of writing into an
+    /// unlinked inode (see [`Self::validate_current_native_wal_path`]).
+    async fn ensure_current_wal_path_for_append(&mut self, cx: &Cx) -> Result<()> {
+        if self.inner.native_reader_required() {
+            return self.validate_current_native_wal_path(cx, true).await;
+        }
+        self.ensure_current_wal_path(cx).await
+    }
+
     async fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
         if self.inner.native_reader_required() {
-            return self.validate_current_native_wal_path(cx).await;
+            return self.validate_current_native_wal_path(cx, false).await;
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding {
@@ -5253,6 +5372,16 @@ where
                     );
                     return Ok(None);
                 }
+                if record.wal_frame_end <= valid_frame_count
+                    && self
+                        .authorized_certificate_record
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        == Some(&record)
+                {
+                    return Ok(Some(record));
+                }
                 let frame_index =
                     usize::try_from(record.wal_frame_end.saturating_sub(1)).map_err(|_| {
                         FrankenError::WalCorrupt {
@@ -5294,6 +5423,10 @@ where
                         actual_digest,
                     )
                 }) {
+                    *self
+                        .authorized_certificate_record
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
                     return Ok(Some(record));
                 }
 
@@ -5438,7 +5571,7 @@ where
             if self.inner.has_pending_publication() || self.inner.native_recovery_requested.is_some() {
                 return Err(FrankenError::BusyRecovery);
             }
-            self.validate_current_native_wal_path(cx).await?;
+            self.validate_current_native_wal_path(cx, true).await?;
             self.inner.preflight_native_append(cx).await
         })
     }
@@ -5623,7 +5756,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner
                 .append_frame(cx, page_number, page_data, db_size_if_commit)
                 .await
@@ -5637,7 +5770,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner.append_frames(cx, frames).await
         })
     }
@@ -5651,7 +5784,7 @@ where
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             preflight.hand_off();
             drop(preflight);
             self.inner
@@ -5682,7 +5815,7 @@ where
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             self.inner.append_prepared_frames(cx, prepared).await
         })
     }
@@ -5696,7 +5829,7 @@ where
         Box::pin(async move {
             let mut preflight = WalWriteCompletionPreflight::new(Some(&completion));
             self.inner.assert_no_pending_append_attempt()?;
-            self.ensure_current_wal_path(cx).await?;
+            self.ensure_current_wal_path_for_append(cx).await?;
             preflight.hand_off();
             drop(preflight);
             self.inner

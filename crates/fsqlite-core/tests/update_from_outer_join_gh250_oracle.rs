@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #250 (bd-gh-update-from-outer-join-wusp5): `UPDATE ... FROM` whose FROM
 //! clause contains an OUTER JOIN source used to error with "UPDATE ... FROM with
 //! an OUTER JOIN source is not yet supported". The connection-layer AST rewrite

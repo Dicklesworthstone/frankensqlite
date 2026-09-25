@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Reproduction / regression test for the batched-commit INSERT scaling cliff.
 //!
 //! Workload mirrors `comprehensive-bench`'s

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch3): ATTACH with an already-in-use schema name
 // (main, temp, or a duplicate attached name) reports stock's "database <name>
 // is already in use" (name as-written), not frank's old "internal error: cannot

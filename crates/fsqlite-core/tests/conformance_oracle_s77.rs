@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 77
 //!
 //! Coverage: multi-table JOINs with mixed aggregates, complex UPDATE/DELETE with

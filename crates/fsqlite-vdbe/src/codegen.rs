@@ -21945,6 +21945,8 @@ fn precomputed_serial_type_kind(column: &ColumnInfo) -> Option<PrecomputedSerial
 ///   placeholders for INTEGER PRIMARY KEY aliases just like `MakeRecord`
 /// - CURRENT_* literals stay on the runtime path so the value registers and
 ///   record blob cannot drift from separate timestamp materializations
+// Bakes UTF-8 TEXT: the only caller gates on a UTF-8 database (bd-bld9w.7).
+#[allow(clippy::disallowed_methods)]
 fn try_build_preformatted_insert_record(
     row_values: &[Expr],
     table: &TableSchema,
@@ -27926,6 +27928,25 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         }
     }
+    // bd-01uq7: a MemDatabase row is also its own UNIQUE index, so fill its
+    // VIRTUAL placeholders with the computed values. Register-context reads of
+    // a VIRTUAL column always re-expand its expression, so the order of these
+    // writes cannot change any value computed above or below.
+    if b.materializes_virtual_generated(table.root_page) {
+        let gen_ctx = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondaries: &[],
+        };
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if let Some(expr) = virtual_generated_column_expr(col) {
+                emit_virtual_generated_column(b, col_idx, &expr, val_regs + col_idx as i32, &gen_ctx);
+            }
+        }
+    }
 }
 
 /// bd-r3303: if `col` is a VIRTUAL generated column, parse and return its
@@ -29565,7 +29586,12 @@ fn resolve_sort_key(
     columns: &[ResultColumn],
 ) -> SortKeySource {
     if let Some(output_expr) = resolve_order_by_output_expr(expr, columns) {
-        return resolve_sort_key(output_expr, table, table_alias, columns);
+        // SQLite resolves an ORDER BY term against the result list once. The
+        // selected expression is an ordinary expression, not another output
+        // reference: re-resolving it against `columns` would loop forever for
+        // `SELECT 1 ... ORDER BY 1` (the literal re-reads as ordinal 1) and for
+        // swapped aliases such as `SELECT a AS b, b AS a ... ORDER BY a`.
+        return resolve_sort_key(output_expr, table, table_alias, &[]);
     }
 
     if let Expr::Column(col_ref, _) = expr {
@@ -39156,6 +39182,7 @@ pub fn emit_backfill_column_read(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

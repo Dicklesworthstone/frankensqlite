@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Differential oracle: JSON1 table-valued functions (json_each / json_tree)
 //! and deep-path scalars vs rusqlite (bundled SQLite 3.53). A probe sweep found
 //! the standalone/literal forms stock-correct across 12 cases (asserted here).

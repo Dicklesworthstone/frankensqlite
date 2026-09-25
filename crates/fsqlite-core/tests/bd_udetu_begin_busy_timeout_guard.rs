@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-udetu — a `BEGIN` refused while a checkpoint holds exclusive access must
 //! have spent the connection's `busy_timeout` first.
 //!
@@ -32,6 +34,12 @@
 // BEGIN probes. These deterministic ownership tests do not replace the real
 // contention tests: passing them alone does not establish that dispatch is
 // wired to the scope or that BEGIN honors the requested elapsed-time bound.
+// Mounted directly under this crate root, the module's `pub(super)` items read
+// as `pub(crate)` inside a private module, and its unit test's deliberate
+// `Duration::MAX - 1s` is linted here though the library allows it; neither
+// lint describes the shared code, and while they failed, `cargo clippy
+// --tests` stopped at this target and never linted the rest of the crate.
+#[allow(clippy::redundant_pub_crate, clippy::unchecked_time_subtraction)]
 #[path = "../src/connection/busy_timeout.rs"]
 mod issue423_busy_timeout;
 

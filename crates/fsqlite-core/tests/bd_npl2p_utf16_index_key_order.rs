@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-utf16-index-key-order-encoded-byte-npl2p (bd-7c6g7 residual).
 //!
 //! Stock SQLite orders BINARY (and NOCASE) TEXT index keys on a UTF-16 database

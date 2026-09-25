@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for bd-pragma-index-list-partial-0lqvb: PRAGMA index_list's `partial`
 // column must be 1 for a partial index (created with a WHERE clause) and 0
 // otherwise. Oracle: sqlite3 3.46.1.

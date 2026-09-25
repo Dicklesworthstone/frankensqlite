@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch #1): an INSERT VALUES column/value count
 // mismatch reports stock's verbatim SQLITE_ERROR text, NOT frank's old
 // "not implemented: ..." (NotImplemented) wrapper. Two stock forms:

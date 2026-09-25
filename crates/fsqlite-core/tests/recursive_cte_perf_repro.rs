@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Performance regression repro for recursive CTEs.
 //!
 //! Bench observation: `WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL

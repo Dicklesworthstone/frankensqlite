@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Generic SQL regression for HFDT's repeated capture-consistency EXISTS.
 //! These are engine-only inputs, not financial data or provider proof.
 

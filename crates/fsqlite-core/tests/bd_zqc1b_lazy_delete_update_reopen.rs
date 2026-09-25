@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-zqc1b: lazy `contentless_delete` FTS5 — DELETE and full-column UPDATE
 //! after a reopen must not corrupt the row count or invert the index.
 //!

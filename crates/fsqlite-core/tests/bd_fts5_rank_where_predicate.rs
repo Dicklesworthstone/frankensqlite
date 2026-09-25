@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-ic9nu: the FTS5 `rank` column must be usable in a WHERE predicate
 //! (e.g. `WHERE t MATCH '...' AND rank < 0`), not only in SELECT / ORDER BY.
 //!

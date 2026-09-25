@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Extended conformance oracle tests comparing FrankenSQLite against C SQLite (rusqlite).
 //!
 //! These tests cover areas not yet exercised by the main conformance suite:

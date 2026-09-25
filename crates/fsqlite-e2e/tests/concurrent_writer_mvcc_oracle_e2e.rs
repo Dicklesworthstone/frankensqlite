@@ -1597,17 +1597,22 @@ fn concurrent_scaling_ratio_does_not_degrade() {
                 }
             }
 
+            // bd-rxfuu: time only the insert work after the barrier. Thread
+            // spawn and each connection's open are host scheduling, and the
+            // slowest thread's own elapsed time is the round's wall time.
             let barrier = Arc::new(Barrier::new(n_threads));
-            let start = std::time::Instant::now();
+            let elapsed = Arc::new(std::sync::Mutex::new(Duration::ZERO));
             let handles: Vec<_> = (0..n_threads)
                 .map(|tid| {
                     let p = f_path.clone();
                     let bar = barrier.clone();
+                    let elapsed = elapsed.clone();
                     thread::spawn(move || {
                         asupersync::test_utils::run_test(|| async {
                             let conn = fsqlite::Connection::open(&p).await.unwrap();
                             conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
                             bar.wait();
+                            let start = std::time::Instant::now();
 
                             for i in 0..rows {
                                 let mut attempts = 0u32;
@@ -1638,6 +1643,8 @@ fn concurrent_scaling_ratio_does_not_degrade() {
                                     }
                                 }
                             }
+                            let mut slowest = elapsed.lock().unwrap();
+                            *slowest = (*slowest).max(start.elapsed());
                         });
                     })
                 })
@@ -1646,11 +1653,16 @@ fn concurrent_scaling_ratio_does_not_degrade() {
             for h in handles {
                 h.join().unwrap();
             }
-            start.elapsed()
+            *elapsed.lock().unwrap()
         }
 
-        let t1 = measure(1, rows).await;
-        let t4 = measure(4, rows).await;
+        // Best of three interleaved rounds, so both widths see the same host
+        // noise and one descheduled round cannot decide the ratio.
+        let (mut t1, mut t4) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            t1 = t1.min(measure(1, rows).await);
+            t4 = t4.min(measure(4, rows).await);
+        }
 
         #[allow(clippy::cast_precision_loss)]
         let ratio = t4.as_secs_f64() / t1.as_secs_f64();

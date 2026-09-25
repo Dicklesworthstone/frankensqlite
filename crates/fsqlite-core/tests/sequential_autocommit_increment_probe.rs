@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Isolation probes for the bd-rjc sequential single-account increment bug.
 //!
 //! `connection::tests::test_sequential_single_account_increment_oracle_probe_bd_rjc`

@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! Conformance oracle tests — Session 78 (cc4 bug-probe batch)
 //!
 //! Targeted probes for: expression edge cases, nested subquery positions,

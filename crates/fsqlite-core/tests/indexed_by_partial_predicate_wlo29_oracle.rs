@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-wlo29: the `INDEXED BY` partial-index cover check (GH#173 / 102bbdb07)
 //! was wrong in BOTH directions. This keeper pins the corrected behavior
 //! against the stock `sqlite3` CLI (3.46.1); every reject/allow verdict below

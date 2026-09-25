@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-zywqc.14 adversarial corpus — single-bit structural corruption.
 //!
 //! Flip exactly one bit at a structural offset of a committed database file and

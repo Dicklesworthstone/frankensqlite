@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-o01lp / GH#357: `VACUUM INTO` must round-trip a contentless FTS5 table's
 //! schema. The parent `CREATE VIRTUAL TABLE ... USING fts5(...)` sqlite_master
 //! row is stored with rootpage=0 (no b-tree of its own); its shadow tables

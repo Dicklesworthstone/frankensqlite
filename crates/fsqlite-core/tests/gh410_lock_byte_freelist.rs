@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! GH #410 keepers — the reserved lock-byte page never reaches the freelist,
 //! and an archive whose durable freelist already names it is repairable.
 //!

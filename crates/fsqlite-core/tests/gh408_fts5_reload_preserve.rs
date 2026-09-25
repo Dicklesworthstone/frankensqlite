@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper for GH#408: a schema reload must PRESERVE an unchanged live fts5 index
 // instead of re-deriving the whole corpus on every statement boundary that
 // follows an unrelated write.

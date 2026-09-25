@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 // Keeper (bd-errmsg-parity-batch2): DROP TABLE/VIEW on the wrong object type
 // reports stock's verbatim SQLITE_ERROR text (not "internal error: ..."), and a
 // BEFORE/AFTER trigger on a view names the ACTUAL timing keyword (not the

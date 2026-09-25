@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! bd-gh-compound-order-by-collate-clks3 (GH #217/#218): a compound SELECT
 //! ORDER BY term wrapped in COLLATE must resolve to its SELECT-list column
 //! (by name or position) instead of erroring "ORDER BY expression not found in

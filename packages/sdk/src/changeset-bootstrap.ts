@@ -2,6 +2,16 @@ import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { applyChangeset } from "./changeset-apply";
 import type { ChangesetValue } from "./changeset-codec";
 import { decodeChangeset } from "./changeset-codec";
+import { bootstrapOrderPrefix } from "./changeset-order";
+import { acknowledgeFanoutBootstrapPrefix, assertSingleRecipient } from "./changeset-fanout";
+import {
+  TABLE as OUTBOX,
+  chunkId,
+  ensure as ensureOutbox,
+  find as findOutboxEntry,
+  inspectStream,
+  load as loadOutboxPayload,
+} from "./changeset-outbox-store";
 
 /** Separate from ordinary per-message delivery: staging is NOT an application ACK. */
 export const CHANGESET_BOOTSTRAP_PROTOCOL = "fsqlite-bootstrap-v1";
@@ -20,9 +30,19 @@ export interface BootstrapManifest extends BootstrapManifestInput {
   /** Ordered SHA-256 chain binding the complete scope, chunk digests and totals. */
   readonly sha256: string;
 }
+/** Receiver route and table order chosen before the original seed transfer. */
+export type BootstrapSourceManifestInput = Pick<
+  BootstrapManifestInput, "receiverId" | "deliveryId" | "tables"
+>;
 export interface BootstrapOperationOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+}
+export interface BootstrapAcknowledgeOptions extends BootstrapOperationOptions {
+  /** Trusted source route, not a receiver identity copied from an incoming ACK. */
+  receiverId: string;
+  /** Require the installed order prefix for this exact source incarnation. */
+  orderedSourceId?: string;
 }
 export interface BootstrapProgress {
   readonly receivedChunks: number;
@@ -42,6 +62,13 @@ export interface BootstrapInstallReceipt {
   readonly installed: true;
   readonly confirmed: true;
   readonly replayed: boolean;
+  /** Present only when the seed and its ordered prefix committed together. */
+  readonly order?: Readonly<{
+    protocol: "fsqlite-ordered-changeset-v1";
+    streamId: string;
+    /** Last seed sequence, not the current incremental tip. */
+    sequence: string;
+  }>;
 }
 export interface BootstrapReceiverOptions {
   receiverId: string;
@@ -49,6 +76,12 @@ export interface BootstrapReceiverOptions {
   tables: readonly string[];
   /** SAME top-level database; called after installation and every installed replay. */
   confirmCommit: () => Promise<unknown>;
+  /**
+   * Trusted source incarnation for an outbox seed occupying sequences 1..N.
+   * Bind before the FIRST stage and preserve on reopen. Never inferred from
+   * incoming data. Installation publishes the prefix in the SAME transaction.
+   */
+  orderedSourceId?: string;
   maxChunkBytes?: number;
   maxBytes?: number;
   maxChunks?: number;
@@ -306,6 +339,37 @@ export async function createBootstrapManifest(
     budget.finish();
   }
 }
+/**
+ * Build or recover the SAME receiver-specific manifest from a retained source
+ * bootstrap, never by snapshotting current application rows. Pending bodies are
+ * verified one at a time; acknowledged chunks use their retained identities.
+ * Reads one source transaction, creates no storage, changes no cursors and
+ * proves neither receiver installation nor source commit durability.
+ */
+export async function readBootstrapManifest(
+  source: ChangesetTarget,
+  input: BootstrapSourceManifestInput,
+  options?: BootstrapOperationOptions,
+): Promise<BootstrapManifest> {
+  const route = Object.freeze({
+    receiverId: text(data(input, "receiverId"), 256),
+    deliveryId: text(data(input, "deliveryId"), 480),
+    tables: tableNames(data(input, "tables")),
+  });
+  if (typeof source?.transaction !== "function") fail("INPUT", "A source transaction owner is required");
+  const b = new Budget(options);
+  try {
+    b.check();
+    const result = await source.transaction(async executor => {
+      const retained = await inspectSourceBootstrap(sourceExecutor(executor, b), b, route);
+      return retained.manifest;
+    }, b.options());
+    b.check();
+    return result;
+  } finally {
+    b.finish();
+  }
+}
 async function query(
   tx: ChangesetExecutor,
   b: Budget,
@@ -415,6 +479,11 @@ async function noTriggers(tx: ChangesetExecutor, b: Budget, table: string): Prom
 interface Stored extends BootstrapProgress {
   chain: string;
 }
+function storedManifest(m: BootstrapManifest, orderedSourceId: string | undefined): string {
+  // Local policy is separate from the portable bootstrap wire hash. Persist it
+  // with the manifest so restart cannot silently downgrade an ordered install.
+  return JSON.stringify(orderedSourceId === undefined ? m : { ...m, orderedSourceId });
+}
 function progress(s: Stored): BootstrapProgress {
   return Object.freeze({
     receivedChunks: s.receivedChunks,
@@ -427,6 +496,7 @@ async function state(
   tx: ChangesetExecutor,
   b: Budget,
   m: BootstrapManifest,
+  orderedSourceId: string | undefined,
 ): Promise<Stored | null> {
   const rows = await query(
     tx,
@@ -442,7 +512,7 @@ async function state(
   if (rows.length !== 1 || rows[0]!.length !== 7 || sqlNumber(rows[0]![0], 1) !== 1)
     fail("CORRUPT", "Invalid bootstrap state row");
   const r = rows[0]!;
-  if (r[1] !== JSON.stringify(m))
+  if (r[1] !== storedManifest(m, orderedSourceId))
     fail("STATE", "Receiver is bound to a different bootstrap manifest; do not reseed");
   const s = {
     receivedChunks: sqlNumber(r[2], m.chunks),
@@ -513,6 +583,7 @@ export class ChangesetBootstrapReceiver {
   readonly #bytes: number;
   readonly #chunks: number;
   readonly #changes: number;
+  readonly #orderedSourceId: string | undefined;
   #active = false;
   constructor(target: ChangesetTarget, options: BootstrapReceiverOptions) {
     this.#target = target;
@@ -522,6 +593,8 @@ export class ChangesetBootstrapReceiver {
     if (typeof confirm !== "function")
       fail("INPUT", "Bootstrap requires same-target storage confirmation");
     this.#confirm = confirm;
+    const orderedSourceId = options.orderedSourceId;
+    this.#orderedSourceId = orderedSourceId === undefined ? undefined : text(orderedSourceId, 256);
     this.#chunkBytes = number(options.maxChunkBytes ?? 8 * 1024 * 1024, HARD_CHUNK, 1);
     this.#bytes = number(options.maxBytes ?? 256 * 1024 * 1024, HARD_BYTES, 1);
     this.#chunks = number(options.maxChunks ?? 10_000, 100_000, 1);
@@ -562,7 +635,7 @@ export class ChangesetBootstrapReceiver {
     return this.#run(options, (b) =>
       this.#target.transaction(async (tx) => {
         if (!(await ensure(tx, b, false))) return null;
-        const s = await state(tx, b, m);
+        const s = await state(tx, b, m, this.#orderedSourceId);
         return s === null ? null : progress(s);
       }, b.options()),
     );
@@ -585,7 +658,7 @@ export class ChangesetBootstrapReceiver {
       b.check();
       return this.#target.transaction(async (tx) => {
         await ensure(tx, b, true);
-        let s = await state(tx, b, m);
+        let s = await state(tx, b, m, this.#orderedSourceId);
         if (s === null) {
           if (index !== 0) fail("STATE", "Start bootstrap at chunk zero");
           s = {
@@ -599,7 +672,7 @@ export class ChangesetBootstrapReceiver {
             tx,
             b,
             `INSERT OR ABORT INTO ${STATE} VALUES (1,?,0,0,0,?,0)`,
-            [JSON.stringify(m), s.chain],
+            [storedManifest(m, this.#orderedSourceId), s.chain],
             1,
           );
         }
@@ -666,10 +739,13 @@ export class ChangesetBootstrapReceiver {
     return this.#run(options, async (b) => {
       const replayed = await this.#target.transaction(async (tx) => {
         if (!(await ensure(tx, b, false))) fail("STATE", "No staged bootstrap");
-        const s = await state(tx, b, m);
+        const s = await state(tx, b, m, this.#orderedSourceId);
         if (s === null || s.receivedChunks !== m.chunks)
           fail("STATE", "The complete bootstrap must be staged before installation");
-        if (s.installed) return true;
+        if (s.installed) {
+          await this.#orderPrefix(tx, b, m, true);
+          return true;
+        }
         await emptyTargets(tx, b, m);
         const count = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
         if (
@@ -715,6 +791,7 @@ export class ChangesetBootstrapReceiver {
         }
         if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
           fail("CORRUPT", "Staged bootstrap digest/totals mismatch");
+        await this.#orderPrefix(tx, b, m, false);
         await write(tx, b, `UPDATE OR ABORT ${CHUNKS} SET payload=X''`, [], m.chunks);
         await write(
           tx,
@@ -748,7 +825,201 @@ export class ChangesetBootstrapReceiver {
         installed: true,
         confirmed: true,
         replayed,
+        ...(this.#orderedSourceId === undefined ? {} : {
+          order: Object.freeze({
+            protocol: "fsqlite-ordered-changeset-v1" as const,
+            streamId: this.#orderedSourceId,
+            sequence: String(m.chunks),
+          }),
+        }),
       });
     });
+  }
+
+  /** Verify retained chunk metadata even after bodies have been reclaimed. */
+  async #orderPrefix(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest, replayed: boolean): Promise<void> {
+    if (this.#orderedSourceId === undefined) return;
+    const population = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
+    if (population.length !== 1 || population[0]!.length !== 1 ||
+        sqlNumber(population[0]![0], m.chunks) !== m.chunks)
+      fail("CORRUPT", "Bootstrap order prefix has missing or extra chunks");
+    let chain = await seed(m), bytes = 0, changes = 0;
+    await bootstrapOrderPrefix(tx, {
+      receiverId: this.#id,
+      sourceId: this.#orderedSourceId,
+      deliveryId: m.deliveryId,
+      chunks: m.chunks,
+      replayed,
+    }, async index => {
+      const meta = await chunkMeta(tx, b, index);
+      if (meta.storedBytes !== (replayed ? 0 : meta.byteLength) || meta.byteLength > this.#chunkBytes)
+        fail("CORRUPT", "Bootstrap order prefix has invalid payload metadata");
+      chain = await link(chain, index, meta.sha256, meta.byteLength, meta.changes);
+      bytes += meta.byteLength;
+      changes += meta.changes;
+      if (bytes > m.byteLength || changes > m.changes)
+        fail("CORRUPT", "Bootstrap order prefix exceeds manifest totals");
+      return meta;
+    }, () => b.check());
+    b.check();
+    if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
+      fail("CORRUPT", "Bootstrap order prefix failed manifest verification");
+  }
+}
+
+/** Check cancellation at every source-storage SQL boundary without racing it. */
+function sourceExecutor(executor: ChangesetExecutor, b: Budget): ChangesetExecutor {
+  return {
+    execute: async (sql, params) => {
+      b.check();
+      const changed = await executor.execute(sql, params);
+      b.check();
+      return changed;
+    },
+    query: async (sql, params) => {
+      b.check();
+      const rows = await executor.query(sql, params);
+      b.check();
+      return rows;
+    },
+  };
+}
+
+/** Shared retained-source proof for manifest recovery and install ACK admission. */
+async function inspectSourceBootstrap(
+  tx: ChangesetExecutor,
+  b: Budget,
+  route: BootstrapSourceManifestInput,
+  expected?: BootstrapManifest,
+) {
+  if (!(await ensureOutbox(tx, false))) fail("STATE", "No retained source bootstrap");
+  const root = await findOutboxEntry(tx, route.deliveryId);
+  if (root === null || root.stream?.index !== 0 || root.stream.summary === null)
+    fail("STATE", "The original source bootstrap manifest is no longer retained");
+  const scope = JSON.parse(root.scope) as { tables: string[] };
+  if (JSON.stringify(scope.tables) !== JSON.stringify([...route.tables].sort()))
+    fail("STATE", "Bootstrap manifest has a different source table scope");
+  const before = await inspectStream(tx, root, () => b.check(), false);
+  if (expected !== undefined && (before.chunks !== expected.chunks ||
+      before.changes !== expected.changes || before.byteLength !== expected.byteLength))
+    fail("STATE", "Install acknowledgement has different retained source totals");
+  const input = captureInput({ ...route, chunks: before.chunks, changes: before.changes, byteLength: before.byteLength });
+  let chain = await seed(input);
+  for (let i = 0; i < input.chunks; i++) {
+    b.check();
+    const entry = await findOutboxEntry(tx, chunkId(input.deliveryId, i));
+    if (entry === null || entry.stream?.id !== input.deliveryId || entry.stream.index !== i ||
+        entry.stream.base !== root.stream.base)
+      fail("CORRUPT", "Source bootstrap contains missing or foreign prefix entries");
+    // Already acknowledged bodies are gone; their retained hashes still bind
+    // replay. A pending body must pass the existing size/hash/codec checks.
+    await loadOutboxPayload(tx, entry);
+    const d = entry.delivery;
+    chain = await link(chain, i, d.sha256, d.byteLength, d.changes);
+  }
+  b.check();
+  if (expected !== undefined && chain !== expected.sha256)
+    fail("CORRUPT", "Install manifest does not match the complete source prefix");
+  const manifest: BootstrapManifest = Object.freeze({ protocol: CHANGESET_BOOTSTRAP_PROTOCOL, ...input, sha256: chain });
+  return { root, before, manifest };
+}
+
+/**
+ * Reclaim a single-recipient source seed after its complete, authenticated install
+ * ACK. Pass the ORIGINAL outbound manifest and trusted route, not a manifest
+ * reconstructed from the incoming receipt. No network or receiver SQL runs here.
+ *
+ * Verify source metadata and pending bodies in one snapshot, then acknowledge the
+ * entire remaining prefix in that SAME transaction. Keep identity tombstones and
+ * later incremental entries. Return newly acknowledged chunks; zero is an exact
+ * retained replay, not permission to forget history. Snapshot sources must still
+ * confirm their own commit. Fanout sources require per-replica acknowledgement.
+ */
+export async function acknowledgeBootstrapInstall(
+  source: ChangesetTarget,
+  manifest: BootstrapManifest,
+  receipt: BootstrapInstallReceipt,
+  options: BootstrapAcknowledgeOptions,
+): Promise<number> {
+  return acknowledgeInstall(source, manifest, receipt, options, false);
+}
+
+/**
+ * Accept one required replica's complete install ACK on a fanout source. The
+ * original receiver-bound manifest and trusted route are mandatory, just as for
+ * acknowledgeBootstrapInstall(). Only that replica advances, without rewinding
+ * newer incremental progress. Payload reclamation follows the minimum required
+ * replica cursor, not this receiver's installation frontier.
+ *
+ * Return seed sequences newly acknowledged by THIS replica, not reclaimed rows
+ * or bytes. Cursor advancement and any reclamation commit together. A retained
+ * replay returns zero; missing history is an error. Confirm the same source's
+ * storage before treating this SQL result as durable. No network runs here.
+ */
+export async function acknowledgeFanoutBootstrapInstall(
+  source: ChangesetTarget,
+  manifest: BootstrapManifest,
+  receipt: BootstrapInstallReceipt,
+  options: BootstrapAcknowledgeOptions,
+): Promise<number> {
+  return acknowledgeInstall(source, manifest, receipt, options, true);
+}
+
+async function acknowledgeInstall(
+  source: ChangesetTarget,
+  manifest: BootstrapManifest,
+  receipt: BootstrapInstallReceipt,
+  options: BootstrapAcknowledgeOptions,
+  fanout: boolean,
+): Promise<number> {
+  const m = captureManifest(manifest);
+  const receiverId = text(options?.receiverId, 256);
+  const requestedSource = options.orderedSourceId;
+  const orderedSourceId = requestedSource === undefined ? undefined : text(requestedSource, 256);
+  if (typeof source?.transaction !== "function" || m.receiverId !== receiverId)
+    fail("INPUT", "Use the source transaction owner and its trusted bootstrap receiver route");
+  for (const key of ["protocol", "receiverId", "deliveryId", "sha256", "chunks", "changes", "byteLength"] as const) {
+    if (data(receipt, key) !== m[key])
+      fail("STATE", "Install acknowledgement does not match the original bootstrap manifest");
+  }
+  if (data(receipt, "installed") !== true || data(receipt, "confirmed") !== true ||
+      typeof data(receipt, "replayed") !== "boolean")
+    fail("STATE", "Only a confirmed complete installation can reclaim a source seed");
+  if (orderedSourceId === undefined) {
+    if ("order" in receipt)
+      fail("INPUT", "Configure orderedSourceId before accepting an ordered install acknowledgement");
+  } else {
+    const order = data(receipt, "order");
+    if (data(order, "protocol") !== "fsqlite-ordered-changeset-v1" ||
+        data(order, "streamId") !== orderedSourceId || data(order, "sequence") !== String(m.chunks))
+      fail("STATE", "Install acknowledgement does not confirm the expected source prefix");
+  }
+  // All receipt fields and route policy were captured before the first await.
+  const b = new Budget(options);
+  try {
+    b.check();
+    return await source.transaction(async executor => {
+      const tx = sourceExecutor(executor, b);
+      if (!fanout) await assertSingleRecipient(tx);
+      const { root, before } = await inspectSourceBootstrap(tx, b, m, m);
+      if (fanout) {
+        const advanced = await acknowledgeFanoutBootstrapPrefix(tx, receiverId, root, () => b.check());
+        b.check();
+        return advanced;
+      }
+      const changed = m.chunks - before.acknowledgedChunks;
+      if (changed === 0) return 0;
+      await write(tx, b,
+        `UPDATE OR ABORT ${OUTBOX} SET acknowledged=1,payload=X'' WHERE seq>=1 AND seq<=? AND acknowledged=0`,
+        [BigInt(m.chunks)], changed);
+      const after = await inspectStream(tx, root, () => b.check(), false);
+      if (!after.complete || after.chunks !== before.chunks || after.changes !== before.changes ||
+          after.byteLength !== before.byteLength || after.sha256 !== before.sha256)
+        fail("CORRUPT", "Source bootstrap acknowledgement was not retained atomically");
+      b.check();
+      return changed;
+    }, b.options());
+  } finally {
+    b.finish();
   }
 }
