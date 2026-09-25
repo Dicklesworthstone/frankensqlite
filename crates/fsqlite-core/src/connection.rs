@@ -27668,7 +27668,12 @@ impl Connection {
             // settlement, a statement prepared before a transaction and executed
             // after that transaction's guard was dropped would write inside the
             // abandoned transaction instead of rolling it back first.
-            self.settle_pending_transaction_cleanup().await?;
+            //
+            // Settling is rare and its future is 9 KB; awaited inline it would
+            // size (and be copied with) this block on every prepared execution.
+            if self.pending_transaction_cleanup.get() {
+                Box::pin(self.settle_pending_transaction_cleanup()).await?;
+            }
             self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
                 .await
         }))
