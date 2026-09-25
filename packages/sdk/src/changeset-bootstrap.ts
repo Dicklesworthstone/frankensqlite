@@ -640,6 +640,54 @@ export class ChangesetBootstrapReceiver {
       }, b.options()),
     );
   }
+  /**
+   * Explicitly abandon ONLY this uninstalled upload. Stop its senders first.
+   * Application rows, installed receipts and source outbox state are untouched.
+   * Corrupt payload bytes may be discarded, but the storage schema, manifest
+   * identity and ordered-source binding must still validate. No file is deleted.
+   * A successful false result confirms already-absent state too; it is never an
+   * installation ACK or permission to reclaim the source's pending payloads.
+   */
+  async discard(
+    manifest: BootstrapManifest,
+    options?: BootstrapOperationOptions,
+  ): Promise<boolean> {
+    const m = this.#admit(manifest);
+    return this.#run(options, async (b) => {
+      const removed = await this.#target.transaction(async (tx) => {
+        if (!(await ensure(tx, b, false))) return false;
+        const s = await state(tx, b, m, this.#orderedSourceId);
+        if (s === null) return false;
+        if (s.installed)
+          fail("STATE", "An installed bootstrap cannot be discarded or reseeded");
+        // Claim the exact uninstalled decision before touching its chunks. A
+        // concurrent installer must conflict, not have its receipt erased.
+        await write(tx, b,
+          `DELETE FROM ${STATE} WHERE id=1 AND installed=0 AND manifest=?`,
+          [storedManifest(m, this.#orderedSourceId)], 1);
+        b.check();
+        const deleted = await tx.execute(`DELETE FROM ${CHUNKS}`);
+        b.check();
+        sqlNumber(deleted, 100_000);
+        if ((await query(tx, b, `SELECT 1 FROM ${CHUNKS} LIMIT 1`)).length)
+          fail("CORRUPT", "Bootstrap discard left staged chunks behind");
+        return true;
+      }, b.options());
+      // As with installation, cancellation during a successful COMMIT cannot
+      // abandon confirmation. Replays must confirm an earlier lost response.
+      try {
+        await this.#confirm();
+      } catch (cause: unknown) {
+        throw new ChangesetBootstrapError(
+          "CONFIRM",
+          "Bootstrap discard may have committed; confirm this database before staging another baseline",
+          { cause },
+        );
+      }
+      b.check();
+      return removed;
+    });
+  }
   /** Contiguous, restartable upload; this result NEVER authorizes source payload reclamation. */
   async stage(
     manifest: BootstrapManifest,
