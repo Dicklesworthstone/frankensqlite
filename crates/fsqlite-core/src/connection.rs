@@ -37739,7 +37739,15 @@ impl Connection {
         {
             self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
         }
-        let was_auto = if is_txn_control {
+        // A SELECT with no FROM, CTE, compound arm or subquery reads no
+        // storage. Like stock SQLite, whose program for it has no Transaction
+        // opcode, it needs no autocommit read transaction (a begin and commit
+        // were most of the cost of `SELECT 1`).
+        let storage_free_select = matches!(statement, Statement::Select(select)
+            if select.with.is_none()
+                && is_expression_only_select(select)
+                && !expression_only_has_subquery(select));
+        let was_auto = if is_txn_control || storage_free_select {
             false // transaction-control manages its own transactions
         } else if is_write {
             self.ensure_autocommit_txn_with_cx(&op_cx).await?
@@ -221221,7 +221229,9 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .copied()
                 .unwrap_or(0);
 
-            conn.query("SELECT 1;").await.unwrap();
+            conn.query("SELECT count(*) FROM sqlite_master;")
+                .await
+                .unwrap();
 
             let after_rows = conn.query("PRAGMA txn_stats;").await.unwrap();
             let after = txn_metrics_map(&after_rows)
@@ -221232,6 +221242,18 @@ fts5(title, body, content=docs, content_rowid=id)'
                 after,
                 baseline + 1,
                 "autocommit read should increment completed transaction count"
+            );
+
+            // A SELECT that touches no storage opens no transaction at all.
+            conn.query("SELECT 1;").await.unwrap();
+            let storage_free_rows = conn.query("PRAGMA txn_stats;").await.unwrap();
+            assert_eq!(
+                txn_metrics_map(&storage_free_rows)
+                    .get("completed_count")
+                    .copied()
+                    .unwrap_or(0),
+                after,
+                "storage-free SELECT must not begin an autocommit transaction"
             );
         });
     }
