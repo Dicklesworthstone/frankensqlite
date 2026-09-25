@@ -1663,6 +1663,54 @@ impl<F: VfsFile> WalFile<F> {
         WalFrameHeader::from_bytes(&header_buf)
     }
 
+    /// Read the headers of frames `start..end`, a run of whole frames per
+    /// read instead of one read per header. Each read stays within 64 KiB,
+    /// the size VFS backends perform inline rather than handing to a worker.
+    pub async fn read_frame_headers(
+        &self,
+        cx: &Cx,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<WalFrameHeader>> {
+        const MAX_READ_BYTES: usize = 64 * 1024;
+        if start > end || end > self.frame_count {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "frame range {start}..{end} out of range (count: {})",
+                    self.frame_count
+                ),
+            });
+        }
+        let frame_size = self.frame_size();
+        let frames_per_read = (MAX_READ_BYTES / frame_size).max(1);
+        let mut headers = Vec::with_capacity(end - start);
+        let mut buf = vec![0_u8; frame_size * frames_per_read.min(end - start).max(1)];
+        let mut frame = start;
+        while frame < end {
+            let frames = frames_per_read.min(end - frame);
+            // A run's last frame needs only its header.
+            let wanted = (frames - 1) * frame_size + WAL_FRAME_HEADER_SIZE;
+            let bytes = &mut buf[..wanted];
+            let bytes_read = self.file.read(cx, bytes, self.frame_offset(frame)).await?;
+            if bytes_read < wanted {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "short header read at frames {frame}..{}: got {bytes_read} of {wanted}",
+                        frame + frames
+                    ),
+                });
+            }
+            for index in 0..frames {
+                let at = index * frame_size;
+                headers.push(WalFrameHeader::from_bytes(
+                    &bytes[at..at + WAL_FRAME_HEADER_SIZE],
+                )?);
+            }
+            frame += frames;
+        }
+        Ok(headers)
+    }
+
     /// Find the last commit frame index, or `None` if there are no commits.
     pub fn last_commit_frame(&mut self, cx: &Cx) -> Result<Option<usize>> {
         let _ = cx;
@@ -2524,6 +2572,33 @@ mod tests {
         assert_eq!(header.db_size, 0);
         assert_eq!(header.salts, test_salts());
         assert_eq!(data, page);
+
+        wal.close(&cx).expect("close WAL");
+    }
+
+    #[test]
+    fn test_read_frame_headers_matches_single_header_reads_across_chunks() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 1, test_salts()).expect("create WAL");
+        // 40 frames of 4 KiB span three 64 KiB reads, the last one partial.
+        for frame in 0..40_u32 {
+            let commit = if frame % 5 == 4 { frame + 1 } else { 0 };
+            let page = sample_page(u8::try_from(frame).unwrap());
+            wal.append_frame(&cx, frame % 7 + 1, &page, commit)
+                .expect("append frame");
+        }
+        for (start, end) in [(0, 40), (0, 1), (13, 29), (39, 40), (7, 7)] {
+            let batched = wal
+                .read_frame_headers(&cx, start, end)
+                .expect("batched headers");
+            let single: Vec<_> = (start..end)
+                .map(|frame| wal.read_frame_header(&cx, frame).expect("single header"))
+                .collect();
+            assert_eq!(batched, single, "frames {start}..{end}");
+        }
+        assert!(wal.read_frame_headers(&cx, 0, 41).is_err());
 
         wal.close(&cx).expect("close WAL");
     }

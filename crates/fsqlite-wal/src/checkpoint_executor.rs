@@ -247,9 +247,12 @@ pub async fn execute_checkpoint<F: VfsFile>(
             std::collections::HashMap::new();
 
         // Pass 1: Find the latest frame index for each page in the checkpoint range.
-        for frame_idx in start..end {
-            let header = wal.read_frame_header(cx, frame_idx).await?;
-
+        let headers = if start < end {
+            wal.read_frame_headers(cx, start, end).await?
+        } else {
+            Vec::new()
+        };
+        for (frame_idx, header) in (start..end).zip(headers) {
             let page_no =
                 PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
                     what: "checkpoint frame page number".to_owned(),
