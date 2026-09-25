@@ -4466,11 +4466,11 @@ mod tests {
     #[allow(clippy::literal_string_with_formatting_args)]
     fn json5_nonfinite_visitor_preserves_keys_strings_and_finite_types() {
         let value = parse_json5_text(
-            r#"{
+            r"{
                 Infinity:1, NaN:'NaN',
                 u:18446744073709551615, i:-9223372036854775808,
                 z:-0.0, v:'\v', s:'\\Infinity', b:true, n:null, a:[]
-            }"#,
+            }",
         )
         .expect("ordinary JSON5 values keep their representation");
         assert_eq!(value["Infinity"].as_u64(), Some(1));
