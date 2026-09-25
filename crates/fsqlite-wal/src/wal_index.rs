@@ -836,6 +836,18 @@ pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u
     let retained = usize::try_from(retained)
         .map_err(|_| FrankenError::internal("WAL-index prefix exceeds usize"))?
         .min(capacity);
+    // Every writer installs a page entry before its hash slot and clears hash
+    // slots before page entries (as stock SQLite's walIndexAppend and
+    // walCleanupHash do), so at any crash point a hash slot naming an entry
+    // past the prefix implies that entry's page slot is still set. A clean
+    // page tail, the common case, therefore proves a clean hash tail.
+    if !segment.atomic_any_nonzero_u32_ne(
+        offset + retained * 4,
+        capacity - retained,
+        Ordering::Acquire,
+    )? {
+        return Ok(());
+    }
     // The caller retains the WRITE owner, so only this owner can change hash
     // slots. Capture them at their atomic protocol width under one local lock;
     // readers may continue using the published prefix throughout cleanup.

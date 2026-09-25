@@ -574,6 +574,63 @@ impl ShmRegion {
         }
     }
 
+    /// Whether any native-endian `u32` word among the `count` words starting
+    /// at `offset` is nonzero, holding the local backing mutex once. Each
+    /// word is read with a fixed-width load at `ordering`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 4-byte
+    /// aligned or the range exceeds the visible or backing length.
+    ///
+    /// # Panics
+    ///
+    /// Nonempty mmap ranges panic for `Release` or `AcqRel` ordering.
+    pub fn atomic_any_nonzero_u32_ne(
+        &self,
+        offset: usize,
+        count: usize,
+        ordering: Ordering,
+    ) -> Result<bool> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        if !offset.is_multiple_of(4) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u32 scan".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        let width = count
+            .checked_mul(4)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "SHM atomic u32 scan".to_owned(),
+                value: format!("count={count}"),
+            })?;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range =
+                    self.checked_range(offset, width, guard.len(), "SHM atomic u32 scan")?;
+                Ok(guard[range].iter().any(|&byte| byte != 0))
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_range(offset, width, m.len, "SHM atomic u32 scan")?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: The complete aligned range was checked; the mapping
+                // and backing mutex span every load.
+                Ok((0..count).any(|index| {
+                    unsafe { atomic_u32_at(m, offset + index * 4) }.load(ordering) != 0
+                }))
+            }
+        }
+    }
+
     /// Zero every nonzero native-endian `u32` word among the `count` words
     /// starting at `offset`, holding the local backing mutex once.
     ///
@@ -604,16 +661,19 @@ impl ShmRegion {
                 value: format!("unaligned offset={offset}"),
             });
         }
-        let width = count.checked_mul(4).ok_or_else(|| FrankenError::OutOfRange {
-            what: "SHM atomic u32 clear".to_owned(),
-            value: format!("count={count}"),
-        })?;
+        let width = count
+            .checked_mul(4)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "SHM atomic u32 clear".to_owned(),
+                value: format!("count={count}"),
+            })?;
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let range = self.checked_range(offset, width, guard.len(), "SHM atomic u32 clear")?;
+                let range =
+                    self.checked_range(offset, width, guard.len(), "SHM atomic u32 clear")?;
                 guard[range].fill(0);
                 Ok(())
             }
@@ -1388,11 +1448,35 @@ mod tests {
                 .atomic_store_u32_ne(index * 4, value, Ordering::Release)
                 .unwrap();
         }
+        assert!(
+            region
+                .atomic_any_nonzero_u32_ne(4, 2, Ordering::Acquire)
+                .unwrap()
+        );
+        assert!(
+            !region
+                .atomic_any_nonzero_u32_ne(4, 1, Ordering::Acquire)
+                .unwrap()
+        );
+        assert!(
+            !region
+                .atomic_any_nonzero_u32_ne(4, 0, Ordering::Acquire)
+                .unwrap()
+        );
         // Clear words 1..=2 only: the zero stays zero, the nonzero goes.
         region
             .atomic_clear_nonzero_u32_ne(4, 2, Ordering::Release)
             .unwrap();
-        let read = |index: usize| region.atomic_load_u32_ne(index * 4, Ordering::Acquire).unwrap();
+        assert!(
+            !region
+                .atomic_any_nonzero_u32_ne(4, 2, Ordering::Acquire)
+                .unwrap()
+        );
+        let read = |index: usize| {
+            region
+                .atomic_load_u32_ne(index * 4, Ordering::Acquire)
+                .unwrap()
+        };
         assert_eq!([read(0), read(1), read(2), read(3)], [7, 0, 0, 0x1234_5678]);
 
         // Unaligned or out-of-range requests store nothing.
