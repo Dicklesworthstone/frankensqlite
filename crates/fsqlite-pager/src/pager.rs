@@ -17070,24 +17070,19 @@ where
         Ok(wal.native_read_binding().map(|binding| binding.header()))
     }
 
-    /// Whether a standalone refresh now would observe exactly what the last
-    /// complete one did.
-    async fn standalone_refresh_is_unchanged(
-        &self,
-        cx: &Cx,
+    /// Whether `current`, just observed, shows that a standalone refresh would
+    /// find exactly what the last complete one did.
+    fn standalone_refresh_is_unchanged(
         inner: &PagerInner<V::File>,
-    ) -> Result<bool> {
-        let Some(previous) = inner.wal_refresh_signature else {
-            return Ok(false);
-        };
-        if inner.active_transactions > 0
-            || inner.checkpoint_active
-            || inner.rollback_journal_recovery_state.is_pending()
-            || inner.commit_seq != previous.commit_seq
-        {
-            return Ok(false);
-        }
-        Ok(self.current_wal_refresh_signature(cx, inner).await? == Some(previous))
+        current: Option<WalRefreshSignature>,
+    ) -> bool {
+        inner.wal_refresh_signature.is_some_and(|previous| {
+            inner.active_transactions == 0
+                && !inner.checkpoint_active
+                && !inner.rollback_journal_recovery_state.is_pending()
+                && inner.commit_seq == previous.commit_seq
+                && current == Some(previous)
+        })
     }
 
     /// Refresh the publication plane from the latest committed pager state.
@@ -17112,10 +17107,7 @@ where
         pre_refresh_signature: Option<WalRefreshSignature>,
     ) -> Result<CommittedStateRefresh> {
         if let Some(signature) = pre_refresh_signature
-            && inner.wal_refresh_signature == Some(signature)
-            && inner.active_transactions == 0
-            && !inner.checkpoint_active
-            && !inner.rollback_journal_recovery_state.is_pending()
+            && Self::standalone_refresh_is_unchanged(inner, pre_refresh_signature)
             && self.bound_native_read_header(cx).await? == Some(signature.shm_header)
         {
             return Ok(CommittedStateRefresh {
@@ -17159,9 +17151,6 @@ where
             // exact existing recovery-owner admission check.
             self.validate_namespace_binding_locked(&mut inner)?;
             inner.adopt_orphaned_rollback_journal_recovery()?;
-            if self.standalone_refresh_is_unchanged(cx, &inner).await? {
-                return Ok(self.published.snapshot());
-            }
         }
         // Observed before refreshing: a commit that lands while the refresh
         // runs changes the header, so the next boundary still refreshes.
@@ -17170,6 +17159,9 @@ where
         } else {
             self.current_wal_refresh_signature(cx, &inner).await?
         };
+        if !returning_open && Self::standalone_refresh_is_unchanged(&inner, pre_refresh_signature) {
+            return Ok(self.published.snapshot());
+        }
         inner.wal_refresh_signature = None;
         let expected_recovery_owner = if inner.active_transactions == 0
             && inner
