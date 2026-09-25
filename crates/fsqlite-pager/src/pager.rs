@@ -1434,6 +1434,13 @@ struct GroupCommitQueue {
     /// (not a `Vec`) so the fold-time re-share of still-abandoned pages is
     /// idempotent and the ledger cannot accumulate duplicates.
     disowned_pages: Arc<Mutex<HashSet<u32>>>,
+    /// The WAL generation the `disowned_pages` ledger is reconciled against:
+    /// the latest generation any connection to this file refreshed into, or
+    /// `None` once a checkpoint reset the WAL and nobody has observed the new
+    /// generation yet. A private abandonment pool parked in any other
+    /// generation is stale — the frames that proved its pages were holes went
+    /// with that generation — and must never be handed to the ledger.
+    disowned_pages_generation: Arc<Mutex<Option<WalGenerationIdentity>>>,
     /// Test-local proof that a resolved wake dropped during post-wake
     /// finalization is classified instead of being silently discarded.
     #[cfg(test)]
@@ -1914,6 +1921,7 @@ impl GroupCommitQueue {
             epoch_resolution_claims_in_flight: AtomicUsize::new(0),
             pending_logical_cleanups: Mutex::new(VecDeque::new()),
             disowned_pages: Arc::new(Mutex::new(HashSet::new())),
+            disowned_pages_generation: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             unaccounted_epoch_wake_drops: AtomicUsize::new(0),
         }
@@ -7874,6 +7882,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// with no bound queue (which are single-connection shapes that never
     /// populate the pool), so the cross-connection sweep is simply inert there.
     disowned_page_ledger: Option<Arc<Mutex<HashSet<u32>>>>,
+    /// The ledger's shared reconciliation generation
+    /// (`GroupCommitQueue::disowned_pages_generation`).
+    disowned_page_ledger_generation: Option<Arc<Mutex<Option<WalGenerationIdentity>>>>,
     /// bd-r82et: the pager's last-known CURRENT durable freelist content —
     /// exactly the pages recorded free in durable page-1/trunk metadata. It
     /// is refreshed wherever durable freelist state is actually read
@@ -7961,17 +7972,37 @@ impl<F: VfsFile> Drop for PagerInner<F> {
         // ledger so a surviving connection adopts and reconciles them at its
         // next fold. Sync-mutex only — safe in Drop; a no-op when the pool is
         // empty (the overwhelming common case) or no shared ledger is bound.
+        //
+        // Only a pool parked in the ledger's current WAL generation may be
+        // handed over. A connection that never refreshed across a peer's
+        // checkpoint still holds entries judged in the old generation; one of
+        // them may since have been re-granted from EOF, committed live and
+        // checkpointed away, and a fold would read its missing frame as a
+        // hole and free a live page (a page referenced twice). Discarding a
+        // stale pool can at worst leave an unreferenced hole, which the
+        // open-time orphan repair reclaims; handing it over can corrupt.
         if !ioq6x_ledger_disabled()
             && !self.abandoned_eof_reservations.is_empty()
             && let Some(ledger) = self.disowned_page_ledger.as_ref()
         {
+            let current_generation = self.disowned_page_ledger_generation.as_ref().map(|generation| {
+                *generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            let pool_is_current = self.committed_wal_generation.is_some()
+                && current_generation == Some(self.committed_wal_generation);
             if std::env::var_os("IOQ6X_TRACE").is_some() {
                 eprintln!(
-                    "IOQ6X DISOWN pool={} -> shared ledger",
+                    "IOQ6X DISOWN pool={} current={pool_is_current} -> shared ledger",
                     self.abandoned_eof_reservations.len(),
                 );
             }
-            disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+            if pool_is_current {
+                disown_pages(ledger, self.abandoned_eof_reservations.drain(..));
+            } else {
+                self.abandoned_eof_reservations.clear();
+            }
         }
         if let Some(owner) = self.rollback_journal_recovery_owner {
             // Never expose a clean identity atomic merely because this one
@@ -9762,19 +9793,34 @@ impl<F: VfsFile> PagerInner<F> {
         // Cross the boundary the way the checkpointing pager itself does:
         // above-extent entries stay in the shared ledger, in-range ones are
         // dropped, and this refresh must not re-park anything.
+        //
+        // "Above extent" must be judged against the NEW generation's committed
+        // extent. This pager's `db_size` is its view from before the boundary:
+        // a page it abandoned above that view may since have been committed
+        // live by a peer and checkpointed away with the old generation, so
+        // classifying against the stale extent would carry a live page into the
+        // shared ledger as provably free, and keep in-range ledger entries the
+        // boundary must drop. Each branch below crosses the boundary only once
+        // `db_size` covers the new generation's image.
         let wal_generation_changed = self.journal_mode == JournalMode::Wal
             && self.committed_wal_generation.is_some()
             && self.committed_wal_generation != probe.wal_generation;
-        if wal_generation_changed {
-            preserve_above_extent_at_generation_boundary(self);
-        }
         if mode == CommittedStateRefreshMode::Normal
             && probe.visible_commit_seq == self.commit_seq
             && probe.file_size == self.committed_db_file_size_bytes
             && !probe.durable_identity_changed
         {
+            // Nothing was committed since this pager's view, so its extent is
+            // the new generation's.
+            if wal_generation_changed {
+                preserve_above_extent_at_generation_boundary(self);
+            }
             self.committed_db_change_counter = probe.db_change_counter;
+            let generation_moved = self.committed_wal_generation != probe.wal_generation;
             self.committed_wal_generation = probe.wal_generation;
+            if generation_moved {
+                publish_disowned_ledger_generation(self);
+            }
             self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
             return Ok(CommittedStateRefresh {
                 wal_snapshot_initialized: probe.wal_snapshot_initialized,
@@ -9878,6 +9924,9 @@ impl<F: VfsFile> PagerInner<F> {
             self.db_size.max(db_size)
         };
         let effective_db_size = self.db_size;
+        if wal_generation_changed {
+            preserve_above_extent_at_generation_boundary(self);
+        }
         self.next_page = if effective_db_size >= 2 {
             effective_db_size.saturating_add(1)
         } else {
@@ -9954,7 +10003,11 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.committed_db_file_size_bytes = probe.file_size;
         self.committed_db_change_counter = probe.db_change_counter;
+        let generation_moved = self.committed_wal_generation != probe.wal_generation;
         self.committed_wal_generation = probe.wal_generation;
+        if generation_moved {
+            publish_disowned_ledger_generation(self);
+        }
         self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
 
         Ok(CommittedStateRefresh {
@@ -10260,6 +10313,34 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
         );
     }
     adopted_count
+}
+
+/// Record the WAL generation this connection just refreshed into as the
+/// ledger's reconciliation generation (see
+/// `GroupCommitQueue::disowned_pages_generation`). Called only when the
+/// connection's own generation moved, so steady-state refreshes never lock.
+fn publish_disowned_ledger_generation<F: VfsFile>(inner: &PagerInner<F>) {
+    let (Some(generation), Some(shared)) = (
+        inner.committed_wal_generation,
+        inner.disowned_page_ledger_generation.as_ref(),
+    ) else {
+        return;
+    };
+    let mut current = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *current != Some(generation) {
+        *current = Some(generation);
+    }
+}
+
+/// A checkpoint just reset the WAL: every pool parked before this point
+/// belongs to a dead generation until some connection observes the new one.
+fn invalidate_disowned_ledger_generation(queue: &GroupCommitQueue) {
+    *queue
+        .disowned_pages_generation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// bd-ioq6x Face-2: clear the shared disowned-page ledger at a WAL-generation
@@ -18764,6 +18845,9 @@ where
                 freelist_repair_dropped: open_freelist_entries_dropped,
                 wal_reader: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
+                disowned_page_ledger_generation: Some(Arc::clone(
+                    &group_commit_queue.disowned_pages_generation,
+                )),
                 journal_mode: initial_journal_mode,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -19193,6 +19277,9 @@ where
                 freelist_repair_dropped: 0,
                 wal_reader: None,
                 disowned_page_ledger: Some(Arc::clone(&group_commit_queue.disowned_pages)),
+                disowned_page_ledger_generation: Some(Arc::clone(
+                    &group_commit_queue.disowned_pages_generation,
+                )),
                 journal_mode: JournalMode::Delete,
                 rollback_cleanup: RollbackCleanup::default(),
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
@@ -29343,6 +29430,9 @@ where
             wal_was_reset = result.wal_was_reset,
             "checkpoint completed without re-entering the foreground physical writer lane"
         );
+        if result.wal_was_reset {
+            invalidate_disowned_ledger_generation(&pager_group_commit_queue(self));
+        }
         guard
             .external_lock
             .as_mut()
@@ -46600,9 +46690,20 @@ mod tests {
         // per-file disowned-page ledger so a surviving connection can reconcile
         // them. Without this, a `drop_close` under churn orphaned the holes and
         // a later grow turned them into durable "page N is never used" leaks.
+        // Only a pool parked in the ledger's current WAL generation may be
+        // handed over; one from a generation a checkpoint has since retired is
+        // discarded, because its "no frame => hole" judgements died with it.
+        let generation = |checkpoint_seq| WalGenerationIdentity {
+            checkpoint_seq,
+            salts: fsqlite_wal::WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+        };
+        for pool_is_current in [true, false] {
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
-            let path = PathBuf::from("/ioq6x_face2_disown.db");
+            let path = PathBuf::from(format!("/ioq6x_face2_disown_{pool_is_current}.db"));
             let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
@@ -46616,6 +46717,13 @@ mod tests {
                 // connection WAL directly (no live backend needed — the drop
                 // handoff itself is mode-agnostic).
                 inner.journal_mode = JournalMode::Wal;
+                inner.committed_wal_generation = Some(generation(1));
+                *inner
+                    .disowned_page_ledger_generation
+                    .as_ref()
+                    .expect("an open pager binds the ledger generation")
+                    .lock()
+                    .unwrap() = Some(generation(if pool_is_current { 1 } else { 2 }));
                 let ledger = inner
                     .disowned_page_ledger
                     .clone()
@@ -46647,12 +46755,13 @@ mod tests {
                 .map(|page| page.get())
                 .collect();
             disowned.sort_unstable();
+            let expected = if pool_is_current { vec![57, 58] } else { Vec::new() };
             assert_eq!(
-                disowned,
-                vec![57, 58],
-                "a dropped connection disowns its still-parked pool to the shared ledger"
+                disowned, expected,
+                "a dropped connection disowns its still-parked pool only within its generation"
             );
         });
+        }
     }
 
     #[test]
