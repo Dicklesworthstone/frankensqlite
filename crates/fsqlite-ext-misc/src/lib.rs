@@ -52,6 +52,15 @@ const fn normalize_generate_series_step(step: i64) -> i64 {
 impl VirtualTable for GenerateSeriesTable {
     type Cursor = GenerateSeriesCursor;
 
+    /// Stock declares `value, start HIDDEN, stop HIDDEN, step HIDDEN`, all
+    /// typeless, so a named instance can constrain the hidden arguments.
+    fn column_info(_args: &[&str]) -> Vec<(String, char)> {
+        ["value", "start", "stop", "step"]
+            .into_iter()
+            .map(|name| (name.to_owned(), 'A'))
+            .collect()
+    }
+
     fn create(_cx: &Cx, _args: &[&str]) -> Result<Self> {
         Ok(Self)
     }

@@ -467,6 +467,17 @@ pub trait VirtualTable: Send + Sync {
         ShadowTablePolicy::ordinary()
     }
 
+    /// Column names and affinities a named instance declares, in `xColumn`
+    /// index order (SQLite's `sqlite3_declare_vtab`). `args` uses the same
+    /// canonical argv shape as [`create`](Self::create). The default declares
+    /// nothing, which leaves the columns to the `USING` arguments.
+    fn column_info(_args: &[&str]) -> Vec<(String, char)>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
+
     /// Called for `CREATE VIRTUAL TABLE`.
     ///
     /// `args` follows SQLite's canonical module ABI: module name, database
@@ -841,6 +852,10 @@ where
         fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
             let vtab = T::connect(cx, args)?;
             Ok(Box::new(vtab))
+        }
+
+        fn column_info(&self, args: &[&str]) -> Vec<(String, char)> {
+            T::column_info(args)
         }
 
         fn module_metadata(&self, args: &[&str]) -> VtabModuleMetadata {
