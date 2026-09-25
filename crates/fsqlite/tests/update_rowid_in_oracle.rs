@@ -88,10 +88,14 @@ async fn assert_update_plan(c: &Connection, sql: &str, unique_seek_values: Optio
             assert_eq!(op_count(&ops, "Rewind"), 1, "plan: {ops:?}");
             assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
             assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
+            // GH #415: a rowid IN list of non-literal constants builds a probe set
+            // (OpenAutoindex) and loops it with one SeekRowid per member instead of
+            // scanning the table; the literal-only unrolled seeks above still decline.
+            let const_list_probe = op_count(&ops, "OpenAutoindex") == 1;
             assert_eq!(
                 op_count(&ops, "SeekRowid"),
-                1,
-                "fallback must retain only the Pass-2 seek: {ops:?}"
+                1 + usize::from(const_list_probe),
+                "fallback must retain only the Pass-2 seek (plus the probe-set seek): {ops:?}"
             );
         }
     }
@@ -225,7 +229,8 @@ fn update_rowid_in_matches_sqlite() {
         )
         .await;
 
-        // Controls that are not exact integer-literal rowid sets must retain the filtered scan.
+        // Controls that are not exact integer-literal rowid sets decline the unrolled seeks: they keep the
+        // filtered scan, or (constant lists, GH #415) the probe-set loop.
         check_update("UPDATE t SET x = 'ctl' WHERE a IN (3, 5)", None).await; // a is not the rowid
         check_update("UPDATE t SET x = 'ctl' WHERE id IN (-1, 5)", None).await; // unary-negative list member
         check_update("UPDATE t SET x = 'ctl' WHERE id IN (NULL, 5)", None).await; // NULL list member
