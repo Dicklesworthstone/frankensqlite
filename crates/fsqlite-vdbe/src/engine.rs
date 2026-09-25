@@ -13261,7 +13261,6 @@ impl VdbeEngine {
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
                     let arg_count = usize::from(op.p5);
-                    let execution_cx = self.execution_cx.clone();
                     // Gather per-argument subtypes (parallel to args) so
                     // subtype-aware aggregates embed a JSON-subtyped argument
                     // rather than quoting it (bd-76x57). Cheap: `register_subtype`
@@ -13292,7 +13291,7 @@ impl VdbeEngine {
                                 func: &func,
                                 func_name,
                                 agg_collation,
-                                execution_cx: &execution_cx,
+                                execution_cx: &self.execution_cx,
                                 args,
                                 arg_subtypes: &arg_subtypes,
                                 text_encoding: self.text_encoding,
@@ -13310,7 +13309,7 @@ impl VdbeEngine {
                                 func: &func,
                                 func_name,
                                 agg_collation,
-                                execution_cx: &execution_cx,
+                                execution_cx: &self.execution_cx,
                                 args: &args,
                                 arg_subtypes: &arg_subtypes,
                                 text_encoding,
@@ -13417,9 +13416,9 @@ impl VdbeEngine {
                             }
                         });
 
-                    observe_execution_cancellation(&execution_cx)?;
+                    observe_requested_execution_cancellation(&execution_cx)?;
                     ctx.func.inverse(&mut ctx.state, &args)?;
-                    observe_execution_cancellation(&execution_cx)?;
+                    observe_requested_execution_cancellation(&execution_cx)?;
                     pc += 1;
                 }
 

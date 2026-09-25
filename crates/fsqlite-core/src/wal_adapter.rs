@@ -311,8 +311,22 @@ struct PendingCheckpointReset<F: VfsFile> {
     _source: Option<Arc<WalIndexShmSource<F>>>,
 }
 
+/// The shared WAL-index header a native read admission last proved against
+/// this WAL file, with the file state it was proved against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeReadProof {
+    header: fsqlite_wal::wal_index::WalIndexHdr,
+    frame_count: usize,
+    salts: WalSalts,
+}
+
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
+    /// Committed WAL frames are immutable within a generation and every commit
+    /// or reset rewrites the shared header, so a read admission whose header,
+    /// in-memory frame count and salts all equal the last proof need not
+    /// re-read the WAL header and terminal frame from the file.
+    native_read_proof: Option<NativeReadProof>,
     /// Guard so commit-time append refresh runs only once per commit batch.
     refresh_before_append: bool,
     /// Active commit-published visibility plane for the current WAL generation.
@@ -499,7 +513,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let generation = wal.generation_identity();
         Self {
             wal,
-            refresh_before_append: true,
+            native_read_proof: None,
+            refresh_before_append:true,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -534,7 +549,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let generation = wal.generation_identity();
         Self {
             wal,
-            refresh_before_append: true,
+            native_read_proof: None,
+            refresh_before_append:true,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -2190,7 +2206,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             if header.mx_frame != binding.boundary().maximum_wal_frame {
                 return Err(FrankenError::BusyRecovery);
             }
-            self.wal.refresh(cx).await?;
+            let proven = self.native_read_proof == Some(NativeReadProof {
+                header,
+                frame_count: self.wal.frame_count(),
+                salts: self.wal.header().salts,
+            });
+            if !proven {
+                self.wal.refresh(cx).await?;
+            }
             let wal_header = self.wal.header();
             if header.page_size()? != wal_header.page_size
                 || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
@@ -2207,14 +2230,25 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     WalNativeRecoveryReason::WalTerminalMismatch,
                 ));
             }
-            let terminal = match frame_count.checked_sub(1) {
-                Some(index) => Some((header.mx_frame, self.wal.read_frame_header(cx, index).await?)),
-                None => None,
-            };
-            if validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal).is_err() {
-                return Ok(WalNativeReadOutcome::RecoveryRequired(
-                    WalNativeRecoveryReason::WalTerminalMismatch,
-                ));
+            if !proven {
+                let terminal = match frame_count.checked_sub(1) {
+                    Some(index) => {
+                        Some((header.mx_frame, self.wal.read_frame_header(cx, index).await?))
+                    }
+                    None => None,
+                };
+                if validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)
+                    .is_err()
+                {
+                    return Ok(WalNativeReadOutcome::RecoveryRequired(
+                        WalNativeRecoveryReason::WalTerminalMismatch,
+                    ));
+                }
+                self.native_read_proof = Some(NativeReadProof {
+                    header,
+                    frame_count: self.wal.frame_count(),
+                    salts: self.wal.header().salts,
+                });
             }
             self.publish_visible_snapshot(cx, frame_count.checked_sub(1), "begin_native_read").await?;
             self.read_snapshot = Some(self.published_snapshot.clone());

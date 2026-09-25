@@ -16988,6 +16988,16 @@ where
         }))
     }
 
+    /// The WAL-index header the currently bound native reader is pinned to.
+    async fn bound_native_read_header(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<fsqlite_wal::wal_index::WalIndexHdr>> {
+        let backend = wal_backend_handle(&self.wal_backend)?;
+        let wal = async_rwlock_read(&backend, cx, "bound native read header").await?;
+        Ok(wal.native_read_binding().map(|binding| binding.header()))
+    }
+
     /// Whether a standalone refresh now would observe exactly what the last
     /// complete one did.
     async fn standalone_refresh_is_unchanged(
@@ -17013,6 +17023,45 @@ where
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
+    /// The begin-path counterpart of the standalone refresh fast path.
+    ///
+    /// `pre_refresh_signature` was observed before the native reader bound.
+    /// When it equals what the last full refresh observed (see
+    /// [`WalRefreshSignature`]) and the reader is bound to that same header,
+    /// re-deriving committed state would only re-read unchanged files, so the
+    /// full refresh's no-change result is returned. A reader bound to a newer
+    /// header (a commit landed in between) takes the full refresh, and the
+    /// signature stored after it is the pre-binding one, never newer than the
+    /// state the refresh adopted.
+    async fn refresh_committed_state_unless_unchanged(
+        &self,
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        pre_refresh_signature: Option<WalRefreshSignature>,
+    ) -> Result<CommittedStateRefresh> {
+        if let Some(signature) = pre_refresh_signature
+            && inner.wal_refresh_signature == Some(signature)
+            && inner.active_transactions == 0
+            && !inner.checkpoint_active
+            && !inner.rollback_journal_recovery_state.is_pending()
+            && self.bound_native_read_header(cx).await? == Some(signature.shm_header)
+        {
+            return Ok(CommittedStateRefresh {
+                wal_snapshot_initialized: inner.journal_mode == JournalMode::Wal,
+                page_cache_invalidated: false,
+            });
+        }
+        inner.wal_refresh_signature = None;
+        let refresh = inner
+            .refresh_committed_state(cx, &self.cache, &self.wal_backend, true)
+            .await?;
+        inner.wal_refresh_signature = pre_refresh_signature.map(|signature| WalRefreshSignature {
+            commit_seq: inner.commit_seq,
+            ..signature
+        });
+        Ok(refresh)
+    }
+
     // bd-h9o9r: the pager's sync mutex guard is held across awaits here, as
     // the full refresh below already did; the reachable-deadlock audit and
     // lock-scope repair belong to the Phase-C pager reconstruction.
@@ -18103,10 +18152,16 @@ where
             };
         }
 
+        // Observed before the reader binds: the refresh below reflects the
+        // bound header, which can only be this one or newer.
+        let pre_refresh_signature = self.current_wal_refresh_signature(cx, inner).await?;
         let refresh_result = match self.prepare_runtime_native_reader(
             cx, maintenance_lease, inner, external_lock,
         ).await {
-            Ok(()) => inner.refresh_committed_state(cx, &self.cache, &self.wal_backend, true).await,
+            Ok(()) => {
+                self.refresh_committed_state_unless_unchanged(cx, inner, pre_refresh_signature)
+                    .await
+            }
             Err(error) => Err(error),
         };
         if retain_snapshot_for_caller {
