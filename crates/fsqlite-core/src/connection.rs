@@ -27961,8 +27961,10 @@ impl Connection {
                         )
                         .await
                     }
+                    // Boxed so UPDATE/DELETE's 21 KB future does not size the
+                    // INSERT path this block also serves, and vice versa.
                     PreparedDmlKind::Update | PreparedDmlKind::Delete => {
-                        self.execute_precompiled_prepared_update_or_delete(
+                        Box::pin(self.execute_precompiled_prepared_update_or_delete(
                             &op_cx,
                             stmt,
                             dispatch.kind,
@@ -27972,7 +27974,7 @@ impl Connection {
                                 || force_skip_statement_savepoint_in_explicit_txn,
                             entry_proof,
                             p,
-                        )
+                        ))
                         .await
                     }
                 };
@@ -28044,19 +28046,18 @@ impl Connection {
                             reason = "deferred_dml_direct_dispatch",
                         );
                     }
-                    return self
-                        .execute_precompiled_prepared_update_or_delete(
-                            &op_cx,
-                            stmt,
-                            fast_path.kind,
-                            fast_path.rollback_on_constraint_violation,
-                            fast_path.preserve_prior_changes_on_constraint_violation,
-                            fast_path.skip_statement_savepoint_in_explicit_txn
-                                || force_skip_statement_savepoint_in_explicit_txn,
-                            entry_proof,
-                            p,
-                        )
-                        .await;
+                    return Box::pin(self.execute_precompiled_prepared_update_or_delete(
+                        &op_cx,
+                        stmt,
+                        fast_path.kind,
+                        fast_path.rollback_on_constraint_violation,
+                        fast_path.preserve_prior_changes_on_constraint_violation,
+                        fast_path.skip_statement_savepoint_in_explicit_txn
+                            || force_skip_statement_savepoint_in_explicit_txn,
+                        entry_proof,
+                        p,
+                    ))
+                    .await;
                 }
                 // Slow path: validate schema without prebinding publication.
                 stmt.ensure_schema_unchanged(&op_cx).await?;
@@ -31770,13 +31771,12 @@ impl Connection {
                     previous_total_changes,
                     previous_last_insert_rowid,
                 );
-                match self
-                    .maybe_rollback_transaction_for_conflict_action(
-                        rollback_on_constraint_violation,
-                        was_auto,
-                        &error,
-                    )
-                    .await
+                match Box::pin(self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ))
+                .await
                 {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(rollback_error),
@@ -31990,8 +31990,9 @@ impl Connection {
         }
         let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
             .then(fsqlite_types::sync_primitives::Instant::now);
-        let outcome = self
-            .execute_prepared_dml_entry(
+        // Boxed: the general DML entry's 24 KB future would otherwise size the
+        // direct paths that every prepared DML statement embeds.
+        let outcome = Box::pin(self.execute_prepared_dml_entry(
                 execution_cx,
                 "insert",
                 Some(table_name),
@@ -32010,7 +32011,7 @@ impl Connection {
                         params,
                     )
                 },
-            )
+            ))
             .await;
         if outcome.resolve_succeeded && (statement_reuse_enabled || compat_trace_profile_enabled) {
             let elapsed_ns = execution_started
@@ -32082,9 +32083,14 @@ impl Connection {
         }
 
         let autocommit_begin_start = hot_path_profile_enabled().then(Instant::now);
-        let was_auto = match self
-            .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
-            .await
+        // The autocommit begin/resolve futures (10-12 KB) are boxed: they run
+        // once per autocommit statement, while inline they would size every
+        // prepared statement on this path, including those in explicit
+        // transactions.
+        let was_auto = match Box::pin(
+            self.ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication),
+        )
+        .await
         {
             Ok(was_auto) => was_auto,
             Err(error) => return Some(Err(error)),
@@ -32124,13 +32130,12 @@ impl Connection {
             Err(error) => {
                 record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
                 self.reset_statement_change_count();
-                match self
-                    .maybe_rollback_transaction_for_conflict_action(
-                        rollback_on_constraint_violation,
-                        was_auto,
-                        &error,
-                    )
-                    .await
+                match Box::pin(self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ))
+                .await
                 {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(rollback_error),
@@ -32153,16 +32158,15 @@ impl Connection {
             // branch; preserve any count+sum cache through that no-op mark.
             self.preserve_retained_autocommit_count_sum_cache_for_noop_write();
         }
-        let resolve_result = self
-            .resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
-                was_auto,
-                ok,
-                Some(table_name),
-                capture_time_travel_snapshot,
-                false,
-                execution_cx,
-            )
-            .await;
+        let resolve_result = Box::pin(self.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+            was_auto,
+            ok,
+            Some(table_name),
+            capture_time_travel_snapshot,
+            false,
+            execution_cx,
+        ))
+        .await;
         record_hot_path_duration(
             &FSQLITE_PREPARED_DIRECT_INSERT_AUTOCOMMIT_RESOLVE_TIME_NS,
             autocommit_resolve_start,
@@ -32263,8 +32267,9 @@ impl Connection {
                     !Self::direct_simple_insert_prefers_reusable_table_program(direct)
                 })
         });
-        let outcome = self
-            .execute_prepared_dml_entry(
+        // Boxed: the general DML entry's 24 KB future would otherwise size the
+        // direct-insert path above.
+        let outcome = Box::pin(self.execute_prepared_dml_entry(
                 execution_cx,
                 "insert",
                 Some(table_name),
@@ -32287,7 +32292,7 @@ impl Connection {
                         params,
                     )
                 },
-            )
+            ))
             .await;
         outcome.result
     }
@@ -33359,8 +33364,8 @@ impl Connection {
             {
                 fk_row_values[ipk_idx] = SqliteValue::Integer(*rowid);
             }
-            self.check_fk_parent_exists(table_name, &fk_row_values)
-                .await?;
+            // Boxed: its 15 KB future would otherwise size every direct insert.
+            Box::pin(self.check_fk_parent_exists(table_name, &fk_row_values)).await?;
         }
         result
     }
@@ -34997,9 +35002,14 @@ impl Connection {
         // bound, mirroring the INSERT fast path. Without this the autocommit
         // begin would re-bind (a second `pager_publication_refresh`) for every
         // prepared UPDATE/DELETE (bd-db300.5.2.2.4 / T13).
-        let was_auto = match self
-            .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
-            .await
+        // The autocommit begin/resolve futures (10-12 KB) are boxed: they run
+        // once per autocommit statement, while inline they would size every
+        // prepared statement on this path, including those in explicit
+        // transactions.
+        let was_auto = match Box::pin(
+            self.ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication),
+        )
+        .await
         {
             Ok(was_auto) => was_auto,
             Err(error) => return Some(Err(error)),
@@ -35360,8 +35370,9 @@ impl Connection {
         }
         let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
             .then(fsqlite_types::sync_primitives::Instant::now);
-        let outcome = self
-            .execute_prepared_dml_entry(
+        // Boxed: the general DML entry's 24 KB future would otherwise size the
+        // direct paths that every prepared DML statement embeds.
+        let outcome = Box::pin(self.execute_prepared_dml_entry(
                 execution_cx,
                 kind.statement_kind(),
                 stmt.precompiled_dml()
@@ -35383,7 +35394,7 @@ impl Connection {
                         params,
                     )
                 },
-            )
+            ))
             .await;
         if outcome.resolve_succeeded && (statement_reuse_enabled || compat_trace_profile_enabled) {
             let elapsed_ns = execution_started
