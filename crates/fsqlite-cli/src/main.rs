@@ -299,9 +299,17 @@ where
     // io_uring driver spawner that outlives the connection. The default
     // process-global env deliberately has no runtime handle, so plain
     // Connection::open keeps the Unix fallback; this is the opt-in surface.
-    let cli_runtime_env = fsqlite::ConnectionEnv::new(std::sync::Arc::new(
+    let mut cli_runtime_env = fsqlite::ConnectionEnv::new(std::sync::Arc::new(
         fsqlite::RuntimeContext::new(fsqlite::RuntimeConfig::default()),
     ));
+    // bd-bjm5d: the shell drives its connection from block_on on this
+    // current-thread runtime, so every open and operation is serialized on
+    // one dedicated thread. Page-sized reads and writes may therefore run
+    // inline. Without the marker, the blocking pool that bde346896 added for
+    // WAL-FEC also took every page I/O: a thread hop plus ~8 syscalls per
+    // pread, ~1.8x CPU per autocommit statement versus v0.3.18. The pool
+    // still serves WAL-FEC encoding and anything larger than a page.
+    cli_runtime_env.mark_blocking_io_inline_safe();
     let mut connection =
         match Connection::open_with_env(&options.db_path, cli_runtime_env.clone()).await {
             Ok(connection) => connection,

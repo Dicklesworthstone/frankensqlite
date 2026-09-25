@@ -92364,9 +92364,11 @@ impl Connection {
             // bound) and the stable ORDER BY sort is a no-op reorder.
             rows
         } else {
-            table_rows[0]
-                .iter()
-                .map(|row| {
+            // GH#420: move the primary rows rather than copying each one; the
+            // join loop below reads only `table_rows[1..]`.
+            std::mem::take(&mut table_rows[0])
+                .into_iter()
+                .map(|mut row| {
                     // Invariant: a materialized primary-table row is at least as
                     // wide as scan_width(). A violation means scan_width()
                     // over-counted — historically a virtual/FTS5 table that
@@ -92374,13 +92376,14 @@ impl Connection {
                     // materialized (see join_table_supports_hidden_rowid).
                     // Surface the offending widths so the over-count is
                     // self-diagnosing instead of a bare slice OOB.
-                    debug_assert!(
+                    assert!(
                         row.len() >= primary_width,
                         "join primary row width {} < scan_width {}: primary table scan_width over-counted columns the scan did not materialize",
                         row.len(),
                         primary_width,
                     );
-                    row[..primary_width].to_vec()
+                    row.truncate(primary_width);
+                    row
                 })
                 .collect()
         };

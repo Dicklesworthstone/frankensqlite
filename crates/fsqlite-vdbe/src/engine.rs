@@ -473,13 +473,31 @@ impl BtreeCursorPageLayout {
     }
 }
 
+/// Page-1 read failures that describe the real database, as opposed to a
+/// synthetic page store that simply has no page 1. Answering any of these
+/// with the no-reserved-bytes UTF-8 default would let a write cursor place
+/// cells in the reserved trailer, or encode TEXT as UTF-8 in a UTF-16
+/// database, so they must fail the cursor open instead.
+fn page_one_read_error_must_propagate(error: &FrankenError) -> bool {
+    error.is_transient()
+        || matches!(
+            error,
+            FrankenError::Abort
+                | FrankenError::Interrupt
+                | FrankenError::OutOfMemory
+                | FrankenError::Io(_)
+                | FrankenError::ShortRead { .. }
+                | FrankenError::DatabaseCorrupt { .. }
+        )
+}
+
 async fn btree_cursor_page_layout_from_page_one<P: PageReader>(
     page_reader: &P,
     cx: &Cx,
 ) -> Result<Option<BtreeCursorPageLayout>> {
     let page_one = match page_reader.read_page(cx, PageNumber::ONE).await {
         Ok(page) => page,
-        Err(FrankenError::Abort) => return Err(FrankenError::Abort),
+        Err(error) if page_one_read_error_must_propagate(&error) => return Err(error),
         Err(_) => return Ok(None),
     };
     let Some(header_prefix) = page_one.get(..DATABASE_HEADER_SIZE) else {
@@ -31538,6 +31556,61 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_page_one_read_failures_do_not_default_the_cursor_layout() {
+        /// Fails every page read with a fixed error.
+        struct FailingPageOne(fn() -> FrankenError);
+
+        impl PageReader for FailingPageOne {
+            fn read_page<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _page_no: PageNumber,
+            ) -> impl std::future::Future<Output = Result<Vec<u8>>> + 'a {
+                let error = (self.0)();
+                async move { Err(error) }
+            }
+        }
+
+        let cx = Cx::new();
+        // A real database failure must not become the no-reserved-bytes UTF-8
+        // default: a write cursor would then lay cells into the reserved
+        // trailer or encode TEXT as UTF-8 in a UTF-16 database.
+        let failures: [fn() -> FrankenError; 5] = [
+            || FrankenError::Busy,
+            || FrankenError::BusySnapshot {
+                conflicting_pages: String::new(),
+            },
+            || FrankenError::Interrupt,
+            || FrankenError::Io(std::io::Error::other("injected page-1 read failure")),
+            || FrankenError::DatabaseCorrupt {
+                detail: "injected".to_owned(),
+            },
+        ];
+        for error in failures {
+            let expected = error().to_string();
+            let layout = run_async(btree_cursor_page_layout_for_reader_or_default(
+                &FailingPageOne(error),
+                &cx,
+                PageSize::DEFAULT,
+            ));
+            assert!(
+                matches!(&layout, Err(err) if err.to_string() == expected),
+                "page-1 failure `{expected}` must propagate, got {layout:?}"
+            );
+        }
+
+        // A synthetic store with no page 1 keeps the default layout.
+        let layout = run_async(btree_cursor_page_layout_for_reader_or_default(
+            &FailingPageOne(|| FrankenError::internal("page not found")),
+            &cx,
+            PageSize::DEFAULT,
+        ))
+        .expect("a headerless synthetic store falls back to the default layout");
+        assert_eq!(layout.usable_size, PageSize::DEFAULT.get());
+        assert_eq!(layout.text_encoding, TextEncoding::Utf8);
     }
 
     #[test]
