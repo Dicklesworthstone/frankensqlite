@@ -38205,6 +38205,8 @@ impl Connection {
         precompiled: Option<&VdbeProgram>,
         derived_storage_log_select: Option<&SelectStatement>,
     ) -> Result<Vec<Row>> {
+        // Rare statement kinds await futures of 9-58 KB; boxing them keeps this
+        // dispatcher (and every wrapper that embeds it) near its hot-path size.
         if let Some(rows) = self
             .maybe_execute_attached_target_statement(statement, params)
             .await
@@ -38268,9 +38270,8 @@ impl Connection {
         // a view with a matching INSTEAD OF trigger to the trigger body instead of
         // normal table DML (which would fail "no such table" — a view has no
         // B-tree). bd-ffkpv.
-        if let Some(rows) = self
-            .maybe_execute_instead_of_view_dml(statement, params)
-            .await?
+        if let Some(rows) =
+            Box::pin(self.maybe_execute_instead_of_view_dml(statement, params)).await?
         {
             return Ok(rows);
         }
@@ -38292,12 +38293,12 @@ impl Connection {
         }
         match statement {
             Statement::CreateTable(create) => {
-                self.execute_create_table(create).await?;
+                Box::pin(self.execute_create_table(create)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateVirtualTable(create_virtual) => {
-                self.execute_create_virtual_table(create_virtual).await?;
+                Box::pin(self.execute_create_virtual_table(create_virtual)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
@@ -38355,21 +38356,21 @@ impl Connection {
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
                     self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
-                    return self
-                        .execute_time_travel_select(select, params, &target)
-                        .await;
+                    return Box::pin(self.execute_time_travel_select(select, params, &target)).await;
                 }
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
-                    return self.execute_with_ctes(select, params).await;
+                    return Box::pin(self.execute_with_ctes(select, params)).await;
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
                     self.log_mem_execution_fallback("select", "view_materialization")?;
-                    return self.execute_with_materialized_views(select, params).await;
+                    return Box::pin(self.execute_with_materialized_views(select, params)).await;
                 }
-                if let Some(rows) = self.maybe_execute_attached_select(select, params).await? {
+                if let Some(rows) =
+                    Box::pin(self.maybe_execute_attached_select(select, params)).await?
+                {
                     return Ok(rows);
                 }
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT) must
@@ -38394,12 +38395,11 @@ impl Connection {
                         || self.has_implicit_aggregation_with_registry(select)
                         || has_ordered_aggregate(select);
                     let mut rows = if needs_grouped_window {
-                        self.execute_group_by_window_select(cx, &bound, None)
-                            .await?
+                        Box::pin(self.execute_group_by_window_select(cx, &bound, None)).await?
                     } else if needs_aggregation && has_joins(select) {
-                        self.execute_group_by_join_select(cx, &bound, None).await?
+                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?
                     } else {
-                        self.execute_join_select(&bound, None).await?
+                        Box::pin(self.execute_join_select(&bound, None)).await?
                     };
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -38412,8 +38412,7 @@ impl Connection {
                         "select",
                         "sqlite_schema_virtual_materialization",
                     )?;
-                    return self
-                        .execute_with_materialized_sqlite_schema(select, params)
+                    return Box::pin(self.execute_with_materialized_sqlite_schema(select, params))
                         .await;
                 }
                 // bd-z22mq: dispatch-cascade short-circuit. When the incoming
@@ -38565,7 +38564,7 @@ impl Connection {
                     // per-row evaluation of outer column refs unless the exact
                     // validated indexed COUNT(*) semijoin fast path applies.
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
-                    self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
                         .await
                 } else if select_has_unsupported_correlated_scalar_subquery(select, self)
                     && self
@@ -38591,7 +38590,7 @@ impl Connection {
                         "select",
                         "correlated_scalar_subquery_fallback",
                     )?;
-                    self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
                         .await
                 } else if select_has_in_subquery_operand_requiring_semantic_fallback(select, self) {
                     // Keep connection dispatch aligned with the native
@@ -38603,7 +38602,7 @@ impl Connection {
                         "select",
                         "in_subquery_operand_semantic_fallback",
                     )?;
-                    self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
                         .await
                 } else if select_has_correlated_in_subquery(select, &self.schema.borrow()) {
                     // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
@@ -38615,7 +38614,7 @@ impl Connection {
                     // (the InSet::Subquery arm). The correlated scalar `=` form is
                     // already handled in VDBE via emit_scalar_subquery.
                     self.log_mem_execution_fallback("select", "correlated_in_subquery_fallback")?;
-                    self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
                         .await
                 } else if self.select_requires_grouped_window_pipeline(select) {
                     // Aggregation must finish before windows run, including
@@ -38634,9 +38633,8 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self
-                        .execute_group_by_window_select(cx, &bound, None)
-                        .await?;
+                    let mut rows =
+                        Box::pin(self.execute_group_by_window_select(cx, &bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38658,7 +38656,8 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_join_select(cx, &bound, None).await?;
+                    let mut rows =
+                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38672,7 +38671,7 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38695,7 +38694,7 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38711,14 +38710,13 @@ impl Connection {
                     let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    if let Some(mut rows) = self
-                        .try_execute_group_by_storage_substrate(
-                            cx,
-                            &bound,
-                            None,
-                            "group_by_storage_substrate",
-                        )
-                        .await?
+                    if let Some(mut rows) = Box::pin(self.try_execute_group_by_storage_substrate(
+                        cx,
+                        &bound,
+                        None,
+                        "group_by_storage_substrate",
+                    ))
+                    .await?
                     {
                         if distinct {
                             dedup_rows_collated(
@@ -38731,7 +38729,7 @@ impl Connection {
                     }
                     self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38754,7 +38752,7 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_window_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_window_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -38778,7 +38776,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -38831,7 +38829,7 @@ impl Connection {
                         return Ok(Vec::new());
                     }
                     let started = Instant::now();
-                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
                     if native_join_dispatch {
                         let elapsed_ns =
                             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -38853,7 +38851,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -38874,7 +38872,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = self.execute_join_select(&bound, None).await?;
+                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -38919,9 +38917,9 @@ impl Connection {
                         || self.has_implicit_aggregation_with_registry(&bound)
                         || has_ordered_aggregate(&bound)
                     {
-                        self.execute_group_by_join_select(cx, &bound, None).await?
+                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?
                     } else {
-                        self.execute_join_select(&bound, None).await?
+                        Box::pin(self.execute_join_select(&bound, None)).await?
                     };
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -39071,7 +39069,8 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&insert.table.name)
                 {
-                    let affected = self.execute_writable_schema_insert(insert, params).await?;
+                    let affected =
+                        Box::pin(self.execute_writable_schema_insert(insert, params)).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -39085,20 +39084,19 @@ impl Connection {
                         insert.table.name
                     )));
                 }
-                if self.execute_fts5_maintenance_insert(insert).await? {
+                if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
                     return Ok(Vec::new());
                 }
                 #[cfg(feature = "ext-fts5")]
-                if let Some(affected) = self
-                    .execute_fts5_magic_delete_insert(insert, params)
-                    .await?
+                if let Some(affected) =
+                    Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
                 {
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
                 if insert.with.is_some() {
                     self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
-                    return self.execute_insert_with_ctes(insert, params).await;
+                    return Box::pin(self.execute_insert_with_ctes(insert, params)).await;
                 }
 
                 let table_name = &insert.table.name;
@@ -39243,14 +39241,20 @@ impl Connection {
                             "insert_select_row_by_row_fallback",
                         )?;
                         if insert.returning.is_empty() {
-                            let _ = self
-                                .execute_insert_select_fallback(insert, select_stmt, params)
-                                .await?;
+                            let _ = Box::pin(self.execute_insert_select_fallback(
+                                insert,
+                                select_stmt,
+                                params,
+                            ))
+                            .await?;
                             return Ok(Vec::new());
                         }
-                        return self
-                            .execute_insert_select_fallback_returning(insert, select_stmt, params)
-                            .await;
+                        return Box::pin(self.execute_insert_select_fallback_returning(
+                            insert,
+                            select_stmt,
+                            params,
+                        ))
+                        .await;
                     }
                 }
                 if !is_live_vtab
@@ -39298,9 +39302,10 @@ impl Connection {
                     && !has_after_insert
                     && matches!(insert.source, InsertSource::Select(_))
                 {
-                    if let Some(affected) = self
-                        .try_execute_streaming_live_vtab_insert_select(insert, params)
-                        .await?
+                    if let Some(affected) = Box::pin(
+                        self.try_execute_streaming_live_vtab_insert_select(insert, params),
+                    )
+                    .await?
                     {
                         self.record_statement_changes(affected);
                         return Ok(Vec::new());
@@ -39345,16 +39350,15 @@ impl Connection {
                         // the explicit rowid when the statement supplies one, and
                         // as -1 when the rowid will be auto-assigned (it is not yet
                         // known). Match that. (GH #205)
-                        if self
-                            .fire_before_triggers(
-                                table_name,
-                                &insert_event,
-                                None,
-                                Some(new_values),
-                                None,
-                                Some(explicit_rowid.unwrap_or(-1)),
-                            )
-                            .await?
+                        if Box::pin(self.fire_before_triggers(
+                            table_name,
+                            &insert_event,
+                            None,
+                            Some(new_values),
+                            None,
+                            Some(explicit_rowid.unwrap_or(-1)),
+                        ))
+                        .await?
                         {
                             skip = true;
                             break;
@@ -39385,9 +39389,12 @@ impl Connection {
                         insert.or_conflict,
                         Some(fsqlite_ast::ConflictAction::Replace)
                     );
-                    let inserted_rowids = self
-                        .execute_live_vtab_insert_rows(table_name, &live_insert_rows, replace)
-                        .await?;
+                    let inserted_rowids = Box::pin(self.execute_live_vtab_insert_rows(
+                        table_name,
+                        &live_insert_rows,
+                        replace,
+                    ))
+                    .await?;
 
                     if has_after_insert {
                         if patch_first_column_with_rowid {
@@ -39400,14 +39407,14 @@ impl Connection {
                             }
                         }
                         for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
-                            self.fire_after_triggers(
+                            Box::pin(self.fire_after_triggers(
                                 table_name,
                                 &insert_event,
                                 None,
                                 Some(&row.values),
                                 None,
                                 Some(*rowid),
-                            )
+                            ))
                             .await?;
                         }
                     }
@@ -39482,14 +39489,14 @@ impl Connection {
                     && *where_true
                     && has_before_update
                 {
-                    self.fire_before_triggers(
+                    Box::pin(self.fire_before_triggers(
                         table_name,
                         &update_event,
                         Some(old_row),
                         Some(new_row),
                         *rowid,
                         *rowid,
-                    )
+                    ))
                     .await?
                 } else {
                     false
@@ -39550,15 +39557,14 @@ impl Connection {
                 // Implicit REPLACE deletes are parent-row deletions for inbound
                 // FK purposes. Enforce their exact OLD rows before child-side
                 // validation and AFTER INSERT processing.
-                self.enforce_fk_on_replace_victims(table_name).await?;
+                Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 // Skip FK enforcement when no row was written (e.g. an OR IGNORE
                 // PK conflict, affected == 0): SQLite does not FK-check a row it
                 // never inserted (#111).
                 if affected > 0 && self.fk_enforcement_enabled() {
-                    self.enforce_fk_on_insert(insert, table_name, params)
-                        .await?;
+                    Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
                 }
 
                 // Patch trigger NEW rows: fill in auto-assigned INTEGER
@@ -39596,14 +39602,14 @@ impl Connection {
                 if has_after_insert && !upsert_conflicted {
                     let after_insert_rowid = self.current_last_insert_rowid();
                     for new_values in &trigger_new_rows {
-                        self.fire_after_triggers(
+                        Box::pin(self.fire_after_triggers(
                             table_name,
                             &insert_event,
                             None,
                             Some(new_values),
                             None,
                             Some(after_insert_rowid),
-                        )
+                        ))
                         .await?;
                     }
                 }
@@ -39614,25 +39620,25 @@ impl Connection {
                     && *where_true
                     && has_after_update
                 {
-                    self.fire_after_triggers(
+                    Box::pin(self.fire_after_triggers(
                         table_name,
                         &update_event,
                         Some(old_row),
                         Some(new_row),
                         *rowid,
                         *rowid,
-                    )
+                    ))
                     .await?;
                 }
 
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-                    self.refresh_sqlite_sequence_cache().await?;
+                    Box::pin(self.refresh_sqlite_sequence_cache()).await?;
                 } else {
-                    self.refresh_autoincrement_sequence_after_insert(
+                    Box::pin(self.refresh_autoincrement_sequence_after_insert(
                         table_name,
                         affected,
                         last_insert_rowid,
-                    )
+                    ))
                     .await?;
                 }
 
@@ -39648,7 +39654,8 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&update.table.name.name)
                 {
-                    let affected = self.execute_writable_schema_update(update, params).await?;
+                    let affected =
+                        Box::pin(self.execute_writable_schema_update(update, params)).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -39666,7 +39673,7 @@ impl Connection {
                 // then execute the UPDATE with the WITH clause stripped.
                 if update.with.is_some() {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
-                    return self.execute_update_with_ctes(update, params).await;
+                    return Box::pin(self.execute_update_with_ctes(update, params)).await;
                 }
                 let canonical_update = canonicalize_update_placeholders(update)?;
                 let (mut effective_update, _limited_row_count_hint) = self
@@ -39723,9 +39730,8 @@ impl Connection {
                             "RETURNING is not supported for live virtual-table UPDATE".to_owned(),
                         ));
                     }
-                    let affected = self
-                        .execute_live_vtab_update(&effective_update, params)
-                        .await?;
+                    let affected =
+                        Box::pin(self.execute_live_vtab_update(&effective_update, params)).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -39782,14 +39788,13 @@ impl Connection {
                         "update",
                         "update_row_by_row_trigger_or_fk_fallback",
                     )?;
-                    return self
-                        .execute_update_row_by_row(
-                            &effective_update,
-                            params,
-                            &locator_columns,
-                            &locator_rows,
-                        )
-                        .await;
+                    return Box::pin(self.execute_update_row_by_row(
+                        &effective_update,
+                        params,
+                        &locator_columns,
+                        &locator_rows,
+                    ))
+                    .await;
                 }
                 // Trigger rows carry the matched rowid so OLD.rowid/NEW.rowid
                 // resolve on tables without an INTEGER PRIMARY KEY column. An
@@ -39822,16 +39827,15 @@ impl Connection {
                     let mut non_ignored_rows = Vec::with_capacity(trigger_rows.len());
                     let mut ignored_any = false;
                     for (row_rowid, old_values, new_values) in &trigger_rows {
-                        if self
-                            .fire_before_triggers(
-                                table_name,
-                                &update_event,
-                                Some(old_values),
-                                Some(new_values),
-                                *row_rowid,
-                                *row_rowid,
-                            )
-                            .await?
+                        if Box::pin(self.fire_before_triggers(
+                            table_name,
+                            &update_event,
+                            Some(old_values),
+                            Some(new_values),
+                            *row_rowid,
+                            *row_rowid,
+                        ))
+                        .await?
                         {
                             ignored_any = true;
                             if !is_rowid_table {
@@ -39913,15 +39917,15 @@ impl Connection {
                         // Parent-side: if this table is referenced by children,
                         // check that changing FK-referenced values doesn't orphan them.
                         // Use ON UPDATE actions (not ON DELETE) for UPDATE statements.
-                        let fk_actions = self
-                            .check_fk_on_update(table_name, old_values, new_values)
-                            .await?;
+                        let fk_actions =
+                            Box::pin(self.check_fk_on_update(table_name, old_values, new_values))
+                                .await?;
                         pending_fk_actions.extend(fk_actions);
                         // Child-side: validate new FK values against parent tables.
                         // Only check when NOT inside a cascade action, because
                         // the cascade itself is modifying parent data.
                         if self.fk_enforcement_enabled() {
-                            self.check_fk_parent_exists(table_name, new_values).await?;
+                            Box::pin(self.check_fk_parent_exists(table_name, new_values)).await?;
                         }
                     }
                 }
@@ -39969,25 +39973,25 @@ impl Connection {
                 // UPDATE OR REPLACE may implicitly delete a different row.
                 // Apply inbound FK effects for that exact victim before the
                 // existing parent UPDATE actions and AFTER UPDATE processing.
-                self.enforce_fk_on_replace_victims(table_name).await?;
+                Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
 
                 // SQLite's FK programs observe the updated parent row and run
                 // before the parent's AFTER UPDATE triggers.
                 for action in &pending_fk_actions {
-                    self.execute_fk_update_action(action).await?;
+                    Box::pin(self.execute_fk_update_action(action)).await?;
                 }
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
-                        self.fire_after_triggers(
+                        Box::pin(self.fire_after_triggers(
                             table_name,
                             &update_event,
                             Some(old_values),
                             Some(new_values),
                             *row_rowid,
                             *row_rowid,
-                        )
+                        ))
                         .await?;
                     }
                 }
@@ -40004,7 +40008,8 @@ impl Connection {
                 if self.pragma_state.borrow().writable_schema
                     && is_sqlite_schema_name(&delete.table.name.name)
                 {
-                    let affected = self.execute_writable_schema_delete(delete, params).await?;
+                    let affected =
+                        Box::pin(self.execute_writable_schema_delete(delete, params)).await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -40022,7 +40027,7 @@ impl Connection {
                 // then execute the DELETE with the WITH clause stripped.
                 if delete.with.is_some() {
                     self.log_mem_execution_fallback("delete", "with_clause_materialization")?;
-                    return self.execute_delete_with_ctes(delete, params).await;
+                    return Box::pin(self.execute_delete_with_ctes(delete, params)).await;
                 }
                 let (mut effective_delete, _limited_row_count_hint) =
                     self.materialize_delete_limit_scope(delete, params).await?;
@@ -40158,16 +40163,15 @@ impl Connection {
                     let mut non_ignored_rows = Vec::with_capacity(trigger_old_rows.len());
                     let mut ignored_any = false;
                     for (old_rowid, old_values) in &trigger_old_rows {
-                        if self
-                            .fire_before_triggers(
-                                table_name,
-                                &delete_event,
-                                Some(old_values),
-                                None,
-                                *old_rowid,
-                                None,
-                            )
-                            .await?
+                        if Box::pin(self.fire_before_triggers(
+                            table_name,
+                            &delete_event,
+                            Some(old_values),
+                            None,
+                            *old_rowid,
+                            None,
+                        ))
+                        .await?
                         {
                             ignored_any = true;
                             if !is_rowid_table {
@@ -40231,7 +40235,9 @@ impl Connection {
                     };
                     let mut actions = Vec::new();
                     for (_rowid, row_values) in &rows_to_check {
-                        actions.extend(self.check_fk_on_delete(table_name, row_values).await?);
+                        actions.extend(
+                            Box::pin(self.check_fk_on_delete(table_name, row_values)).await?,
+                        );
                     }
                     actions
                 } else {
@@ -40256,25 +40262,24 @@ impl Connection {
                             "RETURNING is not supported for live virtual-table DELETE".to_owned(),
                         ));
                     }
-                    let affected = self
-                        .execute_live_vtab_delete(&effective_delete, params)
-                        .await?;
+                    let affected =
+                        Box::pin(self.execute_live_vtab_delete(&effective_delete, params)).await?;
 
                     for action in &pending_fk_actions {
-                        self.execute_fk_delete_action(action).await?;
+                        Box::pin(self.execute_fk_delete_action(action)).await?;
                     }
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
                         for (old_rowid, old_values) in &trigger_old_rows {
-                            self.fire_after_triggers(
+                            Box::pin(self.fire_after_triggers(
                                 table_name,
                                 &delete_event,
                                 Some(old_values),
                                 None,
                                 *old_rowid,
                                 None,
-                            )
+                            ))
                             .await?;
                         }
                     }
@@ -40317,20 +40322,20 @@ impl Connection {
                     .await?;
 
                 for action in &pending_fk_actions {
-                    self.execute_fk_delete_action(action).await?;
+                    Box::pin(self.execute_fk_delete_action(action)).await?;
                 }
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
                     for (old_rowid, old_values) in &trigger_old_rows {
-                        self.fire_after_triggers(
+                        Box::pin(self.fire_after_triggers(
                             table_name,
                             &delete_event,
                             Some(old_values),
                             None,
                             *old_rowid,
                             None,
-                        )
+                        ))
                         .await?;
                     }
                 }
@@ -40344,69 +40349,69 @@ impl Connection {
                 }
             }
             Statement::Begin(begin) => {
-                self.execute_begin(*begin).await?;
+                Box::pin(self.execute_begin(*begin)).await?;
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                self.execute_commit_with_cx(cx).await?;
+                Box::pin(self.execute_commit_with_cx(cx)).await?;
                 // GH#244: once the main transaction is durably committed, commit
                 // any attached participants enrolled during it (no-op when none,
                 // so the normal path is unaffected). On a main-commit Err the `?`
                 // above returns early, correctly leaving children mid-txn.
-                self.commit_attached_participants(cx).await?;
+                Box::pin(self.commit_attached_participants(cx)).await?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
-                self.execute_rollback_with_cx(cx, rb).await?;
+                Box::pin(self.execute_rollback_with_cx(cx, rb)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::Savepoint(name) => {
-                self.execute_savepoint_with_cx(cx, name).await?;
+                Box::pin(self.execute_savepoint_with_cx(cx, name)).await?;
                 Ok(Vec::new())
             }
             Statement::Release(name) => {
-                self.execute_release_with_cx(cx, name).await?;
+                Box::pin(self.execute_release_with_cx(cx, name)).await?;
                 Ok(Vec::new())
             }
-            Statement::Pragma(pragma) => self.execute_pragma(pragma).await,
+            Statement::Pragma(pragma) => Box::pin(self.execute_pragma(pragma)).await,
             Statement::Drop(drop_stmt) => {
-                self.execute_drop(drop_stmt).await?;
+                Box::pin(self.execute_drop(drop_stmt)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::AlterTable(alter) => {
-                self.execute_alter_table(alter).await?;
+                Box::pin(self.execute_alter_table(alter)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateIndex(create_idx) => {
-                self.execute_create_index(create_idx).await?;
+                Box::pin(self.execute_create_index(create_idx)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateView(create_view) => {
-                self.execute_create_view(create_view).await?;
+                Box::pin(self.execute_create_view(create_view)).await?;
                 Ok(Vec::new())
             }
             Statement::CreateTrigger(create_trigger) => {
-                self.execute_create_trigger(create_trigger).await?;
+                Box::pin(self.execute_create_trigger(create_trigger)).await?;
                 Ok(Vec::new())
             }
             Statement::Vacuum(vacuum_stmt) => {
-                self.execute_vacuum(vacuum_stmt, params).await?;
+                Box::pin(self.execute_vacuum(vacuum_stmt, params)).await?;
                 Ok(Vec::new())
             }
             Statement::Analyze(target) => {
-                self.execute_analyze(target.as_ref()).await?;
+                Box::pin(self.execute_analyze(target.as_ref())).await?;
                 Ok(Vec::new())
             }
             Statement::Reindex(target) => {
-                self.execute_reindex(target.as_ref()).await?;
+                Box::pin(self.execute_reindex(target.as_ref())).await?;
                 Ok(Vec::new())
             }
             Statement::Explain { query_plan, stmt } => {
-                self.execute_explain(stmt, *query_plan, params).await
+                Box::pin(self.execute_explain(stmt, *query_plan, params)).await
             }
             Statement::Attach(attach) => {
                 // bd-wymdl.3: never mutate the attached-database registry while
@@ -40462,11 +40467,17 @@ impl Connection {
                 // attached database read-write as usual.
                 let attached_connection = if self.pager.is_readonly() {
                     Box::new(
-                        Self::open_schema_only_with_env(path.clone(), self.attach_env.clone())
-                            .await?,
+                        Box::pin(Self::open_schema_only_with_env(
+                            path.clone(),
+                            self.attach_env.clone(),
+                        ))
+                        .await?,
                     )
                 } else {
-                    Box::new(Self::open_with_env(path.clone(), self.attach_env.clone()).await?)
+                    Box::new(
+                        Box::pin(Self::open_with_env(path.clone(), self.attach_env.clone()))
+                            .await?,
+                    )
                 };
                 // bd-6n5cy stock-fidelity: SQLite refuses to attach a database
                 // whose text encoding differs from the main database ("attached

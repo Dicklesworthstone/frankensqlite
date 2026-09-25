@@ -6,6 +6,8 @@
 //! - deterministic shard replay metadata with stable bundle hashes,
 //! - deterministic ingestion/normalization/execution replay behavior.
 
+#![recursion_limit = "512"]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
