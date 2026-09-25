@@ -24,6 +24,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.4...main) | HEAD | 2026-09-17 | — |
+| [0.4.5](https://crates.io/crates/fsqlite-pager/0.4.5) | crates.io only | 2026-09-25 | `fsqlite-pager` alone: bd-b5vmw backport onto v0.4.4, so a page can no longer end up referenced by both the freelist trunk and a live b-tree across a WAL generation. Tag `fsqlite-pager-v0.4.5`; no GitHub Release. The next uniform release must be >= 0.4.6 |
 | [v0.4.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.4) | Release | 2026-09-17 | First uniform-version release: all 28 crates publish at 0.4.4 together. Page-accounting repair: abandoned pages reach the durable freelist again on the native WAL-index path, fixing orphans stock `integrity_check` reported as `page N is never used` (bd-u2kmg); pending freelist repair is reserved for real writers (GH#462). Shared-memory foundations for cross-process MVCC (mapped page lock table, Unix MVCC SHM with identity-bound headers, session-owned `BEGIN CONCURRENT` tokens) — infrastructure only; public `Connection` MVCC authority stays process-local (GH#329 open). Native WAL-index SHM with append ownership and reader leases, plus stock WAL-index codec parity (GH#19). Read-only openers join a live WAL; schema-only WAL-index recovery. Scoped WAL-FEC repair pipeline. A substantial new TypeScript SDK / WASM worker: managed transaction scopes, streaming imports, atomic bulk writes, pre-IPC backpressure, versioned IndexedDB snapshots, binary result transfer, snapshot pools, and committed-change streams with live SELECT. SQL fixes: no rowid burned on a discarded row (bd-55kh5), `UNIQUE` violations name the conflicting columns (bd-towj6), bounded `DROP` teardown (bd-fmhvo), VIRTUAL generated-column bounds/NOT NULL/collation (bd-fjieg) |
 | [0.4.3](https://crates.io/crates/fsqlite-pager/0.4.3) | crates.io only | 2026-09-16 | `fsqlite-pager` alone (GH#462 freelist repair); no tag, no GitHub Release. Documented in the v0.4.4 section |
 | [0.4.2](https://crates.io/crates/fsqlite/0.4.2) | crates.io only | 2026-09-16 | Partial bump of the crates whose APIs had changed; no tag, no GitHub Release |
@@ -56,6 +57,43 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.4...ma
 No changes yet.
 
 ---
+
+## [0.4.5] -- 2026-09-25 (crates.io only: `fsqlite-pager`)
+
+This is a pager-only patch, published from tag
+[`fsqlite-pager-v0.4.5`](https://github.com/Dicklesworthstone/frankensqlite/tree/fsqlite-pager-v0.4.5)
+(commit `6843bf75e`). It is the v0.4.4 release tree plus one fix, and it follows the 0.4.3 precedent.
+
+- **Other crates.** Every other crate stays at 0.4.4 and requires `fsqlite-pager` by caret, so consumers pick
+  the fix up with `cargo update -p fsqlite-pager --precise 0.4.5`.
+- **Not shipped here.** There is no GitHub Release and no binaries. `main`'s later pager/WAL/core/VDBE
+  performance commits are not included.
+- **Next release.** `main`'s pager manifest still reads 0.4.4, so the next uniform release must use 0.4.6 or
+  later.
+
+### Fixed
+
+- **A live B-tree page could be freed and granted again across a WAL generation.** `integrity_check` then
+  reported `page N is referenced multiple times`, either as freelist trunk plus index or as two index paths
+  (bd-b5vmw; backport of [`a712b8ea4`](https://github.com/Dicklesworthstone/frankensqlite/commit/a712b8ea4d2f0e9ad203985e9817f598a24b91bd)).
+  There were two paths, and both are now closed:
+  - a refreshing connection classified its abandonment pool against a stale pre-generation `db_size`;
+  - a connection dropped without refreshing handed its pool to the shared ledger from the wrong generation.
+- **Downstream report.** The same signature corrupted a shared hfdt store in the field
+  (hfdt-field-reports-20260925-otkbvu.1).
+
+### Verification
+
+- **Package tests.** `cargo test --locked -p fsqlite-pager --lib` on the tag tree (rch): 1004 passed,
+  0 failed, 13 ignored.
+- **Fixed keeper loop.** The keeper `retried_create_index_persists_verbatim_sql_and_leaves_no_residue`
+  (from `a712b8ea4`) ran against v0.4.4 `fsqlite-core` plus this pager in a 120-run loop: 0 failures.
+- **Unfixed control.** The identical loop on the unfixed v0.4.4 tree failed 3 times by run 108, with
+  `page 1974 is referenced multiple times (freelist trunk[0]; index ix_v ...)` and
+  `page 1973 ... (index ix_v ...; index ix_v ...)`. rch's 3600 s cap then killed that run.
+- **Publish check.** `cargo publish --locked` verified the packaged crate against the published 0.4.4
+  family. The published `.cargo_vcs_info.json` records `6843bf75e`, and `src/pager.rs` is byte-identical to
+  the tag.
 
 ## [0.4.4] -- 2026-09-17 (GitHub Release)
 
