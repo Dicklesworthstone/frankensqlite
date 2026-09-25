@@ -46734,8 +46734,18 @@ mod tests {
                 let queue = Arc::clone(&queue);
                 let pool = pool.clone();
                 let start = StdArc::clone(&start);
-                std::thread::spawn(move || {
+                // A thread's lane comes from a process-global slot counter, so
+                // threads that concurrent tests spawn can give two writers the
+                // same lane. Each candidate reports its lane and commits only
+                // when told to (bd-odkn5).
+                let (lane_tx, lane_rx) = std::sync::mpsc::channel();
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<bool>();
+                let handle = std::thread::spawn(move || {
                     let lane_id = queue.current_parallel_wal_lane_id();
+                    lane_tx.send(lane_id).unwrap();
+                    if !go_rx.recv().unwrap_or(false) {
+                        return (lane_id, None);
+                    }
                     let mut outcome = None;
                     asupersync::test_utils::run_test(|| async {
                         let cx = Cx::new();
@@ -46761,19 +46771,33 @@ mod tests {
                     });
                     (
                         lane_id,
-                        outcome.expect("group-commit thread must record an outcome"),
+                        Some(outcome.expect("group-commit thread must record an outcome")),
                     )
-                })
+                });
+                (lane_rx.recv().unwrap(), go_tx, handle)
             };
 
             let writer_a = spawn_commit(2, 0x31);
-            let writer_b = spawn_commit(3, 0x47);
+            let writer_b = (0..64)
+                .find_map(|_| {
+                    let candidate = spawn_commit(3, 0x47);
+                    if candidate.0 == writer_a.0 {
+                        candidate.1.send(false).unwrap();
+                        candidate.2.join().unwrap();
+                        None
+                    } else {
+                        Some(candidate)
+                    }
+                })
+                .expect("a writer thread on a second lane");
+            writer_a.1.send(true).unwrap();
+            writer_b.1.send(true).unwrap();
             start.wait();
 
-            let (lane_a, result_a) = writer_a.join().unwrap();
-            let (lane_b, result_b) = writer_b.join().unwrap();
-            result_a.unwrap();
-            result_b.unwrap();
+            let (lane_a, result_a) = writer_a.2.join().unwrap();
+            let (lane_b, result_b) = writer_b.2.join().unwrap();
+            result_a.unwrap().unwrap();
+            result_b.unwrap().unwrap();
 
             assert_ne!(
                 lane_a, lane_b,
