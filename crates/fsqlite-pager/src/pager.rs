@@ -61837,10 +61837,10 @@ mod tests {
         let reader_plane = Arc::clone(&published);
         let handle = std::thread::spawn(move || reader_plane.snapshot());
 
-        for _ in 0..10_000 {
-            if published.read_retry_count() > 0 {
-                break;
-            }
+        // Bound the wait by time, not a yield count: on an oversubscribed host the
+        // reader thread may not be scheduled within any fixed number of yields.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while published.read_retry_count() == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert!(

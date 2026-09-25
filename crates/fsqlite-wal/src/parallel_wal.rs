@@ -3968,11 +3968,19 @@ mod tests {
                 .map(|handle| handle.join().expect("lane thread should join"))
                 .collect::<Vec<_>>();
             observed.sort_unstable();
+            assert!(observed.iter().all(|&lane| lane < 2), "lanes out of range: {observed:?}");
             observed
         };
 
-        assert_eq!(spawn_wave(), vec![0, 1]);
-        assert_eq!(spawn_wave(), vec![0, 1]);
+        // Lane slots come from the process-global NEXT_BUFFER_SLOT counter, which
+        // threads of concurrently running tests also advance; a slot they take
+        // between this wave's two threads puts both on one lane. Each wave of fresh
+        // threads (the previous wave has exited) must still reach both lanes, so
+        // retry a wave that interference collapsed.
+        for wave in 0..2 {
+            let reached_both = (0..64).any(|_| spawn_wave() == vec![0, 1]);
+            assert!(reached_both, "wave {wave} never spread across both lanes");
+        }
     }
 
     #[test]
