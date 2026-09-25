@@ -7824,7 +7824,6 @@ impl PagerCommittedSnapshot {
     }
 }
 
-/// The inner mutable pager state protected by a mutex.
 /// What a complete standalone WAL refresh observed. While this process holds
 /// the main-file SHARED lock that lives with its WAL shared-memory attachment,
 /// no other process can take EXCLUSIVE — so none can leave WAL mode, write in
@@ -7833,7 +7832,9 @@ impl PagerCommittedSnapshot {
 /// reset, a recovery) rewrites the WAL-index header. An identical header, the
 /// same file at the `-wal` path (an in-process stock SQLite, which cannot see
 /// our locks, may still unlink it) and no local commit since therefore mean
-/// the refresh would find exactly what it found last time.
+/// the refresh would find exactly what it found last time. A transaction's
+/// own commit may carry it forward only when that commit is provably the only
+/// change since (see `advance_refresh_signature_past_own_commit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalRefreshSignature {
     shm_header: fsqlite_wal::wal_index::WalIndexHdr,
@@ -7841,6 +7842,96 @@ struct WalRefreshSignature {
     commit_seq: CommitSeq,
 }
 
+/// The WAL-index header and `-wal` file of a WAL-mode database as they stand
+/// now, when this process can vouch for them (see [`WalRefreshSignature`]).
+async fn observe_wal_refresh_signature<V: Vfs>(
+    cx: &Cx,
+    vfs: &V,
+    wal_backend: &SharedWalBackend,
+    db_file: &SharedDbFile<V::File>,
+    wal_path: &Path,
+    commit_seq: CommitSeq,
+) -> Result<Option<WalRefreshSignature>> {
+    if vfs.is_memory() {
+        return Ok(None);
+    }
+    let Some(shm_header) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await? else {
+        return Ok(None);
+    };
+    let Some(wal_identity) = vfs.path_file_identity(cx, wal_path)? else {
+        return Ok(None);
+    };
+    Ok(Some(WalRefreshSignature {
+        shm_header,
+        wal_identity,
+        commit_seq,
+    }))
+}
+
+/// The shared WAL-index header, when a native WAL reader is attached and this
+/// process holds the main-file SHARED claim that makes it authoritative.
+async fn observe_vouched_wal_index_header<F: VfsFile>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    db_file: &SharedDbFile<F>,
+) -> Result<Option<fsqlite_wal::wal_index::WalIndexHdr>> {
+    {
+        let backend = wal_backend_handle(wal_backend)?;
+        let wal = async_rwlock_read(&backend, cx, "refresh signature").await?;
+        if !wal.native_reader_required() || wal.native_recovery_required().is_some() {
+            return Ok(None);
+        }
+    }
+    let mut file = shared_db_file_write(db_file, cx).await?;
+    if !file.holds_main_wal_lifetime_read_lock() {
+        return Ok(None);
+    }
+    let Ok(region) = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) else {
+        return Ok(None);
+    };
+    fsqlite_wal::wal_index::read_shared_wal_index_header(&region)
+}
+
+/// Carry a pager's refresh signature past a flush that published exactly one
+/// commit of its own, while the append gate still excludes every other
+/// publisher. When the signature described the pager's state immediately
+/// before that commit and the WAL-index header advanced by exactly one commit
+/// in the same generation, the pager (whose commit metadata the flush just
+/// applied) is current, so the next statement need not re-derive committed
+/// state it just wrote. The `-wal` identity carries over: the next check still
+/// re-reads the path and falls back to a full refresh if it changed.
+/// Best-effort: the commit is durable, so any failure leaves the signature
+/// unchanged and the next boundary refreshes.
+async fn advance_refresh_signature_past_own_commit<F: VfsFile>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    db_file: &SharedDbFile<F>,
+    inner_arc: &Arc<Mutex<PagerInner<F>>>,
+    previous: WalRefreshSignature,
+    committed_seq: CommitSeq,
+) {
+    let Ok(Some(header)) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await
+    else {
+        return;
+    };
+    if header.a_salt != previous.shm_header.a_salt
+        || header.i_change != previous.shm_header.i_change.wrapping_add(1)
+    {
+        return;
+    }
+    let Ok(mut inner) = inner_arc.lock() else {
+        return;
+    };
+    if inner.commit_seq == committed_seq && inner.wal_refresh_signature == Some(previous) {
+        inner.wal_refresh_signature = Some(WalRefreshSignature {
+            shm_header: header,
+            wal_identity: previous.wal_identity,
+            commit_seq: committed_seq,
+        });
+    }
+}
+
+/// The inner mutable pager state protected by a mutex.
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
@@ -16953,39 +17044,20 @@ where
         cx: &Cx,
         inner: &PagerInner<V::File>,
     ) -> Result<Option<WalRefreshSignature>> {
-        if inner.journal_mode != JournalMode::Wal || self.vfs.is_memory() {
+        if inner.journal_mode != JournalMode::Wal {
             return Ok(None);
         }
-        {
-            let backend = wal_backend_handle(&self.wal_backend)?;
-            let wal = async_rwlock_read(&backend, cx, "refresh signature").await?;
-            if !wal.native_reader_required() || wal.native_recovery_required().is_some() {
-                return Ok(None);
-            }
-        }
-        let shm_header = {
-            let mut file = shared_db_file_write(&inner.db_file, cx).await?;
-            if !file.holds_main_wal_lifetime_read_lock() {
-                return Ok(None);
-            }
-            let Ok(region) = file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) else {
-                return Ok(None);
-            };
-            let Some(header) = fsqlite_wal::wal_index::read_shared_wal_index_header(&region)? else {
-                return Ok(None);
-            };
-            header
-        };
         let mut wal_path = self.db_path.as_os_str().to_owned();
         wal_path.push("-wal");
-        let Some(wal_identity) = self.vfs.path_file_identity(cx, Path::new(&wal_path))? else {
-            return Ok(None);
-        };
-        Ok(Some(WalRefreshSignature {
-            shm_header,
-            wal_identity,
-            commit_seq: inner.commit_seq,
-        }))
+        observe_wal_refresh_signature(
+            cx,
+            &*self.vfs,
+            &self.wal_backend,
+            &inner.db_file,
+            Path::new(&wal_path),
+            inner.commit_seq,
+        )
+        .await
     }
 
     /// The WAL-index header the currently bound native reader is pinned to.
@@ -24204,7 +24276,30 @@ where
                                 }
                                 drop(append_gate);
                                 drop(wal_guard);
-                                recovery.complete_authorized(&durability_cx)?;
+                                // The refresh signature, if it still described the
+                                // pager's state before this flush's commits land.
+                                let signature_before_publish = inner_arc.lock().ok().and_then(
+                                    |inner| {
+                                        inner
+                                            .wal_refresh_signature
+                                            .filter(|signature| signature.commit_seq == inner.commit_seq)
+                                    },
+                                );
+                                let receipt = recovery.complete_authorized(&durability_cx)?;
+                                if let Some(previous) = signature_before_publish
+                                    && receipt.batch_size == 1
+                                    && receipt.certificate.commit_seq_hi == previous.commit_seq.next()
+                                {
+                                    advance_refresh_signature_past_own_commit(
+                                        &durability_cx,
+                                        wal_backend,
+                                        &db_file,
+                                        inner_arc,
+                                        previous,
+                                        receipt.certificate.commit_seq_hi,
+                                    )
+                                    .await;
+                                }
                                 #[cfg(any(test, feature = "fault-injection"))]
                                 crate::fault_hooks::maybe_inject_after_flush_before_publish(
                                     flush_epoch,
