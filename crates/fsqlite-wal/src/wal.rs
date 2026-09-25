@@ -2054,15 +2054,12 @@ mod tests {
         let vfs = MemoryVfs::new();
         let cx = test_cx();
         let file = open_wal_file(&vfs, &cx);
-        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts())
-            .expect("create WAL");
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
         let expected = *wal.header();
         assert_eq!(expected.checksum, wal.running_checksum());
         let mut bytes = [0_u8; WAL_HEADER_SIZE];
         assert_eq!(
-            wal.file()
-                .read(&cx, &mut bytes, 0)
-                .expect("read header"),
+            wal.file().read(&cx, &mut bytes, 0).expect("read header"),
             WAL_HEADER_SIZE
         );
         assert_eq!(
@@ -2070,8 +2067,7 @@ mod tests {
             expected
         );
         wal.close(&cx).expect("close original");
-        let reopened =
-            WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("reopen WAL");
+        let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("reopen WAL");
         assert_eq!(*reopened.header(), expected);
         reopened.close(&cx).expect("close reopened");
     }

@@ -289,8 +289,7 @@ impl AggregateFunction for AggMaxFunc {
         match state {
             None => *state = Some(candidate.clone()),
             Some(current) => {
-                if candidate.cmp_binary_in(current, statement_text_encoding())
-                    == Ordering::Greater
+                if candidate.cmp_binary_in(current, statement_text_encoding()) == Ordering::Greater
                 {
                     *state = Some(candidate.clone());
                 }
@@ -1212,10 +1211,7 @@ mod tests {
     #[test]
     fn test_numeric_aggregates_recover_low_bits_after_integer_overflow() {
         for (rows, expected) in [
-            (
-                vec![int(i64::MAX), int(1), int(i64::MIN), float(0.5)],
-                0.5,
-            ),
+            (vec![int(i64::MAX), int(1), int(i64::MIN), float(0.5)], 0.5),
             (
                 vec![int(i64::MIN), int(-1), int(i64::MAX), float(0.5)],
                 -1.5,
@@ -1325,7 +1321,9 @@ mod tests {
             let mut first = aggregate.initial_state();
             let mut second = aggregate.initial_state();
             aggregate.step(&mut first, &[int(i64::MAX)]).unwrap();
-            aggregate.step(&mut second, &[float(f64::INFINITY)]).unwrap();
+            aggregate
+                .step(&mut second, &[float(f64::INFINITY)])
+                .unwrap();
             aggregate.step(&mut first, &[int(i64::MIN)]).unwrap();
             aggregate.step(&mut first, &[float(0.0)]).unwrap();
             assert_eq!(aggregate.finalize(second).unwrap(), float(f64::INFINITY));
@@ -1603,21 +1601,10 @@ mod tests {
                 p: None,
             };
             percentile_step(&mut state, &[null(), float(0.5 * scale)], scale, name).unwrap();
-            percentile_step(
-                &mut state,
-                &[int(10), float(0.50075 * scale)],
-                scale,
-                name,
-            )
-            .unwrap();
+            percentile_step(&mut state, &[int(10), float(0.50075 * scale)], scale, name).unwrap();
             assert!(
-                percentile_step(
-                    &mut state,
-                    &[int(20), float(0.5015 * scale)],
-                    scale,
-                    name,
-                )
-                .is_err()
+                percentile_step(&mut state, &[int(20), float(0.5015 * scale)], scale, name,)
+                    .is_err()
             );
             assert_eq!(state.p, Some(0.5));
             assert_eq!(state.values, vec![10.0]);
@@ -1671,7 +1658,10 @@ mod tests {
             ("percentile_disc", 2),
         ] {
             let aggregate = registry.find_aggregate(name, arity).unwrap();
-            assert_eq!(aggregate.finalize(aggregate.initial_state()).unwrap(), null());
+            assert_eq!(
+                aggregate.finalize(aggregate.initial_state()).unwrap(),
+                null()
+            );
             let mut state = aggregate.initial_state();
             for value in [null(), float(f64::NAN)] {
                 let args = if arity == 1 {
@@ -1719,7 +1709,11 @@ mod tests {
         PercentileContFunc
             .step(&mut state, &[int(10), float(0.5)])
             .unwrap();
-        assert!(PercentileContFunc.step(&mut state, &[int(20), null()]).is_err());
+        assert!(
+            PercentileContFunc
+                .step(&mut state, &[int(20), null()])
+                .is_err()
+        );
         assert_eq!(state.p, Some(0.5));
         assert_eq!(state.values, vec![10.0]);
     }

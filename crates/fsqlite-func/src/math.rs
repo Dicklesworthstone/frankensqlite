@@ -810,10 +810,7 @@ mod tests {
     #[test]
     fn test_atanh_endpoints_preserve_infinity() {
         // SQLite oracle: SELECT atanh(1), atanh(-1) -> +Inf, -Inf.
-        for (input, numeric, expected) in [
-            (1, 1.0, f64::INFINITY),
-            (-1, -1.0, f64::NEG_INFINITY),
-        ] {
+        for (input, numeric, expected) in [(1, 1.0, f64::INFINITY), (-1, -1.0, f64::NEG_INFINITY)] {
             for value in [
                 int(input),
                 float(numeric),
@@ -1280,18 +1277,30 @@ mod tests {
     #[test]
     fn test_math_numeric_text_rejects_non_sqlite_spellings() {
         for input in [
-            "", " ", ".", "+", "-", "NaN", "-NaN", "inf", "+Inf", "infinity",
-            "-Infinity", "0x4", "4tail", "4e", "4e+", "1_0", "4\0", "4\0tail", "1 2",
+            "",
+            " ",
+            ".",
+            "+",
+            "-",
+            "NaN",
+            "-NaN",
+            "inf",
+            "+Inf",
+            "infinity",
+            "-Infinity",
+            "0x4",
+            "4tail",
+            "4e",
+            "4e+",
+            "1_0",
+            "4\0",
+            "4\0tail",
+            "1 2",
         ] {
             let value = SqliteValue::Text(input.into());
             assert_eq!(to_f64(&value), None, "{input:?}");
         }
-        for (input, expected) in [
-            (".5", 0.5),
-            ("4.", 4.0),
-            ("+4e-1", 0.4),
-            ("-4E+1", -40.0),
-        ] {
+        for (input, expected) in [(".5", 0.5), ("4.", 4.0), ("+4e-1", 0.4), ("-4E+1", -40.0)] {
             assert_eq!(to_f64(&SqliteValue::Text(input.into())), Some(expected));
         }
     }
@@ -1323,9 +1332,9 @@ mod tests {
             (" \t1.0\u{000b}\n", 1.0),
         ];
         for name in [
-            "acos", "asin", "atan", "cos", "sin", "tan", "acosh", "asinh", "atanh",
-            "cosh", "sinh", "tanh", "ceil", "ceiling", "floor", "trunc", "ln", "log",
-            "log10", "log2", "exp", "sqrt", "degrees", "radians",
+            "acos", "asin", "atan", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh",
+            "tanh", "ceil", "ceiling", "floor", "trunc", "ln", "log", "log10", "log2", "exp",
+            "sqrt", "degrees", "radians",
         ] {
             let function = registry.find_scalar(name, 1).unwrap();
             for (input, numeric) in cases {

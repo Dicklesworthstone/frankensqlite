@@ -15,10 +15,10 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 
 use super::{
-    WalFecDecodeProof, WalFecGroupMeta, WalFecRecoveryFallbackReason,
-    WalFecRecoveryGroupRecord, WalFecRecoveryOutcome, WalFrameCandidate,
-    read_length_prefixed, recover_wal_fec_group_record_with_decoder,
-    scan_offset_after_optional_pragma_header, wal_fec_raptorq_decode,
+    WalFecDecodeProof, WalFecGroupMeta, WalFecRecoveryFallbackReason, WalFecRecoveryGroupRecord,
+    WalFecRecoveryOutcome, WalFrameCandidate, read_length_prefixed,
+    recover_wal_fec_group_record_with_decoder, scan_offset_after_optional_pragma_header,
+    wal_fec_raptorq_decode,
 };
 use crate::checksum::{
     SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalChecksumTransform,
@@ -231,7 +231,8 @@ impl<'a> WalFecReplayResult<'a> {
             latest_pages.insert(frame_header.page_number, &frame[WAL_FRAME_HEADER_SIZE..]);
             if frame_header.is_commit() {
                 retained_base_pages = retained_base_pages.min(frame_header.db_size);
-                while latest_pages.last_key_value()
+                while latest_pages
+                    .last_key_value()
                     .is_some_and(|(page, _)| *page > frame_header.db_size)
                 {
                     latest_pages.pop_last();
@@ -248,7 +249,8 @@ impl<'a> WalFecReplayResult<'a> {
         if PageNumber::new(final_pages).is_none() {
             return Err(corrupt("invalid recovered database page count"));
         }
-        let output_len = usize::try_from(final_pages).ok()
+        let output_len = usize::try_from(final_pages)
+            .ok()
             .and_then(|pages| pages.checked_mul(page_size))
             .filter(|size| *size <= max_database_bytes)
             .ok_or_else(|| corrupt("recovered database exceeds output limit"))?;
@@ -262,23 +264,31 @@ impl<'a> WalFecReplayResult<'a> {
         }
 
         // Validate the final page-one version before allocating the output.
-        let page_one = latest_pages.get(&1).copied()
+        let page_one = latest_pages
+            .get(&1)
+            .copied()
             .or_else(|| database.get(..page_size))
             .ok_or_else(|| corrupt("recovered database has no page one"))?;
         validate_database_header(page_one, self.header.page_size)?;
         if authoritative_database_size(page_one).is_some_and(|size| size != final_pages) {
-            return Err(corrupt("recovered page-one size disagrees with the final WAL commit"));
+            return Err(corrupt(
+                "recovered page-one size disagrees with the final WAL commit",
+            ));
         }
 
         let mut output = Vec::new();
-        output.try_reserve_exact(output_len).map_err(|_| FrankenError::OutOfMemory)?;
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         output.resize(output_len, 0);
         let base_len = usize::try_from(retained_base_pages)
-            .map_err(|_| corrupt("base page count exceeds address space"))? * page_size;
+            .map_err(|_| corrupt("base page count exceeds address space"))?
+            * page_size;
         output[..base_len].copy_from_slice(&database[..base_len]);
         for (page, payload) in latest_pages {
             let offset = usize::try_from(page - 1)
-                .map_err(|_| corrupt("page number exceeds address space"))? * page_size;
+                .map_err(|_| corrupt("page number exceeds address space"))?
+                * page_size;
             output[offset..offset + page_size].copy_from_slice(payload);
         }
         Ok(output)
@@ -304,15 +314,22 @@ fn validate_database_header(bytes: &[u8], expected_page_size: u32) -> Result<()>
         return Err(corrupt("invalid main database header during recovery"));
     }
     let encoded = u16::from_be_bytes([bytes[16], bytes[17]]);
-    let page_size = if encoded == 1 { 65_536 } else { u32::from(encoded) };
+    let page_size = if encoded == 1 {
+        65_536
+    } else {
+        u32::from(encoded)
+    };
     if page_size != expected_page_size {
         return Err(corrupt("main database and WAL page sizes differ"));
     }
-    if !matches!(bytes[18], 1 | 2) || !matches!(bytes[19], 1 | 2)
+    if !matches!(bytes[18], 1 | 2)
+        || !matches!(bytes[19], 1 | 2)
         || bytes[21..24] != [64, 32, 32]
         || page_size.saturating_sub(u32::from(bytes[20])) < 480
     {
-        return Err(corrupt("unsupported main database header format during recovery"));
+        return Err(corrupt(
+            "unsupported main database header format during recovery",
+        ));
     }
     Ok(())
 }
@@ -420,8 +437,11 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         if let Some(frame) = image.get(offset..offset + frame_size) {
             let frame_header = WalFrameHeader::from_bytes(frame)?;
             let expected = WalChecksumTransform::for_wal_frame(
-                frame, page_size, header.big_endian_checksum(),
-            )?.apply(running);
+                frame,
+                page_size,
+                header.big_endian_checksum(),
+            )?
+            .apply(running);
             if PageNumber::new(frame_header.page_number).is_some()
                 && (frame_header.db_size == 0 || PageNumber::new(frame_header.db_size).is_some())
                 && frame_header.salts == header.salts
@@ -446,7 +466,10 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         let group = match find_recovery_group(sidecar_bytes, &header, damaged_frame_no, limits) {
             Ok(group) => group,
             Err(reason) => {
-                stop = Some(WalFecReplayStop { frame_no: damaged_frame_no, reason });
+                stop = Some(WalFecReplayStop {
+                    frame_no: damaged_frame_no,
+                    reason,
+                });
                 break;
             }
         };
@@ -457,7 +480,8 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
             || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols
         {
             stop = Some(WalFecReplayStop {
-                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::ResourceLimit,
+                frame_no: damaged_frame_no,
+                reason: WalFecReplayStopReason::ResourceLimit,
             });
             break;
         }
@@ -465,10 +489,14 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
             || meta.start_frame_no.checked_sub(1) != Some(committed_frames)
             || meta.end_frame_no > frame_count
             || PageNumber::new(meta.db_size_pages).is_none()
-            || meta.page_numbers.iter().any(|page| PageNumber::new(*page).is_none())
+            || meta
+                .page_numbers
+                .iter()
+                .any(|page| PageNumber::new(*page).is_none())
         {
             stop = Some(WalFecReplayStop {
-                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::InvalidGroupBoundary,
+                frame_no: damaged_frame_no,
+                reason: WalFecReplayStopReason::InvalidGroupBoundary,
             });
             break;
         }
@@ -476,7 +504,8 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         let group_end = frame_offset(meta.end_frame_no, frame_size)?;
         if group_end > limits.max_wal_bytes {
             stop = Some(WalFecReplayStop {
-                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::ResourceLimit,
+                frame_no: damaged_frame_no,
+                reason: WalFecReplayStopReason::ResourceLimit,
             });
             break;
         }
@@ -497,37 +526,49 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         }
         let mut decode = wal_fec_raptorq_decode;
         let outcome = recover_wal_fec_group_record_with_decoder(
-            &group, damaged_frame_no, &candidates, &mut decode,
+            &group,
+            damaged_frame_no,
+            &candidates,
+            &mut decode,
         )?;
         let recovered = match outcome {
             WalFecRecoveryOutcome::Recovered(recovered) => recovered,
             WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } => {
-                let reason = decode_proof.fallback_reason
+                let reason = decode_proof
+                    .fallback_reason
                     .unwrap_or(WalFecRecoveryFallbackReason::DecodeFailed);
                 decode_proofs.push(decode_proof);
                 stop = Some(WalFecReplayStop {
-                    frame_no: damaged_frame_no, reason: WalFecReplayStopReason::Decode(reason),
+                    frame_no: damaged_frame_no,
+                    reason: WalFecReplayStopReason::Decode(reason),
                 });
                 break;
             }
         };
         let mut rebuilt = Vec::new();
-        rebuilt.try_reserve_exact(group_end - group_start)
+        rebuilt
+            .try_reserve_exact(group_end - group_start)
             .map_err(|_| FrankenError::OutOfMemory)?;
         let mut rebuilt_checksum = committed_checksum;
         for (index, page) in recovered.recovered_pages.iter().enumerate() {
             let is_last = index + 1 == source_pages;
             let start = rebuilt.len();
-            rebuilt.extend_from_slice(&WalFrameHeader {
-                page_number: meta.page_numbers[index],
-                db_size: if is_last { meta.db_size_pages } else { 0 },
-                salts: header.salts,
-                checksum: SqliteWalChecksum::default(),
-            }.to_bytes());
+            rebuilt.extend_from_slice(
+                &WalFrameHeader {
+                    page_number: meta.page_numbers[index],
+                    db_size: if is_last { meta.db_size_pages } else { 0 },
+                    salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }
+                .to_bytes(),
+            );
             rebuilt.extend_from_slice(page);
             rebuilt_checksum = WalChecksumTransform::for_wal_frame(
-                &rebuilt[start..], page_size, header.big_endian_checksum(),
-            )?.apply(rebuilt_checksum);
+                &rebuilt[start..],
+                page_size,
+                header.big_endian_checksum(),
+            )?
+            .apply(rebuilt_checksum);
             rebuilt[start + 16..start + 20].copy_from_slice(&rebuilt_checksum.s1.to_be_bytes());
             rebuilt[start + 20..start + 24].copy_from_slice(&rebuilt_checksum.s2.to_be_bytes());
         }
@@ -535,11 +576,13 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         let original_terminal = group_end - frame_size;
         let original_checksum = WalFrameHeader::from_bytes(
             &wal_bytes[original_terminal..original_terminal + WAL_FRAME_HEADER_SIZE],
-        )?.checksum;
+        )?
+        .checksum;
         decode_proofs.push(recovered.decode_proof);
         if rebuilt[..verified_len] != image[group_start..group_start + verified_len] {
             stop = Some(WalFecReplayStop {
-                frame_no: damaged_frame_no, reason: WalFecReplayStopReason::PrefixMismatch,
+                frame_no: damaged_frame_no,
+                reason: WalFecReplayStopReason::PrefixMismatch,
             });
             break;
         }
@@ -560,8 +603,11 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         for (index, frame) in rebuilt.chunks_exact(frame_size).enumerate() {
             let offset = group_start + index * frame_size;
             if image.get(offset..offset + frame_size) != Some(frame) {
-                repaired_frame_nos.push(meta.start_frame_no + u32::try_from(index)
-                    .map_err(|_| corrupt("repaired frame index overflow"))?);
+                repaired_frame_nos.push(
+                    meta.start_frame_no
+                        + u32::try_from(index)
+                            .map_err(|_| corrupt("repaired frame index overflow"))?,
+                );
             }
         }
         grow_replay_image(&mut image, group_end)?;
@@ -569,11 +615,19 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         if let Some(pending) = pending_anchor {
             let records = certificates.get_or_insert_with(|| {
                 read_replay_certificates(
-                    certificate_bytes, database_file_id, &header, complete_frame_count, limits,
+                    certificate_bytes,
+                    database_file_id,
+                    &header,
+                    complete_frame_count,
+                    limits,
                 )
             });
             if let Some(anchor) = match_replay_certificate(
-                records, &image, pending.committed_frames + 1, meta.end_frame_no, frame_size,
+                records,
+                &image,
+                pending.committed_frames + 1,
+                meta.end_frame_no,
+                frame_size,
             ) {
                 certificate_anchors.push(anchor);
                 pending_anchor = None;
@@ -601,7 +655,8 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
     }
     if stop.is_none() && partial_frame_bytes != 0 && committed_frames <= complete_frame_count {
         stop = Some(WalFecReplayStop {
-            frame_no: complete_frame_count.checked_add(1)
+            frame_no: complete_frame_count
+                .checked_add(1)
                 .ok_or_else(|| corrupt("partial WAL frame number overflow"))?,
             reason: WalFecReplayStopReason::PartialFrame,
         });
@@ -609,13 +664,22 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
     let prefix_len = frame_offset(committed_frames, frame_size)?;
     image = match image {
         Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..prefix_len]),
-        Cow::Owned(mut bytes) => { bytes.truncate(prefix_len); Cow::Owned(bytes) }
+        Cow::Owned(mut bytes) => {
+            bytes.truncate(prefix_len);
+            Cow::Owned(bytes)
+        }
     };
     Ok(WalFecReplayResult {
-        image, header, committed_frames, db_size_pages,
+        image,
+        header,
+        committed_frames,
+        db_size_pages,
         discarded_tail_bytes: wal_bytes.len().saturating_sub(prefix_len),
         restored_tail_bytes: prefix_len.saturating_sub(wal_bytes.len()),
-        repaired_frame_nos, decode_proofs, certificate_anchors, stop,
+        repaired_frame_nos,
+        decode_proofs,
+        certificate_anchors,
+        stop,
     })
 }
 
@@ -626,13 +690,17 @@ fn grow_replay_image(image: &mut Cow<'_, [u8]>, required_len: usize) -> Result<(
     match image {
         Cow::Borrowed(bytes) => {
             let mut owned = Vec::new();
-            owned.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+            owned
+                .try_reserve_exact(len)
+                .map_err(|_| FrankenError::OutOfMemory)?;
             owned.extend_from_slice(bytes);
             owned.resize(len, 0);
             *image = Cow::Owned(owned);
         }
         Cow::Owned(bytes) => {
-            bytes.try_reserve_exact(len - bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            bytes
+                .try_reserve_exact(len - bytes.len())
+                .map_err(|_| FrankenError::OutOfMemory)?;
             bytes.resize(len, 0);
         }
     }
@@ -664,12 +732,13 @@ fn read_replay_certificates(
             let encoded_len = u32::from_le_bytes(remaining.get(10..14)?.try_into().ok()?);
             let len = usize::try_from(encoded_len).ok()?;
             if !(ParallelWalDurableCertificateRecord::MIN_ENCODED_SIZE
-                ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE).contains(&len)
+                ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                .contains(&len)
             {
                 return None;
             }
-            let record = ParallelWalDurableCertificateRecord::from_bytes(remaining.get(..len)?)
-                .ok()?;
+            let record =
+                ParallelWalDurableCertificateRecord::from_bytes(remaining.get(..len)?).ok()?;
             remaining = remaining.get(len..)?;
             if record.db_file_id == database_file_id
                 && record.wal_generation == WalGenerationIdentity::from_header(header)
@@ -725,7 +794,10 @@ fn match_replay_certificate(
     if !terminal.is_commit()
         || terminal.db_size != record.certificate.db_size_pages
         || !record.authorizes_wal_boundary(
-            generation, u64::from(end_frame_no), u64::from(end_frame_no), digest.finalize(),
+            generation,
+            u64::from(end_frame_no),
+            u64::from(end_frame_no),
+            digest.finalize(),
         )
     {
         return None;
@@ -749,8 +821,8 @@ fn find_recovery_group(
     if bytes.len() > limits.max_sidecar_bytes {
         return Err(Stop::ResourceLimit);
     }
-    let mut cursor = scan_offset_after_optional_pragma_header(bytes)
-        .map_err(|_| Stop::UnusableSidecar)?;
+    let mut cursor =
+        scan_offset_after_optional_pragma_header(bytes).map_err(|_| Stop::UnusableSidecar)?;
     let mut found = None;
     let mut groups_seen = 0_usize;
     while cursor < bytes.len() {
@@ -761,16 +833,18 @@ fn find_recovery_group(
         let meta_bytes = read_length_prefixed(bytes, &mut cursor)
             .map_err(|_| Stop::UnusableSidecar)?
             .ok_or(Stop::UnusableSidecar)?;
-        let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)
-            .map_err(|_| Stop::UnusableSidecar)?;
+        let meta =
+            WalFecGroupMeta::from_record_bytes(meta_bytes).map_err(|_| Stop::UnusableSidecar)?;
         let matches = meta.verify_salt_binding(header.salts).is_ok()
-            && meta.start_frame_no <= frame_no && frame_no <= meta.end_frame_no;
+            && meta.start_frame_no <= frame_no
+            && frame_no <= meta.end_frame_no;
         if matches && found.is_some() {
             // Do not choose an arbitrary winner among overlapping authorities.
             return Err(Stop::AmbiguousGroup);
         }
-        if matches && (usize::try_from(meta.k_source).unwrap_or(usize::MAX) > limits.max_source_pages
-            || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols)
+        if matches
+            && (usize::try_from(meta.k_source).unwrap_or(usize::MAX) > limits.max_source_pages
+                || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols)
         {
             return Err(Stop::ResourceLimit);
         }
@@ -793,21 +867,28 @@ fn find_recovery_group(
             }
         }
         if matches {
-            found = Some(WalFecRecoveryGroupRecord { meta, repair_symbols, corruption_observations });
+            found = Some(WalFecRecoveryGroupRecord {
+                meta,
+                repair_symbols,
+                corruption_observations,
+            });
         }
     }
     found.ok_or(Stop::MissingGroup)
 }
 
 fn frame_offset(frame_index: u32, frame_size: usize) -> Result<usize> {
-    usize::try_from(frame_index).ok()
+    usize::try_from(frame_index)
+        .ok()
         .and_then(|index| index.checked_mul(frame_size))
         .and_then(|offset| offset.checked_add(WAL_HEADER_SIZE))
         .ok_or_else(|| corrupt("WAL recovery byte offset overflow"))
 }
 
 fn corrupt(detail: impl Into<String>) -> FrankenError {
-    FrankenError::WalCorrupt { detail: detail.into() }
+    FrankenError::WalCorrupt {
+        detail: detail.into(),
+    }
 }
 
 #[cfg(test)]
@@ -815,8 +896,8 @@ mod tests {
     use super::*;
     use crate::checksum::{WAL_FORMAT_VERSION, WAL_MAGIC_BE, WAL_MAGIC_LE, WalSalts};
     use crate::wal_fec::{
-        WalFecGroupMetaInit, WalFecGroupRecord, build_source_page_hashes,
-        encode_wal_fec_group, generate_wal_fec_repair_symbols,
+        WalFecGroupMetaInit, WalFecGroupRecord, build_source_page_hashes, encode_wal_fec_group,
+        generate_wal_fec_repair_symbols,
     };
     use fsqlite_types::{ObjectId, Oti};
 
@@ -826,8 +907,14 @@ mod tests {
 
     fn header(magic: u32) -> WalHeader {
         WalHeader {
-            magic, format_version: WAL_FORMAT_VERSION, page_size: PAGE_SIZE_U32,
-            checkpoint_seq: 17, salts: WalSalts { salt1: 12345, salt2: 67890 },
+            magic,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: PAGE_SIZE_U32,
+            checkpoint_seq: 17,
+            salts: WalSalts {
+                salt1: 12345,
+                salt2: 67890,
+            },
             checksum: SqliteWalChecksum::default(),
         }
     }
@@ -835,33 +922,64 @@ mod tests {
     fn append_group(wal: &mut Vec<u8>, count: u32, repairs: u32, tag: u8) -> Vec<u8> {
         let header = WalHeader::from_bytes(wal).unwrap();
         let start_frame_no = u32::try_from((wal.len() - WAL_HEADER_SIZE) / FRAME_SIZE).unwrap() + 1;
-        let pages: Vec<Vec<u8>> = (0..count).map(|index| {
-            let mut page = vec![tag; PAGE_SIZE];
-            page[..4].copy_from_slice(&index.to_be_bytes());
-            page
-        }).collect();
+        let pages: Vec<Vec<u8>> = (0..count)
+            .map(|index| {
+                let mut page = vec![tag; PAGE_SIZE];
+                page[..4].copy_from_slice(&index.to_be_bytes());
+                page
+            })
+            .collect();
         let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
-            wal_salt1: header.salts.salt1, wal_salt2: header.salts.salt2,
-            start_frame_no, end_frame_no: start_frame_no + count - 1,
-            db_size_pages: 100, page_size: PAGE_SIZE_U32, k_source: count, r_repair: repairs,
-            oti: Oti { f: u64::from(count) * u64::from(PAGE_SIZE_U32), al: 1, t: PAGE_SIZE_U32, z: 1, n: 1 },
+            wal_salt1: header.salts.salt1,
+            wal_salt2: header.salts.salt2,
+            start_frame_no,
+            end_frame_no: start_frame_no + count - 1,
+            db_size_pages: 100,
+            page_size: PAGE_SIZE_U32,
+            k_source: count,
+            r_repair: repairs,
+            oti: Oti {
+                f: u64::from(count) * u64::from(PAGE_SIZE_U32),
+                al: 1,
+                t: PAGE_SIZE_U32,
+                z: 1,
+                n: 1,
+            },
             object_id: ObjectId::derive_from_canonical_bytes(&[tag]),
-            page_numbers: (1..=count).collect(), source_page_xxh3_128: build_source_page_hashes(&pages),
-        }).unwrap();
-        let mut checksum = if start_frame_no == 1 { header.checksum } else {
-            WalFrameHeader::from_bytes(&wal[wal.len() - FRAME_SIZE..]).unwrap().checksum
+            page_numbers: (1..=count).collect(),
+            source_page_xxh3_128: build_source_page_hashes(&pages),
+        })
+        .unwrap();
+        let mut checksum = if start_frame_no == 1 {
+            header.checksum
+        } else {
+            WalFrameHeader::from_bytes(&wal[wal.len() - FRAME_SIZE..])
+                .unwrap()
+                .checksum
         };
         for (index, page) in pages.iter().enumerate() {
             let start = wal.len();
-            wal.extend_from_slice(&WalFrameHeader {
-                page_number: meta.page_numbers[index],
-                db_size: if index + 1 == pages.len() { meta.db_size_pages } else { 0 },
-                salts: header.salts, checksum: SqliteWalChecksum::default(),
-            }.to_bytes());
+            wal.extend_from_slice(
+                &WalFrameHeader {
+                    page_number: meta.page_numbers[index],
+                    db_size: if index + 1 == pages.len() {
+                        meta.db_size_pages
+                    } else {
+                        0
+                    },
+                    salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }
+                .to_bytes(),
+            );
             wal.extend_from_slice(page);
             checksum = WalChecksumTransform::for_wal_frame(
-                &wal[start..], PAGE_SIZE, header.big_endian_checksum(),
-            ).unwrap().apply(checksum);
+                &wal[start..],
+                PAGE_SIZE,
+                header.big_endian_checksum(),
+            )
+            .unwrap()
+            .apply(checksum);
             wal[start + 16..start + 20].copy_from_slice(&checksum.s1.to_be_bytes());
             wal[start + 20..start + 24].copy_from_slice(&checksum.s2.to_be_bytes());
         }
@@ -878,7 +996,8 @@ mod tests {
     fn intact_wal_borrows_and_does_not_parse_sidecar() {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         append_group(&mut wal, 3, 4, 1);
-        let result = recover_wal_fec_image(&wal, b"invalid sidecar", WalFecReplayLimits::default()).unwrap();
+        let result =
+            recover_wal_fec_image(&wal, b"invalid sidecar", WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames, 3);
         assert!(result.decode_proofs.is_empty());
         assert!(matches!(result.complete_image().unwrap(), Cow::Borrowed(_)));
@@ -893,7 +1012,8 @@ mod tests {
             let expected = wal.clone();
             corrupt_payload(&mut wal, 2);
             let damaged = wal.clone();
-            let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
+            let result =
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
             assert_eq!(result.committed_frames, 7);
             assert_eq!(result.repaired_frame_nos, vec![2]);
             assert!(result.decode_proofs[0].decode_attempted);
@@ -922,13 +1042,23 @@ mod tests {
         append_group(&mut wal, 2, 2, 1);
         let expected_len = wal.len();
         let sidecar = append_group(&mut wal, 5, 2, 2);
-        for frame in [4, 5, 6] { corrupt_payload(&mut wal, frame); }
+        for frame in [4, 5, 6] {
+            corrupt_payload(&mut wal, frame);
+        }
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.committed_frames, 2, "frame 3 is valid but not committed");
+        assert_eq!(
+            result.committed_frames, 2,
+            "frame 3 is valid but not committed"
+        );
         assert_eq!(result.replayable_prefix(), &wal[..expected_len]);
-        assert_eq!(result.stop.unwrap().reason,
-            WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols));
-        assert!(result.complete_image().is_err(), "fallback is not complete recovery");
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols)
+        );
+        assert!(
+            result.complete_image().is_err(),
+            "fallback is not complete recovery"
+        );
     }
 
     #[test]
@@ -942,7 +1072,10 @@ mod tests {
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames, 3);
         assert_eq!(result.replayable_prefix(), expected_prefix);
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::MissingGroup);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::MissingGroup
+        );
         assert!(result.complete_image().is_err());
     }
 
@@ -954,7 +1087,10 @@ mod tests {
         wal[last + 16] ^= 1;
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames, 0);
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert!(result.repaired_frame_nos.is_empty());
         assert!(result.complete_image().is_err());
     }
@@ -971,9 +1107,9 @@ mod tests {
                 let mut damaged = original.clone();
                 damaged[terminal + field_byte] ^= 0x80;
                 let saved = damaged.clone();
-                let result = recover_wal_fec_image(
-                    &damaged, &sidecar, WalFecReplayLimits::default(),
-                ).unwrap();
+                let result =
+                    recover_wal_fec_image(&damaged, &sidecar, WalFecReplayLimits::default())
+                        .unwrap();
                 assert_eq!(result.committed_frames(), 3);
                 assert_eq!(result.repaired_frame_nos(), &[3]);
                 assert!(!result.decode_proofs()[0].decode_attempted);
@@ -997,9 +1133,8 @@ mod tests {
             let expected = wal.clone();
             corrupt_checksum(&mut wal, 3);
             let damaged = wal.clone();
-            let result = recover_wal_fec_image(
-                &wal, &sidecar, WalFecReplayLimits::default(),
-            ).unwrap();
+            let result =
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
             assert_eq!(result.committed_frames(), 5);
             assert_eq!(result.repaired_frame_nos(), &[3]);
             assert!(!result.decode_proofs()[0].decode_attempted);
@@ -1023,9 +1158,8 @@ mod tests {
             corrupt_payload(&mut wal, 4);
             corrupt_checksum(&mut wal, 7);
             corrupt_payload(&mut wal, 8);
-            let result = recover_wal_fec_image(
-                &wal, &sidecar, WalFecReplayLimits::default(),
-            ).unwrap();
+            let result =
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
             assert_eq!(result.committed_frames(), 9);
             assert_eq!(result.repaired_frame_nos(), &[3, 4, 7, 8]);
             assert_eq!(result.decode_proofs().len(), 3);
@@ -1045,16 +1179,18 @@ mod tests {
         corrupt_checksum(&mut wal, 5);
         corrupt_payload(&mut wal, 6);
         corrupt_checksum(&mut wal, 8);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames(), 2);
         assert_eq!(result.db_size_pages(), Some(100));
         assert_eq!(result.replayable_prefix(), accepted);
         assert_eq!(result.discarded_tail_bytes(), 6 * FRAME_SIZE);
         assert!(result.repaired_frame_nos().is_empty());
         assert_eq!(result.decode_proofs().len(), 2);
-        assert!(result.database_image(&[0; PAGE_SIZE], 100 * PAGE_SIZE).is_err());
+        assert!(
+            result
+                .database_image(&[0; PAGE_SIZE], 100 * PAGE_SIZE)
+                .is_err()
+        );
         assert!(result.complete_image().is_err());
     }
 
@@ -1065,9 +1201,7 @@ mod tests {
         let accepted = wal.clone();
         let sidecar = append_group(&mut wal, 3, 8, 42); // Tentative size is 100.
         corrupt_checksum(&mut wal, 4);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames(), 1);
         assert_eq!(result.db_size_pages(), Some(1));
         assert_eq!(result.replayable_prefix(), accepted);
@@ -1085,9 +1219,7 @@ mod tests {
         corrupt_checksum(&mut wal, 5);
         corrupt_payload(&mut wal, 6);
         corrupt_checksum(&mut wal, 8);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames(), 2);
         assert_eq!(result.repaired_frame_nos(), &[1]);
         assert_eq!(result.replayable_prefix(), accepted);
@@ -1102,9 +1234,7 @@ mod tests {
         let accepted = wal.clone();
         append_database_frames(&mut wal, &[(9, vec![6; PAGE_SIZE])], 0);
         corrupt_checksum(&mut wal, 3);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames(), 3);
         assert_eq!(result.repaired_frame_nos(), &[3]);
         assert_eq!(result.discarded_tail_bytes(), FRAME_SIZE);
@@ -1120,10 +1250,11 @@ mod tests {
         append_group(&mut wal, 2, 8, 35);
         corrupt_checksum(&mut wal, 5);
         corrupt_payload(&mut wal, 6);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::MissingGroup);
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::MissingGroup
+        );
         assert_eq!(result.replayable_prefix(), accepted);
         assert!(result.repaired_frame_nos().is_empty());
         assert!(result.complete_image().is_err());
@@ -1141,17 +1272,19 @@ mod tests {
                 wal[..WAL_HEADER_SIZE].copy_from_slice(&replacement.to_bytes().unwrap());
             } else {
                 let mut records = crate::wal_fec::scan_wal_fec_bytes(
-                    std::path::Path::new("snapshot-only"), &sidecar,
-                ).unwrap().groups;
+                    std::path::Path::new("snapshot-only"),
+                    &sidecar,
+                )
+                .unwrap()
+                .groups;
                 records[0].meta.db_size_pages += 1;
                 records[0].meta.checksum = records[0].meta.compute_checksum();
                 sidecar = encode_wal_fec_group(&records[0]).unwrap();
                 sidecar.extend(encode_wal_fec_group(&records[1]).unwrap());
             }
             corrupt_payload(&mut wal, 1);
-            let result = recover_wal_fec_image(
-                &wal, &sidecar, WalFecReplayLimits::default(),
-            ).unwrap();
+            let result =
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
             assert_eq!(result.committed_frames(), 0);
             assert!(result.repaired_frame_nos().is_empty());
             assert!(result.complete_image().is_err());
@@ -1167,9 +1300,15 @@ mod tests {
         sidecar.extend(append_group(&mut wal, 4, 8, 40));
         corrupt_checksum(&mut wal, 5);
         corrupt_payload(&mut wal, 6);
-        let limits = WalFecReplayLimits { max_source_pages: 3, ..WalFecReplayLimits::default() };
+        let limits = WalFecReplayLimits {
+            max_source_pages: 3,
+            ..WalFecReplayLimits::default()
+        };
         let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::ResourceLimit);
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::ResourceLimit
+        );
         assert_eq!(result.decode_proofs().len(), 1);
         assert!(result.repaired_frame_nos().is_empty());
         assert_eq!(result.replayable_prefix(), accepted);
@@ -1181,11 +1320,12 @@ mod tests {
         let sidecar = append_group(&mut wal, 3, 8, 41);
         corrupt_checksum(&mut wal, 3);
         wal.extend_from_slice(&[0; 17]);
-        let result = recover_wal_fec_image(
-            &wal, &sidecar, WalFecReplayLimits::default(),
-        ).unwrap();
+        let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.committed_frames(), 0);
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert!(result.repaired_frame_nos().is_empty());
         assert!(result.complete_image().is_err());
     }
@@ -1200,9 +1340,8 @@ mod tests {
             wal[terminal + 4..terminal + 8].fill(0);
             corrupt_payload(&mut wal, 2);
             corrupt_payload(&mut wal, 5);
-            let result = recover_wal_fec_image(
-                &wal, &sidecar, WalFecReplayLimits::default(),
-            ).unwrap();
+            let result =
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
             assert_eq!(result.repaired_frame_nos(), &[2, 5]);
             assert_eq!(result.db_size_pages(), Some(100));
             assert!(result.decode_proofs()[0].decode_attempted);
@@ -1214,17 +1353,20 @@ mod tests {
     fn sidecar_cannot_substitute_a_different_terminal_page_number() {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let sidecar = append_group(&mut wal, 3, 8, 12);
-        let mut records = crate::wal_fec::scan_wal_fec_bytes(
-            std::path::Path::new("snapshot-only"), &sidecar,
-        ).unwrap().groups;
+        let mut records =
+            crate::wal_fec::scan_wal_fec_bytes(std::path::Path::new("snapshot-only"), &sidecar)
+                .unwrap()
+                .groups;
         records[0].meta.page_numbers[2] += 1;
         records[0].meta.checksum = records[0].meta.compute_checksum();
         let substituted = encode_wal_fec_group(&records[0]).unwrap();
         corrupt_payload(&mut wal, 1);
-        let result = recover_wal_fec_image(
-            &wal, &substituted, WalFecReplayLimits::default(),
-        ).unwrap();
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        let result =
+            recover_wal_fec_image(&wal, &substituted, WalFecReplayLimits::default()).unwrap();
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert!(result.repaired_frame_nos().is_empty());
         assert!(result.complete_image().is_err());
     }
@@ -1237,7 +1379,10 @@ mod tests {
         replacement.checkpoint_seq += 1;
         wal[..WAL_HEADER_SIZE].copy_from_slice(&replacement.to_bytes().unwrap());
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert!(result.complete_image().is_err());
     }
 
@@ -1249,7 +1394,10 @@ mod tests {
         sidecar.extend(first);
         corrupt_payload(&mut wal, 1);
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::AmbiguousGroup);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::AmbiguousGroup
+        );
         assert!(result.decode_proofs.is_empty());
     }
 
@@ -1258,16 +1406,25 @@ mod tests {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let sidecar = append_group(&mut wal, 3, 8, 1);
         corrupt_payload(&mut wal, 1);
-        let limits = WalFecReplayLimits { max_source_pages: 2, ..WalFecReplayLimits::default() };
+        let limits = WalFecReplayLimits {
+            max_source_pages: 2,
+            ..WalFecReplayLimits::default()
+        };
         let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::ResourceLimit);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::ResourceLimit
+        );
         assert!(result.decode_proofs.is_empty());
     }
 
     #[test]
     fn image_admission_and_invalid_headers_fail_without_repair() {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
-        let limits = WalFecReplayLimits { max_wal_bytes: 31, ..WalFecReplayLimits::default() };
+        let limits = WalFecReplayLimits {
+            max_wal_bytes: 31,
+            ..WalFecReplayLimits::default()
+        };
         assert!(recover_wal_fec_image(&wal, &[], limits).is_err());
         wal[24] ^= 1;
         assert!(recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).is_err());
@@ -1291,15 +1448,19 @@ mod tests {
     fn metadata_cannot_change_an_already_validated_prefix() {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let sidecar = append_group(&mut wal, 3, 8, 1);
-        let mut records = crate::wal_fec::scan_wal_fec_bytes(
-            std::path::Path::new("snapshot-only"), &sidecar,
-        ).unwrap().groups;
+        let mut records =
+            crate::wal_fec::scan_wal_fec_bytes(std::path::Path::new("snapshot-only"), &sidecar)
+                .unwrap()
+                .groups;
         records[0].meta.page_numbers[0] += 10;
         records[0].meta.checksum = records[0].meta.compute_checksum();
         let tampered = encode_wal_fec_group(&records[0]).unwrap();
         corrupt_payload(&mut wal, 2);
         let result = recover_wal_fec_image(&wal, &tampered, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::PrefixMismatch);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::PrefixMismatch
+        );
         assert!(result.repaired_frame_nos.is_empty());
     }
 
@@ -1307,15 +1468,19 @@ mod tests {
     fn metadata_cannot_change_the_original_database_size_commit_marker() {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let sidecar = append_group(&mut wal, 3, 8, 1);
-        let mut records = crate::wal_fec::scan_wal_fec_bytes(
-            std::path::Path::new("snapshot-only"), &sidecar,
-        ).unwrap().groups;
+        let mut records =
+            crate::wal_fec::scan_wal_fec_bytes(std::path::Path::new("snapshot-only"), &sidecar)
+                .unwrap()
+                .groups;
         records[0].meta.db_size_pages += 1;
         records[0].meta.checksum = records[0].meta.compute_checksum();
         let tampered = encode_wal_fec_group(&records[0]).unwrap();
         corrupt_payload(&mut wal, 1);
         let result = recover_wal_fec_image(&wal, &tampered, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert!(result.complete_image().is_err());
     }
 
@@ -1324,11 +1489,15 @@ mod tests {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let mut sidecar = append_group(&mut wal, 5, 8, 1);
         let expected = wal.clone();
-        let meta_len = usize::try_from(u32::from_le_bytes(sidecar[..4].try_into().unwrap())).unwrap();
+        let meta_len =
+            usize::try_from(u32::from_le_bytes(sidecar[..4].try_into().unwrap())).unwrap();
         let symbol_prefix = 4 + meta_len;
         let symbol_len = usize::try_from(u32::from_le_bytes(
-            sidecar[symbol_prefix..symbol_prefix + 4].try_into().unwrap(),
-        )).unwrap();
+            sidecar[symbol_prefix..symbol_prefix + 4]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
         sidecar[symbol_prefix + 4 + symbol_len - 1] ^= 1;
         corrupt_payload(&mut wal, 2);
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
@@ -1346,7 +1515,10 @@ mod tests {
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
         assert_eq!(result.replayable_prefix(), expected);
         assert_eq!(result.discarded_tail_bytes, 17);
-        assert_eq!(result.stop.unwrap().reason, WalFecReplayStopReason::PartialFrame);
+        assert_eq!(
+            result.stop.unwrap().reason,
+            WalFecReplayStopReason::PartialFrame
+        );
         assert!(result.complete_image().is_err());
     }
 
@@ -1361,20 +1533,33 @@ mod tests {
                 for retained in [0, 1, 17, PAGE_SIZE / 2, PAGE_SIZE - 1] {
                     for earlier_damage in [false, true] {
                         let mut damaged = original.clone();
-                        if earlier_damage { corrupt_payload(&mut damaged, 4); }
+                        if earlier_damage {
+                            corrupt_payload(&mut damaged, 4);
+                        }
                         damaged.truncate(terminal + WAL_FRAME_HEADER_SIZE + retained);
                         let saved = damaged.clone();
                         let result = recover_wal_fec_image(
-                            &damaged, &sidecar, WalFecReplayLimits::default(),
-                        ).unwrap();
+                            &damaged,
+                            &sidecar,
+                            WalFecReplayLimits::default(),
+                        )
+                        .unwrap();
                         assert!(result.stop().is_none());
                         assert_eq!(result.committed_frames(), 5);
                         assert_eq!(result.restored_tail_bytes(), PAGE_SIZE - retained);
                         assert_eq!(result.discarded_tail_bytes(), 0);
-                        assert_eq!(result.repaired_frame_nos(),
-                            if earlier_damage { &[4, 5][..] } else { &[5][..] });
-                        assert!(result.decode_proofs()[0].decode_attempted,
-                            "missing zero suffixes must be erasures, not padded source symbols");
+                        assert_eq!(
+                            result.repaired_frame_nos(),
+                            if earlier_damage {
+                                &[4, 5][..]
+                            } else {
+                                &[5][..]
+                            }
+                        );
+                        assert!(
+                            result.decode_proofs()[0].decode_attempted,
+                            "missing zero suffixes must be erasures, not padded source symbols"
+                        );
                         assert_eq!(result.complete_image().unwrap().as_ref(), original);
                         assert_eq!(damaged, saved);
                     }
@@ -1388,16 +1573,31 @@ mod tests {
         let mut original = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         let sidecar = append_group(&mut original, 3, 8, 72);
         let damaged = &original[..original.len() - 1];
-        let limits = WalFecReplayLimits { max_wal_bytes: damaged.len(), ..WalFecReplayLimits::default() };
+        let limits = WalFecReplayLimits {
+            max_wal_bytes: damaged.len(),
+            ..WalFecReplayLimits::default()
+        };
         let result = recover_wal_fec_image(damaged, &sidecar, limits).unwrap();
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::ResourceLimit);
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::ResourceLimit
+        );
         assert!(result.decode_proofs().is_empty());
         assert!(result.repaired_frame_nos().is_empty());
         assert_eq!(result.restored_tail_bytes(), 0);
         assert_eq!(result.committed_frames(), 0);
-        let limits = WalFecReplayLimits { max_wal_bytes: original.len(), ..limits };
-        assert_eq!(recover_wal_fec_image(damaged, &sidecar, limits).unwrap()
-            .complete_image().unwrap().as_ref(), original);
+        let limits = WalFecReplayLimits {
+            max_wal_bytes: original.len(),
+            ..limits
+        };
+        assert_eq!(
+            recover_wal_fec_image(damaged, &sidecar, limits)
+                .unwrap()
+                .complete_image()
+                .unwrap()
+                .as_ref(),
+            original
+        );
     }
 
     #[test]
@@ -1410,8 +1610,10 @@ mod tests {
         wal.truncate(wal.len() - 1);
         let saved = wal.clone();
         let result = recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.stop().unwrap().reason,
-            WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols));
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols)
+        );
         assert_eq!(result.committed_frames(), 2);
         assert_eq!(result.replayable_prefix(), accepted);
         assert_eq!(result.restored_tail_bytes(), 0);
@@ -1437,7 +1639,10 @@ mod tests {
             assert!(result.repaired_frame_nos().is_empty());
             assert!(result.certificate_anchors().is_empty());
             if retained_header != 0 {
-                assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::PartialFrame);
+                assert_eq!(
+                    result.stop().unwrap().reason,
+                    WalFecReplayStopReason::PartialFrame
+                );
                 assert!(result.complete_image().is_err());
             }
         }
@@ -1454,7 +1659,10 @@ mod tests {
         wal.truncate(wal.len() - 1);
         let saved = wal.clone();
         let result = certificate_recovery(&wal, &sidecar, &certificate);
-        assert_eq!(result.stop().unwrap().reason, WalFecReplayStopReason::TerminalAnchorMismatch);
+        assert_eq!(
+            result.stop().unwrap().reason,
+            WalFecReplayStopReason::TerminalAnchorMismatch
+        );
         assert_eq!(result.replayable_prefix(), accepted);
         assert_eq!(result.committed_frames(), 2);
         assert_eq!(result.restored_tail_bytes(), 0);
@@ -1468,7 +1676,11 @@ mod tests {
     fn database_page_one(page_size: u32, pages: u32) -> Vec<u8> {
         let mut page = vec![0; usize::try_from(page_size).unwrap()];
         page[..16].copy_from_slice(b"SQLite format 3\0");
-        let encoded = if page_size == 65_536 { 1 } else { u16::try_from(page_size).unwrap() };
+        let encoded = if page_size == 65_536 {
+            1
+        } else {
+            u16::try_from(page_size).unwrap()
+        };
         page[16..18].copy_from_slice(&encoded.to_be_bytes());
         page[18..20].copy_from_slice(&[2, 2]);
         page[21..24].copy_from_slice(&[64, 32, 32]);
@@ -1492,21 +1704,34 @@ mod tests {
         let mut running = if wal.len() == WAL_HEADER_SIZE {
             header.checksum
         } else {
-            WalFrameHeader::from_bytes(&wal[wal.len() - frame_size..]).unwrap().checksum
+            WalFrameHeader::from_bytes(&wal[wal.len() - frame_size..])
+                .unwrap()
+                .checksum
         };
         for (index, (number, page)) in pages.iter().enumerate() {
             assert_eq!(page.len(), page_size);
             let start = wal.len();
-            wal.extend_from_slice(&WalFrameHeader {
-                page_number: *number,
-                db_size: if index + 1 == pages.len() { commit_size } else { 0 },
-                salts: header.salts,
-                checksum: SqliteWalChecksum::default(),
-            }.to_bytes());
+            wal.extend_from_slice(
+                &WalFrameHeader {
+                    page_number: *number,
+                    db_size: if index + 1 == pages.len() {
+                        commit_size
+                    } else {
+                        0
+                    },
+                    salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }
+                .to_bytes(),
+            );
             wal.extend_from_slice(page);
             running = WalChecksumTransform::for_wal_frame(
-                &wal[start..], page_size, header.big_endian_checksum(),
-            ).unwrap().apply(running);
+                &wal[start..],
+                page_size,
+                header.big_endian_checksum(),
+            )
+            .unwrap()
+            .apply(running);
             wal[start + 16..start + 20].copy_from_slice(&running.s1.to_be_bytes());
             wal[start + 20..start + 24].copy_from_slice(&running.s2.to_be_bytes());
         }
@@ -1534,7 +1759,11 @@ mod tests {
     fn database_image_can_rebuild_an_empty_base_with_complete_wal_coverage() {
         let page_one = database_page_one(PAGE_SIZE_U32, 2);
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
-        append_database_frames(&mut wal, &[(1, page_one.clone()), (2, vec![7; PAGE_SIZE])], 2);
+        append_database_frames(
+            &mut wal,
+            &[(1, page_one.clone()), (2, vec![7; PAGE_SIZE])],
+            2,
+        );
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
         let image = result.database_image(&[], 2 * PAGE_SIZE).unwrap();
         assert_eq!(&image[..PAGE_SIZE], page_one);
@@ -1545,12 +1774,22 @@ mod tests {
     fn database_image_refuses_missing_growth_pages() {
         let database = database_page_one(PAGE_SIZE_U32, 1);
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
-        append_database_frames(&mut wal, &[
-            (1, database_page_one(PAGE_SIZE_U32, 3)), (3, vec![9; PAGE_SIZE]),
-        ], 3);
+        append_database_frames(
+            &mut wal,
+            &[
+                (1, database_page_one(PAGE_SIZE_U32, 3)),
+                (3, vec![9; PAGE_SIZE]),
+            ],
+            3,
+        );
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert!(result.database_image(&database, 3 * PAGE_SIZE).unwrap_err()
-            .to_string().contains("page 2 has no surviving source"));
+        assert!(
+            result
+                .database_image(&database, 3 * PAGE_SIZE)
+                .unwrap_err()
+                .to_string()
+                .contains("page 2 has no surviving source")
+        );
     }
 
     #[test]
@@ -1573,12 +1812,22 @@ mod tests {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         append_database_frames(&mut wal, &[(3, vec![9; PAGE_SIZE])], 3);
         append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 1))], 1);
-        append_database_frames(&mut wal, &[
-            (1, database_page_one(PAGE_SIZE_U32, 3)), (2, vec![6; PAGE_SIZE]),
-        ], 3);
+        append_database_frames(
+            &mut wal,
+            &[
+                (1, database_page_one(PAGE_SIZE_U32, 3)),
+                (2, vec![6; PAGE_SIZE]),
+            ],
+            3,
+        );
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
-            .to_string().contains("page 3 has no surviving source"));
+        assert!(
+            result
+                .database_image(&database, 4 * PAGE_SIZE)
+                .unwrap_err()
+                .to_string()
+                .contains("page 3 has no surviving source")
+        );
         // A new post-shrink image supplies the missing provenance.
         append_database_frames(&mut wal, &[(3, vec![8; PAGE_SIZE])], 3);
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
@@ -1594,8 +1843,13 @@ mod tests {
         append_database_frames(&mut wal, &[(1, database.clone())], 1);
         corrupt_payload(&mut wal, 1);
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
-            .to_string().contains("incomplete WAL recovery"));
+        assert!(
+            result
+                .database_image(&database, 4 * PAGE_SIZE)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete WAL recovery")
+        );
     }
 
     #[test]
@@ -1605,15 +1859,28 @@ mod tests {
         append_database_frames(&mut wal, &[(1, database.clone())], 1);
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
         assert!(result.database_image(&database, PAGE_SIZE - 1).is_err());
-        assert!(result.database_image(&database[..PAGE_SIZE - 1], 4 * PAGE_SIZE).is_err());
-        assert!(result.database_image(&database_page_one(1024, 1), 4 * PAGE_SIZE).is_err());
+        assert!(
+            result
+                .database_image(&database[..PAGE_SIZE - 1], 4 * PAGE_SIZE)
+                .is_err()
+        );
+        assert!(
+            result
+                .database_image(&database_page_one(1024, 1), 4 * PAGE_SIZE)
+                .is_err()
+        );
         let mut malformed = database.clone();
         malformed[21] = 63;
         assert!(result.database_image(&malformed, 4 * PAGE_SIZE).is_err());
         append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 3))], 2);
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert!(result.database_image(&database, PAGE_SIZE).unwrap_err()
-            .to_string().contains("output limit"));
+        assert!(
+            result
+                .database_image(&database, PAGE_SIZE)
+                .unwrap_err()
+                .to_string()
+                .contains("output limit")
+        );
     }
 
     #[test]
@@ -1623,8 +1890,13 @@ mod tests {
         let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
         append_database_frames(&mut wal, &[(1, database_page_one(PAGE_SIZE_U32, 3))], 2);
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert!(result.database_image(&database, 4 * PAGE_SIZE).unwrap_err()
-            .to_string().contains("page-one size disagrees"));
+        assert!(
+            result
+                .database_image(&database, 4 * PAGE_SIZE)
+                .unwrap_err()
+                .to_string()
+                .contains("page-one size disagrees")
+        );
     }
 
     #[test]
@@ -1648,13 +1920,18 @@ mod tests {
         database.extend_from_slice(&[0xaa; PAGE_SIZE]);
         let wal = header(WAL_MAGIC_LE).to_bytes().unwrap();
         let result = recover_wal_fec_image(&wal, &[], WalFecReplayLimits::default()).unwrap();
-        assert_eq!(result.database_image(&database, 2 * PAGE_SIZE).unwrap(), &database[..PAGE_SIZE]);
+        assert_eq!(
+            result.database_image(&database, 2 * PAGE_SIZE).unwrap(),
+            &database[..PAGE_SIZE]
+        );
     }
 
     const CERTIFICATE_DATABASE_ID: [u8; 16] = [0x6d; 16];
 
     fn certificate_for(
-        wal: &[u8], start_frame: u32, end_frame: u32,
+        wal: &[u8],
+        start_frame: u32,
+        end_frame: u32,
     ) -> ParallelWalDurableCertificateRecord {
         use crate::parallel_wal::{
             PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, ParallelWalCommitCertificate,
@@ -1673,8 +1950,11 @@ mod tests {
             pages.insert(header.page_number);
             commits += u64::from(header.is_commit());
             db_size = header.db_size;
-            digest.update(PageNumber::new(header.page_number).unwrap(), db_size,
-                &frame[WAL_FRAME_HEADER_SIZE..]);
+            digest.update(
+                PageNumber::new(header.page_number).unwrap(),
+                db_size,
+                &frame[WAL_FRAME_HEADER_SIZE..],
+            );
         }
         let mut certificate = ParallelWalCommitCertificate {
             format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
@@ -1694,16 +1974,27 @@ mod tests {
         certificate.certificate_crc32c = certificate.computed_crc32c();
         ParallelWalDurableCertificateRecord::new(
             WalGenerationIdentity::from_header(&WalHeader::from_bytes(wal).unwrap()),
-            u64::from(start_frame), u64::from(end_frame), CERTIFICATE_DATABASE_ID, certificate,
-        ).unwrap()
+            u64::from(start_frame),
+            u64::from(end_frame),
+            CERTIFICATE_DATABASE_ID,
+            certificate,
+        )
+        .unwrap()
     }
 
     fn certificate_recovery<'a>(
-        wal: &'a [u8], sidecar: &[u8], certificates: &[u8],
+        wal: &'a [u8],
+        sidecar: &[u8],
+        certificates: &[u8],
     ) -> WalFecReplayResult<'a> {
         recover_wal_fec_image_with_certificates(
-            wal, sidecar, certificates, CERTIFICATE_DATABASE_ID, WalFecReplayLimits::default(),
-        ).unwrap()
+            wal,
+            sidecar,
+            certificates,
+            CERTIFICATE_DATABASE_ID,
+            WalFecReplayLimits::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1721,13 +2012,22 @@ mod tests {
             let result = certificate_recovery(&wal, &sidecar, &certificate);
             assert_eq!(result.committed_frames(), 5);
             assert_eq!(result.repaired_frame_nos(), &[2, 5]);
-            assert_eq!(result.certificate_anchors(), &[WalFecReplayCertificateAnchor {
-                start_frame_no: 1, end_frame_no: 5, certificate_epoch: 7,
-            }]);
+            assert_eq!(
+                result.certificate_anchors(),
+                &[WalFecReplayCertificateAnchor {
+                    start_frame_no: 1,
+                    end_frame_no: 5,
+                    certificate_epoch: 7,
+                }]
+            );
             assert_eq!(result.complete_image().unwrap().as_ref(), expected);
             assert_eq!(wal, damaged);
-            assert!(recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default())
-                .unwrap().complete_image().is_err());
+            assert!(
+                recover_wal_fec_image(&wal, &sidecar, WalFecReplayLimits::default())
+                    .unwrap()
+                    .complete_image()
+                    .is_err()
+            );
         }
     }
 
@@ -1764,8 +2064,13 @@ mod tests {
         let rejected = certificate_recovery(&wal, &sidecar, &mid_transaction);
         assert_eq!(rejected.replayable_prefix(), prefix);
         assert!(rejected.complete_image().is_err());
-        assert_eq!(certificate_recovery(&wal, &sidecar, &valid)
-            .complete_image().unwrap().as_ref(), expected);
+        assert_eq!(
+            certificate_recovery(&wal, &sidecar, &valid)
+                .complete_image()
+                .unwrap()
+                .as_ref(),
+            expected
+        );
     }
 
     #[test]
@@ -1776,15 +2081,23 @@ mod tests {
         corrupt_checksum(&mut wal, 3);
         for identity in [[0; 16], [0x7a; 16]] {
             let result = recover_wal_fec_image_with_certificates(
-                &wal, &sidecar, &record.to_bytes(), identity, WalFecReplayLimits::default(),
-            ).unwrap();
+                &wal,
+                &sidecar,
+                &record.to_bytes(),
+                identity,
+                WalFecReplayLimits::default(),
+            )
+            .unwrap();
             assert!(result.certificate_anchors().is_empty());
             assert!(result.complete_image().is_err());
         }
         let mut legacy = record;
         legacy.db_file_id = [0; 16];
-        assert!(certificate_recovery(&wal, &sidecar, &legacy.to_bytes())
-            .complete_image().is_err());
+        assert!(
+            certificate_recovery(&wal, &sidecar, &legacy.to_bytes())
+                .complete_image()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1806,7 +2119,11 @@ mod tests {
             record.certificate.certificate_crc32c = record.certificate.computed_crc32c();
             let encoded = record.to_bytes();
             assert!(ParallelWalDurableCertificateRecord::from_bytes(&encoded).is_ok());
-            assert!(certificate_recovery(&wal, &sidecar, &encoded).complete_image().is_err());
+            assert!(
+                certificate_recovery(&wal, &sidecar, &encoded)
+                    .complete_image()
+                    .is_err()
+            );
         }
     }
 
@@ -1820,14 +2137,31 @@ mod tests {
         corrupt_checksum(&mut wal, 3);
         let mut duplicate = encoded.clone();
         duplicate.extend_from_slice(&encoded);
-        assert_eq!(certificate_recovery(&wal, &sidecar, &duplicate)
-            .complete_image().unwrap().as_ref(), expected);
+        assert_eq!(
+            certificate_recovery(&wal, &sidecar, &duplicate)
+                .complete_image()
+                .unwrap()
+                .as_ref(),
+            expected
+        );
         record.certificate.wal_frame_payload_digest[0] ^= 1;
         record.certificate.certificate_crc32c = record.certificate.computed_crc32c();
         for reversed in [false, true] {
-            let mut conflicting = if reversed { record.to_bytes() } else { encoded.clone() };
-            conflicting.extend(if reversed { encoded.clone() } else { record.to_bytes() });
-            assert!(certificate_recovery(&wal, &sidecar, &conflicting).complete_image().is_err());
+            let mut conflicting = if reversed {
+                record.to_bytes()
+            } else {
+                encoded.clone()
+            };
+            conflicting.extend(if reversed {
+                encoded.clone()
+            } else {
+                record.to_bytes()
+            });
+            assert!(
+                certificate_recovery(&wal, &sidecar, &conflicting)
+                    .complete_image()
+                    .is_err()
+            );
         }
     }
 
@@ -1838,25 +2172,51 @@ mod tests {
         let encoded = certificate_for(&wal, 1, 3).to_bytes();
         corrupt_checksum(&mut wal, 3);
         for len in [0, 1, 13, encoded.len() - 1] {
-            assert!(certificate_recovery(&wal, &sidecar, &encoded[..len])
-                .complete_image().is_err());
+            assert!(
+                certificate_recovery(&wal, &sidecar, &encoded[..len])
+                    .complete_image()
+                    .is_err()
+            );
         }
         for index in 0..encoded.len() {
             let mut corrupted = encoded.clone();
             corrupted[index] ^= 1;
-            assert!(certificate_recovery(&wal, &sidecar, &corrupted).complete_image().is_err());
+            assert!(
+                certificate_recovery(&wal, &sidecar, &corrupted)
+                    .complete_image()
+                    .is_err()
+            );
         }
         for limits in [
-            WalFecReplayLimits { max_certificate_bytes: encoded.len() - 1, ..WalFecReplayLimits::default() },
-            WalFecReplayLimits { max_certificate_records: 0, ..WalFecReplayLimits::default() },
+            WalFecReplayLimits {
+                max_certificate_bytes: encoded.len() - 1,
+                ..WalFecReplayLimits::default()
+            },
+            WalFecReplayLimits {
+                max_certificate_records: 0,
+                ..WalFecReplayLimits::default()
+            },
         ] {
-            assert!(recover_wal_fec_image_with_certificates(
-                &wal, &sidecar, &encoded, CERTIFICATE_DATABASE_ID, limits,
-            ).unwrap().complete_image().is_err());
+            assert!(
+                recover_wal_fec_image_with_certificates(
+                    &wal,
+                    &sidecar,
+                    &encoded,
+                    CERTIFICATE_DATABASE_ID,
+                    limits,
+                )
+                .unwrap()
+                .complete_image()
+                .is_err()
+            );
         }
         let mut torn_tail = encoded;
         torn_tail.push(0);
-        assert!(certificate_recovery(&wal, &sidecar, &torn_tail).complete_image().is_err());
+        assert!(
+            certificate_recovery(&wal, &sidecar, &torn_tail)
+                .complete_image()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1866,10 +2226,18 @@ mod tests {
         append_group(&mut wal, 2, 8, 60);
         let expected = wal.clone();
         corrupt_checksum(&mut wal, 3);
-        let limits = WalFecReplayLimits { max_certificate_bytes: 0, ..WalFecReplayLimits::default() };
+        let limits = WalFecReplayLimits {
+            max_certificate_bytes: 0,
+            ..WalFecReplayLimits::default()
+        };
         let result = recover_wal_fec_image_with_certificates(
-            &wal, &sidecar, b"invalid optional certificate", CERTIFICATE_DATABASE_ID, limits,
-        ).unwrap();
+            &wal,
+            &sidecar,
+            b"invalid optional certificate",
+            CERTIFICATE_DATABASE_ID,
+            limits,
+        )
+        .unwrap();
         assert!(result.certificate_anchors().is_empty());
         assert_eq!(result.complete_image().unwrap().as_ref(), expected);
     }
@@ -1880,7 +2248,11 @@ mod tests {
         let sidecar = append_group(&mut wal, 3, 8, 61);
         let encoded = certificate_for(&wal, 1, 3).to_bytes();
         corrupt_checksum(&mut wal, 3);
-        assert!(certificate_recovery(&wal, &[], &encoded).complete_image().is_err());
+        assert!(
+            certificate_recovery(&wal, &[], &encoded)
+                .complete_image()
+                .is_err()
+        );
         let truncated = &wal[..wal.len() - 1];
         let result = certificate_recovery(truncated, &sidecar, &encoded);
         assert!(result.certificate_anchors().is_empty());

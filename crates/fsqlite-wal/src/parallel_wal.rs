@@ -3968,7 +3968,10 @@ mod tests {
                 .map(|handle| handle.join().expect("lane thread should join"))
                 .collect::<Vec<_>>();
             observed.sort_unstable();
-            assert!(observed.iter().all(|&lane| lane < 2), "lanes out of range: {observed:?}");
+            assert!(
+                observed.iter().all(|&lane| lane < 2),
+                "lanes out of range: {observed:?}"
+            );
             observed
         };
 

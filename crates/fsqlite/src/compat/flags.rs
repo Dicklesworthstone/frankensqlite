@@ -613,7 +613,10 @@ mod tests {
             ("file:/tmp/data.db", "/tmp/data.db"),
             ("file:///tmp/data.db", "/tmp/data.db"),
             ("file://localhost/tmp/data.db", "/tmp/data.db"),
-            ("file:data%20+%23%3F%26%3D.db?mode=ro#ignored", "data +#?&=.db"),
+            (
+                "file:data%20+%23%3F%26%3D.db?mode=ro#ignored",
+                "data +#?&=.db",
+            ),
             ("file:caf%C3%A9.db", "café.db"),
             ("file:escaped%253F.db", "escaped%3F.db"),
             ("file:literal%oops%.db", "literal%oops%.db"),
@@ -623,7 +626,9 @@ mod tests {
             assert_eq!(resolved.path, expected, "{uri}");
         }
         assert_eq!(
-            resolve_open("file:a.db#?mode=ro", uri_flags()).unwrap().disposition,
+            resolve_open("file:a.db#?mode=ro", uri_flags())
+                .unwrap()
+                .disposition,
             OpenDisposition::WriteCreate,
         );
         assert!(matches!(
@@ -634,7 +639,11 @@ mod tests {
 
     #[test]
     fn ordinary_filenames_and_disabled_uri_flag_are_literal() {
-        for path in ["ordinary?mode=ro#x", "FILE:a.db?mode=ro", "https:db?mode=ro"] {
+        for path in [
+            "ordinary?mode=ro#x",
+            "FILE:a.db?mode=ro",
+            "https:db?mode=ro",
+        ] {
             let resolved = resolve_open(path, uri_flags()).unwrap();
             assert_eq!(resolved.path, path);
             assert_eq!(resolved.disposition, OpenDisposition::WriteCreate);
@@ -656,13 +665,21 @@ mod tests {
                 ("ro", OpenDisposition::ReadOnly),
                 ("rw", OpenDisposition::WriteExisting),
                 ("rwc", OpenDisposition::WriteCreate),
-            ].into_iter().zip(allowed) {
+            ]
+            .into_iter()
+            .zip(allowed)
+            {
                 let uri = format!("file:a.db?mode={mode}");
                 let result = resolve_open(&uri, flags | OpenFlags::SQLITE_OPEN_URI);
                 if allowed {
                     assert_eq!(result.unwrap().disposition, expected);
                 } else {
-                    assert!(result.unwrap_err().to_string().contains("access mode not allowed"));
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("access mode not allowed")
+                    );
                 }
             }
         }
@@ -680,21 +697,35 @@ mod tests {
         }
         let resolved = resolve_open("file:a.db?mode=rwc&mode=rw&mode=ro", uri_flags()).unwrap();
         assert_eq!(resolved.disposition, OpenDisposition::ReadOnly);
-        assert!(resolve_open(
-            "file:a.db?mode=memory&mode=rwc",
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-        ).is_err());
-        assert!(resolve_open(
-            "file:a.db?mode=memory",
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        ).is_err(), "read-only requests must not produce writable memory connections");
+        assert!(
+            resolve_open(
+                "file:a.db?mode=memory&mode=rwc",
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_open(
+                "file:a.db?mode=memory",
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .is_err(),
+            "read-only requests must not produce writable memory connections"
+        );
     }
 
     #[test]
     fn uri_query_decoding_preserves_literal_plus_and_case() {
         let resolved = resolve_open("file:a.db?mo%64e=%72o&cache=pr%69vate", uri_flags()).unwrap();
         assert_eq!(resolved.disposition, OpenDisposition::ReadOnly);
-        for query in ["mode=+ro", "mode=RO", "mode", "mode=readonly", "cache=PRIVATE", "cache="] {
+        for query in [
+            "mode=+ro",
+            "mode=RO",
+            "mode",
+            "mode=readonly",
+            "cache=PRIVATE",
+            "cache=",
+        ] {
             assert!(resolve_open(&format!("file:a.db?{query}"), uri_flags()).is_err());
         }
         let resolved = resolve_open("file:a.db?MODE=ro&custom=a%26mode%3Dro", uri_flags()).unwrap();
@@ -705,10 +736,16 @@ mod tests {
     #[test]
     fn uri_rejects_remote_authorities_and_ambiguous_decoded_names() {
         for uri in [
-            "file://remote/tmp/a.db", "file://LOCALHOST/tmp/a.db",
-            "file://local%68ost/tmp/a.db", "file://localhost?mode=memory",
-            "file:a%00.db", "file:a.db?mode=ro%00rwc", "file:a.db?mo%00de=ro",
-            "file:%ff.db", "file:a.db?mode=%ff", "file:a\0.db",
+            "file://remote/tmp/a.db",
+            "file://LOCALHOST/tmp/a.db",
+            "file://local%68ost/tmp/a.db",
+            "file://localhost?mode=memory",
+            "file:a%00.db",
+            "file:a.db?mode=ro%00rwc",
+            "file:a.db?mo%00de=ro",
+            "file:%ff.db",
+            "file:a.db?mode=%ff",
+            "file:a\0.db",
         ] {
             assert!(resolve_open(uri, uri_flags()).is_err(), "{uri:?}");
         }
@@ -718,16 +755,30 @@ mod tests {
     #[test]
     fn uri_unsupported_vfs_requests_fail_instead_of_silently_changing_semantics() {
         for query in [
-            "vfs=unix", "vfs=", "immutable=1", "immutable=TRUE", "nolock=1",
-            "nolock=yes", "modeof=owner.db", "psow=0", "cache=shared",
+            "vfs=unix",
+            "vfs=",
+            "immutable=1",
+            "immutable=TRUE",
+            "nolock=1",
+            "nolock=yes",
+            "modeof=owner.db",
+            "psow=0",
+            "cache=shared",
             "mode=memory&cache=shared",
         ] {
-            assert!(matches!(
-                resolve_open(&format!("file:a.db?{query}"), uri_flags()),
-                Err(FrankenError::NotImplemented(_))
-            ), "{query}");
+            assert!(
+                matches!(
+                    resolve_open(&format!("file:a.db?{query}"), uri_flags()),
+                    Err(FrankenError::NotImplemented(_))
+                ),
+                "{query}"
+            );
         }
-        for query in ["immutable=0&nolock=0", "immutable=off&nolock=false", "immutable=&nolock=NO"] {
+        for query in [
+            "immutable=0&nolock=0",
+            "immutable=off&nolock=false",
+            "immutable=&nolock=NO",
+        ] {
             assert!(resolve_open(&format!("file:a.db?{query}"), uri_flags()).is_ok());
         }
     }
@@ -745,20 +796,36 @@ mod tests {
     #[test]
     fn empty_file_uris_do_not_silently_become_persistent_databases() {
         for uri in ["file:", "file://localhost", "file:?mode=rwc"] {
-            assert!(matches!(resolve_open(uri, uri_flags()), Err(FrankenError::NotImplemented(_))));
+            assert!(matches!(
+                resolve_open(uri, uri_flags()),
+                Err(FrankenError::NotImplemented(_))
+            ));
         }
-        assert_eq!(resolve_open("file:?mode=memory", uri_flags()).unwrap().path, ":memory:");
-        assert_eq!(resolve_open("file::memory:", uri_flags()).unwrap().path, ":memory:");
+        assert_eq!(
+            resolve_open("file:?mode=memory", uri_flags()).unwrap().path,
+            ":memory:"
+        );
+        assert_eq!(
+            resolve_open("file::memory:", uri_flags()).unwrap().path,
+            ":memory:"
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_uri_drive_prefix_is_not_a_top_level_directory() {
         assert_eq!(
-            resolve_open("file:///C:/dir/data.db?mode=rw", uri_flags()).unwrap().path,
+            resolve_open("file:///C:/dir/data.db?mode=rw", uri_flags())
+                .unwrap()
+                .path,
             "C:/dir/data.db",
         );
-        assert_eq!(resolve_open("file:/not-a-drive/a.db", uri_flags()).unwrap().path, "/not-a-drive/a.db");
+        assert_eq!(
+            resolve_open("file:/not-a-drive/a.db", uri_flags())
+                .unwrap()
+                .path,
+            "/not-a-drive/a.db"
+        );
     }
 
     #[test]
@@ -769,13 +836,18 @@ mod tests {
             let uri = format!("{}?mode=memory&cache=private", file_uri(&path));
             let first = open_with_flags(&uri, uri_flags()).await.unwrap();
             first.execute("CREATE TABLE only_here(x)").await.unwrap();
-            first.execute("INSERT INTO only_here VALUES(7)").await.unwrap();
+            first
+                .execute("INSERT INTO only_here VALUES(7)")
+                .await
+                .unwrap();
             let second = open_with_flags(&uri, uri_flags()).await.unwrap();
             assert_eq!(first.path(), ":memory:");
             assert_eq!(second.path(), ":memory:");
             assert!(second.query("SELECT x FROM only_here").await.is_err());
-            assert_eq!(first.query("SELECT x FROM only_here").await.unwrap()[0].get(0),
-                Some(&crate::SqliteValue::Integer(7)));
+            assert_eq!(
+                first.query("SELECT x FROM only_here").await.unwrap()[0].get(0),
+                Some(&crate::SqliteValue::Integer(7))
+            );
             first.close().await.unwrap();
             second.close().await.unwrap();
             assert!(!path.exists());
@@ -808,20 +880,30 @@ mod tests {
             let directory = tempfile::tempdir().unwrap().keep();
             let path = directory.join("uri+ café % #.db");
             let stock = rusqlite::Connection::open(&path).unwrap();
-            stock.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(42)").unwrap();
+            stock
+                .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(42)")
+                .unwrap();
             drop(stock);
             let original = fsqlite_vfs::host_fs::read(&path).unwrap();
             let uri = format!("{}?mo%64e=%72o#mode=rwc", file_uri(&path));
             let conn = open_with_flags_with_env(&uri, uri_flags(), ConnectionEnv::default())
-                .await.unwrap();
-            assert_eq!(conn.query("SELECT x FROM t").await.unwrap()[0].get(0),
-                Some(&crate::SqliteValue::Integer(42)));
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query("SELECT x FROM t").await.unwrap()[0].get(0),
+                Some(&crate::SqliteValue::Integer(42))
+            );
             assert!(conn.execute("INSERT INTO t VALUES(99)").await.is_err());
             assert!(conn.execute("CREATE TABLE forbidden(x)").await.is_err());
             conn.close().await.unwrap();
             assert_eq!(fsqlite_vfs::host_fs::read(&path).unwrap(), original);
             let stock = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(stock.query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(
+                stock
+                    .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
         });
     }
 
@@ -832,19 +914,36 @@ mod tests {
             let directory = tempfile::tempdir().unwrap().keep();
             let path = directory.join("created with+URI.db");
             let uri = file_uri(&path);
-            assert!(open_with_flags(&format!("{uri}?mode=rw"), uri_flags()).await.is_err());
+            assert!(
+                open_with_flags(&format!("{uri}?mode=rw"), uri_flags())
+                    .await
+                    .is_err()
+            );
             assert!(!path.exists());
-            assert!(open_with_flags(&format!("{uri}?mode=ro"), uri_flags()).await.is_err());
+            assert!(
+                open_with_flags(&format!("{uri}?mode=ro"), uri_flags())
+                    .await
+                    .is_err()
+            );
             assert!(!path.exists());
-            let conn = open_with_flags(&format!("{uri}?mode=rwc"), uri_flags()).await.unwrap();
+            let conn = open_with_flags(&format!("{uri}?mode=rwc"), uri_flags())
+                .await
+                .unwrap();
             conn.execute("CREATE TABLE t(x)").await.unwrap();
             conn.close().await.unwrap();
             assert!(path.exists());
-            let conn = open_with_flags(&format!("{uri}?mode=rw"), uri_flags()).await.unwrap();
+            let conn = open_with_flags(&format!("{uri}?mode=rw"), uri_flags())
+                .await
+                .unwrap();
             conn.execute("INSERT INTO t VALUES(7)").await.unwrap();
             conn.close().await.unwrap();
             let stock = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(stock.query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 7);
+            assert_eq!(
+                stock
+                    .query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                7
+            );
         });
     }
 
@@ -855,11 +954,26 @@ mod tests {
             let directory = tempfile::tempdir().unwrap().keep();
             let path = directory.join("must-not-exist.db");
             let uri = file_uri(&path);
-            for query in ["mode=bogus", "mode=ro&mode=rw", "vfs=unix", "nolock=1", "cache=shared", "mode=ro%00rwc"] {
-                assert!(open_with_flags(&format!("{uri}?{query}"), uri_flags()).await.is_err());
+            for query in [
+                "mode=bogus",
+                "mode=ro&mode=rw",
+                "vfs=unix",
+                "nolock=1",
+                "cache=shared",
+                "mode=ro%00rwc",
+            ] {
+                assert!(
+                    open_with_flags(&format!("{uri}?{query}"), uri_flags())
+                        .await
+                        .is_err()
+                );
                 assert!(!path.exists(), "{query} created a database");
-                assert!(fsqlite_vfs::host_fs::read_dir_paths(&directory).unwrap().is_empty(),
-                    "{query} created a companion before validation");
+                assert!(
+                    fsqlite_vfs::host_fs::read_dir_paths(&directory)
+                        .unwrap()
+                        .is_empty(),
+                    "{query} created a companion before validation"
+                );
             }
         });
     }
@@ -874,24 +988,48 @@ mod tests {
         drop(stock);
         let uri = file_uri(&path);
         for (ours, stock_flags) in [
-            (OpenFlags::SQLITE_OPEN_READ_ONLY, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY),
-            (OpenFlags::SQLITE_OPEN_READ_WRITE, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE),
-            (OpenFlags::default_flags(), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE),
+            (
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ),
+            (
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            ),
+            (
+                OpenFlags::default_flags(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            ),
         ] {
             for query in [
-                "", "mode=ro", "mode=rw", "mode=rwc", "mode=readonly", "mode=",
-                "mo%64e=%72o", "mode=ro&mode=rw", "mode=rw&mode=rwc",
-                "mode=rwc&mode=rw&mode=ro", "custom=x&mode=ro", "mode=ro#mode=rw",
+                "",
+                "mode=ro",
+                "mode=rw",
+                "mode=rwc",
+                "mode=readonly",
+                "mode=",
+                "mo%64e=%72o",
+                "mode=ro&mode=rw",
+                "mode=rw&mode=rwc",
+                "mode=rwc&mode=rw&mode=ro",
+                "custom=x&mode=ro",
+                "mode=ro#mode=rw",
             ] {
                 let uri = format!("{uri}?{query}");
                 let resolved = resolve_open(&uri, ours | OpenFlags::SQLITE_OPEN_URI);
                 let reference = rusqlite::Connection::open_with_flags(
-                    &uri, stock_flags | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    &uri,
+                    stock_flags | rusqlite::OpenFlags::SQLITE_OPEN_URI,
                 );
                 assert_eq!(resolved.is_ok(), reference.is_ok(), "{uri}");
                 if let (Ok(resolved), Ok(reference)) = (resolved, reference) {
                     let writable = reference.execute("INSERT INTO t VALUES(1)", []).is_ok();
-                    assert_eq!(resolved.disposition != OpenDisposition::ReadOnly, writable, "{uri}");
+                    assert_eq!(
+                        resolved.disposition != OpenDisposition::ReadOnly,
+                        writable,
+                        "{uri}"
+                    );
                 }
             }
         }

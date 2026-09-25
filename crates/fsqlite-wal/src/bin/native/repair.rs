@@ -10,20 +10,19 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use crate::wal_fec::replay::recover_wal_fec_image_with_certificates;
+use crate::wal_index::{
+    WAL_INDEX_VERSION, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation, WalIndexHdr,
+    append_native_wal_index_entry, invalidate_shared_wal_index_header,
+    publish_shared_wal_index_header, read_shared_wal_index_header, replace_shared_wal_index_region,
+    reset_shared_wal_index_recovery_marks, validate_shared_wal_index_wal_binding,
+};
+use crate::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader};
 use asupersync::runtime::spawn_blocking;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_vfs::{FileIdentity, ShmRegion, Vfs, VfsFile, host_fs};
-use crate::wal_fec::replay::recover_wal_fec_image_with_certificates;
-use crate::wal_index::{
-    WAL_INDEX_VERSION, WAL_SHM_SEGMENT_BYTES, WalIndexFrameLocation, WalIndexHdr,
-    append_native_wal_index_entry, invalidate_shared_wal_index_header,
-    publish_shared_wal_index_header, read_shared_wal_index_header,
-    replace_shared_wal_index_region, reset_shared_wal_index_recovery_marks,
-    validate_shared_wal_index_wal_binding,
-};
-use crate::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader};
 
 use super::{
     CapturedSource, ExportReport, IO_CHUNK, NativeFile, NativeVfs, Options, Snapshot, SourceFile,
@@ -49,7 +48,12 @@ impl RepairHandoff {
         F: FnOnce(PathBuf, FileIdentity) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let Self { source, identity, main, report } = self;
+        let Self {
+            source,
+            identity,
+            main,
+            report,
+        } = self;
         // Cancellation after successful repair is an OPEN failure, not evidence
         // that repair rolled back. Preserve the receipt in this case too.
         let opened = match checkpoint(cx) {
@@ -115,26 +119,36 @@ struct RepairPlan {
 }
 
 fn corruption(detail: impl Into<String>) -> FrankenError {
-    FrankenError::WalCorrupt { detail: detail.into() }
+    FrankenError::WalCorrupt {
+        detail: detail.into(),
+    }
 }
 
 impl RepairPlan {
     fn build(snapshot: &Snapshot, options: &Options) -> Result<Self> {
         let mut database_file_id = [0; 16];
-        database_file_id.copy_from_slice(snapshot.database.get(76..92)
-            .ok_or_else(|| corruption("missing captured database identity"))?);
+        database_file_id.copy_from_slice(
+            snapshot
+                .database
+                .get(76..92)
+                .ok_or_else(|| corruption("missing captured database identity"))?,
+        );
         let replay = recover_wal_fec_image_with_certificates(
-            &snapshot.wal, &snapshot.sidecar, &snapshot.certificates,
-            database_file_id, options.replay,
+            &snapshot.wal,
+            &snapshot.sidecar,
+            &snapshot.certificates,
+            database_file_id,
+            options.replay,
         )?;
         // This additionally refuses mixed snapshots, missing page provenance
         // and incompatible main/WAL headers before any backup or source write.
         let database = replay.database_image(&snapshot.database, options.max_database_bytes)?;
-        let page_size = usize::try_from(replay.header().page_size)
-            .map_err(|_| FrankenError::TooBig)?;
+        let page_size =
+            usize::try_from(replay.header().page_size).map_err(|_| FrankenError::TooBig)?;
         let pages = database.len() / page_size;
         drop(database);
-        let frame_size = page_size.checked_add(WAL_FRAME_HEADER_SIZE)
+        let frame_size = page_size
+            .checked_add(WAL_FRAME_HEADER_SIZE)
             .ok_or(FrankenError::TooBig)?;
         let prefix = replay.replayable_prefix();
         if prefix.get(..WAL_HEADER_SIZE) != snapshot.wal.get(..WAL_HEADER_SIZE) {
@@ -144,16 +158,21 @@ impl RepairPlan {
         if target_len - snapshot.wal.len() != replay.restored_tail_bytes()
             || replay.restored_tail_bytes() > page_size
         {
-            return Err(corruption("repair growth lacks verified terminal payload provenance"));
+            return Err(corruption(
+                "repair growth lacks verified terminal payload provenance",
+            ));
         }
         let mut target = Vec::new();
-        target.try_reserve_exact(target_len).map_err(|_| FrankenError::OutOfMemory)?;
+        target
+            .try_reserve_exact(target_len)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         target.extend_from_slice(&snapshot.wal);
         target.resize(target_len, 0);
         target[..prefix.len()].copy_from_slice(prefix);
         let frame_count = replay.committed_frames();
         let mut changed = Vec::new();
-        changed.try_reserve(usize::try_from(frame_count).map_err(|_| FrankenError::TooBig)?)
+        changed
+            .try_reserve(usize::try_from(frame_count).map_err(|_| FrankenError::TooBig)?)
             .map_err(|_| FrankenError::OutOfMemory)?;
         for offset in (WAL_HEADER_SIZE..prefix.len()).step_by(frame_size) {
             let range = offset..offset + frame_size;
@@ -162,19 +181,28 @@ impl RepairPlan {
             }
         }
 
-        let last_region = if frame_count == 0 { 0 } else {
+        let last_region = if frame_count == 0 {
+            0
+        } else {
             WalIndexFrameLocation::new(frame_count)?.region
         };
         let mut index_regions = Vec::new();
         for _ in 0..=last_region {
             let mut region = Vec::new();
-            region.try_reserve_exact(WAL_SHM_SEGMENT_BYTES).map_err(|_| FrankenError::OutOfMemory)?;
+            region
+                .try_reserve_exact(WAL_SHM_SEGMENT_BYTES)
+                .map_err(|_| FrankenError::OutOfMemory)?;
             region.resize(WAL_SHM_SEGMENT_BYTES, 0);
             index_regions.push(region);
         }
         let mut terminal = None;
-        for (index, frame) in prefix[WAL_HEADER_SIZE..].chunks_exact(frame_size).enumerate() {
-            let number = u32::try_from(index).ok().and_then(|index| index.checked_add(1))
+        for (index, frame) in prefix[WAL_HEADER_SIZE..]
+            .chunks_exact(frame_size)
+            .enumerate()
+        {
+            let number = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
                 .ok_or(FrankenError::TooBig)?;
             let marker = WalFrameHeader::from_bytes(frame)?;
             let region = usize::try_from(WalIndexFrameLocation::new(number)?.region)
@@ -184,9 +212,14 @@ impl RepairPlan {
         }
         let wal_header = replay.header();
         let mut index_header = WalIndexHdr {
-            i_version: WAL_INDEX_VERSION, unused: 0, i_change: 0, is_init: 1,
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 0,
+            is_init: 1,
             big_end_cksum: u8::from(wal_header.big_endian_checksum()),
-            sz_page: if page_size == 65_536 { 1 } else {
+            sz_page: if page_size == 65_536 {
+                1
+            } else {
                 u16::try_from(page_size).map_err(|_| FrankenError::TooBig)?
             },
             mx_frame: frame_count,
@@ -200,7 +233,11 @@ impl RepairPlan {
         index_header.update_checksum()?;
         validate_shared_wal_index_wal_binding(&index_header, wal_header, terminal)?;
         Ok(Self {
-            target, changed, index_regions, index_header, pages,
+            target,
+            changed,
+            index_regions,
+            index_header,
+            pages,
             certificate_anchors: replay.certificate_anchors().len(),
         })
     }
@@ -240,10 +277,13 @@ fn write_ranges(
     ranges: impl IntoIterator<Item = Range<usize>>,
 ) -> io::Result<()> {
     for range in ranges {
-        let bytes = image.get(range.clone())
+        let bytes = image
+            .get(range.clone())
             .ok_or_else(|| io::Error::other("WAL repair range exceeds its source image"))?;
-        file.seek(SeekFrom::Start(u64::try_from(range.start)
-            .map_err(|_| io::Error::other("WAL repair offset overflow"))?))?;
+        file.seek(SeekFrom::Start(
+            u64::try_from(range.start)
+                .map_err(|_| io::Error::other("WAL repair offset overflow"))?,
+        ))?;
         file.write_all(bytes)?;
     }
     Ok(())
@@ -276,7 +316,9 @@ fn settle_writes<W: RepairFile>(
                 });
                 write_ranges(file, original, ranges)?;
                 if plan.target.len() > original.len() {
-                    file.truncate(u64::try_from(original.len()).map_err(|_| FrankenError::TooBig)?)?;
+                    file.truncate(
+                        u64::try_from(original.len()).map_err(|_| FrankenError::TooBig)?,
+                    )?;
                 }
                 sync(file)?;
                 verify_image(file, cx, original)
@@ -296,8 +338,16 @@ fn settle_writes<W: RepairFile>(
 fn recheck_names(vfs: &NativeVfs, cx: &Cx, source: &Path, captured: &CapturedSource) -> Result<()> {
     let wal_path = companion(source, "-wal");
     for (path, identity, flags) in [
-        (source, captured.main_identity, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB),
-        (wal_path.as_path(), captured.wal_identity, VfsOpenFlags::READONLY | VfsOpenFlags::WAL),
+        (
+            source,
+            captured.main_identity,
+            VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+        ),
+        (
+            wal_path.as_path(),
+            captured.wal_identity,
+            VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+        ),
     ] {
         let (probe, _) = vfs.open_with_expected_identity(cx, path, flags, identity)?;
         SourceFile::new(probe, cx).finish()?;
@@ -347,7 +397,11 @@ fn backup_original(
     }
 }
 
-fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> Result<RepairHandoff> {
+fn repair_captured(
+    cx: &Cx,
+    options: &Options,
+    mut captured: CapturedSource,
+) -> Result<RepairHandoff> {
     checkpoint(cx)?;
     let vfs = NativeVfs::new();
     let mut plan = RepairPlan::build(&captured.snapshot, options)?;
@@ -362,7 +416,10 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
     let mut regions = Vec::new();
     for number in 0..plan.index_regions.len() {
         regions.push(captured.main.file.shm_map(
-            cx, u32::try_from(number).map_err(|_| FrankenError::TooBig)?, region_size, true,
+            cx,
+            u32::try_from(number).map_err(|_| FrankenError::TooBig)?,
+            region_size,
+            true,
         )?);
     }
     if let Ok(Some(previous)) = read_shared_wal_index_header(&regions[0]) {
@@ -370,7 +427,11 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
         plan.index_header.update_checksum()?;
     }
     let (backup, backup_identity) = backup_original(
-        &vfs, cx, &options.destination, &captured.snapshot.wal, |file| file.sync_all(),
+        &vfs,
+        cx,
+        &options.destination,
+        &captured.snapshot.wal,
+        |file| file.sync_all(),
     )?;
     recheck_names(&vfs, cx, &options.source, &captured)?;
     verify_image(&mut wal, cx, &captured.snapshot.wal)?;
@@ -383,12 +444,19 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
     // settlement. All work below is synchronous on this owning blocking task.
     let _mask = cx.masked();
     invalidate_shared_wal_index_header(&regions[0])?;
-    let mut publication = IndexPublication { zero: regions[0].share(), complete: false };
+    let mut publication = IndexPublication {
+        zero: regions[0].share(),
+        complete: false,
+    };
     let result = (|| {
-        let digest = settle_writes(&mut wal, cx, &captured.snapshot.wal, &plan, |file| file.sync_all())?;
+        let digest = settle_writes(&mut wal, cx, &captured.snapshot.wal, &plan, |file| {
+            file.sync_all()
+        })?;
         for (number, (region, bytes)) in regions.iter().zip(&plan.index_regions).enumerate() {
             replace_shared_wal_index_region(
-                region, u32::try_from(number).map_err(|_| FrankenError::TooBig)?, bytes,
+                region,
+                u32::try_from(number).map_err(|_| FrankenError::TooBig)?,
+                bytes,
             )?;
         }
         reset_shared_wal_index_recovery_marks(&regions[0], plan.index_header.mx_frame)?;
@@ -408,7 +476,10 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
     drop(regions);
     drop(wal);
     if result.is_err() {
-        eprintln!("WAL repair is NOT certified; verify the original backup at {}", options.destination.display());
+        eprintln!(
+            "WAL repair is NOT certified; verify the original backup at {}",
+            options.destination.display()
+        );
     }
     let digest = result?;
     // Stop blocking native readers/writers before invoking an SQL constructor,
@@ -417,18 +488,27 @@ fn repair_captured(cx: &Cx, options: &Options, mut captured: CapturedSource) -> 
     captured.wal.finish()?;
     {
         let _cleanup_mask = captured.main.cleanup_cx.masked();
-        captured.main.file.restore_external_maintenance_attempt(&captured.main.cleanup_cx)?;
+        captured
+            .main
+            .file
+            .restore_external_maintenance_attempt(&captured.main.cleanup_cx)?;
         captured.main.maintenance = false;
     }
     drop(backup);
     let report = ExportReport {
-        destination: options.destination.clone(), pages: plan.pages,
-        wal_frames: plan.index_header.mx_frame, repaired_frames: plan.changed.len(),
-        certificate_anchors: plan.certificate_anchors, digest, repaired_in_place: true,
+        destination: options.destination.clone(),
+        pages: plan.pages,
+        wal_frames: plan.index_header.mx_frame,
+        repaired_frames: plan.changed.len(),
+        certificate_anchors: plan.certificate_anchors,
+        digest,
+        repaired_in_place: true,
     };
     Ok(RepairHandoff {
-        source: options.source.clone(), identity: captured.main_identity,
-        main: captured.main, report,
+        source: options.source.clone(),
+        identity: captured.main_identity,
+        main: captured.main,
+        report,
     })
 }
 
@@ -444,14 +524,28 @@ async fn run_for_open(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Rep
     // A backup must not become any companion of the source, even one that is
     // currently absent. This prevents an optional FEC/certificate path from
     // accidentally acquiring the original WAL bytes as its contents.
-    if ["", "-wal", "-shm", "-journal", "-wal-fec", "-wal-fec.lock", "-wal-cert", ".fsqlite-shm"]
-        .iter().any(|suffix| destination == companion(&source, suffix))
+    if [
+        "",
+        "-wal",
+        "-shm",
+        "-journal",
+        "-wal-fec",
+        "-wal-fec.lock",
+        "-wal-cert",
+        ".fsqlite-shm",
+    ]
+    .iter()
+    .any(|suffix| destination == companion(&source, suffix))
         || vfs.path_entry_exists(cx, &destination)?
     {
         return Err(FrankenError::CannotOpen { path: destination });
     }
     refuse_destination_artifacts(vfs, cx, &destination)?;
-    let options = Options { source, destination, ..*options };
+    let options = Options {
+        source,
+        destination,
+        ..*options
+    };
     let captured = capture_held(vfs, cx, &options).await?;
     let worker_cx = cx.create_child_for_spawn();
     // Ownership is moved, not borrowed. A cancelled/dropped awaiter cannot
@@ -469,7 +563,8 @@ mod tests {
 
     impl RepairFile for Cursor<Vec<u8>> {
         fn truncate(&mut self, len: u64) -> io::Result<()> {
-            let len = usize::try_from(len).map_err(|_| io::Error::other("test file size overflow"))?;
+            let len =
+                usize::try_from(len).map_err(|_| io::Error::other("test file size overflow"))?;
             self.get_mut().truncate(len);
             Ok(())
         }
@@ -477,7 +572,10 @@ mod tests {
 
     fn with_runtime<F: Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 2).build().unwrap().block_on(future)
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn attached_context() -> Cx {
@@ -493,12 +591,17 @@ mod tests {
             let path = directory.join("original.wal");
             let original = vec![0x37; IO_CHUNK + 513];
             let cx = attached_context();
-            let (mut backup, identity) = backup_original(
-                &NativeVfs::new(), &cx, &path, &original, |file| file.sync_all(),
-            ).unwrap();
+            let (mut backup, identity) =
+                backup_original(&NativeVfs::new(), &cx, &path, &original, |file| {
+                    file.sync_all()
+                })
+                .unwrap();
             assert_eq!(FileIdentity::from_file(&backup).unwrap(), Some(identity));
             host_fs::validate_reserved_file_identity(&path, identity).unwrap();
-            assert_eq!(verify_image(&mut backup, &cx, &original).unwrap(), blake3::hash(&original));
+            assert_eq!(
+                verify_image(&mut backup, &cx, &original).unwrap(),
+                blake3::hash(&original)
+            );
             assert_eq!(host_fs::read(&path).unwrap(), original);
         });
     }
@@ -607,40 +710,71 @@ mod tests {
         page[100] = 13;
         page[105..107].copy_from_slice(&512_u16.to_be_bytes());
         host_fs::write(&options.source, &page).unwrap();
-        let pages: Vec<_> = (1_u32..=3).map(|version| {
-            let mut current = page.clone();
-            current[60..64].copy_from_slice(&version.to_be_bytes());
-            current
-        }).collect();
+        let pages: Vec<_> = (1_u32..=3)
+            .map(|version| {
+                let mut current = page.clone();
+                current[60..64].copy_from_slice(&version.to_be_bytes());
+                current
+            })
+            .collect();
         let header = WalHeader {
-            magic: crate::WAL_MAGIC_LE, format_version: crate::WAL_FORMAT_VERSION,
-            page_size: 512, checkpoint_seq: 1,
-            salts: WalSalts { salt1: 123, salt2: 456 }, checksum: SqliteWalChecksum::default(),
+            magic: crate::WAL_MAGIC_LE,
+            format_version: crate::WAL_FORMAT_VERSION,
+            page_size: 512,
+            checkpoint_seq: 1,
+            salts: WalSalts {
+                salt1: 123,
+                salt2: 456,
+            },
+            checksum: SqliteWalChecksum::default(),
         };
         let mut wal = header.to_bytes().unwrap().to_vec();
         let mut running = WalHeader::from_bytes(&wal).unwrap().checksum;
         for (index, page) in pages.iter().enumerate() {
             let start = wal.len();
-            wal.extend_from_slice(&WalFrameHeader {
-                page_number: 1, db_size: u32::from(index == 2), salts: header.salts,
-                checksum: SqliteWalChecksum::default(),
-            }.to_bytes());
+            wal.extend_from_slice(
+                &WalFrameHeader {
+                    page_number: 1,
+                    db_size: u32::from(index == 2),
+                    salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }
+                .to_bytes(),
+            );
             wal.extend_from_slice(page);
             running = WalChecksumTransform::for_wal_frame(&wal[start..], 512, false)
-                .unwrap().apply(running);
+                .unwrap()
+                .apply(running);
             wal[start + 16..start + 20].copy_from_slice(&running.s1.to_be_bytes());
             wal[start + 20..start + 24].copy_from_slice(&running.s2.to_be_bytes());
         }
         let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
-            wal_salt1: 123, wal_salt2: 456, start_frame_no: 1, end_frame_no: 3,
-            db_size_pages: 1, page_size: 512, k_source: 3, r_repair: 8,
-            oti: Oti { f: 1536, al: 1, t: 512, z: 1, n: 1 },
+            wal_salt1: 123,
+            wal_salt2: 456,
+            start_frame_no: 1,
+            end_frame_no: 3,
+            db_size_pages: 1,
+            page_size: 512,
+            k_source: 3,
+            r_repair: 8,
+            oti: Oti {
+                f: 1536,
+                al: 1,
+                t: 512,
+                z: 1,
+                n: 1,
+            },
             object_id: ObjectId::derive_from_canonical_bytes(b"repair-open-handoff"),
-            page_numbers: vec![1; 3], source_page_xxh3_128: build_source_page_hashes(&pages),
-        }).unwrap();
+            page_numbers: vec![1; 3],
+            source_page_xxh3_128: build_source_page_hashes(&pages),
+        })
+        .unwrap();
         let symbols = generate_wal_fec_repair_symbols(&meta, &pages).unwrap();
-        append_wal_fec_group(&companion(&options.source, "-wal-fec"),
-            &WalFecGroupRecord::new(meta, symbols).unwrap()).unwrap();
+        append_wal_fec_group(
+            &companion(&options.source, "-wal-fec"),
+            &WalFecGroupRecord::new(meta, symbols).unwrap(),
+        )
+        .unwrap();
         let repaired = wal.clone();
         wal[WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 60] ^= 0xff;
         host_fs::write(&companion(&options.source, "-wal"), &wal).unwrap();
@@ -648,8 +782,13 @@ mod tests {
     }
 
     fn assert_recovery_available(source: &Path, cx: &Cx) {
-        let (file, _) = NativeVfs::new().open(cx, Some(source),
-            VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+        let (file, _) = NativeVfs::new()
+            .open(
+                cx,
+                Some(source),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
         let mut owner = SourceFile::new(file, cx);
         owner.acquire_recovery(cx).unwrap();
         owner.finish().unwrap();
@@ -663,18 +802,24 @@ mod tests {
             let calls = Rc::new(Cell::new(0));
             let calls_in_opener = Rc::clone(&calls);
             let opener_cx = &cx;
-            let (opened, report) = options.repair_and_open(&cx, |path, identity| async move {
-                calls_in_opener.set(calls_in_opener.get() + 1);
-                let (file, _) = NativeVfs::new().open_with_expected_identity(
-                    opener_cx, &path, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB, identity,
-                )?;
-                let mut owner = SourceFile::new(file, opener_cx);
-                assert_eq!(owner.file.file_identity()?, Some(identity));
-                // This would conflict if the old recovery fence remained held.
-                owner.acquire_recovery(opener_cx)?;
-                owner.finish()?;
-                Ok(calls_in_opener) // Explicitly non-Send result and future.
-            }).await.unwrap();
+            let (opened, report) = options
+                .repair_and_open(&cx, |path, identity| async move {
+                    calls_in_opener.set(calls_in_opener.get() + 1);
+                    let (file, _) = NativeVfs::new().open_with_expected_identity(
+                        opener_cx,
+                        &path,
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                        identity,
+                    )?;
+                    let mut owner = SourceFile::new(file, opener_cx);
+                    assert_eq!(owner.file.file_identity()?, Some(identity));
+                    // This would conflict if the old recovery fence remained held.
+                    owner.acquire_recovery(opener_cx)?;
+                    owner.finish()?;
+                    Ok(calls_in_opener) // Explicitly non-Send result and future.
+                })
+                .await
+                .unwrap();
             assert!(Rc::ptr_eq(&opened.unwrap(), &calls));
             assert_eq!(calls.get(), 1);
             assert_eq!(report.wal_frames, 3);
@@ -682,7 +827,10 @@ mod tests {
             assert!(report.repaired_in_place);
             assert_eq!(report.digest, blake3::hash(&repaired));
             assert_eq!(host_fs::read(&options.destination).unwrap(), original);
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                repaired
+            );
         });
     }
 
@@ -691,13 +839,23 @@ mod tests {
         with_runtime(async {
             let (options, original, repaired) = handoff_fixture();
             let cx = attached_context();
-            let (opened, report) = options.repair_and_open(&cx, |_, _| async {
-                Err::<(), _>(FrankenError::NoSuchTable { name: "opener sentinel".to_owned() })
-            }).await.unwrap();
-            assert!(matches!(opened, Err(FrankenError::NoSuchTable { name }) if name == "opener sentinel"));
+            let (opened, report) = options
+                .repair_and_open(&cx, |_, _| async {
+                    Err::<(), _>(FrankenError::NoSuchTable {
+                        name: "opener sentinel".to_owned(),
+                    })
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(opened, Err(FrankenError::NoSuchTable { name }) if name == "opener sentinel")
+            );
             assert_eq!(report.digest, blake3::hash(&repaired));
             assert_eq!(host_fs::read(&options.destination).unwrap(), original);
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                repaired
+            );
             assert_recovery_available(&options.source, &cx);
         });
     }
@@ -705,14 +863,23 @@ mod tests {
     #[test]
     fn handoff_does_not_unlock_the_openers_native_claims() {
         const CHILD_PATH: &str = "FSQLITE_REPAIR_OPEN_LOCK_CHILD";
-        const TEST: &str = "native_recovery::repair::tests::handoff_does_not_unlock_the_openers_native_claims";
+        const TEST: &str =
+            "native_recovery::repair::tests::handoff_does_not_unlock_the_openers_native_claims";
         if let Some(path) = std::env::var_os(CHILD_PATH) {
             with_runtime(async {
                 let cx = attached_context();
-                let (file, _) = NativeVfs::new().open(&cx, Some(Path::new(&path)),
-                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+                let (file, _) = NativeVfs::new()
+                    .open(
+                        &cx,
+                        Some(Path::new(&path)),
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                    )
+                    .unwrap();
                 let mut peer = SourceFile::new(file, &cx);
-                assert!(matches!(peer.acquire_recovery(&cx), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    peer.acquire_recovery(&cx),
+                    Err(FrankenError::Busy)
+                ));
                 peer.finish().unwrap();
             });
             return;
@@ -721,25 +888,36 @@ mod tests {
             let (options, _, _) = handoff_fixture();
             let cx = attached_context();
             let opener_cx = &cx;
-            let (opened, _) = options.repair_and_open(&cx, |path, identity| async move {
-                let (file, _) = NativeVfs::new().open_with_expected_identity(
-                    opener_cx, &path, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB, identity,
-                )?;
-                let mut new_owner = SourceFile::new(file, opener_cx);
-                new_owner.acquire_recovery(opener_cx)?;
-                Ok(new_owner)
-            }).await.unwrap();
+            let (opened, _) = options
+                .repair_and_open(&cx, |path, identity| async move {
+                    let (file, _) = NativeVfs::new().open_with_expected_identity(
+                        opener_cx,
+                        &path,
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                        identity,
+                    )?;
+                    let mut new_owner = SourceFile::new(file, opener_cx);
+                    new_owner.acquire_recovery(opener_cx)?;
+                    Ok(new_owner)
+                })
+                .await
+                .unwrap();
             let mut owner = opened.unwrap();
             // The old handoff descriptor has now been cleaned up. A raw
             // close-any-fd bug would silently lose this owner's POSIX claims;
             // a new process checks the actual kernel locks, not our ledger.
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([TEST, "--exact", "--nocapture"])
-                .env(CHILD_PATH, &options.source).spawn().unwrap();
+                .env(CHILD_PATH, &options.source)
+                .spawn()
+                .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success(), "foreign process must observe the opener's locks");
+                    assert!(
+                        status.success(),
+                        "foreign process must observe the opener's locks"
+                    );
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -766,17 +944,29 @@ mod tests {
                     host_fs::write(&companion(&options.source, "-wal"), b"invalid WAL").unwrap();
                 }
                 let calls = Cell::new(0);
-                let result = options.repair_and_open(&cx, |_, _| {
-                    calls.set(calls.get() + 1);
-                    std::future::ready(Ok(()))
-                }).await;
+                let result = options
+                    .repair_and_open(&cx, |_, _| {
+                        calls.set(calls.get() + 1);
+                        std::future::ready(Ok(()))
+                    })
+                    .await;
                 assert!(result.is_err());
                 assert_eq!(calls.get(), 0);
                 if existing_backup {
-                    assert_eq!(host_fs::read(&options.destination).unwrap(), b"existing backup");
-                    assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+                    assert_eq!(
+                        host_fs::read(&options.destination).unwrap(),
+                        b"existing backup"
+                    );
+                    assert_eq!(
+                        host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                        original
+                    );
                 } else {
-                    assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
+                    assert!(
+                        !NativeVfs::new()
+                            .path_entry_exists(&cx, &options.destination)
+                            .unwrap()
+                    );
                 }
             }
         });
@@ -788,22 +978,36 @@ mod tests {
             let (options, original, _) = handoff_fixture();
             let cx = attached_context();
             let vfs = NativeVfs::new();
-            let (file, _) = vfs.open(&cx, Some(&options.source),
-                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+            let (file, _) = vfs
+                .open(
+                    &cx,
+                    Some(&options.source),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                )
+                .unwrap();
             let mut owner = SourceFile::new(file, &cx);
             owner.acquire_recovery(&cx).unwrap();
             let calls = Cell::new(0);
-            let result = options.repair_and_open(&cx, |_, _| {
-                calls.set(calls.get() + 1);
-                std::future::ready(Ok(()))
-            }).await;
+            let result = options
+                .repair_and_open(&cx, |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(()))
+                })
+                .await;
             assert!(result.is_err());
             assert_eq!(calls.get(), 0);
             assert!(!vfs.path_entry_exists(&cx, &options.destination).unwrap());
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                original
+            );
             owner.finish().unwrap();
-            options.repair_and_open(&cx, |_, _| std::future::ready(Ok(())))
-                .await.unwrap().0.unwrap();
+            options
+                .repair_and_open(&cx, |_, _| std::future::ready(Ok(())))
+                .await
+                .unwrap()
+                .0
+                .unwrap();
         });
     }
 
@@ -812,13 +1016,17 @@ mod tests {
         with_runtime(async {
             let (options, original, repaired) = handoff_fixture();
             let cx = attached_context();
-            let handoff = run_for_open(&NativeVfs::new(), &cx, &options).await.unwrap();
+            let handoff = run_for_open(&NativeVfs::new(), &cx, &options)
+                .await
+                .unwrap();
             cx.cancel();
             let calls = Cell::new(0);
-            let (opened, report) = handoff.open(&cx, |_, _| {
-                calls.set(calls.get() + 1);
-                std::future::ready(Ok(()))
-            }).await;
+            let (opened, report) = handoff
+                .open(&cx, |_, _| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Ok(()))
+                })
+                .await;
             assert!(matches!(opened, Err(FrankenError::Interrupt)));
             assert_eq!(calls.get(), 0);
             assert_eq!(report.digest, blake3::hash(&repaired));
@@ -831,18 +1039,28 @@ mod tests {
         with_runtime(async {
             let (options, original, repaired) = handoff_fixture();
             let cx = attached_context();
-            let handoff = run_for_open(&NativeVfs::new(), &cx, &options).await.unwrap();
+            let handoff = run_for_open(&NativeVfs::new(), &cx, &options)
+                .await
+                .unwrap();
             let calls = Cell::new(0);
             let mut future = Box::pin(handoff.open(&cx, |_, _| {
                 calls.set(calls.get() + 1);
                 std::future::pending::<Result<()>>()
             }));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             drop(future);
             assert_eq!(calls.get(), 1);
             assert_recovery_available(&options.source, &cx);
             assert_eq!(host_fs::read(&options.destination).unwrap(), original);
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), repaired);
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                repaired
+            );
         });
     }
 
@@ -857,13 +1075,25 @@ mod tests {
                 std::future::ready(Ok(()))
             }));
             let detached = Cx::new();
-            assert!(options.repair_and_open(&detached, |_, _| {
-                calls.set(1);
-                std::future::ready(Ok(()))
-            }).await.is_err());
+            assert!(
+                options
+                    .repair_and_open(&detached, |_, _| {
+                        calls.set(1);
+                        std::future::ready(Ok(()))
+                    })
+                    .await
+                    .is_err()
+            );
             assert_eq!(calls.get(), 0);
-            assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original);
+            assert!(
+                !NativeVfs::new()
+                    .path_entry_exists(&cx, &options.destination)
+                    .unwrap()
+            );
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                original
+            );
         });
     }
 
@@ -881,10 +1111,13 @@ mod tests {
                 let main_before = host_fs::read(&options.source).unwrap();
                 let cx = attached_context();
                 let calls = Cell::new(0);
-                let (opened, report) = options.repair_and_open(&cx, |_, _| {
-                    calls.set(calls.get() + 1);
-                    std::future::ready(Ok(()))
-                }).await.unwrap();
+                let (opened, report) = options
+                    .repair_and_open(&cx, |_, _| {
+                        calls.set(calls.get() + 1);
+                        std::future::ready(Ok(()))
+                    })
+                    .await
+                    .unwrap();
                 opened.unwrap();
                 let after = host_fs::metadata(&wal_path).unwrap();
                 assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
@@ -913,7 +1146,9 @@ mod tests {
                 let sidecar_path = companion(&options.source, "-wal-fec");
                 let sidecar_before = host_fs::read(&sidecar_path).unwrap();
                 let cx = attached_context();
-                let report = crate::native_recovery::export_database(&cx, &options).await.unwrap();
+                let report = crate::native_recovery::export_database(&cx, &options)
+                    .await
+                    .unwrap();
                 let expected = &repaired[repaired.len() - 512..];
                 assert_eq!(host_fs::read(&report.destination).unwrap(), expected);
                 assert_eq!(report.digest, blake3::hash(expected));
@@ -938,18 +1173,29 @@ mod tests {
                     original[terminal + 16] ^= 1;
                 }
                 original.truncate(original.len() - 1);
-                if exceed_budget { options.replay.max_wal_bytes = original.len(); }
+                if exceed_budget {
+                    options.replay.max_wal_bytes = original.len();
+                }
                 let wal_path = companion(&options.source, "-wal");
                 host_fs::write(&wal_path, &original).unwrap();
                 let cx = attached_context();
                 let calls = Cell::new(0);
-                assert!(options.repair_and_open(&cx, |_, _| {
-                    calls.set(calls.get() + 1);
-                    std::future::ready(Ok(()))
-                }).await.is_err());
+                assert!(
+                    options
+                        .repair_and_open(&cx, |_, _| {
+                            calls.set(calls.get() + 1);
+                            std::future::ready(Ok(()))
+                        })
+                        .await
+                        .is_err()
+                );
                 assert_eq!(calls.get(), 0);
                 assert_eq!(host_fs::read(&wal_path).unwrap(), original);
-                assert!(!NativeVfs::new().path_entry_exists(&cx, &options.destination).unwrap());
+                assert!(
+                    !NativeVfs::new()
+                        .path_entry_exists(&cx, &options.destination)
+                        .unwrap()
+                );
                 assert_recovery_available(&options.source, &cx);
             }
         });
@@ -960,13 +1206,24 @@ mod tests {
         target[40..60].fill(0x77);
         target[100..130].fill(0x66);
         RepairPlan {
-            target, changed: vec![40..60, 100..130], index_regions: Vec::new(),
+            target,
+            changed: vec![40..60, 100..130],
+            index_regions: Vec::new(),
             index_header: WalIndexHdr {
-                i_version: WAL_INDEX_VERSION, unused: 0, i_change: 0, is_init: 1,
-                big_end_cksum: 0, sz_page: 512, mx_frame: 0, n_page: 0,
-                a_frame_cksum: [0; 2], a_salt: [0; 2], a_cksum: [0; 2],
+                i_version: WAL_INDEX_VERSION,
+                unused: 0,
+                i_change: 0,
+                is_init: 1,
+                big_end_cksum: 0,
+                sz_page: 512,
+                mx_frame: 0,
+                n_page: 0,
+                a_frame_cksum: [0; 2],
+                a_salt: [0; 2],
+                a_cksum: [0; 2],
             },
-            pages: 1, certificate_anchors: 0,
+            pages: 1,
+            certificate_anchors: 0,
         }
     }
 
@@ -978,7 +1235,10 @@ mod tests {
         let digest = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(())).unwrap();
         assert_eq!(file.get_ref(), &plan.target);
         assert_eq!(digest, blake3::hash(&plan.target));
-        assert_eq!(&file.get_ref()[..WAL_HEADER_SIZE], &original[..WAL_HEADER_SIZE]);
+        assert_eq!(
+            &file.get_ref()[..WAL_HEADER_SIZE],
+            &original[..WAL_HEADER_SIZE]
+        );
         assert_eq!(file.get_ref().len(), original.len());
     }
 
@@ -990,11 +1250,20 @@ mod tests {
         let mut calls = 0;
         let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| {
             calls += 1;
-            if calls == 1 { Err(io::Error::other("injected sync failure")) } else { Ok(()) }
-        }).unwrap_err();
+            if calls == 1 {
+                Err(io::Error::other("injected sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
         assert_eq!(calls, 2);
         assert_eq!(file.into_inner(), original);
-        assert!(error.to_string().contains("original WAL restored and synced"));
+        assert!(
+            error
+                .to_string()
+                .contains("original WAL restored and synced")
+        );
     }
 
     #[test]
@@ -1004,7 +1273,8 @@ mod tests {
         let mut file = Cursor::new(original.clone());
         let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| {
             Err(io::Error::other("persistent sync failure"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("indeterminate"));
     }
 
@@ -1016,9 +1286,12 @@ mod tests {
         let mut calls = 0;
         let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| {
             calls += 1;
-            if calls == 1 { file.get_mut()[45] ^= 1; }
+            if calls == 1 {
+                file.get_mut()[45] ^= 1;
+            }
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(file.into_inner(), original);
         assert!(error.to_string().contains("original WAL restored"));
     }
@@ -1056,7 +1329,9 @@ mod tests {
             self.file.write(bytes)
         }
 
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl RepairFile for TornWrite {
@@ -1074,14 +1349,20 @@ mod tests {
         let plan = byte_plan(&original);
         for prefix_bytes in 0..50 {
             let mut file = TornWrite {
-                file: Cursor::new(original.clone()), bytes_until_failure: prefix_bytes, failed: false,
+                file: Cursor::new(original.clone()),
+                bytes_until_failure: prefix_bytes,
+                failed: false,
                 fail_truncate: false,
             };
-            let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(()))
-                .unwrap_err();
+            let error =
+                settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(())).unwrap_err();
             assert!(file.failed);
             assert_eq!(file.file.into_inner(), original);
-            assert!(error.to_string().contains("original WAL restored and synced"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("original WAL restored and synced")
+            );
         }
     }
 
@@ -1095,7 +1376,8 @@ mod tests {
         settle_writes(&mut file, &cx, &original, &plan, |_| {
             cx.cancel();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(file.into_inner(), plan.target);
     }
 
@@ -1116,8 +1398,10 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&original).unwrap();
         let before = file.metadata().unwrap();
-        let digest = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| file.sync_all())
-            .unwrap();
+        let digest = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| {
+            file.sync_all()
+        })
+        .unwrap();
         let after = file.metadata().unwrap();
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         assert_eq!(after.len(), 320);
@@ -1134,14 +1418,20 @@ mod tests {
         let plan = growth_plan(&original);
         for prefix_bytes in 0..130 {
             let mut file = TornWrite {
-                file: Cursor::new(original.clone()), bytes_until_failure: prefix_bytes,
-                failed: false, fail_truncate: false,
+                file: Cursor::new(original.clone()),
+                bytes_until_failure: prefix_bytes,
+                failed: false,
+                fail_truncate: false,
             };
-            let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(()))
-                .unwrap_err();
+            let error =
+                settle_writes(&mut file, &Cx::new(), &original, &plan, |_| Ok(())).unwrap_err();
             assert!(file.failed);
             assert_eq!(file.file.into_inner(), original);
-            assert!(error.to_string().contains("original WAL restored and synced"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("original WAL restored and synced")
+            );
         }
     }
 
@@ -1160,10 +1450,15 @@ mod tests {
                 assert_eq!(file.get_ref(), &original);
                 Ok(())
             }
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(calls, 2);
         assert_eq!(file.into_inner(), original);
-        assert!(error.to_string().contains("original WAL restored and synced"));
+        assert!(
+            error
+                .to_string()
+                .contains("original WAL restored and synced")
+        );
     }
 
     #[test]
@@ -1174,12 +1469,19 @@ mod tests {
         let mut calls = 0;
         let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |file| {
             calls += 1;
-            if calls == 1 { file.get_mut()[319] ^= 1; }
+            if calls == 1 {
+                file.get_mut()[319] ^= 1;
+            }
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(calls, 2);
         assert_eq!(file.into_inner(), original);
-        assert!(error.to_string().contains("original WAL restored and synced"));
+        assert!(
+            error
+                .to_string()
+                .contains("original WAL restored and synced")
+        );
     }
 
     #[test]
@@ -1187,15 +1489,22 @@ mod tests {
         let original = vec![0x11; 256];
         let plan = growth_plan(&original);
         let mut file = TornWrite {
-            file: Cursor::new(original.clone()), bytes_until_failure: usize::MAX,
-            failed: false, fail_truncate: true,
+            file: Cursor::new(original.clone()),
+            bytes_until_failure: usize::MAX,
+            failed: false,
+            fail_truncate: true,
         };
         let error = settle_writes(&mut file, &Cx::new(), &original, &plan, |_| {
             Err(io::Error::other("injected growth sync failure"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(file.file.get_ref().len(), 320);
         assert!(error.to_string().contains("indeterminate"));
         assert!(error.to_string().contains("rollback truncation failure"));
-        assert!(!error.to_string().contains("original WAL restored and synced"));
+        assert!(
+            !error
+                .to_string()
+                .contains("original WAL restored and synced")
+        );
     }
 }

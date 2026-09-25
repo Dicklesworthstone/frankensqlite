@@ -32,10 +32,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_types::sync_primitives::Mutex;
+use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 use tracing::{debug, error, info, warn};
 
@@ -914,20 +914,32 @@ mod tests {
                 let file = open_db_file(&vfs, &cx);
                 let page = PageNumber::ONE;
                 let checksum = write_page_with_checksum(&cx, &file, page_size, page, 0xAB);
-                file.write(&cx, &[0x54], u64::from(damaged_offset)).wait().unwrap();
+                file.write(&cx, &[0x54], u64::from(damaged_offset))
+                    .wait()
+                    .unwrap();
                 let mut read_back = vec![0; usize::try_from(page_size).unwrap()];
-                assert_eq!(file.read(&cx, &mut read_back, 0).wait().unwrap(), read_back.len());
-                assert_eq!(crate::checksum::read_page_checksum(&read_back).unwrap(), checksum);
+                assert_eq!(
+                    file.read(&cx, &mut read_back, 0).wait().unwrap(),
+                    read_back.len()
+                );
+                assert_eq!(
+                    crate::checksum::read_page_checksum(&read_back).unwrap(),
+                    checksum
+                );
                 assert!(!crate::checksum::verify_page_checksum(&read_back).unwrap());
                 let expected = [ExpectedPageChecksum { page, checksum }];
                 assert_eq!(
                     verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected)
-                        .wait().unwrap(),
-                    CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+                        .wait()
+                        .unwrap(),
+                    CheckpointChecksumVerdict::Mismatch {
+                        first_bad_page: page
+                    }
                 );
                 let mut target = SyncAuditTarget::default();
                 let error = execute_recovery_barrier(&cx, &mut target, &file, page_size, &expected)
-                    .wait().unwrap_err();
+                    .wait()
+                    .unwrap_err();
                 assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
                 assert_eq!(target.sync_count, 1);
                 assert!(target.truncate_at.is_none());
@@ -944,18 +956,28 @@ mod tests {
         let checksum = write_page_with_checksum(&cx, &file, 4096, page, 0xAB);
         let expected = [ExpectedPageChecksum { page, checksum }];
         // The body is intact but its stored checksum was damaged.
-        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095).wait().unwrap();
+        file.write(&cx, &[checksum.to_le_bytes()[15] ^ 1], 4095)
+            .wait()
+            .unwrap();
         assert_eq!(
-            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
-            CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected)
+                .wait()
+                .unwrap(),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: page
+            }
         );
         // A different, internally consistent body+trailer still cannot match
         // the authoritative post-checkpoint digest supplied by the caller.
         let other = write_page_with_checksum(&cx, &file, 4096, page, 0x11);
         assert_ne!(other, checksum);
         assert_eq!(
-            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected).wait().unwrap(),
-            CheckpointChecksumVerdict::Mismatch { first_bad_page: page }
+            verify_checkpoint_checksum_prefix(&cx, &file, 4096, &expected)
+                .wait()
+                .unwrap(),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: page
+            }
         );
     }
 
@@ -974,21 +996,34 @@ mod tests {
         let mut third = vec![0xAB; 512];
         let checksum = crate::checksum::write_page_checksum(&mut third).unwrap();
         let third_page = PageNumber::new(3).unwrap();
-        expected.push(ExpectedPageChecksum { page: third_page, checksum });
+        expected.push(ExpectedPageChecksum {
+            page: third_page,
+            checksum,
+        });
         file.write(&cx, &third[..256], 1024).wait().unwrap();
         file.write(&cx, &[0x54], 612).wait().unwrap();
         assert_eq!(
-            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
-            CheckpointChecksumVerdict::Mismatch { first_bad_page: PageNumber::new(2).unwrap() }
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected)
+                .wait()
+                .unwrap(),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: PageNumber::new(2).unwrap()
+            }
         );
         write_page_with_checksum(&cx, &file, page_size, PageNumber::new(2).unwrap(), 0xAB);
         assert_eq!(
-            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
-            CheckpointChecksumVerdict::Mismatch { first_bad_page: third_page }
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected)
+                .wait()
+                .unwrap(),
+            CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: third_page
+            }
         );
         file.write(&cx, &third, 1024).wait().unwrap();
         assert_eq!(
-            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected).wait().unwrap(),
+            verify_checkpoint_checksum_prefix(&cx, &file, page_size, &expected)
+                .wait()
+                .unwrap(),
             CheckpointChecksumVerdict::Match
         );
     }
@@ -1017,12 +1052,20 @@ mod tests {
         let checksum = write_page_with_checksum(&cx, &file, 512, page, 0xAB);
         let expected = [ExpectedPageChecksum { page, checksum }];
         let mut target = SyncAuditTarget::default();
-        execute_recovery_barrier(&cx, &mut target, &file, 512, &expected).wait().unwrap();
+        execute_recovery_barrier(&cx, &mut target, &file, 512, &expected)
+            .wait()
+            .unwrap();
         assert_eq!(target.sync_count, 1);
-        assert!(target.truncate_at.is_none(), "the barrier itself never truncates");
+        assert!(
+            target.truncate_at.is_none(),
+            "the barrier itself never truncates"
+        );
         target.sync_should_fail = true;
         let result = execute_recovery_barrier(&cx, &mut target, &file, 512, &expected).wait();
-        assert!(result.is_err(), "matching pages cannot override a failed sync");
+        assert!(
+            result.is_err(),
+            "matching pages cannot override a failed sync"
+        );
         assert!(target.truncate_at.is_none());
     }
 

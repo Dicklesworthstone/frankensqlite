@@ -44,18 +44,24 @@ fn healthy_source(directory: &Path) -> (Options, Vec<u8>, Vec<u8>) {
         format_version: crate::WAL_FORMAT_VERSION,
         page_size: 512,
         checkpoint_seq: 1,
-        salts: WalSalts { salt1: 123, salt2: 456 },
+        salts: WalSalts {
+            salt1: 123,
+            salt2: 456,
+        },
         checksum: SqliteWalChecksum::default(),
     };
     let mut wal = header.to_bytes().unwrap().to_vec();
     let seed = WalHeader::from_bytes(&wal).unwrap().checksum;
     let offset = wal.len();
-    wal.extend_from_slice(&WalFrameHeader {
-        page_number: 1,
-        db_size: 1,
-        salts: header.salts,
-        checksum: SqliteWalChecksum::default(),
-    }.to_bytes());
+    wal.extend_from_slice(
+        &WalFrameHeader {
+            page_number: 1,
+            db_size: 1,
+            salts: header.salts,
+            checksum: SqliteWalChecksum::default(),
+        }
+        .to_bytes(),
+    );
     wal.extend_from_slice(&page);
     let checksum = WalChecksumTransform::for_wal_frame(&wal[offset..], 512, false)
         .unwrap()
@@ -74,7 +80,16 @@ fn reserved_source_destinations_fail_before_any_source_admission() {
         let cx = request_context().unwrap();
         let vfs = NativeVfs::new();
         // Independent list: omitting a production suffix must break this test.
-        for suffix in ["", "-journal", "-wal", "-shm", "-wal-fec", "-wal-fec.lock", "-wal-cert", ".fsqlite-shm"] {
+        for suffix in [
+            "",
+            "-journal",
+            "-wal",
+            "-shm",
+            "-wal-fec",
+            "-wal-fec.lock",
+            "-wal-cert",
+            ".fsqlite-shm",
+        ] {
             let destination = companion(&source, suffix);
             let expected = vfs.full_pathname(&cx, &destination).unwrap();
             let options = Options::new(&source, destination);
@@ -97,12 +112,17 @@ fn healthy_export_cannot_create_an_absent_source_certificate() {
         let entries = directory_entries(directory.path());
         options.destination = companion(&options.source, "-wal-cert");
         let cx = request_context().unwrap();
-        let expected = NativeVfs::new().full_pathname(&cx, &options.destination).unwrap();
+        let expected = NativeVfs::new()
+            .full_pathname(&cx, &options.destination)
+            .unwrap();
         assert!(matches!(export_database(&cx, &options).await,
             Err(FrankenError::CannotOpen { path }) if path == expected));
         assert_eq!(directory_entries(directory.path()), entries);
         assert_eq!(host_fs::read(&options.source).unwrap(), original);
-        assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), wal);
+        assert_eq!(
+            host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+            wal
+        );
     });
 }
 
@@ -122,8 +142,15 @@ fn unrelated_destination_still_exports_the_latest_committed_page() {
         assert_eq!(report.digest, blake3::hash(&expected));
         assert_eq!(host_fs::read(&options.destination).unwrap(), expected);
         assert_eq!(host_fs::read(&options.source).unwrap(), original);
-        assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), wal);
-        assert!(!NativeVfs::new().path_entry_exists(&cx, &companion(&options.source, "-wal-cert")).unwrap());
+        assert_eq!(
+            host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+            wal
+        );
+        assert!(
+            !NativeVfs::new()
+                .path_entry_exists(&cx, &companion(&options.source, "-wal-cert"))
+                .unwrap()
+        );
     });
 }
 
@@ -147,7 +174,11 @@ fn orphaned_destination_fec_lock_prevents_export_without_side_effects() {
 #[test]
 fn source_namespace_guard_is_not_a_filename_prefix_ban() {
     let source = Path::new("source.db");
-    for destination in ["source.db.export", "source.db-wal-cert.backup", "source.db-copy"] {
+    for destination in [
+        "source.db.export",
+        "source.db-wal-cert.backup",
+        "source.db-copy",
+    ] {
         assert!(!is_source_artifact(source, Path::new(destination)));
     }
 }

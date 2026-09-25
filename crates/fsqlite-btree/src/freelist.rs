@@ -646,7 +646,11 @@ mod tests {
             page[12..16].copy_from_slice(&invalid.to_be_bytes());
             let error = FreelistTrunk::parse(&page).unwrap_err();
             assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
-            assert!(error.to_string().contains("invalid freelist leaf page number"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid freelist leaf page number")
+            );
         }
     }
 

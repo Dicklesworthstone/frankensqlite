@@ -936,9 +936,7 @@ pub fn cell_on_page_size_fast(
     // SQLite format floor (bd-bfnlm): every cell occupies at least
     // MIN_CELL_ALLOCATION bytes of the content area. Clamp at the available
     // usable boundary, which may be shorter than the declared usable size.
-    Ok(total
-        .max(MIN_CELL_ALLOCATION)
-        .min(page.len() - cell_offset))
+    Ok(total.max(MIN_CELL_ALLOCATION).min(page.len() - cell_offset))
 }
 
 // ---------------------------------------------------------------------------
@@ -957,7 +955,16 @@ mod tests {
         let page_type = BtreePageType::InteriorTable;
         for page_size in [512_usize, 4096, 65536] {
             let usable = page_size - 32;
-            for key in [0_u64, 127, 128, 16383, 16384, (1_u64 << 63) - 1, 1_u64 << 63, u64::MAX] {
+            for key in [
+                0_u64,
+                127,
+                128,
+                16383,
+                16384,
+                (1_u64 << 63) - 1,
+                1_u64 << 63,
+                u64::MAX,
+            ] {
                 let mut varint = [0_u8; 9];
                 let width = write_varint(&mut varint, key);
                 let mut encoded = 7_u32.to_be_bytes().to_vec();
@@ -977,10 +984,14 @@ mod tests {
                         assert_eq!(cell.payload_offset, usable);
                         assert_eq!(sized.unwrap(), encoded.len());
                     } else {
-                        assert!(matches!(parsed, Err(FrankenError::DatabaseCorrupt { .. })),
-                            "page_size={page_size} key={key} available={available}");
-                        assert!(matches!(sized, Err(FrankenError::DatabaseCorrupt { .. })),
-                            "page_size={page_size} key={key} available={available}");
+                        assert!(
+                            matches!(parsed, Err(FrankenError::DatabaseCorrupt { .. })),
+                            "page_size={page_size} key={key} available={available}"
+                        );
+                        assert!(
+                            matches!(sized, Err(FrankenError::DatabaseCorrupt { .. })),
+                            "page_size={page_size} key={key} available={available}"
+                        );
                     }
                 }
             }
@@ -992,7 +1003,11 @@ mod tests {
         use fsqlite_types::serial_type::write_varint;
 
         let usable = 4064_u32;
-        for page_type in [BtreePageType::LeafTable, BtreePageType::LeafIndex, BtreePageType::InteriorIndex] {
+        for page_type in [
+            BtreePageType::LeafTable,
+            BtreePageType::LeafIndex,
+            BtreePageType::InteriorIndex,
+        ] {
             for payload_size in [8, max_local_payload(usable, page_type) + 1] {
                 let mut encoded = Vec::new();
                 if page_type.is_interior() {
@@ -1022,7 +1037,10 @@ mod tests {
                         assert_eq!(cell.payload_size, payload_size);
                         assert_eq!(cell.local_size, local);
                         assert_eq!(cell.local_payload(&page), vec![0xab; local as usize]);
-                        assert_eq!(cell.overflow_page, if overflow { PageNumber::new(11) } else { None });
+                        assert_eq!(
+                            cell.overflow_page,
+                            if overflow { PageNumber::new(11) } else { None }
+                        );
                         assert_eq!(sized.unwrap(), encoded.len());
                     } else {
                         assert!(matches!(parsed, Err(FrankenError::DatabaseCorrupt { .. })));
@@ -1057,7 +1075,10 @@ mod tests {
             }
             let cell = CellRef::parse(encoded, 0, page_type, 4096).unwrap();
             assert_eq!(cell.payload_offset, encoded.len());
-            assert_eq!(cell_on_page_size_fast(encoded, 0, page_type, 4096).unwrap(), encoded.len());
+            assert_eq!(
+                cell_on_page_size_fast(encoded, 0, page_type, 4096).unwrap(),
+                encoded.len()
+            );
         }
     }
 
@@ -1065,8 +1086,10 @@ mod tests {
     fn test_cell_parsers_reject_offsets_outside_usable_extent() {
         let page = [0_u8; 512];
         for page_type in [
-            BtreePageType::LeafTable, BtreePageType::LeafIndex,
-            BtreePageType::InteriorTable, BtreePageType::InteriorIndex,
+            BtreePageType::LeafTable,
+            BtreePageType::LeafIndex,
+            BtreePageType::InteriorTable,
+            BtreePageType::InteriorIndex,
         ] {
             for offset in [480, 481, 511, 512, usize::MAX] {
                 assert!(matches!(

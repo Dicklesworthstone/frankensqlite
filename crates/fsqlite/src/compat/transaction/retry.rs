@@ -85,8 +85,11 @@ pub struct TransactionRetryError {
 
 impl fmt::Display for TransactionRetryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "transaction retry stopped ({:?}) after {} attempt(s), {:?}",
-            self.reason, self.attempts, self.elapsed)?;
+        write!(
+            f,
+            "transaction retry stopped ({:?}) after {} attempt(s), {:?}",
+            self.reason, self.attempts, self.elapsed
+        )?;
         if let Some(error) = &self.last_error {
             write!(f, ": {error}")?;
         }
@@ -99,7 +102,8 @@ impl fmt::Display for TransactionRetryError {
 
 impl std::error::Error for TransactionRetryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.last_error.as_deref()
+        self.last_error
+            .as_deref()
             .or(self.rollback_error.as_deref())
             .map(|error| error as &(dyn std::error::Error + 'static))
     }
@@ -157,17 +161,28 @@ struct AttemptFailure {
 impl AttemptFailure {
     fn database(error: FrankenError) -> Self {
         let reason = matches!(error, FrankenError::Interrupt).then_some(RetryStopReason::Cancelled);
-        Self { reason, error: Some(Box::new(error)) }
+        Self {
+            reason,
+            error: Some(Box::new(error)),
+        }
     }
 
     fn stopped(reason: RetryStopReason) -> Self {
-        Self { reason: Some(reason), error: None }
+        Self {
+            reason: Some(reason),
+            error: None,
+        }
     }
 }
 
 impl RetryRun<'_> {
     fn elapsed(&self) -> Duration {
-        Duration::from_nanos(self.native.now().as_nanos().saturating_sub(self.started.as_nanos()))
+        Duration::from_nanos(
+            self.native
+                .now()
+                .as_nanos()
+                .saturating_sub(self.started.as_nanos()),
+        )
     }
 
     fn stop_reason(&self) -> Option<RetryStopReason> {
@@ -217,7 +232,8 @@ impl RetryRun<'_> {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-        }).await;
+        })
+        .await;
         if let Some(reason) = self.stop_reason() {
             return Err(reason);
         }
@@ -238,7 +254,8 @@ impl RetryRun<'_> {
                 return Poll::Ready(Err(RetryStopReason::Cancelled));
             }
             sleep.as_mut().poll(cx).map(|()| Ok(()))
-        }).await;
+        })
+        .await;
         drop(native_cancel_tx);
         waited?;
         self.stop_reason().map_or(Ok(()), Err)
@@ -252,15 +269,18 @@ impl RetryRun<'_> {
     where
         F: for<'tx, 'conn> AsyncFnMut(&'tx Transaction<'conn>) -> Result<T, FrankenError>,
     {
-        self.conn.begin_transaction().await.map_err(AttemptFailure::database)?;
+        self.conn
+            .begin_transaction()
+            .await
+            .map_err(AttemptFailure::database)?;
         if let Some(reason) = self.stop_reason() {
             return Err(AttemptFailure::stopped(reason));
         }
         let result = operation(tx).await;
         // A typed transient engine abort can retire its own scope. That is
         // not the same as a callback executing COMMIT then returning Busy.
-        let retryable_abort = tx.retryable_abort.get()
-            && result.as_ref().is_err_and(FrankenError::is_transient);
+        let retryable_abort =
+            tx.retryable_abort.get() && result.as_ref().is_err_and(FrankenError::is_transient);
         if (tx.finalized.get() || !self.conn.in_transaction()) && !retryable_abort {
             return Err(AttemptFailure {
                 reason: Some(RetryStopReason::TransactionEnded),
@@ -292,7 +312,8 @@ impl RetryRun<'_> {
             async || tx.rollback().await,
             || self.conn.in_transaction(),
             async |retry| self.wait(retry).await,
-        ).await
+        )
+        .await
     }
 }
 
@@ -340,10 +361,15 @@ impl TransactionRetryExt for Connection {
     {
         let started = Instant::now();
         let rejected = |reason| TransactionRetryError {
-            reason, attempts: 0, elapsed: started.elapsed(), last_error: None,
-            rollback_error: None, transaction_open: self.in_transaction(),
+            reason,
+            attempts: 0,
+            elapsed: started.elapsed(),
+            last_error: None,
+            rollback_error: None,
+            transaction_open: self.in_transaction(),
         };
-        if policy.max_attempts == 0 || policy.max_rollback_attempts == 0
+        if policy.max_attempts == 0
+            || policy.max_rollback_attempts == 0
             || policy.initial_backoff > policy.max_backoff
         {
             return Err(rejected(RetryStopReason::InvalidPolicy));
@@ -351,14 +377,20 @@ impl TransactionRetryExt for Connection {
         if self.in_transaction() {
             return Err(rejected(RetryStopReason::AlreadyInTransaction));
         }
-        let native = NativeCx::current()
-            .ok_or_else(|| rejected(RetryStopReason::RuntimeUnavailable))?;
+        let native =
+            NativeCx::current().ok_or_else(|| rejected(RetryStopReason::RuntimeUnavailable))?;
         let capabilities = native.capabilities();
         if !capabilities.time || !capabilities.entropy || self.root_cx().mask_depth() != 0 {
             return Err(rejected(RetryStopReason::RuntimeUnavailable));
         }
         let started = native.now();
-        let mut run = RetryRun { conn: self, native, policy, started, attempts: 0 };
+        let mut run = RetryRun {
+            conn: self,
+            native,
+            policy,
+            started,
+            attempts: 0,
+        };
         let mut last_error = None;
         loop {
             if let Some(reason) = run.stop_reason() {
@@ -385,7 +417,10 @@ impl TransactionRetryExt for Connection {
             if let Some(reason) = failure.reason {
                 return Err(run.failure(reason, last_error, None));
             }
-            if !last_error.as_deref().is_some_and(FrankenError::is_transient) {
+            if !last_error
+                .as_deref()
+                .is_some_and(FrankenError::is_transient)
+            {
                 return Err(run.failure(RetryStopReason::NonTransient, last_error, None));
             }
             if run.attempts == policy.max_attempts {
@@ -400,10 +435,16 @@ impl TransactionRetryExt for Connection {
 
 fn backoff_cap(policy: RetryPolicy, retry: u32) -> Duration {
     let factor = 1_u128.checked_shl(retry).unwrap_or(u128::MAX);
-    let nanos = policy.initial_backoff.as_nanos().saturating_mul(factor)
+    let nanos = policy
+        .initial_backoff
+        .as_nanos()
+        .saturating_mul(factor)
         .min(policy.max_backoff.as_nanos());
     // Bounded by a Duration, so both components fit their destination types.
-    Duration::new((nanos / 1_000_000_000) as u64, (nanos % 1_000_000_000) as u32)
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
 }
 
 fn full_jitter(cap: Duration, entropy: u64) -> Duration {
@@ -422,11 +463,17 @@ mod tests {
         assert_eq!(backoff_cap(policy, 0), policy.initial_backoff);
         assert_eq!(backoff_cap(policy, 1), policy.initial_backoff * 2);
         assert_eq!(backoff_cap(policy, u32::MAX), policy.max_backoff);
-        let tiny = RetryPolicy { initial_backoff: Duration::from_nanos(1),
-            max_backoff: Duration::from_secs(60), ..policy };
+        let tiny = RetryPolicy {
+            initial_backoff: Duration::from_nanos(1),
+            max_backoff: Duration::from_secs(60),
+            ..policy
+        };
         assert_eq!(backoff_cap(tiny, 32), Duration::from_nanos(1_u64 << 32));
         assert_eq!(backoff_cap(tiny, 100), tiny.max_backoff);
-        let zero = RetryPolicy { initial_backoff: Duration::ZERO, ..policy };
+        let zero = RetryPolicy {
+            initial_backoff: Duration::ZERO,
+            ..policy
+        };
         assert_eq!(backoff_cap(zero, u32::MAX), Duration::ZERO);
         for cap in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
             for entropy in [0, 1, u64::MAX / 2, u64::MAX] {
@@ -442,14 +489,17 @@ mod tests {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(value INTEGER)").await.unwrap();
             let mut attempts = 0;
-            let value = conn.transaction_with_retry(RetryPolicy::default(), async |tx| {
-                attempts += 1;
-                tx.execute("INSERT INTO t VALUES (42)").await?;
-                if attempts == 1 {
-                    return Err(FrankenError::Busy);
-                }
-                Ok(attempts)
-            }).await.unwrap();
+            let value = conn
+                .transaction_with_retry(RetryPolicy::default(), async |tx| {
+                    attempts += 1;
+                    tx.execute("INSERT INTO t VALUES (42)").await?;
+                    if attempts == 1 {
+                        return Err(FrankenError::Busy);
+                    }
+                    Ok(attempts)
+                })
+                .await
+                .unwrap();
             assert_eq!(value, 2);
             assert!(!conn.in_transaction());
             assert_eq!(conn.query("SELECT * FROM t").await.unwrap().len(), 1);
@@ -461,14 +511,23 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(value INTEGER)").await.unwrap();
-            let policy = RetryPolicy { max_attempts: 2, ..RetryPolicy::default() };
-            let error = conn.transaction_with_retry(policy, async |tx| {
-                tx.execute("INSERT INTO t VALUES (1)").await?;
-                Err::<(), _>(FrankenError::Busy)
-            }).await.unwrap_err();
+            let policy = RetryPolicy {
+                max_attempts: 2,
+                ..RetryPolicy::default()
+            };
+            let error = conn
+                .transaction_with_retry(policy, async |tx| {
+                    tx.execute("INSERT INTO t VALUES (1)").await?;
+                    Err::<(), _>(FrankenError::Busy)
+                })
+                .await
+                .unwrap_err();
             assert_eq!(error.reason, RetryStopReason::AttemptsExhausted);
             assert_eq!(error.attempts, 2);
-            assert!(matches!(error.last_error.as_deref(), Some(FrankenError::Busy)));
+            assert!(matches!(
+                error.last_error.as_deref(),
+                Some(FrankenError::Busy)
+            ));
             assert!(!error.transaction_open);
             assert!(error.rollback_error.is_none());
             assert!(conn.query("SELECT * FROM t").await.unwrap().is_empty());
@@ -481,18 +540,24 @@ mod tests {
             let calls = Cell::new(0);
             let active = Cell::new(true);
             let waits = Cell::new(0);
-            let outcome = confirm_rollback(3, async || {
-                calls.set(calls.get() + 1);
-                if calls.get() < 3 {
-                    Err(FrankenError::Busy)
-                } else {
-                    active.set(false);
+            let outcome = confirm_rollback(
+                3,
+                async || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() < 3 {
+                        Err(FrankenError::Busy)
+                    } else {
+                        active.set(false);
+                        Ok(())
+                    }
+                },
+                || active.get(),
+                async |_| {
+                    waits.set(waits.get() + 1);
                     Ok(())
-                }
-            }, || active.get(), async |_| {
-                waits.set(waits.get() + 1);
-                Ok(())
-            }).await;
+                },
+            )
+            .await;
             assert!(outcome.is_ok());
             assert_eq!(calls.get(), 3);
             assert_eq!(waits.get(), 2);
@@ -505,12 +570,23 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             for deadline in [false, true] {
                 let calls = Cell::new(0);
-                let failure = confirm_rollback(3, async || {
-                    calls.set(calls.get() + 1);
-                    Err(FrankenError::Busy)
-                }, || true, async |_| {
-                    if deadline { Err(RetryStopReason::DeadlineExceeded) } else { Ok(()) }
-                }).await.unwrap_err();
+                let failure = confirm_rollback(
+                    3,
+                    async || {
+                        calls.set(calls.get() + 1);
+                        Err(FrankenError::Busy)
+                    },
+                    || true,
+                    async |_| {
+                        if deadline {
+                            Err(RetryStopReason::DeadlineExceeded)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+                .unwrap_err();
                 assert!(matches!(failure.as_deref(), Some(FrankenError::Busy)));
                 assert_eq!(calls.get(), if deadline { 1 } else { 3 });
             }
@@ -520,12 +596,24 @@ mod tests {
     #[test]
     fn rollback_requires_both_success_and_an_idle_transaction() {
         asupersync::test_utils::run_test(|| async {
-            let unretired = confirm_rollback(2, async || Ok(()), || true,
-                async |_| panic!("a success without retirement must not retry")).await;
+            let unretired = confirm_rollback(
+                2,
+                async || Ok(()),
+                || true,
+                async |_| panic!("a success without retirement must not retry"),
+            )
+            .await;
             assert!(matches!(unretired, Err(None)));
-            let unacknowledged = confirm_rollback(2, async || Err(FrankenError::Busy),
-                || false, async |_| panic!("an unacknowledged outcome must not retry")).await;
-            assert!(matches!(unacknowledged, Err(Some(error)) if matches!(*error, FrankenError::Busy)));
+            let unacknowledged = confirm_rollback(
+                2,
+                async || Err(FrankenError::Busy),
+                || false,
+                async |_| panic!("an unacknowledged outcome must not retry"),
+            )
+            .await;
+            assert!(
+                matches!(unacknowledged, Err(Some(error)) if matches!(*error, FrankenError::Busy))
+            );
         });
     }
 
@@ -533,10 +621,18 @@ mod tests {
     fn nontransient_rollback_failure_never_waits_or_retries() {
         asupersync::test_utils::run_test(|| async {
             let calls = Cell::new(0);
-            let failure = confirm_rollback(8, async || {
-                calls.set(calls.get() + 1);
-                Err(FrankenError::DatabaseCorrupt { detail: "injected rollback failure".into() })
-            }, || true, async |_| panic!("corruption must not be retried")).await;
+            let failure = confirm_rollback(
+                8,
+                async || {
+                    calls.set(calls.get() + 1);
+                    Err(FrankenError::DatabaseCorrupt {
+                        detail: "injected rollback failure".into(),
+                    })
+                },
+                || true,
+                async |_| panic!("corruption must not be retried"),
+            )
+            .await;
             assert!(failure.is_err());
             assert_eq!(calls.get(), 1);
         });
@@ -566,5 +662,4 @@ mod tests {
             assert!(!tx.retryable_abort.get());
         });
     }
-
 }

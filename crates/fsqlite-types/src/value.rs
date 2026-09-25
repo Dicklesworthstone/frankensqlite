@@ -829,7 +829,9 @@ fn parse_integer_prefix_bytes(b: &[u8]) -> i64 {
         if !byte.is_ascii_digit() {
             break;
         }
-        value = value.saturating_mul(10).saturating_sub(i64::from(byte - b'0'));
+        value = value
+            .saturating_mul(10)
+            .saturating_sub(i64::from(byte - b'0'));
     }
     if negative {
         value
@@ -907,8 +909,7 @@ fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
         // CAST AS NUMERIC uses SQLite's conservative signed 51-bit
         // round-trip range for REAL syntax, not the wider affinity range.
         // Integer syntax above still retains the complete signed i64 range.
-        if value.is_finite()
-            && (-2_251_799_813_685_248.0..2_251_799_813_685_248.0).contains(&value)
+        if value.is_finite() && (-2_251_799_813_685_248.0..2_251_799_813_685_248.0).contains(&value)
         {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             let truncated = value as i64;
@@ -1033,12 +1034,14 @@ impl SqliteValue {
                 // INTEGER in a STRICT INTEGER column (3.0 -> 3); a fractional or
                 // out-of-range REAL stays a type error. The round-trip through
                 // i64 is the lossless test SQLite applies.
-                Self::Float(fl) => float_to_affinity_integer(fl)
-                    .map(Self::Integer)
-                    .ok_or(StrictTypeError {
-                        expected: col_type,
-                        actual: StorageClass::Real,
-                    }),
+                Self::Float(fl) => {
+                    float_to_affinity_integer(fl)
+                        .map(Self::Integer)
+                        .ok_or(StrictTypeError {
+                            expected: col_type,
+                            actual: StorageClass::Real,
+                        })
+                }
                 // GH #163: STRICT accepts a TEXT value that losslessly converts
                 // to the column's declared type (stock sqlite3 STRICT). For an
                 // INTEGER column only text parsing to an integer qualifies —
@@ -2007,7 +2010,13 @@ pub fn binary_text_cmp(left: &[u8], right: &[u8], encoding: TextEncoding) -> Ord
         (Ok(left), Ok(right)) => {
             // memcmp over little-endian unit bytes `[lo, hi]` is numeric order
             // of the byte-swapped unit.
-            let stored = |unit: u16| if little_endian { unit.swap_bytes() } else { unit };
+            let stored = |unit: u16| {
+                if little_endian {
+                    unit.swap_bytes()
+                } else {
+                    unit
+                }
+            };
             left.encode_utf16()
                 .map(stored)
                 .cmp(right.encode_utf16().map(stored))
@@ -2912,8 +2921,8 @@ mod tests {
         // `binary_text_cmp` must reproduce that from the canonical UTF-8 form
         // without transcoding, for every pair and both byte orders.
         let samples = [
-            "", "A", "a", "é", "Ā", "ÿ", "Đ", "名", "東", "杲", "\u{e000}", "\u{ffff}",
-            "😀", "😀grin", "én12", "Ān15", "a\0", "ab",
+            "", "A", "a", "é", "Ā", "ÿ", "Đ", "名", "東", "杲", "\u{e000}", "\u{ffff}", "😀",
+            "😀grin", "én12", "Ān15", "a\0", "ab",
         ];
         for a in samples {
             for b in samples {
@@ -4759,7 +4768,11 @@ mod tests {
                 SqliteValue::from(text),
                 SqliteValue::Blob(Arc::from(text.as_bytes())),
             ] {
-                assert_eq!(value.cast_to_numeric().typeof_str(), expected_type, "{text}");
+                assert_eq!(
+                    value.cast_to_numeric().typeof_str(),
+                    expected_type,
+                    "{text}"
+                );
             }
         }
         // Affinity and CAST deliberately differ here.
@@ -4828,7 +4841,10 @@ mod tests {
         for prefix in ["\u{00a0}", "\u{2003}"] {
             let value = SqliteValue::from(format!("{prefix}1.5"));
             assert!(!value.is_integer_numeric_type());
-            assert_eq!(value.sql_add(&SqliteValue::Integer(0)).as_integer(), Some(0));
+            assert_eq!(
+                value.sql_add(&SqliteValue::Integer(0)).as_integer(),
+                Some(0)
+            );
             assert_eq!(value.to_float(), 0.0);
         }
     }

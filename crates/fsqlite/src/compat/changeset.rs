@@ -32,7 +32,10 @@
 use std::fmt;
 
 use fsqlite_ast::Statement;
-use fsqlite_ext_session::{ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, ConflictAction, ConflictType, TableChangeset};
+use fsqlite_ext_session::{
+    ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, ConflictAction, ConflictType,
+    TableChangeset,
+};
 use fsqlite_parser::Parser;
 
 use crate::{Connection, FrankenError, Row, SqliteValue};
@@ -70,25 +73,60 @@ pub struct SqlChangesetConflict<'a> {
 /// error is not, by itself, proof that no durable effects occurred.
 #[derive(Debug)]
 pub enum SqlChangesetApplyError {
-    InvalidChange { table: String, row: usize, detail: &'static str },
-    Schema { table: String, detail: &'static str },
-    Conflict { table: String, row: usize, kind: ConflictType },
-    Constraint { table: String, row: usize, error: FrankenError },
-    InvalidResolution { table: String, row: usize, kind: ConflictType },
+    InvalidChange {
+        table: String,
+        row: usize,
+        detail: &'static str,
+    },
+    Schema {
+        table: String,
+        detail: &'static str,
+    },
+    Conflict {
+        table: String,
+        row: usize,
+        kind: ConflictType,
+    },
+    Constraint {
+        table: String,
+        row: usize,
+        error: FrankenError,
+    },
+    InvalidResolution {
+        table: String,
+        row: usize,
+        kind: ConflictType,
+    },
     Database(FrankenError),
-    Rollback { cause: Box<Self>, rollback: FrankenError },
+    Rollback {
+        cause: Box<Self>,
+        rollback: FrankenError,
+    },
 }
 
 impl fmt::Display for SqlChangesetApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidChange { table, row, detail } => write!(f, "invalid changeset for {table:?}, row {row}: {detail}"),
-            Self::Schema { table, detail } => write!(f, "incompatible changeset target {table:?}: {detail}"),
-            Self::Conflict { table, row, kind } => write!(f, "changeset conflict in {table:?}, row {row}: {kind:?}"),
-            Self::Constraint { table, row, error } => write!(f, "changeset constraint in {table:?}, row {row}: {error}"),
-            Self::InvalidResolution { table, row, kind } => write!(f, "REPLACE is not permitted for {kind:?} in {table:?}, row {row}"),
+            Self::InvalidChange { table, row, detail } => {
+                write!(f, "invalid changeset for {table:?}, row {row}: {detail}")
+            }
+            Self::Schema { table, detail } => {
+                write!(f, "incompatible changeset target {table:?}: {detail}")
+            }
+            Self::Conflict { table, row, kind } => {
+                write!(f, "changeset conflict in {table:?}, row {row}: {kind:?}")
+            }
+            Self::Constraint { table, row, error } => {
+                write!(f, "changeset constraint in {table:?}, row {row}: {error}")
+            }
+            Self::InvalidResolution { table, row, kind } => write!(
+                f,
+                "REPLACE is not permitted for {kind:?} in {table:?}, row {row}"
+            ),
             Self::Database(error) => write!(f, "{error}"),
-            Self::Rollback { cause, rollback } => write!(f, "{cause}; rollback also failed: {rollback}"),
+            Self::Rollback { cause, rollback } => {
+                write!(f, "{cause}; rollback also failed: {rollback}")
+            }
         }
     }
 }
@@ -104,20 +142,31 @@ impl std::error::Error for SqlChangesetApplyError {
 }
 
 impl From<FrankenError> for SqlChangesetApplyError {
-    fn from(error: FrankenError) -> Self { Self::Database(error) }
+    fn from(error: FrankenError) -> Self {
+        Self::Database(error)
+    }
 }
 
 type ApplyResult<T> = Result<T, SqlChangesetApplyError>;
 
 fn invalid(table: &TableChangeset, row: usize, detail: &'static str) -> SqlChangesetApplyError {
-    SqlChangesetApplyError::InvalidChange { table: table.info.name.clone(), row, detail }
+    SqlChangesetApplyError::InvalidChange {
+        table: table.info.name.clone(),
+        row,
+        detail,
+    }
 }
 
 fn schema(name: &str, detail: &'static str) -> SqlChangesetApplyError {
-    SqlChangesetApplyError::Schema { table: name.to_owned(), detail }
+    SqlChangesetApplyError::Schema {
+        table: name.to_owned(),
+        detail,
+    }
 }
 
-const fn undefined(value: &ChangesetValue) -> bool { matches!(value, ChangesetValue::Undefined) }
+const fn undefined(value: &ChangesetValue) -> bool {
+    matches!(value, ChangesetValue::Undefined)
+}
 
 /// Public changeset structs are constructible without passing through a wire
 /// decoder. Validate every row before the first SQL statement, including the
@@ -125,12 +174,21 @@ const fn undefined(value: &ChangesetValue) -> bool { matches!(value, ChangesetVa
 fn validate(changeset: &Changeset) -> ApplyResult<()> {
     for table in &changeset.tables {
         let info = &table.info;
-        if info.name.is_empty() || info.name.contains('\0')
-            || info.name.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
-            || info.column_count == 0 || info.pk_flags.len() != info.column_count
+        if info.name.is_empty()
+            || info.name.contains('\0')
+            || info
+                .name
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
+            || info.column_count == 0
+            || info.pk_flags.len() != info.column_count
             || !info.pk_flags.iter().any(|pk| *pk)
         {
-            return Err(invalid(table, 0, "invalid name, column count or primary-key layout"));
+            return Err(invalid(
+                table,
+                0,
+                "invalid name, column count or primary-key layout",
+            ));
         }
         for (index, row) in table.rows.iter().enumerate() {
             let n = info.column_count;
@@ -139,17 +197,34 @@ fn validate(changeset: &Changeset) -> ApplyResult<()> {
                 ChangeOp::Delete => row.old_values.len() == n && row.new_values.is_empty(),
                 ChangeOp::Update => row.old_values.len() == n && row.new_values.len() == n,
             };
-            if !width_ok { return Err(invalid(table, index, "invalid row width")); }
-            if row.old_values.iter().chain(&row.new_values)
+            if !width_ok {
+                return Err(invalid(table, index, "invalid row width"));
+            }
+            if row
+                .old_values
+                .iter()
+                .chain(&row.new_values)
                 .any(|value| matches!(value, ChangesetValue::Real(number) if number.is_nan()))
             {
-                return Err(invalid(table, index, "NaN must be normalized before recording a change"));
+                return Err(invalid(
+                    table,
+                    index,
+                    "NaN must be normalized before recording a change",
+                ));
             }
-            let key = if row.op == ChangeOp::Insert { &row.new_values } else { &row.old_values };
+            let key = if row.op == ChangeOp::Insert {
+                &row.new_values
+            } else {
+                &row.old_values
+            };
             if info.pk_flags.iter().zip(key).any(|(pk, value)| {
                 *pk && matches!(value, ChangesetValue::Undefined | ChangesetValue::Null)
             }) {
-                return Err(invalid(table, index, "primary-key values must be defined and non-NULL"));
+                return Err(invalid(
+                    table,
+                    index,
+                    "primary-key values must be defined and non-NULL",
+                ));
             }
             match row.op {
                 ChangeOp::Insert if row.new_values.iter().any(undefined) => {
@@ -159,27 +234,52 @@ fn validate(changeset: &Changeset) -> ApplyResult<()> {
                     for (pk, old) in info.pk_flags.iter().zip(&row.old_values) {
                         let valid = if changeset.kind == ChangesetKind::Changeset || *pk {
                             !undefined(old)
-                        } else { undefined(old) };
-                        if !valid { return Err(invalid(table, index, "invalid DELETE old-value layout")); }
+                        } else {
+                            undefined(old)
+                        };
+                        if !valid {
+                            return Err(invalid(table, index, "invalid DELETE old-value layout"));
+                        }
                     }
                 }
                 ChangeOp::Update => {
                     let mut modified = false;
-                    for ((pk, old), new) in info.pk_flags.iter().zip(&row.old_values).zip(&row.new_values) {
+                    for ((pk, old), new) in info
+                        .pk_flags
+                        .iter()
+                        .zip(&row.old_values)
+                        .zip(&row.new_values)
+                    {
                         if *pk {
                             if !undefined(new) {
-                                return Err(invalid(table, index, "primary-key changes must be DELETE plus INSERT"));
+                                return Err(invalid(
+                                    table,
+                                    index,
+                                    "primary-key changes must be DELETE plus INSERT",
+                                ));
                             }
                         } else {
                             let valid = match changeset.kind {
                                 ChangesetKind::Changeset => undefined(old) == undefined(new),
                                 ChangesetKind::Patchset => undefined(old),
                             };
-                            if !valid { return Err(invalid(table, index, "invalid UPDATE old/new value layout")); }
+                            if !valid {
+                                return Err(invalid(
+                                    table,
+                                    index,
+                                    "invalid UPDATE old/new value layout",
+                                ));
+                            }
                             modified |= !undefined(new);
                         }
                     }
-                    if !modified { return Err(invalid(table, index, "UPDATE has no changed non-key column")); }
+                    if !modified {
+                        return Err(invalid(
+                            table,
+                            index,
+                            "UPDATE has no changed non-key column",
+                        ));
+                    }
                 }
                 ChangeOp::Insert => {}
             }
@@ -188,10 +288,15 @@ fn validate(changeset: &Changeset) -> ApplyResult<()> {
     Ok(())
 }
 
-fn quote_identifier(name: &str) -> String { format!("\"{}\"", name.replace('"', "\"\"")) }
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 fn text(row: &Row, index: usize) -> Option<&str> {
-    match row.get(index) { Some(SqliteValue::Text(value)) => Some(value), _ => None }
+    match row.get(index) {
+        Some(SqliteValue::Text(value)) => Some(value),
+        _ => None,
+    }
 }
 
 struct TablePlan {
@@ -209,14 +314,22 @@ impl TablePlan {
             "SELECT name, sql FROM main.sqlite_schema WHERE type='table' AND name = ?1 COLLATE NOCASE",
             &[SqliteValue::Text(name.as_str().into())],
         ).await?;
-        if entries.len() != 1 { return Err(schema(name, "ordinary main table does not exist")); }
+        if entries.len() != 1 {
+            return Err(schema(name, "ordinary main table does not exist"));
+        }
         let canonical = text(&entries[0], 0).ok_or_else(|| schema(name, "missing catalog name"))?;
-        let sql = text(&entries[0], 1).ok_or_else(|| schema(name, "missing CREATE TABLE statement"))?;
+        let sql =
+            text(&entries[0], 1).ok_or_else(|| schema(name, "missing CREATE TABLE statement"))?;
         let (statements, errors) = Parser::from_sql(sql).parse_all();
         if !errors.is_empty() || !matches!(statements.as_slice(), [Statement::CreateTable(_)]) {
             return Err(schema(name, "only ordinary tables are supported"));
         }
-        let columns = conn.query(&format!("PRAGMA main.table_xinfo({})", quote_identifier(canonical))).await?;
+        let columns = conn
+            .query(&format!(
+                "PRAGMA main.table_xinfo({})",
+                quote_identifier(canonical)
+            ))
+            .await?;
         if columns.len() < table.info.column_count {
             return Err(schema(name, "target has fewer columns than the changeset"));
         }
@@ -231,35 +344,72 @@ impl TablePlan {
             if usize::try_from(*cid).ok() != Some(index)
                 || !matches!(column.get(6), Some(SqliteValue::Integer(0)))
             {
-                return Err(schema(name, "hidden or generated columns are not supported"));
+                return Err(schema(
+                    name,
+                    "hidden or generated columns are not supported",
+                ));
             }
             if (*pk > 0) != table.info.pk_flags.get(index).copied().unwrap_or(false) {
                 return Err(schema(name, "primary-key columns differ"));
             }
             if index < table.info.column_count {
-                let column_name = text(column, 1).ok_or_else(|| schema(name, "missing column name"))?;
-                if column_name.contains('\0') { return Err(schema(name, "invalid column name")); }
+                let column_name =
+                    text(column, 1).ok_or_else(|| schema(name, "missing column name"))?;
+                if column_name.contains('\0') {
+                    return Err(schema(name, "invalid column name"));
+                }
                 names.push(quote_identifier(column_name));
             }
         }
         let qualified = format!("main.{}", quote_identifier(canonical));
-        let placeholders = (1..=names.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(",");
+        let placeholders = (1..=names.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
         // ABORT deliberately overrides a target's IGNORE/REPLACE default. An
         // import must not silently discard data or delete an unrelated row.
-        let insert = format!("INSERT OR ABORT INTO {qualified} ({}) VALUES ({placeholders})", names.join(","));
-        let keys = table.info.pk_flags.iter().enumerate().filter(|(_, pk)| **pk).map(|(i, _)| i).collect();
-        Ok(Self { name: canonical.to_owned(), qualified, columns: names, keys, insert })
+        let insert = format!(
+            "INSERT OR ABORT INTO {qualified} ({}) VALUES ({placeholders})",
+            names.join(",")
+        );
+        let keys = table
+            .info
+            .pk_flags
+            .iter()
+            .enumerate()
+            .filter(|(_, pk)| **pk)
+            .map(|(i, _)| i)
+            .collect();
+        Ok(Self {
+            name: canonical.to_owned(),
+            qualified,
+            columns: names,
+            keys,
+            insert,
+        })
     }
 
     fn key_predicate(&self, row: &ChangesetRow, params: &mut Vec<SqliteValue>) -> String {
-        let values = if row.op == ChangeOp::Insert { &row.new_values } else { &row.old_values };
-        self.keys.iter().map(|index| {
-            params.push(values[*index].to_sqlite());
-            format!("{} IS ?{}", self.columns[*index], params.len())
-        }).collect::<Vec<_>>().join(" AND ")
+        let values = if row.op == ChangeOp::Insert {
+            &row.new_values
+        } else {
+            &row.old_values
+        };
+        self.keys
+            .iter()
+            .map(|index| {
+                params.push(values[*index].to_sqlite());
+                format!("{} IS ?{}", self.columns[*index], params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
     }
 
-    async fn lookup(&self, conn: &Connection, change: &ChangesetRow) -> ApplyResult<Option<(Vec<SqliteValue>, bool)>> {
+    async fn lookup(
+        &self,
+        conn: &Connection,
+        change: &ChangesetRow,
+    ) -> ApplyResult<Option<(Vec<SqliteValue>, bool)>> {
         let mut params = Vec::new();
         let key = self.key_predicate(change, &mut params);
         let mut checks = Vec::new();
@@ -271,13 +421,33 @@ impl TablePlan {
                 checks.push(format!("{} IS ?{}", self.columns[index], params.len()));
             }
         }
-        let check = if checks.is_empty() { "1".to_owned() } else { checks.join(" AND ") };
-        let sql = format!("SELECT {}, ({check}) FROM {} WHERE {key} LIMIT 2", self.columns.join(","), self.qualified);
+        let check = if checks.is_empty() {
+            "1".to_owned()
+        } else {
+            checks.join(" AND ")
+        };
+        let sql = format!(
+            "SELECT {}, ({check}) FROM {} WHERE {key} LIMIT 2",
+            self.columns.join(","),
+            self.qualified
+        );
         let rows = conn.query_with_params(&sql, &params).await?;
-        if rows.len() > 1 { return Err(schema(&self.name, "primary-key lookup matched multiple rows")); }
-        let Some(row) = rows.first() else { return Ok(None); };
-        let current = (0..self.columns.len()).map(|index| row.get(index).cloned()
-            .ok_or_else(|| schema(&self.name, "short target row"))).collect::<ApplyResult<Vec<_>>>()?;
+        if rows.len() > 1 {
+            return Err(schema(
+                &self.name,
+                "primary-key lookup matched multiple rows",
+            ));
+        }
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let current = (0..self.columns.len())
+            .map(|index| {
+                row.get(index)
+                    .cloned()
+                    .ok_or_else(|| schema(&self.name, "short target row"))
+            })
+            .collect::<ApplyResult<Vec<_>>>()?;
         let matches = match row.get(self.columns.len()) {
             Some(SqliteValue::Integer(value)) => *value != 0,
             _ => return Err(schema(&self.name, "invalid old-value comparison result")),
@@ -285,14 +455,23 @@ impl TablePlan {
         Ok(Some((current, matches)))
     }
 
-    async fn delete_key(&self, conn: &Connection, change: &ChangesetRow) -> Result<(), FrankenError> {
+    async fn delete_key(
+        &self,
+        conn: &Connection,
+        change: &ChangesetRow,
+    ) -> Result<(), FrankenError> {
         let mut params = Vec::new();
         let key = self.key_predicate(change, &mut params);
-        let changed = conn.execute_with_params(
-            &format!("DELETE FROM {} WHERE {key}", self.qualified), &params,
-        ).await?;
+        let changed = conn
+            .execute_with_params(
+                &format!("DELETE FROM {} WHERE {key}", self.qualified),
+                &params,
+            )
+            .await?;
         if changed != 1 {
-            return Err(FrankenError::internal("changeset replacement lost its primary-key target"));
+            return Err(FrankenError::internal(
+                "changeset replacement lost its primary-key target",
+            ));
         }
         Ok(())
     }
@@ -317,18 +496,24 @@ impl TablePlan {
                     }
                 }
                 let key = self.key_predicate(change, &mut params);
-                format!("UPDATE OR ABORT {} SET {} WHERE {key}", self.qualified, assignments.join(","))
+                format!(
+                    "UPDATE OR ABORT {} SET {} WHERE {key}",
+                    self.qualified,
+                    assignments.join(",")
+                )
             }
         };
         let changed = conn.execute_with_params(&sql, &params).await?;
         if changed != 1 {
-            return Err(FrankenError::internal(format!("changeset DML expected one target row, changed {changed}")));
+            return Err(FrankenError::internal(format!(
+                "changeset DML expected one target row, changed {changed}"
+            )));
         }
         Ok(())
     }
 }
 
- enum WriteAttempt {
+enum WriteAttempt {
     Applied,
     /// The row savepoint has been rolled back and released successfully.
     Rejected(FrankenError),
@@ -339,13 +524,19 @@ impl TablePlan {
 /// the same savepoint as the subsequent ABORT-mode insert. Rejection restores
 /// that row and all trigger side effects before asking the handler what to do.
 async fn attempt_write(
-    conn: &Connection, plan: &TablePlan, change: &ChangesetRow, replace_insert: bool,
+    conn: &Connection,
+    plan: &TablePlan,
+    change: &ChangesetRow,
+    replace_insert: bool,
 ) -> ApplyResult<WriteAttempt> {
     conn.execute("SAVEPOINT _fsqlite_changeset_row").await?;
     let result = async {
-        if replace_insert { plan.delete_key(conn, change).await?; }
+        if replace_insert {
+            plan.delete_key(conn, change).await?;
+        }
         plan.write(conn, change).await
-    }.await;
+    }
+    .await;
     match result {
         Ok(()) => {
             conn.execute("RELEASE _fsqlite_changeset_row").await?;
@@ -354,16 +545,20 @@ async fn attempt_write(
         Err(error) => {
             // RAISE(ROLLBACK), a failed cleanup, or a lost transaction is not
             // an omittable row conflict. The whole apply must stop.
-            if !conn.in_transaction() { return Err(error.into()); }
+            if !conn.in_transaction() {
+                return Err(error.into());
+            }
             let restored = async {
                 conn.execute("ROLLBACK TO _fsqlite_changeset_row").await?;
                 conn.execute("RELEASE _fsqlite_changeset_row").await?;
                 Ok::<_, FrankenError>(())
-            }.await;
+            }
+            .await;
             match restored {
                 Ok(()) => Ok(WriteAttempt::Rejected(error)),
                 Err(rollback) => Err(SqlChangesetApplyError::Rollback {
-                    cause: Box::new(error.into()), rollback,
+                    cause: Box::new(error.into()),
+                    rollback,
                 }),
             }
         }
@@ -374,11 +569,16 @@ const fn is_row_constraint(error: &FrankenError) -> bool {
     // RaiseFail is a typed SQL trigger rejection even though the core's error
     // mapping currently calls it SQLITE_ERROR. Do not guess from text or turn
     // generic function/I/O/cancellation failures into skippable constraints.
-    matches!(error,
-        FrankenError::UniqueViolation { .. } | FrankenError::PrimaryKeyViolation
-        | FrankenError::NotNullViolation { .. } | FrankenError::CheckViolation { .. }
-        | FrankenError::ForeignKeyViolation | FrankenError::DatatypeViolation { .. }
-        | FrankenError::RtreeConstraint { .. } | FrankenError::RaiseFail(_)
+    matches!(
+        error,
+        FrankenError::UniqueViolation { .. }
+            | FrankenError::PrimaryKeyViolation
+            | FrankenError::NotNullViolation { .. }
+            | FrankenError::CheckViolation { .. }
+            | FrankenError::ForeignKeyViolation
+            | FrankenError::DatatypeViolation { .. }
+            | FrankenError::RtreeConstraint { .. }
+            | FrankenError::RaiseFail(_)
     )
 }
 
@@ -388,7 +588,11 @@ enum RowOutcome {
 }
 
 async fn apply_row<F>(
-    conn: &Connection, plan: &TablePlan, index: usize, change: &ChangesetRow, handler: &mut F,
+    conn: &Connection,
+    plan: &TablePlan,
+    index: usize,
+    change: &ChangesetRow,
+    handler: &mut F,
 ) -> ApplyResult<RowOutcome>
 where
     F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
@@ -403,36 +607,67 @@ where
     let mut replaced = false;
     if let Some(kind) = conflict {
         match handler(SqlChangesetConflict {
-            table: &plan.name, row: index, kind, change,
-            current: current.as_ref().map(|(row, _)| row.as_slice()), error: None,
+            table: &plan.name,
+            row: index,
+            kind,
+            change,
+            current: current.as_ref().map(|(row, _)| row.as_slice()),
+            error: None,
         }) {
             ConflictAction::Abort => {
-                return Err(SqlChangesetApplyError::Conflict { table: plan.name.clone(), row: index, kind });
+                return Err(SqlChangesetApplyError::Conflict {
+                    table: plan.name.clone(),
+                    row: index,
+                    kind,
+                });
             }
             ConflictAction::OmitChange => return Ok(RowOutcome::Skipped),
-            ConflictAction::Replace if matches!(kind, ConflictType::Data | ConflictType::Conflict) => {
+            ConflictAction::Replace
+                if matches!(kind, ConflictType::Data | ConflictType::Conflict) =>
+            {
                 replaced = true;
             }
             ConflictAction::Replace => {
-                return Err(SqlChangesetApplyError::InvalidResolution { table: plan.name.clone(), row: index, kind });
+                return Err(SqlChangesetApplyError::InvalidResolution {
+                    table: plan.name.clone(),
+                    row: index,
+                    kind,
+                });
             }
         }
     }
-    match attempt_write(conn, plan, change, replaced && change.op == ChangeOp::Insert).await? {
+    match attempt_write(
+        conn,
+        plan,
+        change,
+        replaced && change.op == ChangeOp::Insert,
+    )
+    .await?
+    {
         WriteAttempt::Applied => Ok(RowOutcome::Applied { replaced }),
         WriteAttempt::Rejected(error) => {
-            if !is_row_constraint(&error) { return Err(error.into()); }
+            if !is_row_constraint(&error) {
+                return Err(error.into());
+            }
             let kind = ConflictType::Constraint;
             match handler(SqlChangesetConflict {
-                table: &plan.name, row: index, kind, change,
-                current: current.as_ref().map(|(row, _)| row.as_slice()), error: Some(&error),
+                table: &plan.name,
+                row: index,
+                kind,
+                change,
+                current: current.as_ref().map(|(row, _)| row.as_slice()),
+                error: Some(&error),
             }) {
                 ConflictAction::OmitChange => Ok(RowOutcome::Skipped),
                 ConflictAction::Abort => Err(SqlChangesetApplyError::Constraint {
-                    table: plan.name.clone(), row: index, error,
+                    table: plan.name.clone(),
+                    row: index,
+                    error,
                 }),
                 ConflictAction::Replace => Err(SqlChangesetApplyError::InvalidResolution {
-                    table: plan.name.clone(), row: index, kind,
+                    table: plan.name.clone(),
+                    row: index,
+                    kind,
                 }),
             }
         }
@@ -446,17 +681,28 @@ struct ApplyTransaction<'a> {
 
 impl ApplyTransaction<'_> {
     async fn rollback(&mut self, cause: SqlChangesetApplyError) -> SqlChangesetApplyError {
-        if !self.conn.in_transaction() { self.armed = false; return cause; }
+        if !self.conn.in_transaction() {
+            self.armed = false;
+            return cause;
+        }
         match self.conn.rollback_transaction().await {
-            Ok(()) => { self.armed = false; cause }
-            Err(rollback) => SqlChangesetApplyError::Rollback { cause: Box::new(cause), rollback },
+            Ok(()) => {
+                self.armed = false;
+                cause
+            }
+            Err(rollback) => SqlChangesetApplyError::Rollback {
+                cause: Box::new(cause),
+                rollback,
+            },
         }
     }
 }
 
 impl Drop for ApplyTransaction<'_> {
     fn drop(&mut self) {
-        if self.armed { self.conn.mark_transaction_cleanup_required(); }
+        if self.armed {
+            self.conn.mark_transaction_cleanup_required();
+        }
     }
 }
 
@@ -473,7 +719,10 @@ impl Drop for ApplyTransaction<'_> {
 /// for the next SQL entry. Commit/rollback I/O errors remain explicit and are
 /// not claims that a durable transaction was undone. This API does not weaken
 /// foreign-key enforcement or change writer-concurrency defaults.
-pub async fn apply_changeset(conn: &mut Connection, changeset: &Changeset) -> ApplyResult<SqlChangesetApplyReport> {
+pub async fn apply_changeset(
+    conn: &mut Connection,
+    changeset: &Changeset,
+) -> ApplyResult<SqlChangesetApplyReport> {
     apply_changeset_with_handler(conn, changeset, |_| ConflictAction::Abort).await
 }
 
@@ -492,13 +741,17 @@ pub async fn apply_changeset(conn: &mut Connection, changeset: &Changeset) -> Ap
 /// COMMIT aborts the transaction. No global FOREIGN_KEY omit callback, rebasing
 /// or operation reordering is provided. Normal target triggers remain enabled.
 pub async fn apply_changeset_with_handler<F>(
-    conn: &mut Connection, changeset: &Changeset, mut handler: F,
+    conn: &mut Connection,
+    changeset: &Changeset,
+    mut handler: F,
 ) -> ApplyResult<SqlChangesetApplyReport>
 where
     F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
 {
     validate(changeset)?;
-    if conn.in_transaction() { return Err(FrankenError::NestedTransaction.into()); }
+    if conn.in_transaction() {
+        return Err(FrankenError::NestedTransaction.into());
+    }
     if changeset.tables.iter().all(|table| table.rows.is_empty()) {
         return Ok(SqlChangesetApplyReport::default());
     }
@@ -509,7 +762,11 @@ where
     }
     let result = async {
         let mut plans = Vec::new();
-        for table in changeset.tables.iter().filter(|table| !table.rows.is_empty()) {
+        for table in changeset
+            .tables
+            .iter()
+            .filter(|table| !table.rows.is_empty())
+        {
             plans.push((table, TablePlan::load(conn, table).await?));
         }
         let mut report = SqlChangesetApplyReport::default();
@@ -525,7 +782,8 @@ where
             }
         }
         Ok(report)
-    }.await;
+    }
+    .await;
     let report = match result {
         Ok(report) => report,
         Err(error) => return Err(transaction.rollback(error).await),
@@ -564,9 +822,17 @@ pub mod streaming {
     pub enum StreamApplyError {
         Input(ChangesetStreamError),
         Sql(SqlChangesetApplyError),
-        LengthMismatch { expected: u64, consumed: u64 },
-        Verification { detail: String },
-        Rollback { cause: Box<Self>, rollback: FrankenError },
+        LengthMismatch {
+            expected: u64,
+            consumed: u64,
+        },
+        Verification {
+            detail: String,
+        },
+        Rollback {
+            cause: Box<Self>,
+            rollback: FrankenError,
+        },
     }
 
     impl std::fmt::Display for StreamApplyError {
@@ -575,9 +841,14 @@ pub mod streaming {
                 Self::Input(error) => write!(f, "{error}"),
                 Self::Sql(error) => write!(f, "{error}"),
                 Self::LengthMismatch { expected, consumed } => {
-                    write!(f, "changeset message length mismatch: expected {expected}, consumed {consumed}")
+                    write!(
+                        f,
+                        "changeset message length mismatch: expected {expected}, consumed {consumed}"
+                    )
                 }
-                Self::Verification { detail } => write!(f, "changeset message verification failed: {detail}"),
+                Self::Verification { detail } => {
+                    write!(f, "changeset message verification failed: {detail}")
+                }
                 Self::Rollback { cause, rollback } => {
                     write!(f, "{cause}; stream rollback also failed: {rollback}")
                 }
@@ -597,15 +868,21 @@ pub mod streaming {
     }
 
     impl From<ChangesetStreamError> for StreamApplyError {
-        fn from(error: ChangesetStreamError) -> Self { Self::Input(error) }
+        fn from(error: ChangesetStreamError) -> Self {
+            Self::Input(error)
+        }
     }
 
     impl From<SqlChangesetApplyError> for StreamApplyError {
-        fn from(error: SqlChangesetApplyError) -> Self { Self::Sql(error) }
+        fn from(error: SqlChangesetApplyError) -> Self {
+            Self::Sql(error)
+        }
     }
 
     impl From<FrankenError> for StreamApplyError {
-        fn from(error: FrankenError) -> Self { Self::Sql(error.into()) }
+        fn from(error: FrankenError) -> Self {
+            Self::Sql(error.into())
+        }
     }
 
     /// Apply one complete EOF-delimited changeset or patchset atomically.
@@ -692,7 +969,8 @@ pub mod streaming {
     {
         apply_verified_with_handler(conn, cx, input, limits, expected_bytes, verify, |_| {
             ConflictAction::Abort
-        }).await
+        })
+        .await
     }
 
     /// Exact-message verification with the ordinary strict conflict handler.
@@ -711,7 +989,16 @@ pub mod streaming {
         V: FnOnce(&R) -> Result<(), String>,
         F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
     {
-        apply_checked(conn, cx, input, limits, Some(expected_bytes), verify, handler).await
+        apply_checked(
+            conn,
+            cx,
+            input,
+            limits,
+            Some(expected_bytes),
+            verify,
+            handler,
+        )
+        .await
     }
 
     async fn apply_checked<R, V, F>(
@@ -728,13 +1015,17 @@ pub mod streaming {
         V: FnOnce(&R) -> Result<(), String>,
         F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
     {
-        if conn.in_transaction() { return Err(FrankenError::NestedTransaction.into()); }
+        if conn.in_transaction() {
+            return Err(FrankenError::NestedTransaction.into());
+        }
         checkpoint(cx)?;
         if let Some(expected) = expected_bytes {
             if expected > limits.max_input_bytes {
                 return Err(ChangesetStreamError::Limit {
-                    offset: 0, resource: "declared input bytes",
-                }.into());
+                    offset: 0,
+                    resource: "declared input bytes",
+                }
+                .into());
             }
             // Bound work by the declared message too, not just the caller's
             // general policy. Never apply an attacker-supplied extra stream.
@@ -792,7 +1083,8 @@ pub mod streaming {
     }
 
     fn checkpoint(cx: &Cx) -> Result<(), StreamApplyError> {
-        cx.checkpoint().map_err(|_| ChangesetStreamError::Cancelled.into())
+        cx.checkpoint()
+            .map_err(|_| ChangesetStreamError::Cancelled.into())
     }
 
     async fn rollback(
@@ -804,8 +1096,14 @@ pub mod streaming {
             return cause;
         }
         match transaction.conn.rollback_transaction().await {
-            Ok(()) => { transaction.armed = false; cause }
-            Err(rollback) => StreamApplyError::Rollback { cause: Box::new(cause), rollback },
+            Ok(()) => {
+                transaction.armed = false;
+                cause
+            }
+            Err(rollback) => StreamApplyError::Rollback {
+                cause: Box::new(cause),
+                rollback,
+            },
         }
     }
 
@@ -838,7 +1136,8 @@ pub mod streaming {
                 return Err(SqlChangesetApplyError::Schema {
                     table: event.table.name.clone(),
                     detail: "changeset targets replication-owned metadata",
-                }.into());
+                }
+                .into());
             }
             if event.section != section {
                 section = event.section;
@@ -851,22 +1150,39 @@ pub mod streaming {
             // instead of a second interpretation of Undefined/NULL/PK rules.
             validate(&single).map_err(|error| match error {
                 SqlChangesetApplyError::InvalidChange { table, detail, .. } => {
-                    SqlChangesetApplyError::InvalidChange { table, row: event.row_index, detail }
+                    SqlChangesetApplyError::InvalidChange {
+                        table,
+                        row: event.row_index,
+                        detail,
+                    }
                 }
                 other => other,
             })?;
-            if plan.is_none() { plan = Some(TablePlan::load(conn, &single.tables[0]).await?); }
+            if plan.is_none() {
+                plan = Some(TablePlan::load(conn, &single.tables[0]).await?);
+            }
             let table_plan = plan.as_ref().ok_or_else(|| {
                 FrankenError::internal("streamed changeset lost its validated table plan")
             })?;
-            match apply_row(conn, table_plan, event.row_index, &single.tables[0].rows[0], handler).await? {
+            match apply_row(
+                conn,
+                table_plan,
+                event.row_index,
+                &single.tables[0].rows[0],
+                handler,
+            )
+            .await?
+            {
                 RowOutcome::Applied { replaced } => {
                     report.applied = report.applied.checked_add(1).ok_or_else(|| {
                         FrankenError::internal("streamed changeset applied count overflow")
                     })?;
-                    report.replaced = report.replaced.checked_add(usize::from(replaced)).ok_or_else(|| {
-                        FrankenError::internal("streamed changeset replacement count overflow")
-                    })?;
+                    report.replaced = report
+                        .replaced
+                        .checked_add(usize::from(replaced))
+                        .ok_or_else(|| {
+                            FrankenError::internal("streamed changeset replacement count overflow")
+                        })?;
                 }
                 RowOutcome::Skipped => {
                     report.skipped = report.skipped.checked_add(1).ok_or_else(|| {
@@ -887,52 +1203,113 @@ mod tests {
     use super::*;
     use fsqlite_ext_session::{Session, TableInfo};
 
-    const fn int(value: i64) -> ChangesetValue { ChangesetValue::Integer(value) }
-    fn string(value: &str) -> ChangesetValue { ChangesetValue::Text(value.to_owned()) }
+    const fn int(value: i64) -> ChangesetValue {
+        ChangesetValue::Integer(value)
+    }
+    fn string(value: &str) -> ChangesetValue {
+        ChangesetValue::Text(value.to_owned())
+    }
     fn insert(values: Vec<ChangesetValue>) -> ChangesetRow {
-        ChangesetRow { op: ChangeOp::Insert, indirect: false, old_values: Vec::new(), new_values: values }
+        ChangesetRow {
+            op: ChangeOp::Insert,
+            indirect: false,
+            old_values: Vec::new(),
+            new_values: values,
+        }
     }
     fn delete(values: Vec<ChangesetValue>) -> ChangesetRow {
-        ChangesetRow { op: ChangeOp::Delete, indirect: false, old_values: values, new_values: Vec::new() }
+        ChangesetRow {
+            op: ChangeOp::Delete,
+            indirect: false,
+            old_values: values,
+            new_values: Vec::new(),
+        }
     }
     fn update(old: Vec<ChangesetValue>, new: Vec<ChangesetValue>) -> ChangesetRow {
-        ChangesetRow { op: ChangeOp::Update, indirect: false, old_values: old, new_values: new }
+        ChangesetRow {
+            op: ChangeOp::Update,
+            indirect: false,
+            old_values: old,
+            new_values: new,
+        }
     }
     fn table(name: &str, pk: &[bool], rows: Vec<ChangesetRow>) -> TableChangeset {
-        TableChangeset { info: TableInfo { name: name.to_owned(), column_count: pk.len(), pk_flags: pk.to_vec() }, rows }
+        TableChangeset {
+            info: TableInfo {
+                name: name.to_owned(),
+                column_count: pk.len(),
+                pk_flags: pk.to_vec(),
+            },
+            rows,
+        }
     }
     fn changes(rows: Vec<ChangesetRow>) -> Changeset {
-        Changeset { kind: ChangesetKind::Changeset, tables: vec![table("t", &[true, false], rows)] }
+        Changeset {
+            kind: ChangesetKind::Changeset,
+            tables: vec![table("t", &[true, false], rows)],
+        }
     }
     async fn rows(conn: &Connection, sql: &str, width: usize) -> Vec<Vec<SqliteValue>> {
-        conn.query(sql).await.unwrap().iter().map(|row| {
-            (0..width).map(|index| row.get(index).unwrap().clone()).collect()
-        }).collect()
+        conn.query(sql)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (0..width)
+                    .map(|index| row.get(index).unwrap().clone())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
     fn recorded_changes_reach_sql_and_an_inverse_restores_the_base() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'old'),(2,'gone')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'old'),(2,'gone')")
+                .await
+                .unwrap();
             let mut session = Session::new();
             session.attach_table("t", 2, vec![true, false]);
-            session.record_update("t", vec![int(1), string("old")], vec![int(1), string("new")]);
+            session.record_update(
+                "t",
+                vec![int(1), string("old")],
+                vec![int(1), string("new")],
+            );
             session.record_delete("t", vec![int(2), string("gone")]);
             session.record_insert("t", vec![int(3), ChangesetValue::Blob(vec![0, 0xff, 0])]);
             let changeset = session.changeset();
-            assert_eq!(apply_changeset(&mut conn, &changeset).await.unwrap().applied, 3);
-            assert_eq!(rows(&conn, "SELECT * FROM t ORDER BY id", 2).await, vec![
-                vec![SqliteValue::Integer(1), SqliteValue::Text("new".into())],
-                vec![SqliteValue::Integer(3), SqliteValue::Blob(vec![0, 0xff, 0].into())],
-            ]);
+            assert_eq!(
+                apply_changeset(&mut conn, &changeset)
+                    .await
+                    .unwrap()
+                    .applied,
+                3
+            );
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t ORDER BY id", 2).await,
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Text("new".into())],
+                    vec![
+                        SqliteValue::Integer(3),
+                        SqliteValue::Blob(vec![0, 0xff, 0].into())
+                    ],
+                ]
+            );
             assert!(!conn.in_transaction());
-            apply_changeset(&mut conn, &changeset.invert().unwrap()).await.unwrap();
-            assert_eq!(rows(&conn, "SELECT * FROM t ORDER BY id", 2).await, vec![
-                vec![SqliteValue::Integer(1), SqliteValue::Text("old".into())],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("gone".into())],
-            ]);
+            apply_changeset(&mut conn, &changeset.invert().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t ORDER BY id", 2).await,
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Text("old".into())],
+                    vec![SqliteValue::Integer(2), SqliteValue::Text("gone".into())],
+                ]
+            );
         });
     }
 
@@ -940,18 +1317,48 @@ mod tests {
     fn sparse_updates_preserve_local_edits_and_extra_default_columns() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v, local, extra TEXT DEFAULT 'default')").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'old','local edit','retained')").await.unwrap();
-            let changeset = Changeset { kind: ChangesetKind::Changeset, tables: vec![table("t", &[true, false, false], vec![
-                update(vec![int(1), string("old"), ChangesetValue::Undefined],
-                    vec![ChangesetValue::Undefined, string("new"), ChangesetValue::Undefined]),
-                insert(vec![int(2), ChangesetValue::Null, string("remote")]),
-            ])] };
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v, local, extra TEXT DEFAULT 'default')",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'old','local edit','retained')")
+                .await
+                .unwrap();
+            let changeset = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![table(
+                    "t",
+                    &[true, false, false],
+                    vec![
+                        update(
+                            vec![int(1), string("old"), ChangesetValue::Undefined],
+                            vec![
+                                ChangesetValue::Undefined,
+                                string("new"),
+                                ChangesetValue::Undefined,
+                            ],
+                        ),
+                        insert(vec![int(2), ChangesetValue::Null, string("remote")]),
+                    ],
+                )],
+            };
             apply_changeset(&mut conn, &changeset).await.unwrap();
-            assert_eq!(rows(&conn, "SELECT v,local,extra FROM t ORDER BY id", 3).await, vec![
-                vec![SqliteValue::Text("new".into()), SqliteValue::Text("local edit".into()), SqliteValue::Text("retained".into())],
-                vec![SqliteValue::Null, SqliteValue::Text("remote".into()), SqliteValue::Text("default".into())],
-            ]);
+            assert_eq!(
+                rows(&conn, "SELECT v,local,extra FROM t ORDER BY id", 3).await,
+                vec![
+                    vec![
+                        SqliteValue::Text("new".into()),
+                        SqliteValue::Text("local edit".into()),
+                        SqliteValue::Text("retained".into())
+                    ],
+                    vec![
+                        SqliteValue::Null,
+                        SqliteValue::Text("remote".into()),
+                        SqliteValue::Text("default".into())
+                    ],
+                ]
+            );
         });
     }
 
@@ -959,17 +1366,42 @@ mod tests {
     fn data_conflict_rolls_back_earlier_changes_across_tables() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'local')").await.unwrap();
-            let changeset = Changeset { kind: ChangesetKind::Changeset, tables: vec![
-                table("other", &[true, false], vec![insert(vec![int(9), string("must roll back")])]),
-                table("t", &[true, false], vec![delete(vec![int(1), string("stale")])]),
-            ] };
-            assert!(matches!(apply_changeset(&mut conn, &changeset).await,
-                Err(SqlChangesetApplyError::Conflict { kind: ConflictType::Data, .. })));
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'local')")
+                .await
+                .unwrap();
+            let changeset = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![
+                    table(
+                        "other",
+                        &[true, false],
+                        vec![insert(vec![int(9), string("must roll back")])],
+                    ),
+                    table(
+                        "t",
+                        &[true, false],
+                        vec![delete(vec![int(1), string("stale")])],
+                    ),
+                ],
+            };
+            assert!(matches!(
+                apply_changeset(&mut conn, &changeset).await,
+                Err(SqlChangesetApplyError::Conflict {
+                    kind: ConflictType::Data,
+                    ..
+                })
+            ));
             assert!(rows(&conn, "SELECT * FROM other", 2).await.is_empty());
-            assert_eq!(rows(&conn, "SELECT v FROM t", 1).await, vec![vec![SqliteValue::Text("local".into())]]);
+            assert_eq!(
+                rows(&conn, "SELECT v FROM t", 1).await,
+                vec![vec![SqliteValue::Text("local".into())]]
+            );
             assert!(!conn.in_transaction());
         });
     }
@@ -978,19 +1410,42 @@ mod tests {
     fn missing_rows_and_duplicate_keys_are_explicit_conflicts() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'keep')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'keep')")
+                .await
+                .unwrap();
             for (row, expected) in [
-                (insert(vec![int(1), string("overwrite")]), ConflictType::Conflict),
-                (delete(vec![int(2), string("absent")]), ConflictType::NotFound),
-                (update(vec![int(2), string("absent")], vec![ChangesetValue::Undefined, string("new")]), ConflictType::NotFound),
+                (
+                    insert(vec![int(1), string("overwrite")]),
+                    ConflictType::Conflict,
+                ),
+                (
+                    delete(vec![int(2), string("absent")]),
+                    ConflictType::NotFound,
+                ),
+                (
+                    update(
+                        vec![int(2), string("absent")],
+                        vec![ChangesetValue::Undefined, string("new")],
+                    ),
+                    ConflictType::NotFound,
+                ),
             ] {
-                assert!(matches!(apply_changeset(&mut conn, &changes(vec![row])).await,
-                    Err(SqlChangesetApplyError::Conflict { kind, .. }) if kind == expected));
+                assert!(
+                    matches!(apply_changeset(&mut conn, &changes(vec![row])).await,
+                    Err(SqlChangesetApplyError::Conflict { kind, .. }) if kind == expected)
+                );
                 assert!(!conn.in_transaction());
             }
-            assert_eq!(rows(&conn, "SELECT * FROM t", 2).await,
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Text("keep".into())]]);
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t", 2).await,
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("keep".into())
+                ]]
+            );
         });
     }
 
@@ -998,12 +1453,26 @@ mod tests {
     fn target_ignore_policy_cannot_silently_discard_an_import() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT IGNORE)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'occupied')").await.unwrap();
-            let changeset = changes(vec![insert(vec![int(2), string("temporary")]), insert(vec![int(3), string("occupied")])]);
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT IGNORE)",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'occupied')")
+                .await
+                .unwrap();
+            let changeset = changes(vec![
+                insert(vec![int(2), string("temporary")]),
+                insert(vec![int(3), string("occupied")]),
+            ]);
             assert!(apply_changeset(&mut conn, &changeset).await.is_err());
-            assert_eq!(rows(&conn, "SELECT * FROM t", 2).await,
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Text("occupied".into())]]);
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t", 2).await,
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("occupied".into())
+                ]]
+            );
         });
     }
 
@@ -1011,16 +1480,28 @@ mod tests {
     fn decoded_patchsets_skip_absent_old_non_key_values() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'different')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'different')")
+                .await
+                .unwrap();
             let full = changes(vec![
-                update(vec![int(1), string("remote base")], vec![ChangesetValue::Undefined, string("remote end")]),
+                update(
+                    vec![int(1), string("remote base")],
+                    vec![ChangesetValue::Undefined, string("remote end")],
+                ),
                 delete(vec![int(2), string("other base")]),
             ]);
             let patch = Changeset::decode_patchset(&full.encode_patchset()).unwrap();
             assert_eq!(apply_changeset(&mut conn, &patch).await.unwrap().applied, 2);
-            assert_eq!(rows(&conn, "SELECT * FROM t", 2).await,
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Text("remote end".into())]]);
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t", 2).await,
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("remote end".into())
+                ]]
+            );
         });
     }
 
@@ -1030,13 +1511,27 @@ mod tests {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE \"odd\"\" table\"(\"key\"\"one\" TEXT, k2 INTEGER, v, PRIMARY KEY(\"key\"\"one\",k2)) WITHOUT ROWID").await.unwrap();
             let value = "'); DROP TABLE t; --";
-            let initial = Changeset { kind: ChangesetKind::Changeset, tables: vec![table("odd\" table", &[true, true, false],
-                vec![insert(vec![string("k'\""), int(7), string(value)])])] };
+            let initial = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![table(
+                    "odd\" table",
+                    &[true, true, false],
+                    vec![insert(vec![string("k'\""), int(7), string(value)])],
+                )],
+            };
             apply_changeset(&mut conn, &initial).await.unwrap();
-            assert_eq!(rows(&conn, "SELECT v FROM \"odd\"\" table\"", 1).await,
-                vec![vec![SqliteValue::Text(value.into())]]);
-            apply_changeset(&mut conn, &initial.invert().unwrap()).await.unwrap();
-            assert!(rows(&conn, "SELECT v FROM \"odd\"\" table\"", 1).await.is_empty());
+            assert_eq!(
+                rows(&conn, "SELECT v FROM \"odd\"\" table\"", 1).await,
+                vec![vec![SqliteValue::Text(value.into())]]
+            );
+            apply_changeset(&mut conn, &initial.invert().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                rows(&conn, "SELECT v FROM \"odd\"\" table\"", 1)
+                    .await
+                    .is_empty()
+            );
         });
     }
 
@@ -1045,15 +1540,29 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(id TEXT PRIMARY KEY COLLATE NOCASE, v TEXT COLLATE NOCASE, n INTEGER)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES('Key','LOCAL',12)").await.unwrap();
-            let changeset = Changeset { kind: ChangesetKind::Changeset, tables: vec![table("t", &[true, false, false], vec![
-                update(vec![string("key"), string("local"), string("12")],
-                    vec![ChangesetValue::Undefined, string("new"), int(13)]),
-            ])] };
+            conn.execute("INSERT INTO t VALUES('Key','LOCAL',12)")
+                .await
+                .unwrap();
+            let changeset = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![table(
+                    "t",
+                    &[true, false, false],
+                    vec![update(
+                        vec![string("key"), string("local"), string("12")],
+                        vec![ChangesetValue::Undefined, string("new"), int(13)],
+                    )],
+                )],
+            };
             apply_changeset(&mut conn, &changeset).await.unwrap();
-            assert_eq!(rows(&conn, "SELECT id,v,n FROM t", 3).await, vec![vec![
-                SqliteValue::Text("Key".into()), SqliteValue::Text("new".into()), SqliteValue::Integer(13),
-            ]]);
+            assert_eq!(
+                rows(&conn, "SELECT id,v,n FROM t", 3).await,
+                vec![vec![
+                    SqliteValue::Text("Key".into()),
+                    SqliteValue::Text("new".into()),
+                    SqliteValue::Integer(13),
+                ]]
+            );
         });
     }
 
@@ -1061,13 +1570,31 @@ mod tests {
     fn schema_mismatch_rejects_the_whole_apply_and_leaves_source_tables() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("CREATE TABLE incompatible(id, v PRIMARY KEY)").await.unwrap();
-            let changeset = Changeset { kind: ChangesetKind::Changeset, tables: vec![
-                table("t", &[true, false], vec![insert(vec![int(1), string("not committed")])]),
-                table("incompatible", &[true, false], vec![insert(vec![int(2), string("no")])]),
-            ] };
-            assert!(matches!(apply_changeset(&mut conn, &changeset).await, Err(SqlChangesetApplyError::Schema { .. })));
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE incompatible(id, v PRIMARY KEY)")
+                .await
+                .unwrap();
+            let changeset = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![
+                    table(
+                        "t",
+                        &[true, false],
+                        vec![insert(vec![int(1), string("not committed")])],
+                    ),
+                    table(
+                        "incompatible",
+                        &[true, false],
+                        vec![insert(vec![int(2), string("no")])],
+                    ),
+                ],
+            };
+            assert!(matches!(
+                apply_changeset(&mut conn, &changeset).await,
+                Err(SqlChangesetApplyError::Schema { .. })
+            ));
             assert!(rows(&conn, "SELECT * FROM t", 2).await.is_empty());
             assert!(!conn.in_transaction());
         });
@@ -1077,13 +1604,28 @@ mod tests {
     fn a_caller_transaction_is_neither_committed_nor_rolled_back() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
             conn.begin_transaction().await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'caller')").await.unwrap();
-            assert!(matches!(apply_changeset(&mut conn, &changes(vec![insert(vec![int(2), string("no")])])).await,
-                Err(SqlChangesetApplyError::Database(FrankenError::NestedTransaction))));
+            conn.execute("INSERT INTO t VALUES(1,'caller')")
+                .await
+                .unwrap();
+            assert!(matches!(
+                apply_changeset(
+                    &mut conn,
+                    &changes(vec![insert(vec![int(2), string("no")])])
+                )
+                .await,
+                Err(SqlChangesetApplyError::Database(
+                    FrankenError::NestedTransaction
+                ))
+            ));
             assert!(conn.in_transaction());
-            assert_eq!(rows(&conn, "SELECT count(*) FROM t", 1).await, vec![vec![SqliteValue::Integer(1)]]);
+            assert_eq!(
+                rows(&conn, "SELECT count(*) FROM t", 1).await,
+                vec![vec![SqliteValue::Integer(1)]]
+            );
             conn.commit_transaction().await.unwrap();
         });
     }
@@ -1092,16 +1634,25 @@ mod tests {
     fn invalid_public_rows_are_rejected_without_mutation_or_panics() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
             for row in [
-                insert(vec![int(1)]), insert(vec![int(1), ChangesetValue::Undefined]),
-                insert(vec![ChangesetValue::Null, int(1)]), insert(vec![int(1), ChangesetValue::Real(f64::NAN)]),
+                insert(vec![int(1)]),
+                insert(vec![int(1), ChangesetValue::Undefined]),
+                insert(vec![ChangesetValue::Null, int(1)]),
+                insert(vec![int(1), ChangesetValue::Real(f64::NAN)]),
                 delete(vec![int(1), ChangesetValue::Undefined]),
                 update(vec![int(1), int(2)], vec![int(1), int(3)]),
-                update(vec![int(1), ChangesetValue::Undefined], vec![ChangesetValue::Undefined, int(3)]),
+                update(
+                    vec![int(1), ChangesetValue::Undefined],
+                    vec![ChangesetValue::Undefined, int(3)],
+                ),
             ] {
-                assert!(matches!(apply_changeset(&mut conn, &changes(vec![row])).await,
-                    Err(SqlChangesetApplyError::InvalidChange { .. })));
+                assert!(matches!(
+                    apply_changeset(&mut conn, &changes(vec![row])).await,
+                    Err(SqlChangesetApplyError::InvalidChange { .. })
+                ));
             }
             assert!(rows(&conn, "SELECT * FROM t", 2).await.is_empty());
             assert!(!conn.in_transaction());
@@ -1112,10 +1663,17 @@ mod tests {
     fn dropped_apply_guard_records_rollback_before_next_sql() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            let guard = ApplyTransaction { conn: &conn, armed: true };
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            let guard = ApplyTransaction {
+                conn: &conn,
+                armed: true,
+            };
             conn.begin_transaction().await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'abandoned')").await.unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'abandoned')")
+                .await
+                .unwrap();
             drop(guard);
             assert!(rows(&conn, "SELECT * FROM t", 2).await.is_empty());
             assert!(!conn.in_transaction());
@@ -1126,10 +1684,17 @@ mod tests {
     fn handler_resolves_data_keys_and_missing_rows_with_committed_counts() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'occupied')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'occupied')")
+                .await
+                .unwrap();
             let mut incoming = changes(vec![
-                update(vec![int(1), string("stale")], vec![ChangesetValue::Undefined, string("merged")]),
+                update(
+                    vec![int(1), string("stale")],
+                    vec![ChangesetValue::Undefined, string("merged")],
+                ),
                 insert(vec![int(2), string("replacement")]),
                 delete(vec![int(9), string("missing")]),
                 insert(vec![int(3), string("fresh")]),
@@ -1147,16 +1712,33 @@ mod tests {
                     assert!(conflict.current.is_some());
                     ConflictAction::Replace
                 }
-            }).await.unwrap();
-            assert_eq!(observed, vec![
-                (ConflictType::Data, 0, false), (ConflictType::Conflict, 1, true),
-                (ConflictType::NotFound, 2, false),
-            ]);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 3, skipped: 1, replaced: 2 });
-            assert_eq!(rows(&conn, "SELECT v FROM t ORDER BY id", 1).await, vec![
-                vec![SqliteValue::Text("merged".into())], vec![SqliteValue::Text("replacement".into())],
-                vec![SqliteValue::Text("fresh".into())],
-            ]);
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed,
+                vec![
+                    (ConflictType::Data, 0, false),
+                    (ConflictType::Conflict, 1, true),
+                    (ConflictType::NotFound, 2, false),
+                ]
+            );
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 3,
+                    skipped: 1,
+                    replaced: 2
+                }
+            );
+            assert_eq!(
+                rows(&conn, "SELECT v FROM t ORDER BY id", 1).await,
+                vec![
+                    vec![SqliteValue::Text("merged".into())],
+                    vec![SqliteValue::Text("replacement".into())],
+                    vec![SqliteValue::Text("fresh".into())],
+                ]
+            );
         });
     }
 
@@ -1164,28 +1746,66 @@ mod tests {
     fn failed_replacement_restores_the_original_and_never_deletes_an_unrelated_unique_row() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)").await.unwrap();
-            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'original'),(2,'occupied')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'original'),(2,'occupied')")
+                .await
+                .unwrap();
             conn.execute("CREATE TRIGGER log_delete AFTER DELETE ON t BEGIN INSERT INTO audit VALUES(old.id,old.v); END").await.unwrap();
-            let incoming = changes(vec![insert(vec![int(1), string("occupied")]), insert(vec![int(3), string("later")])]);
+            let incoming = changes(vec![
+                insert(vec![int(1), string("occupied")]),
+                insert(vec![int(3), string("later")]),
+            ]);
             let mut observed = Vec::new();
             let report = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
                 observed.push(conflict.kind);
-                if conflict.kind == ConflictType::Conflict { return ConflictAction::Replace; }
+                if conflict.kind == ConflictType::Conflict {
+                    return ConflictAction::Replace;
+                }
                 assert_eq!(conflict.kind, ConflictType::Constraint);
-                assert!(matches!(conflict.error, Some(FrankenError::UniqueViolation { .. })));
-                assert_eq!(conflict.current.unwrap()[1], SqliteValue::Text("original".into()));
+                assert!(matches!(
+                    conflict.error,
+                    Some(FrankenError::UniqueViolation { .. })
+                ));
+                assert_eq!(
+                    conflict.current.unwrap()[1],
+                    SqliteValue::Text("original".into())
+                );
                 ConflictAction::OmitChange
-            }).await.unwrap();
-            assert_eq!(observed, vec![ConflictType::Conflict, ConflictType::Constraint]);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 1, skipped: 1, replaced: 0 });
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed,
+                vec![ConflictType::Conflict, ConflictType::Constraint]
+            );
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 1,
+                    skipped: 1,
+                    replaced: 0
+                }
+            );
             assert!(rows(&conn, "SELECT * FROM audit", 2).await.is_empty());
-            assert_eq!(rows(&conn, "SELECT * FROM t ORDER BY id", 2).await, vec![
-                vec![SqliteValue::Integer(1), SqliteValue::Text("original".into())],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("occupied".into())],
-                vec![SqliteValue::Integer(3), SqliteValue::Text("later".into())],
-            ]);
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t ORDER BY id", 2).await,
+                vec![
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("original".into())
+                    ],
+                    vec![
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("occupied".into())
+                    ],
+                    vec![SqliteValue::Integer(3), SqliteValue::Text("later".into())],
+                ]
+            );
         });
     }
 
@@ -1193,10 +1813,16 @@ mod tests {
     fn omitted_constraint_preserves_earlier_and_later_accepted_rows() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL CHECK(v <> 'bad'))").await.unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL CHECK(v <> 'bad'))",
+            )
+            .await
+            .unwrap();
             let incoming = changes(vec![
-                insert(vec![int(1), string("before")]), insert(vec![int(2), ChangesetValue::Null]),
-                insert(vec![int(3), string("bad")]), insert(vec![int(4), string("after")]),
+                insert(vec![int(1), string("before")]),
+                insert(vec![int(2), ChangesetValue::Null]),
+                insert(vec![int(3), string("bad")]),
+                insert(vec![int(4), string("after")]),
             ]);
             let mut observed = 0;
             let report = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
@@ -1204,11 +1830,22 @@ mod tests {
                 assert!(conflict.error.is_some());
                 observed += 1;
                 ConflictAction::OmitChange
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(observed, 2);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 2, skipped: 2, replaced: 0 });
-            assert_eq!(rows(&conn, "SELECT id FROM t ORDER BY id", 1).await,
-                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(4)]]);
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 2,
+                    skipped: 2,
+                    replaced: 0
+                }
+            );
+            assert_eq!(
+                rows(&conn, "SELECT id FROM t ORDER BY id", 1).await,
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(4)]]
+            );
         });
     }
 
@@ -1216,17 +1853,34 @@ mod tests {
     fn replace_is_illegal_for_missing_rows_and_secondary_constraints() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'occupied')").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'occupied')")
+                .await
+                .unwrap();
             for (row, kind) in [
-                (delete(vec![int(9), string("absent")]), ConflictType::NotFound),
-                (insert(vec![int(8), string("occupied")]), ConflictType::Constraint),
+                (
+                    delete(vec![int(9), string("absent")]),
+                    ConflictType::NotFound,
+                ),
+                (
+                    insert(vec![int(8), string("occupied")]),
+                    ConflictType::Constraint,
+                ),
             ] {
                 let incoming = changes(vec![insert(vec![int(2), string("must roll back")]), row]);
-                assert!(matches!(apply_changeset_with_handler(&mut conn, &incoming, |_| ConflictAction::Replace).await,
-                    Err(SqlChangesetApplyError::InvalidResolution { kind: actual, .. }) if actual == kind));
-                assert_eq!(rows(&conn, "SELECT * FROM t", 2).await,
-                    vec![vec![SqliteValue::Integer(1), SqliteValue::Text("occupied".into())]]);
+                assert!(
+                    matches!(apply_changeset_with_handler(&mut conn, &incoming, |_| ConflictAction::Replace).await,
+                    Err(SqlChangesetApplyError::InvalidResolution { kind: actual, .. }) if actual == kind)
+                );
+                assert_eq!(
+                    rows(&conn, "SELECT * FROM t", 2).await,
+                    vec![vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("occupied".into())
+                    ]]
+                );
                 assert!(!conn.in_transaction());
             }
         });
@@ -1236,19 +1890,43 @@ mod tests {
     fn failed_data_replacement_can_be_omitted_without_changing_the_row() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'occupied')").await.unwrap();
-            let incoming = changes(vec![update(vec![int(1), string("stale")],
-                vec![ChangesetValue::Undefined, string("occupied")])]);
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'local'),(2,'occupied')")
+                .await
+                .unwrap();
+            let incoming = changes(vec![update(
+                vec![int(1), string("stale")],
+                vec![ChangesetValue::Undefined, string("occupied")],
+            )]);
             let mut kinds = Vec::new();
             let report = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
                 kinds.push(conflict.kind);
-                if conflict.kind == ConflictType::Data { ConflictAction::Replace } else { ConflictAction::OmitChange }
-            }).await.unwrap();
+                if conflict.kind == ConflictType::Data {
+                    ConflictAction::Replace
+                } else {
+                    ConflictAction::OmitChange
+                }
+            })
+            .await
+            .unwrap();
             assert_eq!(kinds, vec![ConflictType::Data, ConflictType::Constraint]);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 0, skipped: 1, replaced: 0 });
-            assert_eq!(rows(&conn, "SELECT v FROM t ORDER BY id", 1).await,
-                vec![vec![SqliteValue::Text("local".into())], vec![SqliteValue::Text("occupied".into())]]);
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 0,
+                    skipped: 1,
+                    replaced: 0
+                }
+            );
+            assert_eq!(
+                rows(&conn, "SELECT v FROM t ORDER BY id", 1).await,
+                vec![
+                    vec![SqliteValue::Text("local".into())],
+                    vec![SqliteValue::Text("occupied".into())]
+                ]
+            );
         });
     }
 
@@ -1256,21 +1934,40 @@ mod tests {
     fn raising_fail_trigger_effects_are_restored_before_omitting_the_row() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("CREATE TRIGGER reject_row AFTER INSERT ON t WHEN new.v='reject' BEGIN INSERT INTO audit VALUES(new.id); SELECT RAISE(FAIL,'row rejected'); END").await.unwrap();
-            let incoming = changes(vec![insert(vec![int(1), string("reject")]), insert(vec![int(2), string("accepted")])]);
+            let incoming = changes(vec![
+                insert(vec![int(1), string("reject")]),
+                insert(vec![int(2), string("accepted")]),
+            ]);
             let mut calls = 0;
             let report = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
                 calls += 1;
                 assert_eq!(conflict.kind, ConflictType::Constraint);
                 assert!(matches!(conflict.error, Some(FrankenError::RaiseFail(_))));
                 ConflictAction::OmitChange
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(calls, 1);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 1, skipped: 1, replaced: 0 });
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 1,
+                    skipped: 1,
+                    replaced: 0
+                }
+            );
             assert!(rows(&conn, "SELECT * FROM audit", 1).await.is_empty());
-            assert_eq!(rows(&conn, "SELECT id FROM t", 1).await, vec![vec![SqliteValue::Integer(2)]]);
+            assert_eq!(
+                rows(&conn, "SELECT id FROM t", 1).await,
+                vec![vec![SqliteValue::Integer(2)]]
+            );
         });
     }
 
@@ -1278,13 +1975,23 @@ mod tests {
     fn raising_rollback_is_fatal_and_cannot_be_omitted() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
             conn.execute("CREATE TRIGGER reject_all BEFORE INSERT ON t WHEN new.v='reject' BEGIN SELECT RAISE(ROLLBACK,'transaction rejected'); END").await.unwrap();
-            let incoming = changes(vec![insert(vec![int(1), string("earlier")]), insert(vec![int(2), string("reject")])]);
+            let incoming = changes(vec![
+                insert(vec![int(1), string("earlier")]),
+                insert(vec![int(2), string("reject")]),
+            ]);
             let mut calls = 0;
-            assert!(apply_changeset_with_handler(&mut conn, &incoming, |_| {
-                calls += 1; ConflictAction::OmitChange
-            }).await.is_err());
+            assert!(
+                apply_changeset_with_handler(&mut conn, &incoming, |_| {
+                    calls += 1;
+                    ConflictAction::OmitChange
+                })
+                .await
+                .is_err()
+            );
             assert_eq!(calls, 0);
             assert!(rows(&conn, "SELECT * FROM t", 2).await.is_empty());
             assert!(!conn.in_transaction());
@@ -1296,14 +2003,24 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)").await.unwrap();
             let incoming = changes(vec![insert(vec![int(1), int(9)])]);
             let mut calls = 0;
-            assert!(apply_changeset_with_handler(&mut conn, &incoming, |_| {
-                calls += 1; ConflictAction::OmitChange
-            }).await.is_err());
-            assert_eq!(calls, 0, "commit failure must not become an omittable row conflict");
+            assert!(
+                apply_changeset_with_handler(&mut conn, &incoming, |_| {
+                    calls += 1;
+                    ConflictAction::OmitChange
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                calls, 0,
+                "commit failure must not become an omittable row conflict"
+            );
             assert!(rows(&conn, "SELECT * FROM t", 2).await.is_empty());
             assert!(!conn.in_transaction());
         });
@@ -1314,18 +2031,40 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("INSERT INTO parent VALUES(1)").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id))").await.unwrap();
-            let incoming = changes(vec![insert(vec![int(1), int(9)]), insert(vec![int(2), int(1)])]);
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id))")
+                .await
+                .unwrap();
+            let incoming = changes(vec![
+                insert(vec![int(1), int(9)]),
+                insert(vec![int(2), int(1)]),
+            ]);
             let report = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
                 assert_eq!(conflict.kind, ConflictType::Constraint);
-                assert!(matches!(conflict.error, Some(FrankenError::ForeignKeyViolation)));
+                assert!(matches!(
+                    conflict.error,
+                    Some(FrankenError::ForeignKeyViolation)
+                ));
                 ConflictAction::OmitChange
-            }).await.unwrap();
-            assert_eq!(report, SqlChangesetApplyReport { applied: 1, skipped: 1, replaced: 0 });
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 1,
+                    skipped: 1,
+                    replaced: 0
+                }
+            );
             assert!(conn.execute("INSERT INTO t VALUES(3,99)").await.is_err());
-            assert_eq!(rows(&conn, "SELECT id FROM t", 1).await, vec![vec![SqliteValue::Integer(2)]]);
+            assert_eq!(
+                rows(&conn, "SELECT id FROM t", 1).await,
+                vec![vec![SqliteValue::Integer(2)]]
+            );
         });
     }
 
@@ -1337,23 +2076,37 @@ mod tests {
 
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,'original')").await.unwrap();
-            let incoming = changes(vec![insert(vec![int(2), string("abandoned")]), insert(vec![int(1), string("conflict")])]);
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,'original')")
+                .await
+                .unwrap();
+            let incoming = changes(vec![
+                insert(vec![int(2), string("abandoned")]),
+                insert(vec![int(1), string("conflict")]),
+            ]);
             let mut future = Box::pin(apply_changeset_with_handler(&mut conn, &incoming, |_| {
                 std::panic::panic_any("changeset callback panic sentinel")
             }));
-            let result = poll_fn(|cx| {
-                match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-                    Ok(Poll::Pending) => Poll::Pending,
-                    Ok(Poll::Ready(result)) => Poll::Ready(Ok(result)),
-                    Err(panic) => Poll::Ready(Err(panic)),
-                }
-            }).await;
+            let result =
+                poll_fn(
+                    |cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                        Ok(Poll::Pending) => Poll::Pending,
+                        Ok(Poll::Ready(result)) => Poll::Ready(Ok(result)),
+                        Err(panic) => Poll::Ready(Err(panic)),
+                    },
+                )
+                .await;
             assert!(result.is_err());
             drop(future);
-            assert_eq!(rows(&conn, "SELECT * FROM t", 2).await,
-                vec![vec![SqliteValue::Integer(1), SqliteValue::Text("original".into())]]);
+            assert_eq!(
+                rows(&conn, "SELECT * FROM t", 2).await,
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("original".into())
+                ]]
+            );
             assert!(!conn.in_transaction());
         });
     }
@@ -1361,14 +2114,21 @@ mod tests {
     #[test]
     fn resource_io_and_generic_sql_errors_are_never_omittable_row_constraints() {
         for error in [
-            FrankenError::Interrupt, FrankenError::OutOfMemory, FrankenError::ReadOnly,
-            FrankenError::Io(std::io::Error::other("CHECK constraint failed: not actually a constraint")),
+            FrankenError::Interrupt,
+            FrankenError::OutOfMemory,
+            FrankenError::ReadOnly,
+            FrankenError::Io(std::io::Error::other(
+                "CHECK constraint failed: not actually a constraint",
+            )),
             FrankenError::FunctionError("FOREIGN KEY constraint failed".to_owned()),
-            FrankenError::Busy, FrankenError::DatabaseFull,
+            FrankenError::Busy,
+            FrankenError::DatabaseFull,
         ] {
             assert!(!is_row_constraint(&error));
         }
-        assert!(is_row_constraint(&FrankenError::RaiseFail("trigger rejection".to_owned())));
+        assert!(is_row_constraint(&FrankenError::RaiseFail(
+            "trigger rejection".to_owned()
+        )));
         assert!(is_row_constraint(&FrankenError::ForeignKeyViolation));
     }
 
@@ -1379,13 +2139,27 @@ mod tests {
             let directory = tempfile::tempdir().unwrap().keep();
             let path = directory.join("applied.db");
             let mut conn = Connection::open(path.to_str().unwrap()).await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .await
+                .unwrap();
             conn.execute("CREATE INDEX by_v ON t(v)").await.unwrap();
-            apply_changeset(&mut conn, &changes(vec![insert(vec![int(42), string("durable")])])).await.unwrap();
+            apply_changeset(
+                &mut conn,
+                &changes(vec![insert(vec![int(42), string("durable")])]),
+            )
+            .await
+            .unwrap();
             conn.close().await.unwrap();
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
-            assert_eq!(rows(&conn, "SELECT id FROM t INDEXED BY by_v WHERE v='durable'", 1).await,
-                vec![vec![SqliteValue::Integer(42)]]);
+            assert_eq!(
+                rows(
+                    &conn,
+                    "SELECT id FROM t INDEXED BY by_v WHERE v='durable'",
+                    1
+                )
+                .await,
+                vec![vec![SqliteValue::Integer(42)]]
+            );
             conn.close().await.unwrap();
         });
     }
@@ -1399,13 +2173,13 @@ mod streaming_apply_tests {
     use asupersync::io::{AsyncRead, ReadBuf};
     use fsqlite_ext_session::TableInfo;
     use fsqlite_types::cx::Cx;
+    use sha2::{Digest, Sha256};
     use std::cell::Cell;
     use std::future::{Future, poll_fn};
     use std::io;
     use std::pin::Pin;
     use std::rc::Rc;
     use std::task::{Context, Poll};
-    use sha2::{Digest, Sha256};
 
     struct Input {
         bytes: Vec<u8>,
@@ -1420,25 +2194,41 @@ mod streaming_apply_tests {
     impl Input {
         fn new(bytes: Vec<u8>, chunk: usize) -> Self {
             Self {
-                bytes, offset: 0, chunk, reads: Rc::new(Cell::new(0)),
-                at_end: Rc::new(Cell::new(false)), fail_at_end: false, stall_at_end: false,
+                bytes,
+                offset: 0,
+                chunk,
+                reads: Rc::new(Cell::new(0)),
+                at_end: Rc::new(Cell::new(false)),
+                fail_at_end: false,
+                stall_at_end: false,
             }
         }
     }
 
     impl AsyncRead for Input {
         fn poll_read(
-            self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             this.reads.set(this.reads.get() + 1);
-            if buf.remaining() == 0 { return Poll::Ready(Ok(())); }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
             if this.offset == this.bytes.len() {
                 this.at_end.set(true);
-                if this.fail_at_end { return Poll::Ready(Err(io::Error::other("input failed after a complete row"))); }
-                if this.stall_at_end { return Poll::Pending; }
+                if this.fail_at_end {
+                    return Poll::Ready(Err(io::Error::other("input failed after a complete row")));
+                }
+                if this.stall_at_end {
+                    return Poll::Pending;
+                }
             }
-            let n = this.chunk.min(buf.remaining()).min(this.bytes.len() - this.offset);
+            let n = this
+                .chunk
+                .min(buf.remaining())
+                .min(this.bytes.len() - this.offset);
             buf.put_slice(&this.bytes[this.offset..this.offset + n]);
             this.offset += n;
             Poll::Ready(Ok(()))
@@ -1455,18 +2245,27 @@ mod streaming_apply_tests {
 
     impl HashedInput {
         fn new(bytes: Vec<u8>, chunk: usize) -> Self {
-            Self { input: Input::new(bytes, chunk), digest: Sha256::new() }
+            Self {
+                input: Input::new(bytes, chunk),
+                digest: Sha256::new(),
+            }
         }
 
         fn check_digest(&self, expected: [u8; 32]) -> Result<(), String> {
             let actual: [u8; 32] = self.digest.clone().finalize().into();
-            if actual == expected { Ok(()) } else { Err("SHA-256 mismatch".to_owned()) }
+            if actual == expected {
+                Ok(())
+            } else {
+                Err("SHA-256 mismatch".to_owned())
+            }
         }
     }
 
     impl AsyncRead for HashedInput {
         fn poll_read(
-            self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             let before = buf.filled().len();
@@ -1482,33 +2281,55 @@ mod streaming_apply_tests {
 
     fn insert(id: i64, value: &str) -> ChangesetRow {
         ChangesetRow {
-            op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
-            new_values: vec![ChangesetValue::Integer(id), ChangesetValue::Text(value.to_owned())],
+            op: ChangeOp::Insert,
+            indirect: false,
+            old_values: Vec::new(),
+            new_values: vec![
+                ChangesetValue::Integer(id),
+                ChangesetValue::Text(value.to_owned()),
+            ],
         }
     }
 
     fn table(name: &str, rows: Vec<ChangesetRow>) -> TableChangeset {
         TableChangeset {
-            info: TableInfo { name: name.to_owned(), column_count: 2, pk_flags: vec![true, false] },
+            info: TableInfo {
+                name: name.to_owned(),
+                column_count: 2,
+                pk_flags: vec![true, false],
+            },
             rows,
         }
     }
 
     fn wire(tables: Vec<TableChangeset>) -> Vec<u8> {
-        Changeset { kind: ChangesetKind::Changeset, tables }.encode()
+        Changeset {
+            kind: ChangesetKind::Changeset,
+            tables,
+        }
+        .encode()
     }
 
     async fn setup() -> Connection {
         let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)").await.unwrap();
-        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, v TEXT)").await.unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, v TEXT)")
+            .await
+            .unwrap();
         conn.execute("CREATE TRIGGER log_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(NEW.id, NEW.v); END").await.unwrap();
         conn
     }
 
     async fn count(conn: &Connection, table: &str) -> i64 {
-        let rows = conn.query(&format!("SELECT count(*) FROM {table}")).await.unwrap();
-        let Some(SqliteValue::Integer(n)) = rows[0].get(0) else { panic!("integer count"); };
+        let rows = conn
+            .query(&format!("SELECT count(*) FROM {table}"))
+            .await
+            .unwrap();
+        let Some(SqliteValue::Integer(n)) = rows[0].get(0) else {
+            panic!("integer count");
+        };
         *n
     }
 
@@ -1523,13 +2344,35 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             for chunk in [1, 2, 7, 8192] {
                 let mut conn = setup().await;
-                let bytes = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "nul\0λ")])]);
-                let report = apply(&mut conn, &Cx::new(), Input::new(bytes, chunk), ChangesetStreamLimits::default()).await.unwrap();
-                assert_eq!(report, SqlChangesetApplyReport { applied: 2, skipped: 0, replaced: 0 });
+                let bytes = wire(vec![table(
+                    "t",
+                    vec![insert(1, "alpha"), insert(2, "nul\0λ")],
+                )]);
+                let report = apply(
+                    &mut conn,
+                    &Cx::new(),
+                    Input::new(bytes, chunk),
+                    ChangesetStreamLimits::default(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    report,
+                    SqlChangesetApplyReport {
+                        applied: 2,
+                        skipped: 0,
+                        replaced: 0
+                    }
+                );
                 assert_eq!(count(&conn, "t").await, 2);
                 assert_eq!(count(&conn, "audit").await, 2);
-                assert_eq!(conn.query_row("SELECT v FROM t WHERE id=2").await.unwrap().get(0),
-                    Some(&SqliteValue::Text("nul\0λ".into())));
+                assert_eq!(
+                    conn.query_row("SELECT v FROM t WHERE id=2")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Text("nul\0λ".into()))
+                );
                 assert!(!conn.in_transaction());
             }
         });
@@ -1538,27 +2381,62 @@ mod streaming_apply_tests {
     #[test]
     fn changeset_and_patchset_update_delete_use_the_same_sql_executor() {
         asupersync::test_utils::run_test(|| async {
-            let incoming = Changeset { kind: ChangesetKind::Changeset, tables: vec![table("t", vec![
-                ChangesetRow {
-                    op: ChangeOp::Update, indirect: false,
-                    old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("old".to_owned())],
-                    new_values: vec![ChangesetValue::Undefined, ChangesetValue::Text("new".to_owned())],
-                },
-                ChangesetRow {
-                    op: ChangeOp::Delete, indirect: true,
-                    old_values: vec![ChangesetValue::Integer(2), ChangesetValue::Text("gone".to_owned())],
-                    new_values: Vec::new(),
-                },
-            ])] };
+            let incoming = Changeset {
+                kind: ChangesetKind::Changeset,
+                tables: vec![table(
+                    "t",
+                    vec![
+                        ChangesetRow {
+                            op: ChangeOp::Update,
+                            indirect: false,
+                            old_values: vec![
+                                ChangesetValue::Integer(1),
+                                ChangesetValue::Text("old".to_owned()),
+                            ],
+                            new_values: vec![
+                                ChangesetValue::Undefined,
+                                ChangesetValue::Text("new".to_owned()),
+                            ],
+                        },
+                        ChangesetRow {
+                            op: ChangeOp::Delete,
+                            indirect: true,
+                            old_values: vec![
+                                ChangesetValue::Integer(2),
+                                ChangesetValue::Text("gone".to_owned()),
+                            ],
+                            new_values: Vec::new(),
+                        },
+                    ],
+                )],
+            };
             for patchset in [false, true] {
                 let mut conn = setup().await;
-                conn.execute("INSERT INTO t VALUES(1,'old'),(2,'gone')").await.unwrap();
-                let bytes = if patchset { incoming.encode_patchset() } else { incoming.encode() };
-                let report = apply(&mut conn, &Cx::new(), Input::new(bytes, 1), ChangesetStreamLimits::default()).await.unwrap();
+                conn.execute("INSERT INTO t VALUES(1,'old'),(2,'gone')")
+                    .await
+                    .unwrap();
+                let bytes = if patchset {
+                    incoming.encode_patchset()
+                } else {
+                    incoming.encode()
+                };
+                let report = apply(
+                    &mut conn,
+                    &Cx::new(),
+                    Input::new(bytes, 1),
+                    ChangesetStreamLimits::default(),
+                )
+                .await
+                .unwrap();
                 assert_eq!(report.applied, 2);
                 assert_eq!(count(&conn, "t").await, 1);
-                assert_eq!(conn.query_row("SELECT v FROM t WHERE id=1").await.unwrap().get(0),
-                    Some(&SqliteValue::Text("new".into())));
+                assert_eq!(
+                    conn.query_row("SELECT v FROM t WHERE id=1")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Text("new".into()))
+                );
             }
         });
     }
@@ -1571,8 +2449,16 @@ mod streaming_apply_tests {
                 let mut bytes = prefix.clone();
                 bytes.extend_from_slice(&tail);
                 let mut conn = setup().await;
-                assert!(matches!(apply(&mut conn, &Cx::new(), Input::new(bytes, 1), ChangesetStreamLimits::default()).await,
-                    Err(StreamApplyError::Input(_))));
+                assert!(matches!(
+                    apply(
+                        &mut conn,
+                        &Cx::new(),
+                        Input::new(bytes, 1),
+                        ChangesetStreamLimits::default()
+                    )
+                    .await,
+                    Err(StreamApplyError::Input(_))
+                ));
                 assert_empty(&conn).await;
             }
         });
@@ -1584,8 +2470,16 @@ mod streaming_apply_tests {
             let mut conn = setup().await;
             let mut input = Input::new(wire(vec![table("t", vec![insert(1, "first")])]), 1);
             input.fail_at_end = true;
-            assert!(matches!(apply(&mut conn, &Cx::new(), input, ChangesetStreamLimits::default()).await,
-                Err(StreamApplyError::Input(ChangesetStreamError::Io(_)))));
+            assert!(matches!(
+                apply(
+                    &mut conn,
+                    &Cx::new(),
+                    input,
+                    ChangesetStreamLimits::default()
+                )
+                .await,
+                Err(StreamApplyError::Input(ChangesetStreamError::Io(_)))
+            ));
             assert_empty(&conn).await;
         });
     }
@@ -1594,10 +2488,21 @@ mod streaming_apply_tests {
     fn late_resource_limit_failure_undoes_all_sql_and_trigger_writes() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
-            let bytes = wire(vec![table("t", vec![insert(1, "first"), insert(2, "second")])]);
-            let limits = ChangesetStreamLimits { max_rows: 1, ..ChangesetStreamLimits::default() };
-            assert!(matches!(apply(&mut conn, &Cx::new(), Input::new(bytes, 1), limits).await,
-                Err(StreamApplyError::Input(ChangesetStreamError::Limit { resource: "rows", .. }))));
+            let bytes = wire(vec![table(
+                "t",
+                vec![insert(1, "first"), insert(2, "second")],
+            )]);
+            let limits = ChangesetStreamLimits {
+                max_rows: 1,
+                ..ChangesetStreamLimits::default()
+            };
+            assert!(matches!(
+                apply(&mut conn, &Cx::new(), Input::new(bytes, 1), limits).await,
+                Err(StreamApplyError::Input(ChangesetStreamError::Limit {
+                    resource: "rows",
+                    ..
+                }))
+            ));
             assert_empty(&conn).await;
         });
     }
@@ -1607,11 +2512,24 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             for repeated in [false, true] {
                 let mut conn = setup().await;
-                let mut second = table(if repeated { "t" } else { "absent" }, vec![insert(2, "second")]);
-                if repeated { second.info.pk_flags = vec![false, true]; }
+                let mut second = table(
+                    if repeated { "t" } else { "absent" },
+                    vec![insert(2, "second")],
+                );
+                if repeated {
+                    second.info.pk_flags = vec![false, true];
+                }
                 let bytes = wire(vec![table("t", vec![insert(1, "first")]), second]);
-                assert!(matches!(apply(&mut conn, &Cx::new(), Input::new(bytes, 2), ChangesetStreamLimits::default()).await,
-                    Err(StreamApplyError::Sql(SqlChangesetApplyError::Schema { .. }))));
+                assert!(matches!(
+                    apply(
+                        &mut conn,
+                        &Cx::new(),
+                        Input::new(bytes, 2),
+                        ChangesetStreamLimits::default()
+                    )
+                    .await,
+                    Err(StreamApplyError::Sql(SqlChangesetApplyError::Schema { .. }))
+                ));
                 assert_empty(&conn).await;
             }
         });
@@ -1625,11 +2543,22 @@ mod streaming_apply_tests {
             invalid.new_values[1] = ChangesetValue::Undefined;
             let bytes = wire(vec![table("t", vec![insert(1, "first"), invalid])]);
             let mut callbacks = 0;
-            let error = apply_with_handler(&mut conn, &Cx::new(), Input::new(bytes, 1), ChangesetStreamLimits::default(), |_| {
-                callbacks += 1;
-                ConflictAction::OmitChange
-            }).await.unwrap_err();
-            assert!(matches!(error, StreamApplyError::Sql(SqlChangesetApplyError::InvalidChange { row: 1, .. })));
+            let error = apply_with_handler(
+                &mut conn,
+                &Cx::new(),
+                Input::new(bytes, 1),
+                ChangesetStreamLimits::default(),
+                |_| {
+                    callbacks += 1;
+                    ConflictAction::OmitChange
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                StreamApplyError::Sql(SqlChangesetApplyError::InvalidChange { row: 1, .. })
+            ));
             assert_eq!(callbacks, 0);
             assert_empty(&conn).await;
         });
@@ -1640,16 +2569,37 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
             let bytes = wire(vec![
-                table("t", vec![insert(1, "first"), insert(2, "first"), insert(3, "third")]),
+                table(
+                    "t",
+                    vec![insert(1, "first"), insert(2, "first"), insert(3, "third")],
+                ),
                 table("t", vec![insert(1, "duplicate"), insert(4, "fourth")]),
             ]);
             let mut seen = Vec::new();
-            let report = apply_with_handler(&mut conn, &Cx::new(), Input::new(bytes, 1), ChangesetStreamLimits::default(), |conflict| {
-                seen.push((conflict.kind, conflict.row));
-                ConflictAction::OmitChange
-            }).await.unwrap();
-            assert_eq!(seen, vec![(ConflictType::Constraint, 1), (ConflictType::Conflict, 0)]);
-            assert_eq!(report, SqlChangesetApplyReport { applied: 3, skipped: 2, replaced: 0 });
+            let report = apply_with_handler(
+                &mut conn,
+                &Cx::new(),
+                Input::new(bytes, 1),
+                ChangesetStreamLimits::default(),
+                |conflict| {
+                    seen.push((conflict.kind, conflict.row));
+                    ConflictAction::OmitChange
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                seen,
+                vec![(ConflictType::Constraint, 1), (ConflictType::Conflict, 0)]
+            );
+            assert_eq!(
+                report,
+                SqlChangesetApplyReport {
+                    applied: 3,
+                    skipped: 2,
+                    replaced: 0
+                }
+            );
             assert_eq!(count(&conn, "t").await, 3);
             assert_eq!(count(&conn, "audit").await, 3);
         });
@@ -1660,11 +2610,23 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
             conn.begin_transaction().await.unwrap();
-            conn.execute("INSERT INTO t VALUES(9,'caller')").await.unwrap();
+            conn.execute("INSERT INTO t VALUES(9,'caller')")
+                .await
+                .unwrap();
             let input = Input::new(wire(vec![table("t", vec![insert(1, "remote")])]), 1);
             let reads = Rc::clone(&input.reads);
-            assert!(matches!(apply(&mut conn, &Cx::new(), input, ChangesetStreamLimits::default()).await,
-                Err(StreamApplyError::Sql(SqlChangesetApplyError::Database(FrankenError::NestedTransaction)))));
+            assert!(matches!(
+                apply(
+                    &mut conn,
+                    &Cx::new(),
+                    input,
+                    ChangesetStreamLimits::default()
+                )
+                .await,
+                Err(StreamApplyError::Sql(SqlChangesetApplyError::Database(
+                    FrankenError::NestedTransaction
+                )))
+            ));
             assert_eq!(reads.get(), 0);
             assert!(conn.in_transaction());
             conn.commit_transaction().await.unwrap();
@@ -1680,17 +2642,36 @@ mod streaming_apply_tests {
             input.stall_at_end = true;
             let at_end = Rc::clone(&input.at_end);
             let cx = Cx::new();
-            let mut operation = Box::pin(apply(&mut conn, &cx, input, ChangesetStreamLimits::default()));
+            let mut operation = Box::pin(apply(
+                &mut conn,
+                &cx,
+                input,
+                ChangesetStreamLimits::default(),
+            ));
             poll_fn(|task_cx| {
-                assert!(operation.as_mut().poll(task_cx).is_pending(), "input must suspend after the first row");
-                if at_end.get() { Poll::Ready(()) } else { Poll::Pending }
-            }).await;
+                assert!(
+                    operation.as_mut().poll(task_cx).is_pending(),
+                    "input must suspend after the first row"
+                );
+                if at_end.get() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             drop(operation);
             // This is actual cancellation of the public future after its first
             // row was applied, not a direct construction of a cleanup guard.
             assert_empty(&conn).await;
-            let report = apply(&mut conn, &Cx::new(), Input::new(wire(vec![table("t", vec![insert(2, "next")])]), 1),
-                ChangesetStreamLimits::default()).await.unwrap();
+            let report = apply(
+                &mut conn,
+                &Cx::new(),
+                Input::new(wire(vec![table("t", vec![insert(2, "next")])]), 1),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(report.applied, 1);
             assert_eq!(count(&conn, "t").await, 1);
         });
@@ -1700,14 +2681,25 @@ mod streaming_apply_tests {
     fn cancelled_context_and_empty_stream_do_not_modify_sql() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
-            assert_eq!(apply(&mut conn, &Cx::new(), Input::new(Vec::new(), 1), ChangesetStreamLimits::default()).await.unwrap(),
-                SqlChangesetApplyReport::default());
+            assert_eq!(
+                apply(
+                    &mut conn,
+                    &Cx::new(),
+                    Input::new(Vec::new(), 1),
+                    ChangesetStreamLimits::default()
+                )
+                .await
+                .unwrap(),
+                SqlChangesetApplyReport::default()
+            );
             let cx = Cx::new();
             cx.cancel();
             let input = Input::new(wire(vec![table("t", vec![insert(1, "cancelled")])]), 1);
             let reads = Rc::clone(&input.reads);
-            assert!(matches!(apply(&mut conn, &cx, input, ChangesetStreamLimits::default()).await,
-                Err(StreamApplyError::Input(ChangesetStreamError::Cancelled))));
+            assert!(matches!(
+                apply(&mut conn, &cx, input, ChangesetStreamLimits::default()).await,
+                Err(StreamApplyError::Input(ChangesetStreamError::Cancelled))
+            ));
             assert_eq!(reads.get(), 0);
             assert_empty(&conn).await;
         });
@@ -1719,14 +2711,36 @@ mod streaming_apply_tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("streamed.db");
             let mut conn = Connection::open(path.to_str().unwrap()).await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)").await.unwrap();
-            let bytes = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "beta")])]);
-            assert_eq!(apply(&mut conn, &Cx::new(), Input::new(bytes, 1), ChangesetStreamLimits::default()).await.unwrap().applied, 2);
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+                .await
+                .unwrap();
+            let bytes = wire(vec![table(
+                "t",
+                vec![insert(1, "alpha"), insert(2, "beta")],
+            )]);
+            assert_eq!(
+                apply(
+                    &mut conn,
+                    &Cx::new(),
+                    Input::new(bytes, 1),
+                    ChangesetStreamLimits::default()
+                )
+                .await
+                .unwrap()
+                .applied,
+                2
+            );
             conn.close().await.unwrap();
             let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(count(&reopened, "t").await, 2);
-            assert_eq!(reopened.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                Some(&SqliteValue::Text("ok".into())));
+            assert_eq!(
+                reopened
+                    .query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             reopened.close().await.unwrap();
         });
     }
@@ -1736,16 +2750,27 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             for chunk in [1, 3, 8192] {
                 let mut conn = setup().await;
-                let bytes = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "beta")])]);
+                let bytes = wire(vec![table(
+                    "t",
+                    vec![insert(1, "alpha"), insert(2, "beta")],
+                )]);
                 let expected: [u8; 32] = Sha256::digest(&bytes).into();
                 let length = u64::try_from(bytes.len()).unwrap();
                 let mut checks = 0;
-                let report = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, chunk),
-                    ChangesetStreamLimits::default(), length, |input| {
+                let report = apply_verified(
+                    &mut conn,
+                    &Cx::new(),
+                    HashedInput::new(bytes, chunk),
+                    ChangesetStreamLimits::default(),
+                    length,
+                    |input| {
                         checks += 1;
                         assert!(input.input.at_end.get(), "verify only after actual EOF");
                         input.check_digest(expected)
-                    }).await.unwrap();
+                    },
+                )
+                .await
+                .unwrap();
                 assert_eq!(checks, 1);
                 assert_eq!(report.applied, 2);
                 assert_eq!(count(&conn, "t").await, 2);
@@ -1758,13 +2783,27 @@ mod streaming_apply_tests {
     fn digest_rejection_of_well_formed_sql_rolls_back_the_whole_message() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
-            let intended = wire(vec![table("t", vec![insert(1, "alpha"), insert(2, "beta")])]);
-            let altered = wire(vec![table("t", vec![insert(1, "ALPHA"), insert(2, "beta")])]);
+            let intended = wire(vec![table(
+                "t",
+                vec![insert(1, "alpha"), insert(2, "beta")],
+            )]);
+            let altered = wire(vec![table(
+                "t",
+                vec![insert(1, "ALPHA"), insert(2, "beta")],
+            )]);
             assert_eq!(intended.len(), altered.len());
             let expected: [u8; 32] = Sha256::digest(&intended).into();
             let length = u64::try_from(intended.len()).unwrap();
-            let error = apply_verified(&mut conn, &Cx::new(), HashedInput::new(altered, 1),
-                ChangesetStreamLimits::default(), length, |input| input.check_digest(expected)).await.unwrap_err();
+            let error = apply_verified(
+                &mut conn,
+                &Cx::new(),
+                HashedInput::new(altered, 1),
+                ChangesetStreamLimits::default(),
+                length,
+                |input| input.check_digest(expected),
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(error, StreamApplyError::Verification { .. }));
             assert_empty(&conn).await;
         });
@@ -1774,16 +2813,34 @@ mod streaming_apply_tests {
     fn a_missing_final_row_is_not_accepted_as_a_complete_verified_message() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
-            let complete = wire(vec![table("t", vec![insert(1, "first"), insert(2, "second")])]);
+            let complete = wire(vec![table(
+                "t",
+                vec![insert(1, "first"), insert(2, "second")],
+            )]);
             let prefix = wire(vec![table("t", vec![insert(1, "first")])]);
             let length = u64::try_from(complete.len()).unwrap();
             let prefix_length = u64::try_from(prefix.len()).unwrap();
             let mut checks = 0;
-            let result = apply_verified(&mut conn, &Cx::new(), HashedInput::new(prefix, 1),
-                ChangesetStreamLimits::default(), length, |_| { checks += 1; Ok(()) }).await;
-            assert!(matches!(result, Err(StreamApplyError::LengthMismatch { expected, consumed })
-                if expected == length && consumed == prefix_length));
-            assert_eq!(checks, 0, "a completion callback cannot waive missing bytes");
+            let result = apply_verified(
+                &mut conn,
+                &Cx::new(),
+                HashedInput::new(prefix, 1),
+                ChangesetStreamLimits::default(),
+                length,
+                |_| {
+                    checks += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(
+                matches!(result, Err(StreamApplyError::LengthMismatch { expected, consumed })
+                if expected == length && consumed == prefix_length)
+            );
+            assert_eq!(
+                checks, 0,
+                "a completion callback cannot waive missing bytes"
+            );
             assert_empty(&conn).await;
         });
     }
@@ -1792,22 +2849,47 @@ mod streaming_apply_tests {
     fn extra_valid_rows_and_oversized_declarations_cannot_extend_the_boundary() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup().await;
-            let complete = wire(vec![table("t", vec![insert(1, "first"), insert(2, "extra")])]);
+            let complete = wire(vec![table(
+                "t",
+                vec![insert(1, "first"), insert(2, "extra")],
+            )]);
             let first = wire(vec![table("t", vec![insert(1, "first")])]);
             let mut checks = 0;
-            let result = apply_verified(&mut conn, &Cx::new(), Input::new(complete, 8192),
-                ChangesetStreamLimits::default(), u64::try_from(first.len()).unwrap(), |_| {
-                    checks += 1; Ok(())
-                }).await;
-            assert!(matches!(result, Err(StreamApplyError::Input(ChangesetStreamError::Limit { resource: "input bytes", .. }))));
+            let result = apply_verified(
+                &mut conn,
+                &Cx::new(),
+                Input::new(complete, 8192),
+                ChangesetStreamLimits::default(),
+                u64::try_from(first.len()).unwrap(),
+                |_| {
+                    checks += 1;
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(StreamApplyError::Input(ChangesetStreamError::Limit {
+                    resource: "input bytes",
+                    ..
+                }))
+            ));
             assert_eq!(checks, 0);
             assert_empty(&conn).await;
 
             let input = Input::new(first, 1);
             let reads = Rc::clone(&input.reads);
-            let limits = ChangesetStreamLimits { max_input_bytes: 1, ..ChangesetStreamLimits::default() };
-            assert!(matches!(apply_verified(&mut conn, &Cx::new(), input, limits, 2, |_| Ok(())).await,
-                Err(StreamApplyError::Input(ChangesetStreamError::Limit { offset: 0, resource: "declared input bytes" }))));
+            let limits = ChangesetStreamLimits {
+                max_input_bytes: 1,
+                ..ChangesetStreamLimits::default()
+            };
+            assert!(matches!(
+                apply_verified(&mut conn, &Cx::new(), input, limits, 2, |_| Ok(())).await,
+                Err(StreamApplyError::Input(ChangesetStreamError::Limit {
+                    offset: 0,
+                    resource: "declared input bytes"
+                }))
+            ));
             assert_eq!(reads.get(), 0);
             assert_empty(&conn).await;
         });
@@ -1821,15 +2903,33 @@ mod streaming_apply_tests {
                 let length = u64::try_from(bytes.len()).unwrap();
                 let expected: [u8; 32] = Sha256::digest(&bytes).into();
                 let mut checks = 0;
-                let report = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes.clone(), 1),
-                    ChangesetStreamLimits::default(), length, |input| {
-                        checks += 1; input.check_digest(expected)
-                    }).await.unwrap();
+                let report = apply_verified(
+                    &mut conn,
+                    &Cx::new(),
+                    HashedInput::new(bytes.clone(), 1),
+                    ChangesetStreamLimits::default(),
+                    length,
+                    |input| {
+                        checks += 1;
+                        input.check_digest(expected)
+                    },
+                )
+                .await
+                .unwrap();
                 assert_eq!(checks, 1);
                 assert_eq!(report, SqlChangesetApplyReport::default());
-                assert!(matches!(apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, 1),
-                    ChangesetStreamLimits::default(), length, |_| Err("untrusted envelope".to_owned())).await,
-                    Err(StreamApplyError::Verification { .. })));
+                assert!(matches!(
+                    apply_verified(
+                        &mut conn,
+                        &Cx::new(),
+                        HashedInput::new(bytes, 1),
+                        ChangesetStreamLimits::default(),
+                        length,
+                        |_| Err("untrusted envelope".to_owned())
+                    )
+                    .await,
+                    Err(StreamApplyError::Verification { .. })
+                ));
                 assert_empty(&conn).await;
             }
         });
@@ -1843,22 +2943,42 @@ mod streaming_apply_tests {
             let bytes = wire(vec![table("t", vec![insert(1, "abandoned")])]);
             let length = u64::try_from(bytes.len()).unwrap();
             let cx = Cx::new();
-            let mut operation = Box::pin(apply_verified(&mut conn, &cx, Input::new(bytes.clone(), 1),
-                ChangesetStreamLimits::default(), length, |_| panic!("completion verifier panic")));
+            let mut operation = Box::pin(apply_verified(
+                &mut conn,
+                &cx,
+                Input::new(bytes.clone(), 1),
+                ChangesetStreamLimits::default(),
+                length,
+                |_| panic!("completion verifier panic"),
+            ));
             let panicked = poll_fn(|task_cx| {
                 match catch_unwind(AssertUnwindSafe(|| operation.as_mut().poll(task_cx))) {
                     Ok(Poll::Pending) => Poll::Pending,
                     Ok(Poll::Ready(_)) => Poll::Ready(false),
                     Err(_) => Poll::Ready(true),
                 }
-            }).await;
+            })
+            .await;
             assert!(panicked);
             drop(operation);
             assert_empty(&conn).await;
 
-            let result = apply_verified(&mut conn, &cx, Input::new(bytes, 1),
-                ChangesetStreamLimits::default(), length, |_| { cx.cancel(); Ok(()) }).await;
-            assert!(matches!(result, Err(StreamApplyError::Input(ChangesetStreamError::Cancelled))));
+            let result = apply_verified(
+                &mut conn,
+                &cx,
+                Input::new(bytes, 1),
+                ChangesetStreamLimits::default(),
+                length,
+                |_| {
+                    cx.cancel();
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(StreamApplyError::Input(ChangesetStreamError::Cancelled))
+            ));
             assert_empty(&conn).await;
         });
     }
@@ -1868,16 +2988,31 @@ mod streaming_apply_tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
                 .await.unwrap();
             let bytes = wire(vec![table("t", vec![insert(1, "99")])]);
             let length = u64::try_from(bytes.len()).unwrap();
             let expected: [u8; 32] = Sha256::digest(&bytes).into();
             let mut checks = 0;
-            let result = apply_verified(&mut conn, &Cx::new(), HashedInput::new(bytes, 1),
-                ChangesetStreamLimits::default(), length, |input| { checks += 1; input.check_digest(expected) }).await;
-            assert_eq!(checks, 1, "the completed message was verified before COMMIT");
+            let result = apply_verified(
+                &mut conn,
+                &Cx::new(),
+                HashedInput::new(bytes, 1),
+                ChangesetStreamLimits::default(),
+                length,
+                |input| {
+                    checks += 1;
+                    input.check_digest(expected)
+                },
+            )
+            .await;
+            assert_eq!(
+                checks, 1,
+                "the completed message was verified before COMMIT"
+            );
             assert!(matches!(result, Err(StreamApplyError::Sql(_))));
             assert_eq!(count(&conn, "t").await, 0);
             assert!(!conn.in_transaction());

@@ -11,8 +11,8 @@
 
 use std::fmt;
 
-use fsqlite_core::replication_sender::{PageEntry, ReplicationPacket};
 pub use fsqlite_core::replication_sender::SenderConfig;
+use fsqlite_core::replication_sender::{PageEntry, ReplicationPacket};
 use fsqlite_core::snapshot_shipping::SnapshotSender;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -91,7 +91,9 @@ fn checkpoint(cx: &Cx) -> Result<()> {
 }
 
 fn corrupt(detail: &'static str) -> FrankenError {
-    FrankenError::DatabaseCorrupt { detail: detail.to_owned() }
+    FrankenError::DatabaseCorrupt {
+        detail: detail.to_owned(),
+    }
 }
 
 /// Check the self-contained image envelope before allocating page copies.
@@ -105,16 +107,25 @@ fn image_geometry(image: &[u8], limit: usize) -> Result<(u32, u32)> {
         return Err(corrupt("snapshot source has no SQLite database header"));
     }
     let encoded = u16::from_be_bytes([image[16], image[17]]);
-    let page_size = if encoded == 1 { 65_536 } else { u32::from(encoded) };
-    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two()
+    let page_size = if encoded == 1 {
+        65_536
+    } else {
+        u32::from(encoded)
+    };
+    if !(512..=65_536).contains(&page_size)
+        || !page_size.is_power_of_two()
         || !matches!((image[18], image[19]), (1, 1) | (2, 2))
         || image[21..24] != [64, 32, 32]
     {
-        return Err(corrupt("snapshot source has invalid geometry or journal format"));
+        return Err(corrupt(
+            "snapshot source has invalid geometry or journal format",
+        ));
     }
     let size = usize::try_from(page_size).map_err(|_| FrankenError::TooBig)?;
     if image.len() < size || !image.len().is_multiple_of(size) {
-        return Err(corrupt("snapshot source contains an incomplete database page"));
+        return Err(corrupt(
+            "snapshot source contains an incomplete database page",
+        ));
     }
     let page_count = u32::try_from(image.len() / size).map_err(|_| FrankenError::TooBig)?;
     if page_count == u32::MAX {
@@ -122,7 +133,9 @@ fn image_geometry(image: &[u8], limit: usize) -> Result<(u32, u32)> {
     }
     let declared = u32::from_be_bytes(image[28..32].try_into().expect("header width"));
     if declared != 0 && image[24..28] == image[92..96] && declared != page_count {
-        return Err(corrupt("snapshot source header and physical page counts disagree"));
+        return Err(corrupt(
+            "snapshot source header and physical page counts disagree",
+        ));
     }
     Ok((page_size, page_count))
 }
@@ -170,13 +183,16 @@ impl CapturedSnapshot {
         let (page_size, page_count) = image_geometry(&image, options.max_image_bytes)?;
         let image_bytes = u64::try_from(image.len()).map_err(|_| FrankenError::TooBig)?;
         let mut pages = Vec::new();
-        pages.try_reserve_exact(usize::try_from(page_count).map_err(|_| FrankenError::TooBig)?)
+        pages
+            .try_reserve_exact(usize::try_from(page_count).map_err(|_| FrankenError::TooBig)?)
             .map_err(|_| FrankenError::OutOfMemory)?;
         for (index, data) in image.chunks_exact(page_size as usize).enumerate() {
             checkpoint(cx)?;
             let number = u32::try_from(index + 1).map_err(|_| FrankenError::TooBig)?;
             let mut bytes = Vec::new();
-            bytes.try_reserve_exact(data.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            bytes
+                .try_reserve_exact(data.len())
+                .map_err(|_| FrankenError::OutOfMemory)?;
             bytes.extend_from_slice(data);
             pages.push(PageEntry::new(number, bytes));
         }
@@ -188,31 +204,47 @@ impl CapturedSnapshot {
         let manifest = sender.manifest()?;
         let manifest_id = manifest.id();
         checkpoint(cx)?;
-        Ok(Self { sender, manifest, manifest_id, image_bytes, auth_key })
+        Ok(Self {
+            sender,
+            manifest,
+            manifest_id,
+            image_bytes,
+            auth_key,
+        })
     }
 
     #[must_use]
-    pub const fn manifest_id(&self) -> [u8; 32] { self.manifest_id }
+    pub const fn manifest_id(&self) -> [u8; 32] {
+        self.manifest_id
+    }
 
     #[must_use]
-    pub const fn manifest(&self) -> &SnapshotManifest { &self.manifest }
+    pub const fn manifest(&self) -> &SnapshotManifest {
+        &self.manifest
+    }
 
     #[must_use]
-    pub const fn image_bytes(&self) -> u64 { self.image_bytes }
+    pub const fn image_bytes(&self) -> u64 {
+        self.image_bytes
+    }
 
     /// Produce one owned, keyed V2 packet. Retain it until its send attempt is
     /// resolved; retransmitting the same packet is safe for the receiver.
     /// `None` ends this pass, not a receiver/durability acknowledgement.
     pub fn next_packet(&mut self, cx: &Cx) -> Result<Option<ReplicationPacket>> {
         checkpoint(cx)?;
-        let Some(mut packet) = self.sender.next_packet(cx)? else { return Ok(None); };
+        let Some(mut packet) = self.sender.next_packet(cx)? else {
+            return Ok(None);
+        };
         packet.attach_auth_tag(&self.auth_key);
         Ok(Some(packet))
     }
 
     /// Start a fresh pass over the same captured content and identity, without
     /// reopening or recapturing a source that may since have changed.
-    pub fn restart(&mut self) { self.sender.restart(); }
+    pub fn restart(&mut self) {
+        self.sender.restart();
+    }
 }
 
 /// A journal checkpoint and the independently verified SQL installation.
@@ -273,9 +305,16 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
         checkpoint(cx)?;
         Self::require_fresh(spool, SnapshotSpoolState::Ready)?;
         let destination = Destination::create(
-            cx, options, spool.receiver().manifest().clone(), expected_id,
+            cx,
+            options,
+            spool.receiver().manifest().clone(),
+            expected_id,
         )?;
-        Ok(Self { destination, spool, write_in_flight: false })
+        Ok(Self {
+            destination,
+            spool,
+            write_in_flight: false,
+        })
     }
 
     /// Rebuild a fresh image from a reopened journal, then continue live receive.
@@ -308,9 +347,16 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
         checkpoint(cx)?;
         Self::require_fresh(spool, SnapshotSpoolState::Replaying)?;
         let destination = Destination::create(
-            cx, options, spool.receiver().manifest().clone(), expected_id,
+            cx,
+            options,
+            spool.receiver().manifest().clone(),
+            expected_id,
         )?;
-        let mut bootstrap = Self { destination, spool, write_in_flight: false };
+        let mut bootstrap = Self {
+            destination,
+            spool,
+            write_in_flight: false,
+        };
         // Do not stop merely because the receiver has decoded every block:
         // a later record or the required checkpoint can still invalidate the
         // journal. No externally usable bootstrap exists until replay ends.
@@ -324,7 +370,8 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
     }
 
     fn require_fresh(spool: &SnapshotSpool<F>, state: SnapshotSpoolState) -> Result<()> {
-        if spool.state() != state || spool.record_count() != 0
+        if spool.state() != state
+            || spool.record_count() != 0
             || spool.receiver().blocks_decoded() != 0
             || spool.receiver().retained_payload_bytes() != 0
         {
@@ -348,7 +395,9 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
 
     /// Private staging pathname; never open it before successful finalization.
     #[must_use]
-    pub fn database_path(&self) -> &std::path::Path { &self.destination.path }
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.destination.path
+    }
 
     async fn drain_blocks(&mut self, cx: &Cx) -> Result<()> {
         // Arm BEFORE taking output: cancellation at apply_block's entry must
@@ -368,9 +417,13 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
     /// writes poison it. Restart from the journal rather than retrying an
     /// in-doubt image write. No durability acknowledgement is implicit here.
     pub async fn receive_packet(
-        &mut self, cx: &Cx, packet: &ReplicationPacket,
+        &mut self,
+        cx: &Cx,
+        packet: &ReplicationPacket,
     ) -> Result<SnapshotPacketResult> {
-        if self.progress().poisoned { return Err(FrankenError::BusyRecovery); }
+        if self.progress().poisoned {
+            return Err(FrankenError::BusyRecovery);
+        }
         let result = self.spool.append(cx, packet).await?;
         self.drain_blocks(cx).await?;
         Ok(result)
@@ -378,12 +431,15 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
 
     /// Sync the saved packet prefix, without claiming the image is installed.
     pub fn checkpoint(&mut self, cx: &Cx) -> Result<SnapshotCheckpoint> {
-        if self.progress().poisoned { return Err(FrankenError::BusyRecovery); }
+        if self.progress().poisoned {
+            return Err(FrankenError::BusyRecovery);
+        }
         self.spool.checkpoint(cx)
     }
 
     pub async fn finish_and_open(self, cx: &Cx) -> Result<JournaledSnapshotOpen> {
-        self.finish_and_open_with_env(cx, ConnectionEnv::default()).await
+        self.finish_and_open_with_env(cx, ConnectionEnv::default())
+            .await
     }
 
     /// Sync the complete journal before image verification/publication/SQL open.
@@ -392,21 +448,30 @@ impl<'a, F: VfsFile> JournaledSnapshotBootstrap<'a, F> {
     /// image/open result. A failed or abandoned finalizer can leave durable
     /// bytes without a returned receipt; it never deletes either artifact.
     pub async fn finish_and_open_with_env(
-        self, cx: &Cx, env: ConnectionEnv,
+        self,
+        cx: &Cx,
+        env: ConnectionEnv,
     ) -> Result<JournaledSnapshotOpen> {
         let progress = self.progress();
-        if progress.poisoned { return Err(FrankenError::BusyRecovery); }
-        if !progress.ready_to_finish() { return Err(FrankenError::Busy); }
+        if progress.poisoned {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if !progress.ready_to_finish() {
+            return Err(FrankenError::Busy);
+        }
         let saved = self.spool.checkpoint(cx)?;
         let installed = self.destination.finish_and_open(cx, env).await?;
-        Ok(JournaledSnapshotOpen { checkpoint: saved, installed })
+        Ok(JournaledSnapshotOpen {
+            checkpoint: saved,
+            installed,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{BootstrapOptions, SnapshotBootstrap};
+    use super::*;
     use crate::SqliteValue;
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::unix::{UnixFile, UnixVfs};
@@ -416,7 +481,10 @@ mod tests {
 
     fn with_runtime<F: std::future::Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 2).build().unwrap().block_on(future)
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn context() -> Cx {
@@ -429,10 +497,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap().keep();
         let path = root.join("source.db");
         let stock = rusqlite::Connection::open(&path).unwrap();
-        stock.execute_batch(&format!(
-            "PRAGMA page_size={page_size}; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
+        stock
+            .execute_batch(&format!(
+                "PRAGMA page_size={page_size}; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
              INSERT INTO t VALUES(1,'before');"
-        )).unwrap();
+            ))
+            .unwrap();
         stock.close().unwrap();
         fsqlite_vfs::host_fs::read(&path).unwrap()
     }
@@ -441,13 +511,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap().keep();
         let options = BootstrapOptions::new(root.join("replica"));
         let mut destination = SnapshotBootstrap::begin(
-            cx, &options, source.manifest().clone(), source.manifest_id(), KEY,
-        ).unwrap();
+            cx,
+            &options,
+            source.manifest().clone(),
+            source.manifest_id(),
+            KEY,
+        )
+        .unwrap();
         while let Some(packet) = source.next_packet(cx).unwrap() {
             assert!(packet.verify_integrity(Some(&KEY)));
             destination.receive_packet(cx, &packet).await.unwrap();
         }
-        destination.finish_and_open(cx).await.unwrap().connection.unwrap()
+        destination
+            .finish_and_open(cx)
+            .await
+            .unwrap()
+            .connection
+            .unwrap()
     }
 
     #[test]
@@ -457,26 +537,48 @@ mod tests {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("live.db");
             let mut source = Connection::open(path.to_str().unwrap()).await.unwrap();
-            source.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE); \
+            source
+                .execute(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE); \
                 CREATE VIEW names AS SELECT v FROM t; \
-                BEGIN; INSERT INTO t VALUES(1,'before'); COMMIT;").await.unwrap();
-            let mut captured = CapturedSnapshot::capture(
-                &cx, &mut source, KEY, CaptureOptions::default(),
-            ).await.unwrap();
+                BEGIN; INSERT INTO t VALUES(1,'before'); COMMIT;",
+                )
+                .await
+                .unwrap();
+            let mut captured =
+                CapturedSnapshot::capture(&cx, &mut source, KEY, CaptureOptions::default())
+                    .await
+                    .unwrap();
             let id = captured.manifest_id();
             // A peer can write before delivery; it cannot change captured bytes.
             let peer = Connection::open(path.to_str().unwrap()).await.unwrap();
             peer.execute("BEGIN; UPDATE t SET v='after'; INSERT INTO t VALUES(2,'later'); COMMIT;")
-                .await.unwrap();
+                .await
+                .unwrap();
             peer.close().await.unwrap();
             source.close().await.unwrap();
             let replica = install(&cx, &mut captured).await;
-            assert_eq!(replica.query_row("SELECT v FROM names").await.unwrap().get(0),
-                Some(&SqliteValue::Text("before".into())));
+            assert_eq!(
+                replica
+                    .query_row("SELECT v FROM names")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("before".into()))
+            );
             assert_eq!(captured.manifest_id(), id);
-            replica.execute("BEGIN; INSERT INTO t VALUES(3,'replica-write'); COMMIT;").await.unwrap();
-            assert_eq!(replica.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                Some(&SqliteValue::Text("ok".into())));
+            replica
+                .execute("BEGIN; INSERT INTO t VALUES(3,'replica-write'); COMMIT;")
+                .await
+                .unwrap();
+            assert_eq!(
+                replica
+                    .query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             replica.close().await.unwrap();
         });
     }
@@ -487,16 +589,28 @@ mod tests {
             let cx = context();
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY); BEGIN; INSERT INTO t VALUES(1);")
-                .await.unwrap();
-            assert!(CapturedSnapshot::capture(&cx, &mut conn, KEY, CaptureOptions::default())
-                .await.is_err());
+                .await
+                .unwrap();
+            assert!(
+                CapturedSnapshot::capture(&cx, &mut conn, KEY, CaptureOptions::default())
+                    .await
+                    .is_err()
+            );
             assert!(conn.in_transaction());
             conn.execute("ROLLBACK;").await.unwrap();
-            let mut captured = CapturedSnapshot::capture(&cx, &mut conn, KEY, CaptureOptions::default())
-                .await.unwrap();
+            let mut captured =
+                CapturedSnapshot::capture(&cx, &mut conn, KEY, CaptureOptions::default())
+                    .await
+                    .unwrap();
             let replica = install(&cx, &mut captured).await;
-            assert_eq!(replica.query_row("SELECT count(*) FROM t").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(0)));
+            assert_eq!(
+                replica
+                    .query_row("SELECT count(*) FROM t")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(0))
+            );
             replica.close().await.unwrap();
             conn.close().await.unwrap();
         });
@@ -506,11 +620,18 @@ mod tests {
     fn source_restart_repeats_authenticated_packets_and_fixed_identity() {
         let cx = Cx::new();
         let mut captured = CapturedSnapshot::from_image(
-            &cx, image(512), KEY, CaptureOptions {
-                coding: SenderConfig { symbol_size: 256, max_isi_multiplier: 1 },
+            &cx,
+            image(512),
+            KEY,
+            CaptureOptions {
+                coding: SenderConfig {
+                    symbol_size: 256,
+                    max_isi_multiplier: 1,
+                },
                 ..CaptureOptions::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         let id = captured.manifest_id();
         let mut first = Vec::new();
         while let Some(packet) = captured.next_packet(&cx).unwrap() {
@@ -520,7 +641,15 @@ mod tests {
         }
         captured.restart();
         for bytes in first {
-            assert_eq!(captured.next_packet(&cx).unwrap().unwrap().to_bytes().unwrap(), bytes);
+            assert_eq!(
+                captured
+                    .next_packet(&cx)
+                    .unwrap()
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                bytes
+            );
         }
         assert!(captured.next_packet(&cx).unwrap().is_none());
         assert_eq!(captured.manifest_id(), id);
@@ -531,7 +660,10 @@ mod tests {
     fn image_admission_handles_page_sizes_and_legacy_page_count_authority() {
         for page_size in [512, 8192, 65_536] {
             let original = image(page_size);
-            let expected = (page_size, u32::try_from(original.len() / page_size as usize).unwrap());
+            let expected = (
+                page_size,
+                u32::try_from(original.len() / page_size as usize).unwrap(),
+            );
             assert_eq!(image_geometry(&original, original.len()).unwrap(), expected);
             let mut legacy = original.clone();
             legacy[28..32].copy_from_slice(&0_u32.to_be_bytes());
@@ -542,7 +674,10 @@ mod tests {
             let changed_counter: [u8; 4] = legacy[24..28].try_into().unwrap();
             legacy[92..96].copy_from_slice(&changed_counter);
             assert!(image_geometry(&legacy, legacy.len()).is_err());
-            assert!(matches!(image_geometry(&original, original.len() - 1), Err(FrankenError::TooBig)));
+            assert!(matches!(
+                image_geometry(&original, original.len() - 1),
+                Err(FrankenError::TooBig)
+            ));
         }
     }
 
@@ -551,19 +686,28 @@ mod tests {
         let cx = Cx::new();
         let bytes = image(512);
         for length in [0, 15, 99, 100, 511, bytes.len() - 1] {
-            assert!(CapturedSnapshot::from_image(
-                &cx, bytes[..length].to_vec(), KEY, CaptureOptions::default(),
-            ).is_err());
+            assert!(
+                CapturedSnapshot::from_image(
+                    &cx,
+                    bytes[..length].to_vec(),
+                    KEY,
+                    CaptureOptions::default(),
+                )
+                .is_err()
+            );
         }
         for (offset, value) in [(0, b'X'), (16, 3), (18, 0), (19, 2), (21, 0)] {
             let mut invalid = bytes.clone();
             invalid[offset] = value;
-            assert!(CapturedSnapshot::from_image(&cx, invalid, KEY, CaptureOptions::default()).is_err());
+            assert!(
+                CapturedSnapshot::from_image(&cx, invalid, KEY, CaptureOptions::default()).is_err()
+            );
         }
         cx.cancel();
-        assert!(matches!(CapturedSnapshot::from_image(
-            &cx, bytes, KEY, CaptureOptions::default(),
-        ), Err(FrankenError::Interrupt)));
+        assert!(matches!(
+            CapturedSnapshot::from_image(&cx, bytes, KEY, CaptureOptions::default(),),
+            Err(FrankenError::Interrupt)
+        ));
     }
 
     async fn create_journal(
@@ -573,13 +717,23 @@ mod tests {
         limit: u64,
     ) -> SnapshotSpool<UnixFile> {
         let vfs = UnixVfs::new();
-        let (file, _) = vfs.open(cx, Some(path),
-            VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
-        ).unwrap();
+        let (file, _) = vfs
+            .open(
+                cx,
+                Some(path),
+                VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
         let receiver = super::super::ManifestSnapshotReceiver::new(
-            manifest.clone(), manifest.id(), KEY, 1 << 20,
-        ).unwrap();
-        let spool = SnapshotSpool::create(cx, file, receiver, limit).await.unwrap();
+            manifest.clone(),
+            manifest.id(),
+            KEY,
+            1 << 20,
+        )
+        .unwrap();
+        let spool = SnapshotSpool::create(cx, file, receiver, limit)
+            .await
+            .unwrap();
         vfs.sync_parent_directory(cx, path).unwrap();
         spool
     }
@@ -591,19 +745,38 @@ mod tests {
         saved: SnapshotCheckpoint,
         writable: bool,
     ) -> SnapshotSpool<UnixFile> {
-        let flags = if writable { VfsOpenFlags::READWRITE } else { VfsOpenFlags::READONLY };
+        let flags = if writable {
+            VfsOpenFlags::READWRITE
+        } else {
+            VfsOpenFlags::READONLY
+        };
         let (file, _) = UnixVfs::new().open(cx, Some(path), flags).unwrap();
         let receiver = super::super::ManifestSnapshotReceiver::new(
-            manifest.clone(), manifest.id(), KEY, 1 << 20,
-        ).unwrap();
-        SnapshotSpool::open(cx, file, receiver, 1 << 20, Some(saved)).await.unwrap()
+            manifest.clone(),
+            manifest.id(),
+            KEY,
+            1 << 20,
+        )
+        .unwrap();
+        SnapshotSpool::open(cx, file, receiver, 1 << 20, Some(saved))
+            .await
+            .unwrap()
     }
 
     fn captured_image(cx: &Cx) -> CapturedSnapshot {
-        CapturedSnapshot::from_image(cx, image(512), KEY, CaptureOptions {
-            coding: SenderConfig { symbol_size: 256, max_isi_multiplier: 1 },
-            ..CaptureOptions::default()
-        }).unwrap()
+        CapturedSnapshot::from_image(
+            cx,
+            image(512),
+            KEY,
+            CaptureOptions {
+                coding: SenderConfig {
+                    symbol_size: 256,
+                    max_isi_multiplier: 1,
+                },
+                ..CaptureOptions::default()
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -616,9 +789,9 @@ mod tests {
             let path = root.join("transfer.spool");
             let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
             let options = BootstrapOptions::new(root.join("replica"));
-            let mut bootstrap = JournaledSnapshotBootstrap::begin(
-                &cx, &options, &mut spool, manifest.id(),
-            ).unwrap();
+            let mut bootstrap =
+                JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, manifest.id())
+                    .unwrap();
             assert_eq!(bootstrap.checkpoint(&cx).unwrap().record_count, 0);
             let first = source.next_packet(&cx).unwrap().unwrap();
             assert!(first.k_source > 1);
@@ -635,24 +808,44 @@ mod tests {
             assert!(result.checkpoint.record_count > partial.record_count);
             assert_eq!(result.installed.image.byte_len, source.image_bytes());
             let conn = result.installed.connection.unwrap();
-            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
-                Some(&SqliteValue::Text("before".into())));
-            conn.execute("BEGIN; INSERT INTO t VALUES(2,'replica-only'); COMMIT;").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into()))
+            );
+            conn.execute("BEGIN; INSERT INTO t VALUES(2,'replica-only'); COMMIT;")
+                .await
+                .unwrap();
             conn.close().await.unwrap();
             spool.into_file().close(&cx).unwrap();
 
             // A reopened owner can use the acknowledged packet journal alone.
             // Recovery must not pick up writes made later on the first replica.
             let original = host_fs::read(&path).unwrap();
-            let mut reopened = reopen_journal(&cx, &path, &manifest, result.checkpoint, false).await;
+            let mut reopened =
+                reopen_journal(&cx, &path, &manifest, result.checkpoint, false).await;
             let restored = super::super::restore_spool_and_open(
-                &cx, &BootstrapOptions::new(root.join("restored")), &mut reopened, manifest.id(),
-            ).await.unwrap();
+                &cx,
+                &BootstrapOptions::new(root.join("restored")),
+                &mut reopened,
+                manifest.id(),
+            )
+            .await
+            .unwrap();
             let conn = restored.connection.unwrap();
-            assert_eq!(conn.query_row("SELECT count(*) FROM t").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(1)));
-            assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                Some(&SqliteValue::Text("ok".into())));
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM t")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(1))
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             conn.close().await.unwrap();
             reopened.into_file().close(&cx).unwrap();
             assert_eq!(host_fs::read(&path).unwrap(), original);
@@ -671,22 +864,38 @@ mod tests {
             let wire = first.to_bytes().unwrap();
             // Header + exactly one record (sequence/length, packet, chain hash).
             let limit = 40 + 12 + u64::try_from(wire.len()).unwrap() + 32;
-            let mut spool = create_journal(&cx, &root.join("bounded.spool"), &manifest, limit).await;
+            let mut spool =
+                create_journal(&cx, &root.join("bounded.spool"), &manifest, limit).await;
             let options = BootstrapOptions::new(root.join("bounded-image"));
-            let mut bootstrap = JournaledSnapshotBootstrap::begin(
-                &cx, &options, &mut spool, manifest.id(),
-            ).unwrap();
+            let mut bootstrap =
+                JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, manifest.id())
+                    .unwrap();
             let mut bad = ReplicationPacket::from_bytes(&wire).unwrap();
             bad.symbol_data[0] ^= 1;
-            assert_eq!(bootstrap.receive_packet(&cx, &bad).await.unwrap(), SnapshotPacketResult::Rejected);
+            assert_eq!(
+                bootstrap.receive_packet(&cx, &bad).await.unwrap(),
+                SnapshotPacketResult::Rejected
+            );
             assert_eq!(bootstrap.checkpoint(&cx).unwrap().record_count, 0);
-            assert_eq!(bootstrap.receive_packet(&cx, &first).await.unwrap(), SnapshotPacketResult::Accepted);
+            assert_eq!(
+                bootstrap.receive_packet(&cx, &first).await.unwrap(),
+                SnapshotPacketResult::Accepted
+            );
             let saved = bootstrap.checkpoint(&cx).unwrap();
-            assert_eq!(bootstrap.receive_packet(&cx, &first).await.unwrap(), SnapshotPacketResult::Duplicate);
-            assert!(matches!(bootstrap.receive_packet(&cx, &second).await, Err(FrankenError::TooBig)));
+            assert_eq!(
+                bootstrap.receive_packet(&cx, &first).await.unwrap(),
+                SnapshotPacketResult::Duplicate
+            );
+            assert!(matches!(
+                bootstrap.receive_packet(&cx, &second).await,
+                Err(FrankenError::TooBig)
+            ));
             assert!(!bootstrap.progress().poisoned);
             assert_eq!(bootstrap.checkpoint(&cx).unwrap(), saved);
-            assert!(matches!(bootstrap.finish_and_open(&cx).await, Err(FrankenError::Busy)));
+            assert!(matches!(
+                bootstrap.finish_and_open(&cx).await,
+                Err(FrankenError::Busy)
+            ));
             assert_eq!(spool.state(), SnapshotSpoolState::Ready);
             assert_eq!(spool.record_count(), 1);
             spool.into_file().close(&cx).unwrap();
@@ -704,7 +913,9 @@ mod tests {
             let options = BootstrapOptions::new(root.join("refused-image"));
             let mut wrong_id = manifest.id();
             wrong_id[0] ^= 1;
-            assert!(JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, wrong_id).is_err());
+            assert!(
+                JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, wrong_id).is_err()
+            );
             assert!(host_fs::metadata(&options.directory).is_err());
             let first = source.next_packet(&cx).unwrap().unwrap();
             spool.append(&cx, &first).await.unwrap();
@@ -719,23 +930,36 @@ mod tests {
     }
 
     async fn multiblock_packets(
-        cx: &Cx, root: &std::path::Path, repairs: bool,
+        cx: &Cx,
+        root: &std::path::Path,
+        repairs: bool,
     ) -> (SnapshotManifest, Vec<ReplicationPacket>, [u8; 32]) {
         use fsqlite_core::snapshot_shipping::manifest::{SnapshotFileSender, SnapshotSourceLimits};
 
-        let (file, _) = UnixVfs::new().open(cx, Some(&root.join("frozen.db")),
-            VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
-        ).unwrap();
+        let (file, _) = UnixVfs::new()
+            .open(
+                cx,
+                Some(&root.join("frozen.db")),
+                VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+            )
+            .unwrap();
         file.write(cx, &image(512), 0).await.unwrap();
         // An exclusively owned, immutable image; one database page per block
         // makes restart boundaries cover both complete and partial decoders.
-        let mut sender = SnapshotFileSender::open(cx, file,
-            SenderConfig { symbol_size: 256, max_isi_multiplier: if repairs { 4 } else { 1 } },
+        let mut sender = SnapshotFileSender::open(
+            cx,
+            file,
+            SenderConfig {
+                symbol_size: 256,
+                max_isi_multiplier: if repairs { 4 } else { 1 },
+            },
             SnapshotSourceLimits {
                 max_image_bytes: 1 << 20,
                 max_block_bytes: fsqlite_core::replication_sender::CHANGESET_HEADER_SIZE + 512 + 12,
             },
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let manifest = sender.manifest().clone();
         let hash = sender.image_blake3();
         assert!(manifest.blocks().len() > 1);
@@ -760,9 +984,9 @@ mod tests {
                 let path = root.join(format!("prefix-{split}.spool"));
                 let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
                 let abandoned = BootstrapOptions::new(root.join(format!("abandoned-{split}")));
-                let mut bootstrap = JournaledSnapshotBootstrap::begin(
-                    &cx, &abandoned, &mut spool, manifest.id(),
-                ).unwrap();
+                let mut bootstrap =
+                    JournaledSnapshotBootstrap::begin(&cx, &abandoned, &mut spool, manifest.id())
+                        .unwrap();
                 for packet in &packets[..split] {
                     bootstrap.receive_packet(&cx, packet).await.unwrap();
                 }
@@ -773,13 +997,15 @@ mod tests {
 
                 let mut reopened = reopen_journal(&cx, &path, &manifest, saved, true).await;
                 let options = BootstrapOptions::new(root.join(format!("resumed-{split}")));
-                let mut resumed = JournaledSnapshotBootstrap::resume(
-                    &cx, &options, &mut reopened, manifest.id(),
-                ).await.unwrap();
+                let mut resumed =
+                    JournaledSnapshotBootstrap::resume(&cx, &options, &mut reopened, manifest.id())
+                        .await
+                        .unwrap();
                 assert_eq!(resumed.progress(), progress);
                 if split > 0 {
                     let duplicate = resumed.receive_packet(&cx, &packets[0]).await.unwrap();
-                    assert!(matches!(duplicate,
+                    assert!(matches!(
+                        duplicate,
                         SnapshotPacketResult::Duplicate | SnapshotPacketResult::BlockAlreadyDecoded
                     ));
                 }
@@ -792,11 +1018,23 @@ mod tests {
                 let opened = resumed.finish_and_open(&cx).await.unwrap();
                 assert_eq!(opened.installed.image.image_blake3, hash);
                 let conn = opened.installed.connection.unwrap();
-                assert_eq!(conn.query_row("SELECT v FROM t WHERE id=1").await.unwrap().get(0),
-                    Some(&SqliteValue::Text("before".into())));
-                conn.execute("BEGIN; INSERT INTO t VALUES(2,'resumed'); COMMIT;").await.unwrap();
-                assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                    Some(&SqliteValue::Text("ok".into())));
+                assert_eq!(
+                    conn.query_row("SELECT v FROM t WHERE id=1")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Text("before".into()))
+                );
+                conn.execute("BEGIN; INSERT INTO t VALUES(2,'resumed'); COMMIT;")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    conn.query_row("PRAGMA integrity_check")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Text("ok".into()))
+                );
                 conn.close().await.unwrap();
                 reopened.into_file().close(&cx).unwrap();
                 assert!(host_fs::metadata(&abandoned.directory).unwrap().is_dir());
@@ -815,9 +1053,9 @@ mod tests {
             let path = root.join("torn.spool");
             let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
             let initial = BootstrapOptions::new(root.join("initial"));
-            let mut bootstrap = JournaledSnapshotBootstrap::begin(
-                &cx, &initial, &mut spool, manifest.id(),
-            ).unwrap();
+            let mut bootstrap =
+                JournaledSnapshotBootstrap::begin(&cx, &initial, &mut spool, manifest.id())
+                    .unwrap();
             bootstrap.receive_packet(&cx, &packets[0]).await.unwrap();
             let saved = bootstrap.checkpoint(&cx).unwrap();
             drop(bootstrap);
@@ -826,21 +1064,35 @@ mod tests {
             file.close(&cx).unwrap();
             let original = host_fs::read(&path).unwrap();
             let mut reopened = reopen_journal(&cx, &path, &manifest, saved, false).await;
-            assert!(matches!(JournaledSnapshotBootstrap::resume(
-                &cx, &BootstrapOptions::new(root.join("torn-attempt")), &mut reopened, manifest.id(),
-            ).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                JournaledSnapshotBootstrap::resume(
+                    &cx,
+                    &BootstrapOptions::new(root.join("torn-attempt")),
+                    &mut reopened,
+                    manifest.id(),
+                )
+                .await,
+                Err(FrankenError::BusyRecovery)
+            ));
             assert_eq!(reopened.state(), SnapshotSpoolState::TornTail);
 
             let fork_path = root.join("fork.spool");
-            let (file, _) = UnixVfs::new().open(&cx, Some(&fork_path),
-                VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
-            ).unwrap();
+            let (file, _) = UnixVfs::new()
+                .open(
+                    &cx,
+                    Some(&fork_path),
+                    VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::READWRITE,
+                )
+                .unwrap();
             let mut fork = reopened.fork_verified_prefix(&cx, file).await.unwrap();
-            UnixVfs::new().sync_parent_directory(&cx, &fork_path).unwrap();
+            UnixVfs::new()
+                .sync_parent_directory(&cx, &fork_path)
+                .unwrap();
             let options = BootstrapOptions::new(root.join("fork-image"));
-            let mut resumed = JournaledSnapshotBootstrap::resume(
-                &cx, &options, &mut fork, manifest.id(),
-            ).await.unwrap();
+            let mut resumed =
+                JournaledSnapshotBootstrap::resume(&cx, &options, &mut fork, manifest.id())
+                    .await
+                    .unwrap();
             assert_eq!(resumed.checkpoint(&cx).unwrap(), saved);
             // Retransmit the saved symbol as well; it must not add a record.
             for packet in &packets {
@@ -851,8 +1103,10 @@ mod tests {
             assert!(opened.checkpoint.record_count > saved.record_count);
             assert_eq!(opened.installed.image.image_blake3, hash);
             let conn = opened.installed.connection.unwrap();
-            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
-                Some(&SqliteValue::Text("before".into())));
+            assert_eq!(
+                conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into()))
+            );
             conn.close().await.unwrap();
             fork.into_file().close(&cx).unwrap();
             reopened.into_file().close(&cx).unwrap();
@@ -879,9 +1133,11 @@ mod tests {
             wrong.chain_hash[0] ^= 1;
             let mut reopened = reopen_journal(&cx, &path, &manifest, wrong, false).await;
             let options = BootstrapOptions::new(root.join("bad-checkpoint"));
-            assert!(matches!(JournaledSnapshotBootstrap::resume(
-                &cx, &options, &mut reopened, manifest.id(),
-            ).await, Err(FrankenError::DatabaseCorrupt { .. })));
+            assert!(matches!(
+                JournaledSnapshotBootstrap::resume(&cx, &options, &mut reopened, manifest.id(),)
+                    .await,
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
             assert!(reopened.receiver().is_complete());
             assert_eq!(reopened.record_count(), saved.record_count);
             assert_eq!(reopened.state(), SnapshotSpoolState::Poisoned);
@@ -902,9 +1158,10 @@ mod tests {
             assert!(host_fs::metadata(&refused.directory).is_err());
             assert_eq!(fresh.record_count(), 0);
             fresh.replay_next(&cx).await.unwrap().unwrap();
-            assert!(matches!(JournaledSnapshotBootstrap::resume(
-                &cx, &refused, &mut fresh, manifest.id(),
-            ).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                JournaledSnapshotBootstrap::resume(&cx, &refused, &mut fresh, manifest.id(),).await,
+                Err(FrankenError::BusyRecovery)
+            ));
             assert!(host_fs::metadata(&refused.directory).is_err());
             fresh.into_file().close(&cx).unwrap();
         });
@@ -920,9 +1177,9 @@ mod tests {
             let path = root.join("drain.spool");
             let mut spool = create_journal(&cx, &path, &manifest, 1 << 20).await;
             let options = BootstrapOptions::new(root.join("failed-drain"));
-            let mut bootstrap = JournaledSnapshotBootstrap::begin(
-                &cx, &options, &mut spool, manifest.id(),
-            ).unwrap();
+            let mut bootstrap =
+                JournaledSnapshotBootstrap::begin(&cx, &options, &mut spool, manifest.id())
+                    .unwrap();
             // Reach the exact post-append/pre-drain boundary deterministically.
             while let Some(packet) = source.next_packet(&cx).unwrap() {
                 bootstrap.spool.append(&cx, &packet).await.unwrap();
@@ -930,23 +1187,41 @@ mod tests {
             assert!(bootstrap.spool.receiver().is_complete());
             let cancelled = Cx::new();
             cancelled.cancel();
-            assert!(matches!(bootstrap.drain_blocks(&cancelled).await, Err(FrankenError::Abort)));
+            assert!(matches!(
+                bootstrap.drain_blocks(&cancelled).await,
+                Err(FrankenError::Abort)
+            ));
             assert!(bootstrap.progress().poisoned);
-            assert!(matches!(bootstrap.checkpoint(&cx), Err(FrankenError::BusyRecovery)));
-            assert!(matches!(bootstrap.finish_and_open(&cx).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                bootstrap.checkpoint(&cx),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                bootstrap.finish_and_open(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
             // Image failure is terminal for that owner, not loss of the saved
             // authenticated packets. Reopen them into a different destination.
             let saved = spool.checkpoint(&cx).unwrap();
             spool.into_file().close(&cx).unwrap();
             let mut reopened = reopen_journal(&cx, &path, &manifest, saved, true).await;
             let fresh = BootstrapOptions::new(root.join("recovered-drain"));
-            let resumed = JournaledSnapshotBootstrap::resume(
-                &cx, &fresh, &mut reopened, manifest.id(),
-            ).await.unwrap();
+            let resumed =
+                JournaledSnapshotBootstrap::resume(&cx, &fresh, &mut reopened, manifest.id())
+                    .await
+                    .unwrap();
             assert!(resumed.progress().ready_to_finish());
-            let conn = resumed.finish_and_open(&cx).await.unwrap().installed.connection.unwrap();
-            assert_eq!(conn.query_row("SELECT v FROM t").await.unwrap().get(0),
-                Some(&SqliteValue::Text("before".into())));
+            let conn = resumed
+                .finish_and_open(&cx)
+                .await
+                .unwrap()
+                .installed
+                .connection
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT v FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Text("before".into()))
+            );
             conn.close().await.unwrap();
             reopened.into_file().close(&cx).unwrap();
         });

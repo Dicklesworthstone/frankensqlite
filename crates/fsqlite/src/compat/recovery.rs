@@ -13,7 +13,9 @@ use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
 
 use crate::{Connection, ConnectionEnv, FileIdentity, FrankenError};
-pub use fsqlite_wal::native_recovery::{ExportReport as WalRecoveryReport, Options as WalRecoveryOptions};
+pub use fsqlite_wal::native_recovery::{
+    ExportReport as WalRecoveryReport, Options as WalRecoveryOptions,
+};
 
 /// A certified repair and the independent outcome of opening its database.
 ///
@@ -68,12 +70,19 @@ pub async fn repair_and_open_with_env(
     env: ConnectionEnv,
 ) -> Result<RepairedOpen> {
     if options.source.to_str().is_none() {
-        return Err(FrankenError::CannotOpen { path: options.source.clone() });
+        return Err(FrankenError::CannotOpen {
+            path: options.source.clone(),
+        });
     }
-    let (connection, recovery) = options.repair_and_open(cx, |path, identity| {
-        open_checked_source(path, identity, env)
-    }).await?;
-    Ok(RepairedOpen { recovery, connection })
+    let (connection, recovery) = options
+        .repair_and_open(cx, |path, identity| {
+            open_checked_source(path, identity, env)
+        })
+        .await?;
+    Ok(RepairedOpen {
+        recovery,
+        connection,
+    })
 }
 
 async fn open_checked_source(
@@ -83,7 +92,9 @@ async fn open_checked_source(
 ) -> Result<Connection> {
     // A relative UTF-8 input may canonicalize through a non-UTF-8 parent.
     // Never silently lossy-convert it into a different filesystem pathname.
-    let path = path.into_os_string().into_string()
+    let path = path
+        .into_os_string()
+        .into_string()
         .map_err(|path| FrankenError::CannotOpen { path: path.into() })?;
     Connection::open_existing_with_expected_identity_and_env(path, identity, env).await
 }
@@ -91,20 +102,23 @@ async fn open_checked_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_types::{ObjectId, Oti, SqliteValue};
     use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::{ObjectId, Oti, SqliteValue};
     use fsqlite_vfs::{UnixVfs, Vfs, VfsFile, host_fs};
     use fsqlite_wal::checksum::WalChecksumTransform;
     use fsqlite_wal::{
         SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
-        WAL_MAGIC_LE, WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord,
-        WalFrameHeader, WalHeader, WalSalts, append_wal_fec_group,
-        build_source_page_hashes, generate_wal_fec_repair_symbols,
+        WAL_MAGIC_LE, WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord, WalFrameHeader,
+        WalHeader, WalSalts, append_wal_fec_group, build_source_page_hashes,
+        generate_wal_fec_repair_symbols,
     };
 
     fn with_runtime<F: std::future::Future>(future: F) -> F::Output {
         asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 2).build().unwrap().block_on(future)
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn attached_context() -> Cx {
@@ -126,50 +140,84 @@ mod tests {
         let directory = tempfile::tempdir().unwrap().keep();
         let oracle_path = directory.join("oracle.db");
         let oracle = rusqlite::Connection::open(&oracle_path).unwrap();
-        oracle.execute_batch(
-            "PRAGMA page_size=512; CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT); \
+        oracle
+            .execute_batch(
+                "PRAGMA page_size=512; CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT); \
              INSERT INTO sample VALUES (1,'alpha'),(2,'beta'); PRAGMA user_version=0;",
-        ).unwrap();
+            )
+            .unwrap();
         oracle.close().unwrap();
         let mut database = host_fs::read(&oracle_path).unwrap();
         database[18..20].copy_from_slice(&[2, 2]);
         let db_size = u32::try_from(database.len() / 512).unwrap();
-        let options = WalRecoveryOptions::new(directory.join("source.db"), directory.join("original.wal"));
+        let options =
+            WalRecoveryOptions::new(directory.join("source.db"), directory.join("original.wal"));
         host_fs::write(&options.source, &database).unwrap();
-        let pages: Vec<_> = (1_u32..=3).map(|version| {
-            let mut page = database[..512].to_vec();
-            page[60..64].copy_from_slice(&version.to_be_bytes());
-            page
-        }).collect();
+        let pages: Vec<_> = (1_u32..=3)
+            .map(|version| {
+                let mut page = database[..512].to_vec();
+                page[60..64].copy_from_slice(&version.to_be_bytes());
+                page
+            })
+            .collect();
         let header = WalHeader {
-            magic: WAL_MAGIC_LE, format_version: WAL_FORMAT_VERSION, page_size: 512,
-            checkpoint_seq: 1, salts: WalSalts { salt1: 123, salt2: 456 },
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: 512,
+            checkpoint_seq: 1,
+            salts: WalSalts {
+                salt1: 123,
+                salt2: 456,
+            },
             checksum: SqliteWalChecksum::default(),
         };
         let mut wal = header.to_bytes().unwrap().to_vec();
         let mut running = WalHeader::from_bytes(&wal).unwrap().checksum;
         for (index, page) in pages.iter().enumerate() {
             let start = wal.len();
-            wal.extend_from_slice(&WalFrameHeader {
-                page_number: 1, db_size: if index == 2 { db_size } else { 0 },
-                salts: header.salts, checksum: SqliteWalChecksum::default(),
-            }.to_bytes());
+            wal.extend_from_slice(
+                &WalFrameHeader {
+                    page_number: 1,
+                    db_size: if index == 2 { db_size } else { 0 },
+                    salts: header.salts,
+                    checksum: SqliteWalChecksum::default(),
+                }
+                .to_bytes(),
+            );
             wal.extend_from_slice(page);
             running = WalChecksumTransform::for_wal_frame(&wal[start..], 512, false)
-                .unwrap().apply(running);
+                .unwrap()
+                .apply(running);
             wal[start + 16..start + 20].copy_from_slice(&running.s1.to_be_bytes());
             wal[start + 20..start + 24].copy_from_slice(&running.s2.to_be_bytes());
         }
         let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
-            wal_salt1: 123, wal_salt2: 456, start_frame_no: 1, end_frame_no: 3,
-            db_size_pages: db_size, page_size: 512, k_source: 3, r_repair: 8,
-            oti: Oti { f: 1536, al: 1, t: 512, z: 1, n: 1 },
+            wal_salt1: 123,
+            wal_salt2: 456,
+            start_frame_no: 1,
+            end_frame_no: 3,
+            db_size_pages: db_size,
+            page_size: 512,
+            k_source: 3,
+            r_repair: 8,
+            oti: Oti {
+                f: 1536,
+                al: 1,
+                t: 512,
+                z: 1,
+                n: 1,
+            },
             object_id: ObjectId::derive_from_canonical_bytes(b"sql-recovery-handoff"),
-            page_numbers: vec![1; 3], source_page_xxh3_128: build_source_page_hashes(&pages),
-        }).unwrap();
+            page_numbers: vec![1; 3],
+            source_page_xxh3_128: build_source_page_hashes(&pages),
+        })
+        .unwrap();
         let symbols = generate_wal_fec_repair_symbols(&meta, &pages).unwrap();
-        append_wal_fec_group(&companion(&options.source, "-wal-fec"),
-            &WalFecGroupRecord::new(meta, symbols).unwrap()).unwrap();
+        append_wal_fec_group(
+            &companion(&options.source, "-wal-fec"),
+            &WalFecGroupRecord::new(meta, symbols).unwrap(),
+        )
+        .unwrap();
         wal[WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 60] ^= 0xff;
         host_fs::write(&companion(&options.source, "-wal"), &wal).unwrap();
         (options, wal)
@@ -181,23 +229,44 @@ mod tests {
             let (options, original_wal) = fixture();
             let cx = attached_context();
             let outcome = repair_and_open_with_env(&cx, &options, ConnectionEnv::default())
-                .await.unwrap();
+                .await
+                .unwrap();
             assert_eq!(outcome.recovery.repaired_frames, 1);
             assert_eq!(outcome.recovery.wal_frames, 3);
             assert!(outcome.recovery.repaired_in_place);
-            assert_eq!(host_fs::read(&outcome.recovery.destination).unwrap(), original_wal);
+            assert_eq!(
+                host_fs::read(&outcome.recovery.destination).unwrap(),
+                original_wal
+            );
             let conn = outcome.connection.unwrap();
-            assert_eq!(conn.query_row("PRAGMA user_version").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(3)));
-            let rows = conn.query("SELECT id, value FROM sample ORDER BY id").await.unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(3))
+            );
+            let rows = conn
+                .query("SELECT id, value FROM sample ORDER BY id")
+                .await
+                .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("alpha".into())));
             assert_eq!(rows[1].get(1), Some(&SqliteValue::Text("beta".into())));
-            conn.execute("INSERT INTO sample VALUES (3, 'gamma')").await.unwrap();
-            assert_eq!(conn.query_row("SELECT count(*) FROM sample").await.unwrap().get(0),
-                Some(&SqliteValue::Integer(3)));
-            assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                Some(&SqliteValue::Text("ok".into())));
+            conn.execute("INSERT INTO sample VALUES (3, 'gamma')")
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM sample")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(3))
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             conn.close().await.unwrap();
         });
     }
@@ -209,8 +278,14 @@ mod tests {
             host_fs::write(&options.destination, b"existing backup").unwrap();
             let cx = attached_context();
             assert!(repair_and_open(&cx, &options).await.is_err());
-            assert_eq!(host_fs::read(&options.destination).unwrap(), b"existing backup");
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original_wal);
+            assert_eq!(
+                host_fs::read(&options.destination).unwrap(),
+                b"existing backup"
+            );
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                original_wal
+            );
         });
     }
 
@@ -219,21 +294,26 @@ mod tests {
         with_runtime(async {
             let (options, original_wal) = fixture();
             let cx = attached_context();
-            let (connection, report) = options.repair_and_open(&cx, |source, identity| async move {
-                let retired = source.with_file_name("original-main-retained.db");
-                let replacement = source.with_file_name("replacement-retained.db");
-                // Deliberately bypass cooperative namespace admission to model
-                // an external replacement. Preserve both files, then restore
-                // the original name before the identity owner is cleaned up.
-                host_fs::rename(&source, &retired)?;
-                host_fs::write(&source, b"replacement owner")?;
-                let opened = open_checked_source(source.clone(), identity, ConnectionEnv::default()).await;
-                assert!(opened.is_err(), "SQL must not follow the replacement");
-                assert_eq!(host_fs::read(&source)?, b"replacement owner");
-                host_fs::rename(&source, &replacement)?;
-                host_fs::rename(&retired, &source)?;
-                opened
-            }).await.unwrap();
+            let (connection, report) = options
+                .repair_and_open(&cx, |source, identity| async move {
+                    let retired = source.with_file_name("original-main-retained.db");
+                    let replacement = source.with_file_name("replacement-retained.db");
+                    // Deliberately bypass cooperative namespace admission to model
+                    // an external replacement. Preserve both files, then restore
+                    // the original name before the identity owner is cleaned up.
+                    host_fs::rename(&source, &retired)?;
+                    host_fs::write(&source, b"replacement owner")?;
+                    let opened =
+                        open_checked_source(source.clone(), identity, ConnectionEnv::default())
+                            .await;
+                    assert!(opened.is_err(), "SQL must not follow the replacement");
+                    assert_eq!(host_fs::read(&source)?, b"replacement owner");
+                    host_fs::rename(&source, &replacement)?;
+                    host_fs::rename(&retired, &source)?;
+                    opened
+                })
+                .await
+                .unwrap();
             assert!(connection.is_err());
             assert!(report.repaired_in_place);
             assert_eq!(report.repaired_frames, 1);
@@ -247,17 +327,28 @@ mod tests {
             let (options, _) = fixture();
             let cx = attached_context();
             let vfs = UnixVfs::new();
-            let (mut guard, _) = vfs.open(&cx, Some(&options.source),
-                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+            let (mut guard, _) = vfs
+                .open(
+                    &cx,
+                    Some(&options.source),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+                )
+                .unwrap();
             let identity = guard.file_identity().unwrap().unwrap();
             let other = options.source.with_file_name("other.db");
             host_fs::write(&other, b"unrelated owner").unwrap();
-            assert!(open_checked_source(other.clone(), identity, ConnectionEnv::default())
-                .await.is_err());
+            assert!(
+                open_checked_source(other.clone(), identity, ConnectionEnv::default())
+                    .await
+                    .is_err()
+            );
             assert_eq!(host_fs::read(&other).unwrap(), b"unrelated owner");
             let missing = options.source.with_file_name("missing.db");
-            assert!(open_checked_source(missing.clone(), identity, ConnectionEnv::default())
-                .await.is_err());
+            assert!(
+                open_checked_source(missing.clone(), identity, ConnectionEnv::default())
+                    .await
+                    .is_err()
+            );
             assert!(!vfs.path_entry_exists(&cx, &missing).unwrap());
             guard.close(&cx).unwrap();
         });
@@ -269,9 +360,15 @@ mod tests {
             let (options, original_wal) = fixture();
             let cx = attached_context();
             cx.cancel();
-            assert!(matches!(repair_and_open(&cx, &options).await, Err(FrankenError::Interrupt)));
+            assert!(matches!(
+                repair_and_open(&cx, &options).await,
+                Err(FrankenError::Interrupt)
+            ));
             assert!(!options.destination.exists());
-            assert_eq!(host_fs::read(&companion(&options.source, "-wal")).unwrap(), original_wal);
+            assert_eq!(
+                host_fs::read(&companion(&options.source, "-wal")).unwrap(),
+                original_wal
+            );
         });
     }
 
@@ -284,7 +381,10 @@ mod tests {
             host_fs::write(&source, b"untouched").unwrap();
             let options = WalRecoveryOptions::new(&source, directory.join("new-backup.wal"));
             let cx = attached_context();
-            assert!(matches!(repair_and_open(&cx, &options).await, Err(FrankenError::CannotOpen { .. })));
+            assert!(matches!(
+                repair_and_open(&cx, &options).await,
+                Err(FrankenError::CannotOpen { .. })
+            ));
             assert!(!options.destination.exists());
             assert_eq!(host_fs::read(&source).unwrap(), b"untouched");
         });

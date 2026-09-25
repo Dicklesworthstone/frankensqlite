@@ -436,7 +436,10 @@ mod tests {
             }
             conn.execute("COMMIT").await.unwrap();
             assert_eq!(
-                conn.query("SELECT value FROM caller_data").await.unwrap().len(),
+                conn.query("SELECT value FROM caller_data")
+                    .await
+                    .unwrap()
+                    .len(),
                 1
             );
         });
@@ -482,7 +485,9 @@ mod tests {
             use std::task::Poll;
 
             let conn = mem_conn().await;
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let parked = Cell::new(false);
             // Exercise the same owner used by apply_one_once, with a
             // deterministic suspension after real transactional DDL and DML.
@@ -508,7 +513,12 @@ mod tests {
             assert!(conn.in_transaction());
             drop(attempt);
 
-            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(!conn.in_transaction());
             assert!(
                 conn.query("SELECT name FROM sqlite_master WHERE name = 'abandoned'")
@@ -518,7 +528,10 @@ mod tests {
             );
             conn.execute("INSERT INTO data VALUES (2)").await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(2))
             );
         });
@@ -538,7 +551,10 @@ mod tests {
             assert!(conn.in_transaction());
             conn.execute("COMMIT").await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(99))
             );
         });
@@ -604,7 +620,10 @@ mod tests {
                 .unwrap();
             assert_eq!(result.applied, vec![1]);
             assert!(!conn.in_transaction());
-            let rows = conn.query("SELECT value FROM data ORDER BY value").await.unwrap();
+            let rows = conn
+                .query("SELECT value FROM data ORDER BY value")
+                .await
+                .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
             assert_eq!(rows[1].get(0), Some(&SqliteValue::Integer(3)));
@@ -631,7 +650,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM audit").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM audit")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Text("BEGIN; COMMIT; ROLLBACK; END;".into()))
             );
             assert!(!conn.in_transaction());
@@ -643,7 +665,11 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = mem_conn().await;
             let error = MigrationRunner::new()
-                .add(1, "bad_tail", "CREATE TABLE escaped(value INTEGER); INSERT INTO")
+                .add(
+                    1,
+                    "bad_tail",
+                    "CREATE TABLE escaped(value INTEGER); INSERT INTO",
+                )
                 .run(&conn)
                 .await
                 .unwrap_err();
@@ -669,18 +695,31 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let conn = mem_conn().await;
             let error = MigrationRunner::new()
-                .add(1, "baseline", "CREATE TABLE baseline(value INTEGER); INSERT INTO baseline VALUES (9);")
-                .add(2, "premature_commit", "CREATE TABLE escaped(value INTEGER); COMMIT;")
+                .add(
+                    1,
+                    "baseline",
+                    "CREATE TABLE baseline(value INTEGER); INSERT INTO baseline VALUES (9);",
+                )
+                .add(
+                    2,
+                    "premature_commit",
+                    "CREATE TABLE escaped(value INTEGER); COMMIT;",
+                )
                 .run(&conn)
                 .await
                 .unwrap_err();
             assert!(matches!(error, FrankenError::FunctionError(_)));
             assert_eq!(
-                conn.query_row("SELECT value FROM baseline").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM baseline")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(9))
             );
-            let versions = conn.query("SELECT version FROM main._schema_migrations")
-                .await.unwrap();
+            let versions = conn
+                .query("SELECT version FROM main._schema_migrations")
+                .await
+                .unwrap();
             assert_eq!(versions.len(), 1);
             assert_eq!(versions[0].get(0), Some(&SqliteValue::Integer(1)));
             assert!(
@@ -702,8 +741,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let runner = MigrationRunner::new()
-                .add(1, "durable", "CREATE TABLE durable_data(value INTEGER)");
+            let runner = MigrationRunner::new().add(
+                1,
+                "durable",
+                "CREATE TABLE durable_data(value INTEGER)",
+            );
             let first = runner.run(&conn).await.unwrap();
             assert!(first.was_fresh);
             assert_eq!(first.applied, vec![1]);
@@ -722,7 +764,9 @@ mod tests {
                     .get(0),
                 Some(&SqliteValue::Text("temporary_shadow".into()))
             );
-            conn.execute("INSERT INTO durable_data VALUES (1)").await.unwrap();
+            conn.execute("INSERT INTO durable_data VALUES (1)")
+                .await
+                .unwrap();
             let second = runner.run(&conn).await.unwrap();
             assert!(second.applied.is_empty());
             assert!(!second.was_fresh);
@@ -733,8 +777,11 @@ mod tests {
     fn already_applied_migration_sql_is_not_revalidated() {
         asupersync::test_utils::run_test(|| async {
             let conn = mem_conn().await;
-            MigrationRunner::new().add(1, "baseline", "SELECT 1")
-                .run(&conn).await.unwrap();
+            MigrationRunner::new()
+                .add(1, "baseline", "SELECT 1")
+                .run(&conn)
+                .await
+                .unwrap();
             let result = MigrationRunner::new()
                 .add(1, "historical", "COMMIT")
                 .add(2, "next", "SELECT 2")

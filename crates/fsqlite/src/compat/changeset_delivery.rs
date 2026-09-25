@@ -22,10 +22,9 @@ use std::fmt;
 use fsqlite_types::{PayloadHash, cx::Cx};
 
 use super::{
-    CaptureError, ChangesetOutbox, Connection, DELIVERY_ROUTE, FrankenError,
-    META_COLUMNS, OutboxReceipt, QUEUE, SqliteValue, Transaction,
-    TransactionExt, blob, canonical, checkpoint, count, fixed, integer,
-    quote, text,
+    CaptureError, ChangesetOutbox, Connection, DELIVERY_ROUTE, FrankenError, META_COLUMNS,
+    OutboxReceipt, QUEUE, SqliteValue, Transaction, TransactionExt, blob, canonical, checkpoint,
+    count, fixed, integer, quote, text,
 };
 use crate::compat::changeset::streaming::ordered::{
     ReplicaApplyError, ReplicaCheckpoint, ReplicationEnvelope,
@@ -67,7 +66,10 @@ pub enum OrderedDeliveryError {
     Source(CaptureError),
     Replication(ReplicaApplyError),
     ReceiptMismatch,
-    Rollback { cause: Box<Self>, error: FrankenError },
+    Rollback {
+        cause: Box<Self>,
+        error: FrankenError,
+    },
 }
 
 pub type DeliveryResult<T> = Result<T, OrderedDeliveryError>;
@@ -77,8 +79,12 @@ impl fmt::Display for OrderedDeliveryError {
         match self {
             Self::Source(error) => write!(f, "ordered source: {error}"),
             Self::Replication(error) => write!(f, "{error}"),
-            Self::ReceiptMismatch => f.write_str("receiver checkpoint does not match the pending source message"),
-            Self::Rollback { cause, error } => write!(f, "{cause}; route rollback also failed: {error}"),
+            Self::ReceiptMismatch => {
+                f.write_str("receiver checkpoint does not match the pending source message")
+            }
+            Self::Rollback { cause, error } => {
+                write!(f, "{cause}; route rollback also failed: {error}")
+            }
         }
     }
 }
@@ -95,13 +101,19 @@ impl std::error::Error for OrderedDeliveryError {
 }
 
 impl From<CaptureError> for OrderedDeliveryError {
-    fn from(error: CaptureError) -> Self { Self::Source(error) }
+    fn from(error: CaptureError) -> Self {
+        Self::Source(error)
+    }
 }
 impl From<FrankenError> for OrderedDeliveryError {
-    fn from(error: FrankenError) -> Self { Self::Source(CaptureError::Engine(error)) }
+    fn from(error: FrankenError) -> Self {
+        Self::Source(CaptureError::Engine(error))
+    }
 }
 impl From<ReplicaApplyError> for OrderedDeliveryError {
-    fn from(error: ReplicaApplyError) -> Self { Self::Replication(error) }
+    fn from(error: ReplicaApplyError) -> Self {
+        Self::Replication(error)
+    }
 }
 
 fn invalid(detail: &'static str) -> OrderedDeliveryError {
@@ -130,13 +142,19 @@ pub struct OrderedMessage {
 
 impl OrderedMessage {
     #[must_use]
-    pub const fn source_receipt(&self) -> &OutboxReceipt { &self.source }
+    pub const fn source_receipt(&self) -> &OutboxReceipt {
+        &self.source
+    }
 
     #[must_use]
-    pub const fn envelope(&self) -> &ReplicationEnvelope { &self.envelope }
+    pub const fn envelope(&self) -> &ReplicationEnvelope {
+        &self.envelope
+    }
 
     #[must_use]
-    pub fn body(&self) -> &[u8] { &self.body }
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
 
     /// The checkpoint a receiver must commit before this message can be ACKed.
     #[must_use]
@@ -162,40 +180,59 @@ pub struct OrderedDelivery {
 impl OrderedDelivery {
     pub fn new(source: ChangesetOutbox, baseline: ReplicaCheckpoint) -> DeliveryResult<Self> {
         if baseline.sequence != 0 {
-            return Err(CaptureError::Input("capture outboxes require a sequence-zero delivery baseline").into());
+            return Err(CaptureError::Input(
+                "capture outboxes require a sequence-zero delivery baseline",
+            )
+            .into());
         }
         Ok(Self { source, baseline })
     }
 
     #[must_use]
-    pub const fn outbox(&self) -> &ChangesetOutbox { &self.source }
+    pub const fn outbox(&self) -> &ChangesetOutbox {
+        &self.source
+    }
 
     #[must_use]
-    pub const fn baseline(&self) -> ReplicaCheckpoint { self.baseline }
+    pub const fn baseline(&self) -> ReplicaCheckpoint {
+        self.baseline
+    }
 
     /// Create/bind the route and source outbox atomically. Reinitializing with
     /// the exact same configuration preserves progress, including after ACKs.
     /// A different stream, incarnation or baseline can never adopt its data.
-    pub async fn initialize(&self, conn: &mut Connection, cx: &Cx) -> DeliveryResult<DeliveryProgress> {
+    pub async fn initialize(
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+    ) -> DeliveryResult<DeliveryProgress> {
         checkpoint(cx)?;
         let transaction = conn.transaction().await?;
         let result = async {
             self.source.initialize_in(&transaction, cx).await?;
-            let objects = transaction.query_with_params(
-                "SELECT name FROM main.sqlite_schema WHERE CAST(name AS BLOB)=?1 LIMIT 2",
-                &[blob(DELIVERY_ROUTE.as_bytes())],
-            ).await?;
+            let objects = transaction
+                .query_with_params(
+                    "SELECT name FROM main.sqlite_schema WHERE CAST(name AS BLOB)=?1 LIMIT 2",
+                    &[blob(DELIVERY_ROUTE.as_bytes())],
+                )
+                .await?;
             if objects.is_empty() {
                 transaction.execute(ROUTE_DDL).await?;
-                transaction.execute_with_params(INSERT_ROUTE, &[
-                    blob(&self.source.incarnation),
-                    blob(self.baseline.stream_id.as_bytes()),
-                    blob(self.baseline.tip.as_bytes()),
-                ]).await?;
+                transaction
+                    .execute_with_params(
+                        INSERT_ROUTE,
+                        &[
+                            blob(&self.source.incarnation),
+                            blob(self.baseline.stream_id.as_bytes()),
+                            blob(self.baseline.tip.as_bytes()),
+                        ],
+                    )
+                    .await?;
             }
             Self::validate_route(&transaction, cx).await?;
             self.load_progress(&transaction).await
-        }.await;
+        }
+        .await;
         settle(transaction, cx, result).await
     }
 
@@ -205,18 +242,28 @@ impl OrderedDelivery {
             "SELECT sql FROM main.sqlite_schema WHERE CAST(name AS BLOB)=?1 AND length(CAST(sql AS BLOB))<=8192 LIMIT 2",
             &[blob(DELIVERY_ROUTE.as_bytes())],
         ).await?;
-        let [row] = rows.as_slice() else { return Err(invalid("delivery route is missing or ambiguous")); };
+        let [row] = rows.as_slice() else {
+            return Err(invalid("delivery route is missing or ambiguous"));
+        };
         if canonical(text(row, 0)?)? != canonical(ROUTE_DDL)? {
             return Err(invalid("incompatible delivery route schema"));
         }
-        let indexes = transaction.query("PRAGMA main.index_list('__fsqlite_changeset_delivery_route')").await?;
-        if !indexes.is_empty() { return Err(invalid("delivery route has unexpected indexes")); }
+        let indexes = transaction
+            .query("PRAGMA main.index_list('__fsqlite_changeset_delivery_route')")
+            .await?;
+        if !indexes.is_empty() {
+            return Err(invalid("delivery route has unexpected indexes"));
+        }
         for catalog in ["main", "temp"] {
             checkpoint(cx)?;
-            let rows = transaction.query(&format!(
-                "SELECT tbl_name FROM {catalog}.sqlite_schema WHERE type='trigger' LIMIT 1025",
-            )).await?;
-            if rows.len() > 1024 { return Err(invalid("delivery route trigger admission limit exceeded")); }
+            let rows = transaction
+                .query(&format!(
+                    "SELECT tbl_name FROM {catalog}.sqlite_schema WHERE type='trigger' LIMIT 1025",
+                ))
+                .await?;
+            if rows.len() > 1024 {
+                return Err(invalid("delivery route trigger admission limit exceeded"));
+            }
             for row in rows {
                 if text(&row, 0)?.eq_ignore_ascii_case(DELIVERY_ROUTE) {
                     return Err(invalid("delivery route must not have application triggers"));
@@ -226,32 +273,47 @@ impl OrderedDelivery {
         Ok(())
     }
 
-    async fn load_progress(&self, transaction: &Transaction<'_>) -> DeliveryResult<DeliveryProgress> {
+    async fn load_progress(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> DeliveryResult<DeliveryProgress> {
         let state = self.source.read_state(transaction).await?;
         let rows = transaction.query(READ_ROUTE).await?;
-        let [row] = rows.as_slice() else { return Err(invalid("delivery route requires exactly one row")); };
+        let [row] = rows.as_slice() else {
+            return Err(invalid("delivery route requires exactly one row"));
+        };
         if integer(row, 0)? != 1
             || fixed::<16>(row, 1)? != self.source.incarnation
             || fixed::<32>(row, 2)? != *self.baseline.stream_id.as_bytes()
             || fixed::<32>(row, 3)? != *self.baseline.tip.as_bytes()
         {
-            return Err(invalid("delivery route does not match the configured source/baseline"));
+            return Err(invalid(
+                "delivery route does not match the configured source/baseline",
+            ));
         }
         let ack = integer(row, 4)?;
         let tip = PayloadHash::from_bytes(fixed(row, 5)?);
         if ack < 0 || ack > state.last_sequence || (ack == 0 && tip != self.baseline.tip) {
             return Err(invalid("invalid delivery acknowledgement position"));
         }
-        let rows = transaction.query_with_params(QUEUE_COVERAGE, &[SqliteValue::Integer(ack)]).await?;
-        let [row] = rows.as_slice() else { return Err(invalid("missing delivery queue accounting")); };
-        let acknowledged = usize::try_from(ack).map_err(|_| invalid("delivery sequence overflow"))?;
+        let rows = transaction
+            .query_with_params(QUEUE_COVERAGE, &[SqliteValue::Integer(ack)])
+            .await?;
+        let [row] = rows.as_slice() else {
+            return Err(invalid("missing delivery queue accounting"));
+        };
+        let acknowledged =
+            usize::try_from(ack).map_err(|_| invalid("delivery sequence overflow"))?;
         if count(row, 0)? != state.receipts
             || count(row, 3)? != state.pending_messages
             || count(row, 4)? != state.pending_bytes
-            || count(row, 5)? != 0 || count(row, 6)? != 0
+            || count(row, 5)? != 0
+            || count(row, 6)? != 0
             || state.receipts.checked_sub(acknowledged) != Some(state.pending_messages)
         {
-            return Err(invalid("delivery queue is not the exact acknowledged-prefix/pending-suffix partition"));
+            return Err(invalid(
+                "delivery queue is not the exact acknowledged-prefix/pending-suffix partition",
+            ));
         }
         if state.receipts == 0 {
             if row.get(1) != Some(&SqliteValue::Null) || row.get(2) != Some(&SqliteValue::Null) {
@@ -273,13 +335,18 @@ impl OrderedDelivery {
         })
     }
 
-    pub async fn progress(&self, conn: &mut Connection, cx: &Cx) -> DeliveryResult<DeliveryProgress> {
+    pub async fn progress(
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+    ) -> DeliveryResult<DeliveryProgress> {
         checkpoint(cx)?;
         let transaction = conn.transaction().await?;
         let result = async {
             Self::validate_route(&transaction, cx).await?;
             self.load_progress(&transaction).await
-        }.await;
+        }
+        .await;
         settle(transaction, cx, result).await
     }
 
@@ -287,7 +354,10 @@ impl OrderedDelivery {
     /// before the packet is returned, so no source lock/snapshot spans network
     /// I/O. Reopen or call again after a lost response to obtain the SAME ID.
     pub async fn next_pending(
-        &self, conn: &mut Connection, cx: &Cx, max_message_bytes: usize,
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+        max_message_bytes: usize,
     ) -> DeliveryResult<Option<OrderedMessage>> {
         if max_message_bytes == 0 || max_message_bytes > super::MAX_PAYLOAD {
             return Err(CaptureError::Input("delivery message bound must be in 1..64 MiB").into());
@@ -297,41 +367,80 @@ impl OrderedDelivery {
         let result = async {
             Self::validate_route(&transaction, cx).await?;
             let progress = self.load_progress(&transaction).await?;
-            if progress.pending_messages == 0 { return Ok(None); }
-            let sequence = progress.acknowledged.sequence.checked_add(1)
+            if progress.pending_messages == 0 {
+                return Ok(None);
+            }
+            let sequence = progress
+                .acknowledged
+                .sequence
+                .checked_add(1)
                 .ok_or(FrankenError::TooBig)?;
-            let parameter = SqliteValue::Integer(i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?);
-            let rows = transaction.query_with_params(&format!(
-                "SELECT {META_COLUMNS} FROM main.{} WHERE sequence=?1 LIMIT 2", quote(QUEUE),
-            ), std::slice::from_ref(&parameter)).await?;
-            let [row] = rows.as_slice() else { return Err(invalid("oldest delivery message is missing")); };
+            let parameter =
+                SqliteValue::Integer(i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?);
+            let rows = transaction
+                .query_with_params(
+                    &format!(
+                        "SELECT {META_COLUMNS} FROM main.{} WHERE sequence=?1 LIMIT 2",
+                        quote(QUEUE),
+                    ),
+                    std::slice::from_ref(&parameter),
+                )
+                .await?;
+            let [row] = rows.as_slice() else {
+                return Err(invalid("oldest delivery message is missing"));
+            };
             let status = self.source.status(row)?;
-            if status.acknowledged || status.receipt.sequence != i64::try_from(sequence).map_err(|_| FrankenError::TooBig)? {
+            if status.acknowledged
+                || status.receipt.sequence
+                    != i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?
+            {
                 return Err(invalid("invalid oldest delivery message"));
             }
             if status.receipt.payload_bytes > max_message_bytes {
                 return Err(CaptureError::Limit("delivery first message bytes").into());
             }
             checkpoint(cx)?;
-            let row = transaction.query_row_with_params(&format!(
-                "SELECT payload FROM main.{} WHERE sequence=?1", quote(QUEUE),
-            ), &[parameter]).await?;
-            let Some(SqliteValue::Blob(bytes)) = row.get(0) else { return Err(invalid("delivery payload is not a BLOB")); };
+            let row = transaction
+                .query_row_with_params(
+                    &format!(
+                        "SELECT payload FROM main.{} WHERE sequence=?1",
+                        quote(QUEUE),
+                    ),
+                    &[parameter],
+                )
+                .await?;
+            let Some(SqliteValue::Blob(bytes)) = row.get(0) else {
+                return Err(invalid("delivery payload is not a BLOB"));
+            };
             if bytes.len() != status.receipt.payload_bytes
                 || *PayloadHash::blake3(bytes.as_ref()).as_bytes() != status.receipt.payload_hash
             {
-                return Err(invalid("delivery payload failed length/digest verification"));
+                return Err(invalid(
+                    "delivery payload failed length/digest verification",
+                ));
             }
-            let frame = ChangesetFrame::for_message(cx, bytes.as_ref(),
-                u64::try_from(max_message_bytes).map_err(|_| FrankenError::TooBig)?)?;
+            let frame = ChangesetFrame::for_message(
+                cx,
+                bytes.as_ref(),
+                u64::try_from(max_message_bytes).map_err(|_| FrankenError::TooBig)?,
+            )?;
             let envelope = ReplicationEnvelope::new(
-                self.baseline.stream_id, sequence, progress.acknowledged.tip, frame,
+                self.baseline.stream_id,
+                sequence,
+                progress.acknowledged.tip,
+                frame,
             )?;
             let mut body = Vec::new();
-            body.try_reserve_exact(bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            body.try_reserve_exact(bytes.len())
+                .map_err(|_| FrankenError::OutOfMemory)?;
             body.extend_from_slice(bytes.as_ref());
-            Ok(Some(OrderedMessage { source: status.receipt, envelope, body }))
-        }.await;
+            Ok(Some(OrderedMessage {
+                source: status.receipt,
+                envelope,
+                body,
+            }))
+        }
+        .await;
         settle(transaction, cx, result).await
     }
 
@@ -340,7 +449,10 @@ impl OrderedDelivery {
     /// The current exact ACK is idempotent. Older ACKs are explicitly Stale.
     /// A locally constructed checkpoint is not evidence of remote durability.
     pub async fn acknowledge(
-        &self, conn: &mut Connection, cx: &Cx, message: &OrderedMessage,
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+        message: &OrderedMessage,
         confirmed: ReplicaCheckpoint,
     ) -> DeliveryResult<DeliveryProgress> {
         if message.source.incarnation != self.source.incarnation
@@ -357,53 +469,93 @@ impl OrderedDelivery {
             let before = self.load_progress(&transaction).await?;
             if confirmed.sequence < before.acknowledged.sequence {
                 return Err(ReplicaApplyError::Stale {
-                    current: before.acknowledged.sequence, received: confirmed.sequence,
-                }.into());
+                    current: before.acknowledged.sequence,
+                    received: confirmed.sequence,
+                }
+                .into());
             }
-            let status = self.source.lookup_in(&transaction, message.source.message_id).await?
+            let status = self
+                .source
+                .lookup_in(&transaction, message.source.message_id)
+                .await?
                 .ok_or_else(|| invalid("delivery source request identity is missing"))?;
-            if status.receipt != message.source { return Err(OrderedDeliveryError::ReceiptMismatch); }
+            if status.receipt != message.source {
+                return Err(OrderedDeliveryError::ReceiptMismatch);
+            }
             if confirmed.sequence == before.acknowledged.sequence {
                 if confirmed != before.acknowledged || !status.acknowledged {
                     return Err(OrderedDeliveryError::ReceiptMismatch);
                 }
                 return Ok(before);
             }
-            let expected = before.acknowledged.sequence.checked_add(1).ok_or(FrankenError::TooBig)?;
+            let expected = before
+                .acknowledged
+                .sequence
+                .checked_add(1)
+                .ok_or(FrankenError::TooBig)?;
             if confirmed.sequence != expected {
-                return Err(ReplicaApplyError::Gap { expected, received: confirmed.sequence }.into());
+                return Err(ReplicaApplyError::Gap {
+                    expected,
+                    received: confirmed.sequence,
+                }
+                .into());
             }
             if message.envelope.previous() != before.acknowledged.tip || status.acknowledged {
                 return Err(OrderedDeliveryError::ReceiptMismatch);
             }
-            self.source.acknowledge_in(&transaction, cx, &message.source).await?;
+            self.source
+                .acknowledge_in(&transaction, cx, &message.source)
+                .await?;
             checkpoint(cx)?;
-            let changed = transaction.execute_with_params(ADVANCE_ROUTE, &[
-                SqliteValue::Integer(i64::try_from(confirmed.sequence).map_err(|_| FrankenError::TooBig)?),
-                blob(confirmed.tip.as_bytes()), blob(&self.source.incarnation),
-                blob(self.baseline.stream_id.as_bytes()), blob(self.baseline.tip.as_bytes()),
-                SqliteValue::Integer(i64::try_from(before.acknowledged.sequence).map_err(|_| FrankenError::TooBig)?),
-                blob(before.acknowledged.tip.as_bytes()),
-            ]).await?;
-            if changed != 1 { return Err(invalid("delivery ACK lost its predecessor")); }
+            let changed = transaction
+                .execute_with_params(
+                    ADVANCE_ROUTE,
+                    &[
+                        SqliteValue::Integer(
+                            i64::try_from(confirmed.sequence).map_err(|_| FrankenError::TooBig)?,
+                        ),
+                        blob(confirmed.tip.as_bytes()),
+                        blob(&self.source.incarnation),
+                        blob(self.baseline.stream_id.as_bytes()),
+                        blob(self.baseline.tip.as_bytes()),
+                        SqliteValue::Integer(
+                            i64::try_from(before.acknowledged.sequence)
+                                .map_err(|_| FrankenError::TooBig)?,
+                        ),
+                        blob(before.acknowledged.tip.as_bytes()),
+                    ],
+                )
+                .await?;
+            if changed != 1 {
+                return Err(invalid("delivery ACK lost its predecessor"));
+            }
             let after = self.load_progress(&transaction).await?;
             if after.acknowledged != confirmed
                 || after.produced_sequence != before.produced_sequence
                 || before.pending_messages.checked_sub(1) != Some(after.pending_messages)
-                || before.pending_bytes.checked_sub(message.source.payload_bytes) != Some(after.pending_bytes)
+                || before
+                    .pending_bytes
+                    .checked_sub(message.source.payload_bytes)
+                    != Some(after.pending_bytes)
             {
                 return Err(invalid("delivery ACK failed atomic accounting readback"));
             }
             Ok(after)
-        }.await;
+        }
+        .await;
         settle(transaction, cx, result).await
     }
 }
 
 async fn settle<T>(
-    mut transaction: Transaction<'_>, cx: &Cx, result: DeliveryResult<T>,
+    mut transaction: Transaction<'_>,
+    cx: &Cx,
+    result: DeliveryResult<T>,
 ) -> DeliveryResult<T> {
-    let result = result.and_then(|value| { checkpoint(cx)?; Ok(value) });
+    let result = result.and_then(|value| {
+        checkpoint(cx)?;
+        Ok(value)
+    });
     let failure = match result {
         Ok(value) => match transaction.commit().await {
             Ok(()) => return Ok(value),
@@ -413,7 +565,10 @@ async fn settle<T>(
     };
     match transaction.rollback().await {
         Ok(()) | Err(FrankenError::NoActiveTransaction) => Err(failure),
-        Err(error) => Err(OrderedDeliveryError::Rollback { cause: Box::new(failure), error }),
+        Err(error) => Err(OrderedDeliveryError::Rollback {
+            cause: Box::new(failure),
+            error,
+        }),
     }
 }
 
@@ -426,8 +581,8 @@ mod tests {
     use asupersync::io::{AsyncRead, ReadBuf};
 
     use super::*;
-    use crate::compat::capture::{CaptureOptions, ChangesetCapture};
     use crate::compat::capture::outbox::OutboxLimits;
+    use crate::compat::capture::{CaptureOptions, ChangesetCapture};
     use crate::compat::changeset::streaming::ordered::{self, ReplicaDisposition};
     use crate::compat::changeset_stream::ChangesetStreamLimits;
 
@@ -435,27 +590,53 @@ mod tests {
         OrderedDelivery::new(
             ChangesetOutbox::new([7; 16], OutboxLimits::default()).unwrap(),
             ReplicaCheckpoint {
-                stream_id: PayloadHash::from_bytes([11; 32]), sequence: 0,
+                stream_id: PayloadHash::from_bytes([11; 32]),
+                sequence: 0,
                 tip: PayloadHash::from_bytes([13; 32]),
             },
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     async fn database() -> Connection {
         let conn = Connection::open(":memory:").await.unwrap();
-        conn.execute_batch("PRAGMA recursive_triggers=ON; CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT);").await.unwrap();
+        conn.execute_batch(
+            "PRAGMA recursive_triggers=ON; CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT);",
+        )
+        .await
+        .unwrap();
         conn
     }
 
-    async fn insert(conn: &mut Connection, cx: &Cx, route: &OrderedDelivery, id: u8) -> OutboxReceipt {
-        let mut capture = ChangesetCapture::begin(conn, cx, CaptureOptions::new(["items"])).await.unwrap();
-        capture.execute("INSERT INTO items VALUES(?1,'captured')", &[SqliteValue::Integer(i64::from(id))]).await.unwrap();
-        capture.commit_to_outbox(route.outbox(), [id; 16]).await.unwrap()
+    async fn insert(
+        conn: &mut Connection,
+        cx: &Cx,
+        route: &OrderedDelivery,
+        id: u8,
+    ) -> OutboxReceipt {
+        let mut capture = ChangesetCapture::begin(conn, cx, CaptureOptions::new(["items"]))
+            .await
+            .unwrap();
+        capture
+            .execute(
+                "INSERT INTO items VALUES(?1,'captured')",
+                &[SqliteValue::Integer(i64::from(id))],
+            )
+            .await
+            .unwrap();
+        capture
+            .commit_to_outbox(route.outbox(), [id; 16])
+            .await
+            .unwrap()
     }
 
     struct Fragmented<'a>(&'a [u8]);
     impl AsyncRead for Fragmented<'_> {
-        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             let n = this.0.len().min(output.remaining()).min(7);
             output.put_slice(&this.0[..n]);
@@ -464,9 +645,21 @@ mod tests {
         }
     }
 
-    async fn receive(conn: &mut Connection, cx: &Cx, message: &OrderedMessage) -> ordered::ReplicaApplyReceipt {
-        ordered::apply(conn, cx, &mut Fragmented(message.body()), message.envelope(),
-            message.envelope().id(), ChangesetStreamLimits::default()).await.unwrap()
+    async fn receive(
+        conn: &mut Connection,
+        cx: &Cx,
+        message: &OrderedMessage,
+    ) -> ordered::ReplicaApplyReceipt {
+        ordered::apply(
+            conn,
+            cx,
+            &mut Fragmented(message.body()),
+            message.envelope(),
+            message.envelope().id(),
+            ChangesetStreamLimits::default(),
+        )
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -477,24 +670,79 @@ mod tests {
             let mut source = database().await;
             let mut target = database().await;
             route.initialize(&mut source, &cx).await.unwrap();
-            ordered::initialize(&mut target, &cx, route.baseline()).await.unwrap();
+            ordered::initialize(&mut target, &cx, route.baseline())
+                .await
+                .unwrap();
             let source_receipt = insert(&mut source, &cx, &route, 1).await;
-            let message = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let message = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(message.source_receipt(), &source_receipt);
             assert_eq!(message.envelope().previous(), route.baseline().tip);
-            let raw = route.outbox().pending(&mut source, &cx, 1, 1024).await.unwrap();
+            let raw = route
+                .outbox()
+                .pending(&mut source, &cx, 1, 1024)
+                .await
+                .unwrap();
             assert_eq!(message.body(), raw[0].bytes);
             let receipt = receive(&mut target, &cx, &message).await;
-            assert!(matches!(receipt.disposition, ReplicaDisposition::Applied(report) if report.applied == 1));
-            let progress = route.acknowledge(&mut source, &cx, &message, receipt.checkpoint).await.unwrap();
+            assert!(
+                matches!(receipt.disposition, ReplicaDisposition::Applied(report) if report.applied == 1)
+            );
+            let progress = route
+                .acknowledge(&mut source, &cx, &message, receipt.checkpoint)
+                .await
+                .unwrap();
             assert_eq!(progress.pending_messages, 0);
             assert_eq!(progress.pending_bytes, 0);
-            assert_eq!(route.acknowledge(&mut source, &cx, &message, receipt.checkpoint).await.unwrap(), progress);
-            assert!(route.outbox().lookup(&mut source, &cx, [1; 16]).await.unwrap().unwrap().acknowledged);
-            assert!(route.next_pending(&mut source, &cx, 1024).await.unwrap().is_none());
-            assert_eq!(integer(&source.query_row("SELECT count(*) FROM items").await.unwrap(), 0).unwrap(), 1,
-                "delivery must not replay captured source DML");
-            assert_eq!(text(&target.query_row("SELECT value FROM items WHERE id=1").await.unwrap(), 0).unwrap(), "captured");
+            assert_eq!(
+                route
+                    .acknowledge(&mut source, &cx, &message, receipt.checkpoint)
+                    .await
+                    .unwrap(),
+                progress
+            );
+            assert!(
+                route
+                    .outbox()
+                    .lookup(&mut source, &cx, [1; 16])
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged
+            );
+            assert!(
+                route
+                    .next_pending(&mut source, &cx, 1024)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                integer(
+                    &source
+                        .query_row("SELECT count(*) FROM items")
+                        .await
+                        .unwrap(),
+                    0
+                )
+                .unwrap(),
+                1,
+                "delivery must not replay captured source DML"
+            );
+            assert_eq!(
+                text(
+                    &target
+                        .query_row("SELECT value FROM items WHERE id=1")
+                        .await
+                        .unwrap(),
+                    0
+                )
+                .unwrap(),
+                "captured"
+            );
         });
     }
 
@@ -507,25 +755,61 @@ mod tests {
             let mut target = database().await;
             target.execute_batch("CREATE TABLE audit(id INTEGER); CREATE TRIGGER audit_items AFTER INSERT ON items BEGIN INSERT INTO audit VALUES(new.id); END;").await.unwrap();
             route.initialize(&mut source, &cx).await.unwrap();
-            ordered::initialize(&mut target, &cx, route.baseline()).await.unwrap();
+            ordered::initialize(&mut target, &cx, route.baseline())
+                .await
+                .unwrap();
             insert(&mut source, &cx, &route, 1).await;
             insert(&mut source, &cx, &route, 2).await;
-            let first = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let first = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             receive(&mut target, &cx, &first).await;
-            let retry = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let retry = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(retry.envelope(), first.envelope());
             assert_eq!(retry.body(), first.body());
             let confirmed = receive(&mut target, &cx, &retry).await;
             assert_eq!(confirmed.disposition, ReplicaDisposition::AlreadyApplied);
-            assert_eq!(integer(&target.query_row("SELECT count(*) FROM audit").await.unwrap(), 0).unwrap(), 1);
-            route.acknowledge(&mut source, &cx, &retry, confirmed.checkpoint).await.unwrap();
-            let second = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            assert_eq!(
+                integer(
+                    &target
+                        .query_row("SELECT count(*) FROM audit")
+                        .await
+                        .unwrap(),
+                    0
+                )
+                .unwrap(),
+                1
+            );
+            route
+                .acknowledge(&mut source, &cx, &retry, confirmed.checkpoint)
+                .await
+                .unwrap();
+            let second = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(second.envelope().sequence(), 2);
             assert_eq!(second.envelope().previous(), first.envelope().id());
             let confirmed = receive(&mut target, &cx, &second).await;
-            route.acknowledge(&mut source, &cx, &second, confirmed.checkpoint).await.unwrap();
-            assert!(matches!(route.acknowledge(&mut source, &cx, &first, first.expected_checkpoint()).await,
-                Err(OrderedDeliveryError::Replication(ReplicaApplyError::Stale { .. }))));
+            route
+                .acknowledge(&mut source, &cx, &second, confirmed.checkpoint)
+                .await
+                .unwrap();
+            assert!(matches!(
+                route
+                    .acknowledge(&mut source, &cx, &first, first.expected_checkpoint())
+                    .await,
+                Err(OrderedDeliveryError::Replication(
+                    ReplicaApplyError::Stale { .. }
+                ))
+            ));
         });
     }
 
@@ -537,8 +821,18 @@ mod tests {
             let mut source = database().await;
             route.initialize(&mut source, &cx).await.unwrap();
             let receipt = insert(&mut source, &cx, &route, 1).await;
-            let message = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
-            assert!(route.outbox().acknowledge(&mut source, &cx, &receipt).await.is_err());
+            let message = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                route
+                    .outbox()
+                    .acknowledge(&mut source, &cx, &receipt)
+                    .await
+                    .is_err()
+            );
             for field in 0..3 {
                 let mut wrong = message.expected_checkpoint();
                 match field {
@@ -546,11 +840,28 @@ mod tests {
                     1 => wrong.stream_id = PayloadHash::from_bytes([99; 32]),
                     _ => wrong.tip = PayloadHash::from_bytes([98; 32]),
                 }
-                assert!(matches!(route.acknowledge(&mut source, &cx, &message, wrong).await,
-                    Err(OrderedDeliveryError::ReceiptMismatch)));
+                assert!(matches!(
+                    route.acknowledge(&mut source, &cx, &message, wrong).await,
+                    Err(OrderedDeliveryError::ReceiptMismatch)
+                ));
             }
-            assert_eq!(route.progress(&mut source, &cx).await.unwrap().pending_messages, 1);
-            assert_eq!(route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap().body(), message.body());
+            assert_eq!(
+                route
+                    .progress(&mut source, &cx)
+                    .await
+                    .unwrap()
+                    .pending_messages,
+                1
+            );
+            assert_eq!(
+                route
+                    .next_pending(&mut source, &cx, 1024)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body(),
+                message.body()
+            );
         });
     }
 
@@ -566,18 +877,38 @@ mod tests {
             route.initialize(&mut source, &cx).await.unwrap();
             insert(&mut source, &cx, &route, 1).await;
             insert(&mut source, &cx, &route, 2).await;
-            let first = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
-            let before = route.acknowledge(&mut source, &cx, &first, first.expected_checkpoint()).await.unwrap();
-            let next = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let first = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
+            let before = route
+                .acknowledge(&mut source, &cx, &first, first.expected_checkpoint())
+                .await
+                .unwrap();
+            let next = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             source.close().await.unwrap();
             let mut source = Connection::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(route.initialize(&mut source, &cx).await.unwrap(), before);
-            let reopened = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let reopened = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(reopened.envelope(), next.envelope());
             assert_eq!(reopened.body(), next.body());
-            let foreign = OrderedDelivery::new(route.outbox().clone(), ReplicaCheckpoint {
-                tip: PayloadHash::from_bytes([55; 32]), ..route.baseline()
-            }).unwrap();
+            let foreign = OrderedDelivery::new(
+                route.outbox().clone(),
+                ReplicaCheckpoint {
+                    tip: PayloadHash::from_bytes([55; 32]),
+                    ..route.baseline()
+                },
+            )
+            .unwrap();
             assert!(foreign.initialize(&mut source, &cx).await.is_err());
             assert_eq!(route.progress(&mut source, &cx).await.unwrap(), before);
         });
@@ -592,10 +923,22 @@ mod tests {
             route.outbox().initialize(&mut source, &cx).await.unwrap();
             let first = insert(&mut source, &cx, &route, 1).await;
             insert(&mut source, &cx, &route, 2).await;
-            route.outbox().acknowledge(&mut source, &cx, &first).await.unwrap();
+            route
+                .outbox()
+                .acknowledge(&mut source, &cx, &first)
+                .await
+                .unwrap();
             assert!(route.initialize(&mut source, &cx).await.is_err());
             assert!(source.query("SELECT name FROM main.sqlite_schema WHERE name='__fsqlite_changeset_delivery_route'").await.unwrap().is_empty());
-            assert_eq!(route.outbox().pending(&mut source, &cx, 2, 1024).await.unwrap().len(), 1);
+            assert_eq!(
+                route
+                    .outbox()
+                    .pending(&mut source, &cx, 2, 1024)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
         });
     }
 
@@ -615,7 +958,10 @@ mod tests {
                 insert(&mut source, &cx, &route, 1).await;
                 insert(&mut source, &cx, &route, 2).await;
                 source.execute_batch(mutation).await.unwrap();
-                assert!(route.next_pending(&mut source, &cx, 1024).await.is_err(), "{mutation}");
+                assert!(
+                    route.next_pending(&mut source, &cx, 1024).await.is_err(),
+                    "{mutation}"
+                );
             }
         });
     }
@@ -628,12 +974,27 @@ mod tests {
             let mut source = database().await;
             route.initialize(&mut source, &cx).await.unwrap();
             let receipt = insert(&mut source, &cx, &route, 1).await;
-            assert!(matches!(route.next_pending(&mut source, &cx, 1).await,
-                Err(OrderedDeliveryError::Source(CaptureError::Limit(_)))));
-            source.execute_with_params("UPDATE __fsqlite_changeset_outbox SET payload=zeroblob(?1) WHERE sequence=1",
-                &[super::super::number(receipt.payload_bytes).unwrap()]).await.unwrap();
+            assert!(matches!(
+                route.next_pending(&mut source, &cx, 1).await,
+                Err(OrderedDeliveryError::Source(CaptureError::Limit(_)))
+            ));
+            source
+                .execute_with_params(
+                    "UPDATE __fsqlite_changeset_outbox SET payload=zeroblob(?1) WHERE sequence=1",
+                    &[super::super::number(receipt.payload_bytes).unwrap()],
+                )
+                .await
+                .unwrap();
             assert!(route.next_pending(&mut source, &cx, 1024).await.is_err());
-            assert!(!route.outbox().lookup(&mut source, &cx, [1; 16]).await.unwrap().unwrap().acknowledged);
+            assert!(
+                !route
+                    .outbox()
+                    .lookup(&mut source, &cx, [1; 16])
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged
+            );
         });
     }
 
@@ -645,14 +1006,28 @@ mod tests {
             let mut source = database().await;
             let mut target = database().await;
             route.initialize(&mut source, &cx).await.unwrap();
-            ordered::initialize(&mut target, &cx, route.baseline()).await.unwrap();
-            let capture = ChangesetCapture::begin(&mut source, &cx, CaptureOptions::new(["items"])).await.unwrap();
-            capture.commit_to_outbox(route.outbox(), [1; 16]).await.unwrap();
-            let message = route.next_pending(&mut source, &cx, 1).await.unwrap().unwrap();
+            ordered::initialize(&mut target, &cx, route.baseline())
+                .await
+                .unwrap();
+            let capture = ChangesetCapture::begin(&mut source, &cx, CaptureOptions::new(["items"]))
+                .await
+                .unwrap();
+            capture
+                .commit_to_outbox(route.outbox(), [1; 16])
+                .await
+                .unwrap();
+            let message = route
+                .next_pending(&mut source, &cx, 1)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(message.body().is_empty());
             let confirmed = receive(&mut target, &cx, &message).await;
             assert_eq!(confirmed.checkpoint.sequence, 1);
-            let progress = route.acknowledge(&mut source, &cx, &message, confirmed.checkpoint).await.unwrap();
+            let progress = route
+                .acknowledge(&mut source, &cx, &message, confirmed.checkpoint)
+                .await
+                .unwrap();
             assert_eq!(progress.pending_messages, 0);
             assert_eq!(progress.pending_bytes, 0);
         });
@@ -666,16 +1041,40 @@ mod tests {
             let mut source = database().await;
             route.initialize(&mut source, &cx).await.unwrap();
             insert(&mut source, &cx, &route, 1).await;
-            let message = route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap();
+            let message = route
+                .next_pending(&mut source, &cx, 1024)
+                .await
+                .unwrap()
+                .unwrap();
             let before = route.progress(&mut source, &cx).await.unwrap();
             let transaction = source.transaction().await.unwrap();
-            route.source.acknowledge_in(&transaction, &cx, message.source_receipt()).await.unwrap();
+            route
+                .source
+                .acknowledge_in(&transaction, &cx, message.source_receipt())
+                .await
+                .unwrap();
             drop(transaction); // The actual raw ACK mutation ran, but not COMMIT.
             assert_eq!(route.progress(&mut source, &cx).await.unwrap(), before);
-            assert_eq!(route.next_pending(&mut source, &cx, 1024).await.unwrap().unwrap().body(), message.body());
+            assert_eq!(
+                route
+                    .next_pending(&mut source, &cx, 1024)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body(),
+                message.body()
+            );
             cx.cancel();
-            assert!(route.acknowledge(&mut source, &cx, &message, message.expected_checkpoint()).await.is_err());
-            assert_eq!(route.progress(&mut source, &Cx::new()).await.unwrap(), before);
+            assert!(
+                route
+                    .acknowledge(&mut source, &cx, &message, message.expected_checkpoint())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                route.progress(&mut source, &Cx::new()).await.unwrap(),
+                before
+            );
         });
     }
 }

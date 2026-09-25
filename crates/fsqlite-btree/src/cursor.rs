@@ -34,11 +34,11 @@ use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, parse_record_prefix,
     parse_record_projected_column_offsets, parse_record_with_encoding,
 };
-use fsqlite_types::value::binary_text_cmp;
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
 use fsqlite_types::sync_primitives::Instant;
+use fsqlite_types::value::binary_text_cmp;
 use fsqlite_types::{PageData, PageNumber, SqliteValue, TextEncoding, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;

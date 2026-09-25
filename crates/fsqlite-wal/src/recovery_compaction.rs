@@ -265,23 +265,22 @@ impl NativeRecovery {
             if checkpoint_tip > 0 && marker.commit_seq.get() <= checkpoint_tip {
                 continue;
             }
-            let outcome = if self.recovered_tip.get().checked_add(1)
-                != Some(marker.commit_seq.get())
-            {
-                CapsuleDecodeOutcome::Failed {
-                    reason: format!(
-                        "non-contiguous marker stream: expected commit after {}, got {}",
-                        self.recovered_tip.get(),
-                        marker.commit_seq.get(),
-                    ),
-                }
-            } else if !marker.verify_integrity() {
-                CapsuleDecodeOutcome::Failed {
-                    reason: "commit marker integrity check failed".to_owned(),
-                }
-            } else {
-                decode_capsule(marker.capsule_object_id)
-            };
+            let outcome =
+                if self.recovered_tip.get().checked_add(1) != Some(marker.commit_seq.get()) {
+                    CapsuleDecodeOutcome::Failed {
+                        reason: format!(
+                            "non-contiguous marker stream: expected commit after {}, got {}",
+                            self.recovered_tip.get(),
+                            marker.commit_seq.get(),
+                        ),
+                    }
+                } else if !marker.verify_integrity() {
+                    CapsuleDecodeOutcome::Failed {
+                        reason: "commit marker integrity check failed".to_owned(),
+                    }
+                } else {
+                    decode_capsule(marker.capsule_object_id)
+                };
 
             match &outcome {
                 CapsuleDecodeOutcome::Systematic => {
@@ -2021,9 +2020,7 @@ mod tests {
     fn recovery_rejects_gaps_duplicates_and_backwards_markers_before_decode() {
         for next_seq in [0, 1, 3] {
             let mut recovery = NativeRecovery::new();
-            recovery.replay_markers(&[make_marker(1, 1)], |_| {
-                CapsuleDecodeOutcome::Systematic
-            });
+            recovery.replay_markers(&[make_marker(1, 1)], |_| CapsuleDecodeOutcome::Systematic);
             recovery.replay_markers(&[make_marker(next_seq, 2)], |_| {
                 panic!("a non-contiguous marker must not reach the decoder")
             });

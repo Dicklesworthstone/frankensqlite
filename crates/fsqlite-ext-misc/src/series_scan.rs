@@ -77,7 +77,12 @@ pub fn best_index(info: &mut IndexInfo) -> Result<()> {
         })
     });
     let unavailable_parameter = info.constraints.iter().any(|constraint| {
-        let slot = match constraint.column { 1 => 0, 2 => 1, 3 => 2, _ => return false };
+        let slot = match constraint.column {
+            1 => 0,
+            2 => 1,
+            3 => 2,
+            _ => return false,
+        };
         constraint.op == ConstraintOp::Eq && !constraint.usable && !hidden[slot]
     });
     if !hidden[0] || unavailable_parameter {
@@ -101,7 +106,8 @@ pub fn best_index(info: &mut IndexInfo) -> Result<()> {
     info.idx_num = PLANNED;
     for (flag, column, op) in slots {
         let selected = info.constraints.iter().position(|constraint| {
-            constraint.usable && constraint.op == op
+            constraint.usable
+                && constraint.op == op
                 && (constraint.column == column || (column == 0 && constraint.column == -1))
         });
         if let Some(index) = selected {
@@ -120,7 +126,8 @@ pub fn best_index(info: &mut IndexInfo) -> Result<()> {
     // tighter duplicate or a contradiction. Hidden duplicates stay residual.
     let mut name = PLAN_NAME.to_owned();
     for (index, constraint) in info.constraints.iter().enumerate() {
-        if !constraint.usable || !matches!(constraint.column, -1 | 0)
+        if !constraint.usable
+            || !matches!(constraint.column, -1 | 0)
             || info.constraint_usage[index].argv_index != 0
         {
             continue;
@@ -128,7 +135,9 @@ pub fn best_index(info: &mut IndexInfo) -> Result<()> {
         if let Some(code) = bound_code(constraint.op) {
             argument = argument.checked_add(1).ok_or(FrankenError::TooBig)?;
             info.constraint_usage[index].argv_index = argument;
-            if name.len() == PLAN_NAME.len() { name.push(':'); }
+            if name.len() == PLAN_NAME.len() {
+                name.push(':');
+            }
             name.push(char::from(code));
         }
     }
@@ -174,7 +183,8 @@ pub fn filter(
         }
         return cursor.init(
             args[0].to_integer(),
-            args.get(1).map_or(GENERATE_SERIES_DEFAULT_STOP, SqliteValue::to_integer),
+            args.get(1)
+                .map_or(GENERATE_SERIES_DEFAULT_STOP, SqliteValue::to_integer),
             args.get(2).map_or(1, SqliteValue::to_integer),
         );
     }
@@ -184,17 +194,18 @@ pub fn filter(
         name.and_then(|name| name.strip_prefix(PLAN_NAME))
             .and_then(|suffix| suffix.strip_prefix(':'))
             .filter(|suffix| !suffix.is_empty())
-            .ok_or_else(invalid_plan)?.as_bytes()
+            .ok_or_else(invalid_plan)?
+            .as_bytes()
     };
-    let base_arguments = usize::try_from((index & ARGUMENTS).count_ones())
-        .map_err(|_| invalid_plan())?;
+    let base_arguments =
+        usize::try_from((index & ARGUMENTS).count_ones()).map_err(|_| invalid_plan())?;
     if index & (PLANNED | START) != (PLANNED | START)
         || index & !(ARGUMENTS | PLANNED | ASCENDING | DESCENDING) != 0
         || index & (ASCENDING | DESCENDING) == (ASCENDING | DESCENDING)
         || base_arguments.checked_add(extra_bounds.len()) != Some(args.len())
-        || extra_bounds.iter().any(|code| {
-            bound_flag(*code).is_none_or(|flag| index & flag == 0)
-        })
+        || extra_bounds
+            .iter()
+            .any(|code| bound_flag(*code).is_none_or(|flag| index & flag == 0))
     {
         return Err(invalid_plan());
     }
@@ -232,7 +243,9 @@ pub fn filter(
 
 fn intersect_value_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: &SqliteValue) {
     match value {
-        SqliteValue::Integer(value) => intersect_integer_bound(lower, upper, flag, i128::from(*value)),
+        SqliteValue::Integer(value) => {
+            intersect_integer_bound(lower, upper, flag, i128::from(*value))
+        }
         SqliteValue::Float(value) => intersect_real_bound(lower, upper, flag, *value),
         // The core rechecks every visible comparison. Never guess TEXT/BLOB
         // affinity, including when an opaque operand precedes a numeric bound.
@@ -242,7 +255,10 @@ fn intersect_value_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: &
 
 fn intersect_integer_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: i128) {
     match flag {
-        EQUAL => { *lower = (*lower).max(value); *upper = (*upper).min(value); }
+        EQUAL => {
+            *lower = (*lower).max(value);
+            *upper = (*upper).min(value);
+        }
         GREATER => *lower = (*lower).max(value + 1),
         AT_LEAST => *lower = (*lower).max(value),
         LESS => *upper = (*upper).min(value - 1),
@@ -272,7 +288,10 @@ fn intersect_real_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: f6
         let floor = value.floor() as i128;
         let ceil = value.ceil() as i128;
         match flag {
-            EQUAL if floor != ceil => { *lower = 1; *upper = 0; }
+            EQUAL if floor != ceil => {
+                *lower = 1;
+                *upper = 0;
+            }
             EQUAL => intersect_integer_bound(lower, upper, EQUAL, floor),
             GREATER => intersect_integer_bound(lower, upper, AT_LEAST, floor + 1),
             AT_LEAST => intersect_integer_bound(lower, upper, AT_LEAST, ceil),
@@ -283,7 +302,12 @@ fn intersect_real_bound(lower: &mut i128, upper: &mut i128, flag: i32, value: f6
     }
 }
 
-fn intersect_sequence(cursor: &mut GenerateSeriesCursor, lower: i128, upper: i128, index: i32) -> Result<()> {
+fn intersect_sequence(
+    cursor: &mut GenerateSeriesCursor,
+    lower: i128,
+    upper: i128,
+    index: i32,
+) -> Result<()> {
     if cursor.done || lower > upper {
         cursor.done = true;
         return Ok(());
@@ -297,17 +321,26 @@ fn intersect_sequence(cursor: &mut GenerateSeriesCursor, lower: i128, upper: i12
     // would include an out-of-range row when a bound falls before the origin.
     let ceil = |value: i128| -(-value).div_euclid(stride);
     let (first, last) = if step > 0 {
-        (ceil(lower - start).max(0), (upper - start).div_euclid(stride).min(maximum))
+        (
+            ceil(lower - start).max(0),
+            (upper - start).div_euclid(stride).min(maximum),
+        )
     } else {
-        (ceil(start - upper).max(0), (start - lower).div_euclid(stride).min(maximum))
+        (
+            ceil(start - upper).max(0),
+            (start - lower).div_euclid(stride).min(maximum),
+        )
     };
     if first > last {
         cursor.done = true;
         return Ok(());
     }
-    let reverse = (index & ASCENDING != 0 && step < 0)
-        || (index & DESCENDING != 0 && step > 0);
-    let (first, last) = if reverse { (last, first) } else { (first, last) };
+    let reverse = (index & ASCENDING != 0 && step < 0) || (index & DESCENDING != 0 && step > 0);
+    let (first, last) = if reverse {
+        (last, first)
+    } else {
+        (first, last)
+    };
     // Indices are intersected with both the original sequence and the i64
     // domain. The conversions are checked, including full-domain spans.
     cursor.current = i64::try_from(start + first * step).map_err(|_| invalid_plan())?;
@@ -343,33 +376,52 @@ pub fn next(cursor: &mut GenerateSeriesCursor, cx: &Cx) -> Result<()> {
 mod tests {
     use super::*;
     use crate::GenerateSeriesTable;
-    use fsqlite_func::vtab::{ColumnContext, IndexConstraint, IndexOrderBy, VirtualTable, VirtualTableCursor};
+    use fsqlite_func::vtab::{
+        ColumnContext, IndexConstraint, IndexOrderBy, VirtualTable, VirtualTableCursor,
+    };
 
     fn constraint(column: i32, op: ConstraintOp) -> IndexConstraint {
-        IndexConstraint { column, op, usable: true }
+        IndexConstraint {
+            column,
+            op,
+            usable: true,
+        }
     }
 
     fn planned(
-        constraints: Vec<IndexConstraint>, values: &[SqliteValue], order: Vec<IndexOrderBy>,
+        constraints: Vec<IndexConstraint>,
+        values: &[SqliteValue],
+        order: Vec<IndexOrderBy>,
     ) -> (GenerateSeriesCursor, IndexInfo) {
         assert_eq!(constraints.len(), values.len());
         let mut info = IndexInfo::new(constraints, order);
         GenerateSeriesTable.best_index(&mut info).unwrap();
-        let mut indexed = info.constraint_usage.iter().enumerate()
+        let mut indexed = info
+            .constraint_usage
+            .iter()
+            .enumerate()
             .filter(|(_, usage)| usage.argv_index > 0)
             .map(|(index, usage)| (usage.argv_index, values[index].clone()))
             .collect::<Vec<_>>();
         indexed.sort_by_key(|(index, _)| *index);
-        let args = indexed.into_iter().map(|(_, value)| value).collect::<Vec<_>>();
+        let args = indexed
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
         let mut cursor = GenerateSeriesTable.open().unwrap();
-        cursor.filter(&Cx::new(), info.idx_num, info.idx_str.as_deref(), &args).unwrap();
+        cursor
+            .filter(&Cx::new(), info.idx_num, info.idx_str.as_deref(), &args)
+            .unwrap();
         (cursor, info)
     }
 
     fn values(mut cursor: GenerateSeriesCursor) -> Vec<i64> {
         let mut result = Vec::new();
         while !cursor.eof() {
-            assert!(result.len() < 100, "range pushdown failed to bound the scan");
+            assert!(
+                result.len() < 100,
+                "range pushdown failed to bound the scan"
+            );
             result.push(cursor.rowid().unwrap());
             cursor.next(&Cx::new()).unwrap();
         }
@@ -380,23 +432,49 @@ mod tests {
         result
     }
 
-    fn range(start: i64, stop: i64, step: i64, lower: i64, upper: i64, desc: Option<bool>) -> GenerateSeriesCursor {
+    fn range(
+        start: i64,
+        stop: i64,
+        step: i64,
+        lower: i64,
+        upper: i64,
+        desc: Option<bool>,
+    ) -> GenerateSeriesCursor {
         planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                constraint(3, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge), constraint(0, ConstraintOp::Le)],
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(3, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Le),
+            ],
             &[start, stop, step, lower, upper].map(SqliteValue::Integer),
-            desc.map(|desc| IndexOrderBy { column: 0, desc }).into_iter().collect(),
-        ).0
+            desc.map(|desc| IndexOrderBy { column: 0, desc })
+                .into_iter()
+                .collect(),
+        )
+        .0
     }
 
     #[test]
     fn hidden_arguments_are_bound_by_column_not_predicate_order() {
         let (cursor, info) = planned(
-            vec![constraint(2, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge),
-                constraint(3, ConstraintOp::Eq), constraint(1, ConstraintOp::Eq)],
-            &[11, 4, 2, 1].map(SqliteValue::Integer), Vec::new(),
+            vec![
+                constraint(2, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge),
+                constraint(3, ConstraintOp::Eq),
+                constraint(1, ConstraintOp::Eq),
+            ],
+            &[11, 4, 2, 1].map(SqliteValue::Integer),
+            Vec::new(),
         );
-        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(), vec![2, 4, 3, 1]);
+        assert_eq!(
+            info.constraint_usage
+                .iter()
+                .map(|usage| usage.argv_index)
+                .collect::<Vec<_>>(),
+            vec![2, 4, 3, 1]
+        );
         assert!(!info.constraint_usage[1].omit);
         assert!(info.constraint_usage[0].omit);
         assert_eq!(values(cursor), vec![5, 7, 9, 11]);
@@ -404,27 +482,50 @@ mod tests {
 
     #[test]
     fn duplicate_unusable_and_unsupported_constraints_remain_residual() {
-        let constraints = vec![constraint(1, ConstraintOp::Eq), constraint(1, ConstraintOp::Eq),
-            IndexConstraint { column: 2, op: ConstraintOp::Eq, usable: false },
-            constraint(0, ConstraintOp::Ne), constraint(0, ConstraintOp::Gt)];
+        let constraints = vec![
+            constraint(1, ConstraintOp::Eq),
+            constraint(1, ConstraintOp::Eq),
+            IndexConstraint {
+                column: 2,
+                op: ConstraintOp::Eq,
+                usable: false,
+            },
+            constraint(0, ConstraintOp::Ne),
+            constraint(0, ConstraintOp::Gt),
+        ];
         let original = constraints.clone();
         let mut info = IndexInfo::new(constraints, Vec::new());
         best_index(&mut info).unwrap();
         assert_eq!(info.constraints, original);
-        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(), vec![0, 0, 0, 0, 0]);
+        assert_eq!(
+            info.constraint_usage
+                .iter()
+                .map(|usage| usage.argv_index)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 0, 0]
+        );
         assert!(info.constraint_usage[1..].iter().all(|usage| !usage.omit));
         // Repeated planning must not retain old mappings or ordering promises.
         info.constraints[0].usable = false;
         info.constraints[1].usable = false;
         best_index(&mut info).unwrap();
         assert_eq!(info.idx_num, 0);
-        assert!(info.constraint_usage.iter().all(|usage| usage.argv_index == 0 && !usage.omit));
+        assert!(
+            info.constraint_usage
+                .iter()
+                .all(|usage| usage.argv_index == 0 && !usage.omit)
+        );
     }
 
     #[test]
     fn bounds_without_start_do_not_masquerade_as_positional_arguments() {
-        let mut info = IndexInfo::new(vec![constraint(0, ConstraintOp::Ge)],
-            vec![IndexOrderBy { column: 0, desc: true }]);
+        let mut info = IndexInfo::new(
+            vec![constraint(0, ConstraintOp::Ge)],
+            vec![IndexOrderBy {
+                column: 0,
+                desc: true,
+            }],
+        );
         best_index(&mut info).unwrap();
         assert_eq!(info.idx_num, 0);
         assert!(!info.order_by_consumed);
@@ -436,15 +537,28 @@ mod tests {
     fn unavailable_hidden_parameters_are_not_replaced_with_defaults() {
         for column in [2, 3] {
             let mut info = IndexInfo::new(
-                vec![constraint(1, ConstraintOp::Eq),
-                    IndexConstraint { column, op: ConstraintOp::Eq, usable: false }],
-                vec![IndexOrderBy { column: 0, desc: true }],
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    IndexConstraint {
+                        column,
+                        op: ConstraintOp::Eq,
+                        usable: false,
+                    },
+                ],
+                vec![IndexOrderBy {
+                    column: 0,
+                    desc: true,
+                }],
             );
             best_index(&mut info).unwrap();
             assert_eq!(info.idx_num, 0);
             assert!(info.idx_str.is_none());
             assert!(!info.order_by_consumed);
-            assert!(info.constraint_usage.iter().all(|usage| usage.argv_index == 0 && !usage.omit));
+            assert!(
+                info.constraint_usage
+                    .iter()
+                    .all(|usage| usage.argv_index == 0 && !usage.omit)
+            );
             // A usable equality for the same hidden column can bind it; the
             // unavailable duplicate is still evaluated by the core.
             info.constraints.push(constraint(column, ConstraintOp::Eq));
@@ -460,36 +574,71 @@ mod tests {
     #[test]
     fn duplicate_visible_bounds_intersect_but_hidden_duplicates_stay_residual() {
         let (cursor, info) = planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(1, ConstraintOp::Eq),
-                constraint(2, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge),
-                constraint(0, ConstraintOp::Ge), constraint(0, ConstraintOp::Le)],
-            &[0, 2, 10, 4, 6, 5].map(SqliteValue::Integer), Vec::new(),
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Le),
+            ],
+            &[0, 2, 10, 4, 6, 5].map(SqliteValue::Integer),
+            Vec::new(),
         );
-        assert_eq!(info.constraint_usage.iter().map(|usage| usage.argv_index).collect::<Vec<_>>(),
-            vec![1, 0, 2, 3, 5, 4]);
+        assert_eq!(
+            info.constraint_usage
+                .iter()
+                .map(|usage| usage.argv_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2, 3, 5, 4]
+        );
         assert!(!info.constraint_usage[1].omit);
         assert!(info.constraint_usage[3..].iter().all(|usage| !usage.omit));
         assert_eq!(info.idx_str.as_deref(), Some("series-range-v1:G"));
-        assert!(cursor.eof(), "the second lower bound contradicts the upper bound");
+        assert!(
+            cursor.eof(),
+            "the second lower bound contradicts the upper bound"
+        );
     }
 
     #[test]
     fn repeated_value_and_rowid_bounds_jump_directly_in_either_order() {
         for reverse in [false, true] {
-            let mut constraints = vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                constraint(0, ConstraintOp::Ge), constraint(-1, ConstraintOp::Ge),
-                constraint(0, ConstraintOp::Le), constraint(-1, ConstraintOp::Le)];
+            let mut constraints = vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge),
+                constraint(-1, ConstraintOp::Ge),
+                constraint(0, ConstraintOp::Le),
+                constraint(-1, ConstraintOp::Le),
+            ];
             let mut operands = [i64::MIN, i64::MAX, i64::MIN, 41, i64::MAX, 43]
-                .map(SqliteValue::Integer).to_vec();
-            if reverse { constraints.reverse(); operands.reverse(); }
-            let (cursor, info) = planned(constraints, &operands,
-                vec![IndexOrderBy { column: -1, desc: true }]);
+                .map(SqliteValue::Integer)
+                .to_vec();
+            if reverse {
+                constraints.reverse();
+                operands.reverse();
+            }
+            let (cursor, info) = planned(
+                constraints,
+                &operands,
+                vec![IndexOrderBy {
+                    column: -1,
+                    desc: true,
+                }],
+            );
             assert!(info.order_by_consumed);
-            assert_eq!(cursor.current, 43, "filter must not walk the discarded prefix");
+            assert_eq!(
+                cursor.current, 43,
+                "filter must not walk the discarded prefix"
+            );
             assert_eq!(values(cursor), vec![43, 42, 41]);
         }
         // Every repeat is represented, not just the second of each operator.
-        let mut constraints = vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq)];
+        let mut constraints = vec![
+            constraint(1, ConstraintOp::Eq),
+            constraint(2, ConstraintOp::Eq),
+        ];
         let mut operands = vec![SqliteValue::Integer(0), SqliteValue::Integer(100)];
         for lower in 0..=99 {
             constraints.push(constraint(0, ConstraintOp::Ge));
@@ -501,11 +650,23 @@ mod tests {
 
     #[test]
     fn opaque_and_null_duplicate_operands_do_not_mask_numeric_bounds() {
-        for opaque in [SqliteValue::Text("0".into()), SqliteValue::Blob(vec![b'0'].into())] {
+        for opaque in [
+            SqliteValue::Text("0".into()),
+            SqliteValue::Blob(vec![b'0'].into()),
+        ] {
             let (cursor, info) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                    constraint(0, ConstraintOp::Ge), constraint(0, ConstraintOp::Ge)],
-                &[SqliteValue::Integer(0), SqliteValue::Integer(5), opaque, SqliteValue::Float(3.5)],
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Ge),
+                    constraint(0, ConstraintOp::Ge),
+                ],
+                &[
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(5),
+                    opaque,
+                    SqliteValue::Float(3.5),
+                ],
                 Vec::new(),
             );
             assert!(info.constraint_usage[2..].iter().all(|usage| !usage.omit));
@@ -513,9 +674,18 @@ mod tests {
         }
         for null in [SqliteValue::Null, SqliteValue::Float(f64::NAN)] {
             let (cursor, _) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                    constraint(0, ConstraintOp::Eq), constraint(-1, ConstraintOp::Eq)],
-                &[SqliteValue::Integer(0), SqliteValue::Integer(5), SqliteValue::Integer(3), null],
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Eq),
+                    constraint(-1, ConstraintOp::Eq),
+                ],
+                &[
+                    SqliteValue::Integer(0),
+                    SqliteValue::Integer(5),
+                    SqliteValue::Integer(3),
+                    null,
+                ],
                 Vec::new(),
             );
             assert!(cursor.eof());
@@ -534,7 +704,16 @@ mod tests {
         ] {
             let mut cursor = GenerateSeriesTable.open().unwrap();
             cursor.init(1, 3, 1).unwrap();
-            assert!(cursor.filter(&Cx::new(), index, Some(name), &vec![SqliteValue::Null; count]).is_err());
+            assert!(
+                cursor
+                    .filter(
+                        &Cx::new(),
+                        index,
+                        Some(name),
+                        &vec![SqliteValue::Null; count]
+                    )
+                    .is_err()
+            );
             assert!(cursor.eof());
             assert_eq!(cursor.rowid().unwrap(), 0);
         }
@@ -543,11 +722,18 @@ mod tests {
     #[test]
     fn bounded_default_stop_jumps_over_billions_of_excluded_values() {
         let (cursor, _) = planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge)],
-            &[SqliteValue::Integer(0), SqliteValue::Integer(4_294_967_292)], Vec::new(),
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Ge),
+            ],
+            &[SqliteValue::Integer(0), SqliteValue::Integer(4_294_967_292)],
+            Vec::new(),
         );
         assert_eq!(cursor.current, 4_294_967_292);
-        assert_eq!(values(cursor), vec![4_294_967_292, 4_294_967_293, 4_294_967_294, 4_294_967_295]);
+        assert_eq!(
+            values(cursor),
+            vec![4_294_967_292, 4_294_967_293, 4_294_967_294, 4_294_967_295]
+        );
     }
 
     #[test]
@@ -561,15 +747,35 @@ mod tests {
 
     #[test]
     fn only_supported_single_column_ordering_is_consumed() {
-        for order in [vec![], vec![IndexOrderBy { column: 1, desc: false }],
-            vec![IndexOrderBy { column: 0, desc: false }, IndexOrderBy { column: 2, desc: true }]] {
+        for order in [
+            vec![],
+            vec![IndexOrderBy {
+                column: 1,
+                desc: false,
+            }],
+            vec![
+                IndexOrderBy {
+                    column: 0,
+                    desc: false,
+                },
+                IndexOrderBy {
+                    column: 2,
+                    desc: true,
+                },
+            ],
+        ] {
             let mut info = IndexInfo::new(vec![constraint(1, ConstraintOp::Eq)], order.clone());
             best_index(&mut info).unwrap();
             assert!(!info.order_by_consumed);
             assert_eq!(info.order_by, order);
         }
-        let mut info = IndexInfo::new(vec![constraint(1, ConstraintOp::Eq)],
-            vec![IndexOrderBy { column: -1, desc: true }]);
+        let mut info = IndexInfo::new(
+            vec![constraint(1, ConstraintOp::Eq)],
+            vec![IndexOrderBy {
+                column: -1,
+                desc: true,
+            }],
+        );
         best_index(&mut info).unwrap();
         assert!(info.order_by_consumed);
     }
@@ -578,9 +784,14 @@ mod tests {
     fn equality_point_probes_respect_step_alignment() {
         for (point, expected) in [(6, vec![]), (7, vec![7])] {
             let (cursor, info) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                    constraint(3, ConstraintOp::Eq), constraint(0, ConstraintOp::Eq)],
-                &[1, i64::MAX, 3, point].map(SqliteValue::Integer), Vec::new(),
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(3, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Eq),
+                ],
+                &[1, i64::MAX, 3, point].map(SqliteValue::Integer),
+                Vec::new(),
             );
             assert_eq!(info.estimated_rows, 1);
             assert_eq!(values(cursor), expected);
@@ -591,49 +802,108 @@ mod tests {
     fn strict_bounds_do_not_saturate_into_false_matches_at_i64_extremes() {
         for (op, value) in [(ConstraintOp::Gt, i64::MAX), (ConstraintOp::Lt, i64::MIN)] {
             let (cursor, _) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(0, op)],
-                &[i64::MIN, i64::MAX, value].map(SqliteValue::Integer), Vec::new(),
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(0, op),
+                ],
+                &[i64::MIN, i64::MAX, value].map(SqliteValue::Integer),
+                Vec::new(),
             );
             assert!(cursor.eof());
         }
-        assert_eq!(values(range(i64::MIN, i64::MAX, 1, i64::MAX - 1, i64::MAX, Some(true))),
-            vec![i64::MAX, i64::MAX - 1]);
+        assert_eq!(
+            values(range(
+                i64::MIN,
+                i64::MAX,
+                1,
+                i64::MAX - 1,
+                i64::MAX,
+                Some(true)
+            )),
+            vec![i64::MAX, i64::MAX - 1]
+        );
     }
 
     #[test]
     fn negative_minimum_step_can_be_reversed_without_overflow() {
-        assert_eq!(values(range(i64::MAX, i64::MIN, i64::MIN, i64::MIN, i64::MAX, Some(false))),
-            vec![-1, i64::MAX]);
-        assert_eq!(values(range(0, i64::MIN, i64::MIN, i64::MIN, i64::MAX, Some(false))),
-            vec![i64::MIN, 0]);
+        assert_eq!(
+            values(range(
+                i64::MAX,
+                i64::MIN,
+                i64::MIN,
+                i64::MIN,
+                i64::MAX,
+                Some(false)
+            )),
+            vec![-1, i64::MAX]
+        );
+        assert_eq!(
+            values(range(
+                0,
+                i64::MIN,
+                i64::MIN,
+                i64::MIN,
+                i64::MAX,
+                Some(false)
+            )),
+            vec![i64::MIN, 0]
+        );
     }
 
     #[test]
     fn null_arguments_empty_both_positional_and_planned_scans() {
         for null_at in 0..3 {
-            let mut args = [SqliteValue::Integer(1), SqliteValue::Integer(5), SqliteValue::Integer(1)];
+            let mut args = [
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(1),
+            ];
             args[null_at] = SqliteValue::Null;
             let mut cursor = GenerateSeriesTable.open().unwrap();
             cursor.init(99, 100, 1).unwrap();
             cursor.filter(&Cx::new(), 0, None, &args).unwrap();
             assert!(cursor.eof());
             let (cursor, _) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(3, ConstraintOp::Eq)],
-                &args, Vec::new(),
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(3, ConstraintOp::Eq),
+                ],
+                &args,
+                Vec::new(),
             );
             assert!(cursor.eof());
         }
-        let (cursor, _) = planned(vec![constraint(1, ConstraintOp::Eq), constraint(0, ConstraintOp::Gt)],
-            &[SqliteValue::Integer(0), SqliteValue::Null], Vec::new());
+        let (cursor, _) = planned(
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Gt),
+            ],
+            &[SqliteValue::Integer(0), SqliteValue::Null],
+            Vec::new(),
+        );
         assert!(cursor.eof());
     }
 
     #[test]
     fn invalid_plan_and_cancellation_never_expose_a_stale_row() {
         for (index, name, args) in [
-            (PLANNED | START, Some("unknown"), vec![SqliteValue::Integer(1)]),
-            (PLANNED | START | STOP, Some(PLAN_NAME), vec![SqliteValue::Integer(1)]),
-            (PLANNED | START | ASCENDING | DESCENDING, Some(PLAN_NAME), vec![SqliteValue::Integer(1)]),
+            (
+                PLANNED | START,
+                Some("unknown"),
+                vec![SqliteValue::Integer(1)],
+            ),
+            (
+                PLANNED | START | STOP,
+                Some(PLAN_NAME),
+                vec![SqliteValue::Integer(1)],
+            ),
+            (
+                PLANNED | START | ASCENDING | DESCENDING,
+                Some(PLAN_NAME),
+                vec![SqliteValue::Integer(1)],
+            ),
             (0, None, vec![SqliteValue::Integer(1); 4]),
         ] {
             let mut cursor = GenerateSeriesTable.open().unwrap();
@@ -646,15 +916,24 @@ mod tests {
         let mut cursor = range(1, 10, 1, 1, 10, None);
         assert!(matches!(cursor.next(&cx), Err(FrankenError::Interrupt)));
         assert!(cursor.eof());
-        assert!(matches!(cursor.filter(&cx, 0, None, &[SqliteValue::Integer(1)]), Err(FrankenError::Interrupt)));
+        assert!(matches!(
+            cursor.filter(&cx, 0, None, &[SqliteValue::Integer(1)]),
+            Err(FrankenError::Interrupt)
+        ));
     }
 
     #[test]
     fn rowid_bounds_and_zero_step_use_the_value_sequence() {
         let (cursor, _) = planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq),
-                constraint(3, ConstraintOp::Eq), constraint(-1, ConstraintOp::Gt), constraint(-1, ConstraintOp::Lt)],
-            &[0, 10, 0, 4, 8].map(SqliteValue::Integer), Vec::new(),
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(3, ConstraintOp::Eq),
+                constraint(-1, ConstraintOp::Gt),
+                constraint(-1, ConstraintOp::Lt),
+            ],
+            &[0, 10, 0, 4, 8].map(SqliteValue::Integer),
+            Vec::new(),
         );
         assert_eq!(cursor.step, 1);
         assert_eq!(values(cursor), vec![5, 6, 7]);
@@ -662,10 +941,19 @@ mod tests {
 
     fn real_bound(start: i64, stop: i64, op: ConstraintOp, bound: f64) -> GenerateSeriesCursor {
         planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(0, op)],
-            &[SqliteValue::Integer(start), SqliteValue::Integer(stop), SqliteValue::Float(bound)],
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(0, op),
+            ],
+            &[
+                SqliteValue::Integer(start),
+                SqliteValue::Integer(stop),
+                SqliteValue::Float(bound),
+            ],
             Vec::new(),
-        ).0
+        )
+        .0
     }
 
     #[test]
@@ -673,20 +961,32 @@ mod tests {
     fn fractional_real_bounds_use_mathematical_floor_and_ceiling() {
         for quarter in -28..=28_i32 {
             let bound = f64::from(quarter) / 4.0;
-            for op in [ConstraintOp::Eq, ConstraintOp::Gt, ConstraintOp::Ge, ConstraintOp::Lt, ConstraintOp::Le] {
-                let expected = (-6..=6_i32).filter(|value| {
-                    let value = f64::from(*value);
-                    match op {
-                        ConstraintOp::Eq => value == bound,
-                        ConstraintOp::Gt => value > bound,
-                        ConstraintOp::Ge => value >= bound,
-                        ConstraintOp::Lt => value < bound,
-                        ConstraintOp::Le => value <= bound,
-                        _ => unreachable!(),
-                    }
-                }).map(i64::from).collect::<Vec<_>>();
-                assert_eq!(values(real_bound(-6, 6, op, bound)), expected,
-                    "quarter={quarter}, op={op:?}");
+            for op in [
+                ConstraintOp::Eq,
+                ConstraintOp::Gt,
+                ConstraintOp::Ge,
+                ConstraintOp::Lt,
+                ConstraintOp::Le,
+            ] {
+                let expected = (-6..=6_i32)
+                    .filter(|value| {
+                        let value = f64::from(*value);
+                        match op {
+                            ConstraintOp::Eq => value == bound,
+                            ConstraintOp::Gt => value > bound,
+                            ConstraintOp::Ge => value >= bound,
+                            ConstraintOp::Lt => value < bound,
+                            ConstraintOp::Le => value <= bound,
+                            _ => unreachable!(),
+                        }
+                    })
+                    .map(i64::from)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    values(real_bound(-6, 6, op, bound)),
+                    expected,
+                    "quarter={quarter}, op={op:?}"
+                );
             }
         }
     }
@@ -694,12 +994,33 @@ mod tests {
     #[test]
     fn real_bound_does_not_round_adjacent_large_integer_rows() {
         const ORIGIN: i64 = 9_007_199_254_740_992;
-        assert_eq!(values(real_bound(ORIGIN - 1, ORIGIN + 3, ConstraintOp::Eq, 9_007_199_254_740_992.0)),
-            vec![ORIGIN]);
-        assert_eq!(values(real_bound(ORIGIN - 1, ORIGIN + 3, ConstraintOp::Gt, 9_007_199_254_740_992.0)),
-            vec![ORIGIN + 1, ORIGIN + 2, ORIGIN + 3]);
-        assert_eq!(values(real_bound(-ORIGIN - 3, -ORIGIN + 1, ConstraintOp::Lt, -9_007_199_254_740_992.0)),
-            vec![-ORIGIN - 3, -ORIGIN - 2, -ORIGIN - 1]);
+        assert_eq!(
+            values(real_bound(
+                ORIGIN - 1,
+                ORIGIN + 3,
+                ConstraintOp::Eq,
+                9_007_199_254_740_992.0
+            )),
+            vec![ORIGIN]
+        );
+        assert_eq!(
+            values(real_bound(
+                ORIGIN - 1,
+                ORIGIN + 3,
+                ConstraintOp::Gt,
+                9_007_199_254_740_992.0
+            )),
+            vec![ORIGIN + 1, ORIGIN + 2, ORIGIN + 3]
+        );
+        assert_eq!(
+            values(real_bound(
+                -ORIGIN - 3,
+                -ORIGIN + 1,
+                ConstraintOp::Lt,
+                -9_007_199_254_740_992.0
+            )),
+            vec![-ORIGIN - 3, -ORIGIN - 2, -ORIGIN - 1]
+        );
     }
 
     #[test]
@@ -709,8 +1030,10 @@ mod tests {
                 assert!(real_bound(i64::MAX - 2, i64::MAX, op, bound).eof());
             }
             for op in [ConstraintOp::Lt, ConstraintOp::Le] {
-                assert_eq!(values(real_bound(i64::MAX - 2, i64::MAX, op, bound)),
-                    vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]);
+                assert_eq!(
+                    values(real_bound(i64::MAX - 2, i64::MAX, op, bound)),
+                    vec![i64::MAX - 2, i64::MAX - 1, i64::MAX]
+                );
             }
         }
         for bound in [-9_223_372_036_854_777_856.0, f64::NEG_INFINITY] {
@@ -718,42 +1041,86 @@ mod tests {
                 assert!(real_bound(i64::MIN, i64::MIN + 2, op, bound).eof());
             }
             for op in [ConstraintOp::Gt, ConstraintOp::Ge] {
-                assert_eq!(values(real_bound(i64::MIN, i64::MIN + 2, op, bound)),
-                    vec![i64::MIN, i64::MIN + 1, i64::MIN + 2]);
+                assert_eq!(
+                    values(real_bound(i64::MIN, i64::MIN + 2, op, bound)),
+                    vec![i64::MIN, i64::MIN + 1, i64::MIN + 2]
+                );
             }
         }
-        assert_eq!(values(real_bound(i64::MIN, i64::MIN + 2, ConstraintOp::Eq, -9_223_372_036_854_775_808.0)),
-            vec![i64::MIN]);
-        assert!(real_bound(i64::MIN, i64::MIN + 2, ConstraintOp::Lt, -9_223_372_036_854_775_808.0).eof());
+        assert_eq!(
+            values(real_bound(
+                i64::MIN,
+                i64::MIN + 2,
+                ConstraintOp::Eq,
+                -9_223_372_036_854_775_808.0
+            )),
+            vec![i64::MIN]
+        );
+        assert!(
+            real_bound(
+                i64::MIN,
+                i64::MIN + 2,
+                ConstraintOp::Lt,
+                -9_223_372_036_854_775_808.0
+            )
+            .eof()
+        );
     }
 
     #[test]
     fn numeric_looking_text_and_blobs_remain_core_comparisons() {
-        for value in [SqliteValue::Text("4".into()), SqliteValue::Blob(vec![b'4'].into())] {
+        for value in [
+            SqliteValue::Text("4".into()),
+            SqliteValue::Blob(vec![b'4'].into()),
+        ] {
             let (cursor, info) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(0, ConstraintOp::Ge)],
-                &[SqliteValue::Integer(1), SqliteValue::Integer(5), value], Vec::new(),
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(0, ConstraintOp::Ge),
+                ],
+                &[SqliteValue::Integer(1), SqliteValue::Integer(5), value],
+                Vec::new(),
             );
             assert!(!info.constraint_usage[2].omit);
-            assert_eq!(values(cursor), vec![1, 2, 3, 4, 5], "do not prune on guessed text affinity");
+            assert_eq!(
+                values(cursor),
+                vec![1, 2, 3, 4, 5],
+                "do not prune on guessed text affinity"
+            );
         }
     }
 
     #[test]
     fn nan_inputs_empty_scans_instead_of_becoming_zero() {
         for nan_at in 0..3 {
-            let mut args = [SqliteValue::Integer(1), SqliteValue::Integer(5), SqliteValue::Integer(1)];
+            let mut args = [
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(1),
+            ];
             args[nan_at] = SqliteValue::Float(f64::NAN);
             let mut cursor = GenerateSeriesTable.open().unwrap();
             cursor.filter(&Cx::new(), 0, None, &args).unwrap();
             assert!(cursor.eof());
             let (cursor, _) = planned(
-                vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(3, ConstraintOp::Eq)],
-                &args, Vec::new(),
+                vec![
+                    constraint(1, ConstraintOp::Eq),
+                    constraint(2, ConstraintOp::Eq),
+                    constraint(3, ConstraintOp::Eq),
+                ],
+                &args,
+                Vec::new(),
             );
             assert!(cursor.eof());
         }
-        for op in [ConstraintOp::Eq, ConstraintOp::Gt, ConstraintOp::Ge, ConstraintOp::Lt, ConstraintOp::Le] {
+        for op in [
+            ConstraintOp::Eq,
+            ConstraintOp::Gt,
+            ConstraintOp::Ge,
+            ConstraintOp::Lt,
+            ConstraintOp::Le,
+        ] {
             assert!(real_bound(0, 5, op, f64::NAN).eof());
         }
     }
@@ -761,11 +1128,24 @@ mod tests {
     #[test]
     fn intersected_real_bounds_keep_negative_step_alignment_when_reversed() {
         let (cursor, _) = planned(
-            vec![constraint(1, ConstraintOp::Eq), constraint(2, ConstraintOp::Eq), constraint(3, ConstraintOp::Eq),
-                constraint(0, ConstraintOp::Gt), constraint(0, ConstraintOp::Le)],
-            &[SqliteValue::Integer(10), SqliteValue::Integer(-10), SqliteValue::Integer(-3),
-                SqliteValue::Float(-4.5), SqliteValue::Float(6.25)],
-            vec![IndexOrderBy { column: 0, desc: false }],
+            vec![
+                constraint(1, ConstraintOp::Eq),
+                constraint(2, ConstraintOp::Eq),
+                constraint(3, ConstraintOp::Eq),
+                constraint(0, ConstraintOp::Gt),
+                constraint(0, ConstraintOp::Le),
+            ],
+            &[
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(-10),
+                SqliteValue::Integer(-3),
+                SqliteValue::Float(-4.5),
+                SqliteValue::Float(6.25),
+            ],
+            vec![IndexOrderBy {
+                column: 0,
+                desc: false,
+            }],
         );
         assert_eq!((cursor.start, cursor.stop, cursor.step), (10, -10, -3));
         assert_eq!(values(cursor), vec![-2, 1, 4]);
@@ -781,18 +1161,29 @@ mod tests {
                             let stride = if step == 0 { 1 } else { step };
                             let mut expected = Vec::new();
                             let mut value = start;
-                            while if stride > 0 { value <= stop } else { value >= stop } {
-                                if value >= lower && value <= upper { expected.push(value); }
+                            while if stride > 0 {
+                                value <= stop
+                            } else {
+                                value >= stop
+                            } {
+                                if value >= lower && value <= upper {
+                                    expected.push(value);
+                                }
                                 value += stride;
                             }
                             for desc in [None, Some(false), Some(true)] {
                                 let mut ordered = expected.clone();
                                 if let Some(desc) = desc {
                                     ordered.sort_unstable();
-                                    if desc { ordered.reverse(); }
+                                    if desc {
+                                        ordered.reverse();
+                                    }
                                 }
-                                assert_eq!(values(range(start, stop, step, lower, upper, desc)), ordered,
-                                    "start={start} stop={stop} step={step} lower={lower} upper={upper} desc={desc:?}");
+                                assert_eq!(
+                                    values(range(start, stop, step, lower, upper, desc)),
+                                    ordered,
+                                    "start={start} stop={stop} step={step} lower={lower} upper={upper} desc={desc:?}"
+                                );
                             }
                         }
                     }

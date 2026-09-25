@@ -184,7 +184,11 @@ fn persisted_numeric_text_uses_the_same_math_rules_in_projection_and_filter() {
             ],
             [SqliteValue::Integer(2), SqliteValue::Null, text("null")],
             [SqliteValue::Integer(3), SqliteValue::Null, text("null")],
-            [SqliteValue::Integer(4), SqliteValue::Float(2.0), text("real")],
+            [
+                SqliteValue::Integer(4),
+                SqliteValue::Float(2.0),
+                text("real"),
+            ],
         ]) {
             assert_eq!(row.values(), &expected);
         }

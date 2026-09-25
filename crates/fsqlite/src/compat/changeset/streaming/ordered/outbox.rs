@@ -36,8 +36,8 @@ use fsqlite_types::{PayloadHash, cx::Cx};
 
 use super::{
     ApplyTransaction, ReplicaApplyError, ReplicaCheckpoint, ReplicaDisposition,
-    ReplicationEnvelope, SqlChangesetApplyReport, StreamApplyError, begin, blob,
-    checkpoint, protocol, rollback, row_text,
+    ReplicationEnvelope, SqlChangesetApplyReport, StreamApplyError, begin, blob, checkpoint,
+    protocol, rollback, row_text,
 };
 use crate::compat::changeset_stream::verified::ChangesetFrame;
 use crate::compat::changeset_stream::{ChangesetStreamLimits, ChangesetStreamReader};
@@ -87,7 +87,9 @@ pub struct OutboxState {
 impl OutboxState {
     #[must_use]
     pub const fn pending_messages(self) -> u64 {
-        self.produced.sequence.saturating_sub(self.acknowledged.sequence)
+        self.produced
+            .sequence
+            .saturating_sub(self.acknowledged.sequence)
     }
 }
 
@@ -119,10 +121,14 @@ impl std::fmt::Debug for OutboxMessage {
 
 impl OutboxMessage {
     #[must_use]
-    pub const fn envelope(&self) -> &ReplicationEnvelope { &self.envelope }
+    pub const fn envelope(&self) -> &ReplicationEnvelope {
+        &self.envelope
+    }
 
     #[must_use]
-    pub fn body(&self) -> &[u8] { &self.body }
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 // Immutable caller-owned bytes: preflight and SQL application see exactly
@@ -131,7 +137,9 @@ struct Bytes<'a>(&'a [u8]);
 
 impl AsyncRead for Bytes<'_> {
     fn poll_read(
-        self: Pin<&mut Self>, _: &mut Context<'_>, output: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let count = output.remaining().min(this.0.len());
@@ -142,7 +150,9 @@ impl AsyncRead for Bytes<'_> {
 }
 
 fn integer(value: u64) -> Result<SqliteValue> {
-    Ok(SqliteValue::Integer(i64::try_from(value).map_err(|_| FrankenError::TooBig)?))
+    Ok(SqliteValue::Integer(
+        i64::try_from(value).map_err(|_| FrankenError::TooBig)?,
+    ))
 }
 
 fn unsigned(row: &Row, index: usize) -> Result<u64> {
@@ -158,8 +168,12 @@ fn hash_column(row: &Row, index: usize) -> Result<PayloadHash> {
     let Some(SqliteValue::Blob(bytes)) = row.get(index) else {
         return Err(protocol("invalid outbox identity storage class"));
     };
-    Ok(PayloadHash::from_bytes(bytes.as_ref().try_into()
-        .map_err(|_| protocol("invalid outbox identity width"))?))
+    Ok(PayloadHash::from_bytes(
+        bytes
+            .as_ref()
+            .try_into()
+            .map_err(|_| protocol("invalid outbox identity width"))?,
+    ))
 }
 
 fn definition(sql: &str) -> Result<CreateTableStatement> {
@@ -176,17 +190,25 @@ fn definition(sql: &str) -> Result<CreateTableStatement> {
 }
 
 async fn validate_schema(conn: &Connection) -> Result<()> {
-    validate_tables(conn, &[(STREAM_TABLE, CREATE_STREAM), (QUEUE_TABLE, CREATE_QUEUE)]).await
+    validate_tables(
+        conn,
+        &[(STREAM_TABLE, CREATE_STREAM), (QUEUE_TABLE, CREATE_QUEUE)],
+    )
+    .await
 }
 
 async fn validate_tables(conn: &Connection, tables: &[(&str, &str)]) -> Result<()> {
     for &(name, expected) in tables {
         let parameter = SqliteValue::Text(name.into());
-        let rows = conn.query_with_params(
-            "SELECT type,sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE",
-            std::slice::from_ref(&parameter),
-        ).await?;
-        let [row] = rows.as_slice() else { return Err(protocol("missing or ambiguous outbox metadata")); };
+        let rows = conn
+            .query_with_params(
+                "SELECT type,sql FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE",
+                std::slice::from_ref(&parameter),
+            )
+            .await?;
+        let [row] = rows.as_slice() else {
+            return Err(protocol("missing or ambiguous outbox metadata"));
+        };
         if row_text(row, 0) != Some("table")
             || definition(row_text(row, 1).ok_or_else(|| protocol("missing outbox schema"))?)?
                 != definition(expected)?
@@ -198,7 +220,9 @@ async fn validate_tables(conn: &Connection, tables: &[(&str, &str)]) -> Result<(
                 &format!("SELECT name FROM {catalog}.sqlite_schema WHERE type='trigger' AND tbl_name=?1 COLLATE NOCASE LIMIT 1"),
                 std::slice::from_ref(&parameter),
             ).await?;
-            if !triggers.is_empty() { return Err(protocol("outbox metadata must not have triggers")); }
+            if !triggers.is_empty() {
+                return Err(protocol("outbox metadata must not have triggers"));
+            }
         }
     }
     Ok(())
@@ -215,8 +239,16 @@ async fn load_state(conn: &Connection, stream_id: PayloadHash) -> Result<OutboxS
         _ => return Err(protocol("ambiguous source stream")),
     };
     let state = OutboxState {
-        produced: ReplicaCheckpoint { stream_id, sequence: unsigned(row, 0)?, tip: hash_column(row, 1)? },
-        acknowledged: ReplicaCheckpoint { stream_id, sequence: unsigned(row, 2)?, tip: hash_column(row, 3)? },
+        produced: ReplicaCheckpoint {
+            stream_id,
+            sequence: unsigned(row, 0)?,
+            tip: hash_column(row, 1)?,
+        },
+        acknowledged: ReplicaCheckpoint {
+            stream_id,
+            sequence: unsigned(row, 2)?,
+            tip: hash_column(row, 3)?,
+        },
         pending_bytes: unsigned(row, 4)?,
     };
     if state.acknowledged.sequence > state.produced.sequence
@@ -232,7 +264,9 @@ async fn load_state(conn: &Connection, stream_id: PayloadHash) -> Result<OutboxS
         "SELECT count(*),coalesce(sum(length(body)),0),min(sequence),max(sequence) FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1",
         &[blob(stream_id)],
     ).await?;
-    let [row] = rows.as_slice() else { return Err(protocol("missing outbox accounting")); };
+    let [row] = rows.as_slice() else {
+        return Err(protocol("missing outbox accounting"));
+    };
     if unsigned(row, 0)? != state.pending_messages() || unsigned(row, 1)? != state.pending_bytes {
         return Err(protocol("outbox payload accounting mismatch"));
     }
@@ -271,7 +305,9 @@ async fn complete<T>(mut owner: ApplyTransaction<'_>, cx: &Cx, result: Result<T>
         Ok(value) => value,
         Err(error) => return Err(rollback(&mut owner, error).await),
     };
-    if let Err(error) = checkpoint(cx) { return Err(rollback(&mut owner, error).await); }
+    if let Err(error) = checkpoint(cx) {
+        return Err(rollback(&mut owner, error).await);
+    }
     if let Err(error) = owner.conn.commit_transaction().await {
         return Err(rollback(&mut owner, error.into()).await);
     }
@@ -283,7 +319,11 @@ async fn complete<T>(mut owner: ApplyTransaction<'_>, cx: &Cx, result: Result<T>
 /// the receiver from that SAME baseline separately. Never infer it from input.
 /// Existing streams are accepted only at the same already-empty position;
 /// initialization never moves either cursor or resets progressed history.
-pub async fn initialize(conn: &mut Connection, cx: &Cx, baseline: ReplicaCheckpoint) -> Result<OutboxState> {
+pub async fn initialize(
+    conn: &mut Connection,
+    cx: &Cx,
+    baseline: ReplicaCheckpoint,
+) -> Result<OutboxState> {
     checkpoint(cx)?;
     let sequence = integer(baseline.sequence)?;
     let owner = begin(conn).await?;
@@ -327,15 +367,23 @@ pub async fn state(conn: &mut Connection, cx: &Cx, stream_id: PayloadHash) -> Re
         let current = load_state(conn, stream_id).await?;
         let _ = fanout::snapshot(conn, current).await?;
         Ok(current)
-    }.await;
+    }
+    .await;
     complete(owner, cx, result).await
 }
 
 async fn preflight(cx: &Cx, body: &[u8], limits: ChangesetStreamLimits) -> Result<()> {
     let mut reader = ChangesetStreamReader::new(Bytes(body), limits);
     while let Some(row) = reader.next(cx).await.map_err(StreamApplyError::from)? {
-        if [STREAM_TABLE, QUEUE_TABLE, super::CURSOR_TABLE, fanout::GROUP_TABLE, fanout::REPLICA_TABLE].iter()
-            .any(|name| name.eq_ignore_ascii_case(&row.table.name))
+        if [
+            STREAM_TABLE,
+            QUEUE_TABLE,
+            super::CURSOR_TABLE,
+            fanout::GROUP_TABLE,
+            fanout::REPLICA_TABLE,
+        ]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&row.table.name))
         {
             return Err(protocol("source message targets replication metadata"));
         }
@@ -356,15 +404,27 @@ async fn preflight(cx: &Cx, body: &[u8], limits: ChangesetStreamLimits) -> Resul
 /// Trigger effects must be reproducible on the replica; arbitrary source SQL
 /// and trigger-generated changes are not automatically recorded by this API.
 pub async fn record(
-    conn: &mut Connection, cx: &Cx, previous: ReplicaCheckpoint,
-    body: &[u8], limits: OutboxLimits,
+    conn: &mut Connection,
+    cx: &Cx,
+    previous: ReplicaCheckpoint,
+    body: &[u8],
+    limits: OutboxLimits,
 ) -> Result<OutboxCommit> {
     checkpoint(cx)?;
     let byte_len = u64::try_from(body.len()).map_err(|_| FrankenError::TooBig)?;
-    if byte_len > limits.input.max_input_bytes { return Err(FrankenError::TooBig.into()); }
-    let sequence = previous.sequence.checked_add(1).ok_or(FrankenError::TooBig)?;
-    let envelope = ReplicationEnvelope::new(previous.stream_id, sequence, previous.tip,
-        ChangesetFrame::for_message(cx, body, limits.input.max_input_bytes)?)?;
+    if byte_len > limits.input.max_input_bytes {
+        return Err(FrankenError::TooBig.into());
+    }
+    let sequence = previous
+        .sequence
+        .checked_add(1)
+        .ok_or(FrankenError::TooBig)?;
+    let envelope = ReplicationEnvelope::new(
+        previous.stream_id,
+        sequence,
+        previous.tip,
+        ChangesetFrame::for_message(cx, body, limits.input.max_input_bytes)?,
+    )?;
     let identity = envelope.id();
     let owner = begin(conn).await?;
     let result = async {
@@ -412,20 +472,29 @@ pub async fn record(
         Ok(ReplicaDisposition::Applied(report))
     }.await;
     let disposition = complete(owner, cx, result).await?;
-    Ok(OutboxCommit { envelope, disposition })
+    Ok(OutboxCommit {
+        envelope,
+        disposition,
+    })
 }
 
 async fn read_after(
-    conn: &Connection, cx: &Cx, current: OutboxState, after: ReplicaCheckpoint,
+    conn: &Connection,
+    cx: &Cx,
+    current: OutboxState,
+    after: ReplicaCheckpoint,
     max_message_bytes: u64,
 ) -> Result<Option<OutboxMessage>> {
     if after.stream_id != current.produced.stream_id
-        || after.sequence < current.acknowledged.sequence || after.sequence > current.produced.sequence
+        || after.sequence < current.acknowledged.sequence
+        || after.sequence > current.produced.sequence
     {
         return Err(protocol("outbox read position is outside retained history"));
     }
     if after.sequence == current.produced.sequence {
-        if after != current.produced { return Err(protocol("outbox read position has a conflicting tip")); }
+        if after != current.produced {
+            return Err(protocol("outbox read position has a conflicting tip"));
+        }
         return Ok(None);
     }
     let sequence = after.sequence + 1;
@@ -436,27 +505,47 @@ async fn read_after(
         "SELECT previous,tip,length(body),typeof(body) FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1 AND sequence=?2",
         &params,
     ).await?;
-    let [row] = rows.as_slice() else { return Err(protocol("missing outbox head")); };
+    let [row] = rows.as_slice() else {
+        return Err(protocol("missing outbox head"));
+    };
     let previous = hash_column(row, 0)?;
     let tip = hash_column(row, 1)?;
     let length = unsigned(row, 2)?;
     if previous != after.tip || row_text(row, 3) != Some("blob") {
         return Err(protocol("outbox head predecessor or payload type mismatch"));
     }
-    if length > max_message_bytes { return Err(FrankenError::TooBig.into()); }
-    let rows = conn.query_with_params(
-        "SELECT body FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1 AND sequence=?2", &params,
-    ).await?;
-    let [row] = rows.as_slice() else { return Err(protocol("missing outbox payload")); };
-    let Some(SqliteValue::Blob(bytes)) = row.get(0) else { return Err(protocol("outbox body is not a blob")); };
-    if u64::try_from(bytes.len()).ok() != Some(length) { return Err(protocol("outbox body length changed")); }
-    let envelope = ReplicationEnvelope::new(current.produced.stream_id, sequence, previous,
-        ChangesetFrame::for_message(cx, bytes.as_ref(), max_message_bytes)?)?;
-    if envelope.id() != tip || (sequence == current.produced.sequence && tip != current.produced.tip) {
+    if length > max_message_bytes {
+        return Err(FrankenError::TooBig.into());
+    }
+    let rows = conn
+        .query_with_params(
+            "SELECT body FROM main._fsqlite_source_outbox_v1 WHERE stream_id=?1 AND sequence=?2",
+            &params,
+        )
+        .await?;
+    let [row] = rows.as_slice() else {
+        return Err(protocol("missing outbox payload"));
+    };
+    let Some(SqliteValue::Blob(bytes)) = row.get(0) else {
+        return Err(protocol("outbox body is not a blob"));
+    };
+    if u64::try_from(bytes.len()).ok() != Some(length) {
+        return Err(protocol("outbox body length changed"));
+    }
+    let envelope = ReplicationEnvelope::new(
+        current.produced.stream_id,
+        sequence,
+        previous,
+        ChangesetFrame::for_message(cx, bytes.as_ref(), max_message_bytes)?,
+    )?;
+    if envelope.id() != tip
+        || (sequence == current.produced.sequence && tip != current.produced.tip)
+    {
         return Err(protocol("outbox content identity mismatch"));
     }
     let mut body = Vec::new();
-    body.try_reserve_exact(bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+    body.try_reserve_exact(bytes.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
     body.extend_from_slice(bytes.as_ref());
     Ok(Some(OutboxMessage { envelope, body }))
 }
@@ -464,7 +553,10 @@ async fn read_after(
 /// Fetch only the oldest unacknowledged message, rechecking its content hash.
 /// No progress is changed by reading; repeated reads support lost delivery ACKs.
 pub async fn next_pending(
-    conn: &mut Connection, cx: &Cx, stream_id: PayloadHash, max_message_bytes: u64,
+    conn: &mut Connection,
+    cx: &Cx,
+    stream_id: PayloadHash,
+    max_message_bytes: u64,
 ) -> Result<Option<OutboxMessage>> {
     checkpoint(cx)?;
     let owner = begin(conn).await?;
@@ -473,7 +565,8 @@ pub async fn next_pending(
         let current = load_state(conn, stream_id).await?;
         let _ = fanout::snapshot(conn, current).await?;
         read_after(conn, cx, current, current.acknowledged, max_message_bytes).await
-    }.await;
+    }
+    .await;
     complete(owner, cx, result).await
 }
 
@@ -545,37 +638,64 @@ pub async fn acknowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_ext_session::{ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, TableChangeset, TableInfo};
+    use fsqlite_ext_session::{
+        ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, TableChangeset, TableInfo,
+    };
 
     fn baseline() -> ReplicaCheckpoint {
-        ReplicaCheckpoint { stream_id: PayloadHash::from_bytes([1; 32]), sequence: 0, tip: PayloadHash::from_bytes([2; 32]) }
+        ReplicaCheckpoint {
+            stream_id: PayloadHash::from_bytes([1; 32]),
+            sequence: 0,
+            tip: PayloadHash::from_bytes([2; 32]),
+        }
     }
 
     fn wire(values: &[(i64, &str)]) -> Vec<u8> {
         Changeset {
             kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
-                info: TableInfo { name: "t".to_owned(), column_count: 2, pk_flags: vec![true, false] },
-                rows: values.iter().map(|(id, value)| ChangesetRow {
-                    op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
-                    new_values: vec![ChangesetValue::Integer(*id), ChangesetValue::Text((*value).to_owned())],
-                }).collect(),
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: values
+                    .iter()
+                    .map(|(id, value)| ChangesetRow {
+                        op: ChangeOp::Insert,
+                        indirect: false,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(*id),
+                            ChangesetValue::Text((*value).to_owned()),
+                        ],
+                    })
+                    .collect(),
             }],
-        }.encode()
+        }
+        .encode()
     }
 
     async fn setup(path: &str) -> Connection {
         let conn = Connection::open(path).await.unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE); \
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE); \
             CREATE TABLE audit(id INTEGER PRIMARY KEY); \
-            CREATE TRIGGER audit_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;")
-            .await.unwrap();
+            CREATE TRIGGER audit_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;",
+        )
+        .await
+        .unwrap();
         conn
     }
 
     async fn count(conn: &Connection, name: &str) -> i64 {
-        let row = conn.query_row(&format!("SELECT count(*) FROM {name}")).await.unwrap();
-        let Some(SqliteValue::Integer(value)) = row.get(0) else { panic!("integer count"); };
+        let row = conn
+            .query_row(&format!("SELECT count(*) FROM {name}"))
+            .await
+            .unwrap();
+        let Some(SqliteValue::Integer(value)) = row.get(0) else {
+            panic!("integer count");
+        };
         *value
     }
 
@@ -594,23 +714,49 @@ mod tests {
             let mut source = setup(":memory:").await;
             let mut target = setup(":memory:").await;
             initialize(&mut source, &cx, baseline()).await.unwrap();
-            super::super::initialize(&mut target, &cx, baseline()).await.unwrap();
+            super::super::initialize(&mut target, &cx, baseline())
+                .await
+                .unwrap();
             let body = wire(&[(1, "one"), (2, "two")]);
-            let committed = record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
-            assert!(matches!(committed.disposition, ReplicaDisposition::Applied(SqlChangesetApplyReport { applied: 2, .. })));
-            let retry = record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
+            let committed = record(&mut source, &cx, baseline(), &body, OutboxLimits::default())
+                .await
+                .unwrap();
+            assert!(matches!(
+                committed.disposition,
+                ReplicaDisposition::Applied(SqlChangesetApplyReport { applied: 2, .. })
+            ));
+            let retry = record(&mut source, &cx, baseline(), &body, OutboxLimits::default())
+                .await
+                .unwrap();
             assert_eq!(retry.disposition, ReplicaDisposition::AlreadyApplied);
             assert_eq!(retry.envelope, committed.envelope);
             assert_eq!(count(&source, "audit").await, 2);
-            let message = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            let message = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(message.body(), body);
             assert_eq!(message.envelope(), &committed.envelope);
-            let receipt = super::super::apply(&mut target, &cx, &mut Bytes(message.body()),
-                message.envelope(), committed.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            let receipt = super::super::apply(
+                &mut target,
+                &cx,
+                &mut Bytes(message.body()),
+                message.envelope(),
+                committed.envelope.id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(receipt.checkpoint.sequence, 1);
             assert_eq!(count(&target, "t").await, 2);
             assert_eq!(count(&target, "audit").await, 2);
-            assert_eq!(state(&mut source, &cx, baseline().stream_id).await.unwrap().pending_messages(), 1);
+            assert_eq!(
+                state(&mut source, &cx, baseline().stream_id)
+                    .await
+                    .unwrap()
+                    .pending_messages(),
+                1
+            );
             source.close().await.unwrap();
             target.close().await.unwrap();
         });
@@ -622,12 +768,33 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             let initial = initialize(&mut conn, &cx, baseline()).await.unwrap();
-            assert!(record(&mut conn, &cx, baseline(), &wire(&[(1,"same"),(2,"same")]), OutboxLimits::default()).await.is_err());
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+            assert!(
+                record(
+                    &mut conn,
+                    &cx,
+                    baseline(),
+                    &wire(&[(1, "same"), (2, "same")]),
+                    OutboxLimits::default()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                initial
+            );
             assert_eq!(count(&conn, "t").await, 0);
             assert_eq!(count(&conn, "audit").await, 0);
             assert_eq!(count(&conn, QUEUE_TABLE).await, 0);
-            let committed = record(&mut conn, &cx, baseline(), &wire(&[(1,"retry")]), OutboxLimits::default()).await.unwrap();
+            let committed = record(
+                &mut conn,
+                &cx,
+                baseline(),
+                &wire(&[(1, "retry")]),
+                OutboxLimits::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(committed.envelope.sequence(), 1);
             conn.close().await.unwrap();
         });
@@ -639,23 +806,49 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             let initial = initialize(&mut conn, &cx, baseline()).await.unwrap();
-            let bytes = wire(&[(1,"one")]);
+            let bytes = wire(&[(1, "one")]);
             for limits in [
-                OutboxLimits { max_pending_messages: 0, ..OutboxLimits::default() },
-                OutboxLimits { max_pending_bytes: bytes.len() as u64 - 1, ..OutboxLimits::default() },
-                OutboxLimits { input: ChangesetStreamLimits { max_rows: 0, ..ChangesetStreamLimits::default() }, ..OutboxLimits::default() },
+                OutboxLimits {
+                    max_pending_messages: 0,
+                    ..OutboxLimits::default()
+                },
+                OutboxLimits {
+                    max_pending_bytes: bytes.len() as u64 - 1,
+                    ..OutboxLimits::default()
+                },
+                OutboxLimits {
+                    input: ChangesetStreamLimits {
+                        max_rows: 0,
+                        ..ChangesetStreamLimits::default()
+                    },
+                    ..OutboxLimits::default()
+                },
             ] {
-                assert!(record(&mut conn, &cx, baseline(), &bytes, limits).await.is_err());
-                assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+                assert!(
+                    record(&mut conn, &cx, baseline(), &bytes, limits)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                    initial
+                );
                 assert_eq!(count(&conn, "t").await, 0);
             }
-            conn.execute("BEGIN; INSERT INTO t VALUES(9,'caller');").await.unwrap();
-            assert!(matches!(record(&mut conn, &cx, baseline(), &bytes, OutboxLimits::default()).await,
-                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
+            conn.execute("BEGIN; INSERT INTO t VALUES(9,'caller');")
+                .await
+                .unwrap();
+            assert!(matches!(
+                record(&mut conn, &cx, baseline(), &bytes, OutboxLimits::default()).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))
+            ));
             assert!(conn.in_transaction());
             assert_eq!(count(&conn, "t").await, 1);
             conn.execute("ROLLBACK").await.unwrap();
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                initial
+            );
             conn.close().await.unwrap();
         });
     }
@@ -666,10 +859,27 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             let initial = initialize(&mut conn, &cx, baseline()).await.unwrap();
-            conn.execute("CREATE TRIGGER tamper AFTER INSERT ON t BEGIN \
-                UPDATE _fsqlite_source_stream_v1 SET tip=zeroblob(32); END;").await.unwrap();
-            assert!(record(&mut conn, &cx, baseline(), &wire(&[(1,"one")]), OutboxLimits::default()).await.is_err());
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+            conn.execute(
+                "CREATE TRIGGER tamper AFTER INSERT ON t BEGIN \
+                UPDATE _fsqlite_source_stream_v1 SET tip=zeroblob(32); END;",
+            )
+            .await
+            .unwrap();
+            assert!(
+                record(
+                    &mut conn,
+                    &cx,
+                    baseline(),
+                    &wire(&[(1, "one")]),
+                    OutboxLimits::default()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                initial
+            );
             assert_eq!(count(&conn, "audit").await, 0);
             assert_eq!(count(&conn, QUEUE_TABLE).await, 0);
             conn.close().await.unwrap();
@@ -686,46 +896,117 @@ mod tests {
             let mut source = setup(source_path.to_str().unwrap()).await;
             let mut replica = setup(replica_path.to_str().unwrap()).await;
             initialize(&mut source, &cx, baseline()).await.unwrap();
-            super::super::initialize(&mut replica, &cx, baseline()).await.unwrap();
+            super::super::initialize(&mut replica, &cx, baseline())
+                .await
+                .unwrap();
             let body = wire(&[(1, "one")]);
-            let first = record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
-            let second = record(&mut source, &cx, committed_position(&first),
-                &wire(&[(2, "two")]), OutboxLimits::default()).await.unwrap();
+            let first = record(&mut source, &cx, baseline(), &body, OutboxLimits::default())
+                .await
+                .unwrap();
+            let second = record(
+                &mut source,
+                &cx,
+                committed_position(&first),
+                &wire(&[(2, "two")]),
+                OutboxLimits::default(),
+            )
+            .await
+            .unwrap();
             source.close().await.unwrap();
-            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
-            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pending.envelope(), &first.envelope);
-            let receipt = super::super::apply(&mut replica, &cx, &mut Bytes(pending.body()),
-                pending.envelope(), first.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            let receipt = super::super::apply(
+                &mut replica,
+                &cx,
+                &mut Bytes(pending.body()),
+                pending.envelope(),
+                first.envelope.id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
             // Lose the response before persisting source acknowledgement.
             replica.close().await.unwrap();
             source.close().await.unwrap();
-            let mut replica = Connection::open(replica_path.to_str().unwrap()).await.unwrap();
-            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
-            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
-            let duplicate = super::super::apply(&mut replica, &cx, &mut Bytes(pending.body()),
-                pending.envelope(), first.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
+            let mut replica = Connection::open(replica_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let pending = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
+            let duplicate = super::super::apply(
+                &mut replica,
+                &cx,
+                &mut Bytes(pending.body()),
+                pending.envelope(),
+                first.envelope.id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(duplicate.disposition, ReplicaDisposition::AlreadyApplied);
             assert_eq!(duplicate.checkpoint, receipt.checkpoint);
-            let acknowledged = acknowledge(&mut source, &cx, duplicate.checkpoint, 1 << 20).await.unwrap();
+            let acknowledged = acknowledge(&mut source, &cx, duplicate.checkpoint, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(acknowledged.pending_messages(), 1);
             source.close().await.unwrap();
-            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
-            assert_eq!(acknowledge(&mut source, &cx, duplicate.checkpoint, 0).await.unwrap(), acknowledged);
-            let next = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                acknowledge(&mut source, &cx, duplicate.checkpoint, 0)
+                    .await
+                    .unwrap(),
+                acknowledged
+            );
+            let next = next_pending(&mut source, &cx, baseline().stream_id, 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(next.envelope(), &second.envelope);
-            let receipt = super::super::apply(&mut replica, &cx, &mut Bytes(next.body()),
-                next.envelope(), second.envelope.id(), ChangesetStreamLimits::default()).await.unwrap();
-            let empty = acknowledge(&mut source, &cx, receipt.checkpoint, 1 << 20).await.unwrap();
+            let receipt = super::super::apply(
+                &mut replica,
+                &cx,
+                &mut Bytes(next.body()),
+                next.envelope(),
+                second.envelope.id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
+            let empty = acknowledge(&mut source, &cx, receipt.checkpoint, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(empty.pending_messages(), 0);
             assert_eq!(empty.pending_bytes, 0);
-            assert!(next_pending(&mut source, &cx, baseline().stream_id, 0).await.unwrap().is_none());
+            assert!(
+                next_pending(&mut source, &cx, baseline().stream_id, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(count(&source, QUEUE_TABLE).await, 0);
             for conn in [&source, &replica] {
                 assert_eq!(count(conn, "t").await, 2);
                 assert_eq!(count(conn, "audit").await, 2);
-                assert_eq!(conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                    Some(&SqliteValue::Text("ok".into())));
+                assert_eq!(
+                    conn.query_row("PRAGMA integrity_check")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Text("ok".into()))
+                );
             }
             source.close().await.unwrap();
             replica.close().await.unwrap();
@@ -738,28 +1019,69 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             initialize(&mut conn, &cx, baseline()).await.unwrap();
-            let limits = OutboxLimits { max_pending_messages: 2, ..OutboxLimits::default() };
-            let first = record(&mut conn, &cx, baseline(), &wire(&[(1,"one")]), limits).await.unwrap();
-            let second = record(&mut conn, &cx, committed_position(&first), &wire(&[(2,"two")]), limits).await.unwrap();
+            let limits = OutboxLimits {
+                max_pending_messages: 2,
+                ..OutboxLimits::default()
+            };
+            let first = record(&mut conn, &cx, baseline(), &wire(&[(1, "one")]), limits)
+                .await
+                .unwrap();
+            let second = record(
+                &mut conn,
+                &cx,
+                committed_position(&first),
+                &wire(&[(2, "two")]),
+                limits,
+            )
+            .await
+            .unwrap();
             let before = state(&mut conn, &cx, baseline().stream_id).await.unwrap();
-            let third = wire(&[(3,"three")]);
-            assert!(matches!(record(&mut conn, &cx, committed_position(&second), &third, limits).await,
-                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
-            assert!(matches!(acknowledge(&mut conn, &cx, committed_position(&second), 1 << 20).await,
-                Err(ReplicaApplyError::Gap { expected: 1, received: 2 })));
-            let forged = ReplicaCheckpoint { tip: PayloadHash::from_bytes([9; 32]), ..committed_position(&first) };
-            assert!(matches!(acknowledge(&mut conn, &cx, forged, 1 << 20).await,
-                Err(ReplicaApplyError::Diverged { sequence: 1 })));
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), before);
-            let after = acknowledge(&mut conn, &cx, committed_position(&first), 1 << 20).await.unwrap();
+            let third = wire(&[(3, "three")]);
+            assert!(matches!(
+                record(&mut conn, &cx, committed_position(&second), &third, limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))
+            ));
+            assert!(matches!(
+                acknowledge(&mut conn, &cx, committed_position(&second), 1 << 20).await,
+                Err(ReplicaApplyError::Gap {
+                    expected: 1,
+                    received: 2
+                })
+            ));
+            let forged = ReplicaCheckpoint {
+                tip: PayloadHash::from_bytes([9; 32]),
+                ..committed_position(&first)
+            };
+            assert!(matches!(
+                acknowledge(&mut conn, &cx, forged, 1 << 20).await,
+                Err(ReplicaApplyError::Diverged { sequence: 1 })
+            ));
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                before
+            );
+            let after = acknowledge(&mut conn, &cx, committed_position(&first), 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(after.pending_messages(), 1);
             assert!(after.pending_bytes < before.pending_bytes);
-            assert!(matches!(acknowledge(&mut conn, &cx, baseline(), 1 << 20).await,
-                Err(ReplicaApplyError::Stale { .. })));
-            let third = record(&mut conn, &cx, committed_position(&second), &third, limits).await.unwrap();
+            assert!(matches!(
+                acknowledge(&mut conn, &cx, baseline(), 1 << 20).await,
+                Err(ReplicaApplyError::Stale { .. })
+            ));
+            let third = record(&mut conn, &cx, committed_position(&second), &third, limits)
+                .await
+                .unwrap();
             assert_eq!(third.envelope.sequence(), 3);
             assert_eq!(count(&conn, "t").await, 3);
-            assert_eq!(next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20).await.unwrap().unwrap().envelope(), &second.envelope);
+            assert_eq!(
+                next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .envelope(),
+                &second.envelope
+            );
             conn.close().await.unwrap();
         });
     }
@@ -770,18 +1092,31 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             initialize(&mut conn, &cx, baseline()).await.unwrap();
-            let body = wire(&[(1,"one")]);
-            let commit = record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap();
+            let body = wire(&[(1, "one")]);
+            let commit = record(&mut conn, &cx, baseline(), &body, OutboxLimits::default())
+                .await
+                .unwrap();
             let before = state(&mut conn, &cx, baseline().stream_id).await.unwrap();
-            assert!(matches!(next_pending(&mut conn, &cx, baseline().stream_id, body.len() as u64 - 1).await,
-                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            assert!(matches!(
+                next_pending(&mut conn, &cx, baseline().stream_id, body.len() as u64 - 1).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))
+            ));
             // Preserve length/accounting but change authenticated content.
-            conn.execute("UPDATE _fsqlite_source_outbox_v1 SET body=zeroblob(length(body))").await.unwrap();
-            assert!(matches!(next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20).await,
-                Err(ReplicaApplyError::Protocol { .. })));
-            assert!(matches!(acknowledge(&mut conn, &cx, committed_position(&commit), 1 << 20).await,
-                Err(ReplicaApplyError::Protocol { .. })));
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), before);
+            conn.execute("UPDATE _fsqlite_source_outbox_v1 SET body=zeroblob(length(body))")
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_pending(&mut conn, &cx, baseline().stream_id, 1 << 20).await,
+                Err(ReplicaApplyError::Protocol { .. })
+            ));
+            assert!(matches!(
+                acknowledge(&mut conn, &cx, committed_position(&commit), 1 << 20).await,
+                Err(ReplicaApplyError::Protocol { .. })
+            ));
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                before
+            );
             assert_eq!(count(&conn, QUEUE_TABLE).await, 1);
             conn.close().await.unwrap();
         });
@@ -796,14 +1131,26 @@ mod tests {
                 CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);")
                 .await.unwrap();
             let initial = initialize(&mut conn, &cx, baseline()).await.unwrap();
-            let body = wire(&[(1,"99")]);
-            assert!(matches!(record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await,
-                Err(ReplicaApplyError::Database(_))));
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), initial);
+            let body = wire(&[(1, "99")]);
+            assert!(matches!(
+                record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await,
+                Err(ReplicaApplyError::Database(_))
+            ));
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                initial
+            );
             assert_eq!(count(&conn, "t").await, 0);
             assert_eq!(count(&conn, QUEUE_TABLE).await, 0);
             conn.execute("INSERT INTO parent VALUES(99)").await.unwrap();
-            assert_eq!(record(&mut conn, &cx, baseline(), &body, OutboxLimits::default()).await.unwrap().envelope.sequence(), 1);
+            assert_eq!(
+                record(&mut conn, &cx, baseline(), &body, OutboxLimits::default())
+                    .await
+                    .unwrap()
+                    .envelope
+                    .sequence(),
+                1
+            );
             conn.close().await.unwrap();
         });
     }
@@ -814,33 +1161,85 @@ mod tests {
             let cx = Cx::new();
             let mut conn = setup(":memory:").await;
             initialize(&mut conn, &cx, baseline()).await.unwrap();
-            let limits = OutboxLimits { max_pending_messages: 1, max_pending_bytes: 0, ..OutboxLimits::default() };
-            let first = record(&mut conn, &cx, baseline(), &[], limits).await.unwrap();
-            assert!(matches!(record(&mut conn, &cx, committed_position(&first), &[], limits).await,
-                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+            let limits = OutboxLimits {
+                max_pending_messages: 1,
+                max_pending_bytes: 0,
+                ..OutboxLimits::default()
+            };
+            let first = record(&mut conn, &cx, baseline(), &[], limits)
+                .await
+                .unwrap();
+            assert!(matches!(
+                record(&mut conn, &cx, committed_position(&first), &[], limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))
+            ));
             let cancelled = Cx::new();
             cancelled.cancel();
-            assert!(matches!(acknowledge(&mut conn, &cancelled, committed_position(&first), 0).await,
-                Err(ReplicaApplyError::Database(FrankenError::Interrupt))));
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap().pending_messages(), 1);
-            let cleared = acknowledge(&mut conn, &cx, committed_position(&first), 0).await.unwrap();
+            assert!(matches!(
+                acknowledge(&mut conn, &cancelled, committed_position(&first), 0).await,
+                Err(ReplicaApplyError::Database(FrankenError::Interrupt))
+            ));
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id)
+                    .await
+                    .unwrap()
+                    .pending_messages(),
+                1
+            );
+            let cleared = acknowledge(&mut conn, &cx, committed_position(&first), 0)
+                .await
+                .unwrap();
             assert_eq!(cleared.pending_messages(), 0);
             assert!(initialize(&mut conn, &cx, baseline()).await.is_err());
             // Direct mutation is rejected even with a valid Session row shape.
             for name in [STREAM_TABLE, QUEUE_TABLE, super::super::CURSOR_TABLE] {
-                let body = Changeset { kind: ChangesetKind::Changeset, tables: vec![TableChangeset {
-                    info: TableInfo { name: name.to_ascii_uppercase(), column_count: 1, pk_flags: vec![true] },
-                    rows: vec![ChangesetRow { op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
-                        new_values: vec![ChangesetValue::Integer(1)] }],
-                }] }.encode();
-                assert!(matches!(record(&mut conn, &cx, committed_position(&first), &body, OutboxLimits::default()).await,
-                    Err(ReplicaApplyError::Protocol { detail: "source message targets replication metadata" })));
+                let body = Changeset {
+                    kind: ChangesetKind::Changeset,
+                    tables: vec![TableChangeset {
+                        info: TableInfo {
+                            name: name.to_ascii_uppercase(),
+                            column_count: 1,
+                            pk_flags: vec![true],
+                        },
+                        rows: vec![ChangesetRow {
+                            op: ChangeOp::Insert,
+                            indirect: false,
+                            old_values: Vec::new(),
+                            new_values: vec![ChangesetValue::Integer(1)],
+                        }],
+                    }],
+                }
+                .encode();
+                assert!(matches!(
+                    record(
+                        &mut conn,
+                        &cx,
+                        committed_position(&first),
+                        &body,
+                        OutboxLimits::default()
+                    )
+                    .await,
+                    Err(ReplicaApplyError::Protocol {
+                        detail: "source message targets replication metadata"
+                    })
+                ));
             }
-            assert_eq!(state(&mut conn, &cx, baseline().stream_id).await.unwrap(), cleared);
-            conn.execute("CREATE TEMP TRIGGER metadata BEFORE INSERT ON main._fsqlite_source_outbox_v1 \
-                BEGIN SELECT RAISE(ABORT,'must not run'); END;").await.unwrap();
-            assert!(matches!(record(&mut conn, &cx, committed_position(&first), &[], limits).await,
-                Err(ReplicaApplyError::Protocol { detail: "outbox metadata must not have triggers" })));
+            assert_eq!(
+                state(&mut conn, &cx, baseline().stream_id).await.unwrap(),
+                cleared
+            );
+            conn.execute(
+                "CREATE TEMP TRIGGER metadata BEFORE INSERT ON main._fsqlite_source_outbox_v1 \
+                BEGIN SELECT RAISE(ABORT,'must not run'); END;",
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                record(&mut conn, &cx, committed_position(&first), &[], limits).await,
+                Err(ReplicaApplyError::Protocol {
+                    detail: "outbox metadata must not have triggers"
+                })
+            ));
             conn.close().await.unwrap();
         });
     }

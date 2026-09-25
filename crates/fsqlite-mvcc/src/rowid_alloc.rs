@@ -817,7 +817,12 @@ mod tests {
         assert_eq!(alloc.allocate_one(normal).unwrap().get(), 1);
         assert_eq!(alloc.autoincrement_high_water(&normal), Some(0));
         let negative = key(1, 3);
-        alloc.init_table(negative, Some(RowId::new(-10)), -5, RowIdMode::AutoIncrement);
+        alloc.init_table(
+            negative,
+            Some(RowId::new(-10)),
+            -5,
+            RowIdMode::AutoIncrement,
+        );
         assert_eq!(alloc.autoincrement_high_water(&negative), Some(0));
         assert_eq!(alloc.allocate_one(negative).unwrap().get(), 1);
     }
@@ -858,12 +863,19 @@ mod tests {
             let k = key(1, 1);
             alloc.init_table(k, Some(RowId::new(i64::MAX - 2)), 0, mode);
             let mark = alloc.mark_savepoint(10);
-            assert_eq!(alloc.allocate_one_for_session(k, 10).unwrap().get(), i64::MAX - 1);
+            assert_eq!(
+                alloc.allocate_one_for_session(k, 10).unwrap().get(),
+                i64::MAX - 1
+            );
             assert_eq!(alloc.allocate_one_for_session(k, 20).unwrap(), RowId::MAX);
             alloc.rewind_to_mark(&mark);
             assert_eq!(alloc.next_rowid(&k), Some(EXHAUSTED_NEXT_ROWID));
             assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
-            assert_eq!(alloc.session_reservation_len(), 1, "peer attribution survives");
+            assert_eq!(
+                alloc.session_reservation_len(),
+                1,
+                "peer attribution survives"
+            );
             if mode == RowIdMode::AutoIncrement {
                 assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
             }
@@ -874,9 +886,17 @@ mod tests {
     fn rejected_oversized_range_preserves_the_last_valid_reservation() {
         let alloc = ConcurrentRowIdAllocator::new(epoch(1));
         let k = key(1, 1);
-        alloc.init_table(k, Some(RowId::new(i64::MAX - 3)), 0, RowIdMode::AutoIncrement);
+        alloc.init_table(
+            k,
+            Some(RowId::new(i64::MAX - 3)),
+            0,
+            RowIdMode::AutoIncrement,
+        );
         let mark = alloc.mark_savepoint(10);
-        assert_eq!(alloc.reserve_range_for_session(k, 4, 10), Err(RowIdAllocError::Exhausted));
+        assert_eq!(
+            alloc.reserve_range_for_session(k, 4, 10),
+            Err(RowIdAllocError::Exhausted)
+        );
         assert_eq!(alloc.session_reservation_len(), 0);
         let range = alloc.reserve_range_for_session(k, 3, 10).unwrap();
         assert_eq!(range.end_rowid_inclusive(), Some(RowId::MAX));

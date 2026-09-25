@@ -17,7 +17,9 @@ const MAX_OPS: usize = 65_536;
 type Result<T> = std::result::Result<T, HistoryCompressionError>;
 
 fn invalid(message: &str) -> HistoryCompressionError {
-    HistoryCompressionError::DecodeError(format!("structured patch payload decode/encode: {message}"))
+    HistoryCompressionError::DecodeError(format!(
+        "structured patch payload decode/encode: {message}"
+    ))
 }
 
 struct Writer(Vec<u8>);

@@ -253,8 +253,10 @@ mod host_fs_security_tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::symlink;
 
-    use super::host_fs::{open_existing_regular_file_no_follow, open_wal_for_guarded_repair, reserve_new_file};
     use super::FileIdentity;
+    use super::host_fs::{
+        open_existing_regular_file_no_follow, open_wal_for_guarded_repair, reserve_new_file,
+    };
 
     #[test]
     fn reserved_identity_revalidation_refuses_missing_and_replaced_paths() {
@@ -264,19 +266,27 @@ mod host_fs_security_tests {
         let path = directory.join("reserved.db");
         let retained = directory.join("retained.db");
         let mut original = reserve_new_file(&path).unwrap();
-        original.write_all(b"same bytes, different identity").unwrap();
+        original
+            .write_all(b"same bytes, different identity")
+            .unwrap();
         let identity = FileIdentity::from_file(&original).unwrap().unwrap();
         validate_reserved_file_identity(&path, identity).unwrap();
         std::fs::rename(&path, &retained).unwrap();
         assert!(validate_reserved_file_identity(&path, identity).is_err());
-        assert!(!path.exists(), "validation must not recreate a missing reservation");
+        assert!(
+            !path.exists(),
+            "validation must not recreate a missing reservation"
+        );
         std::fs::write(&path, b"same bytes, different identity").unwrap();
         assert!(matches!(
             validate_reserved_file_identity(&path, identity),
             Err(fsqlite_error::FrankenError::BusyRecovery)
         ));
         assert_eq!(FileIdentity::from_file(&original).unwrap(), Some(identity));
-        assert_eq!(std::fs::read(&path).unwrap(), std::fs::read(&retained).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&retained).unwrap()
+        );
     }
 
     #[test]
@@ -326,8 +336,10 @@ mod host_fs_security_tests {
         let identity = FileIdentity::from_file(&original).unwrap().unwrap();
         let mut unrelated = reserve_new_file(&second).unwrap();
         unrelated.write_all(b"other generation").unwrap();
-        assert!(matches!(open_wal_for_guarded_repair(&second, identity),
-            Err(fsqlite_error::FrankenError::BusyRecovery)));
+        assert!(matches!(
+            open_wal_for_guarded_repair(&second, identity),
+            Err(fsqlite_error::FrankenError::BusyRecovery)
+        ));
         assert_eq!(std::fs::read(&second).unwrap(), b"other generation");
     }
 

@@ -1669,11 +1669,12 @@ mod tests {
     fn unknown_process_probe_preserves_snapshot_publisher_identity() {
         let local = SharedMemoryLayout::new(PageSize::DEFAULT, 16);
         let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
-        let backed = SharedMemoryLayout::open_or_initialize_region(
-            region, PageSize::DEFAULT, 16,
-        ).unwrap();
+        let backed =
+            SharedMemoryLayout::open_or_initialize_region(region, PageSize::DEFAULT, 16).unwrap();
         let identity = SnapshotPublisherIdentity::for_test(
-            u32::MAX, 1, fsqlite_vfs::process::PID_BIRTH_PROCFS_TAG | 1,
+            u32::MAX,
+            1,
+            fsqlite_vfs::process::PID_BIRTH_PROCFS_TAG | 1,
         );
         // Exercise both storage adapters and both publication phases. Unknown
         // must leave the odd sequence and all owner evidence untouched.
@@ -1681,14 +1682,21 @@ mod tests {
             for owner in [identity.initializing_token, identity.active_token] {
                 layout.store_u64_field(
                     offsets::SNAPSHOT_PUBLISHER_OWNER,
-                    &layout.snapshot_publisher_owner, owner, Ordering::Release,
+                    &layout.snapshot_publisher_owner,
+                    owner,
+                    Ordering::Release,
                 );
                 layout.store_u64_field(
                     offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
-                    &layout.snapshot_publisher_pid_birth, identity.pid_birth, Ordering::Release,
+                    &layout.snapshot_publisher_pid_birth,
+                    identity.pid_birth,
+                    Ordering::Release,
                 );
                 layout.store_u64_field(
-                    offsets::SNAPSHOT_SEQ, &layout.snapshot_seq, 7, Ordering::Release,
+                    offsets::SNAPSHOT_SEQ,
+                    &layout.snapshot_seq,
+                    7,
+                    Ordering::Release,
                 );
                 let before = layout.to_bytes();
                 assert!(layout.snapshot_publisher_is_alive(owner, &snapshot_publisher_alive_os));
@@ -1704,18 +1712,25 @@ mod tests {
         let birth = fsqlite_vfs::process::current_process_birth_token()
             .expect("own process birth token available");
         let identity = SnapshotPublisherIdentity::for_test(std::process::id(), 1, birth);
-        layout.snapshot_publisher_pid_birth.store(birth, Ordering::Release);
-        assert!(layout.snapshot_publisher_is_alive(
-            identity.active_token, &snapshot_publisher_alive_os,
-        ));
-        layout.snapshot_publisher_pid_birth.store(birth ^ 1, Ordering::Release);
-        assert!(!layout.snapshot_publisher_is_alive(
-            identity.active_token, &snapshot_publisher_alive_os,
-        ));
+        layout
+            .snapshot_publisher_pid_birth
+            .store(birth, Ordering::Release);
+        assert!(
+            layout
+                .snapshot_publisher_is_alive(identity.active_token, &snapshot_publisher_alive_os,)
+        );
+        layout
+            .snapshot_publisher_pid_birth
+            .store(birth ^ 1, Ordering::Release);
+        assert!(
+            !layout
+                .snapshot_publisher_is_alive(identity.active_token, &snapshot_publisher_alive_os,)
+        );
         // An initializer has not published its birth yet; a previous owner's
         // mismatching birth must not be used to declare that live PID dead.
         assert!(layout.snapshot_publisher_is_alive(
-            identity.initializing_token, &snapshot_publisher_alive_os,
+            identity.initializing_token,
+            &snapshot_publisher_alive_os,
         ));
     }
 

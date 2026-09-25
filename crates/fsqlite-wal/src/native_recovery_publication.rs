@@ -156,7 +156,10 @@ mod tests {
             let destination = image.destination.clone();
             let cx = request_context().unwrap();
             cx.cancel();
-            assert!(matches!(publish(&cx, image).await, Err(FrankenError::Interrupt)));
+            assert!(matches!(
+                publish(&cx, image).await,
+                Err(FrankenError::Interrupt)
+            ));
             assert!(!destination.exists());
         });
     }
@@ -173,7 +176,10 @@ mod tests {
             assert!(matches!(publish(&cx, image).await,
                 Err(FrankenError::CannotOpen { path }) if path == stale));
             assert!(!destination.exists());
-            assert_eq!(host_fs::read(&stale).unwrap(), b"another database's committed WAL");
+            assert_eq!(
+                host_fs::read(&stale).unwrap(),
+                b"another database's committed WAL"
+            );
         });
     }
 
@@ -257,7 +263,10 @@ mod tests {
                     assert!(matches!(result, Err(FrankenError::CannotOpen { path })
                         if path == artifact));
                     assert_eq!(host_fs::read(&destination).unwrap(), expected);
-                    assert_eq!(host_fs::read(&artifact).unwrap(), b"unowned recovery artifact");
+                    assert_eq!(
+                        host_fs::read(&artifact).unwrap(),
+                        b"unowned recovery artifact"
+                    );
                 });
             }
         }
@@ -271,12 +280,22 @@ mod tests {
             let destination = image.destination.clone();
             let expected = image.bytes.clone();
             let cx = request_context().unwrap();
-            assert!(publish_with_sync(&cx, image, |_| {
-                Err(io::Error::other("injected body sync failure"))
-            }).await.is_err());
+            assert!(
+                publish_with_sync(&cx, image, |_| {
+                    Err(io::Error::other("injected body sync failure"))
+                })
+                .await
+                .is_err()
+            );
             let output = host_fs::read(&destination).unwrap();
-            assert_eq!(&output[..DATABASE_HEADER_BYTES], &[0; DATABASE_HEADER_BYTES]);
-            assert_eq!(&output[DATABASE_HEADER_BYTES..], &expected[DATABASE_HEADER_BYTES..]);
+            assert_eq!(
+                &output[..DATABASE_HEADER_BYTES],
+                &[0; DATABASE_HEADER_BYTES]
+            );
+            assert_eq!(
+                &output[DATABASE_HEADER_BYTES..],
+                &expected[DATABASE_HEADER_BYTES..]
+            );
         });
     }
 
@@ -297,7 +316,10 @@ mod tests {
             assert!(matches!(result, Err(FrankenError::Interrupt)));
             assert_eq!(syncs, 1);
             let output = host_fs::read(&destination).unwrap();
-            assert_eq!(&output[..DATABASE_HEADER_BYTES], &[0; DATABASE_HEADER_BYTES]);
+            assert_eq!(
+                &output[..DATABASE_HEADER_BYTES],
+                &[0; DATABASE_HEADER_BYTES]
+            );
         });
     }
 
@@ -310,11 +332,18 @@ mod tests {
             let expected = image.bytes.clone();
             let cx = request_context().unwrap();
             let mut syncs = 0;
-            assert!(publish_with_sync(&cx, image, move |file| {
-                syncs += 1;
-                if syncs == 2 { Err(io::Error::other("injected final sync failure")) }
-                else { file.sync_all() }
-            }).await.is_err());
+            assert!(
+                publish_with_sync(&cx, image, move |file| {
+                    syncs += 1;
+                    if syncs == 2 {
+                        Err(io::Error::other("injected final sync failure"))
+                    } else {
+                        file.sync_all()
+                    }
+                })
+                .await
+                .is_err()
+            );
             // A complete-looking file is still not a successful durability receipt.
             assert_eq!(host_fs::read(&destination).unwrap(), expected);
         });
@@ -335,7 +364,8 @@ mod tests {
                     file.write_all(&[0xff])?;
                 }
                 file.sync_all()
-            }).await;
+            })
+            .await;
             assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
             assert_eq!(host_fs::read(&destination).unwrap()[200], 0xff);
         });
@@ -367,9 +397,11 @@ mod tests {
                 let _keep_alive = &completion;
                 if first_sync {
                     first_sync = false;
-                    entered_tx.send(std::thread::current().id())
+                    entered_tx
+                        .send(std::thread::current().id())
                         .map_err(io::Error::other)?;
-                    release_rx.recv_timeout(Duration::from_secs(10))
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
                         .map_err(io::Error::other)?;
                 }
                 file.sync_all()
@@ -377,7 +409,10 @@ mod tests {
             let mut task = Context::from_waker(Waker::noop());
             assert!(matches!(future.as_mut().poll(&mut task), Poll::Pending));
             let worker = entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_ne!(worker, caller, "fsync must not run on the async executor thread");
+            assert_ne!(
+                worker, caller,
+                "fsync must not run on the async executor thread"
+            );
             let mut output = File::open(&destination).unwrap();
             let mut header = [0_u8; DATABASE_HEADER_BYTES];
             output.read_exact(&mut header).unwrap();
@@ -392,7 +427,10 @@ mod tests {
             // completed export and an explicitly invalid-header partial export
             // are allowed; neither may lose the worker-owned bytes or file.
             assert_eq!(output.len(), expected.len());
-            assert_eq!(&output[DATABASE_HEADER_BYTES..], &expected[DATABASE_HEADER_BYTES..]);
+            assert_eq!(
+                &output[DATABASE_HEADER_BYTES..],
+                &expected[DATABASE_HEADER_BYTES..]
+            );
             assert!(
                 output[..DATABASE_HEADER_BYTES] == expected[..DATABASE_HEADER_BYTES]
                     || output[..DATABASE_HEADER_BYTES] == [0; DATABASE_HEADER_BYTES]

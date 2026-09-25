@@ -29,11 +29,11 @@ use fsqlite_types::{
 
 use crate::physical_merge::StructuredPagePatch;
 
+#[cfg(test)]
+mod certificate_tests;
 pub mod compact;
 mod intent_codec;
 mod structured_codec;
-#[cfg(test)]
-mod certificate_tests;
 
 // ---------------------------------------------------------------------------
 // §5.10.6: Compressed PageHistory
@@ -465,9 +465,11 @@ fn intent_target_digest(op: &IntentOpKind) -> [u8; 16] {
             table_row_key_digest(BtreeRef::Table(*table), key.get())
         }
         IntentOpKind::IndexInsert { index, key, .. }
-        | IntentOpKind::IndexDelete { index, key, .. } => {
-            SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, BtreeRef::Index(*index), key)
-        }
+        | IntentOpKind::IndexDelete { index, key, .. } => SemanticKeyRef::compute_digest(
+            SemanticKeyKind::IndexEntry,
+            BtreeRef::Index(*index),
+            key,
+        ),
     }
 }
 
@@ -499,9 +501,11 @@ fn check_update_expression_pair(a: &IntentOpKind, b: &IntentOpKind) -> Option<bo
         return Some(false);
     }
     let overlap: BTreeSet<ColumnIdx> = written_a.intersection(&written_b).copied().collect();
-    if !cols_a.iter().chain(cols_b.iter()).all(|(column, expr)| {
-        !overlap.contains(column) || is_join_max_int_update(*column, expr)
-    }) {
+    if !cols_a
+        .iter()
+        .chain(cols_b.iter())
+        .all(|(column, expr)| !overlap.contains(column) || is_join_max_int_update(*column, expr))
+    {
         return Some(false);
     }
 
@@ -536,19 +540,24 @@ fn expr_reads_columns(
     match expr {
         RebaseExpr::ColumnRef(column) => columns.contains(column),
         RebaseExpr::Literal(_) => false,
-        RebaseExpr::UnaryOp { operand, .. }
-        | RebaseExpr::Cast { expr: operand, .. } => reads(operand),
+        RebaseExpr::UnaryOp { operand, .. } | RebaseExpr::Cast { expr: operand, .. } => {
+            reads(operand)
+        }
         RebaseExpr::BinaryOp { left, right, .. }
         | RebaseExpr::NullIf { left, right }
         | RebaseExpr::Concat { left, right } => reads(left) || reads(right),
-        RebaseExpr::FunctionCall { args, .. } | RebaseExpr::Coalesce(args) => args.iter().any(reads),
+        RebaseExpr::FunctionCall { args, .. } | RebaseExpr::Coalesce(args) => {
+            args.iter().any(reads)
+        }
         RebaseExpr::Case {
             operand,
             when_clauses,
             else_clause,
         } => {
             operand.as_ref().is_some_and(|expr| reads(expr))
-                || when_clauses.iter().any(|(when, then)| reads(when) || reads(then))
+                || when_clauses
+                    .iter()
+                    .any(|(when, then)| reads(when) || reads(then))
                 || else_clause.as_ref().is_some_and(|expr| reads(expr))
         }
     }
@@ -944,11 +953,17 @@ impl std::fmt::Display for CertificateVerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedVerifierVersion { expected, actual } => {
-                write!(f, "unsupported merge verifier version {actual}; expected {expected}")
+                write!(
+                    f,
+                    "unsupported merge verifier version {actual}; expected {expected}"
+                )
             }
             Self::ContextMismatch => f.write_str("merge certificate replay context mismatch"),
             Self::SchemaEpochMismatch { expected, actual } => {
-                write!(f, "merge intent schema epoch {actual} differs from {expected}")
+                write!(
+                    f,
+                    "merge intent schema epoch {actual} differs from {expected}"
+                )
             }
             Self::DuplicatePage { page } => write!(f, "duplicate page {page} in merge evidence"),
             Self::PageSetMismatch => f.write_str("merge certificate page coverage mismatch"),
@@ -1105,7 +1120,11 @@ pub fn verify_merge_certificate(
     validate_certificate_epochs(intent_ops, certificate.schema_epoch)?;
     let declared = unique_certificate_pages(certificate.pages.iter().copied())?;
     let hashed = unique_certificate_pages(
-        certificate.post_state.page_hashes.iter().map(|(page, _)| *page),
+        certificate
+            .post_state
+            .page_hashes
+            .iter()
+            .map(|(page, _)| *page),
     )?;
     let replayed = unique_certificate_pages(post_merge_pages.iter().map(|(page, _)| *page))?;
     if declared != hashed || declared != replayed {
@@ -1555,8 +1574,14 @@ mod tests {
 
     #[test]
     fn expression_reads_prevent_reordering_disjoint_writes() {
-        let left = expression_update(vec![(ColumnIdx::new(0), RebaseExpr::ColumnRef(ColumnIdx::new(1)))]);
-        let right = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(9)))]);
+        let left = expression_update(vec![(
+            ColumnIdx::new(0),
+            RebaseExpr::ColumnRef(ColumnIdx::new(1)),
+        )]);
+        let right = expression_update(vec![(
+            ColumnIdx::new(1),
+            RebaseExpr::Literal(SqliteValue::Integer(9)),
+        )]);
         // From (a,b)=(1,2), a=b then b=9 yields (2,9); the reverse yields (9,9).
         assert_dependent(&left, &right);
         assert_eq!(
@@ -1577,14 +1602,23 @@ mod tests {
         let literal = RebaseExpr::Literal(SqliteValue::Integer(0));
         let expressions = vec![
             column.clone(),
-            RebaseExpr::UnaryOp { op: RebaseUnaryOp::Not, operand: Box::new(column.clone()) },
+            RebaseExpr::UnaryOp {
+                op: RebaseUnaryOp::Not,
+                operand: Box::new(column.clone()),
+            },
             RebaseExpr::BinaryOp {
                 op: RebaseBinaryOp::Add,
                 left: Box::new(literal.clone()),
                 right: Box::new(column.clone()),
             },
-            RebaseExpr::FunctionCall { name: "ABS".to_owned(), args: vec![column.clone()] },
-            RebaseExpr::Cast { expr: Box::new(column.clone()), type_name: "TEXT".to_owned() },
+            RebaseExpr::FunctionCall {
+                name: "ABS".to_owned(),
+                args: vec![column.clone()],
+            },
+            RebaseExpr::Cast {
+                expr: Box::new(column.clone()),
+                type_name: "TEXT".to_owned(),
+            },
             RebaseExpr::Case {
                 operand: Some(Box::new(column.clone())),
                 when_clauses: vec![(literal.clone(), literal.clone())],
@@ -1606,8 +1640,14 @@ mod tests {
                 else_clause: Some(Box::new(column.clone())),
             },
             RebaseExpr::Coalesce(vec![literal.clone(), column.clone()]),
-            RebaseExpr::NullIf { left: Box::new(column.clone()), right: Box::new(literal.clone()) },
-            RebaseExpr::Concat { left: Box::new(literal.clone()), right: Box::new(column) },
+            RebaseExpr::NullIf {
+                left: Box::new(column.clone()),
+                right: Box::new(literal.clone()),
+            },
+            RebaseExpr::Concat {
+                left: Box::new(literal.clone()),
+                right: Box::new(column),
+            },
         ];
         let writer = expression_update(vec![(ColumnIdx::new(1), literal)]);
         for expr in expressions {
@@ -1640,16 +1680,23 @@ mod tests {
         ]);
         let max = expression_update(vec![(column, max_update(column, 20))]);
         assert_dependent(&duplicate, &max);
-        let other_column = expression_update(vec![
-            (ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(1))),
-        ]);
+        let other_column = expression_update(vec![(
+            ColumnIdx::new(1),
+            RebaseExpr::Literal(SqliteValue::Integer(1)),
+        )]);
         assert_dependent(&duplicate, &other_column);
     }
 
     #[test]
     fn column_refinement_preserves_all_explicit_footprint_dependencies() {
-        let mut left = expression_update(vec![(ColumnIdx::new(0), RebaseExpr::Literal(SqliteValue::Integer(1)))]);
-        let mut right = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(2)))]);
+        let mut left = expression_update(vec![(
+            ColumnIdx::new(0),
+            RebaseExpr::Literal(SqliteValue::Integer(1)),
+        )]);
+        let mut right = expression_update(vec![(
+            ColumnIdx::new(1),
+            RebaseExpr::Literal(SqliteValue::Integer(2)),
+        )]);
         left.footprint.writes.push(table_key(1, 1));
         right.footprint.writes.push(table_key(1, 1));
         assert!(are_intent_ops_independent(&left, &right));
@@ -1657,7 +1704,11 @@ mod tests {
         explicit_read.footprint.reads.push(table_key(1, 1));
         assert_dependent(&explicit_read, &right);
 
-        let extra = SemanticKeyRef::new(BtreeRef::Index(IndexId::new(9)), SemanticKeyKind::IndexEntry, &[7]);
+        let extra = SemanticKeyRef::new(
+            BtreeRef::Index(IndexId::new(9)),
+            SemanticKeyKind::IndexEntry,
+            &[7],
+        );
         left.footprint.writes.push(extra.clone());
         right.footprint.reads.push(extra.clone());
         assert_dependent(&left, &right);
@@ -1674,12 +1725,24 @@ mod tests {
         let table = TableId::new(1);
         let key = RowId::new(1);
         let operations = [
-            IntentOpKind::Insert { table, key, record: vec![1] },
+            IntentOpKind::Insert {
+                table,
+                key,
+                record: vec![1],
+            },
             IntentOpKind::Delete { table, key },
-            IntentOpKind::Update { table, key, new_record: vec![2] },
+            IntentOpKind::Update {
+                table,
+                key,
+                new_record: vec![2],
+            },
             IntentOpKind::UpdateExpression {
-                table, key,
-                column_updates: vec![(ColumnIdx::new(0), RebaseExpr::Literal(SqliteValue::Integer(1)))],
+                table,
+                key,
+                column_updates: vec![(
+                    ColumnIdx::new(0),
+                    RebaseExpr::Literal(SqliteValue::Integer(1)),
+                )],
             },
         ];
         for a in &operations {
@@ -1688,7 +1751,13 @@ mod tests {
             }
         }
         let writer = make_op(1, operations[0].clone());
-        let mut reader = make_op(1, IntentOpKind::Delete { table, key: RowId::new(2) });
+        let mut reader = make_op(
+            1,
+            IntentOpKind::Delete {
+                table,
+                key: RowId::new(2),
+            },
+        );
         assert!(are_intent_ops_independent(&writer, &reader));
         reader.footprint.reads.push(table_key(1, 1));
         assert_dependent(&writer, &reader);
@@ -1697,10 +1766,30 @@ mod tests {
     #[test]
     fn intrinsic_index_writes_are_separate_from_table_key_space() {
         let index = IndexId::new(1);
-        let left = make_op(1, IntentOpKind::IndexInsert { index, key: vec![1], rowid: RowId::new(1) });
-        let right = make_op(1, IntentOpKind::IndexDelete { index, key: vec![1], rowid: RowId::new(1) });
+        let left = make_op(
+            1,
+            IntentOpKind::IndexInsert {
+                index,
+                key: vec![1],
+                rowid: RowId::new(1),
+            },
+        );
+        let right = make_op(
+            1,
+            IntentOpKind::IndexDelete {
+                index,
+                key: vec![1],
+                rowid: RowId::new(1),
+            },
+        );
         assert_dependent(&left, &right);
-        let table = make_op(1, IntentOpKind::Delete { table: TableId::new(1), key: RowId::new(1) });
+        let table = make_op(
+            1,
+            IntentOpKind::Delete {
+                table: TableId::new(1),
+                key: RowId::new(1),
+            },
+        );
         assert!(are_intent_ops_independent(&left, &table));
     }
 
@@ -1708,9 +1797,15 @@ mod tests {
     fn bounded_expression_analysis_fails_closed() {
         let mut deep = RebaseExpr::Literal(SqliteValue::Integer(1));
         for _ in 0..65 {
-            deep = RebaseExpr::Cast { expr: Box::new(deep), type_name: "INTEGER".to_owned() };
+            deep = RebaseExpr::Cast {
+                expr: Box::new(deep),
+                type_name: "INTEGER".to_owned(),
+            };
         }
-        let writer = expression_update(vec![(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(2)))]);
+        let writer = expression_update(vec![(
+            ColumnIdx::new(1),
+            RebaseExpr::Literal(SqliteValue::Integer(2)),
+        )]);
         assert_dependent(&expression_update(vec![(ColumnIdx::new(0), deep)]), &writer);
         let wide = RebaseExpr::Coalesce(vec![RebaseExpr::Literal(SqliteValue::Integer(1)); 4097]);
         assert_dependent(&expression_update(vec![(ColumnIdx::new(0), wide)]), &writer);
@@ -1727,7 +1822,10 @@ mod tests {
             assert_eq!(collapse_join_max_updates(column, &[invalid, &valid]), None);
         }
         assert_eq!(collapse_join_max_updates(column, &[]), None);
-        assert_eq!(collapse_join_max_updates(column, &[&valid, &valid]), Some(valid.clone()));
+        assert_eq!(
+            collapse_join_max_updates(column, &[&valid, &valid]),
+            Some(valid.clone())
+        );
     }
 
     #[test]
@@ -1742,7 +1840,8 @@ mod tests {
                 let value = match expr {
                     RebaseExpr::ColumnRef(source) => row[usize::try_from(source.get()).unwrap()],
                     RebaseExpr::Literal(SqliteValue::Integer(value)) => *value,
-                    _ => row[usize::try_from(column.get()).unwrap()].max(extract_join_max_constant(*column, expr).unwrap()),
+                    _ => row[usize::try_from(column.get()).unwrap()]
+                        .max(extract_join_max_constant(*column, expr).unwrap()),
                 };
                 result[usize::try_from(column.get()).unwrap()] = value;
             }
@@ -1763,7 +1862,10 @@ mod tests {
         }
         for a in &updates {
             for b in &updates {
-                assert_eq!(are_intent_ops_independent(a, b), are_intent_ops_independent(b, a));
+                assert_eq!(
+                    are_intent_ops_independent(a, b),
+                    are_intent_ops_independent(b, a)
+                );
                 if are_intent_ops_independent(a, b) {
                     for row in [[-2, 5], [0, 0], [9, -1]] {
                         assert_eq!(apply(b, apply(a, row)), apply(a, apply(b, row)));

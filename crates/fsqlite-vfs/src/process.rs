@@ -258,7 +258,12 @@ mod linux {
 
         #[test]
         fn proc_stat_parsing_ignores_arbitrary_comm_bytes() {
-            for comm in [b"writer".as_slice(), b"a (b) c)", b"a\nb", b"invalid\xff\xfe"] {
+            for comm in [
+                b"writer".as_slice(),
+                b"a (b) c)",
+                b"a\nb",
+                b"invalid\xff\xfe",
+            ] {
                 for ticks in [0, 42, u64::MAX] {
                     assert_eq!(start_ticks(&stat(123, comm, ticks), 123), Some(ticks));
                 }

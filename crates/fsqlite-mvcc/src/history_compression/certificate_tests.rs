@@ -48,10 +48,16 @@ fn verify(certificate: &MergeCertificate) -> Result<(), CertificateVerificationE
 fn missing_all_or_one_page_hash_never_verifies() {
     let mut cert = certificate();
     cert.post_state.page_hashes.clear();
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::PageSetMismatch));
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::PageSetMismatch)
+    );
     let mut cert = certificate();
     cert.post_state.page_hashes.pop();
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::PageSetMismatch));
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::PageSetMismatch)
+    );
 }
 
 #[test]
@@ -59,7 +65,10 @@ fn omitting_a_page_from_both_manifests_does_not_hide_replay_output() {
     let mut cert = certificate();
     cert.pages.pop();
     cert.post_state.page_hashes.pop();
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::PageSetMismatch));
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::PageSetMismatch)
+    );
 }
 
 #[test]
@@ -67,7 +76,10 @@ fn declared_manifest_is_checked_not_just_hash_entries() {
     for replacement in [vec![], vec![PageNumber::ONE]] {
         let mut cert = certificate();
         cert.pages = replacement;
-        assert_eq!(verify(&cert), Err(CertificateVerificationError::PageSetMismatch));
+        assert_eq!(
+            verify(&cert),
+            Err(CertificateVerificationError::PageSetMismatch)
+        );
     }
 }
 
@@ -97,10 +109,18 @@ fn duplicate_manifest_and_hash_entries_are_rejected() {
     let mut cert = certificate();
     let page = cert.pages[0];
     cert.pages.push(page);
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::DuplicatePage { page }));
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::DuplicatePage { page })
+    );
     let mut cert = certificate();
-    cert.post_state.page_hashes.push(cert.post_state.page_hashes[0]);
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::DuplicatePage { page }));
+    cert.post_state
+        .page_hashes
+        .push(cert.post_state.page_hashes[0]);
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::DuplicatePage { page })
+    );
 }
 
 #[test]
@@ -162,9 +182,19 @@ fn unsupported_algorithm_versions_fail_before_other_evidence() {
 fn generation_and_verification_bind_every_intent_schema_epoch() {
     let mut other = intent();
     other.schema_epoch = 8;
-    let expected = CertificateVerificationError::SchemaEpochMismatch { expected: 7, actual: 8 };
+    let expected = CertificateVerificationError::SchemaEpochMismatch {
+        expected: 7,
+        actual: 8,
+    };
     assert_eq!(
-        generate_merge_certificate(MergeKind::Rebase, 41, 7, &[intent(), other.clone()], &pages(), [0; 16]),
+        generate_merge_certificate(
+            MergeKind::Rebase,
+            41,
+            7,
+            &[intent(), other.clone()],
+            &pages(),
+            [0; 16]
+        ),
         Err(expected.clone())
     );
     assert_eq!(
@@ -173,23 +203,50 @@ fn generation_and_verification_bind_every_intent_schema_epoch() {
     );
     let mut cert = certificate();
     cert.schema_epoch = 9;
-    assert_eq!(verify(&cert), Err(CertificateVerificationError::SchemaEpochMismatch { expected: 9, actual: 7 }));
+    assert_eq!(
+        verify(&cert),
+        Err(CertificateVerificationError::SchemaEpochMismatch {
+            expected: 9,
+            actual: 7
+        })
+    );
 }
 
 #[test]
 fn context_binds_merge_kind_base_and_schema_including_empty_intents() {
     for ops in [vec![], vec![intent()]] {
         let expected = context();
-        let cert = generate_merge_certificate(expected.merge_kind, expected.base_commit_seq,
-            expected.schema_epoch, &ops, &pages(), [0x42; 16]).unwrap();
-        assert!(cert.verify_in_context(expected, &ops, &pages(), [0x42; 16]).is_ok());
+        let cert = generate_merge_certificate(
+            expected.merge_kind,
+            expected.base_commit_seq,
+            expected.schema_epoch,
+            &ops,
+            &pages(),
+            [0x42; 16],
+        )
+        .unwrap();
+        assert!(
+            cert.verify_in_context(expected, &ops, &pages(), [0x42; 16])
+                .is_ok()
+        );
         for wrong in [
-            MergeCertificateContext { merge_kind: MergeKind::Rebase, ..expected },
-            MergeCertificateContext { base_commit_seq: 42, ..expected },
-            MergeCertificateContext { schema_epoch: 8, ..expected },
+            MergeCertificateContext {
+                merge_kind: MergeKind::Rebase,
+                ..expected
+            },
+            MergeCertificateContext {
+                base_commit_seq: 42,
+                ..expected
+            },
+            MergeCertificateContext {
+                schema_epoch: 8,
+                ..expected
+            },
         ] {
-            assert_eq!(cert.verify_in_context(wrong, &ops, &pages(), [0x42; 16]),
-                Err(CertificateVerificationError::ContextMismatch));
+            assert_eq!(
+                cert.verify_in_context(wrong, &ops, &pages(), [0x42; 16]),
+                Err(CertificateVerificationError::ContextMismatch)
+            );
         }
     }
 }
@@ -198,11 +255,17 @@ fn context_binds_merge_kind_base_and_schema_including_empty_intents() {
 fn corrupt_page_and_invariant_hashes_still_fail_after_manifest_validation() {
     let mut cert = certificate();
     cert.post_state.page_hashes[0].1[0] ^= 1;
-    assert!(matches!(verify(&cert), Err(CertificateVerificationError::PageHashMismatch { .. })));
+    assert!(matches!(
+        verify(&cert),
+        Err(CertificateVerificationError::PageHashMismatch { .. })
+    ));
     let mut cert = certificate();
     cert.post_state.btree_invariant_hash[0] ^= 1;
     let error = verify(&cert).unwrap_err();
-    assert!(matches!(error, CertificateVerificationError::BtreeInvariantHashMismatch { .. }));
+    assert!(matches!(
+        error,
+        CertificateVerificationError::BtreeInvariantHashMismatch { .. }
+    ));
     assert!(circuit_breaker_check(error, &cert).disable_safe_merge);
 }
 
@@ -210,8 +273,10 @@ fn corrupt_page_and_invariant_hashes_still_fail_after_manifest_validation() {
 fn empty_evidence_is_only_a_consistent_no_op() {
     let cert = generate_merge_certificate(MergeKind::Rebase, 41, 7, &[], &[], [0; 16]).unwrap();
     assert!(verify_merge_certificate(&[], &[], [0; 16], &cert).is_ok());
-    assert_eq!(verify_merge_certificate(&[], &pages(), [0; 16], &cert),
-        Err(CertificateVerificationError::PageSetMismatch));
+    assert_eq!(
+        verify_merge_certificate(&[], &pages(), [0; 16], &cert),
+        Err(CertificateVerificationError::PageSetMismatch)
+    );
 }
 
 #[test]
@@ -253,7 +318,10 @@ fn proof_digests_bind_semantic_key_routing_metadata() {
         [0x42; 16],
     )
     .unwrap();
-    assert!(cert.verify_in_context(context(), &[baseline.clone()], &pages(), [0x42; 16]).is_ok());
+    assert!(
+        cert.verify_in_context(context(), &[baseline.clone()], &pages(), [0x42; 16])
+            .is_ok()
+    );
     for source in 0..2 {
         for variant in 0..3 {
             let mut changed = baseline.clone();
@@ -270,7 +338,10 @@ fn proof_digests_bind_semantic_key_routing_metadata() {
             }
             assert_eq!(key.key_digest, unchanged_digest);
             assert_ne!(compute_op_digest(&changed), expected_op);
-            assert_ne!(compute_footprint_digest(&[&changed.footprint]), expected_footprint);
+            assert_ne!(
+                compute_footprint_digest(&[&changed.footprint]),
+                expected_footprint
+            );
             assert!(matches!(
                 cert.verify_in_context(context(), &[changed], &pages(), [0x42; 16]),
                 Err(CertificateVerificationError::OpDigestMismatch { .. })
@@ -307,7 +378,9 @@ fn circuit_breaker_identity_binds_all_certificate_fields() {
             1 => changed.merge_kind = MergeKind::StructuredPatch,
             2 => changed.base_commit_seq += 1,
             3 => changed.schema_epoch += 1,
-            4 => { let _ = changed.pages.pop(); }
+            4 => {
+                let _ = changed.pages.pop();
+            }
             5 => changed.intent_op_digests[0][0] ^= 1,
             6 => changed.footprint_digest[0] ^= 1,
             7 => changed.normal_form[0][0] ^= 1,

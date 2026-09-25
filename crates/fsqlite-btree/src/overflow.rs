@@ -100,9 +100,7 @@ impl OverflowReadState {
         }
         if self.visited.len() >= MAX_OVERFLOW_CHAIN {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "overflow chain exceeds maximum length of {MAX_OVERFLOW_CHAIN}"
-                ),
+                detail: format!("overflow chain exceeds maximum length of {MAX_OVERFLOW_CHAIN}"),
             });
         }
         if !self.visited.insert(page_no)? {
@@ -511,7 +509,10 @@ impl OverflowWriteState {
         }
         if !self.seen.insert(page_no) {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("overflow allocator returned duplicate page {}", page_no.get()),
+                detail: format!(
+                    "overflow allocator returned duplicate page {}",
+                    page_no.get()
+                ),
             });
         }
         self.pages.push(page_no);
@@ -814,8 +815,14 @@ mod tests {
             page_no: PageNumber,
         ) -> impl Future<Output = Result<()>> + 'a {
             async move {
-                assert!(cx.checkpoint().is_ok(), "cleanup cancellation must be masked");
-                assert!(!self.freed.contains(&page_no), "double free during compensation");
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "cleanup cancellation must be masked"
+                );
+                assert!(
+                    !self.freed.contains(&page_no),
+                    "double free during compensation"
+                );
                 assert_ne!(page_no.get(), 1, "must never free the database header");
                 self.freed.push(page_no);
                 self.store.free_page(cx, page_no).await
@@ -834,14 +841,16 @@ mod tests {
                 if allocated == 0 {
                     cx.cancel();
                 }
-                let result = write_overflow_chain_async(&cx, &[0x42; 50], 20, 32, &mut store)
-                    .await;
+                let result = write_overflow_chain_async(&cx, &[0x42; 50], 20, 32, &mut store).await;
                 assert!(matches!(result, Err(FrankenError::Abort)));
                 assert_eq!(store.allocations, allocated);
                 assert_eq!(store.writes, 0);
                 assert_eq!(store.freed.len(), allocated);
                 assert!(store.store.pages.is_empty());
-                assert!(cx.checkpoint().is_err(), "cleanup must not uncancel its parent");
+                assert!(
+                    cx.checkpoint().is_err(),
+                    "cleanup must not uncancel its parent"
+                );
             }
         });
     }
@@ -851,10 +860,8 @@ mod tests {
         run_async(async {
             for index in 0..4 {
                 let mut store = FaultPageStore::new(WriteFault::FailAllocation(index));
-                let result = write_overflow_chain_async(
-                    &Cx::new(), &[0x42; 50], 20, 32, &mut store,
-                )
-                .await;
+                let result =
+                    write_overflow_chain_async(&Cx::new(), &[0x42; 50], 20, 32, &mut store).await;
                 assert!(matches!(result, Err(FrankenError::Busy)));
                 assert_eq!(store.allocations, index + 1);
                 assert_eq!(store.writes, 0);
@@ -869,10 +876,8 @@ mod tests {
         run_async(async {
             for index in 0..4 {
                 let mut store = FaultPageStore::new(WriteFault::FailWrite(index));
-                let result = write_overflow_chain_async(
-                    &Cx::new(), &[0x42; 50], 20, 32, &mut store,
-                )
-                .await;
+                let result =
+                    write_overflow_chain_async(&Cx::new(), &[0x42; 50], 20, 32, &mut store).await;
                 assert!(matches!(result, Err(FrankenError::Busy)));
                 assert_eq!(store.allocations, 4);
                 assert_eq!(store.writes, index + 1);
@@ -892,10 +897,9 @@ mod tests {
                 }
                 for fault in faults {
                     let mut store = FaultPageStore::new(fault);
-                    let result = write_overflow_chain_async(
-                        &Cx::new(), &[0x42; 50], 20, 32, &mut store,
-                    )
-                    .await;
+                    let result =
+                        write_overflow_chain_async(&Cx::new(), &[0x42; 50], 20, 32, &mut store)
+                            .await;
                     assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
                     assert_eq!(store.allocations, index + 1);
                     assert_eq!(store.writes, 0);
@@ -911,11 +915,11 @@ mod tests {
         run_async(async {
             for (usable, full) in [(0, 16), (4, 16), (16, 8)] {
                 let mut store = FaultPageStore::new(WriteFault::None);
-                assert!(write_overflow_chain_async(
-                    &Cx::new(), &[0x42; 50], usable, full, &mut store,
-                )
-                .await
-                .is_err());
+                assert!(
+                    write_overflow_chain_async(&Cx::new(), &[0x42; 50], usable, full, &mut store,)
+                        .await
+                        .is_err()
+                );
                 assert_eq!(store.allocations, 0);
                 assert_eq!(store.writes, 0);
                 assert!(store.freed.is_empty());
@@ -962,11 +966,16 @@ mod tests {
         };
         let first = write_overflow_chain(&data, 16, 32, &mut allocate, &mut write).unwrap();
         assert_eq!(pages.len(), 3);
-        assert!(pages.values().all(|page| page[16..].iter().all(|&b| b == 0)));
-        let mut read = |page: PageNumber| {
-            pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
-        };
-        assert_eq!(read_overflow_chain(&[], first, 25, 16, &mut read).unwrap(), data);
+        assert!(
+            pages
+                .values()
+                .all(|page| page[16..].iter().all(|&b| b == 0))
+        );
+        let mut read = |page: PageNumber| pages.get(&page.get()).cloned().ok_or(FrankenError::Busy);
+        assert_eq!(
+            read_overflow_chain(&[], first, 25, 16, &mut read).unwrap(),
+            data
+        );
     }
 
     fn linked_page(next: u32) -> Vec<u8> {
@@ -988,10 +997,20 @@ mod tests {
         let mut out = vec![0xEE; 32];
         let mut read_page = |page: PageNumber| {
             store.reads.set(store.reads.get() + 1);
-            store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+            store
+                .pages
+                .get(&page.get())
+                .cloned()
+                .ok_or(FrankenError::Busy)
         };
         let error = read_overflow_chain_prefix_into(
-            &[], first, total, 16, prefix, &mut read_page, &mut out,
+            &[],
+            first,
+            total,
+            16,
+            prefix,
+            &mut read_page,
+            &mut out,
         )
         .unwrap_err();
         assert!(matches!(&error, FrankenError::DatabaseCorrupt { .. }));
@@ -1000,7 +1019,14 @@ mod tests {
 
         store.reads.set(0);
         let error = read_overflow_chain_prefix_into_async(
-            &Cx::new(), &[], first, total, 16, prefix, &store, &mut out,
+            &Cx::new(),
+            &[],
+            first,
+            total,
+            16,
+            prefix,
+            &store,
+            &mut out,
         )
         .await
         .unwrap_err();
@@ -1015,7 +1041,11 @@ mod tests {
             for prefix in [1, 12, 13, 100] {
                 assert_invalid_overflow(
                     HashMap::from([(5, linked_page(5))]),
-                    5, 100, prefix, "cycle in overflow chain", 1,
+                    5,
+                    100,
+                    prefix,
+                    "cycle in overflow chain",
+                    1,
                 )
                 .await;
             }
@@ -1027,10 +1057,8 @@ mod tests {
                     .into_iter()
                     .map(|(page, next)| (page, linked_page(next)))
                     .collect();
-                assert_invalid_overflow(
-                    pages, 5, 100, prefix, "cycle in overflow chain", reads,
-                )
-                .await;
+                assert_invalid_overflow(pages, 5, 100, prefix, "cycle in overflow chain", reads)
+                    .await;
             }
         });
     }
@@ -1073,7 +1101,11 @@ mod tests {
                 page.truncate(size);
                 assert_invalid_overflow(
                     HashMap::from([(5, page)]),
-                    5, 1, 1, "overflow page too small", 1,
+                    5,
+                    1,
+                    1,
+                    "overflow page too small",
+                    1,
                 )
                 .await;
             }
@@ -1088,12 +1120,20 @@ mod tests {
                 // that already proves the complete payload is truncated.
                 assert_invalid_overflow(
                     HashMap::from([(5, linked_page(0))]),
-                    5, 13, prefix, "unexpected end of overflow chain", 1,
+                    5,
+                    13,
+                    prefix,
+                    "unexpected end of overflow chain",
+                    1,
                 )
                 .await;
                 assert_invalid_overflow(
                     HashMap::from([(5, linked_page(6))]),
-                    5, 12, prefix, "continues beyond the declared payload", 1,
+                    5,
+                    12,
+                    prefix,
+                    "continues beyond the declared payload",
+                    1,
                 )
                 .await;
             }
@@ -1106,7 +1146,11 @@ mod tests {
             assert_invalid_overflow(HashMap::new(), 1, 12, 12, "header page", 0).await;
             assert_invalid_overflow(
                 HashMap::from([(5, linked_page(1))]),
-                5, 13, 13, "header page", 1,
+                5,
+                13,
+                13,
+                "header page",
+                1,
             )
             .await;
         });
@@ -1159,10 +1203,20 @@ mod tests {
                 store.reads.set(0);
                 let mut read_page = |page: PageNumber| {
                     store.reads.set(store.reads.get() + 1);
-                    store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+                    store
+                        .pages
+                        .get(&page.get())
+                        .cloned()
+                        .ok_or(FrankenError::Busy)
                 };
                 read_overflow_chain_prefix_into(
-                    &[], first, 13, 16, prefix, &mut read_page, &mut out,
+                    &[],
+                    first,
+                    13,
+                    16,
+                    prefix,
+                    &mut read_page,
+                    &mut out,
                 )
                 .unwrap();
                 assert_eq!(out, vec![b'x'; count]);
@@ -1170,7 +1224,14 @@ mod tests {
 
                 store.reads.set(0);
                 read_overflow_chain_prefix_into_async(
-                    &cx, &[], first, 13, 16, prefix, &store, &mut out,
+                    &cx,
+                    &[],
+                    first,
+                    13,
+                    16,
+                    prefix,
+                    &store,
+                    &mut out,
                 )
                 .await
                 .unwrap();
@@ -1188,9 +1249,7 @@ mod tests {
             let mut last_page = linked_page(0);
             last_page[4] = b'y';
             last_page.extend_from_slice(&[0xEE; 8]);
-            let store = TestPageStore::from_pages(HashMap::from([
-                (5, first_page), (6, last_page),
-            ]));
+            let store = TestPageStore::from_pages(HashMap::from([(5, first_page), (6, last_page)]));
             let mut expected = b"Lxxxxxxxxxxxxy".to_vec();
             assert_eq!(expected.len(), 14);
             let first = PageNumber::new(5).unwrap();
@@ -1202,10 +1261,20 @@ mod tests {
                 store.reads.set(0);
                 let mut read_page = |page: PageNumber| {
                     store.reads.set(store.reads.get() + 1);
-                    store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+                    store
+                        .pages
+                        .get(&page.get())
+                        .cloned()
+                        .ok_or(FrankenError::Busy)
                 };
                 read_overflow_chain_prefix_into(
-                    b"L", first, 14, 16, prefix, &mut read_page, &mut out,
+                    b"L",
+                    first,
+                    14,
+                    16,
+                    prefix,
+                    &mut read_page,
+                    &mut out,
                 )
                 .unwrap();
                 assert_eq!(out, expected[..count]);
@@ -1228,10 +1297,13 @@ mod tests {
             );
             expected.clear();
             let mut read_page = |page: PageNumber| {
-                store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+                store
+                    .pages
+                    .get(&page.get())
+                    .cloned()
+                    .ok_or(FrankenError::Busy)
             };
-            read_overflow_chain_into(b"L", first, 14, 16, &mut read_page, &mut expected)
-                .unwrap();
+            read_overflow_chain_into(b"L", first, 14, 16, &mut read_page, &mut expected).unwrap();
             assert_eq!(expected.as_slice(), b"Lxxxxxxxxxxxxy");
         });
     }
@@ -1242,7 +1314,11 @@ mod tests {
             let store = TestPageStore::from_pages(HashMap::from([(5, linked_page(6))]));
             let first = PageNumber::new(5).unwrap();
             let mut read_page = |page: PageNumber| {
-                store.pages.get(&page.get()).cloned().ok_or(FrankenError::Busy)
+                store
+                    .pages
+                    .get(&page.get())
+                    .cloned()
+                    .ok_or(FrankenError::Busy)
             };
             assert!(matches!(
                 read_overflow_chain(&[], first, 13, 16, &mut read_page),

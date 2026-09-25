@@ -374,7 +374,9 @@ mod tests {
     fn replayable_sql_preflight_covers_every_execute_and_query_entry_point() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let mut tx = conn.transaction().await.unwrap();
             tx.allow_sql_transaction_control = false;
             tx.execute("INSERT INTO data VALUES (1)").await.unwrap();
@@ -414,7 +416,12 @@ mod tests {
             assert_eq!(rows.len(), 1, "no prefix of a refused batch may run");
             assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
             tx.rollback().await.unwrap();
-            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -438,7 +445,10 @@ mod tests {
             assert_eq!(tx.query("SELECT value FROM audit").await.unwrap().len(), 1);
             tx.commit().await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Text("keep".into()))
             );
         });
@@ -448,20 +458,40 @@ mod tests {
     fn new_transaction_settles_previous_abandoned_scope() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let previous = conn.transaction().await.unwrap();
-            previous.execute("INSERT INTO data VALUES (1)").await.unwrap();
+            previous
+                .execute("INSERT INTO data VALUES (1)")
+                .await
+                .unwrap();
             drop(previous);
-            assert!(conn.in_transaction(), "Drop records rather than executes rollback");
+            assert!(
+                conn.in_transaction(),
+                "Drop records rather than executes rollback"
+            );
 
             // No intervening query: transaction() itself must settle the old
             // scope rather than treating the abandoned transaction as live.
             let mut replacement = conn.transaction().await.unwrap();
-            assert!(replacement.query("SELECT value FROM data").await.unwrap().is_empty());
-            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            assert!(
+                replacement
+                    .query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            replacement
+                .execute("INSERT INTO data VALUES (2)")
+                .await
+                .unwrap();
             replacement.commit().await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(2))
             );
         });
@@ -471,14 +501,20 @@ mod tests {
     fn nested_transaction_refusal_preserves_live_wrapper() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let mut caller = conn.transaction().await.unwrap();
             caller.execute("INSERT INTO data VALUES (7)").await.unwrap();
             let refused = conn.transaction().await;
             assert!(matches!(refused, Err(FrankenError::NestedTransaction)));
             assert!(conn.in_transaction());
             assert_eq!(
-                caller.query_row("SELECT value FROM data").await.unwrap().get(0),
+                caller
+                    .query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(7))
             );
             caller.commit().await.unwrap();
@@ -490,7 +526,9 @@ mod tests {
     fn failed_admission_retires_partial_transaction_before_next_begin() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let refused = Transaction::new_with_begin(&conn, async {
                 conn.begin_transaction().await?;
                 conn.execute("INSERT INTO data VALUES (1)").await?;
@@ -498,14 +536,29 @@ mod tests {
             })
             .await;
             assert!(matches!(refused, Err(FrankenError::Busy)));
-            assert!(conn.in_transaction(), "failed admission must leave an owned cleanup obligation");
+            assert!(
+                conn.in_transaction(),
+                "failed admission must leave an owned cleanup obligation"
+            );
 
             let mut replacement = conn.transaction().await.unwrap();
-            assert!(replacement.query("SELECT value FROM data").await.unwrap().is_empty());
-            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            assert!(
+                replacement
+                    .query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            replacement
+                .execute("INSERT INTO data VALUES (2)")
+                .await
+                .unwrap();
             replacement.commit().await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(2))
             );
         });
@@ -518,7 +571,9 @@ mod tests {
             use std::task::Poll;
 
             let conn = Connection::open(":memory:").await.unwrap();
-            conn.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            conn.execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             let parked = Cell::new(false);
             let mut admission = Box::pin(Transaction::new_with_begin(&conn, async {
                 conn.begin_transaction().await?;
@@ -538,13 +593,24 @@ mod tests {
             assert!(conn.in_transaction());
             drop(admission);
 
-            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(!conn.in_transaction());
             let mut replacement = conn.transaction().await.unwrap();
-            replacement.execute("INSERT INTO data VALUES (2)").await.unwrap();
+            replacement
+                .execute("INSERT INTO data VALUES (2)")
+                .await
+                .unwrap();
             replacement.commit().await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(2))
             );
         });
@@ -562,11 +628,20 @@ mod tests {
             assert!(matches!(refused, Err(FrankenError::BusyRecovery)));
             assert!(!conn.in_transaction());
             let mut replacement = conn.transaction().await.unwrap();
-            replacement.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
-            replacement.execute("INSERT INTO data VALUES (3)").await.unwrap();
+            replacement
+                .execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
+            replacement
+                .execute("INSERT INTO data VALUES (3)")
+                .await
+                .unwrap();
             replacement.commit().await.unwrap();
             assert_eq!(
-                conn.query_row("SELECT value FROM data").await.unwrap().get(0),
+                conn.query_row("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .get(0),
                 Some(&SqliteValue::Integer(3))
             );
         });
@@ -580,9 +655,17 @@ mod tests {
             assert!(matches!(refused, Err(FrankenError::NoActiveTransaction)));
             assert!(!conn.in_transaction());
             let mut replacement = conn.transaction().await.unwrap();
-            replacement.execute("CREATE TABLE data(value INTEGER)").await.unwrap();
+            replacement
+                .execute("CREATE TABLE data(value INTEGER)")
+                .await
+                .unwrap();
             replacement.commit().await.unwrap();
-            assert!(conn.query("SELECT value FROM data").await.unwrap().is_empty());
+            assert!(
+                conn.query("SELECT value FROM data")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 

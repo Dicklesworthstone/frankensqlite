@@ -2516,7 +2516,9 @@ mod tests {
         );
         let previous_birth = birth ^ 1;
         assert!(!process_alive_os(pid, previous_birth));
-        table.rebuild_pid_birth.store(previous_birth, Ordering::Release);
+        table
+            .rebuild_pid_birth
+            .store(previous_birth, Ordering::Release);
         assert_eq!(table.rebuild_lease_expiry.load(Ordering::Relaxed), 1005);
         assert!(table.acquire_rebuild_lease(1002, 7, 1001).is_ok());
         assert_eq!(table.rebuild_pid.load(Ordering::Relaxed), 1002);

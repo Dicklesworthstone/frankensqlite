@@ -142,7 +142,9 @@ fn ebr_batch_randomized_retire_and_reclaim_match_slot_oracle() {
     let mut next_slot = 0_u32;
     let mut recycled = 0_u64;
     for _ in 0..5_000 {
-        random = random.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        random = random
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let epoch = (random >> 24) % 128;
         if random & 3 != 0 {
             let count = ((random >> 40) % 19) as usize;

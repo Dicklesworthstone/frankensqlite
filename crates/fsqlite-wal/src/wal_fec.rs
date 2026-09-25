@@ -2739,7 +2739,8 @@ impl CommittedRangeSidecar {
             }
         };
         output.write_all(&record)?;
-        self.present.insert(group.meta.group_id(), group.meta.clone());
+        self.present
+            .insert(group.meta.group_id(), group.meta.clone());
         Ok(())
     }
 

@@ -54,7 +54,9 @@ output or repaired source before using it; untouched B-tree pages are not checke
     }
 
     fn positive_limit(value: &OsStr) -> std::result::Result<usize, String> {
-        value.to_str().and_then(|text| text.parse::<usize>().ok())
+        value
+            .to_str()
+            .and_then(|text| text.parse::<usize>().ok())
             .filter(|limit| *limit != 0 && isize::try_from(*limit).is_ok())
             .ok_or_else(|| "limits must be positive addressable byte/page counts".to_owned())
     }
@@ -76,7 +78,9 @@ output or repaired source before using it; untouched B-tree pages are not checke
             } else if !literal_paths && arg == "--repair-wal" {
                 command.repair_wal = true;
             } else if !literal_paths && (arg == "--max-bytes" || arg == "--max-source-pages") {
-                let value = args.next().ok_or_else(|| "missing limit value".to_owned())?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing limit value".to_owned())?;
                 let limit = positive_limit(&value)?;
                 if arg == "--max-bytes" {
                     command.options.max_database_bytes = limit;
@@ -112,11 +116,20 @@ output or repaired source before using it; untouched B-tree pages are not checke
     pub fn main() -> ExitCode {
         let command = match parse_args(std::env::args_os().skip(1).collect()) {
             Ok(Some(command)) => command,
-            Ok(None) => { println!("{HELP}"); return ExitCode::SUCCESS; }
-            Err(error) => { eprintln!("{error}\n\n{HELP}"); return ExitCode::from(2); }
+            Ok(None) => {
+                println!("{HELP}");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("{error}\n\n{HELP}");
+                return ExitCode::from(2);
+            }
         };
         // Only the executable owns an executor; the library uses this caller.
-        let runtime = match RuntimeBuilder::current_thread().blocking_threads(1, 2).build() {
+        let runtime = match RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+        {
             Ok(runtime) => runtime,
             Err(error) => {
                 eprintln!("cannot start recovery runtime: {error}");
@@ -136,24 +149,46 @@ output or repaired source before using it; untouched B-tree pages are not checke
         match result {
             Ok(report) => {
                 if report.repaired_in_place {
-                    println!("Repaired WAL and rebuilt index: {}", command.options.source.display());
+                    println!(
+                        "Repaired WAL and rebuilt index: {}",
+                        command.options.source.display()
+                    );
                     println!("Original WAL backup: {}", report.destination.display());
                 } else {
                     println!("Recovered database: {}", report.destination.display());
                 }
-                println!("Pages: {}; verified WAL frames: {}; repaired frames: {}",
-                    report.pages, report.wal_frames, report.repaired_frames);
-                println!("{} BLAKE3: {}",
-                    if report.repaired_in_place { "Repaired WAL" } else { "Output" }, report.digest);
-                println!("Certificate-validated intervals: {}", report.certificate_anchors);
+                println!(
+                    "Pages: {}; verified WAL frames: {}; repaired frames: {}",
+                    report.pages, report.wal_frames, report.repaired_frames
+                );
+                println!(
+                    "{} BLAKE3: {}",
+                    if report.repaired_in_place {
+                        "Repaired WAL"
+                    } else {
+                        "Output"
+                    },
+                    report.digest
+                );
+                println!(
+                    "Certificate-validated intervals: {}",
+                    report.certificate_anchors
+                );
                 if report.repaired_in_place {
-                    println!("Main/FEC/certificates preserved. Run integrity_check before using the database.");
+                    println!(
+                        "Main/FEC/certificates preserved. Run integrity_check before using the database."
+                    );
                 } else {
-                    println!("Source data preserved. Output B-tree integrity has not been checked.");
+                    println!(
+                        "Source data preserved. Output B-tree integrity has not been checked."
+                    );
                 }
                 ExitCode::SUCCESS
             }
-            Err(error) => { eprintln!("recovery failed: {error}"); ExitCode::FAILURE }
+            Err(error) => {
+                eprintln!("recovery failed: {error}");
+                ExitCode::FAILURE
+            }
         }
     }
 
@@ -164,16 +199,29 @@ output or repaired source before using it; untouched B-tree pages are not checke
 
         #[test]
         fn arguments_keep_paths_literal_and_limits_explicit() {
-            let parse = |args: &[&str]| parse_args(args.iter().map(|arg| OsString::from(*arg)).collect());
+            let parse =
+                |args: &[&str]| parse_args(args.iter().map(|arg| OsString::from(*arg)).collect());
             assert!(parse(&["--help"]).unwrap().is_none());
             assert!(parse(&[]).is_err());
             assert!(parse(&["--max-bytes", "0", "a", "b"]).is_err());
             assert!(parse(&["--max-source-pages"]).is_err());
             assert!(parse(&["--force", "a", "b"]).is_err());
             assert!(!parse(&["a", "b"]).unwrap().unwrap().repair_wal);
-            assert!(parse(&["--repair-wal", "a", "b"]).unwrap().unwrap().repair_wal);
-            assert!(!parse(&["--", "--repair-wal", "b"]).unwrap().unwrap().repair_wal);
-            let command = parse(&["--max-bytes", "2048", "--", "-a", "-b"]).unwrap().unwrap();
+            assert!(
+                parse(&["--repair-wal", "a", "b"])
+                    .unwrap()
+                    .unwrap()
+                    .repair_wal
+            );
+            assert!(
+                !parse(&["--", "--repair-wal", "b"])
+                    .unwrap()
+                    .unwrap()
+                    .repair_wal
+            );
+            let command = parse(&["--max-bytes", "2048", "--", "-a", "-b"])
+                .unwrap()
+                .unwrap();
             assert_eq!(command.options.source, Path::new("-a"));
             assert_eq!(command.options.destination, Path::new("-b"));
             assert_eq!(command.options.max_database_bytes, 2048);

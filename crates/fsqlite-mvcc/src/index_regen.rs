@@ -1642,7 +1642,10 @@ mod tests {
             let occupied = record_bytes(&[SqliteValue::Integer(7), fraction]);
             let delete = regenerate_index_ops(
                 &occupied,
-                &[(ColumnIdx::new(1), RebaseExpr::Literal(SqliteValue::Integer(0)))],
+                &[(
+                    ColumnIdx::new(1),
+                    RebaseExpr::Literal(SqliteValue::Integer(0)),
+                )],
                 std::slice::from_ref(&index),
                 RowId::new(7),
                 &NoOpUniqueChecker,
@@ -1682,8 +1685,12 @@ mod tests {
         );
         assert!(eval_unary_op(RebaseUnaryOp::Not, SqliteValue::Null).is_null());
         let expression = RebaseExpr::NullIf {
-            left: Box::new(RebaseExpr::Literal(SqliteValue::Integer(9_007_199_254_740_993))),
-            right: Box::new(RebaseExpr::Literal(SqliteValue::Float(9_007_199_254_740_992.0))),
+            left: Box::new(RebaseExpr::Literal(SqliteValue::Integer(
+                9_007_199_254_740_993,
+            ))),
+            right: Box::new(RebaseExpr::Literal(SqliteValue::Float(
+                9_007_199_254_740_992.0,
+            ))),
         };
         assert_eq!(
             eval_rebase_expr(&expression, &[]).unwrap().as_integer(),

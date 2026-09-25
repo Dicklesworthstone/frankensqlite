@@ -16,10 +16,9 @@
 use fsqlite_types::{PayloadHash, cx::Cx};
 
 use super::{
-    Connection, FrankenError, OutboxMessage, OutboxState, ReplicaApplyError,
-    ReplicaCheckpoint, Result, SqliteValue, begin, blob, checkpoint, complete,
-    hash_column, integer, load_state, protocol, read_after, row_text, save_state,
-    unsigned, validate_schema, validate_tables,
+    Connection, FrankenError, OutboxMessage, OutboxState, ReplicaApplyError, ReplicaCheckpoint,
+    Result, SqliteValue, begin, blob, checkpoint, complete, hash_column, integer, load_state,
+    protocol, read_after, row_text, save_state, unsigned, validate_schema, validate_tables,
 };
 
 /// Maximum fixed recipient roster. This bounds metadata, not SQL engine RSS.
@@ -69,31 +68,50 @@ async fn tables_present(conn: &Connection) -> Result<bool> {
         "SELECT name FROM main.sqlite_schema WHERE name=?1 COLLATE NOCASE OR name=?2 COLLATE NOCASE LIMIT 3",
         &[SqliteValue::Text(GROUP_TABLE.into()), SqliteValue::Text(REPLICA_TABLE.into())],
     ).await?;
-    if objects.is_empty() { return Ok(false); }
-    if objects.len() != 2 { return Err(protocol("incomplete fanout metadata schema")); }
-    validate_tables(conn, &[(GROUP_TABLE, CREATE_GROUP), (REPLICA_TABLE, CREATE_REPLICA)]).await?;
+    if objects.is_empty() {
+        return Ok(false);
+    }
+    if objects.len() != 2 {
+        return Err(protocol("incomplete fanout metadata schema"));
+    }
+    validate_tables(
+        conn,
+        &[(GROUP_TABLE, CREATE_GROUP), (REPLICA_TABLE, CREATE_REPLICA)],
+    )
+    .await?;
     Ok(true)
 }
 
 /// Validate fixed membership, every progress row, and the retention frontier.
 /// Body payloads are not requested by these metadata queries.
-pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<Option<FanoutState>> {
-    if !tables_present(conn).await? { return Ok(None); }
+pub(super) async fn snapshot(
+    conn: &Connection,
+    current: OutboxState,
+) -> Result<Option<FanoutState>> {
+    if !tables_present(conn).await? {
+        return Ok(None);
+    }
     let stream_id = current.produced.stream_id;
     let parameter = [blob(stream_id)];
-    let rows = conn.query_with_params(
-        "SELECT CASE WHEN typeof(start_sequence)='integer' THEN start_sequence END,\
+    let rows = conn
+        .query_with_params(
+            "SELECT CASE WHEN typeof(start_sequence)='integer' THEN start_sequence END,\
          length(start_tip),typeof(start_tip),length(members),typeof(members) \
          FROM main._fsqlite_source_fanout_v1 WHERE stream_id=?1 LIMIT 2",
-        &parameter,
-    ).await?;
+            &parameter,
+        )
+        .await?;
     let row = match rows.as_slice() {
         [] => {
-            let orphan = conn.query_with_params(
-                "SELECT 1 FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 LIMIT 1",
-                &parameter,
-            ).await?;
-            if !orphan.is_empty() { return Err(protocol("orphaned fanout replica progress")); }
+            let orphan = conn
+                .query_with_params(
+                    "SELECT 1 FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 LIMIT 1",
+                    &parameter,
+                )
+                .await?;
+            if !orphan.is_empty() {
+                return Err(protocol("orphaned fanout replica progress"));
+            }
             return Ok(None);
         }
         [row] => row,
@@ -101,8 +119,11 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
     };
     let start_sequence = unsigned(row, 0)?;
     let length = usize::try_from(unsigned(row, 3)?).map_err(|_| FrankenError::TooBig)?;
-    if unsigned(row, 1)? != 32 || row_text(row, 2) != Some("blob")
-        || row_text(row, 4) != Some("blob") || length == 0 || length > MAX_REPLICAS * 32
+    if unsigned(row, 1)? != 32
+        || row_text(row, 2) != Some("blob")
+        || row_text(row, 4) != Some("blob")
+        || length == 0
+        || length > MAX_REPLICAS * 32
         || !length.is_multiple_of(32)
     {
         return Err(protocol("invalid fanout roster dimensions"));
@@ -111,24 +132,48 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
     let rows = conn.query_with_params(
         "SELECT start_tip,members FROM main._fsqlite_source_fanout_v1 WHERE stream_id=?1 LIMIT 2", &parameter,
     ).await?;
-    let [row] = rows.as_slice() else { return Err(protocol("missing fanout roster")); };
-    let baseline = ReplicaCheckpoint { stream_id, sequence: start_sequence, tip: hash_column(row, 0)? };
+    let [row] = rows.as_slice() else {
+        return Err(protocol("missing fanout roster"));
+    };
+    let baseline = ReplicaCheckpoint {
+        stream_id,
+        sequence: start_sequence,
+        tip: hash_column(row, 0)?,
+    };
     if baseline.sequence > current.acknowledged.sequence
-        || (baseline.sequence == current.acknowledged.sequence && baseline.tip != current.acknowledged.tip)
+        || (baseline.sequence == current.acknowledged.sequence
+            && baseline.tip != current.acknowledged.tip)
     {
         return Err(protocol("fanout baseline disagrees with source retention"));
     }
-    let Some(SqliteValue::Blob(bytes)) = row.get(1) else { return Err(protocol("invalid fanout roster storage")); };
-    if bytes.len() != length { return Err(protocol("fanout roster length changed")); }
-    let members: Vec<_> = bytes.as_ref().as_chunks::<32>().0.iter()
-        .map(|bytes| PayloadHash::from_bytes(*bytes)).collect();
-    if members.windows(2).any(|pair| pair[0].as_bytes() >= pair[1].as_bytes()) {
+    let Some(SqliteValue::Blob(bytes)) = row.get(1) else {
+        return Err(protocol("invalid fanout roster storage"));
+    };
+    if bytes.len() != length {
+        return Err(protocol("fanout roster length changed"));
+    }
+    let members: Vec<_> = bytes
+        .as_ref()
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|bytes| PayloadHash::from_bytes(*bytes))
+        .collect();
+    if members
+        .windows(2)
+        .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+    {
         return Err(protocol("noncanonical fanout roster"));
     }
-    let counts = conn.query_with_params(
-        "SELECT count(*) FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1", &parameter,
-    ).await?;
-    let [count] = counts.as_slice() else { return Err(protocol("missing fanout member count")); };
+    let counts = conn
+        .query_with_params(
+            "SELECT count(*) FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1",
+            &parameter,
+        )
+        .await?;
+    let [count] = counts.as_slice() else {
+        return Err(protocol("missing fanout member count"));
+    };
     if unsigned(count, 0)? != (length / 32) as u64 {
         return Err(protocol("fanout progress does not cover its roster"));
     }
@@ -139,13 +184,20 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
          ORDER BY replica_id LIMIT 257",
         &parameter,
     ).await?;
-    if rows.len() != members.len() { return Err(protocol("fanout progress does not cover its roster")); }
+    if rows.len() != members.len() {
+        return Err(protocol("fanout progress does not cover its roster"));
+    }
     let mut replicas = Vec::with_capacity(members.len());
     let mut minimum = current.produced.sequence;
     for (row, expected_id) in rows.iter().zip(members) {
         let replica_id = hash_column(row, 0)?;
-        let position = ReplicaCheckpoint { stream_id, sequence: unsigned(row, 1)?, tip: hash_column(row, 2)? };
-        if replica_id != expected_id || position.sequence < current.acknowledged.sequence
+        let position = ReplicaCheckpoint {
+            stream_id,
+            sequence: unsigned(row, 1)?,
+            tip: hash_column(row, 2)?,
+        };
+        if replica_id != expected_id
+            || position.sequence < current.acknowledged.sequence
             || position.sequence > current.produced.sequence
         {
             return Err(protocol("fanout progress identity or position mismatch"));
@@ -158,28 +210,43 @@ pub(super) async fn snapshot(conn: &Connection, current: OutboxState) -> Result<
                  AND typeof(tip)='blob' AND length(tip)=32 LIMIT 2",
                 &[blob(stream_id), integer(position.sequence)?],
             ).await?;
-            let [queued] = queued.as_slice() else { return Err(protocol("fanout progress references missing history")); };
+            let [queued] = queued.as_slice() else {
+                return Err(protocol("fanout progress references missing history"));
+            };
             hash_column(queued, 0)?
         };
-        if position.tip != expected_tip { return Err(protocol("fanout progress has a conflicting tip")); }
+        if position.tip != expected_tip {
+            return Err(protocol("fanout progress has a conflicting tip"));
+        }
         minimum = minimum.min(position.sequence);
-        replicas.push(ReplicaProgress { replica_id, checkpoint: position });
+        replicas.push(ReplicaProgress {
+            replica_id,
+            checkpoint: position,
+        });
     }
     if minimum != current.acknowledged.sequence {
         return Err(protocol("fanout retention frontier is inconsistent"));
     }
-    Ok(Some(FanoutState { outbox: current, baseline, replicas }))
+    Ok(Some(FanoutState {
+        outbox: current,
+        baseline,
+        replicas,
+    }))
 }
 
 fn member_index(state: &FanoutState, replica_id: PayloadHash) -> Result<usize> {
-    state.replicas.binary_search_by(|entry| entry.replica_id.as_bytes().cmp(replica_id.as_bytes()))
+    state
+        .replicas
+        .binary_search_by(|entry| entry.replica_id.as_bytes().cmp(replica_id.as_bytes()))
         .map_err(|_| protocol("replica is not in the required fanout roster"))
 }
 
 async fn load(conn: &Connection, stream_id: PayloadHash) -> Result<FanoutState> {
     validate_schema(conn).await?;
     let current = load_state(conn, stream_id).await?;
-    snapshot(conn, current).await?.ok_or_else(|| protocol("source stream has no fanout roster"))
+    snapshot(conn, current)
+        .await?
+        .ok_or_else(|| protocol("source stream has no fanout roster"))
 }
 
 /// Seal the required roster at an already initialized, empty source position.
@@ -190,7 +257,10 @@ async fn load(conn: &Connection, stream_id: PayloadHash) -> Result<FanoutState> 
 /// never rewinds confirmations. A different roster/baseline is always refused.
 /// This transaction does not initialize a replica or verify its remote state.
 pub async fn configure(
-    conn: &mut Connection, cx: &Cx, baseline: ReplicaCheckpoint, members: &[PayloadHash],
+    conn: &mut Connection,
+    cx: &Cx,
+    baseline: ReplicaCheckpoint,
+    members: &[PayloadHash],
 ) -> Result<FanoutState> {
     checkpoint(cx)?;
     let _ = integer(baseline.sequence)?;
@@ -253,8 +323,11 @@ pub async fn state(conn: &mut Connection, cx: &Cx, stream_id: PayloadHash) -> Re
 /// Fast replicas may continue while slower replicas retain earlier bodies.
 /// A caller-owned transaction is refused; no SQL transaction spans transport.
 pub async fn next_pending(
-    conn: &mut Connection, cx: &Cx, stream_id: PayloadHash,
-    replica_id: PayloadHash, max_message_bytes: u64,
+    conn: &mut Connection,
+    cx: &Cx,
+    stream_id: PayloadHash,
+    replica_id: PayloadHash,
+    max_message_bytes: u64,
 ) -> Result<Option<OutboxMessage>> {
     checkpoint(cx)?;
     let owner = begin(conn).await?;
@@ -262,7 +335,8 @@ pub async fn next_pending(
         let group = load(conn, stream_id).await?;
         let position = group.replicas[member_index(&group, replica_id)?].checkpoint;
         read_after(conn, cx, group.outbox, position, max_message_bytes).await
-    }.await;
+    }
+    .await;
     complete(owner, cx, result).await
 }
 
@@ -277,8 +351,11 @@ pub async fn next_pending(
 /// transaction. Failed/dropped/uncertain commits use the existing cleanup and
 /// reconciliation protocol; do not turn an I/O error into a success receipt.
 pub async fn acknowledge(
-    conn: &mut Connection, cx: &Cx, replica_id: PayloadHash,
-    confirmed: ReplicaCheckpoint, max_message_bytes: u64,
+    conn: &mut Connection,
+    cx: &Cx,
+    replica_id: PayloadHash,
+    confirmed: ReplicaCheckpoint,
+    max_message_bytes: u64,
 ) -> Result<FanoutState> {
     checkpoint(cx)?;
     let _ = integer(confirmed.sequence)?;
@@ -340,61 +417,103 @@ pub async fn acknowledge(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Bytes, OutboxLimits, record};
+    use super::*;
     use crate::compat::changeset::streaming::ordered;
     use crate::compat::changeset_stream::ChangesetStreamLimits;
     use fsqlite_ext_session::{
         ChangeOp, Changeset, ChangesetKind, ChangesetRow, ChangesetValue, TableChangeset, TableInfo,
     };
 
-    const fn hash(byte: u8) -> PayloadHash { PayloadHash::from_bytes([byte; 32]) }
+    const fn hash(byte: u8) -> PayloadHash {
+        PayloadHash::from_bytes([byte; 32])
+    }
     const fn baseline() -> ReplicaCheckpoint {
-        ReplicaCheckpoint { stream_id: hash(1), sequence: 0, tip: hash(2) }
+        ReplicaCheckpoint {
+            stream_id: hash(1),
+            sequence: 0,
+            tip: hash(2),
+        }
     }
 
     fn wire(id: i64) -> Vec<u8> {
         Changeset {
             kind: ChangesetKind::Changeset,
             tables: vec![TableChangeset {
-                info: TableInfo { name: "t".to_owned(), column_count: 2, pk_flags: vec![true, false] },
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
                 rows: vec![ChangesetRow {
-                    op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
-                    new_values: vec![ChangesetValue::Integer(id), ChangesetValue::Text(format!("row-{id}"))],
+                    op: ChangeOp::Insert,
+                    indirect: false,
+                    old_values: Vec::new(),
+                    new_values: vec![
+                        ChangesetValue::Integer(id),
+                        ChangesetValue::Text(format!("row-{id}")),
+                    ],
                 }],
             }],
-        }.encode()
+        }
+        .encode()
     }
 
     async fn database(path: &str) -> Connection {
         let conn = Connection::open(path).await.unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT); \
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT); \
             CREATE TABLE audit(id INTEGER PRIMARY KEY); \
-            CREATE TRIGGER audit_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;")
-            .await.unwrap();
+            CREATE TRIGGER audit_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END;",
+        )
+        .await
+        .unwrap();
         conn
     }
 
     async fn source(path: &str) -> Connection {
         let mut conn = database(path).await;
-        super::super::initialize(&mut conn, &Cx::new(), baseline()).await.unwrap();
+        super::super::initialize(&mut conn, &Cx::new(), baseline())
+            .await
+            .unwrap();
         conn
     }
 
     async fn count(conn: &Connection, name: &str) -> i64 {
-        let row = conn.query_row(&format!("SELECT count(*) FROM {name}")).await.unwrap();
-        let Some(SqliteValue::Integer(value)) = row.get(0) else { panic!("integer count"); };
+        let row = conn
+            .query_row(&format!("SELECT count(*) FROM {name}"))
+            .await
+            .unwrap();
+        let Some(SqliteValue::Integer(value)) = row.get(0) else {
+            panic!("integer count");
+        };
         *value
     }
 
     fn position(commit: &super::super::OutboxCommit) -> ReplicaCheckpoint {
         ReplicaCheckpoint {
-            stream_id: commit.envelope.stream_id(), sequence: commit.envelope.sequence(), tip: commit.envelope.id(),
+            stream_id: commit.envelope.stream_id(),
+            sequence: commit.envelope.sequence(),
+            tip: commit.envelope.id(),
         }
     }
 
-    async fn produce(conn: &mut Connection, previous: ReplicaCheckpoint, id: i64) -> ReplicaCheckpoint {
-        position(&record(conn, &Cx::new(), previous, &wire(id), OutboxLimits::default()).await.unwrap())
+    async fn produce(
+        conn: &mut Connection,
+        previous: ReplicaCheckpoint,
+        id: i64,
+    ) -> ReplicaCheckpoint {
+        position(
+            &record(
+                conn,
+                &Cx::new(),
+                previous,
+                &wire(id),
+                OutboxLimits::default(),
+            )
+            .await
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -415,26 +534,66 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            configure(&mut source, &cx, baseline(), &[hash(12), hash(10), hash(11)]).await.unwrap();
+            configure(
+                &mut source,
+                &cx,
+                baseline(),
+                &[hash(12), hash(10), hash(11)],
+            )
+            .await
+            .unwrap();
             let mut tip = baseline();
-            for id in 1..=3 { tip = produce(&mut source, tip, id).await; }
-            let bytes = state(&mut source, &cx, hash(1)).await.unwrap().outbox.pending_bytes;
+            for id in 1..=3 {
+                tip = produce(&mut source, tip, id).await;
+            }
+            let bytes = state(&mut source, &cx, hash(1))
+                .await
+                .unwrap()
+                .outbox
+                .pending_bytes;
             for (member_index, member) in [hash(10), hash(11), hash(12)].into_iter().enumerate() {
                 let mut replica = database(":memory:").await;
-                ordered::initialize(&mut replica, &cx, baseline()).await.unwrap();
+                ordered::initialize(&mut replica, &cx, baseline())
+                    .await
+                    .unwrap();
                 for sequence in 1..=3_u64 {
-                    let message = next_pending(&mut source, &cx, hash(1), member, 1 << 20).await.unwrap().unwrap();
+                    let message = next_pending(&mut source, &cx, hash(1), member, 1 << 20)
+                        .await
+                        .unwrap()
+                        .unwrap();
                     assert_eq!(message.envelope().sequence(), sequence);
                     let receipt = ordered::apply(
-                        &mut replica, &cx, &mut Bytes(message.body()), message.envelope(),
-                        message.envelope().id(), ChangesetStreamLimits::default(),
-                    ).await.unwrap();
-                    let progress = acknowledge(&mut source, &cx, member, receipt.checkpoint, 1 << 20).await.unwrap();
-                    assert_eq!(progress.outbox.acknowledged.sequence, if member_index == 2 { sequence } else { 0 });
-                    assert_eq!(progress.outbox.pending_messages(), if member_index == 2 { 3 - sequence } else { 3 });
-                    if member_index < 2 { assert_eq!(progress.outbox.pending_bytes, bytes); }
+                        &mut replica,
+                        &cx,
+                        &mut Bytes(message.body()),
+                        message.envelope(),
+                        message.envelope().id(),
+                        ChangesetStreamLimits::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let progress =
+                        acknowledge(&mut source, &cx, member, receipt.checkpoint, 1 << 20)
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        progress.outbox.acknowledged.sequence,
+                        if member_index == 2 { sequence } else { 0 }
+                    );
+                    assert_eq!(
+                        progress.outbox.pending_messages(),
+                        if member_index == 2 { 3 - sequence } else { 3 }
+                    );
+                    if member_index < 2 {
+                        assert_eq!(progress.outbox.pending_bytes, bytes);
+                    }
                 }
-                assert!(next_pending(&mut source, &cx, hash(1), member, 1 << 20).await.unwrap().is_none());
+                assert!(
+                    next_pending(&mut source, &cx, hash(1), member, 1 << 20)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(count(&replica, "t").await, 3);
                 assert_eq!(count(&replica, "audit").await, 3);
                 replica.close().await.unwrap();
@@ -454,22 +613,56 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            for invalid in [vec![], vec![hash(10), hash(10)], vec![hash(10); MAX_REPLICAS + 1]] {
-                assert!(configure(&mut source, &cx, baseline(), &invalid).await.is_err());
+            for invalid in [
+                vec![],
+                vec![hash(10), hash(10)],
+                vec![hash(10); MAX_REPLICAS + 1],
+            ] {
+                assert!(
+                    configure(&mut source, &cx, baseline(), &invalid)
+                        .await
+                        .is_err()
+                );
             }
             assert!(!tables_present(&source).await.unwrap());
-            let first = configure(&mut source, &cx, baseline(), &[hash(11), hash(10)]).await.unwrap();
+            let first = configure(&mut source, &cx, baseline(), &[hash(11), hash(10)])
+                .await
+                .unwrap();
             assert_eq!(first.replicas[0].replica_id, hash(10));
-            assert_eq!(configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap(), first);
+            assert_eq!(
+                configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                    .await
+                    .unwrap(),
+                first
+            );
             let committed = produce(&mut source, baseline(), 1).await;
-            let advanced = acknowledge(&mut source, &cx, hash(10), committed, 1 << 20).await.unwrap();
-            assert_eq!(configure(&mut source, &cx, baseline(), &[hash(11), hash(10)]).await.unwrap(), advanced);
+            let advanced = acknowledge(&mut source, &cx, hash(10), committed, 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(
+                configure(&mut source, &cx, baseline(), &[hash(11), hash(10)])
+                    .await
+                    .unwrap(),
+                advanced
+            );
             for changed in [vec![hash(10)], vec![hash(10), hash(12)]] {
-                assert!(configure(&mut source, &cx, baseline(), &changed).await.is_err());
+                assert!(
+                    configure(&mut source, &cx, baseline(), &changed)
+                        .await
+                        .is_err()
+                );
             }
-            assert!(configure(&mut source, &cx, committed, &[hash(10), hash(11)]).await.is_err());
+            assert!(
+                configure(&mut source, &cx, committed, &[hash(10), hash(11)])
+                    .await
+                    .is_err()
+            );
             assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), advanced);
-            assert!(next_pending(&mut source, &cx, hash(1), hash(99), 1 << 20).await.is_err());
+            assert!(
+                next_pending(&mut source, &cx, hash(1), hash(99), 1 << 20)
+                    .await
+                    .is_err()
+            );
             source.close().await.unwrap();
         });
     }
@@ -479,30 +672,73 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
             let first = produce(&mut source, baseline(), 1).await;
             let second = produce(&mut source, first, 2).await;
             let before = state(&mut source, &cx, hash(1)).await.unwrap();
-            assert!(super::super::acknowledge(&mut source, &cx, first, 1 << 20).await.is_err());
-            assert!(acknowledge(&mut source, &cx, hash(99), first, 1 << 20).await.is_err());
-            assert!(matches!(acknowledge(&mut source, &cx, hash(10), second, 1 << 20).await,
-                Err(ReplicaApplyError::Gap { expected: 1, received: 2 })));
-            let forged = ReplicaCheckpoint { tip: hash(99), ..first };
-            assert!(matches!(acknowledge(&mut source, &cx, hash(10), forged, 1 << 20).await,
-                Err(ReplicaApplyError::Diverged { sequence: 1 })));
+            assert!(
+                super::super::acknowledge(&mut source, &cx, first, 1 << 20)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                acknowledge(&mut source, &cx, hash(99), first, 1 << 20)
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                acknowledge(&mut source, &cx, hash(10), second, 1 << 20).await,
+                Err(ReplicaApplyError::Gap {
+                    expected: 1,
+                    received: 2
+                })
+            ));
+            let forged = ReplicaCheckpoint {
+                tip: hash(99),
+                ..first
+            };
+            assert!(matches!(
+                acknowledge(&mut source, &cx, hash(10), forged, 1 << 20).await,
+                Err(ReplicaApplyError::Diverged { sequence: 1 })
+            ));
             let cancelled = Cx::new();
             cancelled.cancel();
-            assert!(acknowledge(&mut source, &cancelled, hash(10), first, 1 << 20).await.is_err());
+            assert!(
+                acknowledge(&mut source, &cancelled, hash(10), first, 1 << 20)
+                    .await
+                    .is_err()
+            );
             assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), before);
-            let fast = acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await.unwrap();
+            let fast = acknowledge(&mut source, &cx, hash(10), first, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(fast.outbox, before.outbox);
-            assert_eq!(acknowledge(&mut source, &cx, hash(10), first, 0).await.unwrap(), fast);
-            let released = acknowledge(&mut source, &cx, hash(11), first, 1 << 20).await.unwrap();
+            assert_eq!(
+                acknowledge(&mut source, &cx, hash(10), first, 0)
+                    .await
+                    .unwrap(),
+                fast
+            );
+            let released = acknowledge(&mut source, &cx, hash(11), first, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(released.outbox.pending_messages(), 1);
             assert_eq!(released.outbox.acknowledged, first);
-            assert_eq!(acknowledge(&mut source, &cx, hash(11), first, 0).await.unwrap(), released);
-            assert!(matches!(acknowledge(&mut source, &cx, hash(11), baseline(), 0).await,
-                Err(ReplicaApplyError::Stale { current: 1, received: 0 })));
+            assert_eq!(
+                acknowledge(&mut source, &cx, hash(11), first, 0)
+                    .await
+                    .unwrap(),
+                released
+            );
+            assert!(matches!(
+                acknowledge(&mut source, &cx, hash(11), baseline(), 0).await,
+                Err(ReplicaApplyError::Stale {
+                    current: 1,
+                    received: 0
+                })
+            ));
             source.close().await.unwrap();
         });
     }
@@ -512,18 +748,44 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
             let committed = produce(&mut source, baseline(), 1).await;
-            acknowledge(&mut source, &cx, hash(10), committed, 1 << 20).await.unwrap();
+            acknowledge(&mut source, &cx, hash(10), committed, 1 << 20)
+                .await
+                .unwrap();
             source.execute_with_params(
                 "DELETE FROM main._fsqlite_source_replica_v1 WHERE stream_id=?1 AND replica_id=?2",
                 &[blob(hash(1)), blob(hash(11))],
             ).await.unwrap();
             assert!(state(&mut source, &cx, hash(1)).await.is_err());
-            assert!(super::super::state(&mut source, &cx, hash(1)).await.is_err());
-            assert!(acknowledge(&mut source, &cx, hash(10), committed, 1 << 20).await.is_err());
-            assert!(super::super::acknowledge(&mut source, &cx, committed, 1 << 20).await.is_err());
-            assert!(record(&mut source, &cx, committed, &wire(2), OutboxLimits::default()).await.is_err());
+            assert!(
+                super::super::state(&mut source, &cx, hash(1))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                acknowledge(&mut source, &cx, hash(10), committed, 1 << 20)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                super::super::acknowledge(&mut source, &cx, committed, 1 << 20)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                record(
+                    &mut source,
+                    &cx,
+                    committed,
+                    &wire(2),
+                    OutboxLimits::default()
+                )
+                .await
+                .is_err()
+            );
             assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
             assert_eq!(count(&source, "t").await, 1);
             assert!(!source.in_transaction());
@@ -544,48 +806,124 @@ mod tests {
             for target in [&mut fast, &mut slow] {
                 ordered::initialize(target, &cx, baseline()).await.unwrap();
             }
-            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
             let first = produce(&mut source, baseline(), 1).await;
             let second = produce(&mut source, first, 2).await;
             for _ in 0..2 {
-                let message = next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20).await.unwrap().unwrap();
-                let receipt = ordered::apply(&mut fast, &cx, &mut Bytes(message.body()), message.envelope(),
-                    message.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
-                acknowledge(&mut source, &cx, hash(10), receipt.checkpoint, 1 << 20).await.unwrap();
+                let message = next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let receipt = ordered::apply(
+                    &mut fast,
+                    &cx,
+                    &mut Bytes(message.body()),
+                    message.envelope(),
+                    message.envelope().id(),
+                    ChangesetStreamLimits::default(),
+                )
+                .await
+                .unwrap();
+                acknowledge(&mut source, &cx, hash(10), receipt.checkpoint, 1 << 20)
+                    .await
+                    .unwrap();
             }
             fast.close().await.unwrap();
-            let message = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
-            let lost = ordered::apply(&mut slow, &cx, &mut Bytes(message.body()), message.envelope(),
-                message.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
+            let message = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
+            let lost = ordered::apply(
+                &mut slow,
+                &cx,
+                &mut Bytes(message.body()),
+                message.envelope(),
+                message.envelope().id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(lost.checkpoint, first);
             // Lose the remote response before source acknowledgement. Both
             // sides reopen; the fast member must not rewind to the slow one.
             source.close().await.unwrap();
             slow.close().await.unwrap();
-            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
-            let mut slow = Connection::open(replica_path.to_str().unwrap()).await.unwrap();
-            assert!(next_pending(&mut source, &cx, hash(1), hash(10), 0).await.unwrap().is_none());
-            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap())
+                .await
+                .unwrap();
+            let mut slow = Connection::open(replica_path.to_str().unwrap())
+                .await
+                .unwrap();
+            assert!(
+                next_pending(&mut source, &cx, hash(1), hash(10), 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pending.envelope().sequence(), 1);
-            let duplicate = ordered::apply(&mut slow, &cx, &mut Bytes(pending.body()), pending.envelope(),
-                pending.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
-            assert_eq!(duplicate.disposition, ordered::ReplicaDisposition::AlreadyApplied);
-            let saved = acknowledge(&mut source, &cx, hash(11), duplicate.checkpoint, 1 << 20).await.unwrap();
+            let duplicate = ordered::apply(
+                &mut slow,
+                &cx,
+                &mut Bytes(pending.body()),
+                pending.envelope(),
+                pending.envelope().id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                duplicate.disposition,
+                ordered::ReplicaDisposition::AlreadyApplied
+            );
+            let saved = acknowledge(&mut source, &cx, hash(11), duplicate.checkpoint, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(saved.outbox.acknowledged, first);
             source.close().await.unwrap();
-            let mut source = Connection::open(source_path.to_str().unwrap()).await.unwrap();
-            assert_eq!(acknowledge(&mut source, &cx, hash(11), first, 0).await.unwrap(), saved);
-            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20).await.unwrap().unwrap();
+            let mut source = Connection::open(source_path.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                acknowledge(&mut source, &cx, hash(11), first, 0)
+                    .await
+                    .unwrap(),
+                saved
+            );
+            let pending = next_pending(&mut source, &cx, hash(1), hash(11), 1 << 20)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pending.envelope().sequence(), 2);
-            let receipt = ordered::apply(&mut slow, &cx, &mut Bytes(pending.body()), pending.envelope(),
-                pending.envelope().id(), ChangesetStreamLimits::default()).await.unwrap();
-            let empty = acknowledge(&mut source, &cx, hash(11), receipt.checkpoint, 1 << 20).await.unwrap();
+            let receipt = ordered::apply(
+                &mut slow,
+                &cx,
+                &mut Bytes(pending.body()),
+                pending.envelope(),
+                pending.envelope().id(),
+                ChangesetStreamLimits::default(),
+            )
+            .await
+            .unwrap();
+            let empty = acknowledge(&mut source, &cx, hash(11), receipt.checkpoint, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(empty.outbox.acknowledged, second);
             assert_eq!(empty.outbox.pending_bytes, 0);
             assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 0);
             assert_eq!(count(&slow, "audit").await, 2);
-            assert_eq!(slow.query_row("PRAGMA integrity_check").await.unwrap().get(0),
-                Some(&SqliteValue::Text("ok".into())));
+            assert_eq!(
+                slow.query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             source.close().await.unwrap();
             slow.close().await.unwrap();
         });
@@ -596,24 +934,49 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await.unwrap();
-            let limits = OutboxLimits { max_pending_messages: 1, max_pending_bytes: 0, ..OutboxLimits::default() };
-            let first = position(&record(&mut source, &cx, baseline(), &[], limits).await.unwrap());
-            acknowledge(&mut source, &cx, hash(10), first, 0).await.unwrap();
-            assert!(matches!(record(&mut source, &cx, first, &[], limits).await,
-                Err(ReplicaApplyError::Database(FrankenError::TooBig))));
-            let cleared = acknowledge(&mut source, &cx, hash(11), first, 0).await.unwrap();
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
+            let limits = OutboxLimits {
+                max_pending_messages: 1,
+                max_pending_bytes: 0,
+                ..OutboxLimits::default()
+            };
+            let first = position(
+                &record(&mut source, &cx, baseline(), &[], limits)
+                    .await
+                    .unwrap(),
+            );
+            acknowledge(&mut source, &cx, hash(10), first, 0)
+                .await
+                .unwrap();
+            assert!(matches!(
+                record(&mut source, &cx, first, &[], limits).await,
+                Err(ReplicaApplyError::Database(FrankenError::TooBig))
+            ));
+            let cleared = acknowledge(&mut source, &cx, hash(11), first, 0)
+                .await
+                .unwrap();
             assert_eq!(cleared.outbox.pending_messages(), 0);
             let second = position(&record(&mut source, &cx, first, &[], limits).await.unwrap());
             let saved = state(&mut source, &cx, hash(1)).await.unwrap();
             assert_eq!(saved.outbox.pending_messages(), 1);
-            source.execute("BEGIN; INSERT INTO t VALUES(7,'caller');").await.unwrap();
-            assert!(matches!(acknowledge(&mut source, &cx, hash(10), second, 0).await,
-                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
-            assert!(matches!(state(&mut source, &cx, hash(1)).await,
-                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
-            assert!(matches!(configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await,
-                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))));
+            source
+                .execute("BEGIN; INSERT INTO t VALUES(7,'caller');")
+                .await
+                .unwrap();
+            assert!(matches!(
+                acknowledge(&mut source, &cx, hash(10), second, 0).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))
+            ));
+            assert!(matches!(
+                state(&mut source, &cx, hash(1)).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))
+            ));
+            assert!(matches!(
+                configure(&mut source, &cx, baseline(), &[hash(10), hash(11)]).await,
+                Err(ReplicaApplyError::Database(FrankenError::NestedTransaction))
+            ));
             assert!(source.in_transaction());
             assert_eq!(count(&source, "t").await, 1);
             source.execute("ROLLBACK").await.unwrap();
@@ -627,29 +990,62 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            let saved = configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+            let saved = configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
             for name in [GROUP_TABLE, REPLICA_TABLE] {
                 let body = Changeset {
                     kind: ChangesetKind::Changeset,
                     tables: vec![TableChangeset {
-                        info: TableInfo { name: name.to_ascii_uppercase(), column_count: 1, pk_flags: vec![true] },
-                        rows: vec![ChangesetRow { op: ChangeOp::Insert, indirect: false, old_values: Vec::new(),
-                            new_values: vec![ChangesetValue::Integer(1)] }],
+                        info: TableInfo {
+                            name: name.to_ascii_uppercase(),
+                            column_count: 1,
+                            pk_flags: vec![true],
+                        },
+                        rows: vec![ChangesetRow {
+                            op: ChangeOp::Insert,
+                            indirect: false,
+                            old_values: Vec::new(),
+                            new_values: vec![ChangesetValue::Integer(1)],
+                        }],
                     }],
-                }.encode();
-                assert!(matches!(record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await,
-                    Err(ReplicaApplyError::Protocol { detail: "source message targets replication metadata" })));
+                }
+                .encode();
+                assert!(matches!(
+                    record(&mut source, &cx, baseline(), &body, OutboxLimits::default()).await,
+                    Err(ReplicaApplyError::Protocol {
+                        detail: "source message targets replication metadata"
+                    })
+                ));
             }
             // Rewrite BOTH roster and matching progress rows. The altered
             // metadata would pass structural validation; equality with the
             // pre-DML snapshot must nevertheless reject this implicit change.
-            source.execute(&format!("CREATE TRIGGER replace_member AFTER INSERT ON t BEGIN \
+            source
+                .execute(&format!(
+                    "CREATE TRIGGER replace_member AFTER INSERT ON t BEGIN \
                 UPDATE _fsqlite_source_replica_v1 SET replica_id=x'{}' WHERE replica_id=x'{}'; \
                 UPDATE _fsqlite_source_fanout_v1 SET members=x'{}{}'; END;",
-                "0c".repeat(32), "0b".repeat(32), "0a".repeat(32), "0c".repeat(32)))
-                .await.unwrap();
-            assert!(matches!(record(&mut source, &cx, baseline(), &wire(1), OutboxLimits::default()).await,
-                Err(ReplicaApplyError::Protocol { detail: "source metadata changed during row application" })));
+                    "0c".repeat(32),
+                    "0b".repeat(32),
+                    "0a".repeat(32),
+                    "0c".repeat(32)
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                record(
+                    &mut source,
+                    &cx,
+                    baseline(),
+                    &wire(1),
+                    OutboxLimits::default()
+                )
+                .await,
+                Err(ReplicaApplyError::Protocol {
+                    detail: "source metadata changed during row application"
+                })
+            ));
             assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), saved);
             assert_eq!(count(&source, "t").await, 0);
             assert_eq!(count(&source, "audit").await, 0);
@@ -670,28 +1066,52 @@ mod tests {
                 "UPDATE _fsqlite_source_outbox_v1 SET body=zeroblob(length(body))",
             ] {
                 let mut source = source(":memory:").await;
-                configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+                configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                    .await
+                    .unwrap();
                 let first = produce(&mut source, baseline(), 1).await;
-                assert!(matches!(next_pending(&mut source, &cx, hash(1), hash(10), 0).await,
-                    Err(ReplicaApplyError::Database(FrankenError::TooBig))));
+                assert!(matches!(
+                    next_pending(&mut source, &cx, hash(1), hash(10), 0).await,
+                    Err(ReplicaApplyError::Database(FrankenError::TooBig))
+                ));
                 source.execute(tamper).await.unwrap();
-                assert!(next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20).await.is_err());
-                assert!(acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await.is_err());
+                assert!(
+                    next_pending(&mut source, &cx, hash(1), hash(10), 1 << 20)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    acknowledge(&mut source, &cx, hash(10), first, 1 << 20)
+                        .await
+                        .is_err()
+                );
                 assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
-                assert_eq!(source.query_row("SELECT ack_sequence FROM _fsqlite_source_stream_v1")
-                    .await.unwrap().get(0), Some(&SqliteValue::Integer(0)));
+                assert_eq!(
+                    source
+                        .query_row("SELECT ack_sequence FROM _fsqlite_source_stream_v1")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&SqliteValue::Integer(0))
+                );
                 assert!(!source.in_transaction());
                 source.close().await.unwrap();
             }
             for temporary in [false, true] {
                 let mut source = source(":memory:").await;
-                configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+                configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                    .await
+                    .unwrap();
                 let first = produce(&mut source, baseline(), 1).await;
                 let prefix = if temporary { "TEMP " } else { "" };
                 source.execute(&format!("CREATE {prefix}TRIGGER ignore_ack BEFORE UPDATE ON main._fsqlite_source_replica_v1 \
                     BEGIN SELECT RAISE(IGNORE); END;")).await.unwrap();
-                assert!(matches!(acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await,
-                    Err(ReplicaApplyError::Protocol { detail: "outbox metadata must not have triggers" })));
+                assert!(matches!(
+                    acknowledge(&mut source, &cx, hash(10), first, 1 << 20).await,
+                    Err(ReplicaApplyError::Protocol {
+                        detail: "outbox metadata must not have triggers"
+                    })
+                ));
                 assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
                 source.close().await.unwrap();
             }
@@ -703,19 +1123,41 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let mut source = source(":memory:").await;
-            configure(&mut source, &cx, baseline(), &[hash(10),hash(11)]).await.unwrap();
+            configure(&mut source, &cx, baseline(), &[hash(10), hash(11)])
+                .await
+                .unwrap();
             let first = produce(&mut source, baseline(), 1).await;
             let saved = state(&mut source, &cx, hash(1)).await.unwrap();
-            let other = ReplicaCheckpoint { stream_id: hash(20), sequence: 0, tip: hash(21) };
-            super::super::initialize(&mut source, &cx, other).await.unwrap();
+            let other = ReplicaCheckpoint {
+                stream_id: hash(20),
+                sequence: 0,
+                tip: hash(21),
+            };
+            super::super::initialize(&mut source, &cx, other)
+                .await
+                .unwrap();
             let unrelated = produce(&mut source, other, 9).await;
-            assert!(configure(&mut source, &cx, other, &[hash(10)]).await.is_err());
-            let released = super::super::acknowledge(&mut source, &cx, unrelated, 1 << 20).await.unwrap();
+            assert!(
+                configure(&mut source, &cx, other, &[hash(10)])
+                    .await
+                    .is_err()
+            );
+            let released = super::super::acknowledge(&mut source, &cx, unrelated, 1 << 20)
+                .await
+                .unwrap();
             assert_eq!(released.pending_messages(), 0);
             assert_eq!(state(&mut source, &cx, hash(1)).await.unwrap(), saved);
-            assert!(super::super::acknowledge(&mut source, &cx, first, 1 << 20).await.is_err());
+            assert!(
+                super::super::acknowledge(&mut source, &cx, first, 1 << 20)
+                    .await
+                    .is_err()
+            );
             assert_eq!(count(&source, super::super::QUEUE_TABLE).await, 1);
-            assert!(next_pending(&mut source, &cx, hash(20), hash(10), 1 << 20).await.is_err());
+            assert!(
+                next_pending(&mut source, &cx, hash(20), hash(10), 1 << 20)
+                    .await
+                    .is_err()
+            );
             source.close().await.unwrap();
         });
     }

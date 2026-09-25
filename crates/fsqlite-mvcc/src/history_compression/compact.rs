@@ -16,9 +16,7 @@
 use super::{
     CompressedPageHistory, CompressedPageVersion, CompressedVersionData, HistoryCompressionError,
 };
-use crate::xor_delta::{
-    DeltaThresholdConfig, decode_sparse_xor_delta, encode_sparse_xor_delta,
-};
+use crate::xor_delta::{DeltaThresholdConfig, decode_sparse_xor_delta, encode_sparse_xor_delta};
 use fsqlite_types::{CommitSeq, PageNumber};
 
 const MAGIC: &[u8; 4] = b"FPH\x01";
@@ -128,9 +126,13 @@ impl CompactPageHistory {
             return Err(invalid("invalid version count or page size"));
         }
         if images.iter().any(|(_, image)| image.len() != newest.len())
-            || images.windows(2).any(|pair| pair[0].0.get() <= pair[1].0.get())
+            || images
+                .windows(2)
+                .any(|pair| pair[0].0.get() <= pair[1].0.get())
         {
-            return Err(invalid("images must have equal sizes and strictly descending sequences"));
+            return Err(invalid(
+                "images must have equal sizes and strictly descending sequences",
+            ));
         }
         let mut versions = Vec::with_capacity(images.len());
         let mut encoded_len = HEADER_BYTES + HASH_BYTES;
@@ -330,7 +332,10 @@ impl CompactPageHistory {
         let mut anchor = 0;
         for index in 0..count {
             let seq = CommitSeq::new(u64::from_le_bytes(input.array()?));
-            if versions.last().is_some_and(|previous| previous.seq.get() <= seq.get()) {
+            if versions
+                .last()
+                .is_some_and(|previous| previous.seq.get() <= seq.get())
+            {
                 return Err(invalid("sequences are not strictly descending"));
             }
             let tag = input.array::<1>()?[0];
@@ -438,8 +443,14 @@ mod tests {
         let decoded = CompactPageHistory::from_bytes(&compressed.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded, compressed);
         for snapshot in 0..=1010 {
-            let expected = images.iter().find(|(seq, _)| seq.get() <= snapshot).cloned();
-            assert_eq!(decoded.reconstruct(CommitSeq::new(snapshot)).unwrap(), expected);
+            let expected = images
+                .iter()
+                .find(|(seq, _)| seq.get() <= snapshot)
+                .cloned();
+            assert_eq!(
+                decoded.reconstruct(CommitSeq::new(snapshot)).unwrap(),
+                expected
+            );
         }
         assert_eq!(decoded.page_number(), PageNumber::ONE);
         assert_eq!(
@@ -455,10 +466,7 @@ mod tests {
             let newest = vec![0xA5; size];
             let mut older = newest.clone();
             older[size - 1] ^= 0xFF;
-            let images = vec![
-                (CommitSeq::new(2), newest),
-                (CommitSeq::new(1), older),
-            ];
+            let images = vec![(CommitSeq::new(2), newest), (CommitSeq::new(1), older)];
             let history = CompactPageHistory::compress(PageNumber::ONE, &images).unwrap();
             assert_eq!(history.delta_count(), 1);
             let decoded = CompactPageHistory::from_bytes(&history.to_bytes().unwrap()).unwrap();
@@ -523,7 +531,10 @@ mod tests {
         let history = CompactPageHistory::compress(PageNumber::ONE, &hot_images(100, 512)).unwrap();
         for (index, version) in history.versions.iter().enumerate() {
             assert!(index - version.anchor <= MAX_DELTA_DEPTH);
-            assert!(matches!(history.versions[version.anchor].payload, Payload::Full(_)));
+            assert!(matches!(
+                history.versions[version.anchor].payload,
+                Payload::Full(_)
+            ));
             if index % 32 == 0 {
                 assert!(matches!(version.payload, Payload::Full(_)));
             }
@@ -687,6 +698,9 @@ mod tests {
         };
         tip[0] ^= 1;
         assert!(history.reconstruct(images[0].0).is_err());
-        assert_eq!(history.reconstruct(images[40].0).unwrap(), Some(images[40].clone()));
+        assert_eq!(
+            history.reconstruct(images[40].0).unwrap(),
+            Some(images[40].clone())
+        );
     }
 }

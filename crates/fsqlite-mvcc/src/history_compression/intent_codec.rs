@@ -121,7 +121,11 @@ impl Writer {
                 self.tag(1)?;
                 self.table_row(*table, *key)
             }
-            IntentOpKind::Update { table, key, new_record } => {
+            IntentOpKind::Update {
+                table,
+                key,
+                new_record,
+            } => {
                 self.tag(2)?;
                 self.table_row(*table, *key)?;
                 self.data(new_record)
@@ -134,7 +138,11 @@ impl Writer {
                 self.tag(4)?;
                 self.index_row(*index, key, *rowid)
             }
-            IntentOpKind::UpdateExpression { table, key, column_updates } => {
+            IntentOpKind::UpdateExpression {
+                table,
+                key,
+                column_updates,
+            } => {
                 self.tag(5)?;
                 self.table_row(*table, *key)?;
                 self.count(column_updates.len())?;
@@ -242,7 +250,11 @@ impl Writer {
                 self.expression(expr, depth + 1)?;
                 self.data(type_name.as_bytes())
             }
-            RebaseExpr::Case { operand, when_clauses, else_clause } => {
+            RebaseExpr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
                 self.tag(6)?;
                 self.optional_expression(operand.as_deref(), depth + 1)?;
                 self.count(when_clauses.len())?;
@@ -286,7 +298,9 @@ impl<'a> Reader<'a> {
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| invalid("truncated fixed field"))
+        self.take(N)?
+            .try_into()
+            .map_err(|_| invalid("truncated fixed field"))
     }
 
     fn tag(&mut self) -> Result<u8> {
@@ -309,7 +323,9 @@ impl<'a> Reader<'a> {
     fn string(&mut self) -> Result<String> {
         let text = std::str::from_utf8(self.data()?).map_err(|_| invalid("invalid UTF-8 name"))?;
         let mut result = String::new();
-        result.try_reserve(text.len()).map_err(|_| invalid("allocation failed"))?;
+        result
+            .try_reserve(text.len())
+            .map_err(|_| invalid("allocation failed"))?;
         result.push_str(text);
         Ok(result)
     }
@@ -328,7 +344,9 @@ impl<'a> Reader<'a> {
         let mut values = Vec::new();
         for _ in 0..count {
             let value = read(self)?;
-            values.try_reserve(1).map_err(|_| invalid("allocation failed"))?;
+            values
+                .try_reserve(1)
+                .map_err(|_| invalid("allocation failed"))?;
             values.push(value);
         }
         Ok(values)
@@ -347,7 +365,11 @@ impl<'a> Reader<'a> {
             1 => BtreeRef::Index(IndexId::new(id)),
             _ => return Err(invalid("unknown B-tree namespace")),
         };
-        Ok(SemanticKeyRef { btree, kind, key_digest: self.array()? })
+        Ok(SemanticKeyRef {
+            btree,
+            kind,
+            key_digest: self.array()?,
+        })
     }
 
     fn operation(&mut self) -> Result<IntentOp> {
@@ -394,7 +416,11 @@ impl<'a> Reader<'a> {
         };
         Ok(IntentOp {
             schema_epoch,
-            footprint: IntentFootprint { reads, writes, structural },
+            footprint: IntentFootprint {
+                reads,
+                writes,
+                structural,
+            },
             op,
         })
     }
@@ -404,7 +430,9 @@ impl<'a> Reader<'a> {
             0 => Ok(SqliteValue::Null),
             1 => Ok(SqliteValue::Integer(i64::from_le_bytes(self.array()?))),
             // Do not use From<f64>, which would replace NaN bits with NULL.
-            2 => Ok(SqliteValue::Float(f64::from_bits(u64::from_le_bytes(self.array()?)))),
+            2 => Ok(SqliteValue::Float(f64::from_bits(u64::from_le_bytes(
+                self.array()?,
+            )))),
             3 => Ok(SqliteValue::Text(SmallText::from_bytes(self.data()?))),
             4 => Ok(SqliteValue::Blob(self.data()?.into())),
             _ => Err(invalid("unknown SQL value tag")),
@@ -431,7 +459,10 @@ impl<'a> Reader<'a> {
                     2 => RebaseUnaryOp::Not,
                     _ => return Err(invalid("unknown unary operator")),
                 };
-                Ok(RebaseExpr::UnaryOp { op, operand: Box::new(self.expression(depth + 1)?) })
+                Ok(RebaseExpr::UnaryOp {
+                    op,
+                    operand: Box::new(self.expression(depth + 1)?),
+                })
             }
             3 => {
                 let op = match self.tag()? {
@@ -467,7 +498,9 @@ impl<'a> Reader<'a> {
                 })?,
                 else_clause: self.optional_expression(depth + 1)?,
             }),
-            7 => Ok(RebaseExpr::Coalesce(self.many(2, |reader| reader.expression(depth + 1))?)),
+            7 => Ok(RebaseExpr::Coalesce(
+                self.many(2, |reader| reader.expression(depth + 1))?,
+            )),
             8 => Ok(RebaseExpr::NullIf {
                 left: Box::new(self.expression(depth + 1)?),
                 right: Box::new(self.expression(depth + 1)?),
@@ -485,7 +518,10 @@ pub(super) fn encode(ops: &[IntentOp]) -> Result<Vec<u8>> {
     if ops.is_empty() {
         return Ok(0_u32.to_le_bytes().to_vec());
     }
-    let mut writer = Writer { bytes: Vec::new(), remaining_nodes: MAX_NODES };
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        remaining_nodes: MAX_NODES,
+    };
     writer.bytes(MAGIC)?;
     writer.count(ops.len())?;
     for op in ops {
@@ -501,7 +537,10 @@ pub(super) fn decode(payload: &[u8]) -> Result<Vec<IntentOp>> {
     if payload.len() > MAX_BYTES {
         return Err(invalid("payload exceeds 16 MiB"));
     }
-    let mut reader = Reader { bytes: payload, remaining_nodes: MAX_NODES };
+    let mut reader = Reader {
+        bytes: payload,
+        remaining_nodes: MAX_NODES,
+    };
     if reader.take(MAGIC.len())? != MAGIC {
         return Err(invalid("unknown format/version"));
     }
@@ -525,7 +564,11 @@ mod tests {
     use fsqlite_types::{CommitSeq, PageNumber, TypeAffinity};
 
     fn intent(op: IntentOpKind) -> IntentOp {
-        IntentOp { schema_epoch: 7, footprint: IntentFootprint::empty(), op }
+        IntentOp {
+            schema_epoch: 7,
+            footprint: IntentFootprint::empty(),
+            op,
+        }
     }
 
     fn expression_intent(expr: RebaseExpr) -> IntentOp {
@@ -544,28 +587,59 @@ mod tests {
         let mut result = vec![
             RebaseExpr::ColumnRef(ColumnIdx::new(u32::MAX)),
             literal(),
-            RebaseExpr::FunctionCall { name: "mAx".to_owned(), args: vec![literal(), literal()] },
-            RebaseExpr::Cast { expr: Box::new(literal()), type_name: "tExT".to_owned() },
+            RebaseExpr::FunctionCall {
+                name: "mAx".to_owned(),
+                args: vec![literal(), literal()],
+            },
+            RebaseExpr::Cast {
+                expr: Box::new(literal()),
+                type_name: "tExT".to_owned(),
+            },
             RebaseExpr::Case {
                 operand: Some(Box::new(literal())),
                 when_clauses: vec![(literal(), literal()), (literal(), literal())],
                 else_clause: Some(Box::new(literal())),
             },
-            RebaseExpr::Case { operand: None, when_clauses: Vec::new(), else_clause: None },
+            RebaseExpr::Case {
+                operand: None,
+                when_clauses: Vec::new(),
+                else_clause: None,
+            },
             RebaseExpr::Coalesce(vec![literal(), literal()]),
-            RebaseExpr::NullIf { left: Box::new(literal()), right: Box::new(literal()) },
-            RebaseExpr::Concat { left: Box::new(literal()), right: Box::new(literal()) },
+            RebaseExpr::NullIf {
+                left: Box::new(literal()),
+                right: Box::new(literal()),
+            },
+            RebaseExpr::Concat {
+                left: Box::new(literal()),
+                right: Box::new(literal()),
+            },
         ];
-        for op in [RebaseUnaryOp::Negate, RebaseUnaryOp::BitwiseNot, RebaseUnaryOp::Not] {
-            result.push(RebaseExpr::UnaryOp { op, operand: Box::new(literal()) });
+        for op in [
+            RebaseUnaryOp::Negate,
+            RebaseUnaryOp::BitwiseNot,
+            RebaseUnaryOp::Not,
+        ] {
+            result.push(RebaseExpr::UnaryOp {
+                op,
+                operand: Box::new(literal()),
+            });
         }
         for op in [
-            RebaseBinaryOp::Add, RebaseBinaryOp::Subtract, RebaseBinaryOp::Multiply,
-            RebaseBinaryOp::Divide, RebaseBinaryOp::Remainder, RebaseBinaryOp::BitwiseAnd,
-            RebaseBinaryOp::BitwiseOr, RebaseBinaryOp::ShiftLeft, RebaseBinaryOp::ShiftRight,
+            RebaseBinaryOp::Add,
+            RebaseBinaryOp::Subtract,
+            RebaseBinaryOp::Multiply,
+            RebaseBinaryOp::Divide,
+            RebaseBinaryOp::Remainder,
+            RebaseBinaryOp::BitwiseAnd,
+            RebaseBinaryOp::BitwiseOr,
+            RebaseBinaryOp::ShiftLeft,
+            RebaseBinaryOp::ShiftRight,
         ] {
             result.push(RebaseExpr::BinaryOp {
-                op, left: Box::new(literal()), right: Box::new(literal()),
+                op,
+                left: Box::new(literal()),
+                right: Box::new(literal()),
             });
         }
         result
@@ -576,13 +650,33 @@ mod tests {
         let key = RowId::new(i64::MIN);
         let index = IndexId::new(u32::MAX);
         let mut ops = vec![
-            intent(IntentOpKind::Insert { table, key, record: vec![0, 255, 3] }),
-            intent(IntentOpKind::Delete { table, key: RowId::MAX }),
-            intent(IntentOpKind::Update { table, key, new_record: Vec::new() }),
-            intent(IntentOpKind::IndexInsert { index, key: vec![0, 255], rowid: key }),
-            intent(IntentOpKind::IndexDelete { index, key: Vec::new(), rowid: RowId::MAX }),
+            intent(IntentOpKind::Insert {
+                table,
+                key,
+                record: vec![0, 255, 3],
+            }),
+            intent(IntentOpKind::Delete {
+                table,
+                key: RowId::MAX,
+            }),
+            intent(IntentOpKind::Update {
+                table,
+                key,
+                new_record: Vec::new(),
+            }),
+            intent(IntentOpKind::IndexInsert {
+                index,
+                key: vec![0, 255],
+                rowid: key,
+            }),
+            intent(IntentOpKind::IndexDelete {
+                index,
+                key: Vec::new(),
+                rowid: RowId::MAX,
+            }),
             intent(IntentOpKind::UpdateExpression {
-                table, key,
+                table,
+                key,
                 // Repeated target columns and expression order must survive encoding.
                 column_updates: expressions()
                     .into_iter()
@@ -625,11 +719,8 @@ mod tests {
             },
         }];
         let expected = [
-            0x49, 0x4C, 0x50, 1, 1, 0, 0, 0,
-            8, 7, 6, 5, 4, 3, 2, 1,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            1, 0x0C, 0x0B, 0x0A, 9,
-            0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x49, 0x4C, 0x50, 1, 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 0x0C, 0x0B, 0x0A, 9, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         ];
         assert_eq!(encode(&ops).unwrap(), expected);
         assert_eq!(decode(&expected).unwrap(), ops);
@@ -717,8 +808,11 @@ mod tests {
             panic!("missing persisted column expressions");
         };
         let updated = crate::index_regen::apply_column_updates(
-            &[SqliteValue::Integer(40)], column_updates, &[TypeAffinity::Integer],
-        ).unwrap();
+            &[SqliteValue::Integer(40)],
+            column_updates,
+            &[TypeAffinity::Integer],
+        )
+        .unwrap();
         assert_eq!(updated[0].as_integer(), Some(42));
     }
 
@@ -736,7 +830,10 @@ mod tests {
     fn intent_wire_rejects_every_truncation_and_trailing_bytes() {
         let bytes = encode(&all_operations()).unwrap();
         for length in 1..bytes.len() {
-            assert!(decode(&bytes[..length]).is_err(), "accepted truncation {length}");
+            assert!(
+                decode(&bytes[..length]).is_err(),
+                "accepted truncation {length}"
+            );
         }
         let mut trailing = bytes;
         trailing.push(0);
@@ -745,12 +842,18 @@ mod tests {
 
     #[test]
     fn intent_wire_rejects_unknown_tags_flags_lengths_and_invalid_names() {
-        let op = intent(IntentOpKind::Delete { table: TableId::new(1), key: RowId::new(1) });
+        let op = intent(IntentOpKind::Delete {
+            table: TableId::new(1),
+            key: RowId::new(1),
+        });
         let bytes = encode(&[op]).unwrap();
         for (offset, value) in [(0, b'X'), (3, 2), (28, 6), (25, 1)] {
             let mut invalid_bytes = bytes.clone();
             invalid_bytes[offset] = value;
-            assert!(decode(&invalid_bytes).is_err(), "accepted invalid field at {offset}");
+            assert!(
+                decode(&invalid_bytes).is_err(),
+                "accepted invalid field at {offset}"
+            );
         }
         for offset in [4, 16, 20] {
             let mut invalid_bytes = bytes.clone();
@@ -763,21 +866,27 @@ mod tests {
 
         // Decode expression fields directly with the same bounded parser.
         for expression in [
-            vec![10],                         // unknown expression
-            vec![1, 5],                       // unknown SQL value
-            vec![2, 3, 1, 0],                 // unknown unary operator
-            vec![3, 9, 1, 0, 1, 0],           // unknown binary operator
-            vec![6, 2, 0, 0, 0, 0, 0],        // optional flag is not 0/1
+            vec![10],                             // unknown expression
+            vec![1, 5],                           // unknown SQL value
+            vec![2, 3, 1, 0],                     // unknown unary operator
+            vec![3, 9, 1, 0, 1, 0],               // unknown binary operator
+            vec![6, 2, 0, 0, 0, 0, 0],            // optional flag is not 0/1
             vec![4, 1, 0, 0, 0, 255, 0, 0, 0, 0], // invalid function-name UTF-8
-            vec![1, 3, 255, 255, 255, 255],    // impossible TEXT length
+            vec![1, 3, 255, 255, 255, 255],       // impossible TEXT length
         ] {
-            let mut reader = Reader { bytes: &expression, remaining_nodes: MAX_NODES };
+            let mut reader = Reader {
+                bytes: &expression,
+                remaining_nodes: MAX_NODES,
+            };
             assert!(reader.expression(0).is_err());
         }
         for (offset, tag) in [(0, 2), (1, 2)] {
             let mut bytes = [0; KEY_BYTES];
             bytes[offset] = tag;
-            let mut reader = Reader { bytes: &bytes, remaining_nodes: MAX_NODES };
+            let mut reader = Reader {
+                bytes: &bytes,
+                remaining_nodes: MAX_NODES,
+            };
             assert!(reader.key().is_err());
         }
     }
@@ -786,11 +895,17 @@ mod tests {
     fn intent_wire_enforces_depth_and_log_wide_node_limits() {
         let mut expr = literal();
         for _ in 1..MAX_DEPTH {
-            expr = RebaseExpr::UnaryOp { op: RebaseUnaryOp::Not, operand: Box::new(expr) };
+            expr = RebaseExpr::UnaryOp {
+                op: RebaseUnaryOp::Not,
+                operand: Box::new(expr),
+            };
         }
         let bytes = encode(&[expression_intent(expr.clone())]).unwrap();
         assert!(decode(&bytes).is_ok());
-        let too_deep = RebaseExpr::UnaryOp { op: RebaseUnaryOp::Not, operand: Box::new(expr) };
+        let too_deep = RebaseExpr::UnaryOp {
+            op: RebaseUnaryOp::Not,
+            operand: Box::new(expr),
+        };
         assert!(encode(&[expression_intent(too_deep)]).is_err());
         // The first expression follows the fixed header, op, and column fields.
         let mut too_deep_bytes = bytes;
@@ -814,10 +929,15 @@ mod tests {
     fn intent_wire_rejects_oversized_payloads_and_collections() {
         assert!(decode(&vec![0; MAX_BYTES + 1]).is_err());
         let op = intent(IntentOpKind::Insert {
-            table: TableId::new(1), key: RowId::new(1), record: vec![0; MAX_BYTES],
+            table: TableId::new(1),
+            key: RowId::new(1),
+            record: vec![0; MAX_BYTES],
         });
         assert!(encode(&[op]).is_err());
-        let op = intent(IntentOpKind::Delete { table: TableId::new(1), key: RowId::new(1) });
+        let op = intent(IntentOpKind::Delete {
+            table: TableId::new(1),
+            key: RowId::new(1),
+        });
         assert!(encode(&vec![op; MAX_ITEMS + 1]).is_err());
     }
 

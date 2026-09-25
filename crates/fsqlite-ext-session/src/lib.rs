@@ -2347,26 +2347,41 @@ mod tests {
             let mut session = Session::new();
             session.attach_table("t", 3, vec![true, false, false]);
             session.set_indirect(indirect);
-            session.record_update("t", before.clone(), vec![
-                ChangesetValue::Undefined,
-                ChangesetValue::Text("after".into()),
-                ChangesetValue::Undefined,
-            ]);
+            session.record_update(
+                "t",
+                before.clone(),
+                vec![
+                    ChangesetValue::Undefined,
+                    ChangesetValue::Text("after".into()),
+                    ChangesetValue::Undefined,
+                ],
+            );
             let changeset = session.changeset();
             let inverse = changeset.invert().unwrap();
             assert_eq!(inverse.tables[0].rows[0].indirect, indirect);
             assert_eq!(Changeset::decode(&inverse.encode()).unwrap(), inverse);
             assert_eq!(inverse.invert().unwrap(), changeset);
             let mut target = SimpleTarget::default();
-            target.tables.insert("t".into(), vec![
-                before.iter().map(ChangesetValue::to_sqlite).collect(),
-            ]);
+            target.tables.insert(
+                "t".into(),
+                vec![before.iter().map(ChangesetValue::to_sqlite).collect()],
+            );
             let original = target.tables.clone();
-            assert_eq!(target.apply(&changeset, |_, _| ConflictAction::Abort),
-                ApplyOutcome::Success { applied: 1, skipped: 0 });
+            assert_eq!(
+                target.apply(&changeset, |_, _| ConflictAction::Abort),
+                ApplyOutcome::Success {
+                    applied: 1,
+                    skipped: 0
+                }
+            );
             assert_ne!(target.tables, original);
-            assert_eq!(target.apply(&inverse, |_, _| ConflictAction::Abort),
-                ApplyOutcome::Success { applied: 1, skipped: 0 });
+            assert_eq!(
+                target.apply(&inverse, |_, _| ConflictAction::Abort),
+                ApplyOutcome::Success {
+                    applied: 1,
+                    skipped: 0
+                }
+            );
             assert_eq!(target.tables, original);
         }
     }
@@ -2376,33 +2391,56 @@ mod tests {
         // SQLite 3.46.1 session API: t(id INTEGER PRIMARY KEY,a,b), initial
         // (1,'old',7), then an indirect UPDATE t SET a='new' WHERE id=1.
         let original = [
-            0x54, 3, 1, 0, 0, b't', 0, 0x17, 1,
-            1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, b'o', b'l', b'd', 0,
-            0, 3, 3, b'n', b'e', b'w', 0,
+            0x54, 3, 1, 0, 0, b't', 0, 0x17, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, b'o', b'l', b'd',
+            0, 0, 3, 3, b'n', b'e', b'w', 0,
         ];
         let expected = [
-            0x54, 3, 1, 0, 0, b't', 0, 0x17, 1,
-            1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, b'n', b'e', b'w', 0,
-            0, 3, 3, b'o', b'l', b'd', 0,
+            0x54, 3, 1, 0, 0, b't', 0, 0x17, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, b'n', b'e', b'w',
+            0, 0, 3, 3, b'o', b'l', b'd', 0,
         ];
         let changeset = Changeset::decode(&original).unwrap();
         assert_eq!(changeset.invert().unwrap().encode(), expected);
-        assert_eq!(Changeset::decode(&expected).unwrap().invert().unwrap().encode(), original);
+        assert_eq!(
+            Changeset::decode(&expected)
+                .unwrap()
+                .invert()
+                .unwrap()
+                .encode(),
+            original
+        );
     }
 
     #[test]
     fn test_sparse_inverse_preserves_composite_keys_in_any_position() {
         for mask in 1_u8..31 {
             let flags: Vec<bool> = (0..5).map(|i| mask & (1 << i) != 0).collect();
-            let old_values: Vec<_> = flags.iter().enumerate().map(|(i, key)| {
-                if *key { ChangesetValue::Integer(i64::try_from(i).unwrap() + 1) }
-                else { ChangesetValue::Text("old".into()) }
-            }).collect();
-            let new_values: Vec<_> = flags.iter().map(|key| {
-                if *key { ChangesetValue::Undefined }
-                else { ChangesetValue::Text("new".into()) }
-            }).collect();
-            let row = ChangesetRow { op: ChangeOp::Update, indirect: true, old_values, new_values };
+            let old_values: Vec<_> = flags
+                .iter()
+                .enumerate()
+                .map(|(i, key)| {
+                    if *key {
+                        ChangesetValue::Integer(i64::try_from(i).unwrap() + 1)
+                    } else {
+                        ChangesetValue::Text("old".into())
+                    }
+                })
+                .collect();
+            let new_values: Vec<_> = flags
+                .iter()
+                .map(|key| {
+                    if *key {
+                        ChangesetValue::Undefined
+                    } else {
+                        ChangesetValue::Text("new".into())
+                    }
+                })
+                .collect();
+            let row = ChangesetRow {
+                op: ChangeOp::Update,
+                indirect: true,
+                old_values,
+                new_values,
+            };
             let inverse = row.invert();
             for (i, key) in flags.iter().enumerate() {
                 if *key {
@@ -2421,13 +2459,20 @@ mod tests {
     fn test_sparse_inverse_distinguishes_null_from_undefined() {
         use ChangesetValue::{Integer, Null, Text, Undefined};
         let row = ChangesetRow {
-            op: ChangeOp::Update, indirect: false,
+            op: ChangeOp::Update,
+            indirect: false,
             old_values: vec![Integer(1), Null, Undefined, Text("old".into())],
             new_values: vec![Undefined, Integer(0), Undefined, Null],
         };
         let inverse = row.invert();
-        assert_eq!(inverse.old_values, vec![Integer(1), Integer(0), Undefined, Null]);
-        assert_eq!(inverse.new_values, vec![Undefined, Null, Undefined, Text("old".into())]);
+        assert_eq!(
+            inverse.old_values,
+            vec![Integer(1), Integer(0), Undefined, Null]
+        );
+        assert_eq!(
+            inverse.new_values,
+            vec![Undefined, Null, Undefined, Text("old".into())]
+        );
         assert_eq!(inverse.invert(), row);
     }
 

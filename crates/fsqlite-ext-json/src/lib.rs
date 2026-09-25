@@ -4425,7 +4425,11 @@ mod tests {
 
     #[test]
     fn json5_nonfinite_scalars_preserve_sign_and_jsonb_round_trip() {
-        for (input, negative) in [("Infinity", false), ("+Infinity", false), ("-Infinity", true)] {
+        for (input, negative) in [
+            ("Infinity", false),
+            ("+Infinity", false),
+            ("-Infinity", true),
+        ] {
             let value = parse_json5_text(input).expect("JSON5 infinity parses");
             assert_eq!(
                 value,
@@ -4488,7 +4492,12 @@ mod tests {
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)]
     fn json5_nonfinite_values_do_not_accept_malformed_input() {
-        for input in ["Infinityx", "[Infinity,,NaN]", "{a:Infinity b:1}", "[-Infinity"] {
+        for input in [
+            "Infinityx",
+            "[Infinity,,NaN]",
+            "{a:Infinity b:1}",
+            "[-Infinity",
+        ] {
             assert!(parse_json5_text(input).is_err(), "accepted {input:?}");
         }
     }

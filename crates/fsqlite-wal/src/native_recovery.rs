@@ -9,23 +9,23 @@
 //! through backup, physical repair and shared-index publication. Neither mode
 //! deletes files or overwrites a destination/backup.
 
+#[path = "native_recovery_publication.rs"]
+mod publication;
 #[cfg(unix)]
 #[path = "bin/native/repair.rs"]
 mod repair;
-#[path = "native_recovery_publication.rs"]
-mod publication;
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use asupersync::runtime::spawn_blocking;
+use crate::wal_fec::replay::{WalFecReplayLimits, recover_wal_fec_image_with_certificates};
 #[cfg(test)]
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::spawn_blocking;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_vfs::{FileIdentity, Vfs, VfsFile, host_fs};
-use crate::wal_fec::replay::{WalFecReplayLimits, recover_wal_fec_image_with_certificates};
 
 #[cfg(unix)]
 type NativeVfs = fsqlite_vfs::unix::UnixVfs;
@@ -39,7 +39,13 @@ const DATABASE_HEADER_BYTES: usize = 100;
 // These names belong to a database even when their entries do not yet exist.
 // In particular, an absent certificate is not a safe export destination.
 const RECOVERY_COMPANION_SUFFIXES: [&str; 7] = [
-    "-journal", "-wal", "-shm", "-wal-fec", "-wal-fec.lock", "-wal-cert", ".fsqlite-shm",
+    "-journal",
+    "-wal",
+    "-shm",
+    "-wal-fec",
+    "-wal-fec.lock",
+    "-wal-cert",
+    ".fsqlite-shm",
 ];
 
 /// Bounded native recovery request. The destination is a new database for
@@ -56,7 +62,8 @@ impl Options {
     #[must_use]
     pub fn new(source: impl Into<PathBuf>, destination: impl Into<PathBuf>) -> Self {
         Self {
-            source: source.into(), destination: destination.into(),
+            source: source.into(),
+            destination: destination.into(),
             max_database_bytes: 256 * 1024 * 1024,
             replay: WalFecReplayLimits::default(),
         }
@@ -98,7 +105,9 @@ fn preflight(cx: &Cx, options: &Options) -> Result<()> {
         ));
     }
     if options.source.as_os_str().is_empty() || options.destination.as_os_str().is_empty() {
-        return Err(FrankenError::CannotOpen { path: PathBuf::new() });
+        return Err(FrankenError::CannotOpen {
+            path: PathBuf::new(),
+        });
     }
     Ok(())
 }
@@ -125,18 +134,23 @@ fn companion(path: &Path, suffix: &str) -> PathBuf {
 
 fn require_regular_file(path: &Path) -> Result<()> {
     if !host_fs::metadata(path)?.is_file() {
-        return Err(FrankenError::CannotOpen { path: path.to_owned() });
+        return Err(FrankenError::CannotOpen {
+            path: path.to_owned(),
+        });
     }
     Ok(())
 }
 
 fn require_wal_mode(database: &[u8]) -> Result<()> {
     // A checksum-valid leftover WAL is not authority after switching to rollback mode.
-    if database.len() < DATABASE_HEADER_BYTES || !database.starts_with(b"SQLite format 3\0")
-        || database[18] != 2 || database[19] != 2
+    if database.len() < DATABASE_HEADER_BYTES
+        || !database.starts_with(b"SQLite format 3\0")
+        || database[18] != 2
+        || database[19] != 2
     {
         return Err(FrankenError::WalCorrupt {
-            detail: "source is not in WAL mode; refusing a potentially stale WAL companion".to_owned(),
+            detail: "source is not in WAL mode; refusing a potentially stale WAL companion"
+                .to_owned(),
         });
     }
     Ok(())
@@ -153,7 +167,12 @@ struct SourceFile<F: VfsFile> {
 
 impl<F: VfsFile> SourceFile<F> {
     fn new(file: F, cx: &Cx) -> Self {
-        Self { file, cleanup_cx: cx.create_child(), maintenance: false, closed: false }
+        Self {
+            file,
+            cleanup_cx: cx.create_child(),
+            maintenance: false,
+            closed: false,
+        }
     }
 
     fn acquire_recovery(&mut self, cx: &Cx) -> Result<()> {
@@ -166,10 +185,13 @@ impl<F: VfsFile> SourceFile<F> {
     }
 
     fn finish(&mut self) -> Result<()> {
-        if self.closed { return Ok(()); }
+        if self.closed {
+            return Ok(());
+        }
         let _mask = self.cleanup_cx.masked();
         if self.maintenance {
-            self.file.restore_external_maintenance_attempt(&self.cleanup_cx)?;
+            self.file
+                .restore_external_maintenance_attempt(&self.cleanup_cx)?;
             self.maintenance = false;
         }
         self.file.close(&self.cleanup_cx)?;
@@ -215,35 +237,57 @@ impl CapturedSource {
 async fn read_vfs_snapshot<F: VfsFile>(file: &F, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
     checkpoint(cx)?;
     let size = file.file_size(cx)?;
-    let len = usize::try_from(size).ok().filter(|len| *len <= limit).ok_or(FrankenError::TooBig)?;
+    let len = usize::try_from(size)
+        .ok()
+        .filter(|len| *len <= limit)
+        .ok_or(FrankenError::TooBig)?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| FrankenError::OutOfMemory)?;
     bytes.resize(len, 0);
     let mut offset = 0;
     while offset < len {
         checkpoint(cx)?;
         let end = len.min(offset.saturating_add(IO_CHUNK));
-        let count = file.read(cx, &mut bytes[offset..end], u64::try_from(offset)
-            .map_err(|_| FrankenError::TooBig)?).await?;
+        let count = file
+            .read(
+                cx,
+                &mut bytes[offset..end],
+                u64::try_from(offset).map_err(|_| FrankenError::TooBig)?,
+            )
+            .await?;
         if count == 0 || count > end - offset {
-            return Err(FrankenError::ShortRead { expected: len, actual: offset });
+            return Err(FrankenError::ShortRead {
+                expected: len,
+                actual: offset,
+            });
         }
         offset += count;
     }
-    if file.file_size(cx)? != size { return Err(FrankenError::BusyRecovery); }
+    if file.file_size(cx)? != size {
+        return Err(FrankenError::BusyRecovery);
+    }
     Ok(bytes)
 }
 
 fn read_exact_snapshot(reader: &mut impl Read, cx: &Cx, len: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| FrankenError::OutOfMemory)?;
     bytes.resize(len, 0);
     let mut offset = 0;
     while offset < len {
         checkpoint(cx)?;
         let end = len.min(offset.saturating_add(IO_CHUNK));
         match reader.read(&mut bytes[offset..end]) {
-            Ok(0) => return Err(FrankenError::ShortRead { expected: len, actual: offset }),
+            Ok(0) => {
+                return Err(FrankenError::ShortRead {
+                    expected: len,
+                    actual: offset,
+                });
+            }
             Ok(count) => offset += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
@@ -301,11 +345,15 @@ fn read_sidecar(path: &Path, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
     lock_sidecar_shared(&guard, cx)?;
     let mut file = match host_fs::open_existing_regular_file_no_follow(path) {
         Ok(file) => file,
-        Err(FrankenError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(FrankenError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
         Err(error) => return Err(error),
     };
-    let len = usize::try_from(file.metadata()?.len()).ok()
-        .filter(|len| *len <= limit).ok_or(FrankenError::TooBig)?;
+    let len = usize::try_from(file.metadata()?.len())
+        .ok()
+        .filter(|len| *len <= limit)
+        .ok_or(FrankenError::TooBig)?;
     let bytes = read_exact_snapshot(&mut file, cx, len)?;
     drop(file);
     drop(guard);
@@ -314,15 +362,26 @@ fn read_sidecar(path: &Path, cx: &Cx, limit: usize) -> Result<Vec<u8>> {
 
 /// Capture certificates through VFS while the main recovery fence excludes writers.
 async fn capture_certificates(
-    vfs: &NativeVfs, cx: &Cx, path: &Path, limit: usize,
-    main_identity: FileIdentity, wal_identity: FileIdentity,
+    vfs: &NativeVfs,
+    cx: &Cx,
+    path: &Path,
+    limit: usize,
+    main_identity: FileIdentity,
+    wal_identity: FileIdentity,
 ) -> Result<Vec<u8>> {
-    if !vfs.path_entry_exists(cx, path)? { return Ok(Vec::new()); }
+    if !vfs.path_entry_exists(cx, path)? {
+        return Ok(Vec::new());
+    }
     require_regular_file(path)?;
     let (file, _) = vfs.open(cx, Some(path), VfsOpenFlags::READONLY)?;
     let mut certificate = SourceFile::new(file, cx);
-    let identity = certificate.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
-    if identity == main_identity || identity == wal_identity { return Err(FrankenError::BusyRecovery); }
+    let identity = certificate
+        .file
+        .file_identity()?
+        .ok_or(FrankenError::Unsupported)?;
+    if identity == main_identity || identity == wal_identity {
+        return Err(FrankenError::BusyRecovery);
+    }
     let size = certificate.file.file_size(cx)?;
     if usize::try_from(size).ok().is_none_or(|size| size > limit) {
         certificate.finish()?;
@@ -344,59 +403,107 @@ async fn capture(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<Snapshot
 
 async fn capture_held(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<CapturedSource> {
     require_regular_file(&options.source)?;
-    let (file, flags) = vfs.open(cx, Some(&options.source), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB)?;
+    let (file, flags) = vfs.open(
+        cx,
+        Some(&options.source),
+        VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+    )?;
     let mut main = SourceFile::new(file, cx);
-    if !flags.contains(VfsOpenFlags::READWRITE) { return Err(FrankenError::ReadOnly); }
+    if !flags.contains(VfsOpenFlags::READWRITE) {
+        return Err(FrankenError::ReadOnly);
+    }
     main.acquire_recovery(cx)?;
-    let main_identity = main.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
+    let main_identity = main
+        .file
+        .file_identity()?
+        .ok_or(FrankenError::Unsupported)?;
     let database = read_vfs_snapshot(&main.file, cx, options.max_database_bytes).await?;
     require_wal_mode(&database)?;
     let wal_path = companion(&options.source, "-wal");
     require_regular_file(&wal_path)?;
-    let (file, _) = vfs.open(cx, Some(&wal_path), VfsOpenFlags::READONLY | VfsOpenFlags::WAL)?;
+    let (file, _) = vfs.open(
+        cx,
+        Some(&wal_path),
+        VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+    )?;
     let wal = SourceFile::new(file, cx);
     let wal_identity = wal.file.file_identity()?.ok_or(FrankenError::Unsupported)?;
-    if main_identity == wal_identity { return Err(FrankenError::BusyRecovery); }
+    if main_identity == wal_identity {
+        return Err(FrankenError::BusyRecovery);
+    }
     let wal_bytes = read_vfs_snapshot(&wal.file, cx, options.replay.max_wal_bytes).await?;
     let sidecar_path = companion(&options.source, "-wal-fec");
     let sidecar_cx = cx.create_child_for_spawn();
     let sidecar_limit = options.replay.max_sidecar_bytes;
-    let sidecar = spawn_blocking(move || read_sidecar(&sidecar_path, &sidecar_cx, sidecar_limit)).await?;
-    let certificates = capture_certificates(vfs, cx, &companion(&options.source, "-wal-cert"),
-        options.replay.max_certificate_bytes, main_identity, wal_identity).await?;
+    let sidecar =
+        spawn_blocking(move || read_sidecar(&sidecar_path, &sidecar_cx, sidecar_limit)).await?;
+    let certificates = capture_certificates(
+        vfs,
+        cx,
+        &companion(&options.source, "-wal-cert"),
+        options.replay.max_certificate_bytes,
+        main_identity,
+        wal_identity,
+    )
+    .await?;
     for (path, identity, flags) in [
-        (&options.source, main_identity, VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB),
-        (&wal_path, wal_identity, VfsOpenFlags::READONLY | VfsOpenFlags::WAL),
+        (
+            &options.source,
+            main_identity,
+            VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+        ),
+        (
+            &wal_path,
+            wal_identity,
+            VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+        ),
     ] {
         let (file, _) = vfs.open_with_expected_identity(cx, path, flags, identity)?;
         SourceFile::new(file, cx).finish()?;
     }
     Ok(CapturedSource {
-        snapshot: Snapshot { database, wal: wal_bytes, sidecar, certificates }, wal, main,
-        #[cfg(unix)] main_identity,
-        #[cfg(unix)] wal_identity,
+        snapshot: Snapshot {
+            database,
+            wal: wal_bytes,
+            sidecar,
+            certificates,
+        },
+        wal,
+        main,
+        #[cfg(unix)]
+        main_identity,
+        #[cfg(unix)]
+        wal_identity,
     })
 }
 
 fn is_source_artifact(source: &Path, destination: &Path) -> bool {
     source == destination
-        || RECOVERY_COMPANION_SUFFIXES.iter()
+        || RECOVERY_COMPANION_SUFFIXES
+            .iter()
             .any(|suffix| destination == companion(source, suffix).as_path())
 }
 
 fn refuse_destination_artifacts(vfs: &NativeVfs, cx: &Cx, path: &Path) -> Result<()> {
     for suffix in RECOVERY_COMPANION_SUFFIXES {
         let artifact = companion(path, suffix);
-        if vfs.path_entry_exists(cx, &artifact)? { return Err(FrankenError::CannotOpen { path: artifact }); }
+        if vfs.path_entry_exists(cx, &artifact)? {
+            return Err(FrankenError::CannotOpen { path: artifact });
+        }
     }
     Ok(())
 }
 
 /// Make the body durable behind an invalid header, then publish the real header.
 fn write_image<W: Write + Seek>(
-    file: &mut W, cx: &Cx, image: &[u8], mut sync: impl FnMut(&mut W) -> io::Result<()>,
+    file: &mut W,
+    cx: &Cx,
+    image: &[u8],
+    mut sync: impl FnMut(&mut W) -> io::Result<()>,
 ) -> Result<()> {
-    if image.len() < DATABASE_HEADER_BYTES { return Err(FrankenError::TooBig); }
+    if image.len() < DATABASE_HEADER_BYTES {
+        return Err(FrankenError::TooBig);
+    }
     checkpoint(cx)?;
     file.write_all(&[0_u8; DATABASE_HEADER_BYTES])?;
     for chunk in image[DATABASE_HEADER_BYTES..].chunks(IO_CHUNK) {
@@ -427,7 +534,9 @@ fn verify_image(file: &mut (impl Read + Seek), cx: &Cx, image: &[u8]) -> Result<
         digest.update(actual);
     }
     if file.read(&mut [0_u8; 1])? != 0 {
-        return Err(FrankenError::DatabaseCorrupt { detail: "recovered output grew during readback".to_owned() });
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "recovered output grew during readback".to_owned(),
+        });
     }
     Ok(digest.finalize())
 }
@@ -445,7 +554,11 @@ pub struct ExportReport {
     pub repaired_in_place: bool,
 }
 
-async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) -> Result<ExportReport> {
+async fn recover_to_new_database(
+    vfs: &NativeVfs,
+    cx: &Cx,
+    options: &Options,
+) -> Result<ExportReport> {
     let source = vfs.full_pathname(cx, &options.source)?;
     let destination = vfs.full_pathname(cx, &options.destination)?;
     // Check reserved names before capture can create source lock/SHM files.
@@ -455,32 +568,52 @@ async fn recover_to_new_database(vfs: &NativeVfs, cx: &Cx, options: &Options) ->
         return Err(FrankenError::CannotOpen { path: destination });
     }
     refuse_destination_artifacts(vfs, cx, &destination)?;
-    let options = Options { source, destination, ..*options };
+    let options = Options {
+        source,
+        destination,
+        ..*options
+    };
     let snapshot = capture(vfs, cx, &options).await?;
     let decode_cx = cx.create_child_for_spawn();
     let limits = options.replay;
     let max_database_bytes = options.max_database_bytes;
-    let (image, wal_frames, repaired_frames, pages, certificate_anchors) = spawn_blocking(move || {
-        checkpoint(&decode_cx)?;
-        let mut database_file_id = [0; 16];
-        database_file_id.copy_from_slice(&snapshot.database[76..92]);
-        let replay = recover_wal_fec_image_with_certificates(
-            &snapshot.wal, &snapshot.sidecar, &snapshot.certificates, database_file_id, limits,
-        )?;
-        let image = replay.database_image(&snapshot.database, max_database_bytes)?;
-        checkpoint(&decode_cx)?;
-        let pages = image.len() / usize::try_from(replay.header().page_size).map_err(|_| FrankenError::TooBig)?;
-        Ok::<_, FrankenError>((image, replay.committed_frames(), replay.repaired_frame_nos().len(),
-            pages, replay.certificate_anchors().len()))
-    }).await?;
-    publication::publish(cx, publication::ExportImage {
-        destination: options.destination,
-        bytes: image,
-        pages,
-        wal_frames,
-        repaired_frames,
-        certificate_anchors,
-    }).await
+    let (image, wal_frames, repaired_frames, pages, certificate_anchors) =
+        spawn_blocking(move || {
+            checkpoint(&decode_cx)?;
+            let mut database_file_id = [0; 16];
+            database_file_id.copy_from_slice(&snapshot.database[76..92]);
+            let replay = recover_wal_fec_image_with_certificates(
+                &snapshot.wal,
+                &snapshot.sidecar,
+                &snapshot.certificates,
+                database_file_id,
+                limits,
+            )?;
+            let image = replay.database_image(&snapshot.database, max_database_bytes)?;
+            checkpoint(&decode_cx)?;
+            let pages = image.len()
+                / usize::try_from(replay.header().page_size).map_err(|_| FrankenError::TooBig)?;
+            Ok::<_, FrankenError>((
+                image,
+                replay.committed_frames(),
+                replay.repaired_frame_nos().len(),
+                pages,
+                replay.certificate_anchors().len(),
+            ))
+        })
+        .await?;
+    publication::publish(
+        cx,
+        publication::ExportImage {
+            destination: options.destination,
+            bytes: image,
+            pages,
+            wal_frames,
+            repaired_frames,
+            certificate_anchors,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

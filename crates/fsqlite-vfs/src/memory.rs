@@ -804,9 +804,11 @@ impl MemoryFile {
             .shared_holders
             .entry(self.shm_owner_id)
             .or_insert(0);
-        *holder_count = holder_count.checked_add(1).ok_or_else(|| FrankenError::LockFailed {
-            detail: format!("shared SHM lock reference count exhausted for slot {slot}"),
-        })?;
+        *holder_count = holder_count
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("shared SHM lock reference count exhausted for slot {slot}"),
+            })?;
         Ok(())
     }
 
@@ -1544,16 +1546,35 @@ mod tests {
         let (writer, _) = vfs.open(&cx, Some(path), flags).unwrap();
         writer.write(&cx, b"original", 0).unwrap();
         let (mut reader, actual) = vfs
-            .open(&cx, Some(path), VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB)
+            .open(
+                &cx,
+                Some(path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
             .unwrap();
         assert!(actual.contains(VfsOpenFlags::READONLY));
         assert!(!actual.contains(VfsOpenFlags::READWRITE));
-        assert_eq!(reader.file_identity().unwrap(), writer.file_identity().unwrap());
+        assert_eq!(
+            reader.file_identity().unwrap(),
+            writer.file_identity().unwrap()
+        );
         let before = vfs.usage_snapshot().unwrap();
-        assert!(matches!(reader.write(&cx, b"bad", 0), Err(FrankenError::ReadOnly)));
-        assert!(matches!(reader.write(&cx, b"grow", 100_000), Err(FrankenError::ReadOnly)));
-        assert!(matches!(reader.write(&cx, b"", 0), Err(FrankenError::ReadOnly)));
-        assert!(matches!(reader.write_page_batch(&cx, &[]), Err(FrankenError::ReadOnly)));
+        assert!(matches!(
+            reader.write(&cx, b"bad", 0),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(matches!(
+            reader.write(&cx, b"grow", 100_000),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(matches!(
+            reader.write(&cx, b"", 0),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(matches!(
+            reader.write_page_batch(&cx, &[]),
+            Err(FrankenError::ReadOnly)
+        ));
         assert!(matches!(
             reader.write_page_batch(&cx, &[(0, b"bad")]),
             Err(FrankenError::ReadOnly)
@@ -1563,15 +1584,24 @@ mod tests {
             Err(FrankenError::ReadOnly)
         ));
         for size in [0, 4, 100_000] {
-            assert!(matches!(reader.truncate(&cx, size), Err(FrankenError::ReadOnly)));
+            assert!(matches!(
+                reader.truncate(&cx, size),
+                Err(FrankenError::ReadOnly)
+            ));
         }
 
         let completion = VfsWriteCompletion::new();
         let write = VfsFile::write_tracked(&reader, &cx, b"bad", 0, completion.clone());
         assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
-        assert!(matches!(crate::block_on_test_io(&cx, write), Err(FrankenError::ReadOnly)));
+        assert!(matches!(
+            crate::block_on_test_io(&cx, write),
+            Err(FrankenError::ReadOnly)
+        ));
         assert_eq!(completion.state(), VfsWriteCompletionState::Error);
-        assert!(!completion.complete_success(), "refusal cannot later become success");
+        assert!(
+            !completion.complete_success(),
+            "refusal cannot later become success"
+        );
         assert_eq!(vfs.usage_snapshot().unwrap(), before);
         let mut contents = [0; 8];
         assert_eq!(reader.read(&cx, &mut contents, 0).unwrap(), 8);
@@ -1595,13 +1625,22 @@ mod tests {
             (VfsOpenFlags::empty(), VfsOpenFlags::READONLY),
             (VfsOpenFlags::READWRITE, VfsOpenFlags::READWRITE),
             (VfsOpenFlags::CREATE, VfsOpenFlags::READWRITE),
-            (VfsOpenFlags::CREATE | VfsOpenFlags::READONLY, VfsOpenFlags::READWRITE),
-            (VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE, VfsOpenFlags::READWRITE),
+            (
+                VfsOpenFlags::CREATE | VfsOpenFlags::READONLY,
+                VfsOpenFlags::READWRITE,
+            ),
+            (
+                VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE,
+                VfsOpenFlags::READWRITE,
+            ),
         ] {
             let (file, actual) = vfs
                 .open(&cx, Some(path), flags | VfsOpenFlags::MAIN_DB)
                 .unwrap();
-            assert_eq!(actual & (VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE), expected);
+            assert_eq!(
+                actual & (VfsOpenFlags::READONLY | VfsOpenFlags::READWRITE),
+                expected
+            );
             assert!(actual.contains(VfsOpenFlags::MAIN_DB));
             assert_eq!(file.file_identity().unwrap(), seed.file_identity().unwrap());
             let result = file.write(&cx, b"x", 0);
@@ -1627,17 +1666,24 @@ mod tests {
         let (owner, _) = vfs.open(&cx, Some(path), VfsOpenFlags::CREATE).unwrap();
         owner.write(&cx, b"keep", 0).unwrap();
         let identity = owner.file_identity().unwrap().unwrap();
-        let (reader, actual) = vfs.open_with_expected_identity(
-            &cx,
-            path,
-            VfsOpenFlags::READONLY | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE,
-            identity,
-        ).unwrap();
+        let (reader, actual) = vfs
+            .open_with_expected_identity(
+                &cx,
+                path,
+                VfsOpenFlags::READONLY | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE,
+                identity,
+            )
+            .unwrap();
         assert!(actual.contains(VfsOpenFlags::READONLY));
-        assert!(!actual.intersects(
-            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE
+        assert!(
+            !actual.intersects(
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE
+            )
+        );
+        assert!(matches!(
+            reader.write(&cx, b"bad!", 0),
+            Err(FrankenError::ReadOnly)
         ));
-        assert!(matches!(reader.write(&cx, b"bad!", 0), Err(FrankenError::ReadOnly)));
         let mut contents = [0; 4];
         owner.read(&cx, &mut contents, 0).unwrap();
         assert_eq!(&contents, b"keep");
@@ -1647,7 +1693,8 @@ mod tests {
     fn anonymous_scratch_open_reports_writable_access_and_cleans_up() {
         let cx = Cx::new();
         let vfs = make_vfs();
-        let (file, actual) = vfs.open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::READONLY)
+        let (file, actual) = vfs
+            .open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::READONLY)
             .unwrap();
         assert!(actual.contains(VfsOpenFlags::READWRITE));
         assert!(!actual.contains(VfsOpenFlags::READONLY));
@@ -1668,7 +1715,9 @@ mod tests {
         });
         let path = Path::new("exclusive.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (owner, _) = vfs.open(&cx, Some(path), flags | VfsOpenFlags::EXCLUSIVE).unwrap();
+        let (owner, _) = vfs
+            .open(&cx, Some(path), flags | VfsOpenFlags::EXCLUSIVE)
+            .unwrap();
         owner.write(&cx, b"owned", 0).unwrap();
         let identity = owner.file_identity().unwrap();
         let before = vfs.usage_snapshot().unwrap();
@@ -1677,7 +1726,9 @@ mod tests {
             Some(path),
             flags | VfsOpenFlags::EXCLUSIVE | VfsOpenFlags::DELETEONCLOSE,
         );
-        assert!(matches!(refused, Err(FrankenError::CannotOpen { path: failed }) if failed == path));
+        assert!(
+            matches!(refused, Err(FrankenError::CannotOpen { path: failed }) if failed == path)
+        );
         assert_eq!(vfs.usage_snapshot().unwrap(), before);
         assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
         let mut contents = [0; 5];
@@ -1708,8 +1759,10 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let cx = Cx::new();
-                    let flags = VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE
-                        | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+                    let flags = VfsOpenFlags::CREATE
+                        | VfsOpenFlags::EXCLUSIVE
+                        | VfsOpenFlags::READWRITE
+                        | VfsOpenFlags::MAIN_DB;
                     barrier.wait();
                     match vfs.open(&cx, Some(Path::new("contended.db")), flags) {
                         Ok((_file, _)) => 1,
@@ -1719,7 +1772,10 @@ mod tests {
                 })
             })
             .collect();
-        let winners: usize = handles.into_iter().map(|handle| handle.join().unwrap()).sum();
+        let winners: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum();
         assert_eq!(winners, 1);
         assert_eq!(vfs.usage_snapshot().unwrap().file_count, 1);
     }
@@ -1741,13 +1797,26 @@ mod tests {
                 .open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::READWRITE)
                 .unwrap();
             let (second, _) = vfs
-                .open(&cx, None, VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE)
+                .open(
+                    &cx,
+                    None,
+                    VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
+                )
                 .unwrap();
             assert!(actual.contains(VfsOpenFlags::READWRITE));
-            assert_ne!(first.file_identity().unwrap(), second.file_identity().unwrap());
+            assert_ne!(
+                first.file_identity().unwrap(),
+                second.file_identity().unwrap()
+            );
             for owner in &owners {
-                assert_ne!(first.file_identity().unwrap(), owner.file_identity().unwrap());
-                assert_ne!(second.file_identity().unwrap(), owner.file_identity().unwrap());
+                assert_ne!(
+                    first.file_identity().unwrap(),
+                    owner.file_identity().unwrap()
+                );
+                assert_ne!(
+                    second.file_identity().unwrap(),
+                    owner.file_identity().unwrap()
+                );
             }
             let first_path = first.path.clone();
             let second_path = second.path.clone();
@@ -1789,7 +1858,10 @@ mod tests {
         assert_eq!(vfs.inner.lock().unwrap().next_temp_id, u64::MAX);
         assert_eq!(vfs.usage_snapshot().unwrap(), before);
         let (peer, _) = vfs.open(&cx, Some(Path::new("__temp_0__")), flags).unwrap();
-        assert_eq!(peer.file_identity().unwrap(), owner.file_identity().unwrap());
+        assert_eq!(
+            peer.file_identity().unwrap(),
+            owner.file_identity().unwrap()
+        );
         let mut contents = [0; 4];
         peer.read(&cx, &mut contents, 0).unwrap();
         assert_eq!(&contents, b"keep");
@@ -1813,16 +1885,25 @@ mod tests {
                 let blocked = first + 2;
                 owner.shm_lock(&cx, owned, 1, lock).unwrap();
                 blocker.shm_lock(&cx, blocked, 1, lock).unwrap();
-                assert!(matches!(owner.shm_lock(&cx, first, 3, lock), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    owner.shm_lock(&cx, first, 3, lock),
+                    Err(FrankenError::Busy)
+                ));
                 for mode in [SQLITE_SHM_SHARED, SQLITE_SHM_EXCLUSIVE] {
-                    assert!(matches!(
-                        observer.shm_lock(&cx, owned, 1, SQLITE_SHM_LOCK | mode),
-                        Err(FrankenError::Busy)
-                    ), "pre-existing slot {owned} must remain excluded");
+                    assert!(
+                        matches!(
+                            observer.shm_lock(&cx, owned, 1, SQLITE_SHM_LOCK | mode),
+                            Err(FrankenError::Busy)
+                        ),
+                        "pre-existing slot {owned} must remain excluded"
+                    );
                 }
                 observer.shm_lock(&cx, fresh, 1, lock).unwrap();
                 observer.shm_lock(&cx, fresh, 1, unlock).unwrap();
-                assert!(matches!(observer.shm_lock(&cx, blocked, 1, lock), Err(FrankenError::Busy)));
+                assert!(matches!(
+                    observer.shm_lock(&cx, blocked, 1, lock),
+                    Err(FrankenError::Busy)
+                ));
                 owner.shm_lock(&cx, owned, 1, unlock).unwrap();
                 observer.shm_lock(&cx, owned, 1, lock).unwrap();
                 observer.shm_lock(&cx, owned, 1, unlock).unwrap();
@@ -1848,12 +1929,18 @@ mod tests {
         owner.shm_lock(&cx, 0, 1, shared).unwrap();
         owner.shm_lock(&cx, 0, 1, exclusive).unwrap();
         blocker.shm_lock(&cx, 2, 1, exclusive).unwrap();
-        assert!(matches!(owner.shm_lock(&cx, 0, 3, shared), Err(FrankenError::Busy)));
+        assert!(matches!(
+            owner.shm_lock(&cx, 0, 3, shared),
+            Err(FrankenError::Busy)
+        ));
         observer.shm_lock(&cx, 1, 1, exclusive).unwrap();
         observer.shm_lock(&cx, 1, 1, unexclude).unwrap();
         owner.shm_lock(&cx, 0, 1, unexclude).unwrap();
         for _ in 0..2 {
-            assert!(matches!(observer.shm_lock(&cx, 0, 1, exclusive), Err(FrankenError::Busy)));
+            assert!(matches!(
+                observer.shm_lock(&cx, 0, 1, exclusive),
+                Err(FrankenError::Busy)
+            ));
             owner.shm_lock(&cx, 0, 1, unshare).unwrap();
         }
         observer.shm_lock(&cx, 0, 1, exclusive).unwrap();
@@ -1878,11 +1965,20 @@ mod tests {
         owner.shm_lock(&cx, 0, 1, shared).unwrap();
         owner.shm_lock(&cx, 1, 1, exclusive).unwrap();
         blocker.shm_lock(&cx, 2, 1, shared).unwrap();
-        assert!(matches!(owner.shm_lock(&cx, 0, 3, exclusive), Err(FrankenError::Busy)));
+        assert!(matches!(
+            owner.shm_lock(&cx, 0, 3, exclusive),
+            Err(FrankenError::Busy)
+        ));
         observer.shm_lock(&cx, 0, 1, shared).unwrap();
         observer.shm_lock(&cx, 0, 1, unshare).unwrap();
-        assert!(matches!(observer.shm_lock(&cx, 0, 1, exclusive), Err(FrankenError::Busy)));
-        assert!(matches!(observer.shm_lock(&cx, 1, 1, shared), Err(FrankenError::Busy)));
+        assert!(matches!(
+            observer.shm_lock(&cx, 0, 1, exclusive),
+            Err(FrankenError::Busy)
+        ));
+        assert!(matches!(
+            observer.shm_lock(&cx, 1, 1, shared),
+            Err(FrankenError::Busy)
+        ));
         for _ in 0..2 {
             owner.shm_lock(&cx, 0, 1, unshare).unwrap();
         }
@@ -1906,13 +2002,22 @@ mod tests {
         owner.shm_lock(&cx, 0, 1, lock).unwrap();
         blocker.shm_lock(&cx, 2, 1, lock).unwrap();
         for _ in 0..3 {
-            assert!(matches!(owner.shm_lock(&cx, 0, 3, lock), Err(FrankenError::Busy)));
-            assert!(matches!(observer.shm_lock(&cx, 0, 1, lock), Err(FrankenError::Busy)));
+            assert!(matches!(
+                owner.shm_lock(&cx, 0, 3, lock),
+                Err(FrankenError::Busy)
+            ));
+            assert!(matches!(
+                observer.shm_lock(&cx, 0, 1, lock),
+                Err(FrankenError::Busy)
+            ));
         }
         blocker.shm_lock(&cx, 2, 1, unlock).unwrap();
         owner.shm_lock(&cx, 0, 3, lock).unwrap();
         for slot in 0..3 {
-            assert!(matches!(observer.shm_lock(&cx, slot, 1, lock), Err(FrankenError::Busy)));
+            assert!(matches!(
+                observer.shm_lock(&cx, slot, 1, lock),
+                Err(FrankenError::Busy)
+            ));
         }
         owner.shm_lock(&cx, 0, 3, unlock).unwrap();
         observer.shm_lock(&cx, 0, 3, lock).unwrap();
@@ -1932,20 +2037,43 @@ mod tests {
         owner.shm_lock(&cx, 2, 1, shared).unwrap();
         {
             let mut info = owner.shm_info.as_ref().unwrap().lock().unwrap();
-            info.slots[2].shared_holders.insert(owner.shm_owner_id, u32::MAX);
+            info.slots[2]
+                .shared_holders
+                .insert(owner.shm_owner_id, u32::MAX);
         }
-        assert!(matches!(owner.shm_lock(&cx, 0, 3, shared), Err(FrankenError::LockFailed { .. })));
+        assert!(matches!(
+            owner.shm_lock(&cx, 0, 3, shared),
+            Err(FrankenError::LockFailed { .. })
+        ));
         {
             let info = owner.shm_info.as_ref().unwrap().lock().unwrap();
-            assert_eq!(info.slots[0].shared_holders.get(&owner.shm_owner_id), Some(&1));
-            assert!(!info.slots[1].shared_holders.contains_key(&owner.shm_owner_id));
-            assert_eq!(info.slots[2].shared_holders.get(&owner.shm_owner_id), Some(&u32::MAX));
+            assert_eq!(
+                info.slots[0].shared_holders.get(&owner.shm_owner_id),
+                Some(&1)
+            );
+            assert!(
+                !info.slots[1]
+                    .shared_holders
+                    .contains_key(&owner.shm_owner_id)
+            );
+            assert_eq!(
+                info.slots[2].shared_holders.get(&owner.shm_owner_id),
+                Some(&u32::MAX)
+            );
         }
-        observer.shm_lock(&cx, 1, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
-        observer.shm_lock(&cx, 1, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
+        observer
+            .shm_lock(&cx, 1, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        observer
+            .shm_lock(&cx, 1, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
         drop(owner);
-        observer.shm_lock(&cx, 0, 3, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
-        observer.shm_lock(&cx, 0, 3, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE).unwrap();
+        observer
+            .shm_lock(&cx, 0, 3, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        observer
+            .shm_lock(&cx, 0, 3, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
     }
 
     #[test]
@@ -1958,11 +2086,8 @@ mod tests {
                     growth_chunk_bytes: 1,
                     max_bytes: Some(128),
                 });
-                let flags =
-                    VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-                let (mut file, _) = vfs
-                    .open(&cx, Some(Path::new("growth.db")), flags)
-                    .unwrap();
+                let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+                let (mut file, _) = vfs.open(&cx, Some(Path::new("growth.db")), flags).unwrap();
                 if truncated {
                     file.write(&cx, &[0x11; 64], 0).unwrap();
                     file.truncate(&cx, 32).unwrap();
@@ -2016,9 +2141,7 @@ mod tests {
                 max_bytes: Some(192),
             });
             let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-            let (file, _) = vfs
-                .open(&cx, Some(Path::new("sparse.db")), flags)
-                .unwrap();
+            let (file, _) = vfs.open(&cx, Some(Path::new("sparse.db")), flags).unwrap();
             let (peer, _) = vfs.open(&cx, Some(Path::new("peer.db")), flags).unwrap();
             file.write(&cx, &[0x11; 32], 0).unwrap();
             peer.write(&cx, b"peer", 0).unwrap();
@@ -2053,9 +2176,7 @@ mod tests {
                 max_bytes: Some(127),
             });
             let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-            let (file, _) = vfs
-                .open(&cx, Some(Path::new("limited.db")), flags)
-                .unwrap();
+            let (file, _) = vfs.open(&cx, Some(Path::new("limited.db")), flags).unwrap();
             file.write(&cx, &[0x11; 32], 0).unwrap();
             let before = vfs.usage_snapshot().unwrap();
             let result = if batch {
