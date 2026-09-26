@@ -476,6 +476,64 @@ impl ShmRegion {
         }
     }
 
+    /// Copy native-endian `u32` words while holding the local backing mutex once.
+    ///
+    /// Mmap words are still loaded individually with `AtomicU32`; independent
+    /// mappings may change between words, so this is not an atomic snapshot.
+    /// No shared byte slice is formed over the mmap storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] before changing `output` if the
+    /// offset or output length is not a multiple of four, or the whole range
+    /// exceeds either the visible or backing length. Empty aligned ranges are
+    /// allowed, including at the end of the region.
+    ///
+    /// # Panics
+    ///
+    /// Nonempty mmap copies panic for `Release` or `AcqRel` ordering.
+    pub fn atomic_copy_u32_ne(
+        &self,
+        offset: usize,
+        output: &mut [u8],
+        ordering: Ordering,
+    ) -> Result<()> {
+        if !offset.is_multiple_of(4) || !output.len().is_multiple_of(4) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u32 copy".to_owned(),
+                value: format!("unaligned offset={offset} length={}", output.len()),
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range =
+                    self.checked_range(offset, output.len(), guard.len(), "SHM atomic u32 copy")?;
+                output.copy_from_slice(&guard[range]);
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_range(offset, output.len(), m.len, "SHM atomic u32 copy")?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (index, bytes) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    // SAFETY: The whole aligned range was checked before the
+                    // loop. The mapping and its local exclusion lock remain
+                    // live, and each reference is used only for one word load.
+                    let value = unsafe { atomic_u32_at(m, offset + index * 4) }.load(ordering);
+                    *bytes = value.to_ne_bytes();
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically store a native-endian `u32` at the given byte offset.
     ///
     /// Uses the same backing and access protocol as [`Self::atomic_load_u32_ne`].
@@ -556,6 +614,62 @@ impl ShmRegion {
                 Ok(unsafe { atomic_u16_at(m, offset) }.load(ordering))
             }
         }
+    }
+
+    /// Copy native-endian `u16` words while holding the local backing mutex once.
+    ///
+    /// Mmap words retain individual `AtomicU16` loads and the same fixed-width
+    /// protocol as [`Self::atomic_load_u16_ne`]. This is not an atomic snapshot
+    /// across words or independent mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] before changing `output` if the
+    /// offset or output length is not even, or the whole range exceeds either
+    /// the visible or backing length. Empty aligned ranges are allowed.
+    ///
+    /// # Panics
+    ///
+    /// Nonempty mmap copies panic for `Release` or `AcqRel` ordering.
+    pub fn atomic_copy_u16_ne(
+        &self,
+        offset: usize,
+        output: &mut [u8],
+        ordering: Ordering,
+    ) -> Result<()> {
+        if !offset.is_multiple_of(2) || !output.len().is_multiple_of(2) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u16 copy".to_owned(),
+                value: format!("unaligned offset={offset} length={}", output.len()),
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = ordering;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range =
+                    self.checked_range(offset, output.len(), guard.len(), "SHM atomic u16 copy")?;
+                output.copy_from_slice(&guard[range]);
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_range(offset, output.len(), m.len, "SHM atomic u16 copy")?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (index, bytes) in output.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    // SAFETY: The complete aligned range and both lengths were
+                    // checked; the mapping and backing mutex span every load.
+                    let value = unsafe { atomic_u16_at(m, offset + index * 2) }.load(ordering);
+                    *bytes = value.to_ne_bytes();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Atomically store a native-endian `u16` at the given byte offset.
@@ -1124,6 +1238,108 @@ mod tests {
         assert!(empty.atomic_store_u16_ne(0, 0, Ordering::Relaxed).is_err());
     }
 
+    fn assert_atomic_copy_words_and_bounds(region: &ShmRegion) {
+        let shared = region.share();
+        let mut expected_words = [0_u8; 8];
+        for (index, value) in [0x1234_5678_u32, u32::MAX].into_iter().enumerate() {
+            shared
+                .atomic_store_u32_ne(index * 4, value, Ordering::Release)
+                .unwrap();
+            expected_words[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut expected_slots = [0_u8; 8];
+        for (index, value) in [0x1234_u16, 0, u16::MAX, 0xABCD].into_iter().enumerate() {
+            shared
+                .atomic_store_u16_ne(8 + index * 2, value, Ordering::Release)
+                .unwrap();
+            expected_slots[index * 2..index * 2 + 2].copy_from_slice(&value.to_ne_bytes());
+        }
+        let mut copied = [0_u8; 8];
+        region
+            .atomic_copy_u32_ne(0, &mut copied, Ordering::Acquire)
+            .unwrap();
+        assert_eq!(copied, expected_words);
+        region
+            .atomic_copy_u16_ne(8, &mut copied, Ordering::Acquire)
+            .unwrap();
+        assert_eq!(copied, expected_slots);
+
+        for (offset, length) in [(1, 4), (0, 3), (region.len() - 4, 8), (usize::MAX - 3, 8)] {
+            let mut output = [0xA5; 8];
+            assert!(matches!(
+                region.atomic_copy_u32_ne(offset, &mut output[..length], Ordering::Acquire),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert_eq!(
+                output, [0xA5; 8],
+                "invalid copy must not partially fill output"
+            );
+        }
+        for (offset, length) in [(1, 2), (0, 3), (region.len() - 2, 4), (usize::MAX - 1, 4)] {
+            let mut output = [0xA5; 8];
+            assert!(matches!(
+                region.atomic_copy_u16_ne(offset, &mut output[..length], Ordering::Acquire),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+            assert_eq!(
+                output, [0xA5; 8],
+                "invalid copy must not partially fill output"
+            );
+        }
+        region
+            .atomic_copy_u32_ne(region.len(), &mut [], Ordering::Acquire)
+            .unwrap();
+        region
+            .atomic_copy_u16_ne(region.len(), &mut [], Ordering::Acquire)
+            .unwrap();
+        assert!(
+            region
+                .atomic_copy_u32_ne(usize::MAX - 3, &mut [], Ordering::Acquire)
+                .is_err()
+        );
+        assert!(
+            region
+                .atomic_copy_u16_ne(usize::MAX - 1, &mut [], Ordering::Acquire)
+                .is_err()
+        );
+        region
+            .atomic_copy_u32_ne(0, &mut copied, Ordering::Acquire)
+            .unwrap();
+        assert_eq!(
+            copied, expected_words,
+            "copies must not change shared words"
+        );
+        region
+            .atomic_copy_u16_ne(8, &mut copied, Ordering::Acquire)
+            .unwrap();
+        assert_eq!(
+            copied, expected_slots,
+            "copies must not change shared slots"
+        );
+    }
+
+    #[test]
+    fn test_shm_region_atomic_copy_words_and_bounds() {
+        assert_atomic_copy_words_and_bounds(&ShmRegion::new(16));
+        let empty = ShmRegion::new(0);
+        empty
+            .atomic_copy_u32_ne(0, &mut [], Ordering::Acquire)
+            .unwrap();
+        empty
+            .atomic_copy_u16_ne(0, &mut [], Ordering::Acquire)
+            .unwrap();
+        assert!(
+            empty
+                .atomic_copy_u32_ne(0, &mut [0; 4], Ordering::Acquire)
+                .is_err()
+        );
+        assert!(
+            empty
+                .atomic_copy_u16_ne(0, &mut [0; 2], Ordering::Acquire)
+                .is_err()
+        );
+    }
+
     #[test]
     fn test_shm_region_atomic_native_shared_resize_bounds() {
         let mut region = ShmRegion::new(4);
@@ -1136,12 +1352,41 @@ mod tests {
         assert!(shared.atomic_store_u32_ne(4, 0, Ordering::SeqCst).is_err());
         assert!(shared.atomic_load_u16_ne(4, Ordering::SeqCst).is_err());
         assert!(shared.atomic_store_u16_ne(4, 0, Ordering::SeqCst).is_err());
+        let mut copied = [0xA5; 8];
+        assert!(
+            shared
+                .atomic_copy_u32_ne(0, &mut copied, Ordering::Acquire)
+                .is_err()
+        );
+        assert!(
+            shared
+                .atomic_copy_u16_ne(0, &mut copied, Ordering::Acquire)
+                .is_err()
+        );
+        assert_eq!(
+            copied, [0xA5; 8],
+            "a shared view cannot read newly grown bytes"
+        );
 
         region.try_resize_heap(2).unwrap();
         assert!(shared.atomic_load_u32_ne(0, Ordering::SeqCst).is_err());
         assert!(shared.atomic_store_u32_ne(0, 0, Ordering::SeqCst).is_err());
         assert!(shared.atomic_load_u16_ne(2, Ordering::SeqCst).is_err());
         assert!(shared.atomic_store_u16_ne(2, 0, Ordering::SeqCst).is_err());
+        assert!(
+            shared
+                .atomic_copy_u32_ne(0, &mut copied[..4], Ordering::Acquire)
+                .is_err()
+        );
+        assert!(
+            shared
+                .atomic_copy_u16_ne(0, &mut copied[..4], Ordering::Acquire)
+                .is_err()
+        );
+        assert_eq!(
+            copied, [0xA5; 8],
+            "a shared view cannot read truncated backing bytes"
+        );
         shared
             .atomic_store_u16_ne(0, u16::MAX, Ordering::Release)
             .unwrap();
@@ -1194,6 +1439,7 @@ mod tests {
         let (mut file, _) = UnixVfs::new().open(&cx, Some(&path), flags).unwrap();
         let region = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
         assert!(region.is_mmap_backed());
+        assert_atomic_copy_words_and_bounds(&region);
         let shared = region.share();
         let cloned = region.clone();
         let end = region.len();
