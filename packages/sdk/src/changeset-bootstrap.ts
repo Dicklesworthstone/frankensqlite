@@ -502,7 +502,7 @@ async function state(
     tx,
     b,
     `SELECT id, CASE WHEN length(CAST(manifest AS BLOB))<=131072 THEN manifest END, received, bytes, changes, ` +
-      `CASE WHEN length(chain)=64 THEN chain END, installed FROM ${STATE} LIMIT 2`,
+      `CASE WHEN typeof(chain)='text' AND length(CAST(chain AS BLOB))<=128 AND length(chain)=64 AND instr(chain,char(0))=0 THEN chain END, installed FROM ${STATE} LIMIT 2`,
   );
   if (!rows.length) {
     if ((await query(tx, b, `SELECT 1 FROM ${CHUNKS} LIMIT 1`)).length)
@@ -533,7 +533,7 @@ async function chunkMeta(tx: ChangesetExecutor, b: Budget, index: number) {
   const rows = await query(
     tx,
     b,
-    `SELECT CASE WHEN length(sha256)=64 THEN sha256 END, byte_length, change_count, typeof(payload), length(payload) FROM ${CHUNKS} WHERE idx=?`,
+    `SELECT CASE WHEN typeof(sha256)='text' AND length(CAST(sha256 AS BLOB))<=128 AND length(sha256)=64 AND instr(sha256,char(0))=0 THEN sha256 END, byte_length, change_count, typeof(payload), length(payload) FROM ${CHUNKS} WHERE idx=?`,
     [BigInt(index)],
   );
   if (rows.length !== 1 || rows[0]!.length !== 5 || rows[0]![3] !== "blob")
@@ -791,7 +791,7 @@ export class ChangesetBootstrapReceiver {
         if (s === null || s.receivedChunks !== m.chunks)
           fail("STATE", "The complete bootstrap must be staged before installation");
         if (s.installed) {
-          await this.#orderPrefix(tx, b, m, true);
+          await this.#verifyPrefix(tx, b, m, true);
           return true;
         }
         await emptyTargets(tx, b, m);
@@ -839,7 +839,7 @@ export class ChangesetBootstrapReceiver {
         }
         if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
           fail("CORRUPT", "Staged bootstrap digest/totals mismatch");
-        await this.#orderPrefix(tx, b, m, false);
+        await this.#verifyPrefix(tx, b, m, false);
         await write(tx, b, `UPDATE OR ABORT ${CHUNKS} SET payload=X''`, [], m.chunks);
         await write(
           tx,
@@ -884,21 +884,14 @@ export class ChangesetBootstrapReceiver {
     });
   }
 
-  /** Verify retained chunk metadata even after bodies have been reclaimed. */
-  async #orderPrefix(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest, replayed: boolean): Promise<void> {
-    if (this.#orderedSourceId === undefined) return;
+  /** Verify complete retained evidence, including unordered installed replays. */
+  async #verifyPrefix(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest, replayed: boolean): Promise<void> {
     const population = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
     if (population.length !== 1 || population[0]!.length !== 1 ||
         sqlNumber(population[0]![0], m.chunks) !== m.chunks)
       fail("CORRUPT", "Bootstrap order prefix has missing or extra chunks");
     let chain = await seed(m), bytes = 0, changes = 0;
-    await bootstrapOrderPrefix(tx, {
-      receiverId: this.#id,
-      sourceId: this.#orderedSourceId,
-      deliveryId: m.deliveryId,
-      chunks: m.chunks,
-      replayed,
-    }, async index => {
+    const readChunk = async (index: number) => {
       const meta = await chunkMeta(tx, b, index);
       if (meta.storedBytes !== (replayed ? 0 : meta.byteLength) || meta.byteLength > this.#chunkBytes)
         fail("CORRUPT", "Bootstrap order prefix has invalid payload metadata");
@@ -908,10 +901,24 @@ export class ChangesetBootstrapReceiver {
       if (bytes > m.byteLength || changes > m.changes)
         fail("CORRUPT", "Bootstrap order prefix exceeds manifest totals");
       return meta;
-    }, () => b.check());
+    };
+    if (this.#orderedSourceId === undefined) {
+      // An installed flag is not sufficient evidence to acknowledge and reclaim
+      // the source seed. Unordered receivers retain the same complete manifest
+      // and chunk identities, even though they have no optional order ledger.
+      for (let index = 0; index < m.chunks; index++) await readChunk(index);
+    } else {
+      await bootstrapOrderPrefix(tx, {
+        receiverId: this.#id,
+        sourceId: this.#orderedSourceId,
+        deliveryId: m.deliveryId,
+        chunks: m.chunks,
+        replayed,
+      }, readChunk, () => b.check());
+    }
     b.check();
     if (chain !== m.sha256 || bytes !== m.byteLength || changes !== m.changes)
-      fail("CORRUPT", "Bootstrap order prefix failed manifest verification");
+      fail("CORRUPT", "Bootstrap prefix failed manifest verification");
   }
 }
 
