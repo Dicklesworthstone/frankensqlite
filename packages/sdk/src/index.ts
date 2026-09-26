@@ -286,3 +286,8 @@ export type {
   BootstrapTransferResult,
   BootstrapTransferPhase,
 } from "./changeset-bootstrap-transfer";
+export {
+  createBootstrapHttpTransport, BootstrapHttpError, BOOTSTRAP_HTTP_PROTOCOL,
+  BOOTSTRAP_HTTP_CONTENT_TYPE, BOOTSTRAP_HTTP_RESPONSE_TYPE, BOOTSTRAP_HTTP_ACTION_HEADER,
+} from "./changeset-bootstrap-http";
+export type { BootstrapHttpAction, BootstrapHttpRequestInfo, BootstrapHttpTransportOptions } from "./changeset-bootstrap-http";
