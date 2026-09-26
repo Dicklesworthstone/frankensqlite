@@ -29370,10 +29370,15 @@ impl ResolvedComparisonInfo {
         let right_resolved = resolve_column_ref(right, scan.table, scan.table_alias);
         let collation_p4 = extract_collation(left)
             .or_else(|| extract_collation(right))
-            .or_else(|| bound_outer_declared_collation(left))
-            .or_else(|| resolved_primary_collation(left_resolved.as_ref(), scan.table))
-            .or_else(|| bound_outer_declared_collation(right))
-            .or_else(|| resolved_primary_collation(right_resolved.as_ref(), scan.table))
+            .or_else(|| {
+                // A declared BINARY winner is the default comparison: keep
+                // P4 empty so the hot path skips the registry lookup.
+                bound_outer_declared_collation(left)
+                    .or_else(|| resolved_primary_collation(left_resolved.as_ref(), scan.table))
+                    .or_else(|| bound_outer_declared_collation(right))
+                    .or_else(|| resolved_primary_collation(right_resolved.as_ref(), scan.table))
+                    .filter(|coll| !coll.eq_ignore_ascii_case("BINARY"))
+            })
             .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
         let cmp_p5 = 0x80
             | comparison_affinity_p5_resolved(
@@ -29396,9 +29401,20 @@ fn resolved_primary_collation<'a>(
     resolved: Option<&SortKeySource>,
     table: &'a TableSchema,
 ) -> Option<&'a str> {
+    // A resolved column with no COLLATE clause still defines BINARY and stops
+    // SQLite's precedence search: `inner.t = outer.w` compares BINARY even
+    // when the bound outer column is NOCASE (GH#428).
     match resolved {
-        Some(SortKeySource::Column(idx)) => table.columns.get(*idx)?.collation.as_deref(),
-        Some(SortKeySource::Rowid | SortKeySource::Expression(_)) | None => None,
+        Some(SortKeySource::Column(idx)) => Some(
+            table
+                .columns
+                .get(*idx)?
+                .collation
+                .as_deref()
+                .unwrap_or("BINARY"),
+        ),
+        Some(SortKeySource::Rowid) => Some("BINARY"),
+        Some(SortKeySource::Expression(_)) | None => None,
     }
 }
 
@@ -29435,6 +29451,44 @@ fn combine_comparison_affinity(l_aff: u8, r_aff: u8) -> u16 {
     0 // No affinity coercion needed
 }
 
+/// `combine_comparison_affinity` for operands whose declared-ness is known.
+///
+/// The affinity codes above use `A` both for a BLOB-affinity column (a column
+/// declared without a type) and for an expression with no affinity at all.
+/// SQLite (`sqlite3CompareAffinity`) distinguishes them: when BOTH operands
+/// carry an affinity and neither is numeric, the comparison uses BLOB affinity
+/// and converts nothing, so a TEXT column never coerces a typeless column's
+/// integer to text (GH#428: `k.t = oc.x` with `oc.x` = 1 and `k.t` = '1' is
+/// false). Only a side with no affinity lets the other side's TEXT apply.
+fn combine_declared_comparison_affinity(
+    l_aff: u8,
+    l_declared: bool,
+    r_aff: u8,
+    r_declared: bool,
+) -> u16 {
+    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
+    if l_declared && r_declared && !is_numeric(l_aff) && !is_numeric(r_aff) {
+        return 0;
+    }
+    combine_comparison_affinity(l_aff, r_aff)
+}
+
+/// Whether `expr` carries an affinity of its own (SQLite's
+/// `sqlite3ExprAffinity` above `SQLITE_AFF_NONE`): a column resolved in scope,
+/// a CAST, a bound outer column value, or a scalar subquery whose result column
+/// has a non-BLOB affinity. Literals and computed expressions carry none.
+fn expr_has_declared_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> bool {
+    match strip_collate_wrappers(expr) {
+        Expr::BoundOuterValue { affinity, .. } => affinity.is_some(),
+        Expr::Cast { .. } => true,
+        Expr::Column(col_ref, _) => ctx.is_some_and(|ctx| column_ref_resolves_in_ctx(col_ref, ctx)),
+        Expr::Subquery(select, _) => {
+            matches!(scalar_subquery_affinity_in_scan(select, ctx), Some(aff) if aff != b'A')
+        }
+        _ => false,
+    }
+}
+
 fn comparison_affinity_p5_resolved(
     left: &Expr,
     left_resolved: Option<&SortKeySource>,
@@ -29442,9 +29496,15 @@ fn comparison_affinity_p5_resolved(
     right_resolved: Option<&SortKeySource>,
     scan: &ScanCtx<'_>,
 ) -> u16 {
-    combine_comparison_affinity(
+    let declared = |expr: &Expr, resolved: Option<&SortKeySource>| match resolved {
+        Some(SortKeySource::Column(_) | SortKeySource::Rowid) => true,
+        Some(SortKeySource::Expression(_)) | None => expr_has_declared_affinity(expr, Some(scan)),
+    };
+    combine_declared_comparison_affinity(
         resolved_expr_affinity(left, left_resolved, scan),
+        declared(left, left_resolved),
         resolved_expr_affinity(right, right_resolved, scan),
+        declared(right, right_resolved),
     )
 }
 
@@ -36471,6 +36531,35 @@ fn emit_exists_subquery(
         }
     };
 
+    // `LIMIT 0` yields no row at all, whatever the subquery would match.
+    if subquery.limit.as_ref().is_some_and(|clause| {
+        matches!(clause.limit, Expr::Literal(Literal::Integer(0), _))
+    }) {
+        b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+        return;
+    }
+
+    // GH#427: an aggregate result list with no GROUP BY or HAVING yields
+    // exactly one row whether or not any source row matches, so the scan
+    // below (which only asks "does a source row match?") would answer wrongly.
+    if subquery.with.is_none()
+        && subquery.body.compounds.is_empty()
+        && single_group_aggregate_limit_is_output_neutral(subquery.limit.as_ref())
+        && matches!(
+            &subquery.body.select,
+            SelectCore::Select {
+                columns,
+                group_by,
+                having: None,
+                windows,
+                ..
+            } if group_by.is_empty() && windows.is_empty() && has_aggregate_columns(columns)
+        )
+    {
+        b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+        return;
+    }
+
     let from_clause = match from {
         Some(f) => f,
         None => {
@@ -37279,10 +37368,8 @@ fn emit_expr_with_fallback(
                 let comparison_collation =
                     fallback_comparison_collation(left, right, inner_ctx, outer_ctx)
                         .map_or(P4::None, P4::Collation);
-                let comparison_affinity = combine_comparison_affinity(
-                    fallback_expr_affinity(left, inner_ctx, outer_ctx),
-                    fallback_expr_affinity(right, inner_ctx, outer_ctx),
-                );
+                let comparison_affinity =
+                    fallback_comparison_affinity_p5(left, right, inner_ctx, outer_ctx);
                 b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
                 b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
                 b.emit_jump_to_label(
@@ -37314,10 +37401,8 @@ fn emit_expr_with_fallback(
                     let comparison_collation =
                         fallback_comparison_collation(left, right, inner_ctx, outer_ctx)
                             .map_or(P4::None, P4::Collation);
-                    let comparison_affinity = combine_comparison_affinity(
-                        fallback_expr_affinity(left, inner_ctx, outer_ctx),
-                        fallback_expr_affinity(right, inner_ctx, outer_ctx),
-                    );
+                    let comparison_affinity =
+                        fallback_comparison_affinity_p5(left, right, inner_ctx, outer_ctx);
                     b.emit_jump_to_label(
                         cmp_opcode,
                         r_right,
@@ -37379,14 +37464,9 @@ fn emit_expr_with_fallback(
                 .map_or(P4::None, P4::Collation);
             let high_collation = fallback_comparison_collation(operand, high, inner_ctx, outer_ctx)
                 .map_or(P4::None, P4::Collation);
-            let low_affinity = combine_comparison_affinity(
-                fallback_expr_affinity(operand, inner_ctx, outer_ctx),
-                fallback_expr_affinity(low, inner_ctx, outer_ctx),
-            );
-            let high_affinity = combine_comparison_affinity(
-                fallback_expr_affinity(operand, inner_ctx, outer_ctx),
-                fallback_expr_affinity(high, inner_ctx, outer_ctx),
-            );
+            let low_affinity = fallback_comparison_affinity_p5(operand, low, inner_ctx, outer_ctx);
+            let high_affinity =
+                fallback_comparison_affinity_p5(operand, high, inner_ctx, outer_ctx);
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
@@ -37988,22 +38068,31 @@ fn join_comparison_affinity_p5(
     right: &Expr,
     tables: &[(&TableSchema, Option<&str>)],
 ) -> u16 {
-    let left_affinity = join_expr_affinity(left, tables);
-    let right_affinity = join_expr_affinity(right, tables);
-    let is_numeric = |affinity: u8| matches!(affinity, b'C' | b'D' | b'E');
+    combine_declared_comparison_affinity(
+        join_expr_affinity(left, tables),
+        join_expr_has_declared_affinity(left, tables),
+        join_expr_affinity(right, tables),
+        join_expr_has_declared_affinity(right, tables),
+    )
+}
 
-    if is_numeric(left_affinity) && matches!(right_affinity, b'A' | b'B') {
-        return u16::from(b'C');
+/// `expr_has_declared_affinity` over a join's table list.
+fn join_expr_has_declared_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> bool {
+    match strip_collate_wrappers(expr) {
+        Expr::BoundOuterValue { affinity, .. } => affinity.is_some(),
+        Expr::Cast { .. } => true,
+        Expr::Column(col_ref, _) => tables.iter().any(|(table, alias)| {
+            col_ref
+                .table
+                .as_deref()
+                .is_none_or(|qualifier| matches_table_or_alias(qualifier, table, *alias))
+                && table_has_column_or_rowid(table, &col_ref.column)
+        }),
+        Expr::Subquery(select, _) => {
+            matches!(scalar_subquery_affinity_in_join(select, tables), Some(aff) if aff != b'A')
+        }
+        _ => false,
     }
-    if is_numeric(right_affinity) && matches!(left_affinity, b'A' | b'B') {
-        return u16::from(b'C');
-    }
-    if (left_affinity == b'B' && right_affinity == b'A')
-        || (left_affinity == b'A' && right_affinity == b'B')
-    {
-        return u16::from(b'B');
-    }
-    0
 }
 
 /// Extract explicit COLLATE from an ORDER BY term's expression.
@@ -39034,7 +39123,12 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
 /// Compute the comparison affinity P5 value for a binary comparison.
 /// Implements SQLite's Section 4.2 type conversion rules.
 fn comparison_affinity_p5(left: &Expr, right: &Expr, ctx: Option<&ScanCtx<'_>>) -> u16 {
-    combine_comparison_affinity(expr_affinity(left, ctx), expr_affinity(right, ctx))
+    combine_declared_comparison_affinity(
+        expr_affinity(left, ctx),
+        expr_has_declared_affinity(left, ctx),
+        expr_affinity(right, ctx),
+        expr_has_declared_affinity(right, ctx),
+    )
 }
 
 /// Affinity that SQLite applies to every element of a value-list / subquery
@@ -39066,6 +39160,41 @@ fn fallback_expr_affinity(expr: &Expr, inner: &ScanCtx<'_>, outer: Option<&ScanC
         // CAST has intrinsic affinity; every other computed expression has NONE.
         _ => expr_affinity(expr, Some(inner)),
     }
+}
+
+/// `expr_has_declared_affinity` in the correlated-subquery fallback path, where
+/// a column may resolve in the inner or the outer scope.
+fn fallback_expr_has_declared_affinity(
+    expr: &Expr,
+    inner: &ScanCtx<'_>,
+    outer: Option<&ScanCtx<'_>>,
+) -> bool {
+    match strip_collate_wrappers(expr) {
+        Expr::Column(col_ref, _) => {
+            column_ref_resolves_in_ctx(col_ref, inner)
+                || outer.is_some_and(|outer| column_ref_resolves_in_ctx(col_ref, outer))
+        }
+        Expr::Subquery(select, _) => matches!(
+            scalar_subquery_affinity_with_fallback(select, inner, outer),
+            Some(aff) if aff != b'A'
+        ),
+        _ => expr_has_declared_affinity(expr, Some(inner)),
+    }
+}
+
+/// Comparison `p5` affinity for the correlated-subquery fallback path.
+fn fallback_comparison_affinity_p5(
+    left: &Expr,
+    right: &Expr,
+    inner: &ScanCtx<'_>,
+    outer: Option<&ScanCtx<'_>>,
+) -> u16 {
+    combine_declared_comparison_affinity(
+        fallback_expr_affinity(left, inner, outer),
+        fallback_expr_has_declared_affinity(left, inner, outer),
+        fallback_expr_affinity(right, inner, outer),
+        fallback_expr_has_declared_affinity(right, inner, outer),
+    )
 }
 
 /// Convert a SQL type name to an affinity character code.

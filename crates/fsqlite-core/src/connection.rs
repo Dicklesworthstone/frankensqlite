@@ -82050,6 +82050,7 @@ impl Connection {
             replacement_exprs: Some(&replacements),
             column_collations: None,
             column_affinities: None,
+            declared_blob_columns: None,
             schema: &schema,
             shadowed_main_tables: Some(&shadowed_main_tables),
             temp_table_names: Some(&temp_table_names),
@@ -83706,7 +83707,24 @@ impl Connection {
         } else {
             return None;
         };
-        let mode = exists_probe_mode(inner_affinity, outer_affinity);
+        // GH#428: when both operands carry an affinity and neither is numeric,
+        // SQLite compares without conversion, so a TEXT column never coerces a
+        // typeless column's integer to text. The inner side is always a
+        // declared base-table column; the outer side counts as declared when it
+        // has a non-BLOB affinity or is a known typeless base column (a BLOB
+        // entry may otherwise stand for a computed column with no affinity,
+        // where the TEXT side's affinity does apply).
+        let outer_declared = outer_affinity != TypeAffinity::Blob
+            || context.declared_json_keys.contains(&probe.outer_index);
+        let mode = if outer_declared
+            && matches!(
+                (inner_affinity, outer_affinity),
+                (TypeAffinity::Text, TypeAffinity::Blob) | (TypeAffinity::Blob, TypeAffinity::Text)
+            ) {
+            ExistsProbeMode::Raw
+        } else {
+            exists_probe_mode(inner_affinity, outer_affinity)
+        };
 
         // Probe the MemDB table.
         let db = self.db.borrow();
@@ -84066,6 +84084,9 @@ impl Connection {
         let column_affinities = column_metadata
             .as_ref()
             .map(|context| context.column_affinities.as_slice());
+        let declared_blob_columns = column_metadata
+            .as_ref()
+            .map(|context| &context.declared_json_keys);
         let schema = self.schema.borrow();
         let shadowed_main_tables = self.shadowed_main_tables.borrow();
         let temp_table_names = self.temp_table_names.borrow();
@@ -84076,6 +84097,7 @@ impl Connection {
             using_skip,
             column_collations,
             column_affinities,
+            declared_blob_columns,
             &schema,
             Some(&shadowed_main_tables),
             Some(&temp_table_names),
@@ -84269,6 +84291,7 @@ impl Connection {
                         col_map,
                         None,
                     );
+                    strip_exists_subquery_projection(&mut sub_clone);
                     // GH#419: a plain single-table filter scans MemDB directly
                     // instead of compiling a fresh nested statement per row.
                     if let Some(scanned) = self.try_scan_correlated_exists_probe(&sub_clone) {
@@ -92734,9 +92757,15 @@ impl Connection {
             col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
         let using_column_projections =
             self.build_join_using_column_projections(select, &col_collations, &col_affinities);
+        let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
+        declared_blob_columns.extend(typeless_base_table_columns(
+            &all_sources,
+            &table_sources,
+            &schema_snapshot,
+        ));
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: self.builtin_json_key_columns(&all_sources, &col_map),
+                declared_json_keys: declared_blob_columns,
                 column_collations: col_collations,
                 column_affinities: col_affinities,
                 using_column_projections,
@@ -93691,8 +93720,10 @@ impl Connection {
                     span,
                 } => {
                     if !is_correlated_subquery_with_schema(subquery, &self.schema.borrow()) {
+                        let mut probe = (**subquery).clone();
+                        strip_exists_subquery_projection(&mut probe);
                         let rows = self
-                            .execute_statement(&Statement::Select((**subquery).clone()), params)
+                            .execute_statement(&Statement::Select(probe), params)
                             .await?;
                         let exists = !rows.is_empty();
                         let truth = if *not { !exists } else { exists };
@@ -94287,6 +94318,7 @@ impl Connection {
                         outer_col_map,
                         using_skip,
                     );
+                    strip_exists_subquery_projection(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -99357,6 +99389,42 @@ fn col_affinities_for_sources(
     affinities
 }
 
+/// Combined-row indices of base-table columns whose BLOB affinity is declared
+/// (a column declared without a type, or as BLOB), laid out exactly like
+/// [`col_affinities_for_sources`]. The join evaluator's affinity vector also
+/// uses BLOB for a derived source's computed column, which has NO affinity in
+/// SQLite; listing the genuinely declared ones lets a comparison against a
+/// TEXT column use SQLite's both-operands rule (no conversion) instead of
+/// coercing the typeless side to TEXT (GH#428).
+fn typeless_base_table_columns(
+    sources: &[&TableOrSubquery],
+    table_sources: &[JoinTableSource],
+    schemas: &[TableSchema],
+) -> HashSet<usize> {
+    let mut declared = HashSet::new();
+    let mut offset = 0usize;
+    for (source, table_source) in sources.iter().zip(table_sources) {
+        if let TableOrSubquery::Table { name, .. } = source
+            && let Some(schema) = schemas
+                .iter()
+                .find(|schema| schema.name.eq_ignore_ascii_case(&name.name))
+        {
+            for (index, column) in schema
+                .columns
+                .iter()
+                .enumerate()
+                .take(table_source.col_names.len())
+            {
+                if affinity_char_to_type(column.affinity) == TypeAffinity::Blob {
+                    declared.insert(offset + index);
+                }
+            }
+        }
+        offset += table_source.scan_width();
+    }
+    declared
+}
+
 fn table_or_subquery_result_affinities(
     source: &TableOrSubquery,
     schemas: &[TableSchema],
@@ -101392,6 +101460,45 @@ fn expr_has_nested_aggregate(expr: &Expr) -> bool {
 /// Whether a SELECT core is an aggregate query: explicit GROUP BY/HAVING, or an
 /// aggregate function in a result column. Used to detect recursive-CTE terms
 /// that SQLite rejects ("recursive aggregate queries not supported").
+/// GH#427: `EXISTS (subquery)` depends only on whether the subquery yields a
+/// row, and SQLite never evaluates its result list, so a result expression that
+/// would raise (`json('bad')`, an integer overflow) must not surface. Replace a
+/// plain (non-aggregate, non-window) projection with the constant `1` and drop
+/// the ORDER BY, neither of which changes how many rows the subquery yields.
+///
+/// Declines when that could change the row count or name resolution: compound
+/// selects, VALUES, aggregates/GROUP BY/HAVING (an aggregate always yields one
+/// row), window functions, result aliases (WHERE may reference them), and
+/// DISTINCT under a LIMIT (the distinct count then decides existence).
+fn strip_exists_subquery_projection(select: &mut SelectStatement) {
+    if !select.body.compounds.is_empty() {
+        return;
+    }
+    let SelectCore::Select {
+        columns, distinct, ..
+    } = &select.body.select
+    else {
+        return;
+    };
+    if (select.limit.is_some() && matches!(distinct, fsqlite_ast::Distinctness::Distinct))
+        || columns.iter().any(|column| match column {
+            ResultColumn::Expr { expr, alias } => alias.is_some() || expr_has_window_function(expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+        })
+        || select_core_is_aggregate(&select.body.select)
+    {
+        return;
+    }
+    let SelectCore::Select { columns, .. } = &mut select.body.select else {
+        return;
+    };
+    *columns = vec![ResultColumn::Expr {
+        expr: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
+        alias: None,
+    }];
+    select.order_by.clear();
+}
+
 fn select_core_is_aggregate(core: &SelectCore) -> bool {
     let SelectCore::Select {
         columns,
@@ -114324,6 +114431,7 @@ fn is_correlated_subquery_with_schema(subquery: &SelectStatement, schema: &[Tabl
         replacement_exprs: None,
         column_collations: None,
         column_affinities: None,
+        declared_blob_columns: None,
         schema,
         shadowed_main_tables: None,
         temp_table_names: None,
@@ -114453,6 +114561,7 @@ fn expr_has_external_column_ref_with_schema_in_core_and_locals(
         replacement_exprs: None,
         column_collations: None,
         column_affinities: None,
+        declared_blob_columns: None,
         schema,
         shadowed_main_tables: None,
         temp_table_names: None,
@@ -115689,6 +115798,11 @@ struct OuterReferenceLookup<'a> {
     /// slices absent and continue producing ordinary literals.
     column_collations: Option<&'a [Option<String>]>,
     column_affinities: Option<&'a [TypeAffinity]>,
+    /// Indices in `column_affinities` whose BLOB affinity is declared (a
+    /// typeless base-table column or a JSON key). Elsewhere a BLOB entry may
+    /// stand for a computed column with no affinity, so it binds as `None`
+    /// (GH#428). `None` keeps every BLOB entry as declared, the prior contract.
+    declared_blob_columns: Option<&'a HashSet<usize>>,
     schema: &'a [TableSchema],
     shadowed_main_tables: Option<&'a HashMap<String, TableSchema>>,
     temp_table_names: Option<&'a HashSet<String>>,
@@ -115901,7 +116015,13 @@ fn resolve_outer_column_expr(
     let affinity = lookup
         .column_affinities
         .and_then(|affinities| affinities.get(semantic_index))
-        .copied();
+        .copied()
+        .filter(|affinity| {
+            *affinity != TypeAffinity::Blob
+                || lookup
+                    .declared_blob_columns
+                    .is_none_or(|declared| declared.contains(&semantic_index))
+        });
     Some(Expr::BoundOuterValue {
         value,
         collation: declared_collation
@@ -116250,6 +116370,7 @@ fn substitute_outer_refs_in_select(
         using_skip,
         None,
         None,
+        None,
         schema,
         None,
         None,
@@ -116263,6 +116384,7 @@ fn substitute_outer_refs_in_select_with_schema_context(
     using_skip: Option<&HashSet<usize>>,
     column_collations: Option<&[Option<String>]>,
     column_affinities: Option<&[TypeAffinity]>,
+    declared_blob_columns: Option<&HashSet<usize>>,
     schema: &[TableSchema],
     shadowed_main_tables: Option<&HashMap<String, TableSchema>>,
     temp_table_names: Option<&HashSet<String>>,
@@ -116274,6 +116396,7 @@ fn substitute_outer_refs_in_select_with_schema_context(
         replacement_exprs: None,
         column_collations,
         column_affinities,
+        declared_blob_columns,
         schema,
         shadowed_main_tables,
         temp_table_names,
@@ -146239,7 +146362,9 @@ impl JoinUsingProjection {
 
 #[derive(Clone)]
 struct JoinEvalCollationContext {
-    /// Built-in JSON keys have declared BLOB affinity, unlike computed columns.
+    /// Columns with declared BLOB affinity, unlike computed columns (which the
+    /// affinity vector also reports as BLOB): built-in JSON keys and, on the
+    /// main join path, typeless base-table columns.
     declared_json_keys: HashSet<usize>,
     column_collations: Vec<Option<String>>,
     column_affinities: Vec<TypeAffinity>,
@@ -148713,10 +148838,19 @@ fn compare_join_expr_values(
                 // Other sources can contain computed columns whose lack of
                 // affinity is currently represented as BLOB in this context.
                 // Limit this correction to keys whose declaration we proved.
-                if context.declared_json_keys.is_empty()
-                    || (!is_declared_json_key(left_expr, col_map, context)
-                        && !is_declared_json_key(right_expr, col_map, context))
-                {
+                // A bound outer value binds `Some(Blob)` only for a declared
+                // typeless column (GH#428), so it takes the precise rule too.
+                let declared_blob_operand = |expr: &Expr| {
+                    is_declared_json_key(expr, col_map, context)
+                        || matches!(
+                            expr,
+                            Expr::BoundOuterValue {
+                                affinity: Some(TypeAffinity::Blob),
+                                ..
+                            }
+                        )
+                };
+                if !declared_blob_operand(left_expr) && !declared_blob_operand(right_expr) {
                     return cmp_values_with_comparison_affinity(
                         left_value,
                         right_value,

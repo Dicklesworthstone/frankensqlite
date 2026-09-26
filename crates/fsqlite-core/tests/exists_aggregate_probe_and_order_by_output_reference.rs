@@ -23,6 +23,13 @@ const SETUP: &[&str] = &[
     "INSERT INTO kx VALUES (1, 'a'), (2, 'b'), (5, 'e')",
     "CREATE TABLE oc(z INTEGER, w TEXT)",
     "INSERT INTO oc VALUES (1, 'a'), (2, 'q'), (3, 'c'), (NULL, NULL)",
+    // GH#428: an inner column with no COLLATE clause and TEXT affinity,
+    // compared with outer NOCASE / RTRIM / typeless columns.
+    "CREATE TABLE k(t TEXT, i INTEGER)",
+    "INSERT INTO k VALUES ('1', 1), ('02', 2), ('abc', NULL), (NULL, 4), ('ABC ', 5)",
+    "CREATE TABLE oc2(w TEXT COLLATE NOCASE, v TEXT COLLATE RTRIM, z INTEGER, x)",
+    "INSERT INTO oc2 VALUES ('abc', 'abc', 1, 1), ('ABC', 'ABC', 2, '2'), \
+     ('Abc ', 'ABC', 3, '02'), (NULL, NULL, NULL, NULL), ('zzz', '1  ', 5, 5.0)",
 ];
 
 fn render_fsqlite(value: &SqliteValue) -> String {
@@ -157,6 +164,133 @@ fn order_by_output_reference_to_a_literal_or_swapped_alias_terminates() {
                 &["3", "'c'"],
                 &["2", "'q'"],
             ],
+        )
+        .await;
+    });
+}
+
+/// GH#427: EXISTS depends only on whether the subquery yields a row. SQLite
+/// never evaluates a non-aggregate result list, so result expressions that
+/// would raise must not surface, uncorrelated or correlated.
+#[test]
+fn exists_does_not_evaluate_its_result_list() {
+    asupersync::test_utils::run_test(|| async {
+        assert_matches_sqlite("SELECT EXISTS (SELECT json('bad') FROM kx)", &[&["1"]]).await;
+        assert_matches_sqlite(
+            "SELECT EXISTS (SELECT abs(-9223372036854775807 - 1) FROM kx)",
+            &[&["1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT z FROM oc WHERE EXISTS \
+             (SELECT json('bad') FROM kx WHERE kx.x = oc.z) ORDER BY rowid",
+            &[&["1"], &["2"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT z FROM oc WHERE NOT EXISTS \
+             (SELECT json('bad') FROM kx WHERE kx.x = oc.z OR 0) ORDER BY rowid",
+            &[&["3"], &["NULL"]],
+        )
+        .await;
+    });
+}
+
+/// GH#427: a correlated EXISTS in the result list over an aggregate subquery
+/// is true for every outer row, like the WHERE-clause form above.
+#[test]
+fn result_list_exists_over_aggregate_result_is_always_one_row() {
+    asupersync::test_utils::run_test(|| async {
+        let all_true: &[&[&str]] = &[&["1", "1"], &["2", "1"], &["3", "1"], &["NULL", "1"]];
+        for sql in [
+            "SELECT z, EXISTS (SELECT count(*) FROM kx WHERE kx.x = oc.z) FROM oc ORDER BY rowid",
+            "SELECT z, EXISTS (SELECT max(t) FROM kx WHERE kx.x = oc.z) FROM oc ORDER BY rowid",
+            "SELECT z, EXISTS (SELECT count(*) FROM kx WHERE kx.x = oc.z OR 0) \
+             FROM oc ORDER BY rowid",
+            "SELECT z, EXISTS (SELECT count(*) FROM kx WHERE kx.x = oc.z LIMIT 5) \
+             FROM oc ORDER BY rowid",
+        ] {
+            assert_matches_sqlite(sql, all_true).await;
+        }
+        // The non-aggregate form still answers per matching row.
+        assert_matches_sqlite(
+            "SELECT z, EXISTS (SELECT 1 FROM kx WHERE kx.x = oc.z) FROM oc ORDER BY rowid",
+            &[&["1", "1"], &["2", "1"], &["3", "0"], &["NULL", "0"]],
+        )
+        .await;
+        // LIMIT 0 on an aggregate yields no row.
+        assert_matches_sqlite(
+            "SELECT z, EXISTS (SELECT count(*) FROM kx WHERE kx.x = oc.z LIMIT 0) \
+             FROM oc ORDER BY rowid",
+            &[&["1", "0"], &["2", "0"], &["3", "0"], &["NULL", "0"]],
+        )
+        .await;
+    });
+}
+
+/// GH#428: comparing an inner column with an outer column follows SQLite's
+/// operand rules. The left column's collation wins, and a column with no
+/// COLLATE clause counts as BINARY. Two operands that both carry an affinity,
+/// neither numeric, compare without conversion, so TEXT '1' is not the typeless
+/// column's integer 1.
+#[test]
+fn correlated_column_comparisons_use_sqlite_operand_rules() {
+    asupersync::test_utils::run_test(|| async {
+        let abc: &[&[&str]] = &[&["'abc'"]];
+        for sql in [
+            "SELECT w FROM oc2 WHERE EXISTS (SELECT 1 FROM k WHERE k.t = oc2.w) ORDER BY rowid",
+            "SELECT w FROM oc2 WHERE EXISTS (SELECT 1 FROM k WHERE k.t = oc2.w OR 0) ORDER BY rowid",
+            "SELECT w FROM oc2 WHERE EXISTS \
+             (SELECT 1 FROM k WHERE k.t = oc2.w OR 0 LIMIT 1) ORDER BY rowid",
+            "SELECT v FROM oc2 WHERE EXISTS (SELECT 1 FROM k WHERE k.t = oc2.v OR 0) ORDER BY rowid",
+        ] {
+            assert_matches_sqlite(sql, abc).await;
+        }
+        for sql in [
+            "SELECT x FROM oc2 WHERE EXISTS (SELECT 1 FROM k WHERE k.t = oc2.x) ORDER BY rowid",
+            "SELECT x FROM oc2 WHERE EXISTS \
+             (SELECT 1 FROM k WHERE k.t = oc2.x LIMIT 1) ORDER BY rowid",
+        ] {
+            assert_matches_sqlite(sql, &[&["'02'"]]).await;
+        }
+        assert_matches_sqlite(
+            "SELECT x FROM oc2 WHERE EXISTS \
+             (SELECT 1 FROM k WHERE (k.t, k.i) = (oc2.x, oc2.z) OR 0) ORDER BY rowid",
+            &[],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT w, (SELECT count(*) FROM k WHERE k.t = oc2.w) FROM oc2 ORDER BY rowid",
+            &[
+                &["'abc'", "1"],
+                &["'ABC'", "0"],
+                &["'Abc '", "0"],
+                &["NULL", "0"],
+                &["'zzz'", "0"],
+            ],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT x, (SELECT count(*) FROM k WHERE k.t = oc2.x) FROM oc2 ORDER BY rowid",
+            &[&["1", "0"], &["'2'", "0"], &["'02'", "1"], &["NULL", "0"], &["5", "0"]],
+        )
+        .await;
+        // The same operand rules apply to a plain join.
+        assert_matches_sqlite(
+            "SELECT oc2.x, k.t = oc2.x FROM oc2, k WHERE k.t = '1' ORDER BY oc2.rowid",
+            &[
+                &["1", "0"],
+                &["'2'", "0"],
+                &["'02'", "0"],
+                &["NULL", "NULL"],
+                &["5", "0"],
+            ],
+        )
+        .await;
+        // IN applies the left operand's collation, so NOCASE matches here.
+        assert_matches_sqlite(
+            "SELECT w FROM oc2 WHERE w IN (SELECT t FROM k) ORDER BY rowid",
+            &[&["'abc'"], &["'ABC'"], &["'Abc '"]],
         )
         .await;
     });
