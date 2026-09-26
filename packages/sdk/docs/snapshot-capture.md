@@ -108,3 +108,79 @@ Reference SQL ownership is not execution of FrankenSQLite's Rust/WASM/MVCC or
 full SDK/worker packaging. Browser storage, production deployment and physical
 power-loss qualification are not claimed. Default capture, native writer settings,
 wire formats and dependency lists are unchanged.
+
+## Retain trigger-driven work atomically in the outbox
+
+`ChangesetOutbox.recordSnapshot(work, options)` runs the same capture inside the
+outbox's existing publication transaction. Source writes, selected trigger/cascade
+results, the outgoing payload and operation identity commit together. A failure
+in capture, final payload admission, metadata validation or COMMIT leaves no
+committed operation. It is not a separate snapshot followed by a later enqueue.
+
+```ts
+const result = await outbox.recordSnapshot(async tx => {
+  await tx.execute('UPDATE orders SET status=? WHERE id=?', ['paid', 42n]);
+  return 42n;
+}, {
+  deliveryId: 'source-42:pay-order-42',
+  tables: ['orders', 'inventory', 'audit'],
+  maxRows: 10_000,
+});
+```
+
+`OutboxSnapshotRecordOptions` adds the usual stable, source-qualified `deliveryId`
+to `SnapshotCaptureOptions`. Results use the existing `OutboxRecordResult<T>`:
+new operations return `value` and delivery metadata; replays return the retained
+metadata without a callback result. The before/after scan counts are available
+from standalone capture, not the outbox result.
+
+The internal capture scope distinguishes snapshot recording from ordinary journal
+recording and either kind of bootstrap. Reusing an ID across methods, table sets
+or indirect policies rejects. Reordering the same table list on a retry is allowed
+but preserves the original payload order. A retained retry verifies pending bytes,
+never re-reads newer application rows, and never repeats business triggers. Once
+acknowledged, its reclaimed payload is not regenerated. Explicit identity forgetting
+has the same consequences as existing outbox forgetting: it ends retry protection;
+never recycle an old business-operation identity for new work.
+
+Both recording strategies share the existing capacity, hash, metadata and fanout
+guards. `maxEntries` and `maxPayloadBytes` apply independently of capture budgets.
+New work refuses a full outbox before scanning application data. Required replicas
+retain shared bytes until all have acknowledged them. Triggered attempts to mutate
+the roster/progress fail with the business transaction. The payload is an ordinary
+changeset and requires no new delivery protocol or receiver API. A replica must not
+execute source-side business effects a second time; the row-only receiver schema
+and appropriate FK policy remain application responsibilities.
+
+There is no implicit network call, automatic retry, background worker, checkpoint,
+source-ID generation or weakening of native concurrent writers. A lost source
+commit response is uncertain: retry the SAME retained operation ID. Browser
+snapshot-backed sources and receivers still need genuine same-database storage
+confirmation using the existing delivery APIs. Nested outbox results remain
+provisional until the outer owner commits.
+
+### Combined executed coverage
+
+The two suites pass 82 tests with no failures/skips: 45 capture tests and 37 outbox
+integration tests. Production snapshot/capture, codec, applyChangeset, outbox,
+store and fanout modules execute without backend substitution. Typechecking covers
+the actual transitive sources, not declaration fixtures. The new outbox cases
+exercise trigger-driven records in UTF-8/UTF-16LE/UTF-16BE databases, native row
+application, bootstrap-to-incremental ordering, exact replay and method collisions,
+empty payloads, slow replicas, rollback, capacity, cancellation and delayed SQL.
+
+Two source connections are forced to overlap before competing read-to-write
+promotions. Eight child processes are actually SIGKILLed under WAL/DELETE journals:
+after trigger work, after payload insertion, before COMMIT and after COMMIT before
+response. Fresh connections recover all-or-none publication and reuse committed
+operation bytes without repeating source triggers. Other cases lose receiver
+responses and recover through the real applyChangeset inbox. These are process
+death and reference-SQL tests, not power-loss, Rust/WASM/MVCC, browser persistence,
+HTTP deployment or full SDK packaging qualification.
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/production-source-loader.mjs \
+  --test packages/sdk/tests/changeset-snapshot-capture.test.mjs \
+  packages/sdk/tests/changeset-outbox-snapshot.test.mjs
+```

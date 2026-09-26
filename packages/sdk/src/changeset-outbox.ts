@@ -5,6 +5,8 @@ import {
   prepareSnapshotChangesetStream,
 } from "./changeset-capture";
 import { assertSingleRecipient, captureFanoutGuard } from "./changeset-fanout";
+import { prepareSnapshotCapture } from "./changeset-snapshot-capture";
+import type { SnapshotCaptureOptions } from "./changeset-snapshot-capture";
 import type {
   ChangesetOutboxOptions,
   OutboxBootstrapChunksOptions,
@@ -53,6 +55,13 @@ export type {
 } from "./changeset-outbox-store";
 export { CHANGESET_OUTBOX_TABLE, ChangesetOutboxError } from "./changeset-outbox-store";
 
+export interface OutboxSnapshotRecordOptions extends SnapshotCaptureOptions {
+  /** Stable source-qualified operation ID, distinct from record/bootstrap operations. */
+  deliveryId: string;
+}
+
+type RecordCapture<T> = ReturnType<typeof prepareChangesetCapture<T>> | ReturnType<typeof prepareSnapshotCapture<T>>;
+
 /** Persistent source-side delivery state; transport and remote ACK policy are caller-owned. */
 export class ChangesetOutbox {
   readonly #target: ChangesetTarget;
@@ -85,10 +94,29 @@ export class ChangesetOutbox {
     options: OutboxRecordOptions,
   ): Promise<OutboxRecordResult<T>> {
     const id = identity(options?.deliveryId);
-    const capture = prepareChangesetCapture(work, options);
+    return this.#recordCapture(id, prepareChangesetCapture(work, options), false);
+  }
+
+  /**
+   * Atomically record trigger/view/cascade-driven net changes. Explicitly scans
+   * all selected rows before/after work; ordinary record() keeps its journal.
+   * Retained retries never rerun the callback or regenerate the snapshots.
+   */
+  async recordSnapshot<T>(
+    work: (tx: ChangesetExecutor) => T | Promise<T>,
+    options: OutboxSnapshotRecordOptions,
+  ): Promise<OutboxRecordResult<T>> {
+    const id = identity(options?.deliveryId);
+    return this.#recordCapture(id, prepareSnapshotCapture(work, options), true);
+  }
+
+  async #recordCapture<T>(
+    id: string, capture: RecordCapture<T>, snapshotCapture: boolean,
+  ): Promise<OutboxRecordResult<T>> {
     const scope = JSON.stringify({
       tables: capture.tables.map(fold).sort(),
       indirect: capture.indirect,
+      ...(snapshotCapture ? { snapshotCapture: true } : {}),
     });
     if (globalThis.crypto?.subtle === undefined)
       fail("INPUT", "The outbox requires Web Crypto SHA-256");
