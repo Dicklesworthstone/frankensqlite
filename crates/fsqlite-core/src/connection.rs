@@ -71833,7 +71833,17 @@ impl Connection {
                 "concurrent_read_finished",
                 None,
             );
-            {
+            // A `:memory:` pager numbers commits with this same clock, so the
+            // read-only COMMIT publishes its serialization point. A file-backed
+            // pager does not: its sequence is derived from the WAL, and the
+            // global clock can carry a peer pager's numbering above anything
+            // this connection's pager will ever publish for the same WAL
+            // state. Stamping that into `last_local_commit_seq` (part of the
+            // execution visibility) made every later BEGIN fail "opened pager
+            // visibility N predates connection execution visibility M"
+            // forever (GH#429), so a file-backed read-only commit, which
+            // commits nothing, leaves it alone.
+            if self.pager.is_memory() {
                 let mut last = self.last_local_commit_seq.borrow_mut();
                 *last = Some(last.map_or(committed_seq, |existing| existing.max(committed_seq)));
             }
@@ -199216,6 +199226,55 @@ mod tests {
             );
 
             txn.rollback(&cx).await.unwrap();
+            conn.close_without_checkpoint_in_place().await.unwrap();
+        });
+    }
+
+    /// GH#429: a read-only BEGIN CONCURRENT transaction commits nothing, so it
+    /// must not raise the connection's execution visibility to the global
+    /// commit clock. That clock can carry a peer pager's numbering above
+    /// anything this connection's pager publishes, and adopting it made every
+    /// later BEGIN fail "opened pager visibility N predates connection execution
+    /// visibility M" with no way to clear.
+    #[test]
+    fn test_read_only_concurrent_commit_keeps_execution_visibility_at_own_commits() {
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("read_only_concurrent_commit_visibility.db");
+            let path_str = path.to_str().unwrap();
+
+            let mut conn = Connection::open(path_str).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 0);").await.unwrap();
+            let own_commit = conn.last_local_commit_seq();
+
+            // A peer pager's numbering for the same WAL state sits well above ours.
+            let pager_seq = conn.pager.published_snapshot().visible_commit_seq;
+            conn.align_commit_clock_floor(CommitSeq::new(pager_seq.get() + 50));
+
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            let rows = conn.query("SELECT v FROM t WHERE id = 1;").await.unwrap();
+            assert_eq!(rows.len(), 1);
+            conn.execute("COMMIT;").await.unwrap();
+            assert_eq!(
+                conn.last_local_commit_seq(),
+                own_commit,
+                "a read-only concurrent commit must not adopt the global clock"
+            );
+
+            // The next write transaction must begin and commit.
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            conn.execute("UPDATE t SET v = 1 WHERE id = 1;").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("UPDATE t SET v = 2 WHERE id = 1;").await.unwrap();
+            conn.execute("COMMIT;").await.unwrap();
+            let rows = conn.query("SELECT v FROM t WHERE id = 1;").await.unwrap();
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(2)]);
+
             conn.close_without_checkpoint_in_place().await.unwrap();
         });
     }
