@@ -293,3 +293,5 @@ export {
 export type { BootstrapHttpAction, BootstrapHttpRequestInfo, BootstrapHttpTransportOptions } from "./changeset-bootstrap-http";
 export { createBootstrapHttpHandler } from "./changeset-bootstrap-http";
 export type { BootstrapHttpAuthorization, BootstrapHttpHandlerOptions, BootstrapHttpHandler, BootstrapHttpReceiver } from "./changeset-bootstrap-http";
+export { captureSnapshotChangeset } from "./changeset-snapshot-capture";
+export type { SnapshotCaptureOptions, SnapshotCapturedChangeset } from "./changeset-snapshot-capture";
