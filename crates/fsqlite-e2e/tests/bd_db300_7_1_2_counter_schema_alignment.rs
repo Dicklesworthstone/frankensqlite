@@ -82,6 +82,7 @@ fn make_iteration(idx: u32, wall_time_ms: u64, ops: u64) -> IterationRecord {
     IterationRecord {
         iteration: idx,
         wall_time_ms,
+        wall_time_ns: wall_time_ms.saturating_mul(1_000_000),
         ops_per_sec: if wall_time_ms > 0 {
             (ops as f64) / (wall_time_ms as f64 / 1000.0)
         } else {

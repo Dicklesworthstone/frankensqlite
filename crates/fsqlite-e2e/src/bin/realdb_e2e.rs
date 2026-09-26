@@ -49,7 +49,7 @@ use fsqlite_e2e::fixture_select::{
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
-use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
+use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta, compiled_cargo_profile};
 use fsqlite_e2e::oplog::{self, OpLog};
 #[cfg(test)]
 use fsqlite_e2e::overlay_honesty_gate::{
@@ -879,7 +879,7 @@ fn try_build_canonical_bench_context(
         beads_data_hash,
         command_entrypoint: format!("realdb-e2e {subcommand}"),
         command_line: benchmark_command_line(subcommand, argv),
-        rerun_command: benchmark_rerun_command(subcommand, argv, cargo_profile_name()),
+        rerun_command: benchmark_rerun_command(subcommand, argv, compiled_cargo_profile()),
         retention_class,
         tool_versions: benchmark_tool_versions(),
     })
@@ -2245,8 +2245,7 @@ fn resolve_hot_path_microarchitectural_context(
 
 fn current_hot_path_cargo_profile() -> String {
     hot_path_override_env(HOT_PATH_CARGO_PROFILE_ENV)
-        .or_else(|| std::env::var("PROFILE").ok())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or_else(|| compiled_cargo_profile().to_owned())
 }
 
 fn resolve_hot_path_workspace_root(
@@ -4998,7 +4997,7 @@ fn run_sqlite3_engine(
         ..SqliteExecConfig::default()
     };
     let sqlite_version = rusqlite::version().to_owned();
-    let environment = run_mode.environment(cargo_profile_name());
+    let environment = run_mode.environment(compiled_cargo_profile());
 
     let golden_sha256 = match sha256_file(&golden_path) {
         Ok(h) => Some(h),
@@ -5151,7 +5150,7 @@ fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
         collect_hot_path_profile: run_mode.hot_path_profile,
         ..FsqliteExecConfig::default()
     };
-    let environment = run_mode.environment(cargo_profile_name());
+    let environment = run_mode.environment(compiled_cargo_profile());
 
     let mut results: Vec<RunAgg> = Vec::new();
     let mut any_error = false;
@@ -5627,7 +5626,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
         }
     };
 
-    let cargo_profile = cargo_profile_name();
+    let cargo_profile = compiled_cargo_profile();
     let canonical_context = selection
         .workspace_root
         .as_deref()
@@ -5904,7 +5903,7 @@ fn cmd_evidence_pack(argv: &[String]) -> i32 {
     }
 
     let lanes = benchmark_all_mode_lanes();
-    let cargo_profile = cargo_profile_name();
+    let cargo_profile = compiled_cargo_profile();
     let execution = match execute_benchmark_matrix(&BenchMatrixRequest {
         selection: &selection,
         lanes: &lanes,
@@ -7363,24 +7362,6 @@ fn quote_ident(name: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn cargo_profile_name() -> &'static str {
-    if let Some(profile) = option_env!("PROFILE") {
-        return match profile {
-            "debug" => "dev",
-            other => other,
-        };
-    }
-    if cfg!(debug_assertions) {
-        return "dev";
-    }
-    if option_env!("OPT_LEVEL") == Some("3") {
-        // release-perf inherits release but sets opt-level = 3.
-        // Plain release uses opt-level = "z".
-        return "release-perf";
-    }
-    "release"
-}
-
 fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
     let s = raw.trim();
     if s.is_empty() {
@@ -7968,6 +7949,7 @@ mod tests {
 
     fn sample_engine_report() -> EngineRunReport {
         EngineRunReport {
+            wall_time_ns: 0,
             wall_time_ms: 0,
             ops_total: 0,
             ops_per_sec: 0.0,
@@ -8566,6 +8548,7 @@ mod tests {
             aggregated_hot_path: None,
             iterations: vec![IterationRecord {
                 iteration: 0,
+                wall_time_ns: wall_time_ms.saturating_mul(1_000_000),
                 wall_time_ms,
                 ops_per_sec: 100.0,
                 ops_total: 100,
@@ -8657,6 +8640,7 @@ mod tests {
             aggregated_hot_path: None,
             iterations: vec![IterationRecord {
                 iteration: 0,
+                wall_time_ns: 10_000_000,
                 wall_time_ms: 10,
                 ops_per_sec: median_ops_per_sec,
                 ops_total: 100,

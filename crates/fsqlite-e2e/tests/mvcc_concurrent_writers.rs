@@ -219,6 +219,7 @@ async fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
 
     EngineRunReport {
         wall_time_ms: u64::try_from(wall.as_millis()).unwrap_or(u64::MAX),
+        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
         ops_total: ops_ok,
         ops_per_sec,
         retries: 0,

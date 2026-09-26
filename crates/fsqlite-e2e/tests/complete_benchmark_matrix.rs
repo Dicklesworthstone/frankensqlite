@@ -590,6 +590,7 @@ fn sample_benchmark_summary(
         aggregated_hot_path: None,
         iterations: vec![IterationRecord {
             iteration: 0,
+            wall_time_ns: 10_000_000,
             wall_time_ms: 10,
             ops_per_sec: throughput_ops_per_sec,
             ops_total: 100,

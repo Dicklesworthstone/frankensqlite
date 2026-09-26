@@ -91,6 +91,7 @@ fn make_iterations(count: u32, base_wall_ms: u64, ops_per_iter: u64) -> Vec<Iter
             IterationRecord {
                 iteration: i,
                 wall_time_ms: wall_ms,
+                wall_time_ns: wall_ms.saturating_mul(1_000_000),
                 ops_per_sec: if wall_ms > 0 {
                     (ops_per_iter as f64) / (wall_ms as f64 / 1000.0)
                 } else {

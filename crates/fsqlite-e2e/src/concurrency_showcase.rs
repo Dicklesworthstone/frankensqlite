@@ -662,6 +662,7 @@ mod tests {
                 IterationRecord {
                     iteration: 0,
                     wall_time_ms: 100,
+                    wall_time_ns: 100_000_000,
                     ops_per_sec,
                     ops_total: 1000,
                     retries,
@@ -671,6 +672,7 @@ mod tests {
                 IterationRecord {
                     iteration: 1,
                     wall_time_ms: 100,
+                    wall_time_ns: 100_000_000,
                     ops_per_sec,
                     ops_total: 1000,
                     retries,
@@ -680,6 +682,7 @@ mod tests {
                 IterationRecord {
                     iteration: 2,
                     wall_time_ms: 100,
+                    wall_time_ns: 100_000_000,
                     ops_per_sec,
                     ops_total: 1000,
                     retries,

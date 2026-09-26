@@ -195,6 +195,7 @@ pub fn run_oplog_sqlite(
     };
 
     Ok(EngineRunReport {
+        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
         wall_time_ms: wall_ms,
         ops_total,
         ops_per_sec,
@@ -285,6 +286,7 @@ fn run_oplog_sqlite_in_memory(
     };
 
     Ok(EngineRunReport {
+        wall_time_ns: u64::try_from(wall.as_nanos()).unwrap_or(u64::MAX),
         wall_time_ms: wall_ms,
         ops_total,
         ops_per_sec,
