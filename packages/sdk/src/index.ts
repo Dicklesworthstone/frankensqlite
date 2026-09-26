@@ -291,3 +291,5 @@ export {
   BOOTSTRAP_HTTP_CONTENT_TYPE, BOOTSTRAP_HTTP_RESPONSE_TYPE, BOOTSTRAP_HTTP_ACTION_HEADER,
 } from "./changeset-bootstrap-http";
 export type { BootstrapHttpAction, BootstrapHttpRequestInfo, BootstrapHttpTransportOptions } from "./changeset-bootstrap-http";
+export { createBootstrapHttpHandler } from "./changeset-bootstrap-http";
+export type { BootstrapHttpAuthorization, BootstrapHttpHandlerOptions, BootstrapHttpHandler, BootstrapHttpReceiver } from "./changeset-bootstrap-http";

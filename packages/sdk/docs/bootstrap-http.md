@@ -116,3 +116,133 @@ Strict isolated TypeScript 5.8.3 checks pass against the pinned bootstrap and
 transfer API declarations. This is not a full SDK build. Browser CORS execution,
 production TLS/proxies, native MVCC, browser storage and physical power loss have
 not been certified by these tests.
+
+## Receiver endpoint
+
+`createBootstrapHttpHandler` wraps an existing `ChangesetBootstrapReceiver` using
+its `receiverId`, `status`, `stage`, and `install` methods. It does not create a
+listener or database, provision schemas, or expose discard/reset remotely.
+
+```ts
+import {
+  ChangesetBootstrapReceiver,
+  createBootstrapHttpHandler,
+} from '@frankensqlite/sdk';
+
+const receiver = new ChangesetBootstrapReceiver(destination, {
+  receiverId: 'replica-east',
+  tables: ['parents', 'children'],
+  orderedSourceId: 'source-42:incarnation-1',
+  confirmCommit: () => destination.checkpoint(),
+});
+const handleBootstrap = createBootstrapHttpHandler(receiver, {
+  authorize: request => authenticateBootstrapToken(
+    request.headers.get('authorization'), request.receiverId, request.action,
+  ),
+  authorizeManifest: (request, info) => authorizeSourceNamespace(
+    request.headers.get('authorization'), info.manifest.deliveryId, info.action,
+  ),
+  orderedSourceId: 'source-42:incarnation-1',
+  allowedOrigins: ['https://app.example'],
+  maxChunkBytes: 1024 * 1024,
+  maxInFlight: 1,
+});
+// The application router passes a streaming Request and returns its Response.
+// Authentication, namespace policy and storage confirmation above are app code.
+```
+
+Mandatory authorization must return literal `true`. It executes before a body
+reader is acquired, with a detached Headers copy, fixed recipient and action,
+URL, method and cancellation signal. It has no upload body or parsed manifest.
+Optional manifest authorization runs after bounded parsing but before any
+receiver operation, including status. Use it to bind an authenticated sender to
+its source namespace and permitted actions. Receiver table admission and SQL
+constraints remain enforced by the receiver, not invented by the HTTP layer.
+
+The action header and frame must agree. Control bodies are bounded to metadata
+plus eight framing bytes; they cannot use the stage payload allowance. All bodies
+must match declared and actual lengths and use the correct uncompressed format.
+The handler captures methods with their receiver binding, and awaits each call.
+It validates and detaches the returned progress or full installation receipt
+before serializing it. Staging is not checkpointed by this layer; the source
+retains bytes until the underlying receiver confirms complete installation.
+A completed status observation never substitutes for calling install again.
+
+The handler's `orderedSourceId` must match the receiver's already provisioned
+policy, and the client/transfer's matching trusted policy. The wire cannot add,
+remove, or change that enrollment. Incorrect configuration fails closed; a
+failed response is not evidence that an installation did not commit.
+
+### Admission and cancellation
+
+`maxInFlight` defaults to one and is capped at 64. It counts authorization, upload,
+receiver execution, and awaited body cleanup. Overflow returns 503 without adding
+a waiter or reading the rejected payload. An individual receiver may also refuse
+concurrent calls; HTTP admission does not create a database pool or global writer
+lock. A cancelled request retains its slot until already-started receiver work
+and cleanup settle. SQL and storage confirmation are never abandoned with a timer
+race. Callback/host implementations that ignore cancellation can delay settlement.
+
+The host must preserve request streaming, propagate peer disconnects into
+Request.signal, and correctly handle early body cancellation. Do not buffer the
+entire upload in a router before invoking the handler. The application supplies
+TLS, an exact route, trusted proxy/Host handling, header/connection limits and
+process-level admission. Limits bound retained protocol bytes, not transport
+buffers, arbitrary SQL work, total process RSS or physical durability.
+
+Method/media failures return 405/415, authorization and CORS failures 403,
+malformed input 400, byte limits 413, local timeout/cancellation 408, busy 503,
+and receiver state conflicts 409. Other receiver/confirmation or invalid-result
+failures return 500. Errors contain a constant redacted record with outcome
+`unknown`, never SQL messages, credentials, routing IDs or stack traces. A client
+may instead lose the connection. In every case it must reconcile the same seed,
+not discard pending source bytes or manufacture a new delivery identity.
+
+### Browser policy
+
+Origins are exact HTTP(S) origins, with at most 64 configured additions. Same-
+origin and originless requests still require authorization. Wildcards, opaque
+origins, URL credentials and paths reject. OPTIONS permits only POST, does not
+invoke authorization or SQL, and allows content-type, authorization, and the
+bootstrap action header by default. Up to 32 additional exact header names may
+be configured. Unlisted headers and ambient-cookie/connection headers reject.
+Responses use exact-origin CORS, no credential opt-in, no-store, nosniff and Vary.
+CORS does not authenticate non-browser callers. These header tests do not replace
+an actual browser/TLS deployment test.
+
+### Combined verification boundary
+
+The combined suite passes 244 tests with zero failures or skips on Node 22.16.0 /
+SQLite 3.49.1: 86 client tests, 82 handler tests, and 76 existing transfer-contract
+tests. It executes the actual new HTTP client/handler and the existing production
+transfer coordinator. The transfer loader explicitly substitutes the previously
+published SQLite-backed source/store/receiver boundary fixtures; it does not load
+the production bootstrap, outbox-store, or fanout modules. Native Session bytes,
+real SQL transactions, real HTTP sockets and process deaths are exercised, but
+these are network/coordination contracts, not full production-module integration.
+
+Tests verify auth-before-read, manifest policy, CORS/preflight, malformed framing,
+actual upload/response bounds, private-field method binding, overload, cancellation
+and cleanup drain, redacted errors and exact ordered receipt admission. HTTP
+transfer resumes a twelve-chunk baseline after a bounded run, retains source bytes
+after a dropped install ACK, retries failed receiver/source confirmations, and
+preserves slow-replica payloads under the fixture's fanout contract. Native SQL
+constraint failure rolls back the fixture's whole baseline application.
+
+Three separate HTTP receiver processes are SIGKILLed after staging, during native
+row installation, and after COMMIT before its response. Fresh file-backed owners
+resume the same seed. The original coordinator's three process-death cases also
+run. This is process death, not power loss. No production SDK receiver/store/fanout,
+full SDK/worker, Rust/WASM/MVCC, real browser storage or TLS deployment certification
+is claimed. Strict isolated TypeScript 5.8.3 passes against the pinned public API
+declaration fixtures, with exact optional properties, unchecked indexes and
+noUnused checks. Existing SDK exports, native storage, concurrency defaults,
+dependencies, workflows and beads are unchanged.
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/bootstrap-transfer-loader.mjs \
+  --test packages/sdk/tests/changeset-bootstrap-http.test.mjs \
+  packages/sdk/tests/changeset-bootstrap-http-handler.test.mjs \
+  packages/sdk/tests/changeset-bootstrap-transfer-contract.test.mjs
+```

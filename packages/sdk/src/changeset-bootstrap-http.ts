@@ -275,3 +275,158 @@ export function createBootstrapHttpTransport(url: string | URL, options: Bootstr
     install: async (m, controls) => await request("install", m, undefined, undefined, controls) as BootstrapInstallReceipt,
   } satisfies BootstrapTransferTransport);
 }
+
+export interface BootstrapHttpAuthorization {
+  readonly method: string;
+  readonly url: string;
+  readonly headers: Headers;
+  readonly receiverId: string;
+  readonly action: BootstrapHttpAction;
+  readonly signal: AbortSignal;
+}
+export interface BootstrapHttpHandlerOptions {
+  /** Mandatory, before body reads. Return literal true; CORS is not authentication. */
+  authorize: (request: BootstrapHttpAuthorization) => boolean | Promise<boolean>;
+  /** Sender namespace and action policy, after bounded parsing but before receiver SQL. */
+  authorizeManifest?: (request: BootstrapHttpAuthorization, info: BootstrapHttpRequestInfo) => boolean | Promise<boolean>;
+  /** Must match the receiver's trusted policy; never derived from a remote receipt. */
+  orderedSourceId?: string;
+  maxChunkBytes?: number;
+  timeoutMs?: number;
+  /** Covers authorization, upload, receiver work and cleanup. Default 1; max 64. */
+  maxInFlight?: number;
+  allowedOrigins?: readonly string[];
+  allowedHeaders?: readonly string[];
+}
+export type BootstrapHttpHandler = (request: Request) => Promise<Response>;
+export type BootstrapHttpReceiver = BootstrapTransferTransport & { readonly receiverId: string };
+function action(value: unknown): BootstrapHttpAction {
+  if (value !== "status" && value !== "stage" && value !== "install") fail("PROTOCOL", "Unsupported bootstrap HTTP action");
+  return value;
+}
+function decode(wire: Uint8Array, expectedAction: BootstrapHttpAction, maximum: number) {
+  if (wire.length < 8 || wire[0] !== 70 || wire[1] !== 67 || wire[2] !== 66 || wire[3] !== 49) fail("PROTOCOL", "Invalid bootstrap HTTP frame");
+  const size = new DataView(wire.buffer, wire.byteOffset, wire.byteLength).getUint32(4);
+  if (size < 1 || size > MAX_METADATA || size > wire.length - 8) fail("PROTOCOL", "Invalid bootstrap metadata length");
+  const input = json(wire.subarray(8, 8 + size));
+  if (data(input, "protocol") !== BOOTSTRAP_HTTP_PROTOCOL || action(data(input, "action")) !== expectedAction) fail("PROTOCOL", "Bootstrap header and frame action disagree");
+  const m = manifest(data(input, "manifest"));
+  const byteLength = integer(data(input, "byteLength"), expectedAction === "stage" ? Math.min(maximum, m.byteLength) : 0);
+  if (byteLength !== wire.length - size - 8) fail("PROTOCOL", "Bootstrap body does not match its declared length");
+  let index: number | undefined;
+  if (expectedAction === "stage") index = integer(data(input, "index"), m.chunks - 1);
+  else if ("index" in (input as object)) fail("PROTOCOL", "Control requests cannot have a chunk index");
+  const info: BootstrapHttpRequestInfo = Object.freeze({ action: expectedAction, manifest: m, byteLength, ...(index === undefined ? {} : { index }) });
+  return { info, bytes: wire.subarray(8 + size) };
+}
+function allowedOrigins(input: readonly string[] | undefined): ReadonlySet<string> {
+  if (input !== undefined && (!Array.isArray(input) || input.length > 64)) fail("INPUT", "Use at most 64 exact browser origins");
+  const result = new Set<string>();
+  for (const item of input ?? []) {
+    if (typeof item !== "string" || item.length > 2048) fail("INPUT", "Invalid browser origin");
+    let url: URL;
+    try { url = new URL(item); } catch { return fail("INPUT", "Invalid browser origin"); }
+    if (url.origin !== item || !["http:", "https:"].includes(url.protocol)) fail("INPUT", "Browser origins must be exact HTTP(S) origins without paths or credentials");
+    result.add(item);
+  }
+  return result;
+}
+function allowedHeaders(input: readonly string[] | undefined): ReadonlySet<string> {
+  if (input !== undefined && (!Array.isArray(input) || input.length > 32)) fail("INPUT", "Use at most 32 additional preflight headers");
+  const result = new Set(["content-type", "authorization", BOOTSTRAP_HTTP_ACTION_HEADER]);
+  for (const item of input ?? []) {
+    if (typeof item !== "string" || item.length > 128 || !/^[!#$%&'+.^_`|~0-9a-z-]+$/i.test(item)) fail("INPUT", "Invalid preflight header");
+    const name = item.toLowerCase();
+    if (["cookie", "cookie2", "host", "origin", "connection", "transfer-encoding"].includes(name) || name.startsWith("sec-") || name.startsWith("proxy-")) fail("INPUT", "Preflight cannot permit ambient credentials or connection headers");
+    result.add(name);
+  }
+  return result;
+}
+function reply(status: number, value: unknown, origin: string | null, extra?: HeadersInit): Response {
+  const headers = new Headers(extra);
+  headers.set("cache-control", "no-store"); headers.set("x-content-type-options", "nosniff");
+  headers.set("vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+  if (origin !== null) headers.set("access-control-allow-origin", origin);
+  if (status === 204) return new Response(null, { status, headers });
+  headers.set("content-type", status === 200 ? BOOTSTRAP_HTTP_RESPONSE_TYPE : "application/json");
+  const bytes = encoder.encode(JSON.stringify(value));
+  if (bytes.length > MAX_RESPONSE) fail("PROTOCOL", "Bootstrap response exceeded its wire budget");
+  return new Response(bytes, { status, headers });
+}
+function rejected(status: number, origin: string | null, extra?: HeadersInit): Response {
+  return reply(status, { error: "ERR_FSQLITE_BOOTSTRAP_HTTP_REJECTED", outcome: "unknown" }, origin, extra);
+}
+
+/** Authenticated Fetch endpoint. No reset/discard operation is exposed remotely. */
+export function createBootstrapHttpHandler(receiver: BootstrapHttpReceiver, options: BootstrapHttpHandlerOptions): BootstrapHttpHandler {
+  const id = text(receiver?.receiverId, 256), authorize = options?.authorize, authorizeManifest = options?.authorizeManifest;
+  const status = receiver?.status, stage = receiver?.stage, install = receiver?.install;
+  if ([status, stage, install, authorize].some(fn => typeof fn !== "function") || (authorizeManifest !== undefined && typeof authorizeManifest !== "function")) fail("INPUT", "A bootstrap receiver and explicit authorization policy are required");
+  const methods = { status: status.bind(receiver), stage: stage.bind(receiver), install: install.bind(receiver) };
+  const maximum = bound(options.maxChunkBytes, 8 * 1024 * 1024, MAX_CHUNK), timeout = bound(options.timeoutMs, 30_000, 2_147_483_647);
+  const capacity = bound(options.maxInFlight, 1, 64), origins = allowedOrigins(options.allowedOrigins), headers = allowedHeaders(options.allowedHeaders);
+  const orderedSourceId = options.orderedSourceId === undefined ? undefined : text(options.orderedSourceId, 256);
+  let active = 0;
+  return async request => {
+    let b: Budget | undefined, admitted = false, receiving = false, origin: string | null = null;
+    try {
+      if (!(request instanceof Request) || request.url.length > 8192) return rejected(400, null);
+      const requested = request.headers.get("origin");
+      if (requested !== null) {
+        let url: URL;
+        try { url = new URL(requested); } catch { return rejected(403, null); }
+        if (url.origin !== requested || !["http:", "https:"].includes(url.protocol) || (requested !== new URL(request.url).origin && !origins.has(requested))) return rejected(403, null);
+        origin = requested;
+      }
+      if (request.method === "OPTIONS") {
+        const names = request.headers.get("access-control-request-headers") ?? "";
+        if (origin === null || request.headers.get("access-control-request-method") !== "POST" || names.length > 4096) return rejected(403, origin);
+        const requestedHeaders = names === "" ? [] : names.split(",").map(n => n.trim().toLowerCase());
+        if (requestedHeaders.length > 35 || requestedHeaders.some(n => !headers.has(n))) return rejected(403, origin);
+        return reply(204, null, origin, { "access-control-allow-methods": "POST", "access-control-allow-headers": [...new Set(requestedHeaders)].join(", ") });
+      }
+      if (request.method !== "POST") return rejected(405, origin, { allow: "POST, OPTIONS" });
+      if (request.headers.get("content-type")?.trim().toLowerCase() !== BOOTSTRAP_HTTP_CONTENT_TYPE) return rejected(415, origin);
+      const op = action(request.headers.get(BOOTSTRAP_HTTP_ACTION_HEADER));
+      if (active >= capacity) return rejected(503, origin);
+      active++; admitted = true;
+      b = new Budget({ signal: request.signal }, timeout); b.check();
+      const context: BootstrapHttpAuthorization = Object.freeze({ method: request.method, url: request.url,
+        headers: new Headers(request.headers), receiverId: id, action: op, signal: b.signal });
+      let permitted: boolean;
+      try { permitted = (await authorize(context)) === true; } catch { permitted = false; }
+      b.check(); if (!permitted) return rejected(403, origin);
+      const wire = await readBody(request.body, request.headers, 8 + MAX_METADATA + (op === "stage" ? maximum : 0), b);
+      const { info, bytes } = decode(wire, op, maximum); b.check();
+      if (info.manifest.receiverId !== id) return rejected(400, origin);
+      if (authorizeManifest !== undefined) {
+        try { permitted = (await authorizeManifest(context, info)) === true; } catch { permitted = false; }
+        b.check(); if (!permitted) return rejected(403, origin);
+      }
+      b.check(); receiving = true;
+      // The admission slot outlives client cancellation until SQL, confirmation
+      // and cleanup settle. Never race or detach an installation transaction.
+      const result = op === "stage" ? await methods.stage(info.manifest, info.index!, bytes, b.options()) :
+        op === "install" ? await methods.install(info.manifest, b.options()) : await methods.status(info.manifest, b.options());
+      b.check();
+      const packet = { protocol: BOOTSTRAP_HTTP_PROTOCOL, action: op, sha256: info.manifest.sha256,
+        ...(op === "stage" ? { index: info.index } : {}), result };
+      const captured = responseResult(packet, info, orderedSourceId);
+      return reply(200, { ...packet, result: captured }, origin);
+    } catch (cause: unknown) {
+      if (cause instanceof BootstrapHttpError) {
+        if (cause.code.endsWith("CANCELLED") || cause.code.endsWith("TIMEOUT")) return rejected(408, origin);
+        if (cause.code.endsWith("LIMIT")) return rejected(413, origin);
+        return rejected(receiving ? 500 : 400, origin);
+      }
+      const code = typeof cause === "object" && cause !== null ? Object.getOwnPropertyDescriptor(cause, "code")?.value : undefined;
+      const status = code === "ERR_FSQLITE_BOOTSTRAP_BUSY" ? 503 : code === "ERR_FSQLITE_BOOTSTRAP_STATE" ? 409 :
+        code === "ERR_FSQLITE_BOOTSTRAP_INPUT" ? 400 : code === "ERR_FSQLITE_BOOTSTRAP_LIMIT" ? 413 :
+        code === "ERR_FSQLITE_BOOTSTRAP_CANCELLED" || code === "ERR_FSQLITE_BOOTSTRAP_TIMEOUT" ? 408 : 500;
+      return rejected(status, origin);
+    } finally {
+      try { if (request instanceof Request && request.body !== null && !request.body.locked) await request.body.cancel().catch(() => {}); }
+      finally { b?.finish(); if (admitted) active--; }
+    }
+  };
+}
