@@ -75940,7 +75940,7 @@ impl Connection {
         // fsqlite-specific: concurrent_mode toggle.
         let name = pragma.name.name.to_ascii_lowercase();
         if matches!(name.as_str(), "quick_check" | "integrity_check") {
-            return Ok(self.pragma_integrity_check_rows(pragma).await);
+            return self.pragma_integrity_check_rows(pragma).await;
         }
         if matches!(
             name.as_str(),
