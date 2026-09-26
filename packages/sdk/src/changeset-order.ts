@@ -9,12 +9,14 @@ const TYPES = ["INTEGER", "TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "INTEGER", 
 const ZERO_HASH = "0".repeat(64);
 const MAX_SEQUENCE = (1n << 63n) - 1n;
 const DDL = `CREATE TABLE ${TABLE} (seq INTEGER PRIMARY KEY, receiver_id TEXT NOT NULL, source_id TEXT NOT NULL, delivery_id TEXT NOT NULL UNIQUE COLLATE BINARY, sha256 TEXT NOT NULL, byte_length INTEGER NOT NULL, applied INTEGER NOT NULL, omitted INTEGER NOT NULL)`;
-// Admit retained metadata in SQL BEFORE it can cross a worker boundary.
+// Admit retained metadata before the worker boundary. SQL BLOB lengths use
+// the database encoding, not UTF-8: valid UTF-16 text can take twice the API
+// byte allowance. metadata() still enforces the original UTF-8 identity limits.
 const META = "CAST(seq AS TEXT), " +
-  "CASE WHEN length(CAST(receiver_id AS BLOB))<=256 THEN receiver_id END, " +
-  "CASE WHEN length(CAST(source_id AS BLOB))<=256 THEN source_id END, " +
-  "CASE WHEN length(CAST(delivery_id AS BLOB))<=512 THEN delivery_id END, " +
-  "CASE WHEN length(CAST(sha256 AS BLOB))=64 THEN sha256 END, byte_length, applied, omitted";
+  "CASE WHEN typeof(receiver_id)='text' AND length(CAST(receiver_id AS BLOB))<=512 AND instr(receiver_id,char(0))=0 THEN receiver_id END, " +
+  "CASE WHEN typeof(source_id)='text' AND length(CAST(source_id AS BLOB))<=512 AND instr(source_id,char(0))=0 THEN source_id END, " +
+  "CASE WHEN typeof(delivery_id)='text' AND length(CAST(delivery_id AS BLOB))<=1024 AND instr(delivery_id,char(0))=0 THEN delivery_id END, " +
+  "CASE WHEN typeof(sha256)='text' AND length(CAST(sha256 AS BLOB))<=128 AND length(sha256)=64 AND instr(sha256,char(0))=0 THEN sha256 END, byte_length, applied, omitted";
 
 export interface ChangesetOrderOptions {
   /** Stable routing identities, NOT authentication. One source per ledger. */
@@ -480,7 +482,10 @@ export class ChangesetOrder {
         fail("ERR_FSQLITE_ORDER_BINDING", "This ledger belongs to another source or receiver");
     }
     const lastEntry = metadata(rows[rows.length - 1]!);
-    const heads = await query(tx, `SELECT slot, CASE WHEN length(CAST(receipt AS BLOB))<=4096 THEN receipt END FROM ${HEAD} LIMIT 2`);
+    // 1024 total identity UTF-8 bytes can expand to 6144 JSON characters,
+    // then 12288 UTF-16 bytes. Leave bounded room for keys/counters/digest;
+    // exact fingerprint equality below remains the authority check.
+    const heads = await query(tx, `SELECT slot, CASE WHEN typeof(receipt)='text' AND length(CAST(receipt AS BLOB))<=16384 THEN receipt END FROM ${HEAD} LIMIT 2`);
     if (heads.length !== 1 || count(heads[0]![0]) !== 1 || heads[0]![1] !== fingerprint(lastEntry))
       fail("ERR_FSQLITE_ORDER_CORRUPT", "Retained head disagrees with the ledger; a committed tail may be missing");
     return lastEntry;

@@ -11,7 +11,10 @@ export const CHANGESET_FANOUT_PROGRESS_TABLE = "__fsqlite_changeset_fanout_progr
 const MANIFEST = `main."${CHANGESET_FANOUT_TABLE}"`;
 const PROGRESS = `main."${CHANGESET_FANOUT_PROGRESS_TABLE}"`;
 const MAX_SEQUENCE = (1n << 63n) - 1n;
-const MANIFEST_BYTES = 262144;
+// At most 256 identities of 256 UTF-8 bytes: JSON escaping can expand each
+// byte to six characters, and UTF-16 storage can double that representation.
+// Bound the SQL transfer, then require the exact validated canonical roster.
+const MANIFEST_BYTES = 1024 * 1024;
 
 export class ChangesetFanoutError extends Error {
   constructor(
@@ -159,12 +162,13 @@ async function state(tx: ChangesetExecutor): Promise<State> {
   } catch {
     return fail("CORRUPT", "Invalid immutable fanout manifest");
   }
-  // Bound retained strings before returning them through a worker/SQL adapter.
+  // Bound database-encoded strings before the worker/SQL boundary. UTF-16
+  // can double UTF-8 sizes; roster membership/identity() retain API limits.
   const rows = await query(tx,
-    `SELECT CASE WHEN typeof(replica_id)='text' AND length(CAST(replica_id AS BLOB))<=256 THEN replica_id END, ` +
+    `SELECT CASE WHEN typeof(replica_id)='text' AND length(CAST(replica_id AS BLOB))<=512 AND instr(replica_id,char(0))=0 THEN replica_id END, ` +
     `CASE WHEN typeof(sequence)='integer' THEN CAST(sequence AS TEXT) END, ` +
-    `CASE WHEN typeof(delivery_id)='text' AND length(CAST(delivery_id AS BLOB))<=512 THEN delivery_id END, ` +
-    `CASE WHEN typeof(sha256)='text' AND length(sha256)<=64 THEN sha256 END FROM ${PROGRESS} LIMIT 257`);
+    `CASE WHEN typeof(delivery_id)='text' AND length(CAST(delivery_id AS BLOB))<=1024 AND instr(delivery_id,char(0))=0 THEN delivery_id END, ` +
+    `CASE WHEN typeof(sha256)='text' AND length(CAST(sha256 AS BLOB))<=128 AND length(sha256)<=64 AND instr(sha256,char(0))=0 THEN sha256 END FROM ${PROGRESS} LIMIT 257`);
   if (rows.length !== replicas.length) fail("CORRUPT", "A required replica cursor is missing or duplicated");
   const byId = new Map<string, ChangesetReplicaProgress>();
   const high = await sourceSequence(tx);
